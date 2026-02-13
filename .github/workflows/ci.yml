@@ -22,7 +22,7 @@ jobs:
       - name: Setup Emscripten SDK
         uses: mymindstorm/setup-emsdk@v14
         with:
-          version: 4.0.24
+          version: latest
 
       - name: Build bridge artifacts
         env:
