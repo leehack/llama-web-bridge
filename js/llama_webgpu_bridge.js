@@ -1,4 +1,5 @@
 const textEncoder = new TextEncoder();
+const defaultModelCacheName = 'llamadart-webgpu-model-cache-v1';
 
 function basenameFromUrl(url) {
   try {
@@ -9,6 +10,14 @@ function basenameFromUrl(url) {
   } catch (_) {
     const parts = String(url).split('/');
     return parts[parts.length - 1] || 'model.gguf';
+  }
+}
+
+function normalizeAbsoluteUrl(url) {
+  try {
+    return new URL(url, typeof window !== 'undefined' ? window.location.href : undefined).toString();
+  } catch (_) {
+    return String(url);
   }
 }
 
@@ -46,6 +55,65 @@ function buildPromptFromMessages(messages, addAssistant) {
   return lines.join('\n');
 }
 
+function isSafariUserAgent(userAgent) {
+  if (typeof userAgent !== 'string' || userAgent.length === 0) {
+    return false;
+  }
+
+  const hasSafariToken = /Safari\//.test(userAgent);
+  const hasOtherBrowserToken = /(Chrome|Chromium|CriOS|Edg|OPR|Firefox|FxiOS)\//.test(userAgent);
+  return hasSafariToken && !hasOtherBrowserToken;
+}
+
+function looksLikeCorruptedGeneration(text) {
+  if (typeof text !== 'string' || text.length === 0) {
+    return false;
+  }
+
+  const normalized = text.trim();
+  if (normalized.length === 0) {
+    return false;
+  }
+
+  const unusedTokens = text.match(/<unused\d+>/g) || [];
+  if (unusedTokens.length >= 4) {
+    return true;
+  }
+
+  const tokenLikeTags = text.match(/<[^>]{1,40}>/g) || [];
+  if (tokenLikeTags.length >= 8) {
+    return true;
+  }
+
+  const compact = text.replace(/\s+/g, '');
+  if (compact.length === 0) {
+    return false;
+  }
+
+  const tagRun = compact.match(/(?:<[^>]{2,32}>){6,}/);
+  if (tagRun) {
+    return true;
+  }
+
+  const alphaNum = (normalized.match(/[A-Za-z0-9]/g) || []).length;
+  const printable = (normalized.match(/[\x20-\x7E]/g) || []).length;
+  const angleBrackets = (normalized.match(/[<>]/g) || []).length;
+
+  const alphaNumRatio = alphaNum / normalized.length;
+  const printableRatio = printable / normalized.length;
+  const bracketRatio = angleBrackets / normalized.length;
+
+  if (normalized.length >= 24 && printableRatio > 0.95 && alphaNumRatio < 0.18) {
+    return true;
+  }
+
+  if (normalized.length >= 24 && bracketRatio > 0.25) {
+    return true;
+  }
+
+  return false;
+}
+
 async function readResponseBytesWithProgress(response, progressCallback) {
   const total = Number(response.headers.get('content-length')) || 0;
 
@@ -72,8 +140,11 @@ async function readResponseBytesWithProgress(response, progressCallback) {
       continue;
     }
 
-    chunks.push(value);
-    loaded += value.length;
+    // Some browsers may reuse the same Uint8Array backing store across reads.
+    // Clone each chunk before storing so reassembly is deterministic.
+    const chunk = value.slice ? value.slice() : new Uint8Array(value);
+    chunks.push(chunk);
+    loaded += chunk.length;
 
     if (typeof progressCallback === 'function') {
       const effectiveTotal = total || loaded;
@@ -174,7 +245,14 @@ export class LlamaWebGpuBridge {
     this._nGpuLayers = Number.isFinite(config.nGpuLayers)
       ? Number(config.nGpuLayers)
       : -1;
+    this._runtimeNotes = [];
+    this._isSafari = isSafariUserAgent(this._config.userAgent ?? globalThis.navigator?.userAgent ?? '');
+    this._modelSource = 'network';
+    this._modelCacheState = 'disabled';
+    this._modelCacheName = defaultModelCacheName;
   }
+
+  static supportsSafariAdaptiveGpu = true;
 
   _coreErrorMessage(prefix, fallbackCode = 0) {
     try {
@@ -186,6 +264,69 @@ export class LlamaWebGpuBridge {
       // Ignore nested error retrieval failures.
     }
     return `${prefix} (code=${fallbackCode})`;
+  }
+
+  _resolveCacheName(options = {}) {
+    if (typeof options.cacheName === 'string' && options.cacheName.trim().length > 0) {
+      return options.cacheName.trim();
+    }
+
+    if (typeof this._config.cacheName === 'string' && this._config.cacheName.trim().length > 0) {
+      return this._config.cacheName.trim();
+    }
+
+    return defaultModelCacheName;
+  }
+
+  async _getCachedModelResponse(url, options = {}) {
+    const useCache = options.useCache !== false;
+    this._modelSource = 'network';
+    this._modelCacheState = useCache ? 'unavailable' : 'disabled';
+    this._modelCacheName = this._resolveCacheName(options);
+
+    if (!useCache) {
+      const response = await fetch(url, { cache: 'no-store' });
+      this._modelCacheState = 'disabled';
+      return response;
+    }
+
+    if (!globalThis.caches || typeof globalThis.caches.open !== 'function') {
+      this._modelCacheState = 'unavailable';
+      return fetch(url);
+    }
+
+    const cacheKey = normalizeAbsoluteUrl(url);
+
+    try {
+      const cache = await globalThis.caches.open(this._modelCacheName);
+      const cached = await cache.match(cacheKey);
+      if (cached) {
+        this._modelSource = 'cache';
+        this._modelCacheState = 'hit';
+        this._runtimeNotes.push('model_cache_hit');
+        return cached;
+      }
+
+      this._modelCacheState = 'miss';
+      const response = await fetch(url);
+
+      if (response.ok) {
+        try {
+          await cache.put(cacheKey, response.clone());
+          this._modelCacheState = 'stored';
+          this._runtimeNotes.push('model_cache_stored');
+        } catch (_) {
+          this._modelCacheState = 'store_failed';
+          this._runtimeNotes.push('model_cache_store_failed');
+        }
+      }
+
+      return response;
+    } catch (_) {
+      this._modelCacheState = 'error';
+      this._runtimeNotes.push('model_cache_error');
+      return fetch(url);
+    }
   }
 
   async _ensureCore() {
@@ -238,9 +379,10 @@ export class LlamaWebGpuBridge {
 
   async loadModelFromUrl(url, options = {}) {
     this._abortRequested = false;
+    this._runtimeNotes = [];
     await this._probeBackends();
 
-    const response = await fetch(url);
+    const response = await this._getCachedModelResponse(url, options);
     if (!response.ok) {
       throw new Error(`Failed to fetch model: ${response.status} ${response.statusText}`);
     }
@@ -271,6 +413,18 @@ export class LlamaWebGpuBridge {
       this._nGpuLayers = Math.trunc(requestedGpuLayers);
     }
 
+    if (this._isSafari && this._nGpuLayers > 0) {
+      const requestedSafariMaxLayers = Number(options.safariMaxGpuLayers);
+      const safariMaxGpuLayers = Number.isFinite(requestedSafariMaxLayers)
+        ? Math.max(1, Math.trunc(requestedSafariMaxLayers))
+        : 1;
+
+      if (this._nGpuLayers > safariMaxGpuLayers) {
+        this._nGpuLayers = safariMaxGpuLayers;
+        this._runtimeNotes.push(`safari_gpu_layers_capped:${safariMaxGpuLayers}`);
+      }
+    }
+
     const rc = Number(
       await core.ccall(
         'llamadart_webgpu_load_model',
@@ -283,6 +437,116 @@ export class LlamaWebGpuBridge {
 
     if (rc !== 0) {
       throw new Error(this._coreErrorMessage('Failed to load GGUF model', rc));
+    }
+
+    const shouldProbeSafariGpu = this._isSafari
+      && this._nGpuLayers > 0
+      && options.safariGpuProbe !== false;
+
+    if (shouldProbeSafariGpu) {
+      const defaultProbePrompts = [
+        'user: hi\nassistant:',
+        'user: say hello in one short sentence\nassistant:',
+      ];
+
+      const probePrompts = Array.isArray(options.safariProbePrompts)
+        ? options.safariProbePrompts
+          .map((v) => String(v || '').trim())
+          .filter((v) => v.length > 0)
+        : (typeof options.safariProbePrompt === 'string' && options.safariProbePrompt.trim().length > 0
+            ? [options.safariProbePrompt.trim()]
+            : defaultProbePrompts);
+
+      const probeTokensRaw = Number(options.safariProbeTokens);
+      const probeTokens = Number.isFinite(probeTokensRaw) && probeTokensRaw > 0
+        ? Math.min(Math.trunc(probeTokensRaw), 96)
+        : 48;
+
+      const runProbe = async (probePrompt, probeSeed) => {
+        try {
+          const probeOutput = await this.createCompletion(probePrompt, {
+            nPredict: probeTokens,
+            temp: 0,
+            topK: 1,
+            topP: 1,
+            penalty: 1,
+            seed: probeSeed,
+          });
+          return !looksLikeCorruptedGeneration(probeOutput);
+        } catch (_) {
+          return false;
+        }
+      };
+
+      let initialProbePassed = true;
+      for (let i = 0; i < probePrompts.length; i += 1) {
+        const ok = await runProbe(probePrompts[i], i + 1);
+        if (!ok) {
+          initialProbePassed = false;
+          break;
+        }
+      }
+
+      if (!initialProbePassed) {
+        this._runtimeNotes.push('safari_gpu_probe_failed');
+
+        const retryCandidates = [];
+        if (this._nGpuLayers > 1) {
+          retryCandidates.push(1);
+        }
+        retryCandidates.push(0);
+
+        let stabilized = false;
+        for (const candidateLayers of retryCandidates) {
+          try {
+            core.ccall('llamadart_webgpu_shutdown', null, [], []);
+          } catch (_) {
+            // ignore shutdown retries
+          }
+
+          const retryRc = Number(
+            await core.ccall(
+              'llamadart_webgpu_load_model',
+              'number',
+              ['string', 'number', 'number', 'number'],
+              [this._modelPath, this._nCtx, this._threads, candidateLayers],
+              { async: true },
+            ),
+          );
+
+          if (retryRc !== 0) {
+            continue;
+          }
+
+          this._nGpuLayers = candidateLayers;
+          if (candidateLayers === 0) {
+            this._runtimeNotes.push('safari_fallback_cpu');
+            stabilized = true;
+            break;
+          }
+
+          let retryProbePassed = true;
+          for (let i = 0; i < probePrompts.length; i += 1) {
+            const ok = await runProbe(probePrompts[i], i + 11);
+            if (!ok) {
+              retryProbePassed = false;
+              break;
+            }
+          }
+
+          if (retryProbePassed) {
+            this._runtimeNotes.push(`safari_gpu_layers_capped:${candidateLayers}`);
+            stabilized = true;
+            break;
+          }
+        }
+
+        if (!stabilized) {
+          throw new Error('Safari GPU probe failed and fallback attempts were unsuccessful.');
+        }
+      } else {
+        this._runtimeNotes.push('safari_gpu_probe_passed');
+      }
     }
 
     try {
@@ -299,6 +563,7 @@ export class LlamaWebGpuBridge {
     this._mmSupportsAudio = false;
     this._mediaFileCounter = 0;
     this._stagedMediaPaths = [];
+    this._gpuActive = this._gpuActive && this._nGpuLayers > 0;
 
     return 1;
   }
@@ -718,6 +983,10 @@ export class LlamaWebGpuBridge {
       'llamadart.webgpu.model_bytes': String(this._modelBytes),
       'llamadart.webgpu.n_threads': String(this._threads),
       'llamadart.webgpu.n_gpu_layers': String(this._nGpuLayers),
+      'llamadart.webgpu.model_source': this._modelSource,
+      'llamadart.webgpu.model_cache_state': this._modelCacheState,
+      'llamadart.webgpu.model_cache_name': this._modelCacheName,
+      'llamadart.webgpu.runtime_notes': this._runtimeNotes.join(';'),
       'llamadart.webgpu.mmproj_loaded': this._mmProjPath ? '1' : '0',
       'llamadart.webgpu.supports_vision': this._mmSupportsVision ? '1' : '0',
       'llamadart.webgpu.supports_audio': this._mmSupportsAudio ? '1' : '0',
@@ -742,6 +1011,10 @@ export class LlamaWebGpuBridge {
   }
 
   getBackendName() {
+    if (this._nGpuLayers === 0) {
+      return 'WASM (Prototype bridge)';
+    }
+
     if (this._backendLabels.length > 0) {
       return this._backendLabels.join(', ');
     }
@@ -767,6 +1040,8 @@ export class LlamaWebGpuBridge {
     }
     this._modelPath = null;
     this._modelBytes = 0;
+    this._modelSource = 'network';
+    this._modelCacheState = 'disabled';
     this._mmProjPath = null;
     this._mmSupportsVision = false;
     this._mmSupportsAudio = false;

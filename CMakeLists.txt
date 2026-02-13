@@ -26,10 +26,12 @@ set(LLAMA_HTTPLIB OFF CACHE BOOL "" FORCE)
 set(LLAMA_OPENSSL OFF CACHE BOOL "" FORCE)
 set(LLAMA_BUILD_HTML OFF CACHE BOOL "" FORCE)
 set(LLAMA_WASM_SINGLE_FILE OFF CACHE BOOL "" FORCE)
+set(LLAMA_WASM_MEM64 OFF CACHE BOOL "" FORCE)
 
 set(GGML_NATIVE OFF CACHE BOOL "" FORCE)
 set(GGML_OPENMP OFF CACHE BOOL "" FORCE)
 set(GGML_WEBGPU ON CACHE BOOL "" FORCE)
+set(GGML_WEBGPU_JSPI OFF CACHE BOOL "" FORCE)
 set(GGML_VULKAN OFF CACHE BOOL "" FORCE)
 set(GGML_METAL OFF CACHE BOOL "" FORCE)
 set(GGML_BLAS OFF CACHE BOOL "" FORCE)
@@ -78,9 +80,6 @@ add_library(llamadart_mtmd STATIC
 )
 
 target_compile_features(llamadart_mtmd PRIVATE cxx_std_17)
-target_compile_options(llamadart_mtmd PRIVATE
-    "-sMEMORY64=1"
-)
 target_include_directories(llamadart_mtmd PRIVATE
     "${LLAMA_CPP_DIR}/tools/mtmd"
     "${LLAMA_CPP_DIR}"
@@ -96,10 +95,6 @@ add_executable(llama_webgpu_core src/llama_webgpu_core.cpp)
 
 target_compile_features(llama_webgpu_core PRIVATE cxx_std_17)
 
-target_compile_options(llama_webgpu_core PRIVATE
-    "-sMEMORY64=1"
-)
-
 target_include_directories(llama_webgpu_core PRIVATE
     "${LLAMA_CPP_DIR}/include"
     "${LLAMA_CPP_DIR}/ggml/include"
@@ -109,11 +104,9 @@ target_include_directories(llama_webgpu_core PRIVATE
 target_link_libraries(llama_webgpu_core PRIVATE llama llamadart_mtmd)
 
 target_link_options(llama_webgpu_core PRIVATE
-    "-sMEMORY64=1"
     "-sALLOW_MEMORY_GROWTH=1"
     "-sASSERTIONS=1"
-    "-sJSPI=1"
-    "-sJSPI_EXPORTS=['llamadart_webgpu_probe','llamadart_webgpu_load_model','llamadart_webgpu_mmproj_load','llamadart_webgpu_tokenize_to_json','llamadart_webgpu_detokenize_from_json','llamadart_webgpu_generate','llamadart_webgpu_begin_generation','llamadart_webgpu_next_token','llamadart_webgpu_shutdown']"
+    "-sMIN_SAFARI_VERSION=170400"
     "-sMODULARIZE=1"
     "-sEXPORT_ES6=1"
     "-sEXPORT_NAME=createLlamaWebGpuCoreModule"
