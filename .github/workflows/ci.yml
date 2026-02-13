@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-webgpu-bridge:
+    name: Build WebGPU Bridge (WASM)
+    runs-on: ubuntu-latest
+    env:
+      LLAMA_CPP_TAG: b8011
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Clone llama.cpp source
+        run: |
+          git clone --depth 1 --branch "$LLAMA_CPP_TAG" https://github.com/ggml-org/llama.cpp.git third_party/llama_cpp
+
+      - name: Setup Emscripten SDK
+        uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: 3.1.70
+
+      - name: Build bridge artifacts
+        env:
+          OUT_DIR: ${{ runner.temp }}/webgpu_bridge_dist
+        run: ./scripts/build_bridge.sh
+
+      - name: Verify outputs
+        run: |
+          test -f "${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_bridge.js"
+          test -f "${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_core.js"
+          test -f "${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_core.wasm"
+
+      - name: Upload bridge artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: webgpu-bridge-dist
+          path: |
+            ${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_bridge.js
+            ${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_core.js
+            ${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_core.wasm
