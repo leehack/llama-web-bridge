@@ -69,3 +69,8 @@ After publish, assets are CDN-available at:
 - `https://cdn.jsdelivr.net/gh/leehack/llama-web-bridge-assets@v0.1.1/llama_webgpu_bridge.js`
 - `https://cdn.jsdelivr.net/gh/leehack/llama-web-bridge-assets@v0.1.1/llama_webgpu_core.js`
 - `https://cdn.jsdelivr.net/gh/leehack/llama-web-bridge-assets@v0.1.1/llama_webgpu_core.wasm`
+
+## Maintainer Docs
+
+- `AGENTS.md`: agent workflow and cross-repo handoff
+- `CONTRIBUTING.md`: contributor setup/build/publish steps
