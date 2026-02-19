@@ -250,9 +250,60 @@ export class LlamaWebGpuBridge {
     this._modelSource = 'network';
     this._modelCacheState = 'disabled';
     this._modelCacheName = defaultModelCacheName;
+    this._logLevel = Number.isFinite(config.logLevel)
+      ? Math.max(0, Math.min(4, Math.trunc(config.logLevel)))
+      : 2;
   }
 
   static supportsSafariAdaptiveGpu = true;
+
+  _loggerFor(level) {
+    const logger = this._config?.logger;
+    const fallback = (typeof console !== 'undefined') ? console : null;
+
+    if (logger && typeof logger[level] === 'function') {
+      return logger[level].bind(logger);
+    }
+
+    if (!fallback) {
+      return () => {};
+    }
+
+    if (typeof fallback[level] === 'function') {
+      return fallback[level].bind(fallback);
+    }
+
+    if (typeof fallback.log === 'function') {
+      return fallback.log.bind(fallback);
+    }
+
+    return () => {};
+  }
+
+  _emitLogger(level, message) {
+    try {
+      this._loggerFor(level)(message);
+    } catch (_) {
+      // Logger callbacks are best-effort only.
+    }
+  }
+
+  _applyCoreLogLevel() {
+    if (!this._core) {
+      return;
+    }
+
+    try {
+      this._core.ccall(
+        'llamadart_webgpu_set_log_level',
+        null,
+        ['number'],
+        [this._logLevel],
+      );
+    } catch (_) {
+      // Older core builds may not expose log-level setter.
+    }
+  }
 
   _coreErrorMessage(prefix, fallbackCode = 0) {
     try {
@@ -331,6 +382,7 @@ export class LlamaWebGpuBridge {
 
   async _ensureCore() {
     if (this._core) {
+      this._applyCoreLogLevel();
       return this._core;
     }
 
@@ -345,7 +397,21 @@ export class LlamaWebGpuBridge {
         }
         return `${prefix}${path}`;
       },
+      print: (msg) => {
+        this._emitLogger('log', msg);
+      },
+      printErr: (msg) => {
+        const text = String(msg ?? '');
+        const lowered = text.toLowerCase();
+        if (lowered.startsWith('warning')) {
+          this._emitLogger('warn', text);
+          return;
+        }
+        this._emitLogger('error', text);
+      },
     });
+
+    this._applyCoreLogLevel();
 
     return this._core;
   }
@@ -1021,6 +1087,13 @@ export class LlamaWebGpuBridge {
     return this._gpuActive
       ? 'WebGPU (Prototype bridge)'
       : 'WASM (Prototype bridge)';
+  }
+
+  setLogLevel(level) {
+    if (Number.isFinite(level)) {
+      this._logLevel = Math.max(0, Math.min(4, Math.trunc(level)));
+    }
+    this._applyCoreLogLevel();
   }
 
   cancel() {

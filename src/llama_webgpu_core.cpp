@@ -1,8 +1,10 @@
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cstdlib>
 #include <cstdint>
 #include <cstring>
+#include <cstdio>
 #include <regex>
 #include <string>
 #include <vector>
@@ -31,6 +33,8 @@ bool g_has_webgpu = false;
 bool g_generation_active = false;
 bool g_cancel_requested = false;
 llama_sampler * g_active_sampler = nullptr;
+std::atomic<int32_t> g_log_level{3};
+std::atomic<int32_t> g_last_non_cont_level{GGML_LOG_LEVEL_NONE};
 
 std::string g_last_error;
 std::string g_last_output;
@@ -87,6 +91,40 @@ void clear_error() {
   g_last_error.clear();
 }
 
+void webgpu_log_callback(
+    ggml_log_level level,
+    const char * text,
+    void * user_data) {
+  (void) user_data;
+
+  const int32_t configured = g_log_level.load(std::memory_order_relaxed);
+  if (configured <= 0 || text == nullptr) {
+    return;
+  }
+
+  int32_t effective = 0;
+  if (level == GGML_LOG_LEVEL_CONT) {
+    effective = g_last_non_cont_level.load(std::memory_order_relaxed);
+  } else {
+    effective = static_cast<int32_t>(level);
+    g_last_non_cont_level.store(effective, std::memory_order_relaxed);
+  }
+
+  if (effective == GGML_LOG_LEVEL_NONE) {
+    return;
+  }
+
+  if (effective >= configured) {
+    std::fputs(text, stderr);
+    std::fflush(stderr);
+  }
+}
+
+void apply_log_level_callback() {
+  llama_log_set(webgpu_log_callback, nullptr);
+  ggml_log_set(webgpu_log_callback, nullptr);
+}
+
 void clear_pending_media() {
   for (mtmd_bitmap * bitmap : g_pending_media) {
     if (bitmap != nullptr) {
@@ -101,6 +139,8 @@ void ensure_backend_initialized() {
     llama_backend_init();
     g_backend_initialized = true;
   }
+
+  apply_log_level_callback();
 }
 
 void end_generation_state() {
@@ -779,6 +819,18 @@ EMSCRIPTEN_KEEPALIVE const char * llamadart_webgpu_backends_json() {
 
 EMSCRIPTEN_KEEPALIVE const char * llamadart_webgpu_last_error() {
   return g_last_error.c_str();
+}
+
+EMSCRIPTEN_KEEPALIVE void llamadart_webgpu_set_log_level(int32_t level) {
+  if (level < 0) {
+    level = 0;
+  } else if (level > 4) {
+    level = 4;
+  }
+
+  g_log_level.store(level, std::memory_order_relaxed);
+  g_last_non_cont_level.store(GGML_LOG_LEVEL_NONE, std::memory_order_relaxed);
+  apply_log_level_callback();
 }
 
 EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_load_model(
