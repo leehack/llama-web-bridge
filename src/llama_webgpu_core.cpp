@@ -43,6 +43,7 @@ std::string g_last_tokens_json = "[]";
 std::string g_last_detokenized;
 std::string g_backend_json = "[]";
 std::string g_model_meta_json = "{}";
+std::vector<llama_token> g_cached_prompt_tokens;
 
 std::vector<mtmd_bitmap *> g_pending_media;
 
@@ -180,6 +181,7 @@ void free_runtime() {
   g_last_tokens_json = "[]";
   g_last_detokenized.clear();
   g_model_meta_json = "{}";
+  g_cached_prompt_tokens.clear();
 }
 
 std::vector<std::string> collect_backend_labels() {
@@ -723,10 +725,11 @@ int32_t begin_generation_impl(
   end_generation_state();
   g_cancel_requested = false;
 
-  llama_memory_clear(llama_get_memory(g_state.ctx), false);
-
   const std::string prompt_text = prompt;
   if (!g_pending_media.empty()) {
+    llama_memory_clear(llama_get_memory(g_state.ctx), false);
+    g_cached_prompt_tokens.clear();
+
     if (!decode_multimodal_prompt(prompt_text)) {
       return -3;
     }
@@ -736,9 +739,43 @@ int32_t begin_generation_impl(
       return -3;
     }
 
-    if (!decode_tokens(prompt_tokens)) {
-      return -4;
+    size_t prefix = 0;
+    const size_t max_prefix =
+        std::min(g_cached_prompt_tokens.size(), prompt_tokens.size());
+    while (prefix < max_prefix &&
+           g_cached_prompt_tokens[prefix] == prompt_tokens[prefix]) {
+      prefix++;
     }
+
+    if (prefix == prompt_tokens.size() && prefix > 0) {
+      prefix--;
+    }
+
+    if (prefix == 0) {
+      llama_memory_clear(llama_get_memory(g_state.ctx), false);
+    } else {
+      const bool removed = llama_memory_seq_rm(
+          llama_get_memory(g_state.ctx),
+          0,
+          static_cast<llama_pos>(prefix),
+          -1);
+      if (!removed) {
+        prefix = 0;
+        llama_memory_clear(llama_get_memory(g_state.ctx), false);
+      }
+    }
+
+    if (prefix < prompt_tokens.size()) {
+      std::vector<llama_token> eval_tokens(
+          prompt_tokens.begin() + prefix,
+          prompt_tokens.end());
+      if (!decode_tokens(eval_tokens)) {
+        g_cached_prompt_tokens.clear();
+        return -4;
+      }
+    }
+
+    g_cached_prompt_tokens = prompt_tokens;
   }
 
   g_active_sampler =

@@ -224,7 +224,240 @@ function toFloat32Array(value) {
   return null;
 }
 
-export class LlamaWebGpuBridge {
+function serializeWorkerError(error) {
+  if (!error) {
+    return 'Unknown worker error';
+  }
+
+  if (typeof error === 'string') {
+    return error;
+  }
+
+  if (typeof error.message === 'string' && error.message.length > 0) {
+    return error.message;
+  }
+
+  try {
+    return JSON.stringify(error);
+  } catch (_) {
+    return String(error);
+  }
+}
+
+function createBridgeWorkerSource(moduleUrl) {
+  return `
+import { LlamaWebGpuBridge } from ${JSON.stringify(moduleUrl)};
+
+let bridge = null;
+
+function postError(id, error) {
+  self.postMessage({
+    type: 'error',
+    id,
+    message: ${serializeWorkerError.toString()}(error),
+  });
+}
+
+function snapshotState(target) {
+  return {
+    metadata: target.getModelMetadata(),
+    contextSize: target.getContextSize(),
+    gpuActive: target.isGpuActive(),
+    backendName: target.getBackendName(),
+    supportsVision: target.supportsVision(),
+    supportsAudio: target.supportsAudio(),
+  };
+}
+
+self.onmessage = async (event) => {
+  const message = event.data || {};
+  const type = message.type;
+  const id = message.id ?? 0;
+
+  try {
+    if (type === 'init') {
+      bridge = new LlamaWebGpuBridge({
+        ...(message.config || {}),
+        disableWorker: true,
+      });
+      self.postMessage({ type: 'ready' });
+      return;
+    }
+
+    if (type !== 'call') {
+      return;
+    }
+
+    if (!bridge) {
+      throw new Error('Bridge worker is not initialized');
+    }
+
+    const method = String(message.method || '');
+    const args = Array.isArray(message.args) ? message.args : [];
+
+    if (method === 'loadModelFromUrl') {
+      const url = args[0];
+      const options = (args[1] && typeof args[1] === 'object') ? { ...args[1] } : {};
+      options.progressCallback = (progress) => {
+        self.postMessage({ type: 'event', id, event: 'progress', payload: progress || {} });
+      };
+
+      const value = await bridge.loadModelFromUrl(url, options);
+      self.postMessage({ type: 'result', id, value, state: snapshotState(bridge) });
+      return;
+    }
+
+    if (method === 'createCompletion') {
+      const prompt = args[0];
+      const options = (args[1] && typeof args[1] === 'object') ? { ...args[1] } : {};
+      delete options.signal;
+      options.onToken = (piece, currentText) => {
+        self.postMessage({
+          type: 'event',
+          id,
+          event: 'token',
+          payload: {
+            piece: Array.from(piece || []),
+            currentText: String(currentText || ''),
+          },
+        });
+      };
+
+      const value = await bridge.createCompletion(prompt, options);
+      self.postMessage({ type: 'result', id, value });
+      return;
+    }
+
+    if (method === 'loadMultimodalProjector') {
+      const value = await bridge.loadMultimodalProjector(args[0]);
+      self.postMessage({ type: 'result', id, value, state: snapshotState(bridge) });
+      return;
+    }
+
+    if (method === 'unloadMultimodalProjector') {
+      const value = await bridge.unloadMultimodalProjector();
+      self.postMessage({ type: 'result', id, value, state: snapshotState(bridge) });
+      return;
+    }
+
+    if (method === 'dispose') {
+      const value = await bridge.dispose();
+      self.postMessage({
+        type: 'result',
+        id,
+        value,
+        state: {
+          metadata: {},
+          contextSize: 0,
+          gpuActive: false,
+          backendName: 'WASM (Prototype bridge)',
+          supportsVision: false,
+          supportsAudio: false,
+        },
+      });
+      return;
+    }
+
+    const value = await bridge[method](...(args || []));
+    self.postMessage({ type: 'result', id, value });
+  } catch (error) {
+    postError(id, error);
+  }
+};
+`;
+}
+
+class BridgeWorkerProxy {
+  constructor({ moduleUrl, config }) {
+    this._nextId = 1;
+    this._pending = new Map();
+    this._workerBlobUrl = null;
+
+    const source = createBridgeWorkerSource(moduleUrl);
+    this._workerBlobUrl = URL.createObjectURL(
+      new Blob([source], { type: 'text/javascript' }),
+    );
+
+    this._worker = new Worker(this._workerBlobUrl, { type: 'module' });
+    this._ready = new Promise((resolve, reject) => {
+      this._readyResolve = resolve;
+      this._readyReject = reject;
+    });
+
+    this._worker.onmessage = (event) => {
+      const message = event.data || {};
+      const type = message.type;
+      if (type === 'ready') {
+        this._readyResolve?.();
+        return;
+      }
+
+      const id = Number(message.id || 0);
+      const pending = this._pending.get(id);
+      if (!pending) {
+        return;
+      }
+
+      if (type === 'event') {
+        pending.onEvent?.(message);
+        return;
+      }
+
+      this._pending.delete(id);
+      if (type === 'error') {
+        pending.reject(new Error(String(message.message || 'Worker request failed')));
+        return;
+      }
+
+      pending.resolve(message);
+    };
+
+    this._worker.onerror = (event) => {
+      const message = event?.message || 'Bridge worker crashed';
+      const error = new Error(String(message));
+
+      this._readyReject?.(error);
+
+      for (const pending of this._pending.values()) {
+        pending.reject(error);
+      }
+      this._pending.clear();
+    };
+
+    this._worker.postMessage({ type: 'init', config });
+  }
+
+  async call(method, args, onEvent) {
+    await this._ready;
+    const id = this._nextId++;
+
+    return new Promise((resolve, reject) => {
+      this._pending.set(id, { resolve, reject, onEvent });
+      this._worker.postMessage({ type: 'call', id, method, args });
+    });
+  }
+
+  async dispose() {
+    try {
+      await this.call('dispose', []);
+    } catch (_) {
+      // best-effort disposal
+    }
+
+    for (const pending of this._pending.values()) {
+      pending.reject(new Error('Bridge worker disposed'));
+    }
+    this._pending.clear();
+
+    this._worker.terminate();
+    if (this._workerBlobUrl) {
+      URL.revokeObjectURL(this._workerBlobUrl);
+      this._workerBlobUrl = null;
+    }
+  }
+}
+
+class LlamaWebGpuBridgeRuntime {
   constructor(config = {}) {
     this._config = config;
     this._core = null;
@@ -1123,6 +1356,366 @@ export class LlamaWebGpuBridge {
 
   async applyChatTemplate(messages, addAssistant = true, _customTemplate = null) {
     return buildPromptFromMessages(messages, addAssistant);
+  }
+}
+
+export class LlamaWebGpuBridge {
+  static supportsSafariAdaptiveGpu =
+    LlamaWebGpuBridgeRuntime.supportsSafariAdaptiveGpu === true;
+
+  constructor(config = {}) {
+    this._config = config;
+    this._runtime = null;
+    this._workerProxy = null;
+
+    this._metadata = {};
+    this._contextSize = 0;
+    this._gpuActive = false;
+    this._backendName = 'WASM (Prototype bridge)';
+    this._supportsVision = false;
+    this._supportsAudio = false;
+
+    if (this._shouldUseWorker()) {
+      try {
+        this._workerProxy = new BridgeWorkerProxy({
+          moduleUrl: this._workerModuleUrl(),
+          config: this._workerConfig(),
+        });
+      } catch (error) {
+        this._disableWorkerFallback(error);
+      }
+    }
+
+    if (!this._workerProxy) {
+      this._runtime = this._createRuntime();
+    }
+  }
+
+  _createRuntime() {
+    return new LlamaWebGpuBridgeRuntime({
+      ...this._config,
+      disableWorker: true,
+    });
+  }
+
+  _shouldUseWorker() {
+    if (this._config?.disableWorker === true) {
+      return false;
+    }
+
+    if (typeof Worker === 'undefined' ||
+        typeof Blob === 'undefined' ||
+        typeof URL === 'undefined' ||
+        typeof URL.createObjectURL !== 'function') {
+      return false;
+    }
+
+    if (typeof this._config?.coreModuleFactory === 'function') {
+      return false;
+    }
+
+    return true;
+  }
+
+  _workerModuleUrl() {
+    const candidate = this._config?.workerUrl;
+    if (typeof candidate === 'string' && candidate.trim().length > 0) {
+      return candidate.trim();
+    }
+    return import.meta.url;
+  }
+
+  _workerConfig() {
+    const config = this._config || {};
+    return {
+      wasmUrl: typeof config.wasmUrl === 'string' ? config.wasmUrl : undefined,
+      coreModuleUrl: typeof config.coreModuleUrl === 'string'
+        ? config.coreModuleUrl
+        : undefined,
+      threads: Number(config.threads) > 0 ? Number(config.threads) : undefined,
+      nGpuLayers: Number.isFinite(config.nGpuLayers)
+        ? Number(config.nGpuLayers)
+        : undefined,
+      userAgent: typeof config.userAgent === 'string' ? config.userAgent : undefined,
+      cacheName: typeof config.cacheName === 'string' ? config.cacheName : undefined,
+      logLevel: Number.isFinite(config.logLevel) ? Number(config.logLevel) : 2,
+    };
+  }
+
+  _applyShadowState(state) {
+    if (!state || typeof state !== 'object') {
+      return;
+    }
+
+    if (state.metadata && typeof state.metadata === 'object') {
+      this._metadata = state.metadata;
+    }
+    if (Number.isFinite(state.contextSize)) {
+      this._contextSize = Number(state.contextSize);
+    }
+    if (typeof state.gpuActive === 'boolean') {
+      this._gpuActive = state.gpuActive;
+    }
+    if (typeof state.backendName === 'string' && state.backendName.length > 0) {
+      this._backendName = state.backendName;
+    }
+    if (typeof state.supportsVision === 'boolean') {
+      this._supportsVision = state.supportsVision;
+    }
+    if (typeof state.supportsAudio === 'boolean') {
+      this._supportsAudio = state.supportsAudio;
+    }
+  }
+
+  _disableWorkerFallback(error) {
+    if (typeof console !== 'undefined' && typeof console.warn === 'function') {
+      console.warn('llamadart: bridge worker unavailable, falling back to main thread', error);
+    }
+
+    if (this._workerProxy) {
+      this._workerProxy.dispose().catch(() => {});
+      this._workerProxy = null;
+    }
+
+    if (!this._runtime) {
+      this._runtime = this._createRuntime();
+    }
+  }
+
+  async _callWorker(method, args, onEvent) {
+    if (!this._workerProxy) {
+      throw new Error('Bridge worker proxy is not available');
+    }
+
+    const response = await this._workerProxy.call(method, args, onEvent);
+    this._applyShadowState(response.state);
+    return response.value;
+  }
+
+  async loadModelFromUrl(url, options = {}) {
+    if (!this._workerProxy) {
+      return this._runtime.loadModelFromUrl(url, options);
+    }
+
+    try {
+      const workerOptions = { ...options };
+      delete workerOptions.progressCallback;
+
+      return await this._callWorker(
+        'loadModelFromUrl',
+        [url, workerOptions],
+        (event) => {
+          if (event.event !== 'progress') {
+            return;
+          }
+          if (typeof options.progressCallback !== 'function') {
+            return;
+          }
+          options.progressCallback(event.payload || {});
+        },
+      );
+    } catch (error) {
+      this._disableWorkerFallback(error);
+      return this._runtime.loadModelFromUrl(url, options);
+    }
+  }
+
+  async createCompletion(prompt, options = {}) {
+    if (!this._workerProxy) {
+      return this._runtime.createCompletion(prompt, options);
+    }
+
+    let removeAbortListener = null;
+    try {
+      if (options?.signal && typeof options.signal.addEventListener === 'function') {
+        const onAbort = () => {
+          this.cancel();
+        };
+        options.signal.addEventListener('abort', onAbort, { once: true });
+        removeAbortListener = () => {
+          options.signal.removeEventListener('abort', onAbort);
+        };
+      }
+
+      const workerOptions = { ...options };
+      delete workerOptions.onToken;
+      delete workerOptions.signal;
+
+      return await this._callWorker(
+        'createCompletion',
+        [prompt, workerOptions],
+        (event) => {
+          if (event.event !== 'token') {
+            return;
+          }
+          if (typeof options.onToken !== 'function') {
+            return;
+          }
+
+          const payload = event.payload || {};
+          const piece = Uint8Array.from(Array.isArray(payload.piece) ? payload.piece : []);
+          options.onToken(piece, String(payload.currentText || ''));
+        },
+      );
+    } catch (error) {
+      this._disableWorkerFallback(error);
+      return this._runtime.createCompletion(prompt, options);
+    } finally {
+      removeAbortListener?.();
+    }
+  }
+
+  async loadMultimodalProjector(url) {
+    if (!this._workerProxy) {
+      return this._runtime.loadMultimodalProjector(url);
+    }
+
+    try {
+      return await this._callWorker('loadMultimodalProjector', [url]);
+    } catch (error) {
+      this._disableWorkerFallback(error);
+      return this._runtime.loadMultimodalProjector(url);
+    }
+  }
+
+  async unloadMultimodalProjector() {
+    if (!this._workerProxy) {
+      return this._runtime.unloadMultimodalProjector();
+    }
+
+    try {
+      return await this._callWorker('unloadMultimodalProjector', []);
+    } catch (error) {
+      this._disableWorkerFallback(error);
+      return this._runtime.unloadMultimodalProjector();
+    }
+  }
+
+  supportsVision() {
+    if (this._workerProxy) {
+      return this._supportsVision;
+    }
+    return this._runtime.supportsVision();
+  }
+
+  supportsAudio() {
+    if (this._workerProxy) {
+      return this._supportsAudio;
+    }
+    return this._runtime.supportsAudio();
+  }
+
+  async tokenize(text, addSpecial = true) {
+    if (!this._workerProxy) {
+      return this._runtime.tokenize(text, addSpecial);
+    }
+
+    try {
+      return await this._callWorker('tokenize', [text, addSpecial]);
+    } catch (error) {
+      this._disableWorkerFallback(error);
+      return this._runtime.tokenize(text, addSpecial);
+    }
+  }
+
+  async detokenize(tokens, special = false) {
+    if (!this._workerProxy) {
+      return this._runtime.detokenize(tokens, special);
+    }
+
+    const normalized = Array.isArray(tokens)
+      ? tokens
+      : Array.from(tokens || []);
+
+    try {
+      return await this._callWorker('detokenize', [normalized, special]);
+    } catch (error) {
+      this._disableWorkerFallback(error);
+      return this._runtime.detokenize(normalized, special);
+    }
+  }
+
+  getModelMetadata() {
+    if (this._workerProxy) {
+      return {
+        ...(this._metadata || {}),
+        'llamadart.webgpu.execution': 'worker',
+      };
+    }
+    return {
+      ...this._runtime.getModelMetadata(),
+      'llamadart.webgpu.execution': 'main-thread',
+    };
+  }
+
+  getContextSize() {
+    if (this._workerProxy) {
+      return this._contextSize || 0;
+    }
+    return this._runtime.getContextSize();
+  }
+
+  isGpuActive() {
+    if (this._workerProxy) {
+      return this._gpuActive;
+    }
+    return this._runtime.isGpuActive();
+  }
+
+  getBackendName() {
+    if (this._workerProxy) {
+      return this._backendName;
+    }
+    return this._runtime.getBackendName();
+  }
+
+  setLogLevel(level) {
+    if (this._workerProxy) {
+      this._callWorker('setLogLevel', [level]).catch((error) => {
+        this._disableWorkerFallback(error);
+      });
+      return;
+    }
+    this._runtime.setLogLevel(level);
+  }
+
+  cancel() {
+    if (this._workerProxy) {
+      this._callWorker('cancel', []).catch(() => {});
+      return;
+    }
+    this._runtime.cancel();
+  }
+
+  async dispose() {
+    if (this._workerProxy) {
+      await this._workerProxy.dispose();
+      this._workerProxy = null;
+      this._metadata = {};
+      this._contextSize = 0;
+      this._gpuActive = false;
+      this._backendName = 'WASM (Prototype bridge)';
+      this._supportsVision = false;
+      this._supportsAudio = false;
+      return;
+    }
+
+    if (this._runtime) {
+      await this._runtime.dispose();
+    }
+  }
+
+  async applyChatTemplate(messages, addAssistant = true, customTemplate = null) {
+    if (!this._workerProxy) {
+      return this._runtime.applyChatTemplate(messages, addAssistant, customTemplate);
+    }
+
+    try {
+      return await this._callWorker('applyChatTemplate', [messages, addAssistant, customTemplate]);
+    } catch (error) {
+      this._disableWorkerFallback(error);
+      return this._runtime.applyChatTemplate(messages, addAssistant, customTemplate);
+    }
   }
 }
 
