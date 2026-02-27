@@ -82,6 +82,8 @@ Example publish:
 1. Create/push a release tag in this repo (for example `v0.1.5`)
 2. `Publish Bridge Assets` runs automatically and publishes the same tag to
    `leehack/llama-web-bridge-assets`
+3. Workflow also creates/updates the matching GitHub Release in
+   `leehack/llama-web-bridge-assets`
 
 Manual override example:
 
@@ -98,8 +100,7 @@ After publish, assets are CDN-available at:
 - `https://cdn.jsdelivr.net/gh/leehack/llama-web-bridge-assets@v0.1.1/llama_webgpu_core.js`
 - `https://cdn.jsdelivr.net/gh/leehack/llama-web-bridge-assets@v0.1.1/llama_webgpu_core.wasm`
 
-Note: CDN pinning only requires git tags in the assets repo; creating a GitHub
-Release object there is optional and mainly for visibility.
+Note: CDN pinning fundamentally relies on git tags in the assets repo.
 
 ## Maintainer Docs
 

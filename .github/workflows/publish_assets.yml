@@ -184,3 +184,27 @@ jobs:
 
           git tag "$ASSETS_TAG"
           git push origin "$ASSETS_TAG"
+
+      - name: Create or update assets release
+        env:
+          GH_TOKEN: ${{ secrets.WEBGPU_BRIDGE_ASSETS_PAT }}
+          ASSETS_TAG: ${{ env.ASSETS_TAG }}
+          ASSETS_REPO: ${{ env.ASSETS_REPO }}
+          SOURCE_REPO: ${{ github.repository }}
+          SOURCE_COMMIT: ${{ github.sha }}
+          LLAMA_CPP_TAG: ${{ env.LLAMA_CPP_TAG }}
+        run: |
+          NOTES="Bridge assets published from ${SOURCE_REPO}@${SOURCE_COMMIT} (llama.cpp ${LLAMA_CPP_TAG})."
+
+          if gh release view "$ASSETS_TAG" --repo "$ASSETS_REPO" >/dev/null 2>&1; then
+            gh release edit "$ASSETS_TAG" \
+              --repo "$ASSETS_REPO" \
+              --title "$ASSETS_TAG" \
+              --notes "$NOTES"
+          else
+            gh release create "$ASSETS_TAG" \
+              --repo "$ASSETS_REPO" \
+              --target "$ASSETS_TAG" \
+              --title "$ASSETS_TAG" \
+              --notes "$NOTES"
+          fi
