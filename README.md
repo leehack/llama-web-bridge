@@ -26,12 +26,28 @@ Useful environment variables:
 - `LLAMA_CPP_DIR` (path to llama.cpp source)
 - `BUILD_DIR` (cmake build dir)
 - `OUT_DIR` (output directory; defaults to `dist/`)
+- `WEBGPU_BRIDGE_BUILD_MEM64` (`1` to also build optional wasm64 core assets)
+- `WEBGPU_BRIDGE_MEM64_MAX_MEMORY` (optional wasm64 max linear memory bytes)
+- `WEBGPU_BRIDGE_PTHREADS` (`1`/`0`, defaults to `1`)
+- `WEBGPU_BRIDGE_PTHREAD_POOL_SIZE` (defaults to `2`)
+
+Notes:
+
+- wasm64 builds default to `WEBGPU_BRIDGE_MEM64_MAX_MEMORY=12884901888` (12 GiB).
+- Large single-file remote model loading requires a cross-origin isolated page
+  (`COOP`/`COEP`) so worker-thread runtime paths are available.
 
 Build outputs:
 
 - `dist/llama_webgpu_bridge.js`
+- `dist/llama_webgpu_bridge_worker.js`
 - `dist/llama_webgpu_core.js`
 - `dist/llama_webgpu_core.wasm`
+
+Optional outputs (when `WEBGPU_BRIDGE_BUILD_MEM64=1`):
+
+- `dist/llama_webgpu_core_mem64.js`
+- `dist/llama_webgpu_core_mem64.wasm`
 
 ## CI
 
@@ -67,6 +83,7 @@ Example publish:
 After publish, assets are CDN-available at:
 
 - `https://cdn.jsdelivr.net/gh/leehack/llama-web-bridge-assets@v0.1.1/llama_webgpu_bridge.js`
+- `https://cdn.jsdelivr.net/gh/leehack/llama-web-bridge-assets@v0.1.1/llama_webgpu_bridge_worker.js`
 - `https://cdn.jsdelivr.net/gh/leehack/llama-web-bridge-assets@v0.1.1/llama_webgpu_core.js`
 - `https://cdn.jsdelivr.net/gh/leehack/llama-web-bridge-assets@v0.1.1/llama_webgpu_core.wasm`
 

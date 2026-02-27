@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <cctype>
 #include <cstdlib>
 #include <cstdint>
@@ -9,7 +10,11 @@
 #include <string>
 #include <vector>
 
+#include <unistd.h>
+
 #include <emscripten/emscripten.h>
+#include <emscripten/threading.h>
+#include <emscripten/wasmfs.h>
 
 #include "ggml-backend.h"
 #include "llama.h"
@@ -840,6 +845,62 @@ int32_t next_token_impl() {
   return 1;
 }
 
+int32_t load_model_internal(
+    const char * model_path,
+    int32_t n_ctx,
+    int32_t n_threads,
+    int32_t n_gpu_layers,
+    bool use_mmap) {
+  llama_model_params mparams = llama_model_default_params();
+  mparams.n_gpu_layers = n_gpu_layers;
+  mparams.use_mmap = use_mmap;
+  mparams.use_mlock = false;
+  mparams.vocab_only = false;
+
+  g_state.model = llama_model_load_from_file(model_path, mparams);
+  if (g_state.model == nullptr) {
+    set_error("llama_model_load_from_file failed");
+    return -2;
+  }
+
+  llama_context_params cparams = llama_context_default_params();
+  if (n_ctx > 0) {
+    cparams.n_ctx = static_cast<uint32_t>(n_ctx);
+  }
+
+  if (n_threads > 0) {
+    cparams.n_threads = n_threads;
+    cparams.n_threads_batch = n_threads;
+  }
+
+  if (cparams.n_batch == 0 || cparams.n_batch > cparams.n_ctx) {
+    cparams.n_batch = std::min<uint32_t>(cparams.n_ctx, 1024U);
+  }
+
+  if (cparams.n_ubatch == 0 || cparams.n_ubatch > cparams.n_batch) {
+    cparams.n_ubatch = std::min<uint32_t>(cparams.n_batch, 512U);
+  }
+
+  const bool enable_gpu_ops = n_gpu_layers > 0;
+  cparams.offload_kqv = enable_gpu_ops;
+  cparams.op_offload = enable_gpu_ops;
+  cparams.no_perf = true;
+
+  g_state.ctx = llama_init_from_model(g_state.model, cparams);
+  if (g_state.ctx == nullptr) {
+    set_error("llama_init_from_model failed");
+    free_runtime();
+    return -3;
+  }
+
+  g_state.vocab = llama_model_get_vocab(g_state.model);
+  g_state.n_ctx = llama_n_ctx(g_state.ctx);
+  llama_set_abort_callback(g_state.ctx, should_abort_callback, nullptr);
+
+  rebuild_model_metadata_json();
+  return 0;
+}
+
 }  // namespace
 
 extern "C" {
@@ -886,54 +947,78 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_load_model(
 
   free_runtime();
 
-  llama_model_params mparams = llama_model_default_params();
-  mparams.n_gpu_layers = n_gpu_layers;
-  mparams.use_mmap = false;
-  mparams.use_mlock = false;
-  mparams.vocab_only = false;
+  return load_model_internal(model_path, n_ctx, n_threads, n_gpu_layers, false);
+}
 
-  g_state.model = llama_model_load_from_file(model_path, mparams);
-  if (g_state.model == nullptr) {
-    set_error("llama_model_load_from_file failed");
-    return -2;
+EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_load_model_from_url(
+    const char * model_url,
+    int32_t n_ctx,
+    int32_t n_threads,
+    int32_t n_gpu_layers,
+    int32_t chunk_size) {
+  clear_error();
+  g_last_output.clear();
+  g_cancel_requested = false;
+
+  if (model_url == nullptr || std::strlen(model_url) == 0) {
+    set_error("Model URL is empty");
+    return -1;
   }
 
-  llama_context_params cparams = llama_context_default_params();
-  if (n_ctx > 0) {
-    cparams.n_ctx = static_cast<uint32_t>(n_ctx);
+  free_runtime();
+
+  if (emscripten_is_main_browser_thread()) {
+    set_error(
+        "Fetch backend requires a worker-thread bridge runtime on this build");
+    return -4;
   }
 
-  if (n_threads > 0) {
-    cparams.n_threads = n_threads;
-    cparams.n_threads_batch = n_threads;
+  const uint32_t effective_chunk_size = chunk_size > 0
+      ? static_cast<uint32_t>(chunk_size)
+      : static_cast<uint32_t>(16 * 1024 * 1024);
+
+  std::string model_url_text(model_url);
+  std::string base_url = model_url_text;
+  std::string fetch_file_path;
+
+  const size_t last_slash = model_url_text.rfind('/');
+  if (last_slash != std::string::npos) {
+    base_url = model_url_text.substr(0, last_slash);
+    fetch_file_path = model_url_text.substr(last_slash + 1);
   }
 
-  if (cparams.n_batch == 0 || cparams.n_batch > cparams.n_ctx) {
-    cparams.n_batch = std::min<uint32_t>(cparams.n_ctx, 1024U);
+  if (fetch_file_path.empty()) {
+    static uint64_t fallback_file_counter = 0;
+    fetch_file_path =
+        "remote_model_" + std::to_string(++fallback_file_counter) + ".gguf";
   }
 
-  if (cparams.n_ubatch == 0 || cparams.n_ubatch > cparams.n_batch) {
-    cparams.n_ubatch = std::min<uint32_t>(cparams.n_batch, 512U);
+  backend_t fetch_backend =
+      wasmfs_create_fetch_backend(base_url.c_str(), effective_chunk_size);
+  if (fetch_backend == nullptr) {
+    set_error("Failed to initialize fetch-backed model loader");
+    return -5;
   }
 
-  const bool enable_gpu_ops = n_gpu_layers > 0;
-  cparams.offload_kqv = enable_gpu_ops;
-  cparams.op_offload = enable_gpu_ops;
-  cparams.no_perf = true;
+  int fd = wasmfs_create_file(
+      const_cast<char *>(fetch_file_path.c_str()),
+      0444,
+      fetch_backend);
+  if (fd < 0) {
+    set_error(
+        "Failed to create fetch-backed model file (errno="
+        + std::to_string(-fd) + ")");
+    return -6;
+  }
+  close(fd);
 
-  g_state.ctx = llama_init_from_model(g_state.model, cparams);
-  if (g_state.ctx == nullptr) {
-    set_error("llama_init_from_model failed");
-    free_runtime();
-    return -3;
+  const int32_t rc =
+      load_model_internal(fetch_file_path.c_str(), n_ctx, n_threads, n_gpu_layers, false);
+  if (unlink(fetch_file_path.c_str()) != 0 && errno != ENOENT) {
+    // best-effort cleanup of temporary fetch path
   }
 
-  g_state.vocab = llama_model_get_vocab(g_state.model);
-  g_state.n_ctx = llama_n_ctx(g_state.ctx);
-  llama_set_abort_callback(g_state.ctx, should_abort_callback, nullptr);
-
-  rebuild_model_metadata_json();
-  return 0;
+  return rc;
 }
 
 EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_mmproj_load(

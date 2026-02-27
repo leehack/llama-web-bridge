@@ -28,6 +28,22 @@ set(LLAMA_BUILD_HTML OFF CACHE BOOL "" FORCE)
 set(LLAMA_WASM_SINGLE_FILE OFF CACHE BOOL "" FORCE)
 set(LLAMA_WASM_MEM64 OFF CACHE BOOL "" FORCE)
 
+option(LLAMADART_WEBGPU_MEM64 "Build WebGPU bridge core with wasm64/memory64" OFF)
+set(LLAMADART_WEBGPU_MEM64_MAX_MEMORY "12884901888" CACHE STRING "Max wasm64 linear memory in bytes")
+option(LLAMADART_WEBGPU_PTHREADS "Enable pthread support for bridge runtime" ON)
+set(LLAMADART_WEBGPU_PTHREAD_POOL_SIZE "2" CACHE STRING "PThread pool size for bridge runtime")
+
+if (LLAMADART_WEBGPU_PTHREADS)
+    add_compile_options("-pthread")
+    add_link_options("-pthread")
+endif()
+
+if (LLAMADART_WEBGPU_MEM64)
+    set(LLAMA_WASM_MEM64 ON CACHE BOOL "" FORCE)
+    add_compile_options("-sMEMORY64=1")
+    add_link_options("-sMEMORY64=1" "-sWASM_BIGINT=1")
+endif()
+
 set(GGML_NATIVE OFF CACHE BOOL "" FORCE)
 set(GGML_OPENMP OFF CACHE BOOL "" FORCE)
 set(GGML_WEBGPU ON CACHE BOOL "" FORCE)
@@ -103,19 +119,48 @@ target_include_directories(llama_webgpu_core PRIVATE
 
 target_link_libraries(llama_webgpu_core PRIVATE llama llamadart_mtmd)
 
-target_link_options(llama_webgpu_core PRIVATE
+set(LLAMADART_WEBGPU_LINK_OPTIONS
     "-sALLOW_MEMORY_GROWTH=1"
+    "-sWASMFS=1"
+    "-sASYNCIFY=1"
+    "-sFORCE_FILESYSTEM=1"
     "-sASSERTIONS=1"
-    "-sMIN_SAFARI_VERSION=170400"
     "-sMODULARIZE=1"
     "-sEXPORT_ES6=1"
     "-sEXPORT_NAME=createLlamaWebGpuCoreModule"
     "-sENVIRONMENT=web,worker"
     "-sEXPORTED_RUNTIME_METHODS=['FS','ccall','UTF8ToString']"
-    "-sEXPORTED_FUNCTIONS=['_main','_llamadart_webgpu_probe','_llamadart_webgpu_backends_json','_llamadart_webgpu_last_error','_llamadart_webgpu_set_log_level','_llamadart_webgpu_load_model','_llamadart_webgpu_mmproj_load','_llamadart_webgpu_mmproj_free','_llamadart_webgpu_mmproj_supports_vision','_llamadart_webgpu_mmproj_supports_audio','_llamadart_webgpu_media_clear_pending','_llamadart_webgpu_media_add_file','_llamadart_webgpu_media_add_encoded','_llamadart_webgpu_media_add_rgb','_llamadart_webgpu_media_add_audio_f32','_llamadart_webgpu_tokenize_to_json','_llamadart_webgpu_last_tokens_json','_llamadart_webgpu_detokenize_from_json','_llamadart_webgpu_last_detokenized','_llamadart_webgpu_generate','_llamadart_webgpu_begin_generation','_llamadart_webgpu_next_token','_llamadart_webgpu_last_piece','_llamadart_webgpu_end_generation','_llamadart_webgpu_request_cancel','_llamadart_webgpu_last_output','_llamadart_webgpu_get_context_size','_llamadart_webgpu_model_meta_json','_llamadart_webgpu_shutdown']"
+    "-sEXPORTED_FUNCTIONS=['_main','_llamadart_webgpu_probe','_llamadart_webgpu_backends_json','_llamadart_webgpu_last_error','_llamadart_webgpu_set_log_level','_llamadart_webgpu_load_model','_llamadart_webgpu_load_model_from_url','_llamadart_webgpu_mmproj_load','_llamadart_webgpu_mmproj_free','_llamadart_webgpu_mmproj_supports_vision','_llamadart_webgpu_mmproj_supports_audio','_llamadart_webgpu_media_clear_pending','_llamadart_webgpu_media_add_file','_llamadart_webgpu_media_add_encoded','_llamadart_webgpu_media_add_rgb','_llamadart_webgpu_media_add_audio_f32','_llamadart_webgpu_tokenize_to_json','_llamadart_webgpu_last_tokens_json','_llamadart_webgpu_detokenize_from_json','_llamadart_webgpu_last_detokenized','_llamadart_webgpu_generate','_llamadart_webgpu_begin_generation','_llamadart_webgpu_next_token','_llamadart_webgpu_last_piece','_llamadart_webgpu_end_generation','_llamadart_webgpu_request_cancel','_llamadart_webgpu_last_output','_llamadart_webgpu_get_context_size','_llamadart_webgpu_model_meta_json','_llamadart_webgpu_shutdown']"
+    "-lwasmfs_fetch.js"
 )
 
+if (LLAMADART_WEBGPU_PTHREADS)
+    list(APPEND LLAMADART_WEBGPU_LINK_OPTIONS
+        "-sPTHREAD_POOL_SIZE=${LLAMADART_WEBGPU_PTHREAD_POOL_SIZE}"
+    )
+endif()
+
+if (LLAMADART_WEBGPU_MEM64)
+    list(APPEND LLAMADART_WEBGPU_LINK_OPTIONS
+        "-sMEMORY64=1"
+        "-sWASM_BIGINT=1"
+        "-sMAXIMUM_MEMORY=${LLAMADART_WEBGPU_MEM64_MAX_MEMORY}"
+    )
+else()
+    list(APPEND LLAMADART_WEBGPU_LINK_OPTIONS
+        "-sMIN_SAFARI_VERSION=170400"
+        "-sMAXIMUM_MEMORY=4294967296"
+    )
+endif()
+
+target_link_options(llama_webgpu_core PRIVATE ${LLAMADART_WEBGPU_LINK_OPTIONS})
+
+set(LLAMADART_WEBGPU_CORE_OUTPUT_NAME "llama_webgpu_core")
+if (LLAMADART_WEBGPU_MEM64)
+    set(LLAMADART_WEBGPU_CORE_OUTPUT_NAME "llama_webgpu_core_mem64")
+endif()
+
 set_target_properties(llama_webgpu_core PROPERTIES
-    OUTPUT_NAME "llama_webgpu_core"
+    OUTPUT_NAME "${LLAMADART_WEBGPU_CORE_OUTPUT_NAME}"
     SUFFIX ".js"
 )
