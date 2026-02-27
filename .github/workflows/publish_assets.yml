@@ -14,6 +14,14 @@ on:
         description: llama.cpp tag to build from
         required: true
         default: b8011
+  push:
+    tags:
+      - 'v*'
+
+env:
+  ASSETS_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.assets_tag || github.ref_name }}
+  ASSETS_REPO: ${{ github.event_name == 'workflow_dispatch' && inputs.assets_repo || 'leehack/llama-web-bridge-assets' }}
+  LLAMA_CPP_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.llama_cpp_tag || 'b8011' }}
 
 permissions:
   contents: read
@@ -25,9 +33,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Resolve publish parameters
+        run: |
+          echo "event=${{ github.event_name }}"
+          echo "assets_tag=${ASSETS_TAG}"
+          echo "assets_repo=${ASSETS_REPO}"
+          echo "llama_cpp_tag=${LLAMA_CPP_TAG}"
+
       - name: Clone llama.cpp source
         run: |
-          git clone --depth 1 --branch "${{ inputs.llama_cpp_tag }}" https://github.com/ggml-org/llama.cpp.git third_party/llama_cpp
+          git clone --depth 1 --branch "${LLAMA_CPP_TAG}" https://github.com/ggml-org/llama.cpp.git third_party/llama_cpp
 
       - name: Setup Emscripten SDK
         uses: mymindstorm/setup-emsdk@v14
@@ -37,19 +52,23 @@ jobs:
       - name: Build bridge artifacts
         env:
           OUT_DIR: ${{ runner.temp }}/webgpu_bridge_dist
+          WEBGPU_BRIDGE_BUILD_MEM64: 1
         run: ./scripts/build_bridge.sh
 
       - name: Generate manifest and checksums
         env:
           OUT_DIR: ${{ runner.temp }}/webgpu_bridge_dist
-          ASSETS_TAG: ${{ inputs.assets_tag }}
-          LLAMA_CPP_TAG: ${{ inputs.llama_cpp_tag }}
+          ASSETS_TAG: ${{ env.ASSETS_TAG }}
+          LLAMA_CPP_TAG: ${{ env.LLAMA_CPP_TAG }}
           SOURCE_REPO: ${{ github.repository }}
           SOURCE_COMMIT: ${{ github.sha }}
         run: |
           test -f "$OUT_DIR/llama_webgpu_bridge.js"
+          test -f "$OUT_DIR/llama_webgpu_bridge_worker.js"
           test -f "$OUT_DIR/llama_webgpu_core.js"
           test -f "$OUT_DIR/llama_webgpu_core.wasm"
+          test -f "$OUT_DIR/llama_webgpu_core_mem64.js"
+          test -f "$OUT_DIR/llama_webgpu_core_mem64.wasm"
 
           python3 - <<'PY'
           import hashlib
@@ -60,8 +79,11 @@ jobs:
           out_dir = os.environ['OUT_DIR']
           files = [
               'llama_webgpu_bridge.js',
+              'llama_webgpu_bridge_worker.js',
               'llama_webgpu_core.js',
               'llama_webgpu_core.wasm',
+              'llama_webgpu_core_mem64.js',
+              'llama_webgpu_core_mem64.wasm',
           ]
 
           manifest = {
@@ -100,8 +122,11 @@ jobs:
           name: webgpu-bridge-dist
           path: |
             ${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_bridge.js
+            ${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_bridge_worker.js
             ${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_core.js
             ${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_core.wasm
+            ${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_core_mem64.js
+            ${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_core_mem64.wasm
             ${{ runner.temp }}/webgpu_bridge_dist/manifest.json
             ${{ runner.temp }}/webgpu_bridge_dist/sha256sums.txt
 
@@ -122,7 +147,7 @@ jobs:
       - name: Checkout assets repository
         uses: actions/checkout@v4
         with:
-          repository: ${{ inputs.assets_repo }}
+          repository: ${{ env.ASSETS_REPO }}
           token: ${{ secrets.WEBGPU_BRIDGE_ASSETS_PAT }}
           path: assets-repo
 
@@ -134,7 +159,7 @@ jobs:
 
       - name: Publish assets and tag
         env:
-          ASSETS_TAG: ${{ inputs.assets_tag }}
+          ASSETS_TAG: ${{ env.ASSETS_TAG }}
         run: |
           if git -C assets-repo ls-remote --exit-code --tags origin "refs/tags/$ASSETS_TAG" >/dev/null 2>&1; then
             echo "error: tag already exists in assets repo: $ASSETS_TAG"
@@ -147,7 +172,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          git add llama_webgpu_bridge.js llama_webgpu_core.js llama_webgpu_core.wasm manifest.json sha256sums.txt
+          git add llama_webgpu_bridge.js llama_webgpu_bridge_worker.js llama_webgpu_core.js llama_webgpu_core.wasm llama_webgpu_core_mem64.js llama_webgpu_core_mem64.wasm manifest.json sha256sums.txt
 
           if git diff --cached --quiet; then
             echo "No asset changes detected; skipping commit and tag."

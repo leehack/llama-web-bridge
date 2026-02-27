@@ -67,6 +67,11 @@ Publish workflow:
 
 - `.github/workflows/publish_assets.yml`
 
+Trigger modes:
+
+- Automatic: push a `v*` tag in this repo (for example `v0.1.5`)
+- Manual: run workflow dispatch with explicit inputs
+
 Required repository secret:
 
 - `WEBGPU_BRIDGE_ASSETS_PAT` (token with write access to
@@ -74,9 +79,15 @@ Required repository secret:
 
 Example publish:
 
+1. Create/push a release tag in this repo (for example `v0.1.5`)
+2. `Publish Bridge Assets` runs automatically and publishes the same tag to
+   `leehack/llama-web-bridge-assets`
+
+Manual override example:
+
 1. Run `Publish Bridge Assets` workflow
 2. Inputs:
-   - `assets_tag`: `v0.1.1`
+   - `assets_tag`: `v0.1.5`
    - `assets_repo`: `leehack/llama-web-bridge-assets`
    - `llama_cpp_tag`: `b8011`
 
@@ -86,6 +97,9 @@ After publish, assets are CDN-available at:
 - `https://cdn.jsdelivr.net/gh/leehack/llama-web-bridge-assets@v0.1.1/llama_webgpu_bridge_worker.js`
 - `https://cdn.jsdelivr.net/gh/leehack/llama-web-bridge-assets@v0.1.1/llama_webgpu_core.js`
 - `https://cdn.jsdelivr.net/gh/leehack/llama-web-bridge-assets@v0.1.1/llama_webgpu_core.wasm`
+
+Note: CDN pinning only requires git tags in the assets repo; creating a GitHub
+Release object there is optional and mainly for visibility.
 
 ## Maintainer Docs
 
