@@ -13,7 +13,7 @@ on:
       llama_cpp_tag:
         description: llama.cpp tag to build from
         required: true
-        default: b8011
+        default: b8157
   push:
     tags:
       - 'v*'
@@ -21,7 +21,7 @@ on:
 env:
   ASSETS_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.assets_tag || github.ref_name }}
   ASSETS_REPO: ${{ github.event_name == 'workflow_dispatch' && inputs.assets_repo || 'leehack/llama-web-bridge-assets' }}
-  LLAMA_CPP_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.llama_cpp_tag || 'b8011' }}
+  LLAMA_CPP_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.llama_cpp_tag || 'b8157' }}
 
 permissions:
   contents: read

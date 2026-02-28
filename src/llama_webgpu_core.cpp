@@ -2,6 +2,7 @@
 #include <atomic>
 #include <cerrno>
 #include <cctype>
+#include <cmath>
 #include <cstdlib>
 #include <cstdint>
 #include <cstring>
@@ -46,6 +47,7 @@ std::string g_last_output;
 std::string g_last_piece;
 std::string g_last_tokens_json = "[]";
 std::string g_last_detokenized;
+std::string g_last_embedding_json = "[]";
 std::string g_backend_json = "[]";
 std::string g_model_meta_json = "{}";
 std::vector<llama_token> g_cached_prompt_tokens;
@@ -185,6 +187,7 @@ void free_runtime() {
   g_last_piece.clear();
   g_last_tokens_json = "[]";
   g_last_detokenized.clear();
+  g_last_embedding_json = "[]";
   g_model_meta_json = "{}";
   g_cached_prompt_tokens.clear();
 }
@@ -445,6 +448,35 @@ std::string serialize_tokens_json(const std::vector<llama_token> & tokens) {
   }
   json += "]";
   return json;
+}
+
+std::string serialize_embedding_json(const std::vector<float> & embedding) {
+  std::string json = "[";
+  for (size_t i = 0; i < embedding.size(); ++i) {
+    if (i > 0) {
+      json += ",";
+    }
+    json += std::to_string(static_cast<double>(embedding[i]));
+  }
+  json += "]";
+  return json;
+}
+
+void normalize_embedding_inplace(std::vector<float> & embedding) {
+  double norm_squared = 0.0;
+  for (const float value : embedding) {
+    const double dv = static_cast<double>(value);
+    norm_squared += dv * dv;
+  }
+
+  if (norm_squared <= 0.0) {
+    return;
+  }
+
+  const double scale = 1.0 / std::sqrt(norm_squared);
+  for (float & value : embedding) {
+    value = static_cast<float>(static_cast<double>(value) * scale);
+  }
 }
 
 void parse_token_list(const char * token_text, std::vector<llama_token> & out_tokens) {
@@ -1265,6 +1297,142 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_detokenize_from_json(
 
 EMSCRIPTEN_KEEPALIVE const char * llamadart_webgpu_last_detokenized() {
   return g_last_detokenized.c_str();
+}
+
+EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_embed_to_json(
+    const char * text,
+    int32_t normalize) {
+  clear_error();
+  g_last_embedding_json = "[]";
+
+  if (!ensure_loaded()) {
+    return -1;
+  }
+
+  if (text == nullptr) {
+    set_error("Text is null");
+    return -2;
+  }
+
+  const bool has_encoder = llama_model_has_encoder(g_state.model);
+  const bool has_decoder = llama_model_has_decoder(g_state.model);
+  if (has_encoder && has_decoder) {
+    set_error("Embedding extraction for encoder-decoder models is not supported");
+    return -3;
+  }
+  const bool use_encoder_path = has_encoder && !has_decoder;
+
+  std::vector<llama_token> tokens;
+  if (!tokenize_text(std::string(text), true, tokens)) {
+    return -4;
+  }
+
+  if (tokens.empty()) {
+    set_error("Embedding input tokenized to an empty sequence");
+    return -5;
+  }
+
+  int32_t embedding_size = llama_model_n_embd_out(g_state.model);
+  if (embedding_size <= 0) {
+    embedding_size = llama_model_n_embd(g_state.model);
+  }
+  if (embedding_size <= 0) {
+    set_error("Failed to resolve embedding dimension");
+    return -6;
+  }
+
+  int32_t max_batch = static_cast<int32_t>(llama_n_batch(g_state.ctx));
+  if (max_batch <= 0) {
+    max_batch = static_cast<int32_t>(tokens.size());
+  }
+  max_batch = std::max<int32_t>(1, std::min<int32_t>(max_batch, static_cast<int32_t>(tokens.size())));
+
+  llama_batch batch = llama_batch_init(max_batch, 0, 1);
+  if (batch.token == nullptr || batch.pos == nullptr ||
+      batch.n_seq_id == nullptr || batch.seq_id == nullptr ||
+      batch.logits == nullptr) {
+    llama_batch_free(batch);
+    set_error("Failed to allocate embedding batch buffers");
+    return -7;
+  }
+
+  int32_t rc = embedding_size;
+
+  llama_synchronize(g_state.ctx);
+  auto * memory = llama_get_memory(g_state.ctx);
+  if (memory != nullptr) {
+    llama_memory_clear(memory, false);
+  }
+  g_cached_prompt_tokens.clear();
+  llama_set_embeddings(g_state.ctx, true);
+
+  int32_t decoded_tokens = 0;
+  while (decoded_tokens < static_cast<int32_t>(tokens.size())) {
+    const int32_t remaining = static_cast<int32_t>(tokens.size()) - decoded_tokens;
+    const int32_t chunk_token_count = std::min(max_batch, remaining);
+    batch.n_tokens = chunk_token_count;
+
+    for (int32_t i = 0; i < chunk_token_count; ++i) {
+      const int32_t token_index = decoded_tokens + i;
+      batch.token[i] = tokens[static_cast<size_t>(token_index)];
+      batch.pos[i] = token_index;
+      batch.n_seq_id[i] = 1;
+      batch.seq_id[i][0] = 0;
+      batch.logits[i] = 1;
+    }
+
+    const int status = use_encoder_path
+        ? llama_encode(g_state.ctx, batch)
+        : llama_decode(g_state.ctx, batch);
+    if (status != 0) {
+      set_error("Embedding forward pass failed");
+      rc = -8;
+      break;
+    }
+
+    decoded_tokens += chunk_token_count;
+  }
+
+  if (rc > 0) {
+    const enum llama_pooling_type pooling_type = llama_pooling_type(g_state.ctx);
+    float * embedding_ptr = nullptr;
+    if (pooling_type == LLAMA_POOLING_TYPE_NONE) {
+      embedding_ptr = llama_get_embeddings_ith(g_state.ctx, batch.n_tokens - 1);
+      if (embedding_ptr == nullptr) {
+        embedding_ptr = llama_get_embeddings(g_state.ctx);
+      }
+    } else {
+      embedding_ptr = llama_get_embeddings_seq(g_state.ctx, 0);
+      if (embedding_ptr == nullptr) {
+        embedding_ptr = llama_get_embeddings(g_state.ctx);
+      }
+    }
+
+    if (embedding_ptr == nullptr) {
+      set_error("Embedding output is unavailable");
+      rc = -9;
+    } else {
+      std::vector<float> embedding(
+          embedding_ptr,
+          embedding_ptr + static_cast<size_t>(embedding_size));
+      if (normalize != 0) {
+        normalize_embedding_inplace(embedding);
+      }
+
+      g_last_embedding_json = serialize_embedding_json(embedding);
+    }
+  }
+
+  {
+    llama_set_embeddings(g_state.ctx, false);
+    llama_batch_free(batch);
+  }
+
+  return rc;
+}
+
+EMSCRIPTEN_KEEPALIVE const char * llamadart_webgpu_last_embedding_json() {
+  return g_last_embedding_json.c_str();
 }
 
 EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_generate(
