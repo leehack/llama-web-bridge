@@ -72,11 +72,7 @@ string(REPLACE
 file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/generated")
 file(WRITE "${MTMD_AUDIO_PATCHED}" "${MTMD_AUDIO_CONTENT}")
 
-add_library(llamadart_mtmd STATIC
-    "${LLAMA_CPP_DIR}/tools/mtmd/mtmd.cpp"
-    "${MTMD_AUDIO_PATCHED}"
-    "${LLAMA_CPP_DIR}/tools/mtmd/mtmd-helper.cpp"
-    "${LLAMA_CPP_DIR}/tools/mtmd/clip.cpp"
+set(LLAMADART_MTMD_MODEL_SOURCES
     "${LLAMA_CPP_DIR}/tools/mtmd/models/cogvlm.cpp"
     "${LLAMA_CPP_DIR}/tools/mtmd/models/conformer.cpp"
     "${LLAMA_CPP_DIR}/tools/mtmd/models/glm4v.cpp"
@@ -93,6 +89,25 @@ add_library(llamadart_mtmd STATIC
     "${LLAMA_CPP_DIR}/tools/mtmd/models/whisper-enc.cpp"
     "${LLAMA_CPP_DIR}/tools/mtmd/models/mobilenetv5.cpp"
     "${LLAMA_CPP_DIR}/tools/mtmd/models/youtuvl.cpp"
+)
+
+set(LLAMADART_MTMD_OPTIONAL_MODEL_SOURCES
+    "${LLAMA_CPP_DIR}/tools/mtmd/models/nemotron-v2-vl.cpp"
+    "${LLAMA_CPP_DIR}/tools/mtmd/models/paddleocr.cpp"
+)
+
+foreach(model_source IN LISTS LLAMADART_MTMD_OPTIONAL_MODEL_SOURCES)
+    if (EXISTS "${model_source}")
+        list(APPEND LLAMADART_MTMD_MODEL_SOURCES "${model_source}")
+    endif()
+endforeach()
+
+add_library(llamadart_mtmd STATIC
+    "${LLAMA_CPP_DIR}/tools/mtmd/mtmd.cpp"
+    "${MTMD_AUDIO_PATCHED}"
+    "${LLAMA_CPP_DIR}/tools/mtmd/mtmd-helper.cpp"
+    "${LLAMA_CPP_DIR}/tools/mtmd/clip.cpp"
+    ${LLAMADART_MTMD_MODEL_SOURCES}
 )
 
 target_compile_features(llamadart_mtmd PRIVATE cxx_std_17)
