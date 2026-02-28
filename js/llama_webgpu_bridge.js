@@ -2700,6 +2700,52 @@ class LlamaWebGpuBridgeRuntime {
     return this._core.ccall('llamadart_webgpu_last_detokenized', 'string', [], []) || '';
   }
 
+  async embed(text, options = {}) {
+    if (this._modelBytes <= 0) {
+      throw new Error('No model loaded. Call loadModelFromUrl first.');
+    }
+
+    const normalize = options?.normalize !== false;
+    const rc = Number(
+      await this._core.ccall(
+        'llamadart_webgpu_embed_to_json',
+        'number',
+        ['string', 'number'],
+        [String(text), normalize ? 1 : 0],
+        { async: true },
+      ),
+    );
+
+    if (rc < 0) {
+      throw new Error(this._coreErrorMessage('Embedding generation failed', rc));
+    }
+
+    const raw = this._core.ccall('llamadart_webgpu_last_embedding_json', 'string', [], []) || '[]';
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed)
+      ? parsed.map((v) => {
+        const numeric = Number(v);
+        return Number.isFinite(numeric) ? numeric : 0;
+      })
+      : [];
+  }
+
+  async embedBatch(texts, options = {}) {
+    const normalized = Array.isArray(texts)
+      ? texts
+      : Array.from(texts || []);
+    if (normalized.length === 0) {
+      return [];
+    }
+
+    const normalize = options?.normalize !== false;
+    const vectors = [];
+    for (const text of normalized) {
+      vectors.push(await this.embed(String(text), { normalize }));
+    }
+    return vectors;
+  }
+
   getModelMetadata() {
     let modelMetadata = {};
 
@@ -3199,6 +3245,35 @@ export class LlamaWebGpuBridge {
     } catch (error) {
       this._disableWorkerFallback(error);
       return this._runtime.detokenize(normalized, special);
+    }
+  }
+
+  async embed(text, options = {}) {
+    if (!this._workerProxy) {
+      return this._runtime.embed(text, options);
+    }
+
+    try {
+      return await this._callWorker('embed', [text, options]);
+    } catch (error) {
+      this._disableWorkerFallback(error);
+      return this._runtime.embed(text, options);
+    }
+  }
+
+  async embedBatch(texts, options = {}) {
+    const normalized = Array.isArray(texts)
+      ? texts
+      : Array.from(texts || []);
+    if (!this._workerProxy) {
+      return this._runtime.embedBatch(normalized, options);
+    }
+
+    try {
+      return await this._callWorker('embedBatch', [normalized, options]);
+    } catch (error) {
+      this._disableWorkerFallback(error);
+      return this._runtime.embedBatch(normalized, options);
     }
   }
 
