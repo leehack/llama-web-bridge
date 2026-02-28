@@ -204,7 +204,7 @@ jobs:
           else
             gh release create "$ASSETS_TAG" \
               --repo "$ASSETS_REPO" \
-              --target "$ASSETS_TAG" \
+              --verify-tag \
               --title "$ASSETS_TAG" \
               --notes "$NOTES"
           fi
