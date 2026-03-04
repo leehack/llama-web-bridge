@@ -1253,6 +1253,10 @@ class LlamaWebGpuBridgeRuntime {
   }
 
   _detectThreadPoolSizeFromCore() {
+    if (!this._coreSupportsPthreads()) {
+      return 1;
+    }
+
     const core = this._core;
     if (!core || typeof core !== 'object') {
       return null;
@@ -1274,6 +1278,63 @@ class LlamaWebGpuBridgeRuntime {
       return total > 0 ? total : null;
     } catch (_) {
       return null;
+    }
+  }
+
+  _coreSupportsPthreads() {
+    const core = this._core;
+    if (!core || typeof core !== 'object') {
+      return false;
+    }
+
+    try {
+      if (typeof core.ccall === 'function') {
+        const compiledWithPthreads = Number(
+          core.ccall('llamadart_webgpu_supports_pthreads', 'number', [], []),
+        );
+        if (Number.isFinite(compiledWithPthreads)) {
+          return compiledWithPthreads !== 0;
+        }
+      }
+    } catch (_) {
+      // Ignore lookup failures and fall back to runtime heuristics.
+    }
+
+    try {
+      const wasmBuffer = core.wasmMemory?.buffer;
+      if (
+        typeof SharedArrayBuffer === 'function'
+        && wasmBuffer instanceof SharedArrayBuffer
+      ) {
+        return true;
+      }
+    } catch (_) {
+      // Ignore wasmMemory inspection failures and fall back.
+    }
+
+    try {
+      const heapBuffer = core.HEAP8?.buffer || core.HEAPU8?.buffer;
+      if (
+        typeof SharedArrayBuffer === 'function'
+        && heapBuffer instanceof SharedArrayBuffer
+      ) {
+        return true;
+      }
+    } catch (_) {
+      // Ignore HEAP buffer inspection failures and fall back.
+    }
+
+    try {
+      const pThread = core.PThread;
+      if (!pThread || typeof pThread !== 'object') {
+        return false;
+      }
+
+      return Array.isArray(pThread.unusedWorkers)
+        || Array.isArray(pThread.runningWorkers)
+        || typeof pThread.allocateUnusedWorker === 'function';
+    } catch (_) {
+      return false;
     }
   }
 
@@ -2664,7 +2725,17 @@ class LlamaWebGpuBridgeRuntime {
     await this._probeBackends();
 
     const core = await this._ensureCore();
+    const configuredPoolHint = Number(this._threadPoolSizeHint);
     this._syncThreadPoolSizeHintFromCore();
+    const coreSupportsPthreads = this._coreSupportsPthreads();
+    this._pushRuntimeNote(`core_pthreads:${coreSupportsPthreads ? 1 : 0}`);
+    if (
+      !coreSupportsPthreads
+      && Number.isFinite(configuredPoolHint)
+      && configuredPoolHint > 1
+    ) {
+      this._runtimeNotes.push('threads_capped_no_pthread');
+    }
 
     this._nCtx = Number(options.nCtx) > 0 ? Number(options.nCtx) : this._nCtx;
 
@@ -2684,9 +2755,11 @@ class LlamaWebGpuBridgeRuntime {
       this._nGpuLayers = Math.trunc(requestedGpuLayers);
     }
 
-    if (!isCrossOriginIsolatedRuntime() && this._threads > 1) {
-      this._threads = 1;
+    if (!isCrossOriginIsolatedRuntime()) {
       this._runtimeNotes.push('threads_capped_no_coi');
+      if (this._threads > 1) {
+        this._threads = 1;
+      }
     }
 
     if (this._isSafari && this._nGpuLayers > 0) {
@@ -3553,7 +3626,11 @@ class LlamaWebGpuBridgeRuntime {
       generationStarted = true;
 
       let generated = 0;
-      let streamed = '';
+      const shouldEmitCurrentText = options.emitCurrentTextOnToken !== false;
+      const shouldYieldForResponsiveness =
+        !(typeof WorkerGlobalScope !== 'undefined' && globalThis instanceof WorkerGlobalScope);
+      const yieldInterval = shouldYieldForResponsiveness ? 4 : 0;
+      let streamed = shouldEmitCurrentText ? '' : null;
 
       while (generated < nPredict) {
         if (this._abortRequested || options.signal?.aborted) {
@@ -3615,17 +3692,21 @@ class LlamaWebGpuBridgeRuntime {
           continue;
         }
 
-        streamed += piece;
         if (typeof options.onToken === 'function') {
-          options.onToken(textEncoder.encode(piece), streamed);
+          if (shouldEmitCurrentText) {
+            streamed += piece;
+            options.onToken(textEncoder.encode(piece), streamed);
+          } else {
+            options.onToken(textEncoder.encode(piece), null);
+          }
         }
 
-        if ((generated % 4) === 0) {
+        if (yieldInterval > 0 && (generated % yieldInterval) === 0) {
           await new Promise((resolve) => setTimeout(resolve, 0));
         }
       }
 
-      const text = this._core.ccall('llamadart_webgpu_last_output', 'string', [], []) || streamed;
+      const text = this._core.ccall('llamadart_webgpu_last_output', 'string', [], []) || streamed || '';
       return text;
     } finally {
       if (generationStarted) {

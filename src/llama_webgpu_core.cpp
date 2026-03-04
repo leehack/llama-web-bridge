@@ -942,6 +942,14 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_probe() {
   return g_has_webgpu ? 1 : 0;
 }
 
+EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_supports_pthreads() {
+#if defined(__EMSCRIPTEN_PTHREADS__)
+  return 1;
+#else
+  return 0;
+#endif
+}
+
 EMSCRIPTEN_KEEPALIVE const char * llamadart_webgpu_backends_json() {
   refresh_backend_probe();
   return g_backend_json.c_str();
