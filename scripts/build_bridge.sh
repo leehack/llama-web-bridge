@@ -14,7 +14,7 @@ CMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE:-Release}"
 BUILD_MEM64="${WEBGPU_BRIDGE_BUILD_MEM64:-0}"
 MEM64_MAX_MEMORY="${WEBGPU_BRIDGE_MEM64_MAX_MEMORY:-12884901888}"
 ENABLE_PTHREADS="${WEBGPU_BRIDGE_PTHREADS:-1}"
-PTHREAD_POOL_SIZE="${WEBGPU_BRIDGE_PTHREAD_POOL_SIZE:-2}"
+PTHREAD_POOL_SIZE="${WEBGPU_BRIDGE_PTHREAD_POOL_SIZE:-4}"
 
 if [[ "$ENABLE_PTHREADS" == "0" ]]; then
   CMAKE_PTHREADS="OFF"
@@ -34,7 +34,7 @@ Environment variables:
   WEBGPU_BRIDGE_BUILD_MEM64  Build optional wasm64 artifacts (1/0)
   WEBGPU_BRIDGE_MEM64_MAX_MEMORY  wasm64 max linear memory bytes (default: 12884901888)
   WEBGPU_BRIDGE_PTHREADS  Enable pthread runtime support (default: 1)
-  WEBGPU_BRIDGE_PTHREAD_POOL_SIZE  PThread pool size when enabled (default: 2)
+  WEBGPU_BRIDGE_PTHREAD_POOL_SIZE  PThread pool size when enabled (default: 4)
 
 Example:
   LLAMA_CPP_DIR="$PWD/../llama.cpp" ./scripts/build_bridge.sh

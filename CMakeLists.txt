@@ -31,7 +31,7 @@ set(LLAMA_WASM_MEM64 OFF CACHE BOOL "" FORCE)
 option(LLAMADART_WEBGPU_MEM64 "Build WebGPU bridge core with wasm64/memory64" OFF)
 set(LLAMADART_WEBGPU_MEM64_MAX_MEMORY "12884901888" CACHE STRING "Max wasm64 linear memory in bytes")
 option(LLAMADART_WEBGPU_PTHREADS "Enable pthread support for bridge runtime" ON)
-set(LLAMADART_WEBGPU_PTHREAD_POOL_SIZE "2" CACHE STRING "PThread pool size for bridge runtime")
+set(LLAMADART_WEBGPU_PTHREAD_POOL_SIZE "4" CACHE STRING "PThread pool size for bridge runtime")
 
 if (LLAMADART_WEBGPU_PTHREADS)
     add_compile_options("-pthread")
@@ -139,7 +139,7 @@ set(LLAMADART_WEBGPU_LINK_OPTIONS
     "-sWASMFS=1"
     "-sASYNCIFY=1"
     "-sFORCE_FILESYSTEM=1"
-    "-sASSERTIONS=1"
+    "-sASSERTIONS=0"
     "-sMODULARIZE=1"
     "-sEXPORT_ES6=1"
     "-sEXPORT_NAME=createLlamaWebGpuCoreModule"
@@ -149,8 +149,14 @@ set(LLAMADART_WEBGPU_LINK_OPTIONS
     "-lwasmfs_fetch.js"
 )
 
+if (CMAKE_BUILD_TYPE STREQUAL "Debug")
+    list(REMOVE_ITEM LLAMADART_WEBGPU_LINK_OPTIONS "-sASSERTIONS=0")
+    list(APPEND LLAMADART_WEBGPU_LINK_OPTIONS "-sASSERTIONS=1")
+endif()
+
 if (LLAMADART_WEBGPU_PTHREADS)
     list(APPEND LLAMADART_WEBGPU_LINK_OPTIONS
+        "-sPTHREAD_POOL_SIZE_STRICT=2"
         "-sPTHREAD_POOL_SIZE=${LLAMADART_WEBGPU_PTHREAD_POOL_SIZE}"
     )
 endif()
