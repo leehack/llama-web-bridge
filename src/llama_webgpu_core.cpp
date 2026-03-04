@@ -881,6 +881,9 @@ int32_t load_model_internal(
     const char * model_path,
     int32_t n_ctx,
     int32_t n_threads,
+    int32_t n_threads_batch,
+    int32_t n_batch,
+    int32_t n_ubatch,
     int32_t n_gpu_layers,
     bool use_mmap) {
   llama_model_params mparams = llama_model_default_params();
@@ -902,7 +905,20 @@ int32_t load_model_internal(
 
   if (n_threads > 0) {
     cparams.n_threads = n_threads;
+  }
+
+  if (n_threads_batch > 0) {
+    cparams.n_threads_batch = n_threads_batch;
+  } else if (n_threads > 0) {
     cparams.n_threads_batch = n_threads;
+  }
+
+  if (n_batch > 0) {
+    cparams.n_batch = static_cast<uint32_t>(n_batch);
+  }
+
+  if (n_ubatch > 0) {
+    cparams.n_ubatch = static_cast<uint32_t>(n_ubatch);
   }
 
   if (cparams.n_batch == 0 || cparams.n_batch > cparams.n_ctx) {
@@ -975,6 +991,9 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_load_model(
     const char * model_path,
     int32_t n_ctx,
     int32_t n_threads,
+    int32_t n_threads_batch,
+    int32_t n_batch,
+    int32_t n_ubatch,
     int32_t n_gpu_layers) {
   clear_error();
   g_last_output.clear();
@@ -987,13 +1006,24 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_load_model(
 
   free_runtime();
 
-  return load_model_internal(model_path, n_ctx, n_threads, n_gpu_layers, false);
+  return load_model_internal(
+      model_path,
+      n_ctx,
+      n_threads,
+      n_threads_batch,
+      n_batch,
+      n_ubatch,
+      n_gpu_layers,
+      false);
 }
 
 EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_load_model_from_url(
     const char * model_url,
     int32_t n_ctx,
     int32_t n_threads,
+    int32_t n_threads_batch,
+    int32_t n_batch,
+    int32_t n_ubatch,
     int32_t n_gpu_layers,
     int32_t chunk_size) {
   clear_error();
@@ -1053,7 +1083,15 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_load_model_from_url(
   close(fd);
 
   const int32_t rc =
-      load_model_internal(fetch_file_path.c_str(), n_ctx, n_threads, n_gpu_layers, false);
+      load_model_internal(
+          fetch_file_path.c_str(),
+          n_ctx,
+          n_threads,
+          n_threads_batch,
+          n_batch,
+          n_ubatch,
+          n_gpu_layers,
+          false);
   if (unlink(fetch_file_path.c_str()) != 0 && errno != ENOENT) {
     // best-effort cleanup of temporary fetch path
   }

@@ -1,4 +1,5 @@
 const textEncoder = new TextEncoder();
+const textDecoder = new TextDecoder();
 const defaultModelCacheName = 'llamadart-webgpu-model-cache-v1';
 
 function basenameFromUrl(url) {
@@ -806,19 +807,95 @@ function installBridgeWorkerHost() {
         const prompt = args[0];
         const options = (args[1] && typeof args[1] === 'object') ? { ...args[1] } : {};
         delete options.signal;
+        const tokenEventEncoding = typeof options.tokenEventEncoding === 'string'
+          ? String(options.tokenEventEncoding || '').toLowerCase()
+          : 'bytes';
+        const flushMsRaw = Number(options.tokenEventFlushMs);
+        const tokenEventFlushMs = Number.isFinite(flushMsRaw) && flushMsRaw >= 0
+          ? Math.max(0, Math.min(200, Math.trunc(flushMsRaw)))
+          : 0;
+        const shouldEmitCurrentText = options.emitCurrentTextOnToken === true;
+
+        let pendingPieceText = '';
+        let pendingCurrentText = '';
+        let flushTimer = null;
+
+        const flushTokenTextPayload = () => {
+          if (pendingPieceText.length === 0) {
+            return;
+          }
+
+          self.postMessage({
+            type: 'event',
+            id,
+            event: 'token',
+            payload: {
+              pieceText: pendingPieceText,
+              currentText: shouldEmitCurrentText ? pendingCurrentText : '',
+            },
+          });
+          pendingPieceText = '';
+          pendingCurrentText = '';
+        };
+
+        const scheduleTokenTextFlush = () => {
+          if (tokenEventFlushMs <= 0 || flushTimer != null) {
+            return;
+          }
+
+          flushTimer = globalThis.setTimeout(() => {
+            flushTimer = null;
+            flushTokenTextPayload();
+          }, tokenEventFlushMs);
+        };
+
         options.onToken = (piece, currentText) => {
+          if (tokenEventEncoding === 'text') {
+            const pieceText = typeof piece === 'string'
+              ? piece
+              : textDecoder.decode(toUint8Array(piece) || new Uint8Array());
+            if (pieceText.length === 0) {
+              return;
+            }
+
+            if (tokenEventFlushMs > 0) {
+              pendingPieceText += pieceText;
+              if (shouldEmitCurrentText) {
+                pendingCurrentText = String(currentText || '');
+              }
+              scheduleTokenTextFlush();
+              return;
+            }
+
+            self.postMessage({
+              type: 'event',
+              id,
+              event: 'token',
+              payload: {
+                pieceText,
+                currentText: shouldEmitCurrentText ? String(currentText || '') : '',
+              },
+            });
+            return;
+          }
+
           self.postMessage({
             type: 'event',
             id,
             event: 'token',
             payload: {
               piece: Array.from(piece || []),
-              currentText: String(currentText || ''),
+              currentText: shouldEmitCurrentText ? String(currentText || '') : '',
             },
           });
         };
 
         const value = await bridge.createCompletion(prompt, options);
+        if (flushTimer != null) {
+          globalThis.clearTimeout(flushTimer);
+          flushTimer = null;
+        }
+        flushTokenTextPayload();
         self.postMessage({ type: 'result', id, value });
         return;
       }
@@ -1202,6 +1279,19 @@ class LlamaWebGpuBridgeRuntime {
       ? Number(config.threads)
       : this._resolveAutoThreadCount();
     this._threads = this._capThreadsToPool(requestedThreads);
+    const requestedThreadsBatch = Number(config.threadsBatch) > 0
+      ? Number(config.threadsBatch)
+      : this._threads;
+    this._threadsBatch = this._capThreadsToPool(
+      requestedThreadsBatch,
+      { noteTag: 'threads_batch_capped_pool' },
+    );
+    this._nBatch = Number(config.nBatch) > 0
+      ? Math.max(32, Math.trunc(Number(config.nBatch)))
+      : 0;
+    this._nUbatch = Number(config.nUbatch) > 0
+      ? Math.max(32, Math.trunc(Number(config.nUbatch)))
+      : 0;
     this._nGpuLayers = Number.isFinite(config.nGpuLayers)
       ? Number(config.nGpuLayers)
       : -1;
@@ -1896,8 +1986,26 @@ class LlamaWebGpuBridgeRuntime {
         await core.ccall(
           'llamadart_webgpu_load_model_from_url',
           'number',
-          ['string', 'number', 'number', 'number', 'number'],
-          [remoteFetchUrl, this._nCtx, this._threads, this._nGpuLayers, chunkBytes],
+          [
+            'string',
+            'number',
+            'number',
+            'number',
+            'number',
+            'number',
+            'number',
+            'number',
+          ],
+          [
+            remoteFetchUrl,
+            this._nCtx,
+            this._threads,
+            this._threadsBatch,
+            this._nBatch,
+            this._nUbatch,
+            this._nGpuLayers,
+            chunkBytes,
+          ],
           { async: true },
         ),
       );
@@ -2746,6 +2854,33 @@ class LlamaWebGpuBridgeRuntime {
       this._threads = this._capThreadsToPool(this._resolveAutoThreadCount());
     }
 
+    const requestedThreadsBatch = Number(options.nThreadsBatch);
+    if (Number.isFinite(requestedThreadsBatch) && requestedThreadsBatch > 0) {
+      this._threadsBatch = this._capThreadsToPool(
+        requestedThreadsBatch,
+        { noteTag: 'threads_batch_capped_pool' },
+      );
+    } else {
+      this._threadsBatch = this._threads;
+    }
+
+    const requestedBatch = Number(options.nBatch);
+    this._nBatch = Number.isFinite(requestedBatch) && requestedBatch > 0
+      ? Math.max(32, Math.trunc(requestedBatch))
+      : 0;
+
+    const requestedUbatch = Number(options.nUbatch);
+    this._nUbatch = Number.isFinite(requestedUbatch) && requestedUbatch > 0
+      ? Math.max(32, Math.trunc(requestedUbatch))
+      : 0;
+
+    if (this._nBatch > 0 && this._nBatch > this._nCtx) {
+      this._nBatch = this._nCtx;
+    }
+    if (this._nUbatch > 0 && this._nBatch > 0 && this._nUbatch > this._nBatch) {
+      this._nUbatch = this._nBatch;
+    }
+
     if (Number.isFinite(this._threadPoolSizeHint) && this._threadPoolSizeHint > 0) {
       this._pushRuntimeNote(`thread_pool_size:${this._threadPoolSizeHint}`);
     }
@@ -2760,6 +2895,17 @@ class LlamaWebGpuBridgeRuntime {
       if (this._threads > 1) {
         this._threads = 1;
       }
+      if (this._threadsBatch > 1) {
+        this._threadsBatch = 1;
+      }
+    }
+
+    this._pushRuntimeNote(`threads_batch:${this._threadsBatch}`);
+    if (this._nBatch > 0) {
+      this._pushRuntimeNote(`n_batch:${this._nBatch}`);
+    }
+    if (this._nUbatch > 0) {
+      this._pushRuntimeNote(`n_ubatch:${this._nUbatch}`);
     }
 
     if (this._isSafari && this._nGpuLayers > 0) {
@@ -2985,8 +3131,16 @@ class LlamaWebGpuBridgeRuntime {
             await core.ccall(
               'llamadart_webgpu_load_model',
               'number',
-              ['string', 'number', 'number', 'number'],
-              [this._modelPath, this._nCtx, this._threads, this._nGpuLayers],
+              ['string', 'number', 'number', 'number', 'number', 'number', 'number'],
+              [
+                this._modelPath,
+                this._nCtx,
+                this._threads,
+                this._threadsBatch,
+                this._nBatch,
+                this._nUbatch,
+                this._nGpuLayers,
+              ],
               { async: true },
             ),
           );
@@ -3101,11 +3255,23 @@ class LlamaWebGpuBridgeRuntime {
               await core.ccall(
                 'llamadart_webgpu_load_model_from_url',
                 'number',
-                ['string', 'number', 'number', 'number', 'number'],
+                [
+                  'string',
+                  'number',
+                  'number',
+                  'number',
+                  'number',
+                  'number',
+                  'number',
+                  'number',
+                ],
                 [
                   reloadUrl,
                   this._nCtx,
                   this._threads,
+                  this._threadsBatch,
+                  this._nBatch,
+                  this._nUbatch,
                   candidateLayers,
                   remoteFetchReloadChunkBytes,
                 ],
@@ -3117,8 +3283,16 @@ class LlamaWebGpuBridgeRuntime {
               await core.ccall(
                 'llamadart_webgpu_load_model',
                 'number',
-                ['string', 'number', 'number', 'number'],
-                [this._modelPath, this._nCtx, this._threads, candidateLayers],
+                ['string', 'number', 'number', 'number', 'number', 'number', 'number'],
+                [
+                  this._modelPath,
+                  this._nCtx,
+                  this._threads,
+                  this._threadsBatch,
+                  this._nBatch,
+                  this._nUbatch,
+                  candidateLayers,
+                ],
                 { async: true },
               ),
             );
@@ -3627,6 +3801,10 @@ class LlamaWebGpuBridgeRuntime {
 
       let generated = 0;
       const shouldEmitCurrentText = options.emitCurrentTextOnToken !== false;
+      const tokenEventEncoding = typeof options.tokenEventEncoding === 'string'
+        ? String(options.tokenEventEncoding || '').toLowerCase()
+        : 'bytes';
+      const emitTokenText = tokenEventEncoding === 'text';
       const shouldYieldForResponsiveness =
         !(typeof WorkerGlobalScope !== 'undefined' && globalThis instanceof WorkerGlobalScope);
       const yieldInterval = shouldYieldForResponsiveness ? 4 : 0;
@@ -3693,11 +3871,12 @@ class LlamaWebGpuBridgeRuntime {
         }
 
         if (typeof options.onToken === 'function') {
+          const piecePayload = emitTokenText ? piece : textEncoder.encode(piece);
           if (shouldEmitCurrentText) {
             streamed += piece;
-            options.onToken(textEncoder.encode(piece), streamed);
+            options.onToken(piecePayload, streamed);
           } else {
-            options.onToken(textEncoder.encode(piece), null);
+            options.onToken(piecePayload, null);
           }
         }
 
@@ -3836,6 +4015,9 @@ class LlamaWebGpuBridgeRuntime {
       'llamadart.webgpu.backends': this._backendLabels.join(','),
       'llamadart.webgpu.model_bytes': String(this._modelBytes),
       'llamadart.webgpu.n_threads': String(this._threads),
+      'llamadart.webgpu.n_threads_batch': String(this._threadsBatch),
+      'llamadart.webgpu.n_batch': this._nBatch > 0 ? String(this._nBatch) : '',
+      'llamadart.webgpu.n_ubatch': this._nUbatch > 0 ? String(this._nUbatch) : '',
       'llamadart.webgpu.thread_pool_size':
         Number.isFinite(this._threadPoolSizeHint) && this._threadPoolSizeHint > 0
           ? String(this._threadPoolSizeHint)
@@ -4719,7 +4901,9 @@ export class LlamaWebGpuBridge {
               }
 
               const payload = event.payload || {};
-              const piece = Uint8Array.from(Array.isArray(payload.piece) ? payload.piece : []);
+              const piece = typeof payload.pieceText === 'string'
+                ? payload.pieceText
+                : Uint8Array.from(Array.isArray(payload.piece) ? payload.piece : []);
               options.onToken(piece, String(payload.currentText || ''));
             },
           ),

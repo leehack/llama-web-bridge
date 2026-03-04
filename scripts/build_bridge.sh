@@ -15,11 +15,19 @@ BUILD_MEM64="${WEBGPU_BRIDGE_BUILD_MEM64:-0}"
 MEM64_MAX_MEMORY="${WEBGPU_BRIDGE_MEM64_MAX_MEMORY:-12884901888}"
 ENABLE_PTHREADS="${WEBGPU_BRIDGE_PTHREADS:-1}"
 PTHREAD_POOL_SIZE="${WEBGPU_BRIDGE_PTHREAD_POOL_SIZE:-4}"
+ALLOW_MEMORY_GROWTH="${WEBGPU_BRIDGE_ALLOW_MEMORY_GROWTH:-1}"
+INITIAL_MEMORY="${WEBGPU_BRIDGE_INITIAL_MEMORY:-0}"
 
 if [[ "$ENABLE_PTHREADS" == "0" ]]; then
   CMAKE_PTHREADS="OFF"
 else
   CMAKE_PTHREADS="ON"
+fi
+
+if [[ "$ALLOW_MEMORY_GROWTH" == "0" ]]; then
+  CMAKE_ALLOW_MEMORY_GROWTH="OFF"
+else
+  CMAKE_ALLOW_MEMORY_GROWTH="ON"
 fi
 
 if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
@@ -35,6 +43,8 @@ Environment variables:
   WEBGPU_BRIDGE_MEM64_MAX_MEMORY  wasm64 max linear memory bytes (default: 12884901888)
   WEBGPU_BRIDGE_PTHREADS  Enable pthread runtime support (default: 1)
   WEBGPU_BRIDGE_PTHREAD_POOL_SIZE  PThread pool size when enabled (default: 4)
+  WEBGPU_BRIDGE_ALLOW_MEMORY_GROWTH  Allow wasm memory growth (default: 1)
+  WEBGPU_BRIDGE_INITIAL_MEMORY  Fixed wasm memory bytes when growth disabled
 
 Example:
   LLAMA_CPP_DIR="$PWD/../llama.cpp" ./scripts/build_bridge.sh
@@ -71,7 +81,9 @@ emcmake cmake \
   -DLLAMA_CPP_DIR="$LLAMA_CPP_DIR" \
   -DCMAKE_BUILD_TYPE="$CMAKE_BUILD_TYPE" \
   -DLLAMADART_WEBGPU_PTHREADS="$CMAKE_PTHREADS" \
-  -DLLAMADART_WEBGPU_PTHREAD_POOL_SIZE="$PTHREAD_POOL_SIZE"
+  -DLLAMADART_WEBGPU_PTHREAD_POOL_SIZE="$PTHREAD_POOL_SIZE" \
+  -DLLAMADART_WEBGPU_ALLOW_MEMORY_GROWTH="$CMAKE_ALLOW_MEMORY_GROWTH" \
+  -DLLAMADART_WEBGPU_INITIAL_MEMORY="$INITIAL_MEMORY"
 
 echo "[bridge] building"
 cmake --build "$BUILD_DIR" -j "$(nproc 2>/dev/null || sysctl -n hw.logicalcpu 2>/dev/null || echo 4)"
@@ -103,7 +115,9 @@ if [[ "$BUILD_MEM64" == "1" ]]; then
     -DLLAMADART_WEBGPU_MEM64=ON \
     -DLLAMADART_WEBGPU_MEM64_MAX_MEMORY="$MEM64_MAX_MEMORY" \
     -DLLAMADART_WEBGPU_PTHREADS="$CMAKE_PTHREADS" \
-    -DLLAMADART_WEBGPU_PTHREAD_POOL_SIZE="$PTHREAD_POOL_SIZE"
+    -DLLAMADART_WEBGPU_PTHREAD_POOL_SIZE="$PTHREAD_POOL_SIZE" \
+    -DLLAMADART_WEBGPU_ALLOW_MEMORY_GROWTH="$CMAKE_ALLOW_MEMORY_GROWTH" \
+    -DLLAMADART_WEBGPU_INITIAL_MEMORY="$INITIAL_MEMORY"
 
   echo "[bridge] building optional wasm64 artifacts"
   cmake --build "$MEM64_BUILD_DIR" -j "$(nproc 2>/dev/null || sysctl -n hw.logicalcpu 2>/dev/null || echo 4)"
