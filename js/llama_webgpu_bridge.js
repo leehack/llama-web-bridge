@@ -814,6 +814,10 @@ function installBridgeWorkerHost() {
         const tokenEventFlushMs = Number.isFinite(flushMsRaw) && flushMsRaw >= 0
           ? Math.max(0, Math.min(200, Math.trunc(flushMsRaw)))
           : 0;
+        const flushCharsRaw = Number(options.tokenEventFlushChars);
+        const tokenEventFlushChars = Number.isFinite(flushCharsRaw) && flushCharsRaw > 0
+          ? Math.max(1, Math.min(1024, Math.trunc(flushCharsRaw)))
+          : 0;
         const shouldEmitCurrentText = options.emitCurrentTextOnToken === true;
 
         let pendingPieceText = '';
@@ -863,6 +867,16 @@ function installBridgeWorkerHost() {
               if (shouldEmitCurrentText) {
                 pendingCurrentText = String(currentText || '');
               }
+
+              if (tokenEventFlushChars > 0 && pendingPieceText.length >= tokenEventFlushChars) {
+                if (flushTimer != null) {
+                  globalThis.clearTimeout(flushTimer);
+                  flushTimer = null;
+                }
+                flushTokenTextPayload();
+                return;
+              }
+
               scheduleTokenTextFlush();
               return;
             }
