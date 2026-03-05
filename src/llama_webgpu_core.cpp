@@ -50,6 +50,7 @@ std::string g_last_detokenized;
 std::string g_last_embedding_json = "[]";
 std::string g_backend_json = "[]";
 std::string g_model_meta_json = "{}";
+bool g_model_uses_gpu_ops = false;
 std::vector<llama_token> g_cached_prompt_tokens;
 
 std::vector<mtmd_bitmap *> g_pending_media;
@@ -189,6 +190,7 @@ void free_runtime() {
   g_last_detokenized.clear();
   g_last_embedding_json = "[]";
   g_model_meta_json = "{}";
+  g_model_uses_gpu_ops = false;
   g_cached_prompt_tokens.clear();
 }
 
@@ -930,6 +932,7 @@ int32_t load_model_internal(
   }
 
   const bool enable_gpu_ops = n_gpu_layers > 0;
+  g_model_uses_gpu_ops = enable_gpu_ops;
   cparams.offload_kqv = enable_gpu_ops;
   cparams.op_offload = enable_gpu_ops;
   cparams.no_perf = true;
@@ -1120,7 +1123,7 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_mmproj_load(
   }
 
   mtmd_context_params params = mtmd_context_params_default();
-  params.use_gpu = g_has_webgpu;
+  params.use_gpu = g_model_uses_gpu_ops;
   params.print_timings = false;
   params.n_threads = llama_n_threads(g_state.ctx);
   if (params.n_threads <= 0) {

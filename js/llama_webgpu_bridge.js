@@ -2182,7 +2182,7 @@ class LlamaWebGpuBridgeRuntime {
     return defaultTimeoutMs;
   }
 
-  _resolveStreamChunkTimeoutMs(options = {}, defaultTimeoutMs = 45000) {
+  _resolveStreamChunkTimeoutMs(options = {}, defaultTimeoutMs = 90000) {
     const configured = Number(options.streamChunkTimeoutMs);
     if (Number.isFinite(configured) && configured > 0) {
       return Math.max(5000, Math.min(300000, Math.trunc(configured)));
@@ -2500,7 +2500,7 @@ class LlamaWebGpuBridgeRuntime {
         ...(controller?.signal ? { signal: controller.signal } : {}),
       };
       const fetchTimeoutMs = this._resolveFetchTimeoutMs(options, 180000);
-      const chunkTimeoutMs = this._resolveStreamChunkTimeoutMs(options, 45000);
+      const chunkTimeoutMs = this._resolveStreamChunkTimeoutMs(options, 90000);
 
       const cache = (useCache && globalThis.caches && typeof globalThis.caches.open === 'function')
         ? await globalThis.caches.open(this._modelCacheName)
@@ -2878,15 +2878,22 @@ class LlamaWebGpuBridgeRuntime {
       this._threadsBatch = this._threads;
     }
 
+    const requestedGpuLayers = Number(options.nGpuLayers);
+    if (Number.isFinite(requestedGpuLayers)) {
+      this._nGpuLayers = Math.trunc(requestedGpuLayers);
+    }
+
+    const isCpuModelMode = this._nGpuLayers === 0;
+
     const requestedBatch = Number(options.nBatch);
     this._nBatch = Number.isFinite(requestedBatch) && requestedBatch > 0
       ? Math.max(32, Math.trunc(requestedBatch))
-      : 0;
+      : (isCpuModelMode ? Math.min(this._nCtx, 512) : 0);
 
     const requestedUbatch = Number(options.nUbatch);
     this._nUbatch = Number.isFinite(requestedUbatch) && requestedUbatch > 0
       ? Math.max(32, Math.trunc(requestedUbatch))
-      : 0;
+      : (isCpuModelMode ? Math.min(this._nBatch || 256, 256) : 0);
 
     if (this._nBatch > 0 && this._nBatch > this._nCtx) {
       this._nBatch = this._nCtx;
@@ -2897,11 +2904,6 @@ class LlamaWebGpuBridgeRuntime {
 
     if (Number.isFinite(this._threadPoolSizeHint) && this._threadPoolSizeHint > 0) {
       this._pushRuntimeNote(`thread_pool_size:${this._threadPoolSizeHint}`);
-    }
-
-    const requestedGpuLayers = Number(options.nGpuLayers);
-    if (Number.isFinite(requestedGpuLayers)) {
-      this._nGpuLayers = Math.trunc(requestedGpuLayers);
     }
 
     if (!isCrossOriginIsolatedRuntime()) {
@@ -2920,6 +2922,9 @@ class LlamaWebGpuBridgeRuntime {
     }
     if (this._nUbatch > 0) {
       this._pushRuntimeNote(`n_ubatch:${this._nUbatch}`);
+    }
+    if (isCpuModelMode && !Number.isFinite(requestedBatch) && !Number.isFinite(requestedUbatch)) {
+      this._runtimeNotes.push('cpu_batch_tuned_default');
     }
 
     if (this._isSafari && this._nGpuLayers > 0) {
@@ -2990,7 +2995,7 @@ class LlamaWebGpuBridgeRuntime {
         : 8;
       const streamChunkTimeoutMs = this._resolveStreamChunkTimeoutMs(
         options,
-        45000,
+        90000,
       );
 
       try {
@@ -3390,7 +3395,7 @@ class LlamaWebGpuBridgeRuntime {
     const fileName = basenameFromUrl(url);
     const mmprojPath = `/mmproj/${fileName}`;
     const fetchTimeoutMs = this._resolveFetchTimeoutMs({}, 180000);
-    const chunkTimeoutMs = this._resolveStreamChunkTimeoutMs({}, 45000);
+    const chunkTimeoutMs = this._resolveStreamChunkTimeoutMs({}, 90000);
     let lastError = null;
 
     for (let attempt = 0; attempt < 2; attempt += 1) {
@@ -4333,13 +4338,35 @@ export class LlamaWebGpuBridge {
     );
   }
 
+  _isCpuModelMode() {
+    const requestedLayers = Number(this._loadedModelOptions?.nGpuLayers);
+    if (Number.isFinite(requestedLayers)) {
+      return requestedLayers === 0;
+    }
+
+    const metadataLayers = Number(this._metadata?.['llamadart.webgpu.n_gpu_layers']);
+    if (Number.isFinite(metadataLayers)) {
+      return metadataLayers === 0;
+    }
+
+    return false;
+  }
+
   _workerCompletionStallTimeoutMs(options = {}) {
     const configured = Number(this._config?.workerGenerationStallTimeoutMs);
     if (Number.isFinite(configured) && configured > 0) {
       return Math.max(5000, Math.min(300000, Math.trunc(configured)));
     }
 
-    return this._hasMediaParts(options) ? 180000 : 90000;
+    if (!this._hasMediaParts(options)) {
+      return 90000;
+    }
+
+    if (this._isCpuModelMode()) {
+      return 0;
+    }
+
+    return 180000;
   }
 
   async _ensureRuntimeReadyAfterWorkerFallback(options = {}, fallbackError = null) {
@@ -4350,7 +4377,25 @@ export class LlamaWebGpuBridge {
     }
 
     const forceReloadRequested = options?._llamadartForceRuntimeReload === true;
+    const shouldEnsureMultimodalInRuntime =
+      this._hasMediaParts(options)
+      && typeof this._loadedMmProjUrl === 'string'
+      && this._loadedMmProjUrl.length > 0;
+
     if (Number(this._runtime?._modelBytes) > 0 && !forceReloadRequested) {
+      if (shouldEnsureMultimodalInRuntime) {
+        const runtimeSupportsMedia =
+          (typeof this._runtime.supportsVision === 'function' && this._runtime.supportsVision())
+          || (typeof this._runtime.supportsAudio === 'function' && this._runtime.supportsAudio());
+
+        if (!runtimeSupportsMedia) {
+          await this._runtime.loadMultimodalProjector(this._loadedMmProjUrl);
+          if (Array.isArray(this._runtime._runtimeNotes)) {
+            this._runtime._runtimeNotes.push('worker_fallback_reload_mmproj');
+          }
+        }
+      }
+
       return;
     }
 
@@ -4404,11 +4449,7 @@ export class LlamaWebGpuBridge {
       }
     }
 
-    if (
-      this._hasMediaParts(options)
-      && typeof this._loadedMmProjUrl === 'string'
-      && this._loadedMmProjUrl.length > 0
-    ) {
+    if (shouldEnsureMultimodalInRuntime) {
       await this._runtime.loadMultimodalProjector(this._loadedMmProjUrl);
     }
   }
@@ -4823,7 +4864,7 @@ export class LlamaWebGpuBridge {
       const hasWorkerFallback =
         typeof this._workerFallbackReason === 'string'
         && this._workerFallbackReason.length > 0;
-      if (hasWorkerFallback && !this._workerProxy) {
+      if (hasWorkerFallback && !this._workerProxy && !this._isCpuModelMode()) {
         await this._ensureRuntimeReadyAfterWorkerFallback(options, null);
         return this._runtime.createCompletion(prompt, options);
       }
@@ -4838,6 +4879,14 @@ export class LlamaWebGpuBridge {
         this._emitBridgeWarn(
           `llamadart: unable to prepare multimodal worker CPU mode (${reason}).`,
         );
+
+        if (this._isCpuModelMode()) {
+          throw new Error(
+            `CPU multimodal worker setup failed (${reason}). `
+            + 'Reload model and retry with a smaller image.',
+          );
+        }
+
         this._disableWorkerFallback(error);
         await this._waitForWorkerDisposal();
         await this._ensureRuntimeReadyAfterWorkerFallback(options, error);
@@ -4898,8 +4947,10 @@ export class LlamaWebGpuBridge {
 
       armStallTimer();
 
+      let sawWorkerTokenEvent = false;
+
       try {
-        return await Promise.race([
+        const workerResult = await Promise.race([
           this._callWorker(
             'createCompletion',
             [prompt, workerOptions],
@@ -4909,6 +4960,7 @@ export class LlamaWebGpuBridge {
               }
 
               armStallTimer();
+              sawWorkerTokenEvent = true;
 
               if (typeof options.onToken !== 'function') {
                 return;
@@ -4923,12 +4975,37 @@ export class LlamaWebGpuBridge {
           ),
           stallPromise,
         ]);
+
+        if (
+          this._hasMediaParts(options)
+          && !sawWorkerTokenEvent
+          && String(workerResult || '').trim().length == 0
+        ) {
+          const emptyResponseError = new Error(
+            'Multimodal worker produced empty response without token events.',
+          );
+          emptyResponseError.llamadartEmptyMultimodalResponse = true;
+          throw emptyResponseError;
+        }
+
+        return workerResult;
       } finally {
         clearStallTimer();
       }
     } catch (error) {
       if (this._hasMediaParts(options)) {
         const reason = serializeWorkerError(error);
+
+        if (this._isCpuModelMode()) {
+          this._emitBridgeWarn(
+            `llamadart: CPU multimodal worker request failed (${reason}); skipping main-thread fallback.`,
+          );
+          throw new Error(
+            `CPU multimodal request failed (${reason}). `
+            + 'Reload model and retry with a smaller image.',
+          );
+        }
+
         this._emitBridgeWarn(
           `llamadart: multimodal worker request failed (${reason}); falling back to main-thread runtime.`,
         );
@@ -4976,6 +5053,26 @@ export class LlamaWebGpuBridge {
       this._emitBridgeWarn(
         `llamadart: multimodal worker setup failed (${reason}).`,
       );
+
+      if (this._isCpuModelMode()) {
+        try {
+          await this._replaceWorkerProxyForMultimodalCpuMode();
+          await this._ensureWorkerMultimodalCpuMode();
+          const retryResult = await this._callWorker('loadMultimodalProjector', [url]);
+          this._rememberLoadedMmProj(url);
+          this._emitBridgeWarn(
+            'llamadart: CPU multimodal worker setup recovered after worker restart.',
+          );
+          return retryResult;
+        } catch (retryError) {
+          const retryReason = serializeWorkerError(retryError);
+          throw new Error(
+            `CPU multimodal projector setup failed (${retryReason}). `
+            + 'Reload model and retry with a smaller image.',
+          );
+        }
+      }
+
       this._disableWorkerFallback(error);
       await this._waitForWorkerDisposal();
       return invokeRuntimeLoad();
