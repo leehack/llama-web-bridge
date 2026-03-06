@@ -4859,6 +4859,9 @@ export class LlamaWebGpuBridge {
   }
 
   async createCompletion(prompt, options = {}) {
+    const isWarmup = options?.warmup === true;
+    const hasRetriedEmptyMultimodal =
+      options?.__llamadartEmptyRetryAttempted === true;
     const workerAllowed = this._config?.disableWorker !== true;
     if (this._hasMediaParts(options) && workerAllowed) {
       const hasWorkerFallback =
@@ -4876,6 +4879,13 @@ export class LlamaWebGpuBridge {
         await this._ensureWorkerMultimodalCpuMode();
       } catch (error) {
         const reason = serializeWorkerError(error);
+        if (isWarmup) {
+          this._emitBridgeWarn(
+            `llamadart: multimodal warmup skipped after worker setup issue (${reason}).`,
+          );
+          return '';
+        }
+
         this._emitBridgeWarn(
           `llamadart: unable to prepare multimodal worker CPU mode (${reason}).`,
         );
@@ -4913,6 +4923,7 @@ export class LlamaWebGpuBridge {
       const workerOptions = { ...options };
       delete workerOptions.onToken;
       delete workerOptions.signal;
+      delete workerOptions.__llamadartEmptyRetryAttempted;
 
       const stallTimeoutMs = this._workerCompletionStallTimeoutMs(options);
       let timeoutHandle = null;
@@ -4978,14 +4989,32 @@ export class LlamaWebGpuBridge {
 
         if (
           this._hasMediaParts(options)
+          && !isWarmup
           && !sawWorkerTokenEvent
           && String(workerResult || '').trim().length == 0
         ) {
-          const emptyResponseError = new Error(
-            'Multimodal worker produced empty response without token events.',
+          this._emitBridgeWarn(
+            'llamadart: multimodal worker produced empty response without token events.',
           );
-          emptyResponseError.llamadartEmptyMultimodalResponse = true;
-          throw emptyResponseError;
+
+          if (!hasRetriedEmptyMultimodal) {
+            this._emitBridgeWarn(
+              'llamadart: retrying multimodal worker once after empty response.',
+            );
+            try {
+              await this._replaceWorkerProxyForMultimodalCpuMode();
+              await this._ensureWorkerMultimodalCpuMode();
+            } catch (retrySetupError) {
+              this._emitBridgeWarn(
+                `llamadart: multimodal empty-response retry setup failed (${serializeWorkerError(retrySetupError)}).`,
+              );
+            }
+
+            return this.createCompletion(prompt, {
+              ...options,
+              __llamadartEmptyRetryAttempted: true,
+            });
+          }
         }
 
         return workerResult;
@@ -4995,6 +5024,13 @@ export class LlamaWebGpuBridge {
     } catch (error) {
       if (this._hasMediaParts(options)) {
         const reason = serializeWorkerError(error);
+
+        if (isWarmup) {
+          this._emitBridgeWarn(
+            `llamadart: multimodal warmup skipped after worker request issue (${reason}).`,
+          );
+          return '';
+        }
 
         if (this._isCpuModelMode()) {
           this._emitBridgeWarn(
