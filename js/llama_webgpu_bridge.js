@@ -1508,10 +1508,12 @@ class LlamaWebGpuBridgeRuntime {
       return;
     }
 
-    this._emitLogger(
-      'warn',
-      `warning: suppressed ${this._suppressedWarmupWarningCount} verbose warmup log lines (set bridge/runtime log level to Info or Debug to inspect full warmup trace).`,
-    );
+    if (this._logLevel <= 2) {
+      this._emitLogger(
+        'log',
+        `info: suppressed ${this._suppressedWarmupWarningCount} verbose warmup log lines (set bridge/runtime log level to Debug to inspect full warmup trace).`,
+      );
+    }
     this._suppressedWarmupWarningCount = 0;
   }
 
@@ -2735,10 +2737,12 @@ class LlamaWebGpuBridgeRuntime {
                 this._suppressedWarmupWarningCount += 1;
                 if (!this._didReportWarmupWarningSuppression) {
                   this._didReportWarmupWarningSuppression = true;
-                  this._emitLogger(
-                    'warn',
-                    'warning: suppressing verbose warmup op logs at WARN level. Set bridge/runtime log level to Info or Debug to inspect all warmup details.',
-                  );
+                  if (this._logLevel <= 2) {
+                    this._emitLogger(
+                      'log',
+                      'info: suppressing verbose warmup op logs; set bridge/runtime log level to Debug to inspect all warmup details.',
+                    );
+                  }
                 }
                 this._pushRuntimeNote('warmup_warning_suppressed');
                 return;
