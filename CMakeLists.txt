@@ -31,7 +31,9 @@ set(LLAMA_WASM_MEM64 OFF CACHE BOOL "" FORCE)
 option(LLAMADART_WEBGPU_MEM64 "Build WebGPU bridge core with wasm64/memory64" OFF)
 set(LLAMADART_WEBGPU_MEM64_MAX_MEMORY "12884901888" CACHE STRING "Max wasm64 linear memory in bytes")
 option(LLAMADART_WEBGPU_PTHREADS "Enable pthread support for bridge runtime" ON)
-set(LLAMADART_WEBGPU_PTHREAD_POOL_SIZE "2" CACHE STRING "PThread pool size for bridge runtime")
+set(LLAMADART_WEBGPU_PTHREAD_POOL_SIZE "4" CACHE STRING "PThread pool size for bridge runtime")
+option(LLAMADART_WEBGPU_ALLOW_MEMORY_GROWTH "Allow wasm linear memory growth" ON)
+set(LLAMADART_WEBGPU_INITIAL_MEMORY "0" CACHE STRING "Initial wasm linear memory in bytes when growth is disabled")
 
 if (LLAMADART_WEBGPU_PTHREADS)
     add_compile_options("-pthread")
@@ -135,22 +137,37 @@ target_include_directories(llama_webgpu_core PRIVATE
 target_link_libraries(llama_webgpu_core PRIVATE llama llamadart_mtmd)
 
 set(LLAMADART_WEBGPU_LINK_OPTIONS
-    "-sALLOW_MEMORY_GROWTH=1"
     "-sWASMFS=1"
     "-sASYNCIFY=1"
     "-sFORCE_FILESYSTEM=1"
-    "-sASSERTIONS=1"
+    "-sASSERTIONS=0"
     "-sMODULARIZE=1"
     "-sEXPORT_ES6=1"
     "-sEXPORT_NAME=createLlamaWebGpuCoreModule"
     "-sENVIRONMENT=web,worker"
     "-sEXPORTED_RUNTIME_METHODS=['FS','ccall','UTF8ToString']"
-    "-sEXPORTED_FUNCTIONS=['_main','_llamadart_webgpu_probe','_llamadart_webgpu_backends_json','_llamadart_webgpu_last_error','_llamadart_webgpu_set_log_level','_llamadart_webgpu_load_model','_llamadart_webgpu_load_model_from_url','_llamadart_webgpu_mmproj_load','_llamadart_webgpu_mmproj_free','_llamadart_webgpu_mmproj_supports_vision','_llamadart_webgpu_mmproj_supports_audio','_llamadart_webgpu_media_clear_pending','_llamadart_webgpu_media_add_file','_llamadart_webgpu_media_add_encoded','_llamadart_webgpu_media_add_rgb','_llamadart_webgpu_media_add_audio_f32','_llamadart_webgpu_tokenize_to_json','_llamadart_webgpu_last_tokens_json','_llamadart_webgpu_detokenize_from_json','_llamadart_webgpu_last_detokenized','_llamadart_webgpu_embed_to_json','_llamadart_webgpu_last_embedding_json','_llamadart_webgpu_generate','_llamadart_webgpu_begin_generation','_llamadart_webgpu_next_token','_llamadart_webgpu_last_piece','_llamadart_webgpu_end_generation','_llamadart_webgpu_request_cancel','_llamadart_webgpu_last_output','_llamadart_webgpu_get_context_size','_llamadart_webgpu_model_meta_json','_llamadart_webgpu_shutdown']"
+    "-sEXPORTED_FUNCTIONS=['_main','_llamadart_webgpu_probe','_llamadart_webgpu_supports_pthreads','_llamadart_webgpu_backends_json','_llamadart_webgpu_last_error','_llamadart_webgpu_set_log_level','_llamadart_webgpu_load_model','_llamadart_webgpu_load_model_from_url','_llamadart_webgpu_mmproj_load','_llamadart_webgpu_mmproj_free','_llamadart_webgpu_mmproj_supports_vision','_llamadart_webgpu_mmproj_supports_audio','_llamadart_webgpu_media_clear_pending','_llamadart_webgpu_media_add_file','_llamadart_webgpu_media_add_encoded','_llamadart_webgpu_media_add_rgb','_llamadart_webgpu_media_add_audio_f32','_llamadart_webgpu_tokenize_to_json','_llamadart_webgpu_last_tokens_json','_llamadart_webgpu_detokenize_from_json','_llamadart_webgpu_last_detokenized','_llamadart_webgpu_embed_to_json','_llamadart_webgpu_last_embedding_json','_llamadart_webgpu_generate','_llamadart_webgpu_begin_generation','_llamadart_webgpu_next_token','_llamadart_webgpu_last_piece','_llamadart_webgpu_end_generation','_llamadart_webgpu_request_cancel','_llamadart_webgpu_last_output','_llamadart_webgpu_get_context_size','_llamadart_webgpu_model_meta_json','_llamadart_webgpu_shutdown']"
     "-lwasmfs_fetch.js"
 )
 
+if (LLAMADART_WEBGPU_ALLOW_MEMORY_GROWTH)
+    list(APPEND LLAMADART_WEBGPU_LINK_OPTIONS "-sALLOW_MEMORY_GROWTH=1")
+else()
+    list(APPEND LLAMADART_WEBGPU_LINK_OPTIONS "-sALLOW_MEMORY_GROWTH=0")
+    if (LLAMADART_WEBGPU_INITIAL_MEMORY)
+        list(APPEND LLAMADART_WEBGPU_LINK_OPTIONS "-sINITIAL_MEMORY=${LLAMADART_WEBGPU_INITIAL_MEMORY}")
+        list(APPEND LLAMADART_WEBGPU_LINK_OPTIONS "-sMAXIMUM_MEMORY=${LLAMADART_WEBGPU_INITIAL_MEMORY}")
+    endif()
+endif()
+
+if (CMAKE_BUILD_TYPE STREQUAL "Debug")
+    list(REMOVE_ITEM LLAMADART_WEBGPU_LINK_OPTIONS "-sASSERTIONS=0")
+    list(APPEND LLAMADART_WEBGPU_LINK_OPTIONS "-sASSERTIONS=1")
+endif()
+
 if (LLAMADART_WEBGPU_PTHREADS)
     list(APPEND LLAMADART_WEBGPU_LINK_OPTIONS
+        "-sPTHREAD_POOL_SIZE_STRICT=2"
         "-sPTHREAD_POOL_SIZE=${LLAMADART_WEBGPU_PTHREAD_POOL_SIZE}"
     )
 endif()

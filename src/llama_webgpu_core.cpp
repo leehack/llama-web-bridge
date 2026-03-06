@@ -50,6 +50,7 @@ std::string g_last_detokenized;
 std::string g_last_embedding_json = "[]";
 std::string g_backend_json = "[]";
 std::string g_model_meta_json = "{}";
+bool g_model_uses_gpu_ops = false;
 std::vector<llama_token> g_cached_prompt_tokens;
 
 std::vector<mtmd_bitmap *> g_pending_media;
@@ -189,6 +190,7 @@ void free_runtime() {
   g_last_detokenized.clear();
   g_last_embedding_json = "[]";
   g_model_meta_json = "{}";
+  g_model_uses_gpu_ops = false;
   g_cached_prompt_tokens.clear();
 }
 
@@ -881,6 +883,9 @@ int32_t load_model_internal(
     const char * model_path,
     int32_t n_ctx,
     int32_t n_threads,
+    int32_t n_threads_batch,
+    int32_t n_batch,
+    int32_t n_ubatch,
     int32_t n_gpu_layers,
     bool use_mmap) {
   llama_model_params mparams = llama_model_default_params();
@@ -902,7 +907,20 @@ int32_t load_model_internal(
 
   if (n_threads > 0) {
     cparams.n_threads = n_threads;
+  }
+
+  if (n_threads_batch > 0) {
+    cparams.n_threads_batch = n_threads_batch;
+  } else if (n_threads > 0) {
     cparams.n_threads_batch = n_threads;
+  }
+
+  if (n_batch > 0) {
+    cparams.n_batch = static_cast<uint32_t>(n_batch);
+  }
+
+  if (n_ubatch > 0) {
+    cparams.n_ubatch = static_cast<uint32_t>(n_ubatch);
   }
 
   if (cparams.n_batch == 0 || cparams.n_batch > cparams.n_ctx) {
@@ -914,6 +932,7 @@ int32_t load_model_internal(
   }
 
   const bool enable_gpu_ops = n_gpu_layers > 0;
+  g_model_uses_gpu_ops = enable_gpu_ops;
   cparams.offload_kqv = enable_gpu_ops;
   cparams.op_offload = enable_gpu_ops;
   cparams.no_perf = true;
@@ -942,6 +961,14 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_probe() {
   return g_has_webgpu ? 1 : 0;
 }
 
+EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_supports_pthreads() {
+#if defined(__EMSCRIPTEN_PTHREADS__)
+  return 1;
+#else
+  return 0;
+#endif
+}
+
 EMSCRIPTEN_KEEPALIVE const char * llamadart_webgpu_backends_json() {
   refresh_backend_probe();
   return g_backend_json.c_str();
@@ -967,6 +994,9 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_load_model(
     const char * model_path,
     int32_t n_ctx,
     int32_t n_threads,
+    int32_t n_threads_batch,
+    int32_t n_batch,
+    int32_t n_ubatch,
     int32_t n_gpu_layers) {
   clear_error();
   g_last_output.clear();
@@ -979,13 +1009,24 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_load_model(
 
   free_runtime();
 
-  return load_model_internal(model_path, n_ctx, n_threads, n_gpu_layers, false);
+  return load_model_internal(
+      model_path,
+      n_ctx,
+      n_threads,
+      n_threads_batch,
+      n_batch,
+      n_ubatch,
+      n_gpu_layers,
+      false);
 }
 
 EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_load_model_from_url(
     const char * model_url,
     int32_t n_ctx,
     int32_t n_threads,
+    int32_t n_threads_batch,
+    int32_t n_batch,
+    int32_t n_ubatch,
     int32_t n_gpu_layers,
     int32_t chunk_size) {
   clear_error();
@@ -1045,7 +1086,15 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_load_model_from_url(
   close(fd);
 
   const int32_t rc =
-      load_model_internal(fetch_file_path.c_str(), n_ctx, n_threads, n_gpu_layers, false);
+      load_model_internal(
+          fetch_file_path.c_str(),
+          n_ctx,
+          n_threads,
+          n_threads_batch,
+          n_batch,
+          n_ubatch,
+          n_gpu_layers,
+          false);
   if (unlink(fetch_file_path.c_str()) != 0 && errno != ENOENT) {
     // best-effort cleanup of temporary fetch path
   }
@@ -1074,7 +1123,7 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_mmproj_load(
   }
 
   mtmd_context_params params = mtmd_context_params_default();
-  params.use_gpu = g_has_webgpu;
+  params.use_gpu = g_model_uses_gpu_ops;
   params.print_timings = false;
   params.n_threads = llama_n_threads(g_state.ctx);
   if (params.n_threads <= 0) {
