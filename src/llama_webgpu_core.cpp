@@ -563,6 +563,14 @@ std::string normalize_media_markers(const std::string & prompt, const size_t med
   replace_all_inplace(normalized, "<|image|>", marker);
   replace_all_inplace(normalized, "<img>", marker);
   replace_all_inplace(normalized, "<|img|>", marker);
+  replace_all_inplace(
+      normalized,
+      "<|vision_start|><|image_pad|><|vision_end|>",
+      marker);
+  replace_all_inplace(
+      normalized,
+      "<|vision_start|><|video_pad|><|vision_end|>",
+      marker);
   replace_all_inplace(normalized, "<audio>", marker);
   replace_all_inplace(normalized, "<|audio|>", marker);
 
@@ -861,7 +869,12 @@ int32_t next_token_impl() {
     return 0;
   }
 
-  g_last_piece = token_to_piece(token, true);
+  if (llama_vocab_is_control(g_state.vocab, token)) {
+    end_generation_state();
+    return 0;
+  }
+
+  g_last_piece = token_to_piece(token, false);
   g_last_output += g_last_piece;
 
   llama_token token_for_decode = token;
