@@ -563,6 +563,14 @@ std::string normalize_media_markers(const std::string & prompt, const size_t med
   replace_all_inplace(normalized, "<|image|>", marker);
   replace_all_inplace(normalized, "<img>", marker);
   replace_all_inplace(normalized, "<|img|>", marker);
+  replace_all_inplace(
+      normalized,
+      "<|vision_start|><|image_pad|><|vision_end|>",
+      marker);
+  replace_all_inplace(
+      normalized,
+      "<|vision_start|><|video_pad|><|vision_end|>",
+      marker);
   replace_all_inplace(normalized, "<audio>", marker);
   replace_all_inplace(normalized, "<|audio|>", marker);
 
