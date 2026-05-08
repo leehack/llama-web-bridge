@@ -57,7 +57,7 @@ This repo includes a wasm build gate in:
 
 - `.github/workflows/ci.yml`
 
-It builds against pinned `llama.cpp` tag `b8157` and uploads build artifacts.
+It builds against pinned `llama.cpp` tag `b9016` and uploads build artifacts.
 
 ## Publishing
 
@@ -93,7 +93,7 @@ Manual override example:
 2. Inputs:
    - `assets_tag`: `v0.1.5`
    - `assets_repo`: `leehack/llama-web-bridge-assets`
-   - `llama_cpp_tag`: `b8157`
+   - `llama_cpp_tag`: `b9016`
 
 After publish, assets are CDN-available at:
 
