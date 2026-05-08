@@ -11,7 +11,7 @@ jobs:
     name: Build WebGPU Bridge (WASM)
     runs-on: ubuntu-latest
     env:
-      LLAMA_CPP_TAG: b8157
+      LLAMA_CPP_TAG: b9016
     steps:
       - uses: actions/checkout@v4
 
@@ -27,13 +27,17 @@ jobs:
       - name: Build bridge artifacts
         env:
           OUT_DIR: ${{ runner.temp }}/webgpu_bridge_dist
+          WEBGPU_BRIDGE_BUILD_MEM64: 1
         run: ./scripts/build_bridge.sh
 
       - name: Verify outputs
         run: |
           test -f "${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_bridge.js"
+          test -f "${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_bridge_worker.js"
           test -f "${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_core.js"
           test -f "${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_core.wasm"
+          test -f "${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_core_mem64.js"
+          test -f "${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_core_mem64.wasm"
 
       - name: Upload bridge artifacts
         uses: actions/upload-artifact@v4
@@ -41,5 +45,8 @@ jobs:
           name: webgpu-bridge-dist
           path: |
             ${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_bridge.js
+            ${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_bridge_worker.js
             ${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_core.js
             ${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_core.wasm
+            ${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_core_mem64.js
+            ${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_core_mem64.wasm

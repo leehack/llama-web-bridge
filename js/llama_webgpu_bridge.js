@@ -108,6 +108,44 @@ function parsePositiveInteger(value) {
   return Math.trunc(numeric);
 }
 
+function parseInteger(value, fallback = 0) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) {
+    return fallback;
+  }
+  return Math.trunc(numeric);
+}
+
+function parseBooleanFlag(value, fallback = false) {
+  if (typeof value === 'boolean') {
+    return value;
+  }
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return value !== 0;
+  }
+  return fallback;
+}
+
+function parseOptionalBooleanFlag(value) {
+  if (typeof value === 'boolean') {
+    return value ? 1 : 0;
+  }
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return value !== 0 ? 1 : 0;
+  }
+  return -1;
+}
+
+function parseEnumValue(value, allowed, fallback) {
+  const parsed = parseInteger(value, fallback);
+  return allowed.includes(parsed) ? parsed : fallback;
+}
+
+function parsePositiveNumber(value) {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) && numeric > 0 ? numeric : 0;
+}
+
 function parseTotalFromContentRangeHeader(contentRangeHeader) {
   if (typeof contentRangeHeader !== 'string' || contentRangeHeader.length === 0) {
     return 0;
@@ -1329,6 +1367,17 @@ class LlamaWebGpuBridgeRuntime {
     this._nGpuLayers = Number.isFinite(config.nGpuLayers)
       ? Number(config.nGpuLayers)
       : -1;
+    this._nSeqMax = 0;
+    this._useMmap = false;
+    this._useMlock = false;
+    this._flashAttention = -1;
+    this._cacheTypeK = 1;
+    this._cacheTypeV = 1;
+    this._kvUnified = -1;
+    this._ropeFrequencyBase = 0;
+    this._ropeFrequencyScale = 0;
+    this._splitMode = -1;
+    this._mainGpu = -1;
     this._isSafari = isSafariUserAgent(this._config.userAgent ?? globalThis.navigator?.userAgent ?? '');
     this._coreVariant = 'uninitialized';
     this._preferMemory64 = this._config.preferMemory64 !== false;
@@ -1963,6 +2012,70 @@ class LlamaWebGpuBridgeRuntime {
     }
   }
 
+  _resolveNativeLoadOptions(options = {}) {
+    this._nSeqMax = parsePositiveInteger(options.nSeqMax);
+    this._useMmap = parseBooleanFlag(options.useMmap, false);
+    this._useMlock = parseBooleanFlag(options.useMlock, false);
+    this._flashAttention = parseEnumValue(options.flashAttention, [-1, 0, 1], -1);
+    this._cacheTypeK = parseEnumValue(options.cacheTypeK, [1, 2, 8], 1);
+    this._cacheTypeV = parseEnumValue(options.cacheTypeV, [1, 2, 8], 1);
+    this._kvUnified = parseOptionalBooleanFlag(options.kvUnified);
+    this._ropeFrequencyBase = parsePositiveNumber(options.ropeFrequencyBase);
+    this._ropeFrequencyScale = parsePositiveNumber(options.ropeFrequencyScale);
+    this._splitMode = parseEnumValue(options.splitMode, [0, 1, 2, 3], -1);
+    this._mainGpu = parseInteger(options.mainGpu, -1);
+    if (this._mainGpu < 0) {
+      this._mainGpu = -1;
+    }
+
+    const wantsQuantizedKvCache = this._cacheTypeK !== 1 || this._cacheTypeV !== 1;
+    if (this._flashAttention === 0 && wantsQuantizedKvCache) {
+      throw new Error(
+        'Non-F16 KV cache requires flashAttention to be auto or enabled.',
+      );
+    }
+    if (this._flashAttention === -1 && wantsQuantizedKvCache) {
+      this._flashAttention = 1;
+      this._runtimeNotes.push('flash_attention:auto_enabled_for_kv_cache');
+    }
+    if (this._kvUnified < 0 && this._nSeqMax > 1) {
+      this._kvUnified = 1;
+      this._runtimeNotes.push('kv_unified:auto_enabled_for_sequences');
+    }
+  }
+
+  _nativeLoadOptionValues() {
+    return [
+      this._nSeqMax,
+      this._useMmap ? 1 : 0,
+      this._useMlock ? 1 : 0,
+      this._flashAttention,
+      this._cacheTypeK,
+      this._cacheTypeV,
+      this._kvUnified,
+      this._ropeFrequencyBase,
+      this._ropeFrequencyScale,
+      this._splitMode,
+      this._mainGpu,
+    ];
+  }
+
+  _nativeLoadOptionTypes() {
+    return [
+      'number',
+      'number',
+      'number',
+      'number',
+      'number',
+      'number',
+      'number',
+      'number',
+      'number',
+      'number',
+      'number',
+    ];
+  }
+
   async _tryLoadModelFromRemoteFetchBackend(core, url, options = {}) {
     if (!this._canUseRemoteFetchBackend(options)) {
       return { loaded: false, sizeBytes: null };
@@ -2031,6 +2144,7 @@ class LlamaWebGpuBridgeRuntime {
             'number',
             'number',
             'number',
+            ...this._nativeLoadOptionTypes(),
           ],
           [
             remoteFetchUrl,
@@ -2041,6 +2155,7 @@ class LlamaWebGpuBridgeRuntime {
             this._nUbatch,
             this._nGpuLayers,
             chunkBytes,
+            ...this._nativeLoadOptionValues(),
           ],
           { async: true },
         ),
@@ -2926,6 +3041,8 @@ class LlamaWebGpuBridgeRuntime {
       this._nUbatch = this._nBatch;
     }
 
+    this._resolveNativeLoadOptions(options);
+
     if (Number.isFinite(this._threadPoolSizeHint) && this._threadPoolSizeHint > 0) {
       this._pushRuntimeNote(`thread_pool_size:${this._threadPoolSizeHint}`);
     }
@@ -2946,6 +3063,9 @@ class LlamaWebGpuBridgeRuntime {
     }
     if (this._nUbatch > 0) {
       this._pushRuntimeNote(`n_ubatch:${this._nUbatch}`);
+    }
+    if (this._nSeqMax > 0) {
+      this._pushRuntimeNote(`n_seq_max:${this._nSeqMax}`);
     }
     if (isCpuModelMode && !Number.isFinite(requestedBatch) && !Number.isFinite(requestedUbatch)) {
       this._runtimeNotes.push('cpu_batch_tuned_default');
@@ -3174,7 +3294,16 @@ class LlamaWebGpuBridgeRuntime {
             await core.ccall(
               'llamadart_webgpu_load_model',
               'number',
-              ['string', 'number', 'number', 'number', 'number', 'number', 'number'],
+              [
+                'string',
+                'number',
+                'number',
+                'number',
+                'number',
+                'number',
+                'number',
+                ...this._nativeLoadOptionTypes(),
+              ],
               [
                 this._modelPath,
                 this._nCtx,
@@ -3183,6 +3312,7 @@ class LlamaWebGpuBridgeRuntime {
                 this._nBatch,
                 this._nUbatch,
                 this._nGpuLayers,
+                ...this._nativeLoadOptionValues(),
               ],
               { async: true },
             ),
@@ -3307,6 +3437,7 @@ class LlamaWebGpuBridgeRuntime {
                   'number',
                   'number',
                   'number',
+                  ...this._nativeLoadOptionTypes(),
                 ],
                 [
                   reloadUrl,
@@ -3317,6 +3448,7 @@ class LlamaWebGpuBridgeRuntime {
                   this._nUbatch,
                   candidateLayers,
                   remoteFetchReloadChunkBytes,
+                  ...this._nativeLoadOptionValues(),
                 ],
                 { async: true },
               ),
@@ -3326,7 +3458,16 @@ class LlamaWebGpuBridgeRuntime {
               await core.ccall(
                 'llamadart_webgpu_load_model',
                 'number',
-                ['string', 'number', 'number', 'number', 'number', 'number', 'number'],
+                [
+                  'string',
+                  'number',
+                  'number',
+                  'number',
+                  'number',
+                  'number',
+                  'number',
+                  ...this._nativeLoadOptionTypes(),
+                ],
                 [
                   this._modelPath,
                   this._nCtx,
@@ -3335,6 +3476,7 @@ class LlamaWebGpuBridgeRuntime {
                   this._nBatch,
                   this._nUbatch,
                   candidateLayers,
+                  ...this._nativeLoadOptionValues(),
                 ],
                 { async: true },
               ),
@@ -4079,6 +4221,20 @@ class LlamaWebGpuBridgeRuntime {
       'llamadart.webgpu.n_threads_batch': String(this._threadsBatch),
       'llamadart.webgpu.n_batch': this._nBatch > 0 ? String(this._nBatch) : '',
       'llamadart.webgpu.n_ubatch': this._nUbatch > 0 ? String(this._nUbatch) : '',
+      'llamadart.webgpu.n_seq_max': this._nSeqMax > 0 ? String(this._nSeqMax) : '',
+      'llamadart.webgpu.flash_attention': String(this._flashAttention),
+      'llamadart.webgpu.cache_type_k': String(this._cacheTypeK),
+      'llamadart.webgpu.cache_type_v': String(this._cacheTypeV),
+      'llamadart.webgpu.kv_unified':
+        this._kvUnified >= 0 ? String(this._kvUnified) : '',
+      'llamadart.webgpu.rope_freq_base':
+        this._ropeFrequencyBase > 0 ? String(this._ropeFrequencyBase) : '',
+      'llamadart.webgpu.rope_freq_scale':
+        this._ropeFrequencyScale > 0 ? String(this._ropeFrequencyScale) : '',
+      'llamadart.webgpu.split_mode':
+        this._splitMode >= 0 ? String(this._splitMode) : '',
+      'llamadart.webgpu.main_gpu':
+        this._mainGpu >= 0 ? String(this._mainGpu) : '',
       'llamadart.webgpu.thread_pool_size':
         Number.isFinite(this._threadPoolSizeHint) && this._threadPoolSizeHint > 0
           ? String(this._threadPoolSizeHint)

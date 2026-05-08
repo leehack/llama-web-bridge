@@ -61,6 +61,9 @@ find_package(Threads REQUIRED)
 set(MTMD_AUDIO_SRC "${LLAMA_CPP_DIR}/tools/mtmd/mtmd-audio.cpp")
 set(MTMD_AUDIO_PATCHED "${CMAKE_BINARY_DIR}/generated/mtmd-audio-single-thread.cpp")
 
+file(GLOB LLAMADART_MTMD_MODEL_SOURCES
+    "${LLAMA_CPP_DIR}/tools/mtmd/models/*.cpp")
+
 file(READ "${MTMD_AUDIO_SRC}" MTMD_AUDIO_CONTENT)
 string(FIND "${MTMD_AUDIO_CONTENT}" "4,  // n_threads" MTMD_AUDIO_THREAD_MARKER_INDEX)
 if (MTMD_AUDIO_THREAD_MARKER_INDEX EQUAL -1)
@@ -74,39 +77,10 @@ string(REPLACE
 file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/generated")
 file(WRITE "${MTMD_AUDIO_PATCHED}" "${MTMD_AUDIO_CONTENT}")
 
-set(LLAMADART_MTMD_MODEL_SOURCES
-    "${LLAMA_CPP_DIR}/tools/mtmd/models/cogvlm.cpp"
-    "${LLAMA_CPP_DIR}/tools/mtmd/models/conformer.cpp"
-    "${LLAMA_CPP_DIR}/tools/mtmd/models/glm4v.cpp"
-    "${LLAMA_CPP_DIR}/tools/mtmd/models/internvl.cpp"
-    "${LLAMA_CPP_DIR}/tools/mtmd/models/kimivl.cpp"
-    "${LLAMA_CPP_DIR}/tools/mtmd/models/kimik25.cpp"
-    "${LLAMA_CPP_DIR}/tools/mtmd/models/llama4.cpp"
-    "${LLAMA_CPP_DIR}/tools/mtmd/models/llava.cpp"
-    "${LLAMA_CPP_DIR}/tools/mtmd/models/minicpmv.cpp"
-    "${LLAMA_CPP_DIR}/tools/mtmd/models/pixtral.cpp"
-    "${LLAMA_CPP_DIR}/tools/mtmd/models/qwen2vl.cpp"
-    "${LLAMA_CPP_DIR}/tools/mtmd/models/qwen3vl.cpp"
-    "${LLAMA_CPP_DIR}/tools/mtmd/models/siglip.cpp"
-    "${LLAMA_CPP_DIR}/tools/mtmd/models/whisper-enc.cpp"
-    "${LLAMA_CPP_DIR}/tools/mtmd/models/mobilenetv5.cpp"
-    "${LLAMA_CPP_DIR}/tools/mtmd/models/youtuvl.cpp"
-)
-
-set(LLAMADART_MTMD_OPTIONAL_MODEL_SOURCES
-    "${LLAMA_CPP_DIR}/tools/mtmd/models/nemotron-v2-vl.cpp"
-    "${LLAMA_CPP_DIR}/tools/mtmd/models/paddleocr.cpp"
-)
-
-foreach(model_source IN LISTS LLAMADART_MTMD_OPTIONAL_MODEL_SOURCES)
-    if (EXISTS "${model_source}")
-        list(APPEND LLAMADART_MTMD_MODEL_SOURCES "${model_source}")
-    endif()
-endforeach()
-
 add_library(llamadart_mtmd STATIC
     "${LLAMA_CPP_DIR}/tools/mtmd/mtmd.cpp"
     "${MTMD_AUDIO_PATCHED}"
+    "${LLAMA_CPP_DIR}/tools/mtmd/mtmd-image.cpp"
     "${LLAMA_CPP_DIR}/tools/mtmd/mtmd-helper.cpp"
     "${LLAMA_CPP_DIR}/tools/mtmd/clip.cpp"
     ${LLAMADART_MTMD_MODEL_SOURCES}
