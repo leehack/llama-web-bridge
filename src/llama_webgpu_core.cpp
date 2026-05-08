@@ -879,6 +879,17 @@ int32_t next_token_impl() {
   return 1;
 }
 
+bool is_supported_kv_cache_type(int32_t value) {
+  switch (value) {
+    case GGML_TYPE_F16:
+    case GGML_TYPE_Q4_0:
+    case GGML_TYPE_Q8_0:
+      return true;
+    default:
+      return false;
+  }
+}
+
 int32_t load_model_internal(
     const char * model_path,
     int32_t n_ctx,
@@ -887,12 +898,29 @@ int32_t load_model_internal(
     int32_t n_batch,
     int32_t n_ubatch,
     int32_t n_gpu_layers,
-    bool use_mmap) {
+    int32_t n_seq_max,
+    bool use_mmap,
+    bool use_mlock,
+    int32_t flash_attn_type,
+    int32_t type_k,
+    int32_t type_v,
+    int32_t kv_unified,
+    double rope_freq_base,
+    double rope_freq_scale,
+    int32_t split_mode,
+    int32_t main_gpu) {
   llama_model_params mparams = llama_model_default_params();
   mparams.n_gpu_layers = n_gpu_layers;
   mparams.use_mmap = use_mmap;
-  mparams.use_mlock = false;
+  mparams.use_mlock = use_mlock;
   mparams.vocab_only = false;
+  if (split_mode >= LLAMA_SPLIT_MODE_NONE &&
+      split_mode <= LLAMA_SPLIT_MODE_TENSOR) {
+    mparams.split_mode = static_cast<llama_split_mode>(split_mode);
+  }
+  if (main_gpu >= 0) {
+    mparams.main_gpu = main_gpu;
+  }
 
   g_state.model = llama_model_load_from_file(model_path, mparams);
   if (g_state.model == nullptr) {
@@ -903,6 +931,10 @@ int32_t load_model_internal(
   llama_context_params cparams = llama_context_default_params();
   if (n_ctx > 0) {
     cparams.n_ctx = static_cast<uint32_t>(n_ctx);
+  }
+
+  if (n_seq_max > 0) {
+    cparams.n_seq_max = static_cast<uint32_t>(n_seq_max);
   }
 
   if (n_threads > 0) {
@@ -929,6 +961,27 @@ int32_t load_model_internal(
 
   if (cparams.n_ubatch == 0 || cparams.n_ubatch > cparams.n_batch) {
     cparams.n_ubatch = std::min<uint32_t>(cparams.n_batch, 512U);
+  }
+
+  if (flash_attn_type >= LLAMA_FLASH_ATTN_TYPE_AUTO &&
+      flash_attn_type <= LLAMA_FLASH_ATTN_TYPE_ENABLED) {
+    cparams.flash_attn_type =
+        static_cast<llama_flash_attn_type>(flash_attn_type);
+  }
+  if (is_supported_kv_cache_type(type_k)) {
+    cparams.type_k = static_cast<ggml_type>(type_k);
+  }
+  if (is_supported_kv_cache_type(type_v)) {
+    cparams.type_v = static_cast<ggml_type>(type_v);
+  }
+  if (kv_unified >= 0) {
+    cparams.kv_unified = kv_unified != 0;
+  }
+  if (rope_freq_base > 0.0) {
+    cparams.rope_freq_base = static_cast<float>(rope_freq_base);
+  }
+  if (rope_freq_scale > 0.0) {
+    cparams.rope_freq_scale = static_cast<float>(rope_freq_scale);
   }
 
   const bool enable_gpu_ops = n_gpu_layers > 0;
@@ -997,7 +1050,18 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_load_model(
     int32_t n_threads_batch,
     int32_t n_batch,
     int32_t n_ubatch,
-    int32_t n_gpu_layers) {
+    int32_t n_gpu_layers,
+    int32_t n_seq_max,
+    int32_t use_mmap,
+    int32_t use_mlock,
+    int32_t flash_attn_type,
+    int32_t type_k,
+    int32_t type_v,
+    int32_t kv_unified,
+    double rope_freq_base,
+    double rope_freq_scale,
+    int32_t split_mode,
+    int32_t main_gpu) {
   clear_error();
   g_last_output.clear();
   g_cancel_requested = false;
@@ -1017,7 +1081,17 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_load_model(
       n_batch,
       n_ubatch,
       n_gpu_layers,
-      false);
+      n_seq_max,
+      use_mmap != 0,
+      use_mlock != 0,
+      flash_attn_type,
+      type_k,
+      type_v,
+      kv_unified,
+      rope_freq_base,
+      rope_freq_scale,
+      split_mode,
+      main_gpu);
 }
 
 EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_load_model_from_url(
@@ -1028,7 +1102,18 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_load_model_from_url(
     int32_t n_batch,
     int32_t n_ubatch,
     int32_t n_gpu_layers,
-    int32_t chunk_size) {
+    int32_t chunk_size,
+    int32_t n_seq_max,
+    int32_t use_mmap,
+    int32_t use_mlock,
+    int32_t flash_attn_type,
+    int32_t type_k,
+    int32_t type_v,
+    int32_t kv_unified,
+    double rope_freq_base,
+    double rope_freq_scale,
+    int32_t split_mode,
+    int32_t main_gpu) {
   clear_error();
   g_last_output.clear();
   g_cancel_requested = false;
@@ -1094,7 +1179,17 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_load_model_from_url(
           n_batch,
           n_ubatch,
           n_gpu_layers,
-          false);
+          n_seq_max,
+          use_mmap != 0,
+          use_mlock != 0,
+          flash_attn_type,
+          type_k,
+          type_v,
+          kv_unified,
+          rope_freq_base,
+          rope_freq_scale,
+          split_mode,
+          main_gpu);
   if (unlink(fetch_file_path.c_str()) != 0 && errno != ENOENT) {
     // best-effort cleanup of temporary fetch path
   }
