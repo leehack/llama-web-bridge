@@ -1436,6 +1436,19 @@ class LlamaWebGpuBridgeRuntime {
     }
 
     try {
+      if (typeof core.ccall === 'function') {
+        const compiledPoolSize = Number(
+          core.ccall('llamadart_webgpu_pthread_pool_size', 'number', [], []),
+        );
+        if (Number.isFinite(compiledPoolSize) && compiledPoolSize > 0) {
+          return Math.max(1, Math.trunc(compiledPoolSize));
+        }
+      }
+    } catch (_) {
+      // Ignore lookup failures and fall back to runtime heuristics.
+    }
+
+    try {
       const pThread = core.PThread;
       if (!pThread || typeof pThread !== 'object') {
         return null;

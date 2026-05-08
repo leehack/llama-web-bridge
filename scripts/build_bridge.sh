@@ -15,6 +15,7 @@ BUILD_MEM64="${WEBGPU_BRIDGE_BUILD_MEM64:-0}"
 MEM64_MAX_MEMORY="${WEBGPU_BRIDGE_MEM64_MAX_MEMORY:-12884901888}"
 ENABLE_PTHREADS="${WEBGPU_BRIDGE_PTHREADS:-1}"
 PTHREAD_POOL_SIZE="${WEBGPU_BRIDGE_PTHREAD_POOL_SIZE:-4}"
+PTHREAD_POOL_SIZE_STRICT="${WEBGPU_BRIDGE_PTHREAD_POOL_SIZE_STRICT:-0}"
 ALLOW_MEMORY_GROWTH="${WEBGPU_BRIDGE_ALLOW_MEMORY_GROWTH:-1}"
 INITIAL_MEMORY="${WEBGPU_BRIDGE_INITIAL_MEMORY:-0}"
 
@@ -43,6 +44,7 @@ Environment variables:
   WEBGPU_BRIDGE_MEM64_MAX_MEMORY  wasm64 max linear memory bytes (default: 12884901888)
   WEBGPU_BRIDGE_PTHREADS  Enable pthread runtime support (default: 1)
   WEBGPU_BRIDGE_PTHREAD_POOL_SIZE  PThread pool size when enabled (default: 4)
+  WEBGPU_BRIDGE_PTHREAD_POOL_SIZE_STRICT  PThread strictness when enabled (default: 0)
   WEBGPU_BRIDGE_ALLOW_MEMORY_GROWTH  Allow wasm memory growth (default: 1)
   WEBGPU_BRIDGE_INITIAL_MEMORY  Fixed wasm memory bytes when growth disabled
 
@@ -82,6 +84,7 @@ emcmake cmake \
   -DCMAKE_BUILD_TYPE="$CMAKE_BUILD_TYPE" \
   -DLLAMADART_WEBGPU_PTHREADS="$CMAKE_PTHREADS" \
   -DLLAMADART_WEBGPU_PTHREAD_POOL_SIZE="$PTHREAD_POOL_SIZE" \
+  -DLLAMADART_WEBGPU_PTHREAD_POOL_SIZE_STRICT="$PTHREAD_POOL_SIZE_STRICT" \
   -DLLAMADART_WEBGPU_ALLOW_MEMORY_GROWTH="$CMAKE_ALLOW_MEMORY_GROWTH" \
   -DLLAMADART_WEBGPU_INITIAL_MEMORY="$INITIAL_MEMORY"
 
@@ -116,6 +119,7 @@ if [[ "$BUILD_MEM64" == "1" ]]; then
     -DLLAMADART_WEBGPU_MEM64_MAX_MEMORY="$MEM64_MAX_MEMORY" \
     -DLLAMADART_WEBGPU_PTHREADS="$CMAKE_PTHREADS" \
     -DLLAMADART_WEBGPU_PTHREAD_POOL_SIZE="$PTHREAD_POOL_SIZE" \
+    -DLLAMADART_WEBGPU_PTHREAD_POOL_SIZE_STRICT="$PTHREAD_POOL_SIZE_STRICT" \
     -DLLAMADART_WEBGPU_ALLOW_MEMORY_GROWTH="$CMAKE_ALLOW_MEMORY_GROWTH" \
     -DLLAMADART_WEBGPU_INITIAL_MEMORY="$INITIAL_MEMORY"
 
@@ -136,27 +140,47 @@ if [[ "$BUILD_MEM64" == "1" ]]; then
   echo "[bridge] applying wasm64 runtime bigint interop patch"
   python3 - <<'PY' "$OUT_DIR/llama_webgpu_core_mem64.js"
 from pathlib import Path
+import re
 import sys
 
 target = Path(sys.argv[1])
 text = target.read_text(encoding='utf-8', errors='ignore')
 
-replacements = {
-    "__wasmfs_read(stream.fd,dataBuffer,length)": "__wasmfs_read(stream.fd,BigInt(dataBuffer),BigInt(length))",
-    "__wasmfs_read(stream.fd,dataBuffer,BigInt(length))": "__wasmfs_read(stream.fd,BigInt(dataBuffer),BigInt(length))",
-    "__wasmfs_pread(stream.fd,dataBuffer,length,BigInt(position))": "__wasmfs_pread(stream.fd,BigInt(dataBuffer),BigInt(length),BigInt(position))",
-    "__wasmfs_pread(stream.fd,dataBuffer,BigInt(length),BigInt(position))": "__wasmfs_pread(stream.fd,BigInt(dataBuffer),BigInt(length),BigInt(position))",
-    "__wasmfs_write(stream.fd,dataBuffer,length)": "__wasmfs_write(stream.fd,BigInt(dataBuffer),BigInt(length))",
-    "__wasmfs_write(stream.fd,dataBuffer,BigInt(length))": "__wasmfs_write(stream.fd,BigInt(dataBuffer),BigInt(length))",
-    "__wasmfs_pwrite(stream.fd,dataBuffer,length,BigInt(position))": "__wasmfs_pwrite(stream.fd,BigInt(dataBuffer),BigInt(length),BigInt(position))",
-    "__wasmfs_pwrite(stream.fd,dataBuffer,BigInt(length),BigInt(position))": "__wasmfs_pwrite(stream.fd,BigInt(dataBuffer),BigInt(length),BigInt(position))",
-    "__wasmfs_mmap(length,prot,flags,stream.fd,BigInt(offset))": "__wasmfs_mmap(BigInt(length),prot,flags,stream.fd,BigInt(offset))",
-}
+def bigint_or_name(name):
+    return rf"(?:BigInt\(\s*{name}\s*\)|{name})"
+
+data_buffer = bigint_or_name("dataBuffer")
+length = bigint_or_name("length")
+position = bigint_or_name("position")
+offset = bigint_or_name("offset")
+
+replacements = [
+    (
+        rf"__wasmfs_read\(\s*stream\.fd\s*,\s*{data_buffer}\s*,\s*{length}\s*\)",
+        "__wasmfs_read(stream.fd,BigInt(dataBuffer),BigInt(length))",
+    ),
+    (
+        rf"__wasmfs_pread\(\s*stream\.fd\s*,\s*{data_buffer}\s*,\s*{length}\s*,\s*{position}\s*\)",
+        "__wasmfs_pread(stream.fd,BigInt(dataBuffer),BigInt(length),BigInt(position))",
+    ),
+    (
+        rf"__wasmfs_write\(\s*stream\.fd\s*,\s*{data_buffer}\s*,\s*{length}\s*\)",
+        "__wasmfs_write(stream.fd,BigInt(dataBuffer),BigInt(length))",
+    ),
+    (
+        rf"__wasmfs_pwrite\(\s*stream\.fd\s*,\s*{data_buffer}\s*,\s*{length}\s*,\s*{position}\s*\)",
+        "__wasmfs_pwrite(stream.fd,BigInt(dataBuffer),BigInt(length),BigInt(position))",
+    ),
+    (
+        rf"__wasmfs_mmap\(\s*{length}\s*,\s*prot\s*,\s*flags\s*,\s*stream\.fd\s*,\s*{offset}\s*\)",
+        "__wasmfs_mmap(BigInt(length),prot,flags,stream.fd,BigInt(offset))",
+    ),
+]
 
 changed = False
-for old, new in replacements.items():
-    if old in text:
-        text = text.replace(old, new)
+for pattern, replacement in replacements:
+    text, count = re.subn(pattern, replacement, text)
+    if count > 0:
         changed = True
 
 if not changed:

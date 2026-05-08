@@ -32,6 +32,18 @@ Useful environment overrides:
 - `OUT_DIR`
 - `CMAKE_BUILD_TYPE`
 
+### Local Verification Notes
+
+When validating bridge runtime changes locally, keep build/cache output outside
+the repo so generated wasm artifacts and toolchain caches do not dirty the
+checkout or hit sandboxed Homebrew/cache paths:
+
+```bash
+export CCACHE_DIR=/private/tmp/llama_web_bridge_ccache
+export EM_CACHE=/private/tmp/llama_web_bridge_emcache
+BUILD_DIR=/private/tmp/llama_web_bridge_build MEM64_BUILD_DIR=/private/tmp/llama_web_bridge_build_mem64 OUT_DIR=/private/tmp/llama_web_bridge_dist WEBGPU_BRIDGE_BUILD_MEM64=1 ./scripts/build_bridge.sh
+```
+
 ## CI / Release
 
 - CI build gate: `.github/workflows/ci.yml`
@@ -52,3 +64,12 @@ After publishing assets tag:
 1. Update/fetch pinned bridge assets in `llamadart`:
    `WEBGPU_BRIDGE_ASSETS_TAG=<tag> ./scripts/fetch_webgpu_bridge_assets.sh`
 2. Update docs/changelog in `llamadart` if behavior changed.
+
+## Regression Smoke Guidance
+
+- For pthread/runtime changes, test a BERT-class embedding model in Chromium
+  with cross-origin isolation enabled. The regression shape is:
+  `loadModelFromUrl`, `tokenize`, `embed`, and `embedBatch` on a host where
+  `navigator.hardwareConcurrency` is greater than the bridge pthread pool size.
+- Run the smoke through both direct runtime (`disableWorker: true`) and the
+  bridge worker path; both should report `n_threads` capped to the pool size.
