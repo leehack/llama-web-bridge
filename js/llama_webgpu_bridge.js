@@ -4349,7 +4349,7 @@ export class LlamaWebGpuBridge {
       return false;
     }
 
-    const selectedOptions = this._createCpuSafeMultimodalLoadOptions(
+    const selectedOptions = this._sanitizeModelLoadOptions(
       this._loadedModelOptions || {},
     );
 
@@ -4455,15 +4455,29 @@ export class LlamaWebGpuBridge {
     }
 
     const forceReloadRequested = options?._llamadartForceRuntimeReload === true;
+    const mediaPartsRequested = this._hasMediaParts(options);
     const shouldEnsureMultimodalInRuntime =
-      this._hasMediaParts(options)
+      mediaPartsRequested
       && typeof this._loadedMmProjUrl === 'string'
       && this._loadedMmProjUrl.length > 0;
-    const forceCpuMultimodalFallback =
-      this._hasMediaParts(options)
-      && Number(this._loadedModelOptions?.nGpuLayers) !== 0;
+    const workerTimedOut = this._isWorkerTimeoutError(fallbackError);
+    const forcedCpuFallback = this._isForcedCpuMultimodalFallbackError(fallbackError);
+    const dispatchWorkgroupFallback = this._isDispatchWorkgroupLimitError(fallbackError);
+    const loadedGpuLayers = Number(this._loadedModelOptions?.nGpuLayers);
+    const metadataGpuLayers = Number(this._metadata?.['llamadart.webgpu.n_gpu_layers']);
+    const modelLoadedWithGpu = Number.isFinite(loadedGpuLayers)
+      ? loadedGpuLayers !== 0
+      : (Number.isFinite(metadataGpuLayers) ? metadataGpuLayers !== 0 : true);
+    const shouldUseCpuMultimodalFallback =
+      mediaPartsRequested
+      && modelLoadedWithGpu
+      && (dispatchWorkgroupFallback || forcedCpuFallback || workerTimedOut);
 
-    if (Number(this._runtime?._modelBytes) > 0 && !forceReloadRequested && !forceCpuMultimodalFallback) {
+    if (
+      Number(this._runtime?._modelBytes) > 0
+      && !forceReloadRequested
+      && !shouldUseCpuMultimodalFallback
+    ) {
       if (shouldEnsureMultimodalInRuntime) {
         const runtimeSupportsMedia =
           (typeof this._runtime.supportsVision === 'function' && this._runtime.supportsVision())
@@ -4484,26 +4498,17 @@ export class LlamaWebGpuBridge {
       return;
     }
 
-    const loadOptions = forceCpuMultimodalFallback
+    const loadOptions = shouldUseCpuMultimodalFallback
       ? this._createCpuSafeMultimodalLoadOptions(this._loadedModelOptions || {})
       : this._sanitizeModelLoadOptions(this._loadedModelOptions || {});
-    const workerTimedOut = this._isWorkerTimeoutError(fallbackError);
-    const forcedCpuFallback = this._isForcedCpuMultimodalFallbackError(fallbackError);
-    const shouldWarnCpuMultimodalFallback =
-      forceCpuMultimodalFallback
-      && (this._isDispatchWorkgroupLimitError(fallbackError)
-        || forcedCpuFallback
-        || Number(this._loadedModelOptions?.nGpuLayers) !== 0);
-
-    if (shouldWarnCpuMultimodalFallback) {
-      loadOptions.nGpuLayers = 0;
-      if (Number.isFinite(loadOptions.nCtx) && Number(loadOptions.nCtx) > 4096) {
-        loadOptions.nCtx = 4096;
-      }
-
+    if (shouldUseCpuMultimodalFallback) {
       if (forcedCpuFallback) {
         this._emitBridgeWarn(
           'llamadart: using CPU fallback for multimodal generation stability.',
+        );
+      } else if (workerTimedOut) {
+        this._emitBridgeWarn(
+          'llamadart: retrying multimodal generation with CPU fallback after worker timeout.',
         );
       } else {
         this._emitBridgeWarn(
@@ -4527,7 +4532,7 @@ export class LlamaWebGpuBridge {
       if (workerTimedOut) {
         this._runtime._runtimeNotes.push('worker_fallback_timeout');
       }
-      if (forceCpuMultimodalFallback) {
+      if (shouldUseCpuMultimodalFallback) {
         this._runtime._runtimeNotes.push('worker_fallback_cpu_multimodal');
       }
     }

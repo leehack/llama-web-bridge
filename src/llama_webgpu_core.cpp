@@ -869,12 +869,7 @@ int32_t next_token_impl() {
     return 0;
   }
 
-  if (llama_vocab_is_control(g_state.vocab, token)) {
-    end_generation_state();
-    return 0;
-  }
-
-  g_last_piece = token_to_piece(token, false);
+  g_last_piece = token_to_piece(token, true);
   g_last_output += g_last_piece;
 
   llama_token token_for_decode = token;
