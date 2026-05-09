@@ -1030,6 +1030,16 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_supports_pthreads() {
 #endif
 }
 
+EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_pthread_pool_size() {
+#if defined(__EMSCRIPTEN_PTHREADS__)
+  return LLAMADART_WEBGPU_PTHREAD_POOL_SIZE > 0
+      ? LLAMADART_WEBGPU_PTHREAD_POOL_SIZE
+      : 1;
+#else
+  return 1;
+#endif
+}
+
 EMSCRIPTEN_KEEPALIVE const char * llamadart_webgpu_backends_json() {
   refresh_backend_probe();
   return g_backend_json.c_str();

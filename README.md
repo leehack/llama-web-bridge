@@ -30,14 +30,18 @@ Useful environment variables:
 - `WEBGPU_BRIDGE_MEM64_MAX_MEMORY` (optional wasm64 max linear memory bytes)
 - `WEBGPU_BRIDGE_PTHREADS` (`1`/`0`, defaults to `1`)
 - `WEBGPU_BRIDGE_PTHREAD_POOL_SIZE` (defaults to `4`)
+- `WEBGPU_BRIDGE_PTHREAD_POOL_SIZE_STRICT` (defaults to `0`)
 
 Notes:
 
 - wasm64 builds default to `WEBGPU_BRIDGE_MEM64_MAX_MEMORY=12884901888` (12 GiB).
 - Large single-file remote model loading requires a cross-origin isolated page
   (`COOP`/`COEP`) so worker-thread runtime paths are available.
-- pthread builds enable `-sPTHREAD_POOL_SIZE_STRICT=2` so pool exhaustion
-  throws explicit errors instead of risking deadlock.
+- pthread builds preallocate `WEBGPU_BRIDGE_PTHREAD_POOL_SIZE` workers and cap
+  bridge-selected thread counts to that compiled pool size.
+  `WEBGPU_BRIDGE_PTHREAD_POOL_SIZE_STRICT` defaults to `0` so an unexpected
+  over-pool request does not hard-abort the wasm runtime, but it can be
+  overridden for stricter local diagnostics.
 
 Build outputs:
 
