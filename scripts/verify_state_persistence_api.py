@@ -91,6 +91,22 @@ def main() -> int:
         errors,
     )
     require(
+        "_worker.postMessage({ type: 'call', id, method, args }, transfers)" in JS,
+        "worker proxy calls must support transfer lists",
+        errors,
+    )
+    require(
+        "if (method === 'stateSaveBytes')" in JS
+        and "self.postMessage({ type: 'result', id, value }, transfers)" in JS,
+        "worker stateSaveBytes must transfer the state Uint8Array buffer back to the main thread",
+        errors,
+    )
+    require(
+        "[transferableBytes.buffer]" in JS,
+        "worker stateLoadBytes must transfer a copied state buffer into the worker",
+        errors,
+    )
+    require(
         "State persistence" in README and "stateSaveBytes" in README and "stateLoadBytes" in README,
         "README must document state persistence semantics and bytes APIs",
         errors,

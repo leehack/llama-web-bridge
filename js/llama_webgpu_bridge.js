@@ -984,6 +984,21 @@ function installBridgeWorkerHost() {
         return;
       }
 
+      if (method === 'stateSaveBytes') {
+        const value = await bridge.stateSaveBytes(args[0]);
+        const transfers = value && value.buffer instanceof ArrayBuffer
+          ? [value.buffer]
+          : [];
+        self.postMessage({ type: 'result', id, value }, transfers);
+        return;
+      }
+
+      if (method === 'stateLoadBytes') {
+        const value = await bridge.stateLoadBytes(args[0], args[1]);
+        self.postMessage({ type: 'result', id, value });
+        return;
+      }
+
       if (method === 'dispose') {
         const value = await bridge.dispose();
         self.postMessage({
@@ -1193,10 +1208,13 @@ class BridgeWorkerProxy {
     this._worker.postMessage({ type: 'init', config });
   }
 
-  async call(method, args, onEvent) {
+  async call(method, args, onEvent, transferList = []) {
     await this._ready;
     const id = this._nextId++;
     const timeoutMs = this._resolveRequestTimeoutMs(method);
+    const transfers = Array.isArray(transferList)
+      ? transferList.filter((item) => item != null)
+      : [];
 
     return new Promise((resolve, reject) => {
       let timeoutHandle = null;
@@ -1234,7 +1252,7 @@ class BridgeWorkerProxy {
           onEvent?.(event);
         },
       });
-      this._worker.postMessage({ type: 'call', id, method, args });
+      this._worker.postMessage({ type: 'call', id, method, args }, transfers);
     });
   }
 
@@ -5147,13 +5165,13 @@ export class LlamaWebGpuBridge {
     }
   }
 
-  async _callWorker(method, args, onEvent) {
+  async _callWorker(method, args, onEvent, transferList = []) {
     if (!this._workerProxy) {
       throw new Error('Bridge worker proxy is not available');
     }
 
     try {
-      const response = await this._workerProxy.call(method, args, onEvent);
+      const response = await this._workerProxy.call(method, args, onEvent, transferList);
       this._applyShadowState(response.state);
       return response.value;
     } catch (error) {
@@ -5586,7 +5604,13 @@ export class LlamaWebGpuBridge {
       throw new Error('State bytes are empty.');
     }
 
-    return this._callWorker('stateLoadBytes', [normalizedBytes, tokenCapacity]);
+    const transferableBytes = new Uint8Array(normalizedBytes);
+    return this._callWorker(
+      'stateLoadBytes',
+      [transferableBytes, tokenCapacity],
+      null,
+      [transferableBytes.buffer],
+    );
   }
 
   async detokenize(tokens, special = false) {
