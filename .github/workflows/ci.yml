@@ -11,7 +11,7 @@ jobs:
     name: Build WebGPU Bridge (WASM)
     runs-on: ubuntu-latest
     env:
-      LLAMA_CPP_TAG: b9016
+      LLAMA_CPP_TAG: b9116
     steps:
       - uses: actions/checkout@v4
 
