@@ -1504,12 +1504,22 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_state_load_file(
       restored_tokens.size(),
       &restored_count);
   if (!loaded) {
+    llama_memory_clear(llama_get_memory(g_state.ctx), false);
+    g_cached_prompt_tokens.clear();
+    g_last_output.clear();
+    g_last_piece.clear();
+    g_last_detokenized.clear();
     set_error(
         "Failed to load llama.cpp state file. The file may be corrupt, from a different model/build, or larger than tokenCapacity.");
     return -5;
   }
 
   if (restored_count > restored_tokens.size()) {
+    llama_memory_clear(llama_get_memory(g_state.ctx), false);
+    g_cached_prompt_tokens.clear();
+    g_last_output.clear();
+    g_last_piece.clear();
+    g_last_detokenized.clear();
     set_error("Loaded state token count exceeds token capacity");
     return -6;
   }

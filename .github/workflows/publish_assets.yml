@@ -194,7 +194,18 @@ jobs:
           SOURCE_COMMIT: ${{ github.sha }}
           LLAMA_CPP_TAG: ${{ env.LLAMA_CPP_TAG }}
         run: |
-          NOTES="Bridge assets published from ${SOURCE_REPO}@${SOURCE_COMMIT} (llama.cpp ${LLAMA_CPP_TAG})."
+          NOTES="$(cat <<EOF
+          Bridge assets published from ${SOURCE_REPO}@${SOURCE_COMMIT} (llama.cpp ${LLAMA_CPP_TAG}).
+
+          State persistence APIs included:
+          - stateSaveFile(path, tokens)
+          - stateLoadFile(path, tokenCapacity)
+          - stateSaveBytes(tokens)
+          - stateLoadBytes(bytes, tokenCapacity)
+
+          State snapshots are model/build/load-parameter coupled. File APIs use WASMFS-local paths; use byte APIs for app-managed durable storage.
+          EOF
+          )"
 
           if gh release view "$ASSETS_TAG" --repo "$ASSETS_REPO" >/dev/null 2>&1; then
             gh release edit "$ASSETS_TAG" \

@@ -89,35 +89,41 @@ def write_harness(web_root: Path) -> None:
     if (typeof LlamaWebGpuBridge !== 'function') {{
       throw new Error('LlamaWebGpuBridge export was not registered');
     }}
-    const bridge = new LlamaWebGpuBridge({{ disableWorker: true }});
     const methods = {methods_json};
-    const missing = methods.filter((name) => typeof bridge[name] !== 'function');
-    if (missing.length > 0) {{
-      throw new Error(`missing public state methods: ${{missing.join(', ')}}`);
-    }}
+    const verifyBridgeStateApi = async (bridge, mode) => {{
+      try {{
+        const missing = methods.filter((name) => typeof bridge[name] !== 'function');
+        if (missing.length > 0) {{
+          throw new Error(`${{mode}} missing public state methods: ${{missing.join(', ')}}`);
+        }}
 
-    let saveRejected = false;
-    try {{
-      await bridge.stateSaveBytes([]);
-    }} catch (error) {{
-      saveRejected = String(error && error.message ? error.message : error).includes('No model loaded');
-    }}
-    if (!saveRejected) {{
-      throw new Error('stateSaveBytes did not reject cleanly before model load');
-    }}
+        let saveRejected = false;
+        try {{
+          await bridge.stateSaveBytes([]);
+        }} catch (error) {{
+          saveRejected = String(error && error.message ? error.message : error).includes('No model loaded');
+        }}
+        if (!saveRejected) {{
+          throw new Error(`${{mode}} stateSaveBytes did not reject cleanly before model load`);
+        }}
 
-    let loadRejected = false;
-    try {{
-      await bridge.stateLoadBytes(new Uint8Array([0]), 1);
-    }} catch (error) {{
-      loadRejected = String(error && error.message ? error.message : error).includes('No model loaded');
-    }}
-    if (!loadRejected) {{
-      throw new Error('stateLoadBytes did not reject cleanly before model load');
-    }}
+        let loadRejected = false;
+        try {{
+          await bridge.stateLoadBytes(new Uint8Array([0]), 1);
+        }} catch (error) {{
+          loadRejected = String(error && error.message ? error.message : error).includes('No model loaded');
+        }}
+        if (!loadRejected) {{
+          throw new Error(`${{mode}} stateLoadBytes did not reject cleanly before model load`);
+        }}
+      }} finally {{
+        await bridge.dispose();
+      }}
+    }};
 
-    await bridge.dispose();
-    finish({{ ok: true, methods }});
+    await verifyBridgeStateApi(new LlamaWebGpuBridge({{ disableWorker: true }}), 'direct runtime');
+    await verifyBridgeStateApi(new LlamaWebGpuBridge({{ disableWorker: false }}), 'worker runtime');
+    finish({{ ok: true, methods, modes: ['direct runtime', 'worker runtime'] }});
   }} catch (error) {{
     finish({{ ok: false, error: String(error && error.stack ? error.stack : error) }});
   }}
@@ -214,6 +220,10 @@ def main() -> int:
     if payload.get("ok") is not True:
         return 1
     require(payload.get("methods") == list(REQUIRED_METHODS), "smoke methods payload mismatch")
+    require(
+        payload.get("modes") == ["direct runtime", "worker runtime"],
+        "smoke modes payload mismatch",
+    )
     return 0
 
 

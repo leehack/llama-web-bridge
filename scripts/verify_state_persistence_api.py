@@ -35,6 +35,30 @@ def method_count(name: str) -> int:
     return len(re.findall(rf"\basync\s+{re.escape(name)}\s*\(", JS))
 
 
+def extract_native_function(name: str) -> str:
+    match = re.search(
+        rf"EMSCRIPTEN_KEEPALIVE\s+int32_t\s+{re.escape(name)}\s*\(",
+        SRC,
+    )
+    if match is None:
+        return ""
+
+    brace = SRC.find("{", match.end())
+    if brace < 0:
+        return ""
+
+    depth = 0
+    for index in range(brace, len(SRC)):
+        char = SRC[index]
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return SRC[brace : index + 1]
+    return ""
+
+
 def main() -> int:
     errors: list[str] = []
 
@@ -59,6 +83,17 @@ def main() -> int:
     require(
         re.search(r"g_cached_prompt_tokens\s*=\s*restored_tokens", SRC) is not None,
         "state load must restore g_cached_prompt_tokens for prompt-prefix reuse",
+        errors,
+    )
+    load_wrapper = extract_native_function("llamadart_webgpu_state_load_file")
+    require(
+        "if (!loaded)" in load_wrapper
+        and "llama_memory_clear(llama_get_memory(g_state.ctx), false);" in load_wrapper
+        and "g_cached_prompt_tokens.clear();" in load_wrapper
+        and "g_last_output.clear();" in load_wrapper
+        and "g_last_piece.clear();" in load_wrapper
+        and "g_last_detokenized.clear();" in load_wrapper,
+        "state load failure must clear potentially stale KV/prompt-cache/output state",
         errors,
     )
     require(
@@ -109,6 +144,13 @@ def main() -> int:
     require(
         "State persistence" in README and "stateSaveBytes" in README and "stateLoadBytes" in README,
         "README must document state persistence semantics and bytes APIs",
+        errors,
+    )
+    require(
+        "stateSave*` snapshots the current llama.cpp context" in README
+        and "The `tokens` argument is stored" in README
+        and "`stateLoad*` requires `tokenCapacity`" in README,
+        "README must document snapshot timing, token metadata semantics, and tokenCapacity requirements",
         errors,
     )
 
