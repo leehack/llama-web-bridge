@@ -1,2 +1,6 @@
 .build/
 dist/
+a.out.js
+a.out.wasm
+__pycache__/
+*.py[cod]

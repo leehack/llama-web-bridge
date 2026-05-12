@@ -55,6 +55,40 @@ Optional outputs (when `WEBGPU_BRIDGE_BUILD_MEM64=1`):
 - `dist/llama_webgpu_core_mem64.js`
 - `dist/llama_webgpu_core_mem64.wasm`
 
+## State persistence
+
+The bridge exposes llama.cpp session/state persistence through both direct runtime
+and worker-backed `LlamaWebGpuBridge` instances:
+
+```js
+const tokens = await bridge.tokenize(prompt, true);
+await bridge.stateSaveFile('/prompt-state.bin', tokens);
+
+const restored = await bridge.stateLoadFile(
+  '/prompt-state.bin',
+  bridge.getContextSize(),
+);
+console.log(restored.tokens);
+
+const bytes = await bridge.stateSaveBytes(tokens);
+await bridge.stateLoadBytes(bytes, bridge.getContextSize());
+```
+
+State files are opaque llama.cpp state/session files. They are tied to the same
+model, llama.cpp build, and compatible runtime/model-load parameters. Loading a
+state file from a different model/build can fail.
+
+`stateSaveFile` and `stateLoadFile` operate on the active WASMFS instance. In a
+browser this filesystem is virtual and not durable by default, and worker-mode
+paths live inside the worker runtime. Use `stateSaveBytes` and `stateLoadBytes`
+when the application needs to persist snapshots in IndexedDB, OPFS, Cache API, or
+another app-managed durable store.
+
+State save/load is rejected while generation is active. On successful load the
+bridge restores the prompt token list returned as `{ tokens }`, so reissuing the
+same prompt can reuse the loaded KV state via the existing prompt-prefix reuse
+path.
+
 ## CI
 
 This repo includes a wasm build gate in:
