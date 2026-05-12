@@ -984,6 +984,21 @@ function installBridgeWorkerHost() {
         return;
       }
 
+      if (method === 'stateSaveBytes') {
+        const value = await bridge.stateSaveBytes(args[0]);
+        const transfers = value && value.buffer instanceof ArrayBuffer
+          ? [value.buffer]
+          : [];
+        self.postMessage({ type: 'result', id, value }, transfers);
+        return;
+      }
+
+      if (method === 'stateLoadBytes') {
+        const value = await bridge.stateLoadBytes(args[0], args[1]);
+        self.postMessage({ type: 'result', id, value });
+        return;
+      }
+
       if (method === 'dispose') {
         const value = await bridge.dispose();
         self.postMessage({
@@ -1193,10 +1208,13 @@ class BridgeWorkerProxy {
     this._worker.postMessage({ type: 'init', config });
   }
 
-  async call(method, args, onEvent) {
+  async call(method, args, onEvent, transferList = []) {
     await this._ready;
     const id = this._nextId++;
     const timeoutMs = this._resolveRequestTimeoutMs(method);
+    const transfers = Array.isArray(transferList)
+      ? transferList.filter((item) => item != null)
+      : [];
 
     return new Promise((resolve, reject) => {
       let timeoutHandle = null;
@@ -1234,7 +1252,7 @@ class BridgeWorkerProxy {
           onEvent?.(event);
         },
       });
-      this._worker.postMessage({ type: 'call', id, method, args });
+      this._worker.postMessage({ type: 'call', id, method, args }, transfers);
     });
   }
 
@@ -1340,6 +1358,7 @@ class LlamaWebGpuBridgeRuntime {
     this._mmSupportsVision = false;
     this._mmSupportsAudio = false;
     this._mediaFileCounter = 0;
+    this._stateFileCounter = 0;
     this._stagedMediaPaths = [];
     this._nCtx = 4096;
     this._abortRequested = false;
@@ -3544,6 +3563,7 @@ class LlamaWebGpuBridgeRuntime {
     this._mmSupportsVision = false;
     this._mmSupportsAudio = false;
     this._mediaFileCounter = 0;
+    this._stateFileCounter = 0;
     this._stagedMediaPaths = [];
     this._gpuActive = this._gpuActive && this._nGpuLayers > 0;
 
@@ -4135,6 +4155,125 @@ class LlamaWebGpuBridgeRuntime {
     return Array.isArray(parsed)
       ? parsed.map((v) => Number(v) | 0)
       : [];
+  }
+
+  _ensureStateDir() {
+    const core = this._core;
+    if (!core?.FS) {
+      throw new Error('Bridge filesystem is not initialized');
+    }
+
+    if (!core.FS.analyzePath('/states').exists) {
+      core.FS.mkdir('/states');
+    }
+  }
+
+  _normalizeStateTokens(tokens) {
+    const normalized = Array.isArray(tokens)
+      ? tokens
+      : Array.from(tokens || []);
+    return normalized.map((value) => Number(value) | 0);
+  }
+
+  _nextStateTempPath() {
+    this._ensureStateDir();
+    this._stateFileCounter += 1;
+    return `/states/state_${Date.now()}_${this._stateFileCounter}.bin`;
+  }
+
+  async stateSaveFile(path, tokens = []) {
+    if (this._modelBytes <= 0) {
+      throw new Error('No model loaded. Call loadModelFromUrl first.');
+    }
+    if (typeof path !== 'string' || path.length === 0) {
+      throw new Error('State file path is empty.');
+    }
+
+    const normalized = this._normalizeStateTokens(tokens);
+    const tokenText = JSON.stringify(normalized);
+    const rc = Number(
+      await this._core.ccall(
+        'llamadart_webgpu_state_save_file',
+        'number',
+        ['string', 'string'],
+        [path, tokenText],
+        { async: true },
+      ),
+    );
+
+    if (rc < 0) {
+      throw new Error(this._coreErrorMessage('State save failed', rc));
+    }
+
+    return true;
+  }
+
+  async stateLoadFile(path, tokenCapacity = this.getContextSize()) {
+    if (this._modelBytes <= 0) {
+      throw new Error('No model loaded. Call loadModelFromUrl first.');
+    }
+    if (typeof path !== 'string' || path.length === 0) {
+      throw new Error('State file path is empty.');
+    }
+
+    const capacity = Number(tokenCapacity) > 0
+      ? Math.trunc(Number(tokenCapacity))
+      : this.getContextSize();
+    const rc = Number(
+      await this._core.ccall(
+        'llamadart_webgpu_state_load_file',
+        'number',
+        ['string', 'number'],
+        [path, capacity],
+        { async: true },
+      ),
+    );
+
+    if (rc < 0) {
+      throw new Error(this._coreErrorMessage('State load failed', rc));
+    }
+
+    const raw = this._core.ccall('llamadart_webgpu_last_tokens_json', 'string', [], []) || '[]';
+    const parsed = JSON.parse(raw);
+    const restoredTokens = Array.isArray(parsed)
+      ? parsed.map((v) => Number(v) | 0)
+      : [];
+
+    return { tokens: restoredTokens };
+  }
+
+  async stateSaveBytes(tokens = []) {
+    if (this._modelBytes <= 0) {
+      throw new Error('No model loaded. Call loadModelFromUrl first.');
+    }
+
+    const tempPath = this._nextStateTempPath();
+    try {
+      await this.stateSaveFile(tempPath, tokens);
+      const bytes = this._core.FS.readFile(tempPath);
+      return bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes || []);
+    } finally {
+      this._deleteFsFile(tempPath);
+    }
+  }
+
+  async stateLoadBytes(bytes, tokenCapacity = this.getContextSize()) {
+    if (this._modelBytes <= 0) {
+      throw new Error('No model loaded. Call loadModelFromUrl first.');
+    }
+
+    const normalizedBytes = toUint8Array(bytes);
+    if (!normalizedBytes || normalizedBytes.length === 0) {
+      throw new Error('State bytes are empty.');
+    }
+
+    const tempPath = this._nextStateTempPath();
+    try {
+      this._core.FS.writeFile(tempPath, normalizedBytes);
+      return await this.stateLoadFile(tempPath, tokenCapacity);
+    } finally {
+      this._deleteFsFile(tempPath);
+    }
   }
 
   async detokenize(tokens, _special = false) {
@@ -5026,13 +5165,13 @@ export class LlamaWebGpuBridge {
     }
   }
 
-  async _callWorker(method, args, onEvent) {
+  async _callWorker(method, args, onEvent, transferList = []) {
     if (!this._workerProxy) {
       throw new Error('Bridge worker proxy is not available');
     }
 
     try {
-      const response = await this._workerProxy.call(method, args, onEvent);
+      const response = await this._workerProxy.call(method, args, onEvent, transferList);
       this._applyShadowState(response.state);
       return response.value;
     } catch (error) {
@@ -5423,6 +5562,55 @@ export class LlamaWebGpuBridge {
       await this._ensureRuntimeReadyAfterWorkerFallback({}, error);
       return this._runtime.tokenize(text, addSpecial);
     }
+  }
+
+  async stateSaveFile(path, tokens = []) {
+    if (!this._workerProxy) {
+      return this._runtime.stateSaveFile(path, tokens);
+    }
+
+    const normalized = Array.isArray(tokens)
+      ? tokens
+      : Array.from(tokens || []);
+    return this._callWorker('stateSaveFile', [path, normalized]);
+  }
+
+  async stateLoadFile(path, tokenCapacity = this.getContextSize()) {
+    if (!this._workerProxy) {
+      return this._runtime.stateLoadFile(path, tokenCapacity);
+    }
+
+    return this._callWorker('stateLoadFile', [path, tokenCapacity]);
+  }
+
+  async stateSaveBytes(tokens = []) {
+    if (!this._workerProxy) {
+      return this._runtime.stateSaveBytes(tokens);
+    }
+
+    const normalized = Array.isArray(tokens)
+      ? tokens
+      : Array.from(tokens || []);
+    return this._callWorker('stateSaveBytes', [normalized]);
+  }
+
+  async stateLoadBytes(bytes, tokenCapacity = this.getContextSize()) {
+    if (!this._workerProxy) {
+      return this._runtime.stateLoadBytes(bytes, tokenCapacity);
+    }
+
+    const normalizedBytes = toUint8Array(bytes);
+    if (!normalizedBytes || normalizedBytes.length === 0) {
+      throw new Error('State bytes are empty.');
+    }
+
+    const transferableBytes = new Uint8Array(normalizedBytes);
+    return this._callWorker(
+      'stateLoadBytes',
+      [transferableBytes, tokenCapacity],
+      null,
+      [transferableBytes.buffer],
+    );
   }
 
   async detokenize(tokens, special = false) {

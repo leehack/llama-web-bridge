@@ -13,7 +13,9 @@ This repository provides:
 Requirements:
 
 - Emscripten SDK (`emcmake`, `emcc`) in `PATH`
-- llama.cpp source checkout
+- llama.cpp source checkout at tag `b9116` or a compatible checkout exposing
+  `llama_state_save_file` / `llama_state_load_file` with the signatures used by
+  `src/llama_webgpu_core.cpp`
 
 Build command:
 
@@ -55,13 +57,71 @@ Optional outputs (when `WEBGPU_BRIDGE_BUILD_MEM64=1`):
 - `dist/llama_webgpu_core_mem64.js`
 - `dist/llama_webgpu_core_mem64.wasm`
 
+## State persistence
+
+The bridge exposes llama.cpp session/state persistence through both direct runtime
+and worker-backed `LlamaWebGpuBridge` instances.
+
+API:
+
+- `await bridge.stateSaveFile(path, tokens = []) -> true`
+- `await bridge.stateLoadFile(path, tokenCapacity = bridge.getContextSize()) -> { tokens }`
+- `await bridge.stateSaveBytes(tokens = []) -> Uint8Array`
+- `await bridge.stateLoadBytes(bytes, tokenCapacity = bridge.getContextSize()) -> { tokens }`
+
+`stateSave*` snapshots the current llama.cpp context; it does not tokenize or
+evaluate the supplied `tokens`. Save only after the prompt/prefix you want to
+restore has already been evaluated by the bridge, then pass the exact token
+sequence for that evaluated prompt/prefix:
+
+```js
+// After loadModelFromUrl(...) and after prompt/prefix evaluation:
+const prefixTokens = await bridge.tokenize(prefixText, true);
+await bridge.stateSaveFile('/prompt-state.bin', prefixTokens);
+
+const restored = await bridge.stateLoadFile(
+  '/prompt-state.bin',
+  bridge.getContextSize(),
+);
+console.log(restored.tokens);
+
+const bytes = await bridge.stateSaveBytes(prefixTokens);
+await bridge.stateLoadBytes(bytes, bridge.getContextSize());
+```
+
+State files are opaque llama.cpp state/session files. They are tied to the same
+model, llama.cpp build, and compatible runtime/model-load parameters. Loading a
+state file from a different model/build can fail.
+
+The `tokens` argument is stored in the llama.cpp state/session file and is
+returned by `stateLoad*`; it is not evaluated by `stateSave*` and is not validated
+against the KV cache. Passing the wrong token list can make later prompt-prefix
+reuse incorrect. Passing `[]` is allowed, but gives the bridge no restored
+prefix-token metadata to reuse.
+
+`stateLoad*` requires `tokenCapacity` to be positive, large enough for the stored
+token list, and no larger than the active context size. If omitted, the JS API
+uses `bridge.getContextSize()`. Empty `stateLoadBytes` input is rejected. All
+four state methods require a loaded model.
+
+`stateSaveFile` and `stateLoadFile` operate on the active WASMFS instance. In a
+browser this filesystem is virtual and not durable by default, and worker-mode
+paths live inside the worker runtime. Use `stateSaveBytes` and `stateLoadBytes`
+when the application needs to persist snapshots in IndexedDB, OPFS, Cache API, or
+another app-managed durable store.
+
+State save/load is rejected while generation is active. On successful load the
+bridge restores the prompt token list returned as `{ tokens }`, so reissuing the
+same prompt can reuse the loaded KV state via the existing prompt-prefix reuse
+path.
+
 ## CI
 
 This repo includes a wasm build gate in:
 
 - `.github/workflows/ci.yml`
 
-It builds against pinned `llama.cpp` tag `b9016` and uploads build artifacts.
+It builds against pinned `llama.cpp` tag `b9116` and uploads build artifacts.
 
 ## Publishing
 
@@ -97,7 +157,7 @@ Manual override example:
 2. Inputs:
    - `assets_tag`: `v0.1.5`
    - `assets_repo`: `leehack/llama-web-bridge-assets`
-   - `llama_cpp_tag`: `b9016`
+   - `llama_cpp_tag`: `b9116`
 
 After publish, assets are CDN-available at:
 

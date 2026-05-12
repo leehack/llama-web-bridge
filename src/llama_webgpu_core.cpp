@@ -1432,6 +1432,108 @@ EMSCRIPTEN_KEEPALIVE const char * llamadart_webgpu_last_tokens_json() {
   return g_last_tokens_json.c_str();
 }
 
+EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_state_save_file(
+    const char * state_path,
+    const char * token_text) {
+  clear_error();
+
+  if (!ensure_loaded()) {
+    return -1;
+  }
+
+  if (g_generation_active) {
+    set_error("State cannot be saved or loaded during active generation");
+    return -2;
+  }
+
+  if (state_path == nullptr || std::strlen(state_path) == 0) {
+    set_error("State file path is empty");
+    return -3;
+  }
+
+  std::vector<llama_token> tokens;
+  parse_token_list(token_text, tokens);
+
+  llama_synchronize(g_state.ctx);
+  const bool saved = llama_state_save_file(
+      g_state.ctx,
+      state_path,
+      tokens.empty() ? nullptr : tokens.data(),
+      tokens.size());
+  if (!saved) {
+    set_error("Failed to save llama.cpp state file");
+    return -4;
+  }
+
+  return 0;
+}
+
+EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_state_load_file(
+    const char * state_path,
+    int32_t token_capacity) {
+  clear_error();
+  g_last_tokens_json = "[]";
+
+  if (!ensure_loaded()) {
+    return -1;
+  }
+
+  if (g_generation_active) {
+    set_error("State cannot be saved or loaded during active generation");
+    return -2;
+  }
+
+  if (state_path == nullptr || std::strlen(state_path) == 0) {
+    set_error("State file path is empty");
+    return -3;
+  }
+
+  const int32_t n_ctx = static_cast<int32_t>(llama_n_ctx(g_state.ctx));
+  if (token_capacity <= 0 || token_capacity > n_ctx) {
+    set_error("State token capacity must be positive and not exceed context size");
+    return -4;
+  }
+
+  std::vector<llama_token> restored_tokens(static_cast<size_t>(token_capacity));
+  size_t restored_count = 0;
+  llama_synchronize(g_state.ctx);
+  const bool loaded = llama_state_load_file(
+      g_state.ctx,
+      state_path,
+      restored_tokens.data(),
+      restored_tokens.size(),
+      &restored_count);
+  if (!loaded) {
+    llama_memory_clear(llama_get_memory(g_state.ctx), false);
+    g_cached_prompt_tokens.clear();
+    g_last_output.clear();
+    g_last_piece.clear();
+    g_last_detokenized.clear();
+    set_error(
+        "Failed to load llama.cpp state file. The file may be corrupt, from a different model/build, or larger than tokenCapacity.");
+    return -5;
+  }
+
+  if (restored_count > restored_tokens.size()) {
+    llama_memory_clear(llama_get_memory(g_state.ctx), false);
+    g_cached_prompt_tokens.clear();
+    g_last_output.clear();
+    g_last_piece.clear();
+    g_last_detokenized.clear();
+    set_error("Loaded state token count exceeds token capacity");
+    return -6;
+  }
+
+  restored_tokens.resize(restored_count);
+  g_cached_prompt_tokens = restored_tokens;
+  g_last_tokens_json = serialize_tokens_json(restored_tokens);
+  g_last_output.clear();
+  g_last_piece.clear();
+  g_last_detokenized.clear();
+
+  return static_cast<int32_t>(restored_count);
+}
+
 EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_detokenize_from_json(
     const char * token_text,
     int32_t special) {
