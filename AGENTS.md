@@ -32,6 +32,21 @@ Useful environment overrides:
 - `OUT_DIR`
 - `CMAKE_BUILD_TYPE`
 
+## Agent PR Workflow
+
+For non-trivial runtime, workflow, or API changes, keep the PR path explicit:
+
+1. Start from a clean topic branch and inspect `git status` before editing.
+2. Add or update a regression/contract check before changing behavior when
+   practical. Static contract scripts are acceptable for workflow invariants.
+3. Keep Emscripten build directories, ccache, model caches, and Playwright
+   artifacts outside the repository unless they are intentionally versioned.
+4. Run the targeted checks in this file and the full browser smoke when the
+   change touches `js/`, `src/`, `scripts/`, or GitHub workflows.
+5. Use an independent review before committing PR-bound changes. Fix blocking
+   findings, rerun the targeted checks, then commit locally; do not push or open
+   a PR unless the maintainer asks.
+
 ### Local Verification Notes
 
 When validating bridge runtime changes locally, keep build/cache output outside
@@ -44,9 +59,44 @@ export EM_CACHE=/private/tmp/llama_web_bridge_emcache
 BUILD_DIR=/private/tmp/llama_web_bridge_build MEM64_BUILD_DIR=/private/tmp/llama_web_bridge_build_mem64 OUT_DIR=/private/tmp/llama_web_bridge_dist WEBGPU_BRIDGE_BUILD_MEM64=1 ./scripts/build_bridge.sh
 ```
 
+Minimum local checks before handing off a PR-ready branch:
+
+```bash
+node --check js/llama_webgpu_bridge.js
+node --check js/llama_webgpu_bridge_worker.js
+python3 -m py_compile scripts/verify_state_persistence_api.py scripts/verify_ci_reliability.py scripts/state_persistence_browser_smoke.py
+python3 scripts/verify_state_persistence_api.py
+python3 scripts/verify_ci_reliability.py
+```
+
+For state-persistence or workflow changes, also run the browser smoke against a
+built `OUT_DIR`. Keep the tiny model in a user cache or `/private/tmp`; do not
+commit downloaded GGUFs or smoke artifacts:
+
+```bash
+python3 -m pip install --user playwright
+python3 -m playwright install chromium
+python3 scripts/state_persistence_browser_smoke.py \
+  --dist-dir /private/tmp/llama_web_bridge_dist \
+  --model-url https://huggingface.co/aladar/llama-2-tiny-random-GGUF/resolve/main/llama-2-tiny-random.gguf \
+  --model-sha256 81f226c62d28ed4a1a9b9fa080fcd9f0cc40e0f9d5680036583ff98fbcd035cb \
+  --model-cache-dir ~/.cache/llama-web-bridge/state-smoke-models \
+  --artifacts-dir /private/tmp/llama_web_bridge_state_smoke_artifacts
+```
+
 ## CI / Release
 
 - CI build gate: `.github/workflows/ci.yml`
+- CI reliability contract: `scripts/verify_ci_reliability.py`
+  - Keep this script updated when changing browser smoke behavior, action
+    versions, or workflow diagnostics.
+  - The CI smoke must use a pinned tiny GGUF URL plus SHA-256, cache the model in
+    the same expanded `~/.cache/llama-web-bridge/state-smoke-models` directory
+    used by `actions/cache`, and upload `state-persistence-smoke-artifacts` on
+    failure.
+  - Both CI and publish workflows intentionally set
+    `FORCE_JAVASCRIPT_ACTIONS_TO_NODE24` so action-runtime regressions are caught
+    before Node 20 deprecation becomes a hard failure.
 - Publish workflow: `.github/workflows/publish_assets.yml`
   - Requires `WEBGPU_BRIDGE_ASSETS_PAT`
   - Pushes assets + tag to `llama-web-bridge-assets`
@@ -73,3 +123,11 @@ After publishing assets tag:
   `navigator.hardwareConcurrency` is greater than the bridge pthread pool size.
 - Run the smoke through both direct runtime (`disableWorker: true`) and the
   bridge worker path; both should report `n_threads` capped to the pool size.
+- For state persistence, exercise both direct and worker runtimes with a real
+  tiny model. The smoke should evaluate a prompt, save bytes, mutate state,
+  reload bytes, and verify generation still works after restore.
+- Worker and direct runtime filesystems are separate. Do not silently fall back
+  from worker-owned state APIs to direct runtime state; byte APIs are the durable
+  app-storage path for IndexedDB/OPFS/Cache API integrations.
+- If the smoke downloads a model, never expose raw signed/authenticated locations in
+  thrown errors or artifacts. Redact userinfo, query, and fragment values.
