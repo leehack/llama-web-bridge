@@ -38,6 +38,11 @@ def main() -> int:
             f"{name} must opt into Node 24 action runtime to catch Node 20 deprecation breakage early",
             errors,
         )
+        require(
+            "FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true" not in workflow,
+            f"{name} must quote FORCE_JAVASCRIPT_ACTIONS_TO_NODE24 so the workflow env value is a string",
+            errors,
+        )
 
     require(
         "--model-url" in smoke and "--model-sha256" in smoke,
@@ -77,6 +82,11 @@ def main() -> int:
     require(
         "state-persistence-smoke-artifacts" in ci and "if: failure()" in ci,
         "CI must upload browser smoke diagnostics on failure",
+        errors,
+    )
+    require(
+        "LLAMA_WEBGPU_SMOKE_ARTIFACTS_DIR: ${{ runner.temp }}" not in ci,
+        "CI must not use runner context in job-level env for smoke artifacts",
         errors,
     )
     require(

@@ -19,7 +19,7 @@ on:
       - 'v*'
 
 env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
   ASSETS_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.assets_tag || github.ref_name }}
   ASSETS_REPO: ${{ github.event_name == 'workflow_dispatch' && inputs.assets_repo || 'leehack/llama-web-bridge-assets' }}
   LLAMA_CPP_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.llama_cpp_tag || 'b9116' }}
