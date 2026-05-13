@@ -121,7 +121,39 @@ This repo includes a wasm build gate in:
 
 - `.github/workflows/ci.yml`
 
-It builds against pinned `llama.cpp` tag `b9116` and uploads build artifacts.
+It builds against pinned `llama.cpp` tag `b9116`, uploads build artifacts, and
+runs the static CI reliability contract:
+
+```bash
+python3 scripts/verify_ci_reliability.py
+```
+
+The reliability contract protects the browser smoke and workflow invariants that
+are easy to regress during agent-driven maintenance:
+
+- both CI and publish workflows opt into `FORCE_JAVASCRIPT_ACTIONS_TO_NODE24`
+  to catch action-runtime deprecation issues early;
+- the state-persistence browser smoke supports an integrity-checked tiny GGUF
+  model round trip;
+- the CI model cache path expands `~` before resolving so it matches the
+  `actions/cache` directory;
+- browser smoke failures upload `state-persistence-smoke-artifacts` with console
+  logs, result JSON, and screenshots when available.
+
+Run the model-backed smoke locally after building the bridge if a change touches
+state persistence, workers, browser smoke, or workflow diagnostics:
+
+```bash
+python3 scripts/state_persistence_browser_smoke.py \
+  --dist-dir /path/to/webgpu_bridge_dist \
+  --model-url https://huggingface.co/aladar/llama-2-tiny-random-GGUF/resolve/main/llama-2-tiny-random.gguf \
+  --model-sha256 81f226c62d28ed4a1a9b9fa080fcd9f0cc40e0f9d5680036583ff98fbcd035cb \
+  --model-cache-dir ~/.cache/llama-web-bridge/state-smoke-models \
+  --artifacts-dir /tmp/llama-web-bridge-state-smoke
+```
+
+Do not commit downloaded GGUFs, Playwright screenshots, console logs, generated
+`dist/` assets, or Emscripten build/cache directories.
 
 ## Publishing
 
