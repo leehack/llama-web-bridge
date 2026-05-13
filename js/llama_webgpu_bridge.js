@@ -4163,8 +4163,30 @@ class LlamaWebGpuBridgeRuntime {
       throw new Error('Bridge filesystem is not initialized');
     }
 
-    if (!core.FS.analyzePath('/states').exists) {
+    const hasStateDir = () => {
+      try {
+        const entries = core.FS.readdir('/');
+        return Array.isArray(entries) && entries.includes('states');
+      } catch (_) {
+        return false;
+      }
+    };
+
+    // Emscripten's generated FS.analyzePath can throw for existing directories in
+    // the pthread/browser runtime. Check the root directory listing instead so
+    // repeated bytes save/load round-trips do not retry mkdir('/states') and hit
+    // EEXIST after the first snapshot.
+    if (hasStateDir()) {
+      return;
+    }
+
+    try {
       core.FS.mkdir('/states');
+    } catch (error) {
+      if (hasStateDir()) {
+        return;
+      }
+      throw error;
     }
   }
 
