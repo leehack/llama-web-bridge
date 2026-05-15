@@ -1,6 +1,7 @@
 name: CI
 
 on:
+  workflow_dispatch:
   push:
     branches: [main]
   pull_request:
@@ -12,13 +13,22 @@ jobs:
     runs-on: ubuntu-latest
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
-      LLAMA_CPP_TAG: b9116
       LLAMA_WEBGPU_SMOKE_MODEL_URL: https://huggingface.co/aladar/llama-2-tiny-random-GGUF/resolve/main/llama-2-tiny-random.gguf
       LLAMA_WEBGPU_SMOKE_MODEL_SHA256: 81f226c62d28ed4a1a9b9fa080fcd9f0cc40e0f9d5680036583ff98fbcd035cb
       LLAMA_WEBGPU_SMOKE_MODEL_CACHE: ~/.cache/llama-web-bridge/state-smoke-models
       LLAMA_WEBGPU_SMOKE_ARTIFACTS_DIR: /tmp/state-persistence-smoke-artifacts
     steps:
       - uses: actions/checkout@v4
+
+      - name: Resolve llama.cpp pin
+        run: |
+          LLAMA_CPP_TAG="$(tr -d '[:space:]' < llama_cpp.version)"
+          if [ -z "$LLAMA_CPP_TAG" ]; then
+            echo "error: llama_cpp.version is empty"
+            exit 1
+          fi
+          echo "LLAMA_CPP_TAG=$LLAMA_CPP_TAG" >> "$GITHUB_ENV"
+          echo "Using llama.cpp ${LLAMA_CPP_TAG}"
 
       - name: Validate state persistence API contract
         run: python3 scripts/verify_state_persistence_api.py

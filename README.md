@@ -13,7 +13,7 @@ This repository provides:
 Requirements:
 
 - Emscripten SDK (`emcmake`, `emcc`) in `PATH`
-- llama.cpp source checkout at tag `b9116` or a compatible checkout exposing
+- llama.cpp source checkout matching `llama_cpp.version` or a compatible checkout exposing
   `llama_state_save_file` / `llama_state_load_file` with the signatures used by
   `src/llama_webgpu_core.cpp`
 
@@ -121,7 +121,7 @@ This repo includes a wasm build gate in:
 
 - `.github/workflows/ci.yml`
 
-It builds against pinned `llama.cpp` tag `b9116`, uploads build artifacts, and
+It builds against the pinned `llama.cpp` tag in `llama_cpp.version`, uploads build artifacts, and
 runs the static CI reliability contract:
 
 ```bash
@@ -131,6 +131,14 @@ python3 scripts/verify_ci_reliability.py
 The reliability contract protects the browser smoke and workflow invariants that
 are easy to regress during agent-driven maintenance:
 
+- both CI and publish workflows resolve the default llama.cpp tag from
+  `llama_cpp.version`, so tag-triggered asset publishes cannot silently rebuild
+  against a stale workflow default;
+- `.github/workflows/auto_llama_cpp_update.yml` opens or updates one stable
+  `automation/bump-llama-cpp` PR when a newer upstream release exists, with the
+  upstream release notes, compare link, and commit range in the PR body, then
+  dispatches the CI workflow on the automation branch so `GITHUB_TOKEN` branch
+  updates still get a head-SHA validation run;
 - both CI and publish workflows opt into `FORCE_JAVASCRIPT_ACTIONS_TO_NODE24`
   to catch action-runtime deprecation issues early;
 - the state-persistence browser smoke supports an integrity-checked tiny GGUF
@@ -175,6 +183,10 @@ Required repository secret:
 - `WEBGPU_BRIDGE_ASSETS_PAT` (token with write access to
   `leehack/llama-web-bridge-assets`)
 
+The publish workflow carries the resolved `llama.cpp` tag from the build job to
+the release job as an explicit job output, so the asset release notes match the
+`manifest.json` `llama_cpp_tag` value.
+
 Example publish:
 
 1. Create/push a release tag in this repo (for example `v0.1.5`)
@@ -189,7 +201,8 @@ Manual override example:
 2. Inputs:
    - `assets_tag`: `v0.1.5`
    - `assets_repo`: `leehack/llama-web-bridge-assets`
-   - `llama_cpp_tag`: `b9116`
+   - `llama_cpp_tag`: leave empty to use `llama_cpp.version`, or set an explicit
+     temporary override such as `b9165`
 
 After publish, assets are CDN-available at:
 
