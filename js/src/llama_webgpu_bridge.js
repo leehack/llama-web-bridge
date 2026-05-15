@@ -4948,9 +4948,14 @@ export class LlamaWebGpuBridge {
         ? config.preferMemory64
         : undefined,
       threads: Number(config.threads) > 0 ? Number(config.threads) : undefined,
+      threadsBatch: Number(config.threadsBatch) > 0
+        ? Number(config.threadsBatch)
+        : undefined,
       threadPoolSize: Number(config.threadPoolSize) > 0
         ? Number(config.threadPoolSize)
         : undefined,
+      nBatch: Number(config.nBatch) > 0 ? Number(config.nBatch) : undefined,
+      nUbatch: Number(config.nUbatch) > 0 ? Number(config.nUbatch) : undefined,
       nGpuLayers: Number.isFinite(config.nGpuLayers)
         ? Number(config.nGpuLayers)
         : undefined,
@@ -4969,6 +4974,7 @@ export class LlamaWebGpuBridge {
         ? Number(config.mediaMaxImageEdge)
         : undefined,
       disableImageDownscale: config.disableImageDownscale === true,
+      allowAutoRemoteFetchBackend: config.allowAutoRemoteFetchBackend === true,
       logLevel: Number.isFinite(config.logLevel) ? Number(config.logLevel) : 2,
     };
   }

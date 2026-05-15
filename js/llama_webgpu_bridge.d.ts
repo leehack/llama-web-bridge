@@ -16,6 +16,7 @@ export interface LlamaWebGpuBridgeConfig {
   workerModelLoadTimeoutMs?: number;
   workerMmprojLoadTimeoutMs?: number;
   workerCompletionTimeoutMs?: number;
+  workerGenerationStallTimeoutMs?: number;
   coreInitTimeoutMs?: number;
   cacheName?: string;
   threads?: number;
