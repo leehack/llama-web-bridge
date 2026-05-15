@@ -11,7 +11,7 @@ Published artifacts are consumed from `llama-web-bridge-assets`.
 
 - Emscripten SDK (`emcmake`, `emcc`)
 - CMake toolchain
-- Access to a llama.cpp checkout
+- Access to a llama.cpp checkout matching `llama_cpp.version`
 
 ## Setup
 
@@ -80,8 +80,15 @@ query strings, and fragments before printing the location.
 ## Agent Workflow Guardrails
 
 - Keep workflow reliability rules in `scripts/verify_ci_reliability.py` when
-  changing `.github/workflows/ci.yml`, `.github/workflows/publish_assets.yml`, or
+  changing `.github/workflows/ci.yml`, `.github/workflows/publish_assets.yml`,
+  `.github/workflows/auto_llama_cpp_update.yml`, or
   `scripts/state_persistence_browser_smoke.py`.
+- Preserve `llama_cpp.version` as the single source of truth for default CI and
+  publish builds. Manual publish overrides are allowed for temporary validation,
+  but tag-triggered publishes should use the pinned file.
+- The auto-update workflow manages the stable `automation/bump-llama-cpp` branch
+  and updates an existing PR instead of opening duplicates. It should include the
+  upstream release notes, compare link, and commit range in the PR body.
 - Preserve `FORCE_JAVASCRIPT_ACTIONS_TO_NODE24` in CI and publish workflows so
   GitHub Action runtime changes are detected before they become mandatory.
 - Upload state-persistence smoke diagnostics only on failure; successful CI runs
@@ -94,7 +101,8 @@ query strings, and fragments before printing the location.
 Use workflow `.github/workflows/publish_assets.yml`:
 
 1. Set input `assets_tag` (new tag).
-2. Optionally set `assets_repo` and `llama_cpp_tag`.
+2. Optionally set `assets_repo`; leave `llama_cpp_tag` empty to use
+   `llama_cpp.version`, or set it only for an explicit temporary override.
 3. Ensure `WEBGPU_BRIDGE_ASSETS_PAT` secret is configured.
 4. Workflow builds, generates `manifest.json`/`sha256sums.txt`, pushes to
    assets repo, and creates matching tag there.

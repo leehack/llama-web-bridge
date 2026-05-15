@@ -1,0 +1,152 @@
+name: Auto-update llama.cpp Pin
+
+on:
+  schedule:
+    # Weekday morning UTC, after upstream llama.cpp usually publishes release tags.
+    - cron: '17 10 * * 1-5'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: llama-cpp-auto-update
+  cancel-in-progress: true
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  VERSION_FILE: llama_cpp.version
+  UPDATE_BRANCH: automation/bump-llama-cpp
+
+jobs:
+  update-llama-cpp-pin:
+    name: Check for newer llama.cpp release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve update metadata
+        id: meta
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          CURRENT_TAG="$(tr -d '[:space:]' < "$VERSION_FILE")"
+          if [ -z "$CURRENT_TAG" ]; then
+            echo "error: $VERSION_FILE is empty"
+            exit 1
+          fi
+
+          LATEST_TAG="$(gh release list --repo ggml-org/llama.cpp --limit 1 --json tagName --jq '.[0].tagName')"
+          if [ -z "$LATEST_TAG" ] || [ "$LATEST_TAG" = "null" ]; then
+            echo "error: could not resolve latest ggml-org/llama.cpp release tag"
+            exit 1
+          fi
+
+          echo "current_tag=$CURRENT_TAG" >> "$GITHUB_OUTPUT"
+          echo "latest_tag=$LATEST_TAG" >> "$GITHUB_OUTPUT"
+
+          if [ "$CURRENT_TAG" = "$LATEST_TAG" ]; then
+            echo "update_needed=false" >> "$GITHUB_OUTPUT"
+            echo "skip_reason=$VERSION_FILE already points at $LATEST_TAG" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          for pr in $(gh pr list --repo "$GITHUB_REPOSITORY" --state open --json number,headRefName --jq ".[] | select(.headRefName != \"$UPDATE_BRANCH\") | .number"); do
+            if gh pr diff "$pr" --repo "$GITHUB_REPOSITORY" --name-only | grep -qx "$VERSION_FILE"; then
+              echo "update_needed=false" >> "$GITHUB_OUTPUT"
+              echo "skip_reason=PR #$pr already changes $VERSION_FILE; not racing a non-automation PR" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          done
+
+          printf '%s\n' "$LATEST_TAG" > "$VERSION_FILE"
+
+          RELEASE_URL="$(gh release view "$LATEST_TAG" --repo ggml-org/llama.cpp --json url --jq '.url')"
+          COMPARE_URL="https://github.com/ggml-org/llama.cpp/compare/${CURRENT_TAG}...${LATEST_TAG}"
+          echo "release_url=$RELEASE_URL" >> "$GITHUB_OUTPUT"
+          echo "compare_url=$COMPARE_URL" >> "$GITHUB_OUTPUT"
+          echo "update_needed=true" >> "$GITHUB_OUTPUT"
+
+          gh release view "$LATEST_TAG" --repo ggml-org/llama.cpp --json body --jq '.body // ""' > /tmp/llama_cpp_release_notes.md
+          gh api "repos/ggml-org/llama.cpp/compare/${CURRENT_TAG}...${LATEST_TAG}" \
+            --jq '.commits[:80][] | "- " + (.commit.message | split("\n")[0]) + " (`" + (.sha[0:7]) + "`)"' \
+            > /tmp/llama_cpp_commits.md || true
+
+          {
+            echo "## llama.cpp update"
+            echo
+            echo "- Previous pin: \`$CURRENT_TAG\`"
+            echo "- New pin: \`$LATEST_TAG\`"
+            echo "- Upstream release: $RELEASE_URL"
+            echo "- Compare: $COMPARE_URL"
+            echo
+            echo "## Upstream changelog"
+            echo
+            echo "<details>"
+            echo "<summary>Release notes for $LATEST_TAG</summary>"
+            echo
+            if [ -s /tmp/llama_cpp_release_notes.md ]; then
+              cat /tmp/llama_cpp_release_notes.md
+            else
+              echo "No GitHub release notes were published for this tag. Use the compare link above as the source of truth."
+            fi
+            echo
+            echo "</details>"
+            echo
+            echo "## Commit range"
+            echo
+            echo "<details>"
+            echo "<summary>Commits from $CURRENT_TAG to $LATEST_TAG (first 80)</summary>"
+            echo
+            if [ -s /tmp/llama_cpp_commits.md ]; then
+              cat /tmp/llama_cpp_commits.md
+            else
+              echo "Commit list unavailable; see $COMPARE_URL."
+            fi
+            echo
+            echo "</details>"
+            echo
+            echo "## Web bridge review focus"
+            echo
+            echo "Please pay extra attention to upstream changes touching:"
+            echo
+            echo "- WebGPU, WASM, Emscripten, pthreads, or memory64 build behavior"
+            echo "- ggml backend APIs used by the bridge"
+            echo "- model loading, tokenizer, chat template, context/state persistence, or cache semantics"
+            echo "- CMake/build flags that can affect the generated JS/WASM artifacts"
+            echo
+            echo "## Validation"
+            echo
+            echo "- [ ] Emscripten build passed"
+            echo "- [ ] Browser WebGPU/state-persistence smoke passed"
+            echo "- [ ] Generated bridge artifacts include wasm32 and memory64 outputs"
+            echo "- [ ] No stale hard-coded llama.cpp tag remains in CI/publish defaults"
+            echo
+            echo "## Automation behavior"
+            echo
+            echo "This PR is managed from the stable branch \`$UPDATE_BRANCH\`. If another llama.cpp release appears before merge, the scheduled workflow updates this same PR instead of opening a duplicate. The workflow skips if a non-automation PR already changes \`$VERSION_FILE\`."
+          } > /tmp/llama_cpp_update_pr.md
+
+      - name: Report skip reason
+        if: steps.meta.outputs.update_needed == 'false'
+        run: echo "${{ steps.meta.outputs.skip_reason }}"
+
+      - name: Create or update llama.cpp bump PR
+        if: steps.meta.outputs.update_needed == 'true'
+        uses: peter-evans/create-pull-request@v7
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          branch: ${{ env.UPDATE_BRANCH }}
+          base: main
+          delete-branch: true
+          title: 'chore: bump llama.cpp to ${{ steps.meta.outputs.latest_tag }}'
+          commit-message: 'chore: bump llama.cpp to ${{ steps.meta.outputs.latest_tag }}'
+          body-path: /tmp/llama_cpp_update_pr.md
+          labels: |
+            dependencies
+            automated

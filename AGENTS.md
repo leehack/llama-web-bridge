@@ -27,7 +27,8 @@ Common maintainer sibling layout:
 
 Useful environment overrides:
 
-- `LLAMA_CPP_DIR`
+- `LLAMA_CPP_DIR` (defaults to `third_party/llama_cpp`; CI clones the tag from
+  `llama_cpp.version`)
 - `BUILD_DIR`
 - `OUT_DIR`
 - `CMAKE_BUILD_TYPE`
@@ -87,6 +88,16 @@ python3 scripts/state_persistence_browser_smoke.py \
 ## CI / Release
 
 - CI build gate: `.github/workflows/ci.yml`
+  - Resolves the default llama.cpp checkout from `llama_cpp.version`.
+- Automated llama.cpp bump PR: `.github/workflows/auto_llama_cpp_update.yml`
+  - Runs on a schedule/manual dispatch, compares `llama_cpp.version` against the
+    latest `ggml-org/llama.cpp` release, and manages one stable
+    `automation/bump-llama-cpp` PR.
+  - The PR body must include the upstream release notes, compare URL, commit
+    range, and WebGPU/WASM review focus. If a newer upstream release appears
+    while the PR is still open, update the same PR instead of opening a duplicate.
+  - Skip instead of racing when a non-automation PR already changes
+    `llama_cpp.version`.
 - CI reliability contract: `scripts/verify_ci_reliability.py`
   - Keep this script updated when changing browser smoke behavior, action
     versions, or workflow diagnostics.
@@ -98,6 +109,8 @@ python3 scripts/state_persistence_browser_smoke.py \
     `FORCE_JAVASCRIPT_ACTIONS_TO_NODE24` so action-runtime regressions are caught
     before Node 20 deprecation becomes a hard failure.
 - Publish workflow: `.github/workflows/publish_assets.yml`
+  - Defaults to `llama_cpp.version`; workflow-dispatch `llama_cpp_tag` is only a
+    temporary explicit override.
   - Requires `WEBGPU_BRIDGE_ASSETS_PAT`
   - Pushes assets + tag to `llama-web-bridge-assets`
 
