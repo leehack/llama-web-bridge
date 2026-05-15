@@ -5,7 +5,8 @@ Reusable llama.cpp web bridge runtime (JS + WASM).
 This repository provides:
 
 - `src/llama_webgpu_core.cpp` (native bridge core)
-- `js/llama_webgpu_bridge.js` (JS runtime wrapper)
+- `js/src/llama_webgpu_bridge.js` (JS runtime wrapper source)
+- `js/llama_webgpu_bridge.js` (generated bundled browser ESM wrapper)
 - `CMakeLists.txt` for Emscripten builds
 
 ## Build
@@ -13,6 +14,7 @@ This repository provides:
 Requirements:
 
 - Emscripten SDK (`emcmake`, `emcc`) in `PATH`
+- Node.js/npm for the JS bridge build pipeline (`npm ci`, `npm run check:js`)
 - llama.cpp source checkout matching `llama_cpp.version` or a compatible checkout exposing
   `llama_state_save_file` / `llama_state_load_file` with the signatures used by
   `src/llama_webgpu_core.cpp`
@@ -20,8 +22,15 @@ Requirements:
 Build command:
 
 ```bash
+npm ci
+npm run check:js
 ./scripts/build_bridge.sh
 ```
+
+`./scripts/build_bridge.sh` also runs the JS bridge build before copying wrapper
+assets, but running `npm run check:js` explicitly is useful before PRs because it
+performs TypeScript `checkJs`, regenerates the checked-in browser ESM wrapper and
+declaration files with esbuild, and syntax-checks the generated bridge files.
 
 Useful environment variables:
 
@@ -49,6 +58,7 @@ Build outputs:
 
 - `dist/llama_webgpu_bridge.js`
 - `dist/llama_webgpu_bridge_worker.js`
+- `dist/llama_webgpu_bridge.d.ts`
 - `dist/llama_webgpu_core.js`
 - `dist/llama_webgpu_core.wasm`
 
@@ -121,8 +131,9 @@ This repo includes a wasm build gate in:
 
 - `.github/workflows/ci.yml`
 
-It builds against the pinned `llama.cpp` tag in `llama_cpp.version`, uploads build artifacts, and
-runs the static CI reliability contract:
+It builds against the pinned `llama.cpp` tag in `llama_cpp.version`, runs the JS
+bridge build/type-check gate, uploads build artifacts, and runs the static CI
+reliability contract:
 
 ```bash
 python3 scripts/verify_ci_reliability.py
@@ -131,6 +142,10 @@ python3 scripts/verify_ci_reliability.py
 The reliability contract protects the browser smoke and workflow invariants that
 are easy to regress during agent-driven maintenance:
 
+- both CI and publish workflows run `npm run check:js`, which TypeScript-checks
+  the JS source, regenerates the readable browser ESM wrapper/declaration files
+  with esbuild, and then fails on any stale checked-in generated output via
+  `git diff --exit-code`;
 - both CI and publish workflows resolve the default llama.cpp tag from
   `llama_cpp.version`, so tag-triggered asset publishes cannot silently rebuild
   against a stale workflow default;
@@ -206,10 +221,17 @@ Manual override example:
 
 After publish, assets are CDN-available at:
 
-- `https://cdn.jsdelivr.net/gh/leehack/llama-web-bridge-assets@v0.1.1/llama_webgpu_bridge.js`
-- `https://cdn.jsdelivr.net/gh/leehack/llama-web-bridge-assets@v0.1.1/llama_webgpu_bridge_worker.js`
-- `https://cdn.jsdelivr.net/gh/leehack/llama-web-bridge-assets@v0.1.1/llama_webgpu_core.js`
-- `https://cdn.jsdelivr.net/gh/leehack/llama-web-bridge-assets@v0.1.1/llama_webgpu_core.wasm`
+- `https://cdn.jsdelivr.net/gh/leehack/llama-web-bridge-assets@<tag>/llama_webgpu_bridge.js`
+- `https://cdn.jsdelivr.net/gh/leehack/llama-web-bridge-assets@<tag>/llama_webgpu_bridge_worker.js`
+- `https://cdn.jsdelivr.net/gh/leehack/llama-web-bridge-assets@<tag>/llama_webgpu_bridge.d.ts`
+- `https://cdn.jsdelivr.net/gh/leehack/llama-web-bridge-assets@<tag>/llama_webgpu_core.js`
+- `https://cdn.jsdelivr.net/gh/leehack/llama-web-bridge-assets@<tag>/llama_webgpu_core.wasm`
+
+When `WEBGPU_BRIDGE_BUILD_MEM64=1`, the assets repo also publishes optional
+memory64 core artifacts:
+
+- `https://cdn.jsdelivr.net/gh/leehack/llama-web-bridge-assets@<tag>/llama_webgpu_core_mem64.js`
+- `https://cdn.jsdelivr.net/gh/leehack/llama-web-bridge-assets@<tag>/llama_webgpu_core_mem64.wasm`
 
 Note: CDN pinning fundamentally relies on git tags in the assets repo.
 
