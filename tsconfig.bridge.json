@@ -11,5 +11,5 @@
     "lib": ["ES2022", "DOM", "WebWorker"],
     "types": []
   },
-  "include": ["js/src/**/*.js"]
+  "include": ["js/src/**/*.js", "js/src/**/*.d.ts"]
 }

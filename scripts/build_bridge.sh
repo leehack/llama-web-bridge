@@ -70,6 +70,11 @@ if ! command -v emcc >/dev/null 2>&1; then
   exit 1
 fi
 
+if ! command -v cmake >/dev/null 2>&1; then
+  echo "error: cmake not found in PATH"
+  exit 1
+fi
+
 if [[ ! -f "$LLAMA_CPP_DIR/CMakeLists.txt" && -f "$SIBLING_LLAMA_CPP_DIR/CMakeLists.txt" ]]; then
   LLAMA_CPP_DIR="$SIBLING_LLAMA_CPP_DIR"
 fi

@@ -3874,7 +3874,7 @@ var LlamaWebGpuBridge = class {
     if (typeof Worker === "undefined" || typeof Blob === "undefined" || typeof URL === "undefined" || typeof URL.createObjectURL !== "function") {
       return false;
     }
-    if (typeof this._config?.coreModuleFactory === "function") {
+    if (this._config?.coreModuleFactory != null) {
       return false;
     }
     return true;

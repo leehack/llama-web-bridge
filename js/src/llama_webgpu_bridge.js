@@ -4911,7 +4911,7 @@ export class LlamaWebGpuBridge {
       return false;
     }
 
-    if (typeof this._config?.coreModuleFactory === 'function') {
+    if (this._config?.coreModuleFactory != null) {
       return false;
     }
 
