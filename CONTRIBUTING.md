@@ -88,7 +88,8 @@ query strings, and fragments before printing the location.
   but tag-triggered publishes should use the pinned file.
 - The auto-update workflow manages the stable `automation/bump-llama-cpp` branch
   and updates an existing PR instead of opening duplicates. It should include the
-  upstream release notes, compare link, and commit range in the PR body.
+  upstream release notes, compare link, and commit range in the PR body, then
+  dispatch CI on the automation branch so bot-token updates are validated.
 - Preserve `FORCE_JAVASCRIPT_ACTIONS_TO_NODE24` in CI and publish workflows so
   GitHub Action runtime changes are detected before they become mandatory.
 - Upload state-persistence smoke diagnostics only on failure; successful CI runs
@@ -105,7 +106,8 @@ Use workflow `.github/workflows/publish_assets.yml`:
    `llama_cpp.version`, or set it only for an explicit temporary override.
 3. Ensure `WEBGPU_BRIDGE_ASSETS_PAT` secret is configured.
 4. Workflow builds, generates `manifest.json`/`sha256sums.txt`, pushes to
-   assets repo, and creates matching tag there.
+   assets repo, creates matching tag there, and uses the build job's resolved
+   `llama.cpp` tag output in release notes.
 
 ## Repository Boundaries
 

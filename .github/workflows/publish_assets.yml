@@ -31,10 +31,13 @@ jobs:
   build-bridge-assets:
     name: Build bridge assets
     runs-on: ubuntu-latest
+    outputs:
+      llama_cpp_tag: ${{ steps.resolve-publish-parameters.outputs.llama_cpp_tag }}
     steps:
       - uses: actions/checkout@v4
 
       - name: Resolve publish parameters
+        id: resolve-publish-parameters
         run: |
           if [ -n "$REQUESTED_LLAMA_CPP_TAG" ]; then
             LLAMA_CPP_TAG="$REQUESTED_LLAMA_CPP_TAG"
@@ -46,6 +49,7 @@ jobs:
             exit 1
           fi
           echo "LLAMA_CPP_TAG=$LLAMA_CPP_TAG" >> "$GITHUB_ENV"
+          echo "llama_cpp_tag=$LLAMA_CPP_TAG" >> "$GITHUB_OUTPUT"
           echo "event=${{ github.event_name }}"
           echo "assets_tag=${ASSETS_TAG}"
           echo "assets_repo=${ASSETS_REPO}"
@@ -200,6 +204,7 @@ jobs:
           GH_TOKEN: ${{ secrets.WEBGPU_BRIDGE_ASSETS_PAT }}
           ASSETS_TAG: ${{ env.ASSETS_TAG }}
           ASSETS_REPO: ${{ env.ASSETS_REPO }}
+          LLAMA_CPP_TAG: ${{ needs.build-bridge-assets.outputs.llama_cpp_tag }}
           SOURCE_REPO: ${{ github.repository }}
           SOURCE_COMMIT: ${{ github.sha }}
         run: |

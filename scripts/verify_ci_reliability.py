@@ -58,16 +58,20 @@ def main() -> int:
     require(
         "tr -d '[:space:]' < llama_cpp.version" in ci
         and "Resolve llama.cpp pin" in ci
+        and "workflow_dispatch:" in ci
         and "LLAMA_CPP_TAG: b9116" not in ci,
-        "ci.yml must resolve the llama.cpp tag from llama_cpp.version instead of a hard-coded stale default",
+        "ci.yml must resolve the llama.cpp tag from llama_cpp.version, support explicit dispatch, and avoid hard-coded stale defaults",
         errors,
     )
     require(
         "REQUESTED_LLAMA_CPP_TAG" in publish
         and "tr -d '[:space:]' < llama_cpp.version" in publish
+        and "outputs:" in publish
+        and "llama_cpp_tag: ${{ steps.resolve-publish-parameters.outputs.llama_cpp_tag }}" in publish
+        and "LLAMA_CPP_TAG: ${{ needs.build-bridge-assets.outputs.llama_cpp_tag }}" in publish
         and "default: b9116" not in publish
         and "|| 'b9116'" not in publish,
-        "publish_assets.yml must default to llama_cpp.version while still allowing a manual override",
+        "publish_assets.yml must default to llama_cpp.version, pass the resolved tag across jobs, and still allow a manual override",
         errors,
     )
     require(
@@ -76,10 +80,13 @@ def main() -> int:
         and "UPDATE_BRANCH: automation/bump-llama-cpp" in auto_update
         and "ggml-org/llama.cpp" in auto_update
         and "create-pull-request" in auto_update
+        and "actions: write" in auto_update
+        and "id: create-pr" in auto_update
+        and "gh workflow run ci.yml --repo \"$GITHUB_REPOSITORY\" --ref \"$UPDATE_BRANCH\"" in auto_update
         and "body-path: /tmp/llama_cpp_update_pr.md" in auto_update
         and "Upstream changelog" in auto_update
         and "not racing a non-automation PR" in auto_update,
-        "auto_llama_cpp_update.yml must update one stable PR branch with upstream changelog context and avoid racing human PRs",
+        "auto_llama_cpp_update.yml must update one stable PR branch with upstream changelog context, dispatch CI for bot updates, and avoid racing human PRs",
         errors,
     )
 

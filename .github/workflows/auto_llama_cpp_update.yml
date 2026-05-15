@@ -7,6 +7,7 @@ on:
   workflow_dispatch:
 
 permissions:
+  actions: write
   contents: write
   pull-requests: write
 
@@ -137,6 +138,7 @@ jobs:
         run: echo "${{ steps.meta.outputs.skip_reason }}"
 
       - name: Create or update llama.cpp bump PR
+        id: create-pr
         if: steps.meta.outputs.update_needed == 'true'
         uses: peter-evans/create-pull-request@v7
         with:
@@ -150,3 +152,21 @@ jobs:
           labels: |
             dependencies
             automated
+
+      - name: Dispatch CI for automation PR
+        if: steps.create-pr.outputs.pull-request-number != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            if gh workflow run ci.yml --repo "$GITHUB_REPOSITORY" --ref "$UPDATE_BRANCH"; then
+              break
+            fi
+            if [ "$attempt" = 3 ]; then
+              echo "error: failed to dispatch CI for $UPDATE_BRANCH after $attempt attempts"
+              exit 1
+            fi
+            sleep $((attempt * 5))
+          done
+          echo "Dispatched CI for #${{ steps.create-pr.outputs.pull-request-number }} on $UPDATE_BRANCH."
