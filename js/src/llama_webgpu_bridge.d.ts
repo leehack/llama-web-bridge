@@ -1,0 +1,122 @@
+export type LlamaCoreModuleFactory = (options?: Record<string, unknown>) => unknown | Promise<unknown>;
+
+export interface LlamaWebGpuBridgeConfig {
+  coreModuleUrl?: string;
+  coreModuleUrlMem64?: string;
+  wasmUrl?: string;
+  wasmUrlMem64?: string;
+  coreModuleFactory?: LlamaCoreModuleFactory | Promise<LlamaCoreModuleFactory>;
+  workerUrl?: string;
+  disableWorker?: boolean;
+  preferMemory64?: boolean;
+  workerRequestTimeoutMs?: number;
+  workerInitTimeoutMs?: number;
+  workerModelLoadTimeoutMs?: number;
+  workerMmprojLoadTimeoutMs?: number;
+  workerCompletionTimeoutMs?: number;
+  coreInitTimeoutMs?: number;
+  cacheName?: string;
+  threads?: number;
+  threadsBatch?: number;
+  threadPoolSize?: number;
+  nBatch?: number;
+  nUbatch?: number;
+  nGpuLayers?: number;
+  userAgent?: string;
+  remoteFetchThresholdBytes?: number;
+  remoteFetchChunkBytes?: number;
+  mediaMaxImagePixels?: number;
+  mediaMaxImageEdge?: number;
+  disableImageDownscale?: boolean;
+  allowAutoRemoteFetchBackend?: boolean;
+  logLevel?: string | number;
+  [key: string]: unknown;
+}
+
+export interface BridgeProgressEvent {
+  loaded?: number;
+  total?: number;
+  shard?: number;
+  shards?: number;
+  url?: string;
+  [key: string]: unknown;
+}
+
+export interface LoadModelOptions {
+  progressCallback?: (progress: BridgeProgressEvent) => void;
+  signal?: AbortSignal;
+  remoteFetchThresholdBytes?: number;
+  remoteFetchChunkBytes?: number;
+  [key: string]: unknown;
+}
+
+export type TokenEventEncoding = 'bytes' | 'text' | (string & {});
+
+export interface CompletionOptions {
+  onToken?: (piece: string | Uint8Array, currentText: string | null) => void;
+  signal?: AbortSignal;
+  warmup?: boolean;
+  emitCurrentTextOnToken?: boolean;
+  tokenEventEncoding?: TokenEventEncoding;
+  tokenEventFlushMs?: number;
+  tokenEventFlushChars?: number;
+  [key: string]: unknown;
+}
+
+export interface EmbedOptions {
+  [key: string]: unknown;
+}
+
+export type ModelMetadata = Record<string, unknown>;
+
+export interface StateLoadResult {
+  tokens: number[];
+}
+
+export function enableBridgeWorkerHost(): void;
+
+export class LlamaWebGpuBridge {
+  static supportsSafariAdaptiveGpu: boolean;
+
+  constructor(config?: LlamaWebGpuBridgeConfig);
+
+  loadModelFromUrl(url: string | string[], options?: LoadModelOptions): Promise<unknown>;
+  prefetchModelToCache(url: string | string[], options?: LoadModelOptions): Promise<unknown>;
+  evictModelFromCache(url: string | string[], options?: Record<string, unknown>): Promise<unknown>;
+
+  createCompletion(prompt: string, options?: CompletionOptions): Promise<string>;
+  tokenize(text: string, addSpecial?: boolean): Promise<number[]>;
+  detokenize(tokens: number[] | ArrayLike<number>, special?: boolean): Promise<string>;
+  applyChatTemplate(
+    messages: Array<Record<string, unknown>>,
+    addAssistant?: boolean,
+    customTemplate?: string | null,
+  ): Promise<string>;
+
+  stateSaveFile(path: string, tokens?: number[] | ArrayLike<number>): Promise<true>;
+  stateLoadFile(path: string, tokenCapacity?: number): Promise<StateLoadResult>;
+  stateSaveBytes(tokens?: number[] | ArrayLike<number>): Promise<Uint8Array>;
+  stateLoadBytes(bytes: Uint8Array | ArrayBuffer | ArrayLike<number>, tokenCapacity?: number): Promise<StateLoadResult>;
+
+  embed(text: string, options?: EmbedOptions): Promise<number[]>;
+  embedBatch(texts: string[], options?: EmbedOptions): Promise<number[][]>;
+
+  loadMultimodalProjector(url: string): Promise<unknown>;
+  unloadMultimodalProjector(): Promise<unknown>;
+  supportsVision(): boolean;
+  supportsAudio(): boolean;
+
+  getModelMetadata(): ModelMetadata | null;
+  getContextSize(): number;
+  isGpuActive(): boolean;
+  getBackendName(): string;
+  setLogLevel(level: string | number): void;
+  cancel(): void;
+  dispose(): Promise<void>;
+}
+
+declare global {
+  interface Window {
+    LlamaWebGpuBridge?: typeof LlamaWebGpuBridge;
+  }
+}

@@ -63,8 +63,7 @@ BUILD_DIR=/private/tmp/llama_web_bridge_build MEM64_BUILD_DIR=/private/tmp/llama
 Minimum local checks before handing off a PR-ready branch:
 
 ```bash
-node --check js/llama_webgpu_bridge.js
-node --check js/llama_webgpu_bridge_worker.js
+npm run check:js
 python3 -m py_compile scripts/verify_state_persistence_api.py scripts/verify_ci_reliability.py scripts/state_persistence_browser_smoke.py
 python3 scripts/verify_state_persistence_api.py
 python3 scripts/verify_ci_reliability.py
@@ -102,7 +101,10 @@ python3 scripts/state_persistence_browser_smoke.py \
     `llama_cpp.version`.
 - CI reliability contract: `scripts/verify_ci_reliability.py`
   - Keep this script updated when changing browser smoke behavior, action
-    versions, or workflow diagnostics.
+    versions, JS build/type-checking, or workflow diagnostics.
+  - CI and publish must run `npm run check:js`, which regenerates the checked-in
+    generated bridge wrapper outputs and declarations, and then fail with
+    `git diff --exit-code` if those generated outputs are stale.
   - The CI smoke must use a pinned tiny GGUF URL plus SHA-256, cache the model in
     the same expanded `~/.cache/llama-web-bridge/state-smoke-models` directory
     used by `actions/cache`, and upload `state-persistence-smoke-artifacts` on
@@ -120,7 +122,8 @@ python3 scripts/state_persistence_browser_smoke.py \
 
 ## Change Boundaries
 
-- Keep runtime bridge code in `js/` and `src/`.
+- Keep runtime bridge source code in `js/src/` and `src/`; generated browser
+  wrapper/declaration outputs live in `js/`.
 - Keep publishing logic in workflow only.
 - Do not edit assets repository files from here outside publish flow.
 

@@ -20,6 +20,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install JS dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Validate JS bridge build
+        run: |
+          npm run check:js
+          git ls-files --error-unmatch js/llama_webgpu_bridge.js js/llama_webgpu_bridge_worker.js js/llama_webgpu_bridge.d.ts
+          git diff --exit-code -- js/llama_webgpu_bridge.js js/llama_webgpu_bridge_worker.js js/llama_webgpu_bridge.d.ts
+
       - name: Resolve llama.cpp pin
         run: |
           LLAMA_CPP_TAG="$(tr -d '[:space:]' < llama_cpp.version)"
@@ -61,6 +76,7 @@ jobs:
         run: |
           test -f "${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_bridge.js"
           test -f "${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_bridge_worker.js"
+          test -f "${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_bridge.d.ts"
           test -f "${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_core.js"
           test -f "${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_core.wasm"
           test -f "${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_core_mem64.js"
@@ -91,6 +107,7 @@ jobs:
           path: |
             ${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_bridge.js
             ${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_bridge_worker.js
+            ${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_bridge.d.ts
             ${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_core.js
             ${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_core.wasm
             ${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_core_mem64.js

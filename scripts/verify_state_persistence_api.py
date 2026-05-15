@@ -9,7 +9,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = (ROOT / "src" / "llama_webgpu_core.cpp").read_text(encoding="utf-8")
-JS = (ROOT / "js" / "llama_webgpu_bridge.js").read_text(encoding="utf-8")
+JS = (ROOT / "js" / "src" / "llama_webgpu_bridge.js").read_text(encoding="utf-8")
 CMAKE = (ROOT / "CMakeLists.txt").read_text(encoding="utf-8")
 README = (ROOT / "README.md").read_text(encoding="utf-8")
 
