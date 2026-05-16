@@ -7,7 +7,18 @@ This repository provides:
 - `src/llama_webgpu_core.cpp` (native bridge core)
 - `js/src/llama_webgpu_bridge.js` (JS runtime wrapper source)
 - `js/llama_webgpu_bridge.js` (generated bundled browser ESM wrapper)
+- `js/llama_webgpu_bridge.d.ts` (public TypeScript declaration asset)
+- `docs/api.md` (public JavaScript API reference)
 - `CMakeLists.txt` for Emscripten builds
+
+## Public API
+
+Applications that consume the browser assets directly should start with the
+[`LlamaWebGpuBridge` public API reference](docs/api.md). The generated
+`llama_webgpu_bridge.d.ts` file is published with the JS/WASM assets; the API
+reference explains the runtime behavior for model loading, generation,
+tokenization, embeddings, multimodal projector support, state persistence,
+metadata, cancellation, disposal, and worker-host bootstrap.
 
 ## Build
 

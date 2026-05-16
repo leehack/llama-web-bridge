@@ -23,6 +23,63 @@ def require(condition: bool, message: str, errors: list[str]) -> None:
         errors.append(message)
 
 
+def count_unescaped_pipes(line: str) -> int:
+    count = 0
+    escaped = False
+    for char in line:
+        if escaped:
+            escaped = False
+            continue
+        if char == "\\":
+            escaped = True
+            continue
+        if char == "|":
+            count += 1
+    return count
+
+
+def require_well_formed_markdown_tables(relative_path: str, content: str, errors: list[str]) -> None:
+    in_fenced_code = False
+    expected_pipe_count: int | None = None
+    expected_line_number = 0
+
+    for line_number, line in enumerate(content.splitlines(), start=1):
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            in_fenced_code = not in_fenced_code
+            expected_pipe_count = None
+            expected_line_number = 0
+            continue
+
+        if in_fenced_code:
+            continue
+
+        if not stripped.startswith("|"):
+            expected_pipe_count = None
+            expected_line_number = 0
+            continue
+
+        pipe_count = count_unescaped_pipes(stripped)
+        require(
+            pipe_count >= 2,
+            f"{relative_path}:{line_number} markdown table row has {pipe_count} unescaped pipes; escape literal pipes as \\|",
+            errors,
+        )
+        if pipe_count < 2:
+            continue
+
+        if expected_pipe_count is None:
+            expected_pipe_count = pipe_count
+            expected_line_number = line_number
+            continue
+
+        require(
+            pipe_count == expected_pipe_count,
+            f"{relative_path}:{line_number} markdown table row has {pipe_count} unescaped pipes, expected {expected_pipe_count} from table starting at line {expected_line_number}; escape literal pipes as \\|",
+            errors,
+        )
+
+
 def main() -> int:
     errors: list[str] = []
     smoke = read_required("scripts/state_persistence_browser_smoke.py", errors)
@@ -39,7 +96,10 @@ def main() -> int:
     version = read_required("llama_cpp.version", errors).strip()
     agents = read_required("AGENTS.md", errors)
     readme = read_required("README.md", errors)
+    api_docs = read_required("docs/api.md", errors)
     contributing = read_required("CONTRIBUTING.md", errors)
+
+    require_well_formed_markdown_tables("docs/api.md", api_docs, errors)
 
     for name, workflow in (
         ("ci.yml", ci),
@@ -95,6 +155,7 @@ def main() -> int:
         "export class LlamaWebGpuBridge" in js_dts
         and "enableBridgeWorkerHost" in js_dts
         and "stateSaveBytes" in js_dts
+        and "workerGenerationStallTimeoutMs" in js_dts
         and "loadMultimodalProjector" in js_dts,
         "js/llama_webgpu_bridge.d.ts must expose the public bridge class, worker host entrypoint, and key APIs",
         errors,
@@ -230,11 +291,55 @@ def main() -> int:
         and "npm run check:js" in readme
         and "js/src/llama_webgpu_bridge.js" in readme
         and "llama_webgpu_bridge.d.ts" in readme
+        and "docs/api.md" in readme
         and "state-persistence-smoke-artifacts" in readme
         and "scripts/verify_ci_reliability.py" in readme
         and "llama_cpp.version" in readme
         and "auto_llama_cpp_update.yml" in readme,
-        "README.md must document CI reliability, JS build/type-checking, diagnostics, Node 24 action-runtime coverage, and llama.cpp pin automation",
+        "README.md must document the public API reference, CI reliability, JS build/type-checking, diagnostics, Node 24 action-runtime coverage, and llama.cpp pin automation",
+        errors,
+    )
+    for api_name in (
+        "LlamaWebGpuBridge",
+        "LlamaWebGpuBridgeConfig",
+        "enableBridgeWorkerHost",
+        "workerGenerationStallTimeoutMs",
+        "loadModelFromUrl",
+        "prefetchModelToCache",
+        "evictModelFromCache",
+        "createCompletion",
+        "tokenize",
+        "detokenize",
+        "applyChatTemplate",
+        "stateSaveFile",
+        "stateLoadFile",
+        "stateSaveBytes",
+        "stateLoadBytes",
+        "embed",
+        "embedBatch",
+        "loadMultimodalProjector",
+        "unloadMultimodalProjector",
+        "supportsVision",
+        "supportsAudio",
+        "getModelMetadata",
+        "getContextSize",
+        "isGpuActive",
+        "getBackendName",
+        "setLogLevel",
+        "cancel",
+        "dispose",
+    ):
+        require(
+            api_name in api_docs,
+            f"docs/api.md must document the public JavaScript API member: {api_name}",
+            errors,
+        )
+    require(
+        "worker" in api_docs.lower()
+        and "direct runtime" in api_docs.lower()
+        and "llama_webgpu_bridge.d.ts" in api_docs
+        and "state persistence" in api_docs.lower(),
+        "docs/api.md must explain declarations, worker/direct runtime behavior, and state persistence semantics",
         errors,
     )
     require(

@@ -3899,7 +3899,10 @@ var LlamaWebGpuBridge = class {
       coreModuleUrlMem64: typeof config.coreModuleUrlMem64 === "string" ? config.coreModuleUrlMem64 : void 0,
       preferMemory64: typeof config.preferMemory64 === "boolean" ? config.preferMemory64 : void 0,
       threads: Number(config.threads) > 0 ? Number(config.threads) : void 0,
+      threadsBatch: Number(config.threadsBatch) > 0 ? Number(config.threadsBatch) : void 0,
       threadPoolSize: Number(config.threadPoolSize) > 0 ? Number(config.threadPoolSize) : void 0,
+      nBatch: Number(config.nBatch) > 0 ? Number(config.nBatch) : void 0,
+      nUbatch: Number(config.nUbatch) > 0 ? Number(config.nUbatch) : void 0,
       nGpuLayers: Number.isFinite(config.nGpuLayers) ? Number(config.nGpuLayers) : void 0,
       userAgent: typeof config.userAgent === "string" ? config.userAgent : void 0,
       cacheName: typeof config.cacheName === "string" ? config.cacheName : void 0,
@@ -3908,6 +3911,7 @@ var LlamaWebGpuBridge = class {
       mediaMaxImagePixels: Number(config.mediaMaxImagePixels) > 0 ? Number(config.mediaMaxImagePixels) : void 0,
       mediaMaxImageEdge: Number(config.mediaMaxImageEdge) > 0 ? Number(config.mediaMaxImageEdge) : void 0,
       disableImageDownscale: config.disableImageDownscale === true,
+      allowAutoRemoteFetchBackend: config.allowAutoRemoteFetchBackend === true,
       logLevel: Number.isFinite(config.logLevel) ? Number(config.logLevel) : 2
     };
   }
