@@ -39,14 +39,43 @@ def count_unescaped_pipes(line: str) -> int:
 
 
 def require_well_formed_markdown_tables(relative_path: str, content: str, errors: list[str]) -> None:
+    in_fenced_code = False
+    expected_pipe_count: int | None = None
+    expected_line_number = 0
+
     for line_number, line in enumerate(content.splitlines(), start=1):
         stripped = line.strip()
-        if not stripped.startswith("|"):
+        if stripped.startswith("```"):
+            in_fenced_code = not in_fenced_code
+            expected_pipe_count = None
+            expected_line_number = 0
             continue
+
+        if in_fenced_code:
+            continue
+
+        if not stripped.startswith("|"):
+            expected_pipe_count = None
+            expected_line_number = 0
+            continue
+
         pipe_count = count_unescaped_pipes(stripped)
         require(
-            pipe_count in (3, 4),
+            pipe_count >= 2,
             f"{relative_path}:{line_number} markdown table row has {pipe_count} unescaped pipes; escape literal pipes as \\|",
+            errors,
+        )
+        if pipe_count < 2:
+            continue
+
+        if expected_pipe_count is None:
+            expected_pipe_count = pipe_count
+            expected_line_number = line_number
+            continue
+
+        require(
+            pipe_count == expected_pipe_count,
+            f"{relative_path}:{line_number} markdown table row has {pipe_count} unescaped pipes, expected {expected_pipe_count} from table starting at line {expected_line_number}; escape literal pipes as \\|",
             errors,
         )
 
