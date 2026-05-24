@@ -88,6 +88,11 @@ python3 scripts/state_persistence_browser_smoke.py \
 
 - CI build gate: `.github/workflows/ci.yml`
   - Resolves the default llama.cpp checkout from `llama_cpp.version`.
+  - After a successful `push` run on `main`, dispatches the publish workflow only
+    when the pushed commit range changed `llama_cpp.version`. The dispatch uses
+    job-scoped `actions: write`, passes the validated source SHA, and lets the
+    serialized publish workflow resolve the next patch assets tag; PR CI never
+    publishes assets.
 - Automated llama.cpp bump PR: `.github/workflows/auto_llama_cpp_update.yml`
   - Runs on a schedule/manual dispatch, compares `llama_cpp.version` against the
     latest `ggml-org/llama.cpp` release, and manages one stable
@@ -118,6 +123,10 @@ python3 scripts/state_persistence_browser_smoke.py \
   - Passes the resolved `llama.cpp` tag as a job output so asset release notes
     match the generated manifest.
   - Requires `WEBGPU_BRIDGE_ASSETS_PAT`
+  - Serializes publishes with workflow concurrency so manual and CI-dispatched
+    asset releases cannot race.
+  - Supports `assets_tag=auto` plus `source_ref=<sha>` for CI-dispatched
+    publishes from the exact source commit that already passed `main` CI.
   - Pushes assets + tag to `llama-web-bridge-assets`
 
 ## Change Boundaries
