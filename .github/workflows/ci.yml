@@ -7,12 +7,17 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
 jobs:
   build-webgpu-bridge:
     name: Build WebGPU Bridge (WASM)
     runs-on: ubuntu-latest
     env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
       LLAMA_WEBGPU_SMOKE_MODEL_URL: https://huggingface.co/aladar/llama-2-tiny-random-GGUF/resolve/main/llama-2-tiny-random.gguf
       LLAMA_WEBGPU_SMOKE_MODEL_SHA256: 81f226c62d28ed4a1a9b9fa080fcd9f0cc40e0f9d5680036583ff98fbcd035cb
       LLAMA_WEBGPU_SMOKE_MODEL_CACHE: ~/.cache/llama-web-bridge/state-smoke-models
@@ -112,3 +117,63 @@ jobs:
             ${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_core.wasm
             ${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_core_mem64.js
             ${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_core_mem64.wasm
+
+  dispatch-publish-assets:
+    name: Dispatch asset publish
+    needs: build-webgpu-bridge
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: read
+    env:
+      ASSETS_REPO: leehack/llama-web-bridge-assets
+      VERSION_FILE: llama_cpp.version
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Dispatch publish when llama.cpp pin changed
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${BEFORE_SHA}" ] || [[ "${BEFORE_SHA}" =~ ^0+$ ]]; then
+            echo "No comparable before SHA for ${GITHUB_SHA}; skipping automatic publish dispatch."
+            exit 0
+          fi
+
+          if git diff --quiet "${BEFORE_SHA}" "${GITHUB_SHA}" -- "${VERSION_FILE}"; then
+            echo "${VERSION_FILE} did not change; skipping automatic publish dispatch."
+            exit 0
+          fi
+
+          changed_files="$(git diff --name-only "${BEFORE_SHA}" "${GITHUB_SHA}" -- "${VERSION_FILE}")"
+          echo "Changed files in main push:"
+          echo "${changed_files}"
+
+          LLAMA_CPP_TAG="$(tr -d '[:space:]' < "${VERSION_FILE}")"
+          if [ -z "${LLAMA_CPP_TAG}" ]; then
+            echo "error: ${VERSION_FILE} is empty"
+            exit 1
+          fi
+
+          gh workflow run publish_assets.yml \
+            --repo "${GITHUB_REPOSITORY}" \
+            --ref main \
+            -f assets_tag=auto \
+            -f assets_repo="${ASSETS_REPO}" \
+            -f source_ref="${GITHUB_SHA}"
+
+          echo "Dispatched publish_assets.yml for the next assets tag from source ${GITHUB_SHA} using llama.cpp ${LLAMA_CPP_TAG}."
+          {
+            echo "### Asset publish dispatched"
+            echo
+            echo "- Assets repo: \`${ASSETS_REPO}\`"
+            echo "- Assets tag: next patch tag resolved by \`publish_assets.yml\`"
+            echo "- llama.cpp tag: \`${LLAMA_CPP_TAG}\`"
+            echo "- Source commit: \`${GITHUB_SHA}\`"
+          } >> "${GITHUB_STEP_SUMMARY}"
