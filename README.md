@@ -201,7 +201,11 @@ Publish workflow:
 
 Trigger modes:
 
-- Automatic: push a `v*` tag in this repo (for example `v0.1.5`)
+- Automatic after a llama.cpp pin merge: when `main` CI succeeds for a push that
+  changed `llama_cpp.version`, CI dispatches `publish_assets.yml` with
+  `assets_tag=auto` and the validated source SHA. The serialized publish workflow
+  resolves the next patch tag from `leehack/llama-web-bridge-assets`.
+- Automatic tag publish: push a `v*` tag in this repo (for example `v0.1.5`)
 - Manual: run workflow dispatch with explicit inputs
 
 Required repository secret:
@@ -213,7 +217,16 @@ The publish workflow carries the resolved `llama.cpp` tag from the build job to
 the release job as an explicit job output, so the asset release notes match the
 `manifest.json` `llama_cpp_tag` value.
 
-Example publish:
+Automatic llama.cpp pin publish:
+
+1. Merge a PR that changes `llama_cpp.version`.
+2. `CI` builds and browser-smokes the merged `main` commit.
+3. If CI succeeds, the final CI job dispatches `Publish Bridge Assets` with the
+   validated source SHA, `assets_tag=auto`, and no `llama_cpp_tag` override. The
+   publish workflow resolves the next patch tag and the manifest uses the merged
+   pin.
+
+Tag publish example:
 
 1. Create/push a release tag in this repo (for example `v0.1.5`)
 2. `Publish Bridge Assets` runs automatically and publishes the same tag to

@@ -199,14 +199,59 @@ def main() -> int:
         errors,
     )
     require(
+        "dispatch-publish-assets:" in ci
+        and "needs: build-webgpu-bridge" in ci
+        and "if: github.event_name == 'push' && github.ref == 'refs/heads/main'" in ci
+        and "actions: write" in ci
+        and "fetch-depth: 0" in ci
+        and "git diff --quiet \"${BEFORE_SHA}\" \"${GITHUB_SHA}\" -- \"${VERSION_FILE}\"" in ci
+        and "gh workflow run publish_assets.yml" in ci
+        and "-f assets_tag=auto" in ci
+        and "-f assets_repo=\"${ASSETS_REPO}\"" in ci
+        and "-f source_ref=\"${GITHUB_SHA}\"" in ci,
+        "ci.yml must dispatch asset publishing only after successful main pushes that changed llama_cpp.version, with actions:write scoped to the dispatch job and auto tag resolution delegated to publish_assets.yml",
+        errors,
+    )
+    require(
         "REQUESTED_LLAMA_CPP_TAG" in publish
+        and "source_ref:" in publish
+        and "REQUESTED_SOURCE_REF" in publish
+        and "ref: ${{ env.REQUESTED_SOURCE_REF }}" in publish
         and "tr -d '[:space:]' < llama_cpp.version" in publish
         and "outputs:" in publish
         and "llama_cpp_tag: ${{ steps.resolve-publish-parameters.outputs.llama_cpp_tag }}" in publish
+        and "assets_tag: ${{ steps.resolve-publish-parameters.outputs.assets_tag }}" in publish
+        and "source_commit: ${{ steps.resolve-publish-parameters.outputs.source_commit }}" in publish
         and "LLAMA_CPP_TAG: ${{ needs.build-bridge-assets.outputs.llama_cpp_tag }}" in publish
+        and "SOURCE_COMMIT: ${{ needs.build-bridge-assets.outputs.source_commit }}" in publish
+        and "llama.cpp tag must match b[0-9]+" in publish
         and "default: b9116" not in publish
         and "|| 'b9116'" not in publish,
-        "publish_assets.yml must default to llama_cpp.version, pass the resolved tag across jobs, and still allow a manual override",
+        "publish_assets.yml must default to llama_cpp.version, support an explicit source ref, pass resolved tags/commit across jobs, and still allow a manual override",
+        errors,
+    )
+    require(
+        "if [ \"${ASSETS_TAG}\" = \"auto\" ]; then" in publish
+        and "assets_tag=auto requires source_ref to be a full source commit SHA" in publish
+        and "checked-out source commit ${SOURCE_COMMIT} does not match requested source_ref" in publish
+        and "gh release view --repo \"${ASSETS_REPO}\" --json tagName" in publish
+        and "RESOLVED_ASSETS_TAG=\"v${MAJOR}.${MINOR}.$((PATCH + 1))\"" in publish
+        and "assets tag must be a vMAJOR.MINOR.PATCH tag or auto" in publish,
+        "publish_assets.yml must resolve automatic next patch asset tags inside the serialized publish workflow",
+        errors,
+    )
+    require(
+        "-f source_ref=\"${GITHUB_SHA}\"" in ci
+        and "SOURCE_COMMIT=\"$(git rev-parse HEAD)\"" in publish
+        and "OUT_DIR: ${{ runner.temp }}/webgpu_bridge_dist\n          ASSETS_TAG: ${{ env.ASSETS_TAG }}" not in publish,
+        "CI-dispatched publishes must build the exact validated source SHA and manifest generation must inherit the runtime-resolved assets tag",
+        errors,
+    )
+    require(
+        "concurrency:" in publish
+        and "group: publish-bridge-assets" in publish
+        and "cancel-in-progress: false" in publish,
+        "publish_assets.yml must serialize asset publishes so automatic and manual releases cannot race",
         errors,
     )
     require(

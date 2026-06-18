@@ -94,6 +94,11 @@ query strings, and fragments before printing the location.
 - Preserve `llama_cpp.version` as the single source of truth for default CI and
   publish builds. Manual publish overrides are allowed for temporary validation,
   but tag-triggered publishes should use the pinned file.
+- Main-branch CI automatically dispatches `publish_assets.yml` after a successful
+  build/smoke only when the pushed commit range changed `llama_cpp.version`. The
+  dispatch passes the validated source SHA and lets the serialized publish
+  workflow compute the next patch tag from `llama-web-bridge-assets`; PR CI must
+  never publish assets.
 - The auto-update workflow manages the stable `automation/bump-llama-cpp` branch
   and updates an existing PR instead of opening duplicates. It should include the
   upstream release notes, compare link, and commit range in the PR body, then
@@ -108,6 +113,17 @@ query strings, and fragments before printing the location.
 ## Publish Process
 
 Use workflow `.github/workflows/publish_assets.yml`:
+
+Automatic publish from CI:
+
+1. Merge a PR that changes `llama_cpp.version`.
+2. Let the `main` CI build and browser smoke pass.
+3. The final CI job dispatches `publish_assets.yml` with `assets_tag=auto` and
+   `source_ref` set to the validated main commit. The serialized publish workflow
+   computes the next patch assets tag and leaves `llama_cpp_tag` empty so the
+   publish reads the merged pin.
+
+Manual publish:
 
 1. Set input `assets_tag` (new tag).
 2. Optionally set `assets_repo`; leave `llama_cpp_tag` empty to use
