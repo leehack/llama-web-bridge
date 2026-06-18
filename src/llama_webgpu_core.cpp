@@ -34,6 +34,11 @@ struct runtime_state {
 
 runtime_state g_state;
 
+struct pending_media {
+  mtmd_bitmap * bitmap = nullptr;
+  mtmd_helper_video * video_ctx = nullptr;
+};
+
 bool g_backend_initialized = false;
 bool g_has_webgpu = false;
 bool g_generation_active = false;
@@ -53,7 +58,7 @@ std::string g_model_meta_json = "{}";
 bool g_model_uses_gpu_ops = false;
 std::vector<llama_token> g_cached_prompt_tokens;
 
-std::vector<mtmd_bitmap *> g_pending_media;
+std::vector<pending_media> g_pending_media;
 
 std::string to_lower(std::string value) {
   std::transform(
@@ -135,9 +140,12 @@ void apply_log_level_callback() {
 }
 
 void clear_pending_media() {
-  for (mtmd_bitmap * bitmap : g_pending_media) {
-    if (bitmap != nullptr) {
-      mtmd_bitmap_free(bitmap);
+  for (pending_media & media : g_pending_media) {
+    if (media.bitmap != nullptr) {
+      mtmd_bitmap_free(media.bitmap);
+    }
+    if (media.video_ctx != nullptr) {
+      mtmd_helper_video_free(media.video_ctx);
     }
   }
   g_pending_media.clear();
@@ -637,8 +645,8 @@ bool decode_multimodal_prompt(const std::string & prompt) {
 
   std::vector<const mtmd_bitmap *> bitmaps;
   bitmaps.reserve(g_pending_media.size());
-  for (const mtmd_bitmap * bitmap : g_pending_media) {
-    bitmaps.push_back(bitmap);
+  for (const pending_media & media : g_pending_media) {
+    bitmaps.push_back(media.bitmap);
   }
 
   const int32_t tokenize_rc = mtmd_tokenize(
@@ -1298,14 +1306,14 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_media_add_file(
     return -3;
   }
 
-  mtmd_bitmap * bitmap =
-      mtmd_helper_bitmap_init_from_file(g_state.mm_ctx, media_path);
-  if (bitmap == nullptr) {
+  mtmd_helper_bitmap_wrapper media =
+      mtmd_helper_bitmap_init_from_file(g_state.mm_ctx, media_path, false);
+  if (media.bitmap == nullptr) {
     set_error("Failed to decode media file content");
     return -4;
   }
 
-  g_pending_media.push_back(bitmap);
+  g_pending_media.push_back({media.bitmap, media.video_ctx});
   return 0;
 }
 
@@ -1328,16 +1336,17 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_media_add_encoded(
     return -3;
   }
 
-  mtmd_bitmap * bitmap = mtmd_helper_bitmap_init_from_buf(
+  mtmd_helper_bitmap_wrapper media = mtmd_helper_bitmap_init_from_buf(
       g_state.mm_ctx,
       bytes,
-      static_cast<size_t>(length));
-  if (bitmap == nullptr) {
+      static_cast<size_t>(length),
+      false);
+  if (media.bitmap == nullptr) {
     set_error("Failed to decode encoded media bytes");
     return -4;
   }
 
-  g_pending_media.push_back(bitmap);
+  g_pending_media.push_back({media.bitmap, media.video_ctx});
   return 0;
 }
 
@@ -1374,7 +1383,7 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_media_add_rgb(
     return -5;
   }
 
-  g_pending_media.push_back(bitmap);
+  g_pending_media.push_back({bitmap, nullptr});
   return 0;
 }
 
@@ -1404,7 +1413,7 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_media_add_audio_f32(
     return -4;
   }
 
-  g_pending_media.push_back(bitmap);
+  g_pending_media.push_back({bitmap, nullptr});
   return 0;
 }
 
