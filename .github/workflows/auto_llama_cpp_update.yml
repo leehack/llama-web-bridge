@@ -34,6 +34,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          # shellcheck disable=SC2016,SC2129
           set -euo pipefail
 
           CURRENT_TAG="$(tr -d '[:space:]' < "$VERSION_FILE")"
@@ -179,6 +180,7 @@ jobs:
           PR_NUMBER: ${{ steps.create-pr.outputs.pull-request-number }}
           PR_HEAD_SHA: ${{ steps.create-pr.outputs.pull-request-head-sha }}
         run: |
+          # shellcheck disable=SC2016
           set -euo pipefail
 
           if [ -z "$PR_HEAD_SHA" ] || [ "$PR_HEAD_SHA" = "null" ]; then
@@ -202,6 +204,7 @@ jobs:
             if [ -n "$run_id" ]; then
               break
             fi
+            echo "Waiting for CI workflow_dispatch run for $PR_HEAD_SHA (attempt $attempt/30)."
             sleep 10
           done
 
