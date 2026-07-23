@@ -163,8 +163,8 @@ are easy to regress during agent-driven maintenance:
 - `.github/workflows/auto_llama_cpp_update.yml` opens or updates one stable
   `automation/bump-llama-cpp` PR when a newer upstream release exists, with the
   upstream release notes, compare link, and commit range in the PR body, then
-  dispatches the CI workflow on the automation branch so `GITHUB_TOKEN` branch
-  updates still get a head-SHA validation run;
+  creates the PR with the maintainer token so the normal `pull_request` CI
+  starts automatically, then waits for the exact head-SHA validation run;
 - both CI and publish workflows opt into `FORCE_JAVASCRIPT_ACTIONS_TO_NODE24`
   to catch action-runtime deprecation issues early;
 - the state-persistence browser smoke supports an integrity-checked tiny GGUF
@@ -210,7 +210,8 @@ Trigger modes:
 
 Required repository secret:
 
-- `WEBGPU_BRIDGE_ASSETS_PAT` (token with write access to
+- `WEBGPU_BRIDGE_ASSETS_PAT` (maintainer token with contents and pull-request
+  write access to `leehack/llama-web-bridge`, plus write access to
   `leehack/llama-web-bridge-assets`)
 
 The publish workflow carries the resolved `llama.cpp` tag from the build job to
