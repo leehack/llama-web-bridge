@@ -260,13 +260,17 @@ def main() -> int:
         and "UPDATE_BRANCH: automation/bump-llama-cpp" in auto_update
         and "ggml-org/llama.cpp" in auto_update
         and "create-pull-request" in auto_update
-        and "actions: write" in auto_update
+        and "actions: read" in auto_update
+        and "contents: read" in auto_update
+        and "pull-requests: read" in auto_update
         and "id: create-pr" in auto_update
-        and "gh workflow run ci.yml --repo \"$GITHUB_REPOSITORY\" --ref \"$UPDATE_BRANCH\"" in auto_update
+        and "token: ${{ secrets.WEBGPU_BRIDGE_ASSETS_PAT }}" in auto_update
+        and "--event pull_request" in auto_update
+        and "gh workflow run ci.yml" not in auto_update
         and "body-path: /tmp/llama_cpp_update_pr.md" in auto_update
         and "Upstream changelog" in auto_update
         and "not racing a non-automation PR" in auto_update,
-        "auto_llama_cpp_update.yml must update one stable PR branch with upstream changelog context, dispatch CI for bot updates, and avoid racing human PRs",
+        "auto_llama_cpp_update.yml must use maintainer-authored PR events, wait for exact-head PR CI, and avoid racing human PRs",
         errors,
     )
 

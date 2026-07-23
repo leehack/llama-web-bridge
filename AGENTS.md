@@ -100,8 +100,8 @@ python3 scripts/state_persistence_browser_smoke.py \
   - The PR body must include the upstream release notes, compare URL, commit
     range, and WebGPU/WASM review focus. If a newer upstream release appears
     while the PR is still open, update the same PR instead of opening a duplicate.
-  - Dispatch the CI workflow on the automation branch after creating/updating
-    the PR so `GITHUB_TOKEN` branch updates still receive head-SHA validation.
+  - Create/update the PR with `WEBGPU_BRIDGE_ASSETS_PAT` so normal
+    `pull_request` CI starts without approval, then wait for the exact head SHA.
   - Skip instead of racing when a non-automation PR already changes
     `llama_cpp.version`.
 - CI reliability contract: `scripts/verify_ci_reliability.py`
@@ -122,7 +122,8 @@ python3 scripts/state_persistence_browser_smoke.py \
     temporary explicit override.
   - Passes the resolved `llama.cpp` tag as a job output so asset release notes
     match the generated manifest.
-  - Requires `WEBGPU_BRIDGE_ASSETS_PAT`
+  - Requires `WEBGPU_BRIDGE_ASSETS_PAT` with contents and pull-request write
+    access to this repository plus write access to the assets repository.
   - Serializes publishes with workflow concurrency so manual and CI-dispatched
     asset releases cannot race.
   - Supports `assets_tag=auto` plus `source_ref=<sha>` for CI-dispatched
