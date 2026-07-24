@@ -302,7 +302,8 @@ def main() -> int:
     require(
         "--artifacts-dir" in smoke
         and "screenshot" in smoke
-        and 'artifact_prefix: str = "state-smoke"' in smoke,
+        and 'artifact_prefix: str = "state-smoke"' in smoke
+        and 'f"{artifact_prefix}-result.json"' in smoke,
         "browser smoke must write debuggable failure artifacts",
         errors,
     )
@@ -318,7 +319,7 @@ def main() -> int:
         and "createCompletion" in multimodal_smoke
         and "direct runtime" in multimodal_smoke
         and "worker runtime" in multimodal_smoke
-        and "multimodal-smoke-result.json" not in multimodal_smoke
+        and 'f"{artifact_prefix}-result.json"' in smoke
         and 'artifact_prefix="multimodal-smoke"' in multimodal_smoke,
         "multimodal browser smoke must integrity-check model inputs and run real direct/worker image inference",
         errors,
