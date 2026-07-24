@@ -349,7 +349,12 @@ def write_json_artifact(artifacts_dir: Path | None, name: str, payload: object) 
     write_text_artifact(artifacts_dir, name, json.dumps(payload, indent=2, sort_keys=True))
 
 
-async def run_playwright(url: str, timeout_ms: int, artifacts_dir: Path | None) -> dict[str, object]:
+async def run_playwright(
+    url: str,
+    timeout_ms: int,
+    artifacts_dir: Path | None,
+    artifact_prefix: str = "state-smoke",
+) -> dict[str, object]:
     try:
         from playwright.async_api import async_playwright  # type: ignore[import-not-found]
     except ModuleNotFoundError as exc:  # pragma: no cover - CI setup failure path
@@ -373,11 +378,17 @@ async def run_playwright(url: str, timeout_ms: int, artifacts_dir: Path | None) 
             )
             payload = await page.evaluate("() => window.__smokeResult")
             if isinstance(payload, dict) and payload.get("ok") is not True and artifacts_dir is not None:
-                await page.screenshot(path=str(artifacts_dir / "state-smoke-page.png"), full_page=True)
+                await page.screenshot(
+                    path=str(artifacts_dir / f"{artifact_prefix}-page.png"),
+                    full_page=True,
+                )
         except Exception:
             if artifacts_dir is not None:
                 artifacts_dir.mkdir(parents=True, exist_ok=True)
-                await page.screenshot(path=str(artifacts_dir / "state-smoke-page.png"), full_page=True)
+                await page.screenshot(
+                    path=str(artifacts_dir / f"{artifact_prefix}-page.png"),
+                    full_page=True,
+                )
             raise
         finally:
             await browser.close()
@@ -385,8 +396,16 @@ async def run_playwright(url: str, timeout_ms: int, artifacts_dir: Path | None) 
     if not isinstance(payload, dict):
         raise RuntimeError(f"unexpected smoke result payload: {payload!r}")
     payload["console"] = console_lines[-200:]
-    write_text_artifact(artifacts_dir, "state-smoke-console.log", "\n".join(console_lines) + "\n")
-    write_json_artifact(artifacts_dir, "state-smoke-result.json", payload)
+    write_text_artifact(
+        artifacts_dir,
+        f"{artifact_prefix}-console.log",
+        "\n".join(console_lines) + "\n",
+    )
+    write_json_artifact(
+        artifacts_dir,
+        f"{artifact_prefix}-result.json",
+        payload,
+    )
     return payload
 
 

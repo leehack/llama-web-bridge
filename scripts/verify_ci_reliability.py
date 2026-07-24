@@ -83,6 +83,7 @@ def require_well_formed_markdown_tables(relative_path: str, content: str, errors
 def main() -> int:
     errors: list[str] = []
     smoke = read_required("scripts/state_persistence_browser_smoke.py", errors)
+    multimodal_smoke = read_required("scripts/multimodal_browser_smoke.py", errors)
     ci = read_required(".github/workflows/ci.yml", errors)
     publish = read_required(".github/workflows/publish_assets.yml", errors)
     auto_update = read_required(".github/workflows/auto_llama_cpp_update.yml", errors)
@@ -93,6 +94,7 @@ def main() -> int:
     js_source = read_required("js/src/llama_webgpu_bridge.js", errors)
     js_output = read_required("js/llama_webgpu_bridge.js", errors)
     js_dts = read_required("js/llama_webgpu_bridge.d.ts", errors)
+    core = read_required("src/llama_webgpu_core.cpp", errors)
     version = read_required("llama_cpp.version", errors).strip()
     agents = read_required("AGENTS.md", errors)
     readme = read_required("README.md", errors)
@@ -298,8 +300,27 @@ def main() -> int:
         errors,
     )
     require(
-        "--artifacts-dir" in smoke and "screenshot" in smoke and "state-smoke-result.json" in smoke,
+        "--artifacts-dir" in smoke
+        and "screenshot" in smoke
+        and 'artifact_prefix: str = "state-smoke"' in smoke,
         "browser smoke must write debuggable failure artifacts",
+        errors,
+    )
+    require(
+        "input_text.text_len = normalized_prompt.size();" in core,
+        "multimodal prompt ingestion must populate mtmd_input_text.text_len",
+        errors,
+    )
+    require(
+        "--model-sha256" in multimodal_smoke
+        and "--mmproj-sha256" in multimodal_smoke
+        and "loadMultimodalProjector" in multimodal_smoke
+        and "createCompletion" in multimodal_smoke
+        and "direct runtime" in multimodal_smoke
+        and "worker runtime" in multimodal_smoke
+        and "multimodal-smoke-result.json" not in multimodal_smoke
+        and 'artifact_prefix="multimodal-smoke"' in multimodal_smoke,
+        "multimodal browser smoke must integrity-check model inputs and run real direct/worker image inference",
         errors,
     )
     require(
@@ -312,6 +333,17 @@ def main() -> int:
     require(
         "state-persistence-smoke-artifacts" in ci and "if: failure()" in ci,
         "CI must upload browser smoke diagnostics on failure",
+        errors,
+    )
+    require(
+        "LLAMA_WEBGPU_MULTIMODAL_MODEL_URL" in ci
+        and "LLAMA_WEBGPU_MULTIMODAL_MODEL_SHA256" in ci
+        and "LLAMA_WEBGPU_MULTIMODAL_MMPROJ_URL" in ci
+        and "LLAMA_WEBGPU_MULTIMODAL_MMPROJ_SHA256" in ci
+        and "Cache multimodal smoke models" in ci
+        and "Run multimodal browser smoke" in ci
+        and "multimodal-smoke-artifacts" in ci,
+        "CI must run checksum-pinned real multimodal inference and upload diagnostics on failure",
         errors,
     )
     require(
@@ -330,6 +362,7 @@ def main() -> int:
         and "generated bridge wrapper outputs" in agents
         and "independent review" in agents
         and "state_persistence_browser_smoke.py" in agents
+        and "multimodal_browser_smoke.py" in agents
         and "llama_cpp.version" in agents
         and "auto_llama_cpp_update.yml" in agents,
         "AGENTS.md must document the JS build gate, agent PR workflow, browser smoke expectations, and llama.cpp auto-update policy",
@@ -342,6 +375,8 @@ def main() -> int:
         and "llama_webgpu_bridge.d.ts" in readme
         and "docs/api.md" in readme
         and "state-persistence-smoke-artifacts" in readme
+        and "multimodal-smoke-artifacts" in readme
+        and "scripts/multimodal_browser_smoke.py" in readme
         and "scripts/verify_ci_reliability.py" in readme
         and "llama_cpp.version" in readme
         and "auto_llama_cpp_update.yml" in readme,
@@ -396,7 +431,9 @@ def main() -> int:
         and "npm run check:js" in contributing
         and "js/src/" in contributing
         and "scripts/verify_ci_reliability.py" in contributing
+        and "scripts/multimodal_browser_smoke.py" in contributing
         and "--model-sha256" in contributing
+        and "--mmproj-sha256" in contributing
         and "llama_cpp.version" in contributing,
         "CONTRIBUTING.md must document JS build/type-checking, maintainer/agent workflow guardrails, checksum-pinned smoke usage, and llama.cpp pin handling",
         errors,

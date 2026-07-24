@@ -169,10 +169,13 @@ are easy to regress during agent-driven maintenance:
   to catch action-runtime deprecation issues early;
 - the state-persistence browser smoke supports an integrity-checked tiny GGUF
   model round trip;
+- the multimodal browser smoke runs checksum-pinned Qwen image inference through
+  both direct and worker runtimes, guarding llama.cpp mtmd API changes;
 - the CI model cache path expands `~` before resolving so it matches the
   `actions/cache` directory;
 - browser smoke failures upload `state-persistence-smoke-artifacts` with console
-  logs, result JSON, and screenshots when available.
+  logs, result JSON, and screenshots when available, plus
+  `multimodal-smoke-artifacts` for vision failures.
 
 Run the model-backed smoke locally after building the bridge if a change touches
 state persistence, workers, browser smoke, or workflow diagnostics:
@@ -184,6 +187,18 @@ python3 scripts/state_persistence_browser_smoke.py \
   --model-sha256 81f226c62d28ed4a1a9b9fa080fcd9f0cc40e0f9d5680036583ff98fbcd035cb \
   --model-cache-dir ~/.cache/llama-web-bridge/state-smoke-models \
   --artifacts-dir /tmp/llama-web-bridge-state-smoke
+```
+
+For llama.cpp pin or multimodal changes, run the real-model vision gate:
+
+```bash
+python3 scripts/multimodal_browser_smoke.py \
+  --dist-dir /path/to/webgpu_bridge_dist \
+  --model-path /path/to/Qwen3.5-0.8B-Q4_K_M.gguf \
+  --model-sha256 bd258782e35f7f458f8aced1adc053e6e92e89bc735ba3be89d38a06121dc517 \
+  --mmproj-path /path/to/mmproj-F16.gguf \
+  --mmproj-sha256 56e4c6cfe73b0c82e3e82bc518d7591997e61d81f723fc41a586f4fa69ea2453 \
+  --artifacts-dir /tmp/llama-web-bridge-multimodal-smoke
 ```
 
 Do not commit downloaded GGUFs, Playwright screenshots, console logs, generated
