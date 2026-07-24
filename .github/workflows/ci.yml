@@ -22,6 +22,13 @@ jobs:
       LLAMA_WEBGPU_SMOKE_MODEL_SHA256: 81f226c62d28ed4a1a9b9fa080fcd9f0cc40e0f9d5680036583ff98fbcd035cb
       LLAMA_WEBGPU_SMOKE_MODEL_CACHE: ~/.cache/llama-web-bridge/state-smoke-models
       LLAMA_WEBGPU_SMOKE_ARTIFACTS_DIR: /tmp/state-persistence-smoke-artifacts
+      LLAMA_WEBGPU_MULTIMODAL_MODEL_URL: https://huggingface.co/unsloth/Qwen3.5-0.8B-GGUF/resolve/main/Qwen3.5-0.8B-Q4_K_M.gguf
+      LLAMA_WEBGPU_MULTIMODAL_MODEL_SHA256: bd258782e35f7f458f8aced1adc053e6e92e89bc735ba3be89d38a06121dc517
+      LLAMA_WEBGPU_MULTIMODAL_MMPROJ_URL: https://huggingface.co/unsloth/Qwen3.5-0.8B-GGUF/resolve/main/mmproj-F16.gguf
+      LLAMA_WEBGPU_MULTIMODAL_MMPROJ_SHA256: 56e4c6cfe73b0c82e3e82bc518d7591997e61d81f723fc41a586f4fa69ea2453
+      LLAMA_WEBGPU_MULTIMODAL_MODEL_CACHE: ~/.cache/llama-web-bridge/multimodal-smoke-models
+      LLAMA_WEBGPU_MULTIMODAL_ARTIFACTS_DIR: /tmp/multimodal-smoke-artifacts
+      LLAMA_WEBGPU_MULTIMODAL_TIMEOUT_MS: 420000
     steps:
       - uses: actions/checkout@v4
 
@@ -53,6 +60,14 @@ jobs:
       - name: Validate state persistence API contract
         run: python3 scripts/verify_state_persistence_api.py
 
+      - name: Validate Python smoke syntax
+        run: |
+          python3 -m py_compile \
+            scripts/verify_state_persistence_api.py \
+            scripts/verify_ci_reliability.py \
+            scripts/state_persistence_browser_smoke.py \
+            scripts/multimodal_browser_smoke.py
+
       - name: Verify CI reliability contract
         run: python3 scripts/verify_ci_reliability.py
 
@@ -61,6 +76,12 @@ jobs:
         with:
           path: ~/.cache/llama-web-bridge/state-smoke-models
           key: state-smoke-model-${{ env.LLAMA_WEBGPU_SMOKE_MODEL_SHA256 }}
+
+      - name: Cache multimodal smoke models
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/llama-web-bridge/multimodal-smoke-models
+          key: multimodal-smoke-${{ env.LLAMA_WEBGPU_MULTIMODAL_MODEL_SHA256 }}-${{ env.LLAMA_WEBGPU_MULTIMODAL_MMPROJ_SHA256 }}
 
       - name: Clone llama.cpp source
         run: |
@@ -97,12 +118,25 @@ jobs:
           BRIDGE_DIST_DIR: ${{ runner.temp }}/webgpu_bridge_dist
         run: python3 scripts/state_persistence_browser_smoke.py
 
+      - name: Run multimodal browser smoke
+        env:
+          BRIDGE_DIST_DIR: ${{ runner.temp }}/webgpu_bridge_dist
+        run: python3 scripts/multimodal_browser_smoke.py
+
       - name: Upload state persistence smoke diagnostics
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: state-persistence-smoke-artifacts
           path: ${{ env.LLAMA_WEBGPU_SMOKE_ARTIFACTS_DIR }}
+          if-no-files-found: ignore
+
+      - name: Upload multimodal smoke diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: multimodal-smoke-artifacts
+          path: ${{ env.LLAMA_WEBGPU_MULTIMODAL_ARTIFACTS_DIR }}
           if-no-files-found: ignore
 
       - name: Upload bridge artifacts

@@ -638,6 +638,8 @@ bool decode_multimodal_prompt(const std::string & prompt) {
 
   mtmd_input_text input_text {};
   input_text.text = normalized_prompt.c_str();
+  // llama.cpp b9979 stopped deriving input length from the C string.
+  input_text.text_len = normalized_prompt.size();
   const llama_token bos = llama_vocab_bos(g_state.vocab);
   const llama_token eos = llama_vocab_eos(g_state.vocab);
   input_text.add_special = bos != eos && bos != -1;

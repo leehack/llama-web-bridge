@@ -64,7 +64,7 @@ Before opening or updating a PR, run the lightweight contracts:
 
 ```bash
 npm run check:js
-python3 -m py_compile scripts/verify_state_persistence_api.py scripts/verify_ci_reliability.py scripts/state_persistence_browser_smoke.py
+python3 -m py_compile scripts/verify_state_persistence_api.py scripts/verify_ci_reliability.py scripts/state_persistence_browser_smoke.py scripts/multimodal_browser_smoke.py
 python3 scripts/verify_state_persistence_api.py
 python3 scripts/verify_ci_reliability.py
 ```
@@ -82,6 +82,19 @@ python3 scripts/state_persistence_browser_smoke.py \
   --artifacts-dir /tmp/llama-web-bridge-state-smoke
 ```
 
+For llama.cpp pin or multimodal changes, run checksum-pinned real image
+inference through both direct and worker runtimes:
+
+```bash
+python3 scripts/multimodal_browser_smoke.py \
+  --dist-dir /private/tmp/llama_web_bridge_dist \
+  --model-path /path/to/Qwen3.5-0.8B-Q4_K_M.gguf \
+  --model-sha256 bd258782e35f7f458f8aced1adc053e6e92e89bc735ba3be89d38a06121dc517 \
+  --mmproj-path /path/to/mmproj-F16.gguf \
+  --mmproj-sha256 56e4c6cfe73b0c82e3e82bc518d7591997e61d81f723fc41a586f4fa69ea2453 \
+  --artifacts-dir /tmp/llama-web-bridge-multimodal-smoke
+```
+
 If the smoke downloads from a URL, errors and diagnostics must redact userinfo,
 query strings, and fragments before printing the location.
 
@@ -91,6 +104,8 @@ query strings, and fragments before printing the location.
   changing `.github/workflows/ci.yml`, `.github/workflows/publish_assets.yml`,
   `.github/workflows/auto_llama_cpp_update.yml`, JS build pipeline files, or
   `scripts/state_persistence_browser_smoke.py`.
+- Keep `scripts/multimodal_browser_smoke.py` in normal CI for every llama.cpp
+  pin update; build-only validation does not cover mtmd prompt ingestion.
 - Preserve `llama_cpp.version` as the single source of truth for default CI and
   publish builds. Manual publish overrides are allowed for temporary validation,
   but tag-triggered publishes should use the pinned file.

@@ -64,7 +64,7 @@ Minimum local checks before handing off a PR-ready branch:
 
 ```bash
 npm run check:js
-python3 -m py_compile scripts/verify_state_persistence_api.py scripts/verify_ci_reliability.py scripts/state_persistence_browser_smoke.py
+python3 -m py_compile scripts/verify_state_persistence_api.py scripts/verify_ci_reliability.py scripts/state_persistence_browser_smoke.py scripts/multimodal_browser_smoke.py
 python3 scripts/verify_state_persistence_api.py
 python3 scripts/verify_ci_reliability.py
 ```
@@ -82,6 +82,19 @@ python3 scripts/state_persistence_browser_smoke.py \
   --model-sha256 81f226c62d28ed4a1a9b9fa080fcd9f0cc40e0f9d5680036583ff98fbcd035cb \
   --model-cache-dir ~/.cache/llama-web-bridge/state-smoke-models \
   --artifacts-dir /private/tmp/llama_web_bridge_state_smoke_artifacts
+```
+
+For llama.cpp pin or multimodal changes, also run real image inference through
+both direct and worker runtimes:
+
+```bash
+python3 scripts/multimodal_browser_smoke.py \
+  --dist-dir /private/tmp/llama_web_bridge_dist \
+  --model-path /path/to/Qwen3.5-0.8B-Q4_K_M.gguf \
+  --model-sha256 bd258782e35f7f458f8aced1adc053e6e92e89bc735ba3be89d38a06121dc517 \
+  --mmproj-path /path/to/mmproj-F16.gguf \
+  --mmproj-sha256 56e4c6cfe73b0c82e3e82bc518d7591997e61d81f723fc41a586f4fa69ea2453 \
+  --artifacts-dir /private/tmp/llama_web_bridge_multimodal_smoke_artifacts
 ```
 
 ## CI / Release
@@ -161,3 +174,6 @@ After publishing assets tag:
   app-storage path for IndexedDB/OPFS/Cache API integrations.
 - If the smoke downloads a model, never expose raw signed/authenticated locations in
   thrown errors or artifacts. Redact userinfo, query, and fragment values.
+- Every llama.cpp pin update must pass checksum-pinned real multimodal inference
+  in both direct and worker runtimes; a successful WASM build alone is not
+  sufficient.
