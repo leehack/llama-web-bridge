@@ -315,6 +315,7 @@ def main() -> int:
     require(
         "--model-sha256" in multimodal_smoke
         and "--mmproj-sha256" in multimodal_smoke
+        and "--artifacts-dir" in multimodal_smoke
         and "loadMultimodalProjector" in multimodal_smoke
         and "createCompletion" in multimodal_smoke
         and "direct runtime" in multimodal_smoke
