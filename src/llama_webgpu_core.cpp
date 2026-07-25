@@ -908,6 +908,18 @@ bool is_supported_kv_cache_type(int32_t value) {
   }
 }
 
+constexpr llama_load_mode resolve_load_mode(bool use_mmap, bool use_mlock) {
+  if (use_mlock) {
+    return LLAMA_LOAD_MODE_MLOCK;
+  }
+  return use_mmap ? LLAMA_LOAD_MODE_MMAP : LLAMA_LOAD_MODE_NONE;
+}
+
+static_assert(resolve_load_mode(false, false) == LLAMA_LOAD_MODE_NONE);
+static_assert(resolve_load_mode(true, false) == LLAMA_LOAD_MODE_MMAP);
+static_assert(resolve_load_mode(false, true) == LLAMA_LOAD_MODE_MLOCK);
+static_assert(resolve_load_mode(true, true) == LLAMA_LOAD_MODE_MLOCK);
+
 int32_t load_model_internal(
     const char * model_path,
     int32_t n_ctx,
@@ -929,8 +941,7 @@ int32_t load_model_internal(
     int32_t main_gpu) {
   llama_model_params mparams = llama_model_default_params();
   mparams.n_gpu_layers = n_gpu_layers;
-  mparams.use_mmap = use_mmap;
-  mparams.use_mlock = use_mlock;
+  mparams.load_mode = resolve_load_mode(use_mmap, use_mlock);
   mparams.vocab_only = false;
   if (split_mode >= LLAMA_SPLIT_MODE_NONE &&
       split_mode <= LLAMA_SPLIT_MODE_TENSOR) {
