@@ -313,6 +313,17 @@ def main() -> int:
         errors,
     )
     require(
+        "constexpr llama_load_mode resolve_load_mode" in core
+        and "LLAMA_LOAD_MODE_NONE" in core
+        and "LLAMA_LOAD_MODE_MMAP" in core
+        and "LLAMA_LOAD_MODE_MLOCK" in core
+        and "mparams.load_mode = resolve_load_mode(use_mmap, use_mlock);" in core
+        and "mparams.use_mmap" not in core
+        and "mparams.use_mlock" not in core,
+        "native bridge model loading must map legacy mmap/mlock options through llama_load_mode",
+        errors,
+    )
+    require(
         "--model-sha256" in multimodal_smoke
         and "--mmproj-sha256" in multimodal_smoke
         and "--artifacts-dir" in multimodal_smoke
