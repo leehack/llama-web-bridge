@@ -257,6 +257,36 @@ def main() -> int:
         errors,
     )
     require(
+        "Read previous asset metadata" in publish
+        and "id: previous-release" in publish
+        and "PREVIOUS_ASSETS_TAG: ${{ steps.previous-release.outputs.assets_tag }}"
+        in publish
+        and "PREVIOUS_SOURCE_COMMIT: ${{ steps.previous-release.outputs.source_commit }}"
+        in publish
+        and "PREVIOUS_LLAMA_CPP_TAG: ${{ steps.previous-release.outputs.llama_cpp_tag }}"
+        in publish
+        and "compare/${PREVIOUS_SOURCE_COMMIT}...${SOURCE_COMMIT}" in publish
+        and "compare/${PREVIOUS_LLAMA_CPP_TAG}...${LLAMA_CPP_TAG}" in publish
+        and 'SOURCE_COMPARE_STATUS" != "ahead"' in publish
+        and "source commit must advance" in publish
+        and "Commit list truncated to" in publish
+        and "llama.cpp tag must not move backward" in publish
+        and "${ASSETS_REPO}/blob/${ASSETS_TAG}/manifest.json" in publish
+        and "${ASSETS_REPO}/blob/${ASSETS_TAG}/sha256sums.txt" in publish
+        and '--notes-file "$NOTES_FILE"' in publish
+        and "State persistence APIs included:" not in publish,
+        "publish_assets.yml must derive release-specific notes from the previous manifest instead of reusing a feature-specific description",
+        errors,
+    )
+    release_notes_index = publish.find("- name: Generate asset release notes")
+    publish_assets_index = publish.find("- name: Publish assets and tag")
+    create_release_index = publish.find("- name: Create or update assets release")
+    require(
+        -1 < release_notes_index < publish_assets_index < create_release_index,
+        "publish_assets.yml must validate and generate release notes before pushing assets or creating the release",
+        errors,
+    )
+    require(
         "concurrency:" in auto_update
         and "group: llama-cpp-auto-update" in auto_update
         and "UPDATE_BRANCH: automation/bump-llama-cpp" in auto_update
