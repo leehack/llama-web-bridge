@@ -141,6 +141,12 @@ python3 scripts/multimodal_browser_smoke.py \
     asset releases cannot race.
   - Supports `assets_tag=auto` plus `source_ref=<sha>` for CI-dispatched
     publishes from the exact source commit that already passed `main` CI.
+  - Builds release notes from the previous asset manifest, including bridge and
+    llama.cpp compare links plus the intervening bridge commit subjects. Do not
+    replace this with a static feature-specific release description.
+  - Rejects backward or diverged source publishes and backward llama.cpp pins
+    before pushing asset commits or tags. Large compare ranges must disclose
+    when GitHub's compare response truncates the rendered commit list.
   - Pushes assets + tag to `llama-web-bridge-assets`
 
 ## Change Boundaries

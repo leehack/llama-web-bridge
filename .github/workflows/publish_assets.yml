@@ -241,11 +241,139 @@ jobs:
           token: ${{ secrets.WEBGPU_BRIDGE_ASSETS_PAT }}
           path: assets-repo
 
+      - name: Read previous asset metadata
+        id: previous-release
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          MANIFEST="assets-repo/manifest.json"
+          if [ ! -f "$MANIFEST" ]; then
+            echo "No previous manifest found; release notes will describe an initial asset publish."
+            exit 0
+          fi
+
+          PREVIOUS_ASSETS_TAG="$(jq -r '.bridge_assets_tag // empty' "$MANIFEST")"
+          PREVIOUS_SOURCE_COMMIT="$(jq -r '.source_commit // empty' "$MANIFEST")"
+          PREVIOUS_LLAMA_CPP_TAG="$(jq -r '.llama_cpp_tag // empty' "$MANIFEST")"
+
+          if [[ ! "$PREVIOUS_ASSETS_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "error: previous manifest has an invalid bridge_assets_tag: $PREVIOUS_ASSETS_TAG"
+            exit 1
+          fi
+          if [[ ! "$PREVIOUS_SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "error: previous manifest has an invalid source_commit: $PREVIOUS_SOURCE_COMMIT"
+            exit 1
+          fi
+          if [[ ! "$PREVIOUS_LLAMA_CPP_TAG" =~ ^b[0-9]+$ ]]; then
+            echo "error: previous manifest has an invalid llama_cpp_tag: $PREVIOUS_LLAMA_CPP_TAG"
+            exit 1
+          fi
+
+          {
+            echo "assets_tag=$PREVIOUS_ASSETS_TAG"
+            echo "source_commit=$PREVIOUS_SOURCE_COMMIT"
+            echo "llama_cpp_tag=$PREVIOUS_LLAMA_CPP_TAG"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Download bridge assets artifact
         uses: actions/download-artifact@v4
         with:
           name: webgpu-bridge-dist
           path: bridge-dist
+
+      - name: Generate asset release notes
+        env:
+          GH_TOKEN: ${{ secrets.WEBGPU_BRIDGE_ASSETS_PAT }}
+          ASSETS_TAG: ${{ env.ASSETS_TAG }}
+          ASSETS_REPO: ${{ env.ASSETS_REPO }}
+          LLAMA_CPP_TAG: ${{ needs.build-bridge-assets.outputs.llama_cpp_tag }}
+          SOURCE_REPO: ${{ github.repository }}
+          SOURCE_COMMIT: ${{ needs.build-bridge-assets.outputs.source_commit }}
+          PREVIOUS_ASSETS_TAG: ${{ steps.previous-release.outputs.assets_tag }}
+          PREVIOUS_SOURCE_COMMIT: ${{ steps.previous-release.outputs.source_commit }}
+          PREVIOUS_LLAMA_CPP_TAG: ${{ steps.previous-release.outputs.llama_cpp_tag }}
+        run: |
+          set -euo pipefail
+
+          NOTES_FILE="${RUNNER_TEMP}/asset-release-notes.md"
+          SOURCE_URL="https://github.com/${SOURCE_REPO}/commit/${SOURCE_COMMIT}"
+          SOURCE_COMPARE_JSON=""
+          SOURCE_COMPARE_COMMIT_COUNT=""
+          SOURCE_COMPARE_TOTAL_COMMITS=""
+
+          if [ -n "$PREVIOUS_ASSETS_TAG" ] && [ "$PREVIOUS_SOURCE_COMMIT" != "$SOURCE_COMMIT" ]; then
+            SOURCE_COMPARE_JSON="${RUNNER_TEMP}/source-compare.json"
+            gh api "repos/${SOURCE_REPO}/compare/${PREVIOUS_SOURCE_COMMIT}...${SOURCE_COMMIT}" > "$SOURCE_COMPARE_JSON"
+
+            SOURCE_COMPARE_STATUS="$(jq -r '.status' "$SOURCE_COMPARE_JSON")"
+            if [ "$SOURCE_COMPARE_STATUS" != "ahead" ]; then
+              echo "error: source commit must advance from ${PREVIOUS_SOURCE_COMMIT}; compare status is ${SOURCE_COMPARE_STATUS}"
+              exit 1
+            fi
+
+            SOURCE_COMPARE_COMMIT_COUNT="$(jq -r '.commits | length' "$SOURCE_COMPARE_JSON")"
+            SOURCE_COMPARE_TOTAL_COMMITS="$(jq -r '.total_commits' "$SOURCE_COMPARE_JSON")"
+            if [ "$SOURCE_COMPARE_COMMIT_COUNT" -eq 0 ]; then
+              echo "error: forward source comparison returned no commits"
+              exit 1
+            fi
+          fi
+
+          if [ -n "$PREVIOUS_LLAMA_CPP_TAG" ] \
+            && [ "${LLAMA_CPP_TAG#b}" -lt "${PREVIOUS_LLAMA_CPP_TAG#b}" ]; then
+            echo "error: llama.cpp tag must not move backward from ${PREVIOUS_LLAMA_CPP_TAG} to ${LLAMA_CPP_TAG}"
+            exit 1
+          fi
+
+          {
+            echo "Bridge assets published from [${SOURCE_REPO}@${SOURCE_COMMIT:0:7}](${SOURCE_URL}) using llama.cpp ${LLAMA_CPP_TAG}."
+            echo
+
+            if [ -n "$PREVIOUS_ASSETS_TAG" ]; then
+              echo "## Changes since ${PREVIOUS_ASSETS_TAG}"
+              echo
+
+              if [ "$PREVIOUS_SOURCE_COMMIT" = "$SOURCE_COMMIT" ]; then
+                echo "- Bridge source commit unchanged."
+              else
+                SOURCE_COMPARE_URL="https://github.com/${SOURCE_REPO}/compare/${PREVIOUS_SOURCE_COMMIT}...${SOURCE_COMMIT}"
+                echo "- Bridge source: [compare ${PREVIOUS_SOURCE_COMMIT:0:7}...${SOURCE_COMMIT:0:7}](${SOURCE_COMPARE_URL})"
+              fi
+
+              if [ "$PREVIOUS_LLAMA_CPP_TAG" = "$LLAMA_CPP_TAG" ]; then
+                echo "- llama.cpp: ${LLAMA_CPP_TAG} (unchanged)"
+              else
+                LLAMA_CPP_COMPARE_URL="https://github.com/ggml-org/llama.cpp/compare/${PREVIOUS_LLAMA_CPP_TAG}...${LLAMA_CPP_TAG}"
+                echo "- llama.cpp: [${PREVIOUS_LLAMA_CPP_TAG}...${LLAMA_CPP_TAG}](${LLAMA_CPP_COMPARE_URL})"
+              fi
+
+              if [ "$PREVIOUS_SOURCE_COMMIT" != "$SOURCE_COMMIT" ]; then
+                echo
+                echo "### Bridge commits"
+                echo
+                # Backticks are intentional Markdown passed literally to jq.
+                # shellcheck disable=SC2016
+                jq -r '.commits[] | "- " + (.commit.message | split("\n")[0]) + " (`" + (.sha[0:7]) + "`)"' \
+                  "$SOURCE_COMPARE_JSON"
+                if [ "$SOURCE_COMPARE_COMMIT_COUNT" -lt "$SOURCE_COMPARE_TOTAL_COMMITS" ]; then
+                  echo
+                  echo "Commit list truncated to ${SOURCE_COMPARE_COMMIT_COUNT} of ${SOURCE_COMPARE_TOTAL_COMMITS} commits; use the bridge compare link for the complete range."
+                fi
+              fi
+            else
+              echo "Initial published WebGPU bridge asset bundle."
+            fi
+
+            echo
+            echo "## Artifact metadata"
+            echo
+            echo "- Asset tag: \`${ASSETS_TAG}\`"
+            echo "- Bridge source commit: [\`${SOURCE_COMMIT}\`](${SOURCE_URL})"
+            echo "- llama.cpp tag: [\`${LLAMA_CPP_TAG}\`](https://github.com/ggml-org/llama.cpp/releases/tag/${LLAMA_CPP_TAG})"
+            echo "- Artifact manifest: [\`manifest.json\`](https://github.com/${ASSETS_REPO}/blob/${ASSETS_TAG}/manifest.json)"
+            echo "- Checksums: [\`sha256sums.txt\`](https://github.com/${ASSETS_REPO}/blob/${ASSETS_TAG}/sha256sums.txt)"
+          } > "$NOTES_FILE"
 
       - name: Publish assets and tag
         run: |
@@ -278,32 +406,20 @@ jobs:
           GH_TOKEN: ${{ secrets.WEBGPU_BRIDGE_ASSETS_PAT }}
           ASSETS_TAG: ${{ env.ASSETS_TAG }}
           ASSETS_REPO: ${{ env.ASSETS_REPO }}
-          LLAMA_CPP_TAG: ${{ needs.build-bridge-assets.outputs.llama_cpp_tag }}
-          SOURCE_REPO: ${{ github.repository }}
-          SOURCE_COMMIT: ${{ needs.build-bridge-assets.outputs.source_commit }}
         run: |
-          NOTES="$(cat <<EOF
-          Bridge assets published from ${SOURCE_REPO}@${SOURCE_COMMIT} (llama.cpp ${LLAMA_CPP_TAG}).
+          set -euo pipefail
 
-          State persistence APIs included:
-          - stateSaveFile(path, tokens)
-          - stateLoadFile(path, tokenCapacity)
-          - stateSaveBytes(tokens)
-          - stateLoadBytes(bytes, tokenCapacity)
-
-          State snapshots are model/build/load-parameter coupled. File APIs use WASMFS-local paths; use byte APIs for app-managed durable storage.
-          EOF
-          )"
+          NOTES_FILE="${RUNNER_TEMP}/asset-release-notes.md"
 
           if gh release view "$ASSETS_TAG" --repo "$ASSETS_REPO" >/dev/null 2>&1; then
             gh release edit "$ASSETS_TAG" \
               --repo "$ASSETS_REPO" \
               --title "$ASSETS_TAG" \
-              --notes "$NOTES"
+              --notes-file "$NOTES_FILE"
           else
             gh release create "$ASSETS_TAG" \
               --repo "$ASSETS_REPO" \
               --verify-tag \
               --title "$ASSETS_TAG" \
-              --notes "$NOTES"
+              --notes-file "$NOTES_FILE"
           fi

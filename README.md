@@ -231,7 +231,12 @@ Required repository secret:
 
 The publish workflow carries the resolved `llama.cpp` tag from the build job to
 the release job as an explicit job output, so the asset release notes match the
-`manifest.json` `llama_cpp_tag` value.
+`manifest.json` `llama_cpp_tag` value. It also reads the previous asset manifest
+before replacing it and derives release-specific bridge and llama.cpp compare
+links plus the intervening bridge commit subjects. Release descriptions are not
+maintained as a static feature list. Backward/diverged source publishes and
+backward llama.cpp pins fail before asset mutation; oversized commit ranges
+explicitly report when GitHub's compare response truncates the rendered list.
 
 Automatic llama.cpp pin publish:
 

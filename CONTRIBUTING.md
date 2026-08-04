@@ -149,7 +149,11 @@ Manual publish:
    repository.
 4. Workflow builds, generates `manifest.json`/`sha256sums.txt`, pushes to
    assets repo, creates matching tag there, and uses the build job's resolved
-   `llama.cpp` tag output in release notes.
+   `llama.cpp` tag output in release notes. It reads the previous asset manifest
+   before publishing so the release body includes bridge and llama.cpp compare
+   links plus the intervening bridge commit subjects. The workflow rejects
+   backward/diverged source publishes and backward llama.cpp pins before it
+   pushes assets or tags, and reports any compare-list truncation.
 
 ## Repository Boundaries
 
