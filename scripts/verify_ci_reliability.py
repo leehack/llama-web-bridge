@@ -193,6 +193,12 @@ def main() -> int:
         errors,
     )
     require(
+        "const int32_t vocab_size = llama_vocab_n_tokens(g_state.vocab);" in core
+        and "vocab_size, 64, repeat_penalty, 0.0f, 0.0f" in core,
+        "the repetition-penalty sampler must receive the active vocabulary size",
+        errors,
+    )
+    require(
         "tr -d '[:space:]' < llama_cpp.version" in ci
         and "Resolve llama.cpp pin" in ci
         and "workflow_dispatch:" in ci

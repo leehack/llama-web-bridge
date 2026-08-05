@@ -713,9 +713,11 @@ llama_sampler * create_sampler(
   }
 
   if (repeat_penalty != 1.0f) {
+    const int32_t vocab_size = llama_vocab_n_tokens(g_state.vocab);
     llama_sampler_chain_add(
         sampler,
-        llama_sampler_init_penalties(64, repeat_penalty, 0.0f, 0.0f));
+        llama_sampler_init_penalties(
+            vocab_size, 64, repeat_penalty, 0.0f, 0.0f));
   }
 
   if (top_k > 0) {
