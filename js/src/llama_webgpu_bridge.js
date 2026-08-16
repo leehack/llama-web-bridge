@@ -3728,8 +3728,11 @@ class LlamaWebGpuBridgeRuntime {
       throw new Error('WebGPU core is not initialized.');
     }
 
-    if (!this._core.FS.analyzePath('/media').exists) {
+    try {
       this._core.FS.mkdir('/media');
+    } catch (_) {
+      // The directory is shared across requests. A following write reports any
+      // real filesystem failure without relying on wasm64 analyzePath support.
     }
 
     this._mediaFileCounter += 1;
@@ -4031,9 +4034,10 @@ class LlamaWebGpuBridgeRuntime {
         ? String(options.tokenEventEncoding || '').toLowerCase()
         : 'bytes';
       const emitTokenText = tokenEventEncoding === 'text';
-      const shouldYieldForResponsiveness =
-        !(typeof WorkerGlobalScope !== 'undefined' && globalThis instanceof WorkerGlobalScope);
-      const yieldInterval = shouldYieldForResponsiveness ? 4 : 0;
+      // Yield in workers as well as on the main thread. Without a macrotask
+      // boundary, worker token events and cancellation messages remain queued
+      // until generation has already completed.
+      const yieldInterval = 4;
       let streamed = '';
       let emittedStableText = '';
 

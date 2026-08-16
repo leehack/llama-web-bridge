@@ -84,6 +84,7 @@ def main() -> int:
     errors: list[str] = []
     smoke = read_required("scripts/state_persistence_browser_smoke.py", errors)
     multimodal_smoke = read_required("scripts/multimodal_browser_smoke.py", errors)
+    speech_smoke = read_required("scripts/speech_to_text_browser_smoke.py", errors)
     ci = read_required(".github/workflows/ci.yml", errors)
     publish = read_required(".github/workflows/publish_assets.yml", errors)
     auto_update = read_required(".github/workflows/auto_llama_cpp_update.yml", errors)
@@ -406,12 +407,32 @@ def main() -> int:
         errors,
     )
     require(
+        "run_speech_to_text_smoke" in ci
+        and "scripts/speech_to_text_browser_smoke.py" in ci
+        and "LLAMA_WEBGPU_SPEECH_MODEL_SHA256" in ci
+        and "LLAMA_WEBGPU_SPEECH_MMPROJ_SHA256" in ci,
+        "CI must expose the checksum-pinned Qwen3-ASR smoke as an opt-in manual gate",
+        errors,
+    )
+    require(
+        "wasm32" in speech_smoke
+        and "wasm64" in speech_smoke
+        and "direct" in speech_smoke
+        and "worker" in speech_smoke
+        and "AbortController" in speech_smoke
+        and "DEFAULT_AUDIO_SHA256" in speech_smoke
+        and "DEFAULT_EXPECTED_TEXT" in speech_smoke,
+        "speech-to-text smoke must validate both memory/runtime modes, cancellation, and a pinned transcript",
+        errors,
+    )
+    require(
         "npm run check:js" in agents
         and "js/src/" in agents
         and "generated bridge wrapper outputs" in agents
         and "independent review" in agents
         and "state_persistence_browser_smoke.py" in agents
         and "multimodal_browser_smoke.py" in agents
+        and "speech_to_text_browser_smoke.py" in agents
         and "llama_cpp.version" in agents
         and "auto_llama_cpp_update.yml" in agents,
         "AGENTS.md must document the JS build gate, agent PR workflow, browser smoke expectations, and llama.cpp auto-update policy",
@@ -426,6 +447,7 @@ def main() -> int:
         and "state-persistence-smoke-artifacts" in readme
         and "multimodal-smoke-artifacts" in readme
         and "scripts/multimodal_browser_smoke.py" in readme
+        and "scripts/speech_to_text_browser_smoke.py" in readme
         and "scripts/verify_ci_reliability.py" in readme
         and "llama_cpp.version" in readme
         and "auto_llama_cpp_update.yml" in readme,
@@ -481,6 +503,7 @@ def main() -> int:
         and "js/src/" in contributing
         and "scripts/verify_ci_reliability.py" in contributing
         and "scripts/multimodal_browser_smoke.py" in contributing
+        and "scripts/speech_to_text_browser_smoke.py" in contributing
         and "--model-sha256" in contributing
         and "--mmproj-sha256" in contributing
         and "llama_cpp.version" in contributing,

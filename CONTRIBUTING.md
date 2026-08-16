@@ -64,7 +64,7 @@ Before opening or updating a PR, run the lightweight contracts:
 
 ```bash
 npm run check:js
-python3 -m py_compile scripts/verify_state_persistence_api.py scripts/verify_ci_reliability.py scripts/state_persistence_browser_smoke.py scripts/multimodal_browser_smoke.py
+python3 -m py_compile scripts/verify_state_persistence_api.py scripts/verify_ci_reliability.py scripts/state_persistence_browser_smoke.py scripts/multimodal_browser_smoke.py scripts/speech_to_text_browser_smoke.py
 python3 scripts/verify_state_persistence_api.py
 python3 scripts/verify_ci_reliability.py
 ```
@@ -95,6 +95,22 @@ python3 scripts/multimodal_browser_smoke.py \
   --artifacts-dir /tmp/llama-web-bridge-multimodal-smoke
 ```
 
+Before publishing assets intended to support typed Qwen3-ASR, run the opt-in
+checksum-pinned speech gate. It validates cold, cancellation, and warm-reuse
+results in wasm32 and memory64, through both direct and worker runtimes. Qwen's
+official English WAV fixture, its SHA-256, and the expected Web transcript are
+pinned by the script:
+
+```bash
+python3 scripts/speech_to_text_browser_smoke.py \
+  --dist-dir /private/tmp/llama_web_bridge_dist \
+  --model-path /path/to/Qwen3-ASR-0.6B-Q8_0.gguf \
+  --model-sha256 bca259818b50ca7c4c05e9bdb35a5dc04fa039653a6d6f3f0f331f96f6aa1971 \
+  --mmproj-path /path/to/mmproj-Qwen3-ASR-0.6B-Q8_0.gguf \
+  --mmproj-sha256 41a342b5e4c514e968cb756de6cd1b7be39eff43c44c57a2ef5fc6522e36603d \
+  --artifacts-dir /tmp/llama-web-bridge-speech-smoke
+```
+
 If the smoke downloads from a URL, errors and diagnostics must redact userinfo,
 query strings, and fragments before printing the location.
 
@@ -106,6 +122,8 @@ query strings, and fragments before printing the location.
   `scripts/state_persistence_browser_smoke.py`.
 - Keep `scripts/multimodal_browser_smoke.py` in normal CI for every llama.cpp
   pin update; build-only validation does not cover mtmd prompt ingestion.
+- Keep `scripts/speech_to_text_browser_smoke.py` opt-in because its model pair
+  is large, but require it before publishing assets advertised for typed ASR.
 - Preserve `llama_cpp.version` as the single source of truth for default CI and
   publish builds. Manual publish overrides are allowed for temporary validation,
   but tag-triggered publishes should use the pinned file.

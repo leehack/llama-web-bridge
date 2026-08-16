@@ -64,7 +64,7 @@ Minimum local checks before handing off a PR-ready branch:
 
 ```bash
 npm run check:js
-python3 -m py_compile scripts/verify_state_persistence_api.py scripts/verify_ci_reliability.py scripts/state_persistence_browser_smoke.py scripts/multimodal_browser_smoke.py
+python3 -m py_compile scripts/verify_state_persistence_api.py scripts/verify_ci_reliability.py scripts/state_persistence_browser_smoke.py scripts/multimodal_browser_smoke.py scripts/speech_to_text_browser_smoke.py
 python3 scripts/verify_state_persistence_api.py
 python3 scripts/verify_ci_reliability.py
 ```
@@ -95,6 +95,18 @@ python3 scripts/multimodal_browser_smoke.py \
   --mmproj-path /path/to/mmproj-F16.gguf \
   --mmproj-sha256 56e4c6cfe73b0c82e3e82bc518d7591997e61d81f723fc41a586f4fa69ea2453 \
   --artifacts-dir /private/tmp/llama_web_bridge_multimodal_smoke_artifacts
+```
+
+Before publishing assets intended for typed Qwen3-ASR, also run the opt-in
+speech smoke in wasm32 and memory64, through direct and worker runtimes:
+
+```bash
+python3 scripts/speech_to_text_browser_smoke.py \
+  --dist-dir /private/tmp/llama_web_bridge_dist \
+  --model-path /path/to/Qwen3-ASR-0.6B-Q8_0.gguf \
+  --model-sha256 bca259818b50ca7c4c05e9bdb35a5dc04fa039653a6d6f3f0f331f96f6aa1971 \
+  --mmproj-path /path/to/mmproj-Qwen3-ASR-0.6B-Q8_0.gguf \
+  --mmproj-sha256 41a342b5e4c514e968cb756de6cd1b7be39eff43c44c57a2ef5fc6522e36603d
 ```
 
 ## CI / Release
@@ -183,3 +195,5 @@ After publishing assets tag:
 - Every llama.cpp pin update must pass checksum-pinned real multimodal inference
   in both direct and worker runtimes; a successful WASM build alone is not
   sufficient.
+- Speech-capable asset releases must also pass the opt-in Qwen3-ASR smoke in
+  wasm32 and memory64; keep the large model pair out of default CI.
