@@ -161,20 +161,29 @@ def write_harness(
             let cancellationState = 'resolved';
             let cancellationRequested = false;
             let cancellationWatchdog;
+            let tokenWatchdog;
+            let rejectWatchdog;
+            const watchdogPromise = new Promise((_, reject) => {{
+              rejectWatchdog = reject;
+              tokenWatchdog = setTimeout(
+                () => reject(new Error('speech did not emit a cancellable token within 180 seconds')),
+                180000,
+              );
+            }});
             try {{
               cancelledOutput = String(await Promise.race([
                 transcribe(controller.signal, () => {{
                   if (cancellationRequested) return;
                   cancellationRequested = true;
+                  clearTimeout(tokenWatchdog);
+                  cancellationWatchdog = setTimeout(
+                    () => rejectWatchdog(new Error('speech cancellation did not settle within 30 seconds')),
+                    30000,
+                  );
                   controller.abort();
                   bridge.cancel();
                 }}),
-                new Promise((_, reject) => {{
-                  cancellationWatchdog = setTimeout(
-                    () => reject(new Error('speech watchdog timed out after 30 seconds')),
-                    30000,
-                  );
-                }}),
+                watchdogPromise,
               ]) || '');
             }} catch (error) {{
               const message = String(error?.message || error || '');
@@ -184,6 +193,7 @@ def write_harness(
               );
               cancellationState = 'rejected';
             }} finally {{
+              clearTimeout(tokenWatchdog);
               clearTimeout(cancellationWatchdog);
             }}
             assert(cancellationRequested, `${{memoryMode}} ${{runtimeMode}} did not emit a token to cancel`);
