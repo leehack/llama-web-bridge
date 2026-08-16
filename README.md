@@ -171,6 +171,9 @@ are easy to regress during agent-driven maintenance:
   model round trip;
 - the multimodal browser smoke runs checksum-pinned Qwen image inference through
   both direct and worker runtimes, guarding llama.cpp mtmd API changes;
+- the opt-in speech-to-text browser smoke runs checksum-pinned Qwen3-ASR through
+  wasm32 and memory64 in both direct and worker runtimes, including cancellation
+  and warm reuse against Qwen's checksum-pinned official English fixture;
 - the CI model cache path expands `~` before resolving so it matches the
   `actions/cache` directory;
 - browser smoke failures upload `state-persistence-smoke-artifacts` with console
@@ -200,6 +203,27 @@ python3 scripts/multimodal_browser_smoke.py \
   --mmproj-sha256 56e4c6cfe73b0c82e3e82bc518d7591997e61d81f723fc41a586f4fa69ea2453 \
   --artifacts-dir /tmp/llama-web-bridge-multimodal-smoke
 ```
+
+Qwen3-ASR is intentionally excluded from default CI because its model and
+projector total about 1.02 GB. Run the opt-in real-model gate before publishing
+speech-capable bridge assets:
+
+```bash
+python3 scripts/speech_to_text_browser_smoke.py \
+  --dist-dir /path/to/webgpu_bridge_dist \
+  --model-path /path/to/Qwen3-ASR-0.6B-Q8_0.gguf \
+  --model-sha256 bca259818b50ca7c4c05e9bdb35a5dc04fa039653a6d6f3f0f331f96f6aa1971 \
+  --mmproj-path /path/to/mmproj-Qwen3-ASR-0.6B-Q8_0.gguf \
+  --mmproj-sha256 41a342b5e4c514e968cb756de6cd1b7be39eff43c44c57a2ef5fc6522e36603d \
+  --artifacts-dir /tmp/llama-web-bridge-speech-smoke
+```
+
+The default audio is Qwen's official English example fixture. The script pins
+its SHA-256 and the exact normalized transcript observed through the Web
+runtime, so an upstream fixture replacement fails loudly. Use
+`--memory-mode wasm32` or `--memory-mode wasm64` to classify one variant; the
+default validates both. The repository CI workflow exposes the same large-model
+gate only through its `run_speech_to_text_smoke` manual-dispatch input.
 
 Do not commit downloaded GGUFs, Playwright screenshots, console logs, generated
 `dist/` assets, or Emscripten build/cache directories.

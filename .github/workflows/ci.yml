@@ -2,6 +2,12 @@ name: CI
 
 on:
   workflow_dispatch:
+    inputs:
+      run_speech_to_text_smoke:
+        description: Run the opt-in Qwen3-ASR browser smoke
+        required: false
+        default: false
+        type: boolean
   push:
     branches: [main]
   pull_request:
@@ -29,6 +35,13 @@ jobs:
       LLAMA_WEBGPU_MULTIMODAL_MODEL_CACHE: ~/.cache/llama-web-bridge/multimodal-smoke-models
       LLAMA_WEBGPU_MULTIMODAL_ARTIFACTS_DIR: /tmp/multimodal-smoke-artifacts
       LLAMA_WEBGPU_MULTIMODAL_TIMEOUT_MS: 420000
+      LLAMA_WEBGPU_SPEECH_MODEL_URL: https://huggingface.co/ggml-org/Qwen3-ASR-0.6B-GGUF/resolve/928ab958557df9aa2ef1c93e0e83c7ad0933fae2/Qwen3-ASR-0.6B-Q8_0.gguf?download=true
+      LLAMA_WEBGPU_SPEECH_MODEL_SHA256: bca259818b50ca7c4c05e9bdb35a5dc04fa039653a6d6f3f0f331f96f6aa1971
+      LLAMA_WEBGPU_SPEECH_MMPROJ_URL: https://huggingface.co/ggml-org/Qwen3-ASR-0.6B-GGUF/resolve/928ab958557df9aa2ef1c93e0e83c7ad0933fae2/mmproj-Qwen3-ASR-0.6B-Q8_0.gguf?download=true
+      LLAMA_WEBGPU_SPEECH_MMPROJ_SHA256: 41a342b5e4c514e968cb756de6cd1b7be39eff43c44c57a2ef5fc6522e36603d
+      LLAMA_WEBGPU_SPEECH_MODEL_CACHE: ~/.cache/llama-web-bridge/speech-smoke-models
+      LLAMA_WEBGPU_SPEECH_ARTIFACTS_DIR: /tmp/speech-to-text-smoke-artifacts
+      LLAMA_WEBGPU_SPEECH_TIMEOUT_MS: 900000
     steps:
       - uses: actions/checkout@v4
 
@@ -66,7 +79,8 @@ jobs:
             scripts/verify_state_persistence_api.py \
             scripts/verify_ci_reliability.py \
             scripts/state_persistence_browser_smoke.py \
-            scripts/multimodal_browser_smoke.py
+            scripts/multimodal_browser_smoke.py \
+            scripts/speech_to_text_browser_smoke.py
 
       - name: Verify CI reliability contract
         run: python3 scripts/verify_ci_reliability.py
@@ -82,6 +96,13 @@ jobs:
         with:
           path: ~/.cache/llama-web-bridge/multimodal-smoke-models
           key: multimodal-smoke-${{ env.LLAMA_WEBGPU_MULTIMODAL_MODEL_SHA256 }}-${{ env.LLAMA_WEBGPU_MULTIMODAL_MMPROJ_SHA256 }}
+
+      - name: Cache speech-to-text smoke models
+        if: github.event_name == 'workflow_dispatch' && inputs.run_speech_to_text_smoke
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/llama-web-bridge/speech-smoke-models
+          key: speech-smoke-${{ env.LLAMA_WEBGPU_SPEECH_MODEL_SHA256 }}-${{ env.LLAMA_WEBGPU_SPEECH_MMPROJ_SHA256 }}
 
       - name: Clone llama.cpp source
         run: |
@@ -123,6 +144,12 @@ jobs:
           BRIDGE_DIST_DIR: ${{ runner.temp }}/webgpu_bridge_dist
         run: python3 scripts/multimodal_browser_smoke.py
 
+      - name: Run Qwen3-ASR browser smoke
+        if: github.event_name == 'workflow_dispatch' && inputs.run_speech_to_text_smoke
+        env:
+          BRIDGE_DIST_DIR: ${{ runner.temp }}/webgpu_bridge_dist
+        run: python3 scripts/speech_to_text_browser_smoke.py
+
       - name: Upload state persistence smoke diagnostics
         if: failure()
         uses: actions/upload-artifact@v4
@@ -137,6 +164,14 @@ jobs:
         with:
           name: multimodal-smoke-artifacts
           path: ${{ env.LLAMA_WEBGPU_MULTIMODAL_ARTIFACTS_DIR }}
+          if-no-files-found: ignore
+
+      - name: Upload speech-to-text smoke diagnostics
+        if: failure() && github.event_name == 'workflow_dispatch' && inputs.run_speech_to_text_smoke
+        uses: actions/upload-artifact@v4
+        with:
+          name: speech-to-text-smoke-artifacts
+          path: ${{ env.LLAMA_WEBGPU_SPEECH_ARTIFACTS_DIR }}
           if-no-files-found: ignore
 
       - name: Upload bridge artifacts

@@ -2958,8 +2958,9 @@ var LlamaWebGpuBridgeRuntime = class {
     if (!this._core) {
       throw new Error("WebGPU core is not initialized.");
     }
-    if (!this._core.FS.analyzePath("/media").exists) {
+    try {
       this._core.FS.mkdir("/media");
+    } catch (_) {
     }
     this._mediaFileCounter += 1;
     const suffix = typeof extension === "string" && extension.startsWith(".") ? extension : ".bin";
@@ -3202,8 +3203,7 @@ var LlamaWebGpuBridgeRuntime = class {
       const shouldEmitCurrentText = options.emitCurrentTextOnToken !== false;
       const tokenEventEncoding = typeof options.tokenEventEncoding === "string" ? String(options.tokenEventEncoding || "").toLowerCase() : "bytes";
       const emitTokenText = tokenEventEncoding === "text";
-      const shouldYieldForResponsiveness = !(typeof WorkerGlobalScope !== "undefined" && globalThis instanceof WorkerGlobalScope);
-      const yieldInterval = shouldYieldForResponsiveness ? 4 : 0;
+      const yieldInterval = 4;
       let streamed = "";
       let emittedStableText = "";
       while (generated < nPredict) {
