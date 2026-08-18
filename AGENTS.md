@@ -64,8 +64,9 @@ Minimum local checks before handing off a PR-ready branch:
 
 ```bash
 npm run check:js
-python3 -m py_compile scripts/verify_state_persistence_api.py scripts/verify_ci_reliability.py scripts/state_persistence_browser_smoke.py scripts/multimodal_browser_smoke.py scripts/speech_to_text_browser_smoke.py
+python3 -m py_compile scripts/verify_state_persistence_api.py scripts/verify_text_to_speech_api.py scripts/verify_ci_reliability.py scripts/state_persistence_browser_smoke.py scripts/multimodal_browser_smoke.py scripts/speech_to_text_browser_smoke.py scripts/text_to_speech_browser_smoke.py
 python3 scripts/verify_state_persistence_api.py
+python3 scripts/verify_text_to_speech_api.py
 python3 scripts/verify_ci_reliability.py
 ```
 
@@ -108,6 +109,25 @@ python3 scripts/speech_to_text_browser_smoke.py \
   --mmproj-path /path/to/mmproj-Qwen3-ASR-0.6B-Q8_0.gguf \
   --mmproj-sha256 41a342b5e4c514e968cb756de6cd1b7be39eff43c44c57a2ef5fc6522e36603d
 ```
+
+Before publishing assets intended for Qwen3-TTS, run the checksum-pinned
+memory64 smoke through direct and worker runtimes. The validated 1.48 GB pair is
+not a practical wasm32 product path:
+
+```bash
+python3 scripts/text_to_speech_browser_smoke.py \
+  --dist-dir /private/tmp/llama_web_bridge_dist \
+  --model-path /path/to/Qwen3-TTS-12Hz-1.7B-Base-Q4_K_M.gguf \
+  --model-sha256 8d18c94acb2addd042f97da63c98be144eafa76d0d9495177eab65130cf85129 \
+  --mmproj-path /path/to/mmproj-Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf \
+  --mmproj-sha256 6fd65188839bcd6ecc91b277ad471e22a0edfada4699a0fe82f1165c18cfcce2 \
+  --memory-mode wasm64 \
+  --runtime-mode all \
+  --gpu-layers 99
+```
+
+Keep this gate opt-in because the pair is large and memory64-only in practice,
+but require it before publishing assets advertised for Qwen3-TTS.
 
 ## CI / Release
 

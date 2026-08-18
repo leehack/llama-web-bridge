@@ -738,6 +738,17 @@ function installBridgeWorkerHost() {
         self.postMessage({ type: "result", id, value: value2, state: snapshotBridgeState(bridge) });
         return;
       }
+      if (method === "synthesizeSpeech") {
+        const options = args[0] && typeof args[0] === "object" ? { ...args[0] } : {};
+        delete options.signal;
+        options.onProgress = (progress) => {
+          self.postMessage({ type: "event", id, event: "progress", payload: progress || {} });
+        };
+        const value2 = await bridge.synthesizeSpeech(options);
+        const transfers = value2?.pcm?.buffer instanceof ArrayBuffer ? [value2.pcm.buffer] : [];
+        self.postMessage({ type: "result", id, value: value2 }, transfers);
+        return;
+      }
       if (method === "unloadMultimodalProjector") {
         const value2 = await bridge.unloadMultimodalProjector();
         self.postMessage({ type: "result", id, value: value2, state: snapshotBridgeState(bridge) });
@@ -1017,6 +1028,9 @@ var BridgeWorkerProxy = class {
     if (method === "createCompletion") {
       return clamp(Number(this._config.workerCompletionTimeoutMs), clamp(explicitGlobal, 6 * 60 * 1e3));
     }
+    if (method === "synthesizeSpeech") {
+      return clamp(Number(this._config.workerTextToSpeechTimeoutMs), clamp(explicitGlobal, 20 * 60 * 1e3));
+    }
     return clamp(explicitGlobal, 12e4);
   }
   async dispose() {
@@ -1064,6 +1078,9 @@ var LlamaWebGpuBridgeRuntime = class {
     this._stagedMediaPaths = [];
     this._nCtx = 4096;
     this._abortRequested = false;
+    this._textToSpeechActive = false;
+    this._textToSpeechDone = null;
+    this._resolveTextToSpeechDone = null;
     this._runtimeNotes = [];
     this._threadPoolSizeHint = Number(config.threadPoolSize) > 0 ? Math.max(1, Math.trunc(Number(config.threadPoolSize))) : null;
     const requestedThreads = Number(config.threads) > 0 ? Number(config.threads) : this._resolveAutoThreadCount();
@@ -2922,20 +2939,206 @@ var LlamaWebGpuBridgeRuntime = class {
       this._mmProjSourceUrl = null;
       return;
     }
-    try {
-      this._core.ccall("llamadart_webgpu_mmproj_free", null, [], []);
-    } finally {
-      this._mmProjPath = null;
-      this._mmSupportsVision = false;
-      this._mmSupportsAudio = false;
-      this._mmProjSourceUrl = null;
+    const mmprojPath = this._mmProjPath;
+    const rc = Number(
+      this._core.ccall("llamadart_webgpu_mmproj_free", "number", [], [])
+    );
+    if (rc !== 0) {
+      throw new Error(this._coreErrorMessage("Failed to unload multimodal projector", rc));
     }
+    this._deleteFsFile(mmprojPath);
+    this._mmProjPath = null;
+    this._mmSupportsVision = false;
+    this._mmSupportsAudio = false;
+    this._mmProjSourceUrl = null;
   }
   supportsVision() {
     return this._mmSupportsVision;
   }
   supportsAudio() {
     return this._mmSupportsAudio;
+  }
+  getTextToSpeechCapabilities() {
+    if (!this._core) {
+      return {
+        apiVersion: 0,
+        supported: false,
+        modelType: 0,
+        capabilities: 0,
+        supportsLanguage: false,
+        supportsSpeakerReference: false,
+        sampleRate: 0,
+        channels: 0,
+        reason: "WebGPU core is not initialized"
+      };
+    }
+    const raw = this._core.ccall(
+      "llamadart_webgpu_tts_info_json",
+      "string",
+      [],
+      []
+    ) || "{}";
+    try {
+      return JSON.parse(raw);
+    } catch (_) {
+      return {
+        apiVersion: 0,
+        supported: false,
+        modelType: 0,
+        capabilities: 0,
+        supportsLanguage: false,
+        supportsSpeakerReference: false,
+        sampleRate: 0,
+        channels: 0,
+        reason: "WebGPU TTS capability response is invalid"
+      };
+    }
+  }
+  _ensureTextToSpeechDir() {
+    try {
+      this._core.FS.mkdir("/tts");
+    } catch (_) {
+    }
+  }
+  async synthesizeSpeech(options = {}) {
+    if (this._modelBytes <= 0) {
+      throw new Error("No model loaded. Call loadModelFromUrl first.");
+    }
+    if (options.signal?.aborted) {
+      throw new DOMException("Text-to-speech synthesis was cancelled.", "AbortError");
+    }
+    const capabilities = this.getTextToSpeechCapabilities();
+    if (capabilities.supported !== true) {
+      throw new Error(
+        capabilities.reason || "Loaded model/projector does not support text-to-speech."
+      );
+    }
+    const text = typeof options.text === "string" ? options.text : "";
+    if (text.length === 0) {
+      throw new Error("Text-to-speech input text is empty.");
+    }
+    if (this._textToSpeechActive) {
+      throw new Error("Text-to-speech synthesis is already active.");
+    }
+    this._ensureTextToSpeechDir();
+    const taskId = `${Date.now()}_${++this._mediaFileCounter}`;
+    const speakerPath = `/tts/speaker_${taskId}.bin`;
+    const outputPath = `/tts/output_${taskId}.pcm`;
+    const speakerBytes = toUint8Array(options.speakerAudio);
+    if (speakerBytes && speakerBytes.length > 0) {
+      this._core.FS.writeFile(speakerPath, speakerBytes);
+    }
+    const promptBatchSize = Number(options.promptBatchSize) > 0 ? Math.max(1, Math.trunc(Number(options.promptBatchSize))) : 512;
+    const maxFrames = Number(options.maxFrames) > 0 ? Math.max(1, Math.trunc(Number(options.maxFrames))) : 512;
+    const topK = Number.isFinite(options.topK) ? Math.max(0, Math.trunc(Number(options.topK))) : 40;
+    const topP = Number.isFinite(options.topP) ? Number(options.topP) : 0.95;
+    const minP = Number.isFinite(options.minP) ? Number(options.minP) : 0;
+    const temperature = Number.isFinite(options.temperature) ? Number(options.temperature) : 0.8;
+    const seed = Number.isInteger(options.seed) ? Number(options.seed) >>> 0 : Math.floor(Math.random() * 4294967295) >>> 0;
+    const language = typeof options.language === "string" ? options.language : "";
+    let started = false;
+    this._textToSpeechActive = true;
+    this._textToSpeechDone = new Promise((resolve) => {
+      this._resolveTextToSpeechDone = resolve;
+    });
+    try {
+      this._abortRequested = false;
+      const startRc = Number(
+        await this._core.ccall(
+          "llamadart_webgpu_tts_start",
+          "number",
+          ["string", "string", "string", "number", "number", "number", "number", "number", "number", "number"],
+          [
+            text,
+            language,
+            speakerBytes && speakerBytes.length > 0 ? speakerPath : null,
+            promptBatchSize,
+            maxFrames,
+            topK,
+            topP,
+            minP,
+            temperature,
+            seed
+          ],
+          { async: true }
+        )
+      );
+      if (startRc !== 0) {
+        throw new Error(this._coreErrorMessage("Failed to start text-to-speech synthesis", startRc));
+      }
+      started = true;
+      let progress = {};
+      for (; ; ) {
+        if (this._abortRequested || options.signal?.aborted) {
+          this.cancel();
+        }
+        const stepRc = Number(
+          await this._core.ccall(
+            "llamadart_webgpu_tts_step",
+            "number",
+            [],
+            [],
+            { async: true }
+          )
+        );
+        const rawProgress = this._core.ccall(
+          "llamadart_webgpu_tts_progress_json",
+          "string",
+          [],
+          []
+        ) || "{}";
+        progress = JSON.parse(rawProgress);
+        options.onProgress?.(progress);
+        if (stepRc === -6 || progress.state === 4) {
+          throw new DOMException("Text-to-speech synthesis was cancelled.", "AbortError");
+        }
+        if (stepRc !== 0) {
+          throw new Error(this._coreErrorMessage("Text-to-speech synthesis failed", stepRc));
+        }
+        if (progress.state === 3) {
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      }
+      const outputRc = Number(
+        this._core.ccall(
+          "llamadart_webgpu_tts_write_pcm",
+          "number",
+          ["string"],
+          [outputPath]
+        )
+      );
+      if (outputRc !== 0) {
+        throw new Error(this._coreErrorMessage("Failed to read synthesized speech", outputRc));
+      }
+      const bytes = this._core.FS.readFile(outputPath);
+      if (!(bytes instanceof Uint8Array) || bytes.byteLength === 0 || bytes.byteLength % 4 !== 0) {
+        throw new Error("Synthesized PCM output is empty or malformed.");
+      }
+      const copy = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+      const pcm = new Float32Array(copy);
+      return {
+        pcm,
+        sampleRate: Number(capabilities.sampleRate) || 0,
+        channels: Number(capabilities.channels) || 1,
+        sampleCount: pcm.length,
+        framesGenerated: Number(progress.framesGenerated) || 0,
+        truncated: progress.truncated === true
+      };
+    } finally {
+      if (started) {
+        try {
+          this._core.ccall("llamadart_webgpu_tts_reset", "number", [], []);
+        } catch (_) {
+        }
+      }
+      this._deleteFsFile(speakerPath);
+      this._deleteFsFile(outputPath);
+      this._textToSpeechActive = false;
+      this._resolveTextToSpeechDone?.();
+      this._resolveTextToSpeechDone = null;
+      this._textToSpeechDone = null;
+    }
   }
   _clearStagedMediaFiles() {
     if (!this._core || this._stagedMediaPaths.length === 0) {
@@ -3560,6 +3763,10 @@ var LlamaWebGpuBridgeRuntime = class {
     }
   }
   async dispose() {
+    if (this._textToSpeechActive && this._textToSpeechDone) {
+      this.cancel();
+      await this._textToSpeechDone;
+    }
     if (this._activeTransferAbortController) {
       try {
         this._activeTransferAbortController.abort();
@@ -3569,8 +3776,18 @@ var LlamaWebGpuBridgeRuntime = class {
     }
     if (this._core) {
       this._clearPendingMedia();
-      this._core.ccall("llamadart_webgpu_mmproj_free", null, [], []);
+      const mmprojPath = this._mmProjPath;
+      const mmprojFreeRc = Number(
+        this._core.ccall("llamadart_webgpu_mmproj_free", "number", [], [])
+      );
       this._core.ccall("llamadart_webgpu_shutdown", null, [], []);
+      this._deleteFsFile(mmprojPath);
+      if (mmprojFreeRc !== 0) {
+        this._emitLogger(
+          "warn",
+          this._coreErrorMessage("Failed to unload multimodal projector during dispose", mmprojFreeRc)
+        );
+      }
     }
     this._modelPath = null;
     this._modelPaths = [];
@@ -3583,6 +3800,9 @@ var LlamaWebGpuBridgeRuntime = class {
     this._mmSupportsVision = false;
     this._mmSupportsAudio = false;
     this._abortRequested = false;
+    this._textToSpeechActive = false;
+    this._textToSpeechDone = null;
+    this._resolveTextToSpeechDone = null;
     this._activeTransferAbortController = null;
     this._suppressedWarmupWarningCount = 0;
     this._didReportWarmupWarningSuppression = false;
@@ -4354,6 +4574,7 @@ var LlamaWebGpuBridge = class {
     }
   }
   async loadMultimodalProjector(url) {
+    const startedWithWorker = this._workerProxy != null;
     const invokeRuntimeLoad = async () => {
       if (!this._runtime) {
         this._runtime = this._createRuntime();
@@ -4374,6 +4595,9 @@ var LlamaWebGpuBridge = class {
       this._rememberLoadedMmProj(url);
       return result;
     } catch (error) {
+      if (!startedWithWorker) {
+        throw error;
+      }
       const reason = serializeWorkerError(error);
       this._emitBridgeWarn(
         `llamadart: multimodal worker setup failed (${reason}).`
@@ -4433,6 +4657,66 @@ var LlamaWebGpuBridge = class {
       return this._supportsAudio;
     }
     return this._runtime.supportsAudio();
+  }
+  async getTextToSpeechCapabilities() {
+    if (!this._workerProxy) {
+      return this._runtime.getTextToSpeechCapabilities();
+    }
+    try {
+      return await this._callWorker("getTextToSpeechCapabilities", []);
+    } catch (error) {
+      this._disableWorkerFallback(error);
+      await this._waitForWorkerDisposal();
+      await this._ensureRuntimeReadyAfterWorkerFallback({}, error);
+      return this._runtime.getTextToSpeechCapabilities();
+    }
+  }
+  async synthesizeSpeech(options = {}) {
+    if (options.signal?.aborted) {
+      throw new DOMException("Text-to-speech synthesis was cancelled.", "AbortError");
+    }
+    if (!this._workerProxy) {
+      return this._runtime.synthesizeSpeech(options);
+    }
+    let removeAbortListener = null;
+    try {
+      if (options.signal && typeof options.signal.addEventListener === "function") {
+        const onAbort = () => this.cancel();
+        options.signal.addEventListener("abort", onAbort, { once: true });
+        removeAbortListener = () => options.signal.removeEventListener("abort", onAbort);
+      }
+      const workerOptions = { ...options };
+      delete workerOptions.onProgress;
+      delete workerOptions.signal;
+      const transferList = [];
+      const speakerBytes = toUint8Array(options.speakerAudio);
+      if (speakerBytes && speakerBytes.length > 0) {
+        const copy = new Uint8Array(speakerBytes);
+        workerOptions.speakerAudio = copy;
+        transferList.push(copy.buffer);
+      }
+      return await this._callWorker(
+        "synthesizeSpeech",
+        [workerOptions],
+        (event) => {
+          if (event.event === "progress") {
+            options.onProgress?.(event.payload || {});
+          }
+        },
+        transferList
+      );
+    } catch (error) {
+      if (error?.name === "AbortError" || options.signal?.aborted || serializeWorkerError(error).toLowerCase().includes("cancel")) {
+        throw new DOMException("Text-to-speech synthesis was cancelled.", "AbortError");
+      }
+      if (this._isWorkerRequestTimeoutError(error)) {
+        this._disableWorkerFallback(error);
+        await this._waitForWorkerDisposal();
+      }
+      throw error;
+    } finally {
+      removeAbortListener?.();
+    }
   }
   async tokenize(text, addSpecial = true) {
     if (!this._workerProxy) {

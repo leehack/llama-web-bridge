@@ -87,6 +87,7 @@ add_library(llamadart_mtmd STATIC
     "${MTMD_AUDIO_PATCHED}"
     "${LLAMA_CPP_DIR}/tools/mtmd/mtmd-image.cpp"
     "${LLAMA_CPP_DIR}/tools/mtmd/mtmd-helper.cpp"
+    "${LLAMA_CPP_DIR}/tools/mtmd/mtmd-helper-gen.cpp"
     "${LLAMA_CPP_DIR}/tools/mtmd/clip.cpp"
     ${LLAMADART_MTMD_MODEL_SOURCES}
 )
@@ -103,7 +104,10 @@ if (NOT MSVC)
     target_compile_options(llamadart_mtmd PRIVATE -Wno-cast-qual)
 endif()
 
-add_executable(llama_webgpu_core src/llama_webgpu_core.cpp)
+add_executable(llama_webgpu_core
+    src/llama_webgpu_core.cpp
+    src/llama_webgpu_tts.cpp
+)
 
 target_compile_features(llama_webgpu_core PRIVATE cxx_std_17)
 
@@ -129,7 +133,7 @@ set(LLAMADART_WEBGPU_LINK_OPTIONS
     "-sEXPORT_NAME=createLlamaWebGpuCoreModule"
     "-sENVIRONMENT=web,worker"
     "-sEXPORTED_RUNTIME_METHODS=['FS','ccall','UTF8ToString']"
-    "-sEXPORTED_FUNCTIONS=['_main','_llamadart_webgpu_probe','_llamadart_webgpu_supports_pthreads','_llamadart_webgpu_pthread_pool_size','_llamadart_webgpu_backends_json','_llamadart_webgpu_last_error','_llamadart_webgpu_set_log_level','_llamadart_webgpu_load_model','_llamadart_webgpu_load_model_from_url','_llamadart_webgpu_mmproj_load','_llamadart_webgpu_mmproj_free','_llamadart_webgpu_mmproj_supports_vision','_llamadart_webgpu_mmproj_supports_audio','_llamadart_webgpu_media_clear_pending','_llamadart_webgpu_media_add_file','_llamadart_webgpu_media_add_encoded','_llamadart_webgpu_media_add_rgb','_llamadart_webgpu_media_add_audio_f32','_llamadart_webgpu_tokenize_to_json','_llamadart_webgpu_last_tokens_json','_llamadart_webgpu_state_save_file','_llamadart_webgpu_state_load_file','_llamadart_webgpu_detokenize_from_json','_llamadart_webgpu_last_detokenized','_llamadart_webgpu_embed_to_json','_llamadart_webgpu_last_embedding_json','_llamadart_webgpu_generate','_llamadart_webgpu_begin_generation','_llamadart_webgpu_next_token','_llamadart_webgpu_last_piece','_llamadart_webgpu_end_generation','_llamadart_webgpu_request_cancel','_llamadart_webgpu_last_output','_llamadart_webgpu_get_context_size','_llamadart_webgpu_model_meta_json','_llamadart_webgpu_shutdown']"
+    "-sEXPORTED_FUNCTIONS=['_main','_llamadart_webgpu_probe','_llamadart_webgpu_supports_pthreads','_llamadart_webgpu_pthread_pool_size','_llamadart_webgpu_backends_json','_llamadart_webgpu_last_error','_llamadart_webgpu_set_log_level','_llamadart_webgpu_load_model','_llamadart_webgpu_load_model_from_url','_llamadart_webgpu_mmproj_load','_llamadart_webgpu_mmproj_free','_llamadart_webgpu_mmproj_supports_vision','_llamadart_webgpu_mmproj_supports_audio','_llamadart_webgpu_media_clear_pending','_llamadart_webgpu_media_add_file','_llamadart_webgpu_media_add_encoded','_llamadart_webgpu_media_add_rgb','_llamadart_webgpu_media_add_audio_f32','_llamadart_webgpu_tokenize_to_json','_llamadart_webgpu_last_tokens_json','_llamadart_webgpu_state_save_file','_llamadart_webgpu_state_load_file','_llamadart_webgpu_detokenize_from_json','_llamadart_webgpu_last_detokenized','_llamadart_webgpu_embed_to_json','_llamadart_webgpu_last_embedding_json','_llamadart_webgpu_generate','_llamadart_webgpu_begin_generation','_llamadart_webgpu_next_token','_llamadart_webgpu_last_piece','_llamadart_webgpu_end_generation','_llamadart_webgpu_request_cancel','_llamadart_webgpu_last_output','_llamadart_webgpu_get_context_size','_llamadart_webgpu_model_meta_json','_llamadart_webgpu_tts_api_version','_llamadart_webgpu_tts_info_json','_llamadart_webgpu_tts_start','_llamadart_webgpu_tts_step','_llamadart_webgpu_tts_progress_json','_llamadart_webgpu_tts_write_pcm','_llamadart_webgpu_tts_reset','_llamadart_webgpu_shutdown']"
     "-lwasmfs_fetch.js"
 )
 

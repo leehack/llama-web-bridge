@@ -85,6 +85,8 @@ def main() -> int:
     smoke = read_required("scripts/state_persistence_browser_smoke.py", errors)
     multimodal_smoke = read_required("scripts/multimodal_browser_smoke.py", errors)
     speech_smoke = read_required("scripts/speech_to_text_browser_smoke.py", errors)
+    tts_smoke = read_required("scripts/text_to_speech_browser_smoke.py", errors)
+    tts_contract = read_required("scripts/verify_text_to_speech_api.py", errors)
     ci = read_required(".github/workflows/ci.yml", errors)
     publish = read_required(".github/workflows/publish_assets.yml", errors)
     auto_update = read_required(".github/workflows/auto_llama_cpp_update.yml", errors)
@@ -164,6 +166,13 @@ def main() -> int:
         errors,
     )
     require(
+        "getTextToSpeechCapabilities" in js_dts
+        and "synthesizeSpeech" in js_dts
+        and "workerTextToSpeechTimeoutMs" in js_dts,
+        "js/llama_webgpu_bridge.d.ts must expose the versioned TTS surface and worker timeout",
+        errors,
+    )
+    require(
         "export class LlamaWebGpuBridge" in js_source
         and "export function enableBridgeWorkerHost" in js_source,
         "js/src/llama_webgpu_bridge.js must remain the source of the public bridge exports",
@@ -173,6 +182,21 @@ def main() -> int:
         "npm run check:js" in build_bridge
         and "llama_webgpu_bridge.d.ts" in build_bridge,
         "scripts/build_bridge.sh must run the JS bridge check and copy the declaration asset",
+        errors,
+    )
+    require(
+        "verify_text_to_speech_api.py" in ci
+        and "text_to_speech_browser_smoke.py" in ci
+        and "run_text_to_speech_smoke" in ci
+        and "Qwen3-TTS-12Hz-1.7B-Base-GGUF/resolve/ca27d74bc954b73dadab5b71ca265d87fc861a7c" in ci
+        and "LLAMA_WEBGPU_TTS_MODEL_SHA256" in ci
+        and "LLAMA_WEBGPU_TTS_MMPROJ_SHA256" in ci
+        and "--memory-mode wasm64" in ci
+        and "--runtime-mode all" in ci
+        and "text-to-speech-smoke-artifacts" in ci
+        and "LLAMADART_WEBGPU_TTS_API_VERSION" in tts_contract
+        and 'RUNTIME_MODES = ("direct", "worker")' in tts_smoke,
+        "CI must syntax-check the TTS smoke, run its static API contract, and preserve the opt-in immutable real-model gate",
         errors,
     )
     for name, workflow in (("ci.yml", ci), ("publish_assets.yml", publish)):
@@ -433,6 +457,7 @@ def main() -> int:
         and "state_persistence_browser_smoke.py" in agents
         and "multimodal_browser_smoke.py" in agents
         and "speech_to_text_browser_smoke.py" in agents
+        and "text_to_speech_browser_smoke.py" in agents
         and "llama_cpp.version" in agents
         and "auto_llama_cpp_update.yml" in agents,
         "AGENTS.md must document the JS build gate, agent PR workflow, browser smoke expectations, and llama.cpp auto-update policy",
@@ -448,6 +473,7 @@ def main() -> int:
         and "multimodal-smoke-artifacts" in readme
         and "scripts/multimodal_browser_smoke.py" in readme
         and "scripts/speech_to_text_browser_smoke.py" in readme
+        and "scripts/text_to_speech_browser_smoke.py" in readme
         and "scripts/verify_ci_reliability.py" in readme
         and "llama_cpp.version" in readme
         and "auto_llama_cpp_update.yml" in readme,
@@ -504,6 +530,7 @@ def main() -> int:
         and "scripts/verify_ci_reliability.py" in contributing
         and "scripts/multimodal_browser_smoke.py" in contributing
         and "scripts/speech_to_text_browser_smoke.py" in contributing
+        and "scripts/text_to_speech_browser_smoke.py" in contributing
         and "--model-sha256" in contributing
         and "--mmproj-sha256" in contributing
         and "llama_cpp.version" in contributing,
