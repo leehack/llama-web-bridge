@@ -57,6 +57,11 @@ std::string g_backend_json = "[]";
 std::string g_model_meta_json = "{}";
 bool g_model_uses_gpu_ops = false;
 std::vector<llama_token> g_cached_prompt_tokens;
+bool g_model_is_qwen3_asr = false;
+bool g_generation_has_qwen3_asr_audio = false;
+bool g_qwen3_asr_prefix_seed_attempted = false;
+std::vector<llama_token> g_qwen3_asr_prefix_tokens;
+size_t g_qwen3_asr_prefix_token_index = 0;
 
 std::vector<pending_media> g_pending_media;
 
@@ -168,6 +173,10 @@ void end_generation_state() {
   g_generation_active = false;
   g_last_piece.clear();
   g_cancel_requested = false;
+  g_generation_has_qwen3_asr_audio = false;
+  g_qwen3_asr_prefix_seed_attempted = false;
+  g_qwen3_asr_prefix_tokens.clear();
+  g_qwen3_asr_prefix_token_index = 0;
 }
 
 void free_runtime() {
@@ -199,6 +208,7 @@ void free_runtime() {
   g_last_embedding_json = "[]";
   g_model_meta_json = "{}";
   g_model_uses_gpu_ops = false;
+  g_model_is_qwen3_asr = false;
   g_cached_prompt_tokens.clear();
 }
 
@@ -338,6 +348,16 @@ void rebuild_model_metadata_json() {
 
   json += "}";
   g_model_meta_json = json;
+
+  const std::string normalized = to_lower(json);
+  // llama.cpp's string metadata API omits the general.tags array. Combine the
+  // Qwen3-VL backbone with Qwen3-ASR's published sampling temperature here,
+  // then require an audio-only projector when generation begins.
+  g_model_is_qwen3_asr =
+      normalized.find("\"general.architecture\":\"qwen3vl\"") !=
+          std::string::npos &&
+      normalized.find("\"general.sampling.temp\":\"0.000001\"") !=
+          std::string::npos;
 }
 
 bool ensure_loaded() {
@@ -783,6 +803,12 @@ int32_t begin_generation_impl(
 
   end_generation_state();
   g_cancel_requested = false;
+  g_generation_has_qwen3_asr_audio =
+      g_model_is_qwen3_asr &&
+      g_state.mm_ctx != nullptr &&
+      mtmd_support_audio(g_state.mm_ctx) &&
+      !mtmd_support_vision(g_state.mm_ctx) &&
+      !g_pending_media.empty();
 
   const std::string prompt_text = prompt;
   if (!g_pending_media.empty()) {
@@ -869,34 +895,65 @@ int32_t next_token_impl() {
     return 0;
   }
 
-  const llama_token token = llama_sampler_sample(g_active_sampler, g_state.ctx, -1);
-  if (token == LLAMA_TOKEN_NULL) {
-    set_error("Sampler returned LLAMA_TOKEN_NULL");
-    end_generation_state();
-    return -3;
-  }
+  while (true) {
+    const bool is_prefix_token =
+        g_qwen3_asr_prefix_token_index < g_qwen3_asr_prefix_tokens.size();
+    llama_token token = is_prefix_token
+        ? g_qwen3_asr_prefix_tokens[g_qwen3_asr_prefix_token_index++]
+        : llama_sampler_sample(g_active_sampler, g_state.ctx, -1);
+    if (token == LLAMA_TOKEN_NULL) {
+      set_error("Sampler returned LLAMA_TOKEN_NULL");
+      end_generation_state();
+      return -3;
+    }
 
-  if (llama_vocab_is_eog(g_state.vocab, token)) {
-    end_generation_state();
-    return 0;
-  }
+    if (!is_prefix_token &&
+        llama_vocab_is_eog(g_state.vocab, token) &&
+        g_last_output.empty() &&
+        g_generation_has_qwen3_asr_audio &&
+        !g_qwen3_asr_prefix_seed_attempted) {
+      // The WASM path can select EOG at the first decoding step for short,
+      // clearly decodable speech. Seed Qwen3-ASR's output boundary once and
+      // let the model decide whether transcript text follows. The prefix is
+      // consumed internally, so silence can still terminate with no output.
+      g_qwen3_asr_prefix_seed_attempted = true;
+      if (tokenize_text(
+              "<asr_text>", false, g_qwen3_asr_prefix_tokens) &&
+          !g_qwen3_asr_prefix_tokens.empty()) {
+        g_qwen3_asr_prefix_token_index = 0;
+        continue;
+      }
+    }
 
-  g_last_piece = token_to_piece(token, true);
-  g_last_output += g_last_piece;
-
-  llama_token token_for_decode = token;
-  const int rc = llama_decode(g_state.ctx, llama_batch_get_one(&token_for_decode, 1));
-  if (rc != 0) {
-    if (g_cancel_requested) {
+    if (llama_vocab_is_eog(g_state.vocab, token)) {
       end_generation_state();
       return 0;
     }
-    set_error("llama_decode failed while generating tokens");
-    end_generation_state();
-    return -4;
-  }
 
-  return 1;
+    g_last_piece = is_prefix_token ? "" : token_to_piece(token, true);
+    if (!is_prefix_token) {
+      g_last_output += g_last_piece;
+    }
+
+    llama_token token_for_decode = token;
+    const int rc =
+        llama_decode(g_state.ctx, llama_batch_get_one(&token_for_decode, 1));
+    if (rc != 0) {
+      if (g_cancel_requested) {
+        end_generation_state();
+        return 0;
+      }
+      set_error("llama_decode failed while generating tokens");
+      end_generation_state();
+      return -4;
+    }
+
+    if (is_prefix_token) {
+      llama_sampler_accept(g_active_sampler, token);
+    } else {
+      return 1;
+    }
+  }
 }
 
 bool is_supported_kv_cache_type(int32_t value) {
