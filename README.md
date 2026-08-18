@@ -136,6 +136,38 @@ bridge restores the prompt token list returned as `{ tokens }`, so reissuing the
 same prompt can reuse the loaded KV state via the existing prompt-prefix reuse
 path.
 
+## Text-to-speech
+
+The bridge exposes versioned, capability-gated Qwen3-TTS synthesis through
+`getTextToSpeechCapabilities()` and `synthesizeSpeech()`. The result is 24 kHz
+mono `Float32Array` PCM for the currently validated Qwen3-TTS projector; audio
+playback and WAV encoding belong to the consuming application. Both direct and
+worker runtimes support progress, cancellation, language selection, and
+optional encoded speaker-reference audio when the loaded projector reports the
+capability.
+
+The validated Qwen3-TTS 1.7B model/projector pair totals about 1.48 GB before
+runtime buffers. It requires the memory64 browser runtime in practice and has a
+high browser-memory and latency cost. wasm32 is not a supported product path for
+this pair. Both direct and worker runtimes generate valid audio with a
+WebGPU-selected model/projector path, while the CPU/WASM fallback remains
+functional but substantially slower. This generated-audio support is
+experimental upstream and stays out of default CI.
+
+Run the checksum-pinned real-model gate before publishing TTS-capable assets:
+
+```bash
+python3 scripts/text_to_speech_browser_smoke.py \
+  --dist-dir /path/to/webgpu_bridge_dist \
+  --model-path /path/to/Qwen3-TTS-12Hz-1.7B-Base-Q4_K_M.gguf \
+  --model-sha256 8d18c94acb2addd042f97da63c98be144eafa76d0d9495177eab65130cf85129 \
+  --mmproj-path /path/to/mmproj-Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf \
+  --mmproj-sha256 6fd65188839bcd6ecc91b277ad471e22a0edfada4699a0fe82f1165c18cfcce2 \
+  --memory-mode wasm64 \
+  --runtime-mode all \
+  --gpu-layers 99
+```
+
 ## CI
 
 This repo includes a wasm build gate in:
@@ -174,6 +206,9 @@ are easy to regress during agent-driven maintenance:
 - the opt-in speech-to-text browser smoke runs checksum-pinned Qwen3-ASR through
   wasm32 and memory64 in both direct and worker runtimes, including cancellation
   and warm reuse against Qwen's checksum-pinned official English fixture;
+- the opt-in text-to-speech browser smoke runs the immutable, checksum-pinned
+  Qwen3-TTS pair through direct and worker memory64 runtimes, including
+  cancellation, immediate reuse, and PCM/WAV validation;
 - the CI model cache path expands `~` before resolving so it matches the
   `actions/cache` directory;
 - browser smoke failures upload `state-persistence-smoke-artifacts` with console
@@ -224,6 +259,12 @@ runtime, so an upstream fixture replacement fails loudly. Use
 `--memory-mode wasm32` or `--memory-mode wasm64` to classify one variant; the
 default validates both. The repository CI workflow exposes the same large-model
 gate only through its `run_speech_to_text_smoke` manual-dispatch input.
+
+Qwen3-TTS is likewise excluded from default CI. Its opt-in workflow gate uses
+the immutable `ca27d74bc954b73dadab5b71ca265d87fc861a7c` model revision and
+verifies both large files before running `text_to_speech_browser_smoke.py` in
+memory64 direct and worker modes. Enable it with the
+`run_text_to_speech_smoke` manual-dispatch input.
 
 Do not commit downloaded GGUFs, Playwright screenshots, console logs, generated
 `dist/` assets, or Emscripten build/cache directories.

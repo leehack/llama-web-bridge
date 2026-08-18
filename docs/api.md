@@ -105,6 +105,7 @@ it.
 | `workerModelLoadTimeoutMs` | `number` | Timeout for model load requests sent to a worker. |
 | `workerMmprojLoadTimeoutMs` | `number` | Timeout for multimodal projector load requests sent to a worker. |
 | `workerCompletionTimeoutMs` | `number` | Timeout for worker `createCompletion` RPC requests. |
+| `workerTextToSpeechTimeoutMs` | `number` | Timeout for a worker text-to-speech request. Defaults to 20 minutes and is refreshed by progress events. |
 | `workerGenerationStallTimeoutMs` | `number` | Stall timeout for worker generation after no token events arrive; clamped by the bridge. |
 | `coreInitTimeoutMs` | `number` | Timeout while initializing the Emscripten core module. |
 | `cacheName` | `string` | Cache Storage name used by model prefetch/load helpers. |
@@ -356,6 +357,59 @@ supportsAudio(): boolean
 Return the multimodal capabilities reported by the loaded projector. They return
 `false` before a projector is loaded or after it is unloaded.
 
+## Text-to-speech
+
+Text-to-speech is a versioned, capability-gated bridge feature. It requires a
+compatible text model and generated-audio projector; ordinary audio-capable
+multimodal models are not automatically TTS models.
+
+The Qwen3-TTS 1.7B Q4 model plus Q8 projector used by the real-model smoke is
+about 1.48 GB before runtime buffers. It is not practical in the wasm32 runtime.
+Use the published memory64 core on a cross-origin-isolated Chromium page and
+warn users that synthesis has a high browser-memory and latency cost. The
+generated-audio path is experimental upstream. The checksum-pinned real-model
+gate passes with WebGPU selected in both direct and worker runtimes. CPU/WASM is
+a functional fallback, but it is considerably slower for this model pair.
+
+### `getTextToSpeechCapabilities()`
+
+```ts
+getTextToSpeechCapabilities(): Promise<TextToSpeechCapabilities>
+```
+
+Returns the versioned capability record for the loaded model/projector. Check
+`supported` before showing synthesis controls. `supportsLanguage` and
+`supportsSpeakerReference` describe optional request inputs; `sampleRate` and
+`channels` describe generated PCM. `reason` explains an unsupported state.
+
+### `synthesizeSpeech(options)`
+
+```ts
+synthesizeSpeech(options: TextToSpeechOptions): Promise<TextToSpeechResult>
+```
+
+Synthesizes speech and returns mono `Float32Array` PCM plus its sample rate,
+sample count, generated-frame count, and truncation flag. The bridge does not
+play or encode the audio. Applications can create a WAV or Web Audio buffer
+from the returned PCM.
+
+| Option | Description |
+| --- | --- |
+| `text` | Required non-empty text to speak. |
+| `language` | Optional model language code, such as `en`; accepted values remain model-specific. |
+| `speakerAudio` | Optional encoded reference-audio bytes when `supportsSpeakerReference` is true. |
+| `promptBatchSize` | Prompt-processing batch size. Defaults to `512`. |
+| `maxFrames` | Maximum generated audio frames. Defaults to `512`; a completed result reports `truncated` when this cap is reached. |
+| `topK`, `topP`, `minP`, `temperature`, `seed` | Model sampling controls. Defaults are `40`, `0.95`, `0`, `0.8`, and a random seed. |
+| `signal` | `AbortSignal` for cancellation. Cancellation rejects with `AbortError`. |
+| `onProgress` | Receives task state, remaining prompt tokens, generated frames, and truncation state. |
+
+Direct and worker modes use the same API. Worker mode transfers the output PCM
+buffer to the caller and does not silently repeat a failed long-running task on
+the main thread. Callers may retry explicitly. A bridge instance rejects a
+second concurrent synthesis, and shared context operations reject overlap with
+active token generation or TTS.
+
 ## Runtime metadata and diagnostics
 
 ### `getModelMetadata()`
@@ -428,9 +482,9 @@ by current or future bridge internals.
 cancel(): void
 ```
 
-Best-effort cancellation for active model transfer or generation. It aborts the
-current transfer controller when present and asks the core/worker to stop active
-generation.
+Best-effort cancellation for active model transfer, token generation, or
+text-to-speech synthesis. It aborts the current transfer controller when
+present and asks the core/worker to stop the active task.
 
 ### `dispose()`
 

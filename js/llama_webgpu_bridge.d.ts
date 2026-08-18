@@ -16,6 +16,7 @@ export interface LlamaWebGpuBridgeConfig {
   workerModelLoadTimeoutMs?: number;
   workerMmprojLoadTimeoutMs?: number;
   workerCompletionTimeoutMs?: number;
+  workerTextToSpeechTimeoutMs?: number;
   workerGenerationStallTimeoutMs?: number;
   coreInitTimeoutMs?: number;
   cacheName?: string;
@@ -70,6 +71,49 @@ export interface EmbedOptions {
   [key: string]: unknown;
 }
 
+export interface TextToSpeechCapabilities {
+  apiVersion: number;
+  supported: boolean;
+  modelType: number;
+  capabilities: number;
+  supportsLanguage: boolean;
+  supportsSpeakerReference: boolean;
+  sampleRate: number;
+  channels: number;
+  reason: string;
+}
+
+export interface TextToSpeechProgress {
+  state: number;
+  promptTokensRemaining: number;
+  framesGenerated: number;
+  truncated: boolean;
+}
+
+export interface TextToSpeechOptions {
+  text: string;
+  language?: string;
+  speakerAudio?: Uint8Array | ArrayBuffer | ArrayLike<number>;
+  promptBatchSize?: number;
+  maxFrames?: number;
+  topK?: number;
+  topP?: number;
+  minP?: number;
+  temperature?: number;
+  seed?: number;
+  signal?: AbortSignal;
+  onProgress?: (progress: TextToSpeechProgress) => void;
+}
+
+export interface TextToSpeechResult {
+  pcm: Float32Array;
+  sampleRate: number;
+  channels: number;
+  sampleCount: number;
+  framesGenerated: number;
+  truncated: boolean;
+}
+
 export type ModelMetadata = Record<string, unknown>;
 
 export interface StateLoadResult {
@@ -108,6 +152,8 @@ export class LlamaWebGpuBridge {
   unloadMultimodalProjector(): Promise<unknown>;
   supportsVision(): boolean;
   supportsAudio(): boolean;
+  getTextToSpeechCapabilities(): Promise<TextToSpeechCapabilities>;
+  synthesizeSpeech(options: TextToSpeechOptions): Promise<TextToSpeechResult>;
 
   getModelMetadata(): ModelMetadata | null;
   getContextSize(): number;

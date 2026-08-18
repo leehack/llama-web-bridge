@@ -64,8 +64,9 @@ Before opening or updating a PR, run the lightweight contracts:
 
 ```bash
 npm run check:js
-python3 -m py_compile scripts/verify_state_persistence_api.py scripts/verify_ci_reliability.py scripts/state_persistence_browser_smoke.py scripts/multimodal_browser_smoke.py scripts/speech_to_text_browser_smoke.py
+python3 -m py_compile scripts/verify_state_persistence_api.py scripts/verify_text_to_speech_api.py scripts/verify_ci_reliability.py scripts/state_persistence_browser_smoke.py scripts/multimodal_browser_smoke.py scripts/speech_to_text_browser_smoke.py scripts/text_to_speech_browser_smoke.py
 python3 scripts/verify_state_persistence_api.py
+python3 scripts/verify_text_to_speech_api.py
 python3 scripts/verify_ci_reliability.py
 ```
 
@@ -111,6 +112,24 @@ python3 scripts/speech_to_text_browser_smoke.py \
   --artifacts-dir /tmp/llama-web-bridge-speech-smoke
 ```
 
+Before publishing assets intended to support Qwen3-TTS, run the opt-in
+checksum-pinned memory64 gate through both direct and worker runtimes. The
+validated model/projector pair is too large for a practical wasm32 product
+path:
+
+```bash
+python3 scripts/text_to_speech_browser_smoke.py \
+  --dist-dir /private/tmp/llama_web_bridge_dist \
+  --model-path /path/to/Qwen3-TTS-12Hz-1.7B-Base-Q4_K_M.gguf \
+  --model-sha256 8d18c94acb2addd042f97da63c98be144eafa76d0d9495177eab65130cf85129 \
+  --mmproj-path /path/to/mmproj-Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf \
+  --mmproj-sha256 6fd65188839bcd6ecc91b277ad471e22a0edfada4699a0fe82f1165c18cfcce2 \
+  --memory-mode wasm64 \
+  --runtime-mode all \
+  --gpu-layers 99 \
+  --artifacts-dir /tmp/llama-web-bridge-text-to-speech-smoke
+```
+
 If the smoke downloads from a URL, errors and diagnostics must redact userinfo,
 query strings, and fragments before printing the location.
 
@@ -124,6 +143,9 @@ query strings, and fragments before printing the location.
   pin update; build-only validation does not cover mtmd prompt ingestion.
 - Keep `scripts/speech_to_text_browser_smoke.py` opt-in because its model pair
   is large, but require it before publishing assets advertised for typed ASR.
+- Keep `scripts/text_to_speech_browser_smoke.py` opt-in because its model pair
+  is large and requires memory64, but require it before publishing assets
+  advertised for Qwen3-TTS.
 - Preserve `llama_cpp.version` as the single source of truth for default CI and
   publish builds. Manual publish overrides are allowed for temporary validation,
   but tag-triggered publishes should use the pinned file.
