@@ -160,6 +160,18 @@ def write_harness(
             );
           }}
 
+          const preAbortedController = new AbortController();
+          preAbortedController.abort();
+          try {{
+            await bridge.synthesizeSpeech({{
+              text: 'This pre-aborted task must not start.',
+              signal: preAbortedController.signal,
+            }});
+            throw new Error('pre-aborted synthesis unexpectedly completed');
+          }} catch (error) {{
+            assert(error?.name === 'AbortError', `unexpected pre-abort error: ${{error}}`);
+          }}
+
           const progress = [];
           setStage(`${{memoryMode}}:${{runtimeMode}}:synthesize`);
           const synthesisStartedAt = performance.now();
@@ -238,6 +250,13 @@ def write_harness(
             cancellationTested = true;
             reuseSampleCount = reuse.sampleCount;
           }}
+          setStage(`${{memoryMode}}:${{runtimeMode}}:unload-projector`);
+          await bridge.unloadMultimodalProjector();
+          const unloadedCapabilities = await bridge.getTextToSpeechCapabilities();
+          assert(
+            unloadedCapabilities.supported === false,
+            'TTS capability remained enabled after projector unload',
+          );
           modeResults.push({{
             memoryMode,
             runtimeMode,
@@ -256,8 +275,10 @@ def write_harness(
             peak,
             rms,
             cancellationTested,
+            preAbortedTested: true,
             reuseSampleCount,
             speakerReferenceTested: speakerAudio !== null,
+            unloadTested: true,
             _wavBase64: pcmToWavBase64(output.pcm, output.sampleRate),
           }});
         }} finally {{

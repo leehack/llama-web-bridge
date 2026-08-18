@@ -135,9 +135,36 @@ def main() -> int:
     )
     require(
         "AbortController" in SMOKE
+        and "preAbortedTested" in SMOKE
         and "cancellationTested" in SMOKE
+        and "unloadTested" in SMOKE
         and "runtime reuse after cancellation" in SMOKE,
-        "real-model smoke must validate cancellation and warm runtime reuse",
+        "real-model smoke must validate pre-abort, active cancellation, warm reuse, and projector unload",
+        errors,
+    )
+    require(
+        "const mmprojPath = this._mmProjPath;" in JS
+        and "this._deleteFsFile(mmprojPath);" in JS
+        and re.search(
+            r"async unloadMultimodalProjector\(\).*?if \(rc !== 0\).*?"
+            r"this\._deleteFsFile\(mmprojPath\);",
+            JS,
+            re.DOTALL,
+        )
+        is not None,
+        "projector unload must preserve state on native rejection and release the WasmFS file after success",
+        errors,
+    )
+    require(
+        re.search(
+            r"async synthesizeSpeech\(options = \{\}\).*?"
+            r"if \(this\._textToSpeechActive\).*?"
+            r"this\._ensureTextToSpeechDir\(\)",
+            JS,
+            re.DOTALL,
+        )
+        is not None,
+        "direct TTS must reserve the operation before writing temporary speaker input",
         errors,
     )
 

@@ -3704,19 +3704,18 @@ class LlamaWebGpuBridgeRuntime {
       return;
     }
 
-    try {
-      const rc = Number(
-        this._core.ccall('llamadart_webgpu_mmproj_free', 'number', [], []),
-      );
-      if (rc !== 0) {
-        throw new Error(this._coreErrorMessage('Failed to unload multimodal projector', rc));
-      }
-    } finally {
-      this._mmProjPath = null;
-      this._mmSupportsVision = false;
-      this._mmSupportsAudio = false;
-      this._mmProjSourceUrl = null;
+    const mmprojPath = this._mmProjPath;
+    const rc = Number(
+      this._core.ccall('llamadart_webgpu_mmproj_free', 'number', [], []),
+    );
+    if (rc !== 0) {
+      throw new Error(this._coreErrorMessage('Failed to unload multimodal projector', rc));
     }
+    this._deleteFsFile(mmprojPath);
+    this._mmProjPath = null;
+    this._mmSupportsVision = false;
+    this._mmSupportsAudio = false;
+    this._mmProjSourceUrl = null;
   }
 
   supportsVision() {
@@ -3790,6 +3789,9 @@ class LlamaWebGpuBridgeRuntime {
     if (text.length === 0) {
       throw new Error('Text-to-speech input text is empty.');
     }
+    if (this._textToSpeechActive) {
+      throw new Error('Text-to-speech synthesis is already active.');
+    }
     this._ensureTextToSpeechDir();
     const taskId = `${Date.now()}_${++this._mediaFileCounter}`;
     const speakerPath = `/tts/speaker_${taskId}.bin`;
@@ -3819,9 +3821,6 @@ class LlamaWebGpuBridgeRuntime {
     const language = typeof options.language === 'string' ? options.language : '';
     let started = false;
 
-    if (this._textToSpeechActive) {
-      throw new Error('Text-to-speech synthesis is already active.');
-    }
     this._textToSpeechActive = true;
     this._textToSpeechDone = new Promise((resolve) => {
       this._resolveTextToSpeechDone = resolve;
@@ -5853,6 +5852,9 @@ export class LlamaWebGpuBridge {
   }
 
   async synthesizeSpeech(options = {}) {
+    if (options.signal?.aborted) {
+      throw new DOMException('Text-to-speech synthesis was cancelled.', 'AbortError');
+    }
     if (!this._workerProxy) {
       return this._runtime.synthesizeSpeech(options);
     }
