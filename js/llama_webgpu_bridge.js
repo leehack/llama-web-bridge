@@ -3776,8 +3776,18 @@ var LlamaWebGpuBridgeRuntime = class {
     }
     if (this._core) {
       this._clearPendingMedia();
-      this._core.ccall("llamadart_webgpu_mmproj_free", null, [], []);
+      const mmprojPath = this._mmProjPath;
+      const mmprojFreeRc = Number(
+        this._core.ccall("llamadart_webgpu_mmproj_free", "number", [], [])
+      );
       this._core.ccall("llamadart_webgpu_shutdown", null, [], []);
+      this._deleteFsFile(mmprojPath);
+      if (mmprojFreeRc !== 0) {
+        this._emitLogger(
+          "warn",
+          this._coreErrorMessage("Failed to unload multimodal projector during dispose", mmprojFreeRc)
+        );
+      }
     }
     this._modelPath = null;
     this._modelPaths = [];

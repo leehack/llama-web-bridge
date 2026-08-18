@@ -2058,6 +2058,12 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_tts_start(
   // Cancellation is shared with token generation through the llama.cpp abort
   // callback. A completed TTS cancellation must not poison the next task.
   g_cancel_requested = false;
+  // TTS currently shares sequence 0 with normal generation. Its upstream
+  // helper clears that sequence before loading the speech prompt, so the
+  // cached-token mirror must be invalidated before any later chat generation
+  // attempts prefix reuse. Using a second sequence would require every caller
+  // to allocate n_seq_max >= 2 and would reduce the per-sequence context size.
+  g_cached_prompt_tokens.clear();
   const llama_webgpu_tts_status status =
       llama_webgpu_tts_start(g_tts, request);
   if (status != LLAMADART_WEBGPU_TTS_STATUS_OK) {

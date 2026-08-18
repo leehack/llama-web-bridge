@@ -70,6 +70,7 @@ def main() -> int:
     require(
         re.search(
             r"llamadart_webgpu_tts_start\(.*?g_cancel_requested = false;.*?"
+            r"g_cached_prompt_tokens\.clear\(\);.*?"
             r"llama_webgpu_tts_start\(g_tts, request\)",
             CORE,
             re.DOTALL,
@@ -81,7 +82,7 @@ def main() -> int:
             re.DOTALL,
         )
         is not None,
-        "TTS reset/start must clear the shared llama.cpp cancellation latch",
+        "TTS start must invalidate shared prompt-cache metadata and start/reset must clear the cancellation latch",
         errors,
     )
 
@@ -153,6 +154,18 @@ def main() -> int:
         )
         is not None,
         "projector unload must preserve state on native rejection and release the WasmFS file after success",
+        errors,
+    )
+    require(
+        re.search(
+            r"async dispose\(\).*?const mmprojPath = this\._mmProjPath;.*?"
+            r"llamadart_webgpu_mmproj_free', 'number'.*?"
+            r"llamadart_webgpu_shutdown'.*?this\._deleteFsFile\(mmprojPath\);",
+            JS,
+            re.DOTALL,
+        )
+        is not None,
+        "runtime dispose must inspect projector unload status and release the staged WasmFS file after shutdown",
         errors,
     )
     require(
