@@ -11,6 +11,7 @@ from pathlib import Path
 import shutil
 import sys
 import tempfile
+import wave
 
 from multimodal_browser_smoke import resolve_file
 from state_persistence_browser_smoke import (
@@ -37,6 +38,8 @@ DEFAULT_EXPECTED_TEXT = (
     "well when he started writing for other people."
 )
 MEMORY_MODES = ("wasm32", "wasm64")
+SILENCE_DURATION_SECONDS = 4
+SILENCE_SAMPLE_RATE = 16000
 
 
 def stage_file(source: Path, target: Path) -> None:
@@ -52,6 +55,15 @@ def copy_memory64_artifacts(dist_dir: Path, web_root: Path) -> None:
         source = dist_dir / name
         require(source.is_file(), f"missing wasm64 bridge artifact: {source}")
         shutil.copyfile(source, web_root / name)
+
+
+def write_silence_fixture(target: Path) -> None:
+    """Write a deterministic PCM16 WAV used to reject ASR hallucinations."""
+    with wave.open(str(target), "wb") as output:
+        output.setnchannels(1)
+        output.setsampwidth(2)
+        output.setframerate(SILENCE_SAMPLE_RATE)
+        output.writeframes(b"\0\0" * SILENCE_DURATION_SECONDS * SILENCE_SAMPLE_RATE)
 
 
 def write_harness(
@@ -99,6 +111,10 @@ def write_harness(
     assert(audioResponse.ok, `audio fetch failed: ${{audioResponse.status}}`);
     const audioBytes = new Uint8Array(await audioResponse.arrayBuffer());
     assert(audioBytes.byteLength > 44, 'audio fixture is empty');
+    const silenceResponse = await fetch('/silence.wav', {{ cache: 'no-store' }});
+    assert(silenceResponse.ok, `silence fetch failed: ${{silenceResponse.status}}`);
+    const silenceBytes = new Uint8Array(await silenceResponse.arrayBuffer());
+    assert(silenceBytes.byteLength > 44, 'silence fixture is empty');
 
     const expected = normalizeTranscript({expected_json});
     assert(expected.length > 0, 'expected transcript is empty');
@@ -128,7 +144,11 @@ def write_harness(
         await bridge.loadMultimodalProjector('/qwen3-asr-mmproj.gguf');
         assert(bridge.supportsAudio(), `${{memoryMode}} ${{runtimeMode}} did not report audio support`);
 
-        const transcribe = (signal = undefined, onToken = undefined) => bridge.createCompletion(
+        const transcribe = (
+          bytes = audioBytes,
+          signal = undefined,
+          onToken = undefined,
+        ) => bridge.createCompletion(
             'Transcribe this audio accurately.',
             {{
               nPredict: 512,
@@ -140,12 +160,12 @@ def write_harness(
               tokenEventEncoding: 'text',
               signal,
               onToken,
-              parts: [{{ type: 'audio', bytes: audioBytes }}],
+              parts: [{{ type: 'audio', bytes }}],
             }},
           );
         const transcripts = [];
         for (let attempt = 0; attempt < 2; attempt += 1) {{
-          const output = await transcribe();
+          const output = await transcribe(audioBytes);
           const outputText = String(output || '').trim();
           const normalized = normalizeTranscript(outputText);
           assert(normalized.length > 0, `${{memoryMode}} ${{runtimeMode}} returned an empty transcript`);
@@ -172,7 +192,7 @@ def write_harness(
             }});
             try {{
               cancelledOutput = String(await Promise.race([
-                transcribe(controller.signal, () => {{
+                transcribe(audioBytes, controller.signal, () => {{
                   if (cancellationRequested) return;
                   cancellationRequested = true;
                   clearTimeout(tokenWatchdog);
@@ -206,6 +226,12 @@ def write_harness(
           }}
         }}
 
+        const silenceOutput = String(await transcribe(silenceBytes) || '').trim();
+        assert(
+          normalizeTranscript(silenceOutput).length === 0,
+          `${{memoryMode}} ${{runtimeMode}} hallucinated speech from silence: ${{silenceOutput}}`,
+        );
+
         modeResults.push({{
           memoryMode,
           runtimeMode,
@@ -213,6 +239,7 @@ def write_harness(
           coldTranscript: transcripts[0],
           cancellation: transcripts[1],
           warmTranscript: transcripts[2],
+          silenceTranscript: silenceOutput,
         }});
       }} finally {{
         await bridge.dispose();
@@ -392,6 +419,7 @@ def main() -> int:
         stage_file(model_path, web_root / "qwen3-asr-model.gguf")
         stage_file(mmproj_path, web_root / "qwen3-asr-mmproj.gguf")
         stage_file(audio_path, web_root / "speech.wav")
+        write_silence_fixture(web_root / "silence.wav")
         write_harness(
             web_root,
             expected_text=args.expect,
