@@ -5044,8 +5044,10 @@ export class LlamaWebGpuBridge {
 
     const forceReloadRequested = options?._llamadartForceRuntimeReload === true;
     const mediaPartsRequested = this._hasMediaParts(options);
+    const textToSpeechRequested = options?._llamadartTextToSpeech === true;
+    const multimodalRuntimeRequired = mediaPartsRequested || textToSpeechRequested;
     const shouldEnsureMultimodalInRuntime =
-      mediaPartsRequested
+      multimodalRuntimeRequired
       && typeof this._loadedMmProjUrl === 'string'
       && this._loadedMmProjUrl.length > 0;
     const workerTimedOut = this._isWorkerTimeoutError(fallbackError);
@@ -5057,7 +5059,7 @@ export class LlamaWebGpuBridge {
       ? loadedGpuLayers !== 0
       : (Number.isFinite(metadataGpuLayers) ? metadataGpuLayers !== 0 : true);
     const shouldUseCpuMultimodalFallback =
-      mediaPartsRequested
+      multimodalRuntimeRequired
       && modelLoadedWithGpu
       && (dispatchWorkgroupFallback || forcedCpuFallback || workerTimedOut);
 
@@ -5090,7 +5092,11 @@ export class LlamaWebGpuBridge {
       ? this._createCpuSafeMultimodalLoadOptions(this._loadedModelOptions || {})
       : this._sanitizeModelLoadOptions(this._loadedModelOptions || {});
     if (shouldUseCpuMultimodalFallback) {
-      if (forcedCpuFallback) {
+      if (textToSpeechRequested) {
+        this._emitBridgeWarn(
+          'llamadart: retrying text-to-speech once with CPU fallback after WebGPU failure.',
+        );
+      } else if (forcedCpuFallback) {
         this._emitBridgeWarn(
           'llamadart: using CPU fallback for multimodal generation stability.',
         );
@@ -5122,6 +5128,9 @@ export class LlamaWebGpuBridge {
       }
       if (shouldUseCpuMultimodalFallback) {
         this._runtime._runtimeNotes.push('worker_fallback_cpu_multimodal');
+        if (textToSpeechRequested) {
+          this._runtime._runtimeNotes.push('worker_fallback_cpu_text_to_speech');
+        }
       }
     }
 
@@ -5905,13 +5914,33 @@ export class LlamaWebGpuBridge {
       ) {
         throw new DOMException('Text-to-speech synthesis was cancelled.', 'AbortError');
       }
+
+      const canRetryOnCpu =
+        !this._isCpuModelMode()
+        && (
+          this._isDispatchWorkgroupLimitError(error)
+          || this._isWorkerRequestTimeoutError(error)
+        );
+      if (canRetryOnCpu) {
+        this._disableWorkerFallback(error);
+        await this._waitForWorkerDisposal();
+        await this._ensureRuntimeReadyAfterWorkerFallback(
+          {
+            _llamadartForceRuntimeReload: true,
+            _llamadartTextToSpeech: true,
+          },
+          error,
+        );
+        if (options.signal?.aborted) {
+          throw new DOMException('Text-to-speech synthesis was cancelled.', 'AbortError');
+        }
+        return this._runtime.synthesizeSpeech(options);
+      }
+
       if (this._isWorkerRequestTimeoutError(error)) {
         this._disableWorkerFallback(error);
         await this._waitForWorkerDisposal();
       }
-      // Do not implicitly repeat a potentially long synthesis on the main
-      // thread. That could allocate a second large model and freeze the UI
-      // after the worker already consumed substantial CPU.
       throw error;
     } finally {
       removeAbortListener?.();

@@ -388,6 +388,12 @@ Returns the versioned capability record for the loaded model/projector. Check
 synthesizeSpeech(options: TextToSpeechOptions): Promise<TextToSpeechResult>
 ```
 
+When worker-mode WebGPU synthesis aborts or stalls before returning audio, the
+bridge disposes that worker and retries the request once in a CPU-backed
+main-thread runtime. The retry reloads the cached model and projector, so it is
+slower than the normal WebGPU path but avoids leaving a capable browser with an
+unrecoverable speech control after transient GPU memory or device loss.
+
 Synthesizes speech and returns mono `Float32Array` PCM plus its sample rate,
 sample count, generated-frame count, and truncation flag. The bridge does not
 play or encode the audio. Applications can create a WAV or Web Audio buffer
