@@ -232,6 +232,12 @@ def main() -> int:
         errors,
     )
     require(
+        "python3 -m playwright install chromium" in ci
+        and "playwright install --with-deps chromium" not in ci,
+        "ci.yml must use the pre-provisioned runner dependencies instead of rerunning the OS package installer for Playwright",
+        errors,
+    )
+    require(
         "dispatch-publish-assets:" in ci
         and "needs: build-webgpu-bridge" in ci
         and "if: github.event_name == 'push' && github.ref == 'refs/heads/main'" in ci

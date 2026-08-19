@@ -19,6 +19,9 @@ API_DOCS = (ROOT / "docs" / "api.md").read_text(encoding="utf-8")
 SMOKE = (ROOT / "scripts" / "text_to_speech_browser_smoke.py").read_text(
     encoding="utf-8"
 )
+RECOVERY_TEST = (ROOT / "scripts" / "text_to_speech_recovery_test.mjs").read_text(
+    encoding="utf-8"
+)
 
 NATIVE_EXPORTS = (
     "llamadart_webgpu_tts_api_version",
@@ -99,8 +102,18 @@ def main() -> int:
         errors,
     )
     require(
-        "Do not implicitly repeat a potentially long synthesis" in JS,
-        "worker synthesis failures must not silently repeat on the main thread",
+        "_llamadartTextToSpeech: true" in JS
+        and "retrying text-to-speech once with CPU fallback" in JS
+        and "worker_fallback_cpu_text_to_speech" in JS,
+        "worker synthesis WebGPU failures must retry once through the CPU recovery path",
+        errors,
+    )
+    require(
+        "nGpuLayers, 0" in RECOVERY_TEST
+        and "worker_fallback_cpu_text_to_speech" in RECOVERY_TEST
+        and "gpuLayers: 0" in RECOVERY_TEST
+        and "AbortError" in RECOVERY_TEST,
+        "TTS recovery tests must cover GPU failure, CPU no-retry, and cancellation",
         errors,
     )
     require(
