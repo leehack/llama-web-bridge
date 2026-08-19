@@ -183,7 +183,7 @@ jobs:
       - name: Install Playwright Chromium
         run: |
           python3 -m pip install --user playwright
-          python3 -m playwright install --with-deps chromium
+          python3 -m playwright install chromium
 
       - name: Run state persistence browser smoke
         env:
