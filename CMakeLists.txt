@@ -30,6 +30,7 @@ set(LLAMA_WASM_MEM64 OFF CACHE BOOL "" FORCE)
 
 option(LLAMADART_WEBGPU_MEM64 "Build WebGPU bridge core with wasm64/memory64" OFF)
 set(LLAMADART_WEBGPU_MEM64_MAX_MEMORY "12884901888" CACHE STRING "Max wasm64 linear memory in bytes")
+set(LLAMADART_WEBGPU_STACK_SIZE "1048576" CACHE STRING "Wasm stack size in bytes")
 option(LLAMADART_WEBGPU_PTHREADS "Enable pthread support for bridge runtime" ON)
 set(LLAMADART_WEBGPU_PTHREAD_POOL_SIZE "4" CACHE STRING "PThread pool size for bridge runtime")
 set(LLAMADART_WEBGPU_PTHREAD_POOL_SIZE_STRICT "0" CACHE STRING "PThread pool strictness for bridge runtime")
@@ -128,6 +129,7 @@ set(LLAMADART_WEBGPU_LINK_OPTIONS
     "-sASYNCIFY=1"
     "-sFORCE_FILESYSTEM=1"
     "-sASSERTIONS=0"
+    "-sSTACK_SIZE=${LLAMADART_WEBGPU_STACK_SIZE}"
     "-sMODULARIZE=1"
     "-sEXPORT_ES6=1"
     "-sEXPORT_NAME=createLlamaWebGpuCoreModule"

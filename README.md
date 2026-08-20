@@ -50,6 +50,7 @@ Useful environment variables:
 - `OUT_DIR` (output directory; defaults to `dist/`)
 - `WEBGPU_BRIDGE_BUILD_MEM64` (`1` to also build optional wasm64 core assets)
 - `WEBGPU_BRIDGE_MEM64_MAX_MEMORY` (optional wasm64 max linear memory bytes)
+- `WEBGPU_BRIDGE_STACK_SIZE` (Wasm stack bytes; defaults to `1048576`)
 - `WEBGPU_BRIDGE_PTHREADS` (`1`/`0`, defaults to `1`)
 - `WEBGPU_BRIDGE_PTHREAD_POOL_SIZE` (defaults to `4`)
 - `WEBGPU_BRIDGE_PTHREAD_POOL_SIZE_STRICT` (defaults to `0`)
@@ -57,6 +58,9 @@ Useful environment variables:
 Notes:
 
 - wasm64 builds default to `WEBGPU_BRIDGE_MEM64_MAX_MEMORY=12884901888` (12 GiB).
+- Keep `WEBGPU_BRIDGE_STACK_SIZE` at or above its 1 MiB default unless both
+  wasm32 and memory64 real-model smokes prove a lower value safe. Current
+  llama.cpp graph parameters can overflow Emscripten's 64 KiB default stack.
 - Large single-file remote model loading requires a cross-origin isolated page
   (`COOP`/`COEP`) so worker-thread runtime paths are available.
 - pthread builds preallocate `WEBGPU_BRIDGE_PTHREAD_POOL_SIZE` workers and cap
@@ -193,10 +197,13 @@ are easy to regress during agent-driven maintenance:
   `llama_cpp.version`, so tag-triggered asset publishes cannot silently rebuild
   against a stale workflow default;
 - `.github/workflows/auto_llama_cpp_update.yml` opens or updates one stable
-  `automation/bump-llama-cpp` PR when a newer upstream release exists, with the
-  upstream release notes, compare link, and commit range in the PR body, then
-  creates the PR with the maintainer token so the normal `pull_request` CI
-  starts automatically, then waits for the exact head-SHA validation run;
+  `automation/bump-llama-cpp` PR when the latest published `llamadart-native`
+  release advances, with the matching upstream release notes, compare link,
+  commit range, and raw upstream latest tag in the PR body; this keeps native
+  and Web on the same llama.cpp release unless a maintainer explicitly authors
+  a compatibility exception, then creates the PR with the maintainer token so
+  the normal `pull_request` CI starts automatically and waits for the exact
+  head-SHA validation run;
 - both CI and publish workflows opt into `FORCE_JAVASCRIPT_ACTIONS_TO_NODE24`
   to catch action-runtime deprecation issues early;
 - the state-persistence browser smoke supports an integrity-checked tiny GGUF
