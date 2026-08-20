@@ -98,7 +98,7 @@ target_include_directories(llamadart_mtmd PRIVATE
     "${LLAMA_CPP_DIR}"
     "${LLAMA_CPP_DIR}/vendor"
 )
-target_link_libraries(llamadart_mtmd PRIVATE ggml llama Threads::Threads)
+target_link_libraries(llamadart_mtmd PRIVATE ggml llama Threads::Threads vendor::hash)
 
 if (NOT MSVC)
     target_compile_options(llamadart_mtmd PRIVATE -Wno-cast-qual)

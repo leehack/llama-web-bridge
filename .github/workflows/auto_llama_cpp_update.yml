@@ -42,9 +42,17 @@ jobs:
             exit 1
           fi
 
-          LATEST_TAG="$(gh release list --repo ggml-org/llama.cpp --limit 1 --json tagName --jq ".[0].tagName")"
+          # GitHub's latest-release endpoint excludes draft and prerelease
+          # aliases. This keeps the bridge on llama.cpp's stable bNNNNN line
+          # even when a newer semantic-version prerelease points at the same
+          # commit.
+          LATEST_TAG="$(gh api repos/ggml-org/llama.cpp/releases/latest --jq ".tag_name")"
           if [ -z "$LATEST_TAG" ] || [ "$LATEST_TAG" = "null" ]; then
-            echo "error: could not resolve latest ggml-org/llama.cpp release tag"
+            echo "error: could not resolve latest stable ggml-org/llama.cpp release tag"
+            exit 1
+          fi
+          if ! [[ "$LATEST_TAG" =~ ^b[0-9]+$ ]]; then
+            echo "error: latest stable ggml-org/llama.cpp release tag does not match bNNNNN: $LATEST_TAG"
             exit 1
           fi
 
