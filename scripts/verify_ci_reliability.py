@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
 
@@ -226,8 +227,12 @@ def main() -> int:
         errors,
     )
     require(
-        "target_link_libraries(llamadart_mtmd PRIVATE ggml llama Threads::Threads vendor::hash)"
-        in cmake,
+        re.search(
+            r"target_link_libraries\s*\(\s*llamadart_mtmd\b[^)]*\bvendor::hash\b[^)]*\)",
+            cmake,
+            re.DOTALL,
+        )
+        is not None,
         "llamadart_mtmd must retain llama.cpp's vendor::hash dependency",
         errors,
     )
