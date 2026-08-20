@@ -97,6 +97,7 @@ def main() -> int:
     js_source = read_required("js/src/llama_webgpu_bridge.js", errors)
     js_output = read_required("js/llama_webgpu_bridge.js", errors)
     js_dts = read_required("js/llama_webgpu_bridge.d.ts", errors)
+    cmake = read_required("CMakeLists.txt", errors)
     core = read_required("src/llama_webgpu_core.cpp", errors)
     version = read_required("llama_cpp.version", errors).strip()
     agents = read_required("AGENTS.md", errors)
@@ -215,6 +216,19 @@ def main() -> int:
     require(
         version.startswith("b") and version[1:].isdigit(),
         "llama_cpp.version must contain a llama.cpp release tag like b9165",
+        errors,
+    )
+    require(
+        "gh api repos/ggml-org/llama.cpp/releases/latest" in auto_update
+        and "gh release list --repo ggml-org/llama.cpp --limit 1" not in auto_update
+        and '[[ "$LATEST_TAG" =~ ^b[0-9]+$ ]]' in auto_update,
+        "auto_llama_cpp_update.yml must use GitHub's latest stable release endpoint and reject non-bNNNNN tags",
+        errors,
+    )
+    require(
+        "target_link_libraries(llamadart_mtmd PRIVATE ggml llama Threads::Threads vendor::hash)"
+        in cmake,
+        "llamadart_mtmd must retain llama.cpp's vendor::hash dependency",
         errors,
     )
     require(
