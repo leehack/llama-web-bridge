@@ -140,11 +140,14 @@ but require it before publishing assets advertised for Qwen3-TTS.
     publishes assets.
 - Automated llama.cpp bump PR: `.github/workflows/auto_llama_cpp_update.yml`
   - Runs on a schedule/manual dispatch, compares `llama_cpp.version` against the
-    latest `ggml-org/llama.cpp` release, and manages one stable
-    `automation/bump-llama-cpp` PR.
+    latest published `leehack/llamadart-native` release, and manages one stable
+    `automation/bump-llama-cpp` PR. Raw upstream latest is review context only;
+    Web must not advance ahead of native without an explicit maintainer-authored
+    compatibility exception.
   - The PR body must include the upstream release notes, compare URL, commit
-    range, and WebGPU/WASM review focus. If a newer upstream release appears
-    while the PR is still open, update the same PR instead of opening a duplicate.
+    range, raw upstream latest tag, and WebGPU/WASM review focus. If a newer
+    native parity release appears while the PR is still open, update the same PR
+    instead of opening a duplicate.
   - Create/update the PR with `WEBGPU_BRIDGE_ASSETS_PAT` so normal
     `pull_request` CI starts without approval, then wait for the exact head SHA.
   - Skip instead of racing when a non-automation PR already changes

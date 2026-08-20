@@ -220,10 +220,14 @@ def main() -> int:
         errors,
     )
     require(
-        "gh api repos/ggml-org/llama.cpp/releases/latest" in auto_update
+        "PARITY_REPO: leehack/llamadart-native" in auto_update
+        and "gh api repos/ggml-org/llama.cpp/releases/latest" in auto_update
+        and 'gh api "repos/${PARITY_REPO}/releases/latest"' in auto_update
         and "gh release list --repo ggml-org/llama.cpp --limit 1" not in auto_update
-        and '[[ "$LATEST_TAG" =~ ^b[0-9]+$ ]]' in auto_update,
-        "auto_llama_cpp_update.yml must use GitHub's latest stable release endpoint and reject non-bNNNNN tags",
+        and '[[ "$UPSTREAM_LATEST_TAG" =~ ^b[0-9]+$ ]]' in auto_update
+        and '[[ "$TARGET_TAG" =~ ^b[0-9]+$ ]]' in auto_update
+        and '"${TARGET_TAG#b}" -lt "${CURRENT_TAG#b}"' in auto_update,
+        "auto_llama_cpp_update.yml must target the latest published native release, retain raw upstream context, reject non-bNNNNN tags, and prevent downgrades",
         errors,
     )
     require(
@@ -234,6 +238,14 @@ def main() -> int:
         )
         is not None,
         "llamadart_mtmd must retain llama.cpp's vendor::hash dependency",
+        errors,
+    )
+    require(
+        'set(LLAMADART_WEBGPU_STACK_SIZE "1048576"' in cmake
+        and '"-sSTACK_SIZE=${LLAMADART_WEBGPU_STACK_SIZE}"' in cmake
+        and 'WEBGPU_BRIDGE_STACK_SIZE:-1048576' in build_bridge
+        and build_bridge.count('-DLLAMADART_WEBGPU_STACK_SIZE="$STACK_SIZE"') == 2,
+        "wasm32 and wasm64 builds must each provision the explicit 1 MiB stack required by current llama.cpp graph parameters",
         errors,
     )
     require(
@@ -357,8 +369,10 @@ def main() -> int:
         and "gh workflow run ci.yml" not in auto_update
         and "body-path: /tmp/llama_cpp_update_pr.md" in auto_update
         and "Upstream changelog" in auto_update
+        and "Native parity release" in auto_update
+        and "Raw upstream latest observed" in auto_update
         and "not racing a non-automation PR" in auto_update,
-        "auto_llama_cpp_update.yml must use maintainer-authored PR events, wait for exact-head PR CI, and avoid racing human PRs",
+        "auto_llama_cpp_update.yml must use maintainer-authored PR events, follow native release parity, wait for exact-head PR CI, and avoid racing human PRs",
         errors,
     )
 

@@ -19,10 +19,11 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
   VERSION_FILE: llama_cpp.version
   UPDATE_BRANCH: automation/bump-llama-cpp
+  PARITY_REPO: leehack/llamadart-native
 
 jobs:
   update-llama-cpp-pin:
-    name: Check for newer llama.cpp release
+    name: Check for native-aligned llama.cpp release
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -42,29 +43,52 @@ jobs:
             exit 1
           fi
 
-          # GitHub's latest-release endpoint excludes draft and prerelease
-          # aliases. This keeps the bridge on llama.cpp's stable bNNNNN line
-          # even when a newer semantic-version prerelease points at the same
-          # commit.
-          LATEST_TAG="$(gh api repos/ggml-org/llama.cpp/releases/latest --jq ".tag_name")"
-          if [ -z "$LATEST_TAG" ] || [ "$LATEST_TAG" = "null" ]; then
+          # Keep the Web bridge on the latest llama.cpp tag already published by
+          # llamadart-native. Raw upstream latest is review context only: Web
+          # must not advance ahead of the native release without an explicit
+          # maintainer-authored compatibility exception.
+          UPSTREAM_LATEST_TAG="$(gh api repos/ggml-org/llama.cpp/releases/latest --jq ".tag_name")"
+          if [ -z "$UPSTREAM_LATEST_TAG" ] || [ "$UPSTREAM_LATEST_TAG" = "null" ]; then
             echo "error: could not resolve latest stable ggml-org/llama.cpp release tag"
             exit 1
           fi
-          if ! [[ "$LATEST_TAG" =~ ^b[0-9]+$ ]]; then
-            echo "error: latest stable ggml-org/llama.cpp release tag does not match bNNNNN: $LATEST_TAG"
+          if ! [[ "$UPSTREAM_LATEST_TAG" =~ ^b[0-9]+$ ]]; then
+            echo "error: latest stable ggml-org/llama.cpp release tag does not match bNNNNN: $UPSTREAM_LATEST_TAG"
+            exit 1
+          fi
+
+          TARGET_TAG="$(gh api "repos/${PARITY_REPO}/releases/latest" --jq ".tag_name")"
+          if [ -z "$TARGET_TAG" ] || [ "$TARGET_TAG" = "null" ]; then
+            echo "error: could not resolve latest published ${PARITY_REPO} release tag"
+            exit 1
+          fi
+          if ! [[ "$TARGET_TAG" =~ ^b[0-9]+$ ]]; then
+            echo "error: latest published ${PARITY_REPO} release tag does not match bNNNNN: $TARGET_TAG"
+            exit 1
+          fi
+          if ! gh release view "$TARGET_TAG" --repo ggml-org/llama.cpp >/dev/null; then
+            echo "error: ${PARITY_REPO} release ${TARGET_TAG} has no matching stable llama.cpp release"
             exit 1
           fi
 
           {
             echo "current_tag=$CURRENT_TAG"
-            echo "latest_tag=$LATEST_TAG"
+            echo "target_tag=$TARGET_TAG"
+            echo "upstream_latest_tag=$UPSTREAM_LATEST_TAG"
           } >> "$GITHUB_OUTPUT"
 
-          if [ "$CURRENT_TAG" = "$LATEST_TAG" ]; then
+          if [ "$CURRENT_TAG" = "$TARGET_TAG" ]; then
             {
               echo "update_needed=false"
-              echo "skip_reason=$VERSION_FILE already points at $LATEST_TAG"
+              echo "skip_reason=$VERSION_FILE already matches latest ${PARITY_REPO} release $TARGET_TAG (raw upstream latest: $UPSTREAM_LATEST_TAG)"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ "${TARGET_TAG#b}" -lt "${CURRENT_TAG#b}" ]; then
+            {
+              echo "update_needed=false"
+              echo "skip_reason=refusing to move $VERSION_FILE backward from $CURRENT_TAG to latest ${PARITY_REPO} release $TARGET_TAG"
             } >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -79,18 +103,20 @@ jobs:
             fi
           done
 
-          printf '%s\n' "$LATEST_TAG" > "$VERSION_FILE"
+          printf '%s\n' "$TARGET_TAG" > "$VERSION_FILE"
 
-          RELEASE_URL="$(gh release view "$LATEST_TAG" --repo ggml-org/llama.cpp --json url --jq ".url")"
-          COMPARE_URL="https://github.com/ggml-org/llama.cpp/compare/${CURRENT_TAG}...${LATEST_TAG}"
+          RELEASE_URL="$(gh release view "$TARGET_TAG" --repo ggml-org/llama.cpp --json url --jq ".url")"
+          PARITY_RELEASE_URL="$(gh release view "$TARGET_TAG" --repo "$PARITY_REPO" --json url --jq ".url")"
+          COMPARE_URL="https://github.com/ggml-org/llama.cpp/compare/${CURRENT_TAG}...${TARGET_TAG}"
           {
             echo "release_url=$RELEASE_URL"
+            echo "parity_release_url=$PARITY_RELEASE_URL"
             echo "compare_url=$COMPARE_URL"
             echo "update_needed=true"
           } >> "$GITHUB_OUTPUT"
 
-          gh release view "$LATEST_TAG" --repo ggml-org/llama.cpp --json body --jq ".body // \"\"" > /tmp/llama_cpp_release_notes.md
-          gh api "repos/ggml-org/llama.cpp/compare/${CURRENT_TAG}...${LATEST_TAG}" \
+          gh release view "$TARGET_TAG" --repo ggml-org/llama.cpp --json body --jq ".body // \"\"" > /tmp/llama_cpp_release_notes.md
+          gh api "repos/ggml-org/llama.cpp/compare/${CURRENT_TAG}...${TARGET_TAG}" \
             --jq ".commits[:80][] | \"- \" + (.commit.message | split(\"\\n\")[0]) + \" (\`\" + (.sha[0:7]) + \"\`)\"" \
             > /tmp/llama_cpp_commits.md || true
 
@@ -98,14 +124,16 @@ jobs:
             echo "## llama.cpp update"
             echo
             echo "- Previous pin: \`$CURRENT_TAG\`"
-            echo "- New pin: \`$LATEST_TAG\`"
+            echo "- New pin: \`$TARGET_TAG\`"
+            echo "- Native parity release: $PARITY_RELEASE_URL"
+            echo "- Raw upstream latest observed: \`$UPSTREAM_LATEST_TAG\`"
             echo "- Upstream release: $RELEASE_URL"
             echo "- Compare: $COMPARE_URL"
             echo
             echo "## Upstream changelog"
             echo
             echo "<details>"
-            echo "<summary>Release notes for $LATEST_TAG</summary>"
+            echo "<summary>Release notes for $TARGET_TAG</summary>"
             echo
             if [ -s /tmp/llama_cpp_release_notes.md ]; then
               cat /tmp/llama_cpp_release_notes.md
@@ -118,7 +146,7 @@ jobs:
             echo "## Commit range"
             echo
             echo "<details>"
-            echo "<summary>Commits from $CURRENT_TAG to $LATEST_TAG (first 80)</summary>"
+            echo "<summary>Commits from $CURRENT_TAG to $TARGET_TAG (first 80)</summary>"
             echo
             if [ -s /tmp/llama_cpp_commits.md ]; then
               cat /tmp/llama_cpp_commits.md
@@ -146,7 +174,7 @@ jobs:
             echo
             echo "## Automation behavior"
             echo
-            echo "This PR is managed from the stable branch \`$UPDATE_BRANCH\`. If another llama.cpp release appears before merge, the scheduled workflow updates this same PR instead of opening a duplicate. The workflow skips if a non-automation PR already changes \`$VERSION_FILE\`."
+            echo "This PR is managed from the stable branch \`$UPDATE_BRANCH\`. The scheduled workflow follows the latest published \`$PARITY_REPO\` release instead of raw upstream latest, so Web does not advance ahead of native without an explicit maintainer-authored exception. It updates this same PR when the native parity target advances and skips if a non-automation PR already changes \`$VERSION_FILE\`."
           } > /tmp/llama_cpp_update_pr.md
 
       - name: Report skip reason
@@ -164,8 +192,8 @@ jobs:
           branch: ${{ env.UPDATE_BRANCH }}
           base: main
           delete-branch: true
-          title: 'chore: bump llama.cpp to ${{ steps.meta.outputs.latest_tag }}'
-          commit-message: 'chore: bump llama.cpp to ${{ steps.meta.outputs.latest_tag }}'
+          title: 'chore: bump llama.cpp to ${{ steps.meta.outputs.target_tag }}'
+          commit-message: 'chore: bump llama.cpp to ${{ steps.meta.outputs.target_tag }}'
           body-path: /tmp/llama_cpp_update_pr.md
           labels: |
             dependencies
