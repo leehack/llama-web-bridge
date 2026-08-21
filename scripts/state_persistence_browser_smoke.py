@@ -323,6 +323,8 @@ def write_harness(web_root: Path, model_filename: str | None) -> None:
       const direct = modeResults.find((entry) => entry.mode === 'direct runtime');
       const worker = modeResults.find((entry) => entry.mode === 'worker runtime');
       assert(direct && worker && arraysEqual(direct.embedding, worker.embedding), 'direct and worker embeddings differed');
+      delete direct.embedding;
+      delete worker.embedding;
       assert(worker && worker.detachedAfterLoadTransfer === true, 'worker stateLoadBytes transfer did not detach transferred buffer');
       assert(worker && worker.workerSaveSnapshotReturned === true, 'worker stateSaveBytes did not return a byte snapshot');
     }}
