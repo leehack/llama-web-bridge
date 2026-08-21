@@ -4680,6 +4680,7 @@ var LlamaWebGpuBridge = class {
       return this._runtime.getTextToSpeechCapabilities();
     }
   }
+  /** @param {Partial<import('./llama_webgpu_bridge.d.ts').TextToSpeechOptions>} [options] */
   async synthesizeSpeech(options = {}) {
     if (options.signal?.aborted) {
       throw new DOMException("Text-to-speech synthesis was cancelled.", "AbortError");
