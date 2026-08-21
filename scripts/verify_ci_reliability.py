@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -22,6 +23,27 @@ def read_required(relative_path: str, errors: list[str]) -> str:
 def require(condition: bool, message: str, errors: list[str]) -> None:
     if not condition:
         errors.append(message)
+
+
+def list_typescript_files(errors: list[str]) -> set[Path]:
+    tsc = ROOT / "node_modules" / "typescript" / "bin" / "tsc"
+    try:
+        result = subprocess.run(
+            ["node", str(tsc), "-p", "tsconfig.bridge.json", "--noEmit", "--listFiles"],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError as exc:
+        errors.append(f"failed to run tsc --listFiles: {exc}")
+        return set()
+
+    if result.returncode != 0:
+        errors.append(f"tsc --listFiles failed with exit code {result.returncode}")
+        return set()
+
+    return {Path(line).resolve() for line in result.stdout.splitlines() if line.strip()}
 
 
 def count_unescaped_pipes(line: str) -> int:
@@ -106,6 +128,7 @@ def main() -> int:
     readme = read_required("README.md", errors)
     api_docs = read_required("docs/api.md", errors)
     contributing = read_required("CONTRIBUTING.md", errors)
+    typechecked_files = list_typescript_files(errors)
 
     require_well_formed_markdown_tables("docs/api.md", api_docs, errors)
 
@@ -147,9 +170,13 @@ def main() -> int:
     )
     require(
         '"checkJs": true' in tsconfig
-        and '"allowJs": true' in tsconfig
-        and '"js/src/**/*.js"' in tsconfig,
-        "tsconfig.bridge.json must type-check the JS bridge source under js/src",
+        and '"allowJs": true' in tsconfig,
+        "tsconfig.bridge.json must enable JavaScript type-checking",
+        errors,
+    )
+    require(
+        (ROOT / "js/src/llama_webgpu_bridge.js").resolve() in typechecked_files,
+        "tsc --listFiles must include js/src/llama_webgpu_bridge.js",
         errors,
     )
     require(
