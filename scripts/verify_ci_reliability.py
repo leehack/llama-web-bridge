@@ -88,6 +88,7 @@ def main() -> int:
     speech_smoke = read_required("scripts/speech_to_text_browser_smoke.py", errors)
     tts_smoke = read_required("scripts/text_to_speech_browser_smoke.py", errors)
     tts_contract = read_required("scripts/verify_text_to_speech_api.py", errors)
+    embedding_contract = read_required("scripts/embedding_json_contract_test.mjs", errors)
     ci = read_required(".github/workflows/ci.yml", errors)
     publish = read_required(".github/workflows/publish_assets.yml", errors)
     auto_update = read_required(".github/workflows/auto_llama_cpp_update.yml", errors)
@@ -129,9 +130,19 @@ def main() -> int:
         and '"typecheck:js"' in package_json
         and '"build:js"' in package_json
         and '"syntax:js"' in package_json
+        and '"test:embedding-json"' in package_json
         and '"esbuild"' in package_json
         and '"typescript"' in package_json,
         "package.json must define JS build/typecheck/syntax scripts and pin esbuild + TypeScript dev dependencies",
+        errors,
+    )
+    require(
+        "llama_webgpu_embedding_json.h" in embedding_contract
+        and "JSON.parse(raw)" in embedding_contract
+        and "float32Bits" in embedding_contract
+        and "quiet_NaN" in embedding_contract
+        and "infinity" in embedding_contract,
+        "embedding JSON contract must compile the C++ serializer and verify JS float32 parsing plus non-finite sanitization",
         errors,
     )
     require(
