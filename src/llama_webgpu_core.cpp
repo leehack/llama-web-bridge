@@ -23,6 +23,7 @@
 #include "mtmd-helper.h"
 #include "mtmd.h"
 
+#include "llama_webgpu_embedding_json.h"
 #include "llama_webgpu_tts.h"
 
 namespace {
@@ -531,18 +532,6 @@ std::string serialize_tokens_json(const std::vector<llama_token> & tokens) {
       json += ",";
     }
     json += std::to_string(tokens[i]);
-  }
-  json += "]";
-  return json;
-}
-
-std::string serialize_embedding_json(const std::vector<float> & embedding) {
-  std::string json = "[";
-  for (size_t i = 0; i < embedding.size(); ++i) {
-    if (i > 0) {
-      json += ",";
-    }
-    json += std::to_string(static_cast<double>(embedding[i]));
   }
   json += "]";
   return json;
@@ -1854,7 +1843,8 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_embed_to_json(
         normalize_embedding_inplace(embedding);
       }
 
-      g_last_embedding_json = serialize_embedding_json(embedding);
+      g_last_embedding_json =
+          llamadart_webgpu_detail::serialize_embedding_json(embedding);
     }
   }
 

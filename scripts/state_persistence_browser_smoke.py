@@ -3,10 +3,11 @@
 
 The default smoke stays lightweight by verifying API shape and clean pre-load
 failures in Chromium. When a tiny GGUF model is supplied, the same harness also
-loads the model in both direct and worker runtimes, evaluates a prompt, saves a
-state snapshot as bytes, mutates the context, reloads the snapshot, and verifies
-restored token metadata. CI supplies an integrity-pinned tiny model so state
-persistence regressions are caught without large downloads.
+loads the model in both direct and worker runtimes, verifies finite embeddings,
+evaluates a prompt, saves a state snapshot as bytes, mutates the context, reloads
+the snapshot, and verifies restored token metadata. CI supplies an
+integrity-pinned tiny model so core API regressions are caught without large
+downloads.
 """
 
 from __future__ import annotations
@@ -223,6 +224,20 @@ def write_harness(web_root: Path, model_filename: str | None) -> None:
       const tokens = await bridge.tokenize(prompt, true);
       assert(Array.isArray(tokens) && tokens.length > 0, `${{mode}} tokenization returned no tokens`);
 
+      const embedding = await bridge.embed(prompt);
+      assert(Array.isArray(embedding) && embedding.length > 0, `${{mode}} embedding returned no components`);
+      assert(embedding.every(Number.isFinite), `${{mode}} embedding returned non-finite components`);
+      assert(embedding.some((value) => value !== 0), `${{mode}} embedding was rounded entirely to zero`);
+
+      const embeddingBatch = await bridge.embedBatch([prompt, mutationPrompt]);
+      assert(Array.isArray(embeddingBatch) && embeddingBatch.length === 2, `${{mode}} embedding batch shape was invalid`);
+      assert(embeddingBatch.every((values) => (
+        Array.isArray(values)
+          && values.length === embedding.length
+          && values.every(Number.isFinite)
+      )), `${{mode}} embedding batch contained invalid vectors`);
+      assert(arraysEqual(embeddingBatch[0], embedding), `${{mode}} batch embedding differed from the single embedding`);
+
       const firstText = await bridge.createCompletion(prompt, {{
         nPredict: 1,
         temp: 0,
@@ -278,6 +293,9 @@ def write_harness(web_root: Path, model_filename: str | None) -> None:
         : null;
       return {{
         progressEvents: progress.length,
+        embedding,
+        embeddingComponents: embedding.length,
+        embeddingBatchSize: embeddingBatch.length,
         savedBytes: snapshot.byteLength,
         restoredTokens: restored.tokens.length,
         detachedAfterLoadTransfer,
@@ -302,7 +320,11 @@ def write_harness(web_root: Path, model_filename: str | None) -> None:
     await verifyBridgeStateApi(new LlamaWebGpuBridge({{ disableWorker: false }}), 'worker runtime');
 
     if (modelUrl) {{
+      const direct = modeResults.find((entry) => entry.mode === 'direct runtime');
       const worker = modeResults.find((entry) => entry.mode === 'worker runtime');
+      assert(direct && worker && arraysEqual(direct.embedding, worker.embedding), 'direct and worker embeddings differed');
+      delete direct.embedding;
+      delete worker.embedding;
       assert(worker && worker.detachedAfterLoadTransfer === true, 'worker stateLoadBytes transfer did not detach transferred buffer');
       assert(worker && worker.workerSaveSnapshotReturned === true, 'worker stateSaveBytes did not return a byte snapshot');
     }}
@@ -487,6 +509,11 @@ def main() -> int:
         mode_results = payload.get("modeResults")
         require(isinstance(mode_results, list) and len(mode_results) == 2, "model-backed mode results missing")
         for entry in mode_results:
+            require(
+                isinstance(entry.get("embeddingComponents"), int) and entry["embeddingComponents"] > 0,
+                "embedding vector was empty",
+            )
+            require(entry.get("embeddingBatchSize") == 2, "embedding batch result was incomplete")
             require(isinstance(entry.get("savedBytes"), int) and entry["savedBytes"] > 0, "state snapshot was empty")
             require(isinstance(entry.get("restoredTokens"), int) and entry["restoredTokens"] > 0, "restored token metadata missing")
     return 0
