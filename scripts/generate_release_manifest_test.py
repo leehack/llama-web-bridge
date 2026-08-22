@@ -33,6 +33,9 @@ class GenerateReleaseManifestTest(unittest.TestCase):
                 native_manifest_sha256="c" * 64,
                 native_commit="d" * 40,
                 emscripten_version="6.0.8",
+                orchestrator_correlation_id="llamadart-pin:run-123",
+                github_run_id="123456789",
+                github_run_url="https://github.com/leehack/llama-web-bridge/actions/runs/123456789",
             )
             manifest = generate(args)
             first_bytes = (out_dir / "manifest.json").read_bytes()
@@ -44,6 +47,23 @@ class GenerateReleaseManifestTest(unittest.TestCase):
             self.assertEqual(manifest["upstream_commit"], "b" * 40)
             self.assertEqual(manifest["native_commit"], "d" * 40)
             self.assertEqual(manifest["bridge_assets_tag"], "v0.2.0-1")
+            self.assertEqual(
+                manifest["orchestrator_correlation_id"], "llamadart-pin:run-123"
+            )
+            self.assertEqual(manifest["github_run_id"], "123456789")
+            self.assertEqual(
+                manifest["github_run_url"],
+                "https://github.com/leehack/llama-web-bridge/actions/runs/123456789",
+            )
+            self.assertEqual(
+                manifest["qualification_gates"],
+                {
+                    "state_persistence": "passed",
+                    "multimodal": "passed",
+                    "speech_to_text": "passed",
+                    "text_to_speech": "passed",
+                },
+            )
             self.assertTrue(manifest["capabilities"]["speech_to_text"]["advertised"])
             self.assertTrue(manifest["capabilities"]["text_to_speech"]["advertised"])
             self.assertNotIn("generated_at_utc", manifest)

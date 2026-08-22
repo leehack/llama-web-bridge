@@ -167,8 +167,9 @@ query strings, and fragments before printing the location.
 ## Publish Process
 
 Use `.github/workflows/publish_assets.yml` only after explicit publication
-approval. The central orchestrator may call it, or a maintainer may dispatch it,
-with the exact bridge SHA, upstream tag/commit, native release tag plus
+approval. The central orchestrator or a maintainer dispatches this bridge-owned,
+non-reusable workflow with a required correlation ID, exact bridge SHA,
+upstream tag/commit, native release tag plus
 `assets.json` SHA-256, output release tag/rebuild, and assets repository.
 
 The request must set `publish_approved=true`. Publication remains blocked until
@@ -178,7 +179,13 @@ the workflow fails closed if that protection is absent. It verifies all
 identities plus native GitHub asset digests/inventory, builds wasm32 and
 memory64, runs mandatory state/multimodal/ASR/TTS gates, generates a
 deterministic schema-v2 manifest, and recovers exact partial states while
-rejecting any mismatch.
+rejecting any mismatch. Manifest and outcome records include the exact bridge
+workflow run ID/URL and explicit conclusions for every mandatory capability
+gate; unavailable post-mutation re-queries produce retryable
+`mutation-unknown` records rather than guessed state.
+Retry partial publication by rerunning the same GitHub Actions run so its
+fingerprinted run ID/URL remains stable. Do not redispatch a new run against an
+existing output tag.
 
 GitHub artifact tags are `vMAJOR.MINOR.PATCH`, `vMAJOR.MINOR.PATCH-N`, `bNNNN`,
 or `bNNNN-N`. Historical `bNNNN-llamadart.N` and prior wrapper forms are

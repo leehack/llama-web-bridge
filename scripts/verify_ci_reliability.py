@@ -345,6 +345,14 @@ def main() -> int:
         errors,
     )
     require(
+        "may dispatch the bridge-owned" in auto_update
+        and "through GitHub's API" in auto_update
+        and "required correlation ID" in auto_update
+        and "may call `publish_assets.yml`" not in auto_update,
+        "the scheduled scan summary must describe the bridge-owned API dispatch contract",
+        errors,
+    )
+    require(
         re.search(
             r"target_link_libraries\s*\(\s*llamadart_mtmd\b[^)]*\bvendor::hash\b[^)]*\)",
             cmake,
@@ -390,8 +398,9 @@ def main() -> int:
         errors,
     )
     require(
-        "workflow_call:" in publish
+        "workflow_call:" not in publish
         and "workflow_dispatch:" in publish
+        and "orchestrator_correlation_id:" in publish
         and "bridge_source_sha:" in publish
         and "upstream_tag:" in publish
         and "upstream_commit:" in publish
@@ -403,7 +412,7 @@ def main() -> int:
         and "release_capabilities:" not in publish
         and "publish_approved:" in publish
         and "llama_cpp.version" not in publish,
-        "publish_assets.yml must expose exact bridge/upstream/native/output inputs without depending on a bridge pin",
+        "bridge-owned publish_assets.yml must expose exact orchestrator/bridge/upstream/native/output inputs without a bridge pin",
         errors,
     )
     require(
@@ -411,17 +420,28 @@ def main() -> int:
         and len(re.findall(r"repository: leehack/llama-web-bridge\s*$", publish, re.MULTILINE)) == 3
         and '--bridge-repo "${BRIDGE_REPO}"' in publish
         and 'repos/${GITHUB_REPOSITORY}' not in publish,
-        "reusable publication must always checkout and verify the owning bridge repository, never the caller",
+        "dispatch-only publication must always checkout and verify the owning bridge repository",
         errors,
     )
     require(
         "publish_approved=true requires explicit maintainer approval" in publish
         and "Verify externally configured approval environment" in publish
         and "release_contract.py validate-environment" in publish
-        and "environment: bridge-assets-publication" in publish
+        and re.search(
+            r"verify-publication-environment:\s+.*?permissions:\s+actions: read\s+contents: read",
+            publish,
+            re.DOTALL,
+        )
+        is not None
+        and 'if [ "${GITHUB_REPOSITORY}" != "${BRIDGE_REPO}" ]' in publish
+        and 'echo "environment_name=bridge-assets-publication" >> "${GITHUB_OUTPUT}"'
+        in publish
+        and "name: ${{ needs.verify-publication-environment.outputs.environment_name }}"
+        in publish
+        and "environment: bridge-assets-publication" not in publish
         and "push:" not in publish.split("permissions:", 1)[0]
         and "schedule:" not in publish,
-        "cross-repository publication must require explicit input confirmation plus the protected publication environment and have no automatic trigger",
+        "cross-repository publication must require explicit input confirmation plus a preverified dynamic protected environment and have no automatic trigger",
         errors,
     )
     require(
@@ -450,10 +470,22 @@ def main() -> int:
         and "publication_outcome" in publish
         and 'cp "${RUNNER_TEMP}/preflight.json" "${RUNNER_TEMP}/publication-outcome.json"' in publish
         and "state_changed()" in publish
+        and "mutation-unknown" in publish
+        and "ref-requery-failed" in publish
+        and "release-requery-failed" in publish
+        and "classify_remote() (" in publish
+        and '.reason_code != "invalid-input-or-state"' in publish
+        and ".orchestrator_correlation_id == env.ORCHESTRATOR_CORRELATION_ID"
+        in publish
+        and publish.count(
+            '.qualification_gates == {state_persistence:"passed",multimodal:"passed",'
+        )
+        == 2
+        and publish.count('speech_to_text:"passed",text_to_speech:"passed"}') >= 2
         and "persist-credentials: false" in publish
         and "sha256sum --check sha256sums.txt" in publish
         and "git -C assets-repo push --atomic" in publish,
-        "publication must classify exact retry states, emit outcomes, lock credentials, and recheck after mutation",
+        "publication must classify exact retry states, reject failed classifier re-queries, emit outcomes, lock credentials, and recheck after mutation",
         errors,
     )
     require(
@@ -461,6 +493,9 @@ def main() -> int:
         and "Run durable multimodal gate" in publish
         and "Run durable Qwen3-ASR gate" in publish
         and "Run durable Qwen3-TTS memory64 gate" in publish
+        and "bridge-qualification-outcome" in publish
+        and "STATE_CONCLUSION:" in publish
+        and "TTS_CONCLUSION:" in publish
         and "contains(inputs.release_capabilities" not in publish
         and "WEBGPU_BRIDGE_BUILD_MEM64: 1" in publish,
         "exact publication must always build wasm32/memory64 and run state, multimodal, ASR, and TTS gates",
@@ -486,10 +521,19 @@ def main() -> int:
         and '"native_commit": native_commit' in read_required(
             "scripts/generate_release_manifest.py", errors
         )
+        and '"orchestrator_correlation_id": correlation_id' in read_required(
+            "scripts/generate_release_manifest.py", errors
+        )
+        and '"github_run_id": args.github_run_id' in read_required(
+            "scripts/generate_release_manifest.py", errors
+        )
+        and '"qualification_gates": QUALIFICATION_GATES' in read_required(
+            "scripts/generate_release_manifest.py", errors
+        )
         and '"sha256": digest' in read_required(
             "scripts/generate_release_manifest.py", errors
         ),
-        "published manifests must carry schema, capability, three-source provenance, and per-artifact SHA-256 fields",
+        "published manifests must carry schema, capability gates, run/correlation identity, three-source provenance, and artifact SHA-256 fields",
         errors,
     )
 

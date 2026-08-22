@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
-from generate_release_manifest import ARTIFACTS, CAPABILITIES
+from generate_release_manifest import ARTIFACTS, CAPABILITIES, QUALIFICATION_GATES
 from release_contract import (
     ASSETS_REPOSITORY,
     BRIDGE_REPOSITORY,
@@ -23,6 +23,7 @@ from release_contract import (
     compare_upstream,
     parse_release_tag,
     parse_upstream_tag,
+    require_correlation_id,
     require_sha256,
 )
 
@@ -49,6 +50,9 @@ class CandidateIdentity:
     native_manifest_sha256: str
     native_commit: str
     emscripten_version: str
+    orchestrator_correlation_id: str
+    github_run_id: str
+    github_run_url: str
 
 
 def require_approved_assets_repo(value: str) -> str:
@@ -88,6 +92,14 @@ def validate_candidate(directory: Path, identity: CandidateIdentity) -> str:
     _require_commit(identity.upstream_commit, "upstream_commit")
     _require_commit(identity.native_commit, "native_commit")
     require_sha256(identity.native_manifest_sha256, "native_manifest_sha256")
+    require_correlation_id(identity.orchestrator_correlation_id)
+    if not identity.github_run_id.isdigit() or identity.github_run_id.startswith("0"):
+        raise ContractError("github_run_id must be a positive decimal string")
+    expected_run_url = (
+        f"https://github.com/{BRIDGE_REPOSITORY}/actions/runs/{identity.github_run_id}"
+    )
+    if identity.github_run_url != expected_run_url:
+        raise ContractError(f"github_run_url must be exactly {expected_run_url}")
 
     manifest = _read_json(directory / "manifest.json", "candidate manifest")
     expected_fields: dict[str, object] = {
@@ -106,6 +118,10 @@ def validate_candidate(directory: Path, identity: CandidateIdentity) -> str:
         "native_manifest_sha256": identity.native_manifest_sha256,
         "native_commit": identity.native_commit,
         "emscripten_version": identity.emscripten_version,
+        "orchestrator_correlation_id": identity.orchestrator_correlation_id,
+        "github_run_id": identity.github_run_id,
+        "github_run_url": identity.github_run_url,
+        "qualification_gates": QUALIFICATION_GATES,
         "capabilities": CAPABILITIES,
         "bridge_assets_tag": identity.release_tag,
         "source_repository": BRIDGE_REPOSITORY,
@@ -277,6 +293,9 @@ def _validate_release(
         or release.get("target_commitish") != tag_commit
         or not isinstance(release.get("id"), int)
         or f"Candidate fingerprint: `{fingerprint}`" not in str(release.get("body", ""))
+        or f"Orchestrator correlation: `{identity.orchestrator_correlation_id}`"
+        not in str(release.get("body", ""))
+        or identity.github_run_url not in str(release.get("body", ""))
     ):
         raise ContractError("GitHub Release metadata does not match the immutable candidate")
     assets = release.get("assets")
@@ -336,6 +355,10 @@ def _result(
         "branch_commit": branch_commit,
         "tag_commit": tag_commit,
         "release_id": release.get("id") if release else None,
+        "orchestrator_correlation_id": identity.orchestrator_correlation_id,
+        "github_run_id": identity.github_run_id,
+        "github_run_url": identity.github_run_url,
+        "qualification_gates": QUALIFICATION_GATES,
     }
 
 
@@ -357,6 +380,63 @@ def publication_state_changed(
         )
 
     return identity(before) != identity(after)
+
+
+def mutation_unknown_outcome(
+    candidate: Path, identity: CandidateIdentity, reason_code: str
+) -> dict[str, object]:
+    """Emit a durable retry contract when a credentialed mutation cannot be re-read."""
+    if reason_code not in {"ref-requery-failed", "release-requery-failed"}:
+        raise ContractError("unsupported mutation-unknown reason_code")
+    fingerprint = validate_candidate(candidate, identity)
+    return {
+        "schema_version": 1,
+        "state": "mutation-unknown",
+        "allowed": False,
+        "action": "none",
+        "outcome": "mutation-unknown",
+        "reason_code": reason_code,
+        "reason": "a credentialed mutation was attempted but exact remote state could not be re-read",
+        "retryable": True,
+        "mutated": None,
+        "mutation_status": "unknown",
+        "candidate_fingerprint": fingerprint,
+        "assets_repository": identity.assets_repo,
+        "release_tag": identity.release_tag,
+        "branch_commit": None,
+        "tag_commit": None,
+        "release_id": None,
+        "orchestrator_correlation_id": identity.orchestrator_correlation_id,
+        "github_run_id": identity.github_run_id,
+        "github_run_url": identity.github_run_url,
+        "qualification_gates": QUALIFICATION_GATES,
+    }
+
+
+def mutation_unknown_from_requery(
+    candidate: Path,
+    identity: CandidateIdentity,
+    reason_code: str,
+    requery_path: Path,
+) -> dict[str, object]:
+    """Convert only an unavailable or semantically invalid re-query to unknown."""
+    try:
+        data = requery_path.read_bytes()
+    except OSError:
+        data = b""
+    if data.strip():
+        try:
+            parsed = json.loads(data)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            parsed = None
+        if (
+            isinstance(parsed, Mapping)
+            and parsed.get("reason_code") != "invalid-input-or-state"
+        ):
+            raise ContractError(
+                "valid classifier JSON must be handled as exact state, not mutation-unknown"
+            )
+    return mutation_unknown_outcome(candidate, identity, reason_code)
 
 
 def classify(
@@ -470,6 +550,9 @@ def _identity(args: argparse.Namespace) -> CandidateIdentity:
         native_manifest_sha256=args.native_manifest_sha256,
         native_commit=args.native_commit,
         emscripten_version=args.emscripten_version,
+        orchestrator_correlation_id=args.orchestrator_correlation_id,
+        github_run_id=args.github_run_id,
+        github_run_url=args.github_run_url,
     )
 
 
@@ -482,6 +565,24 @@ def _parser() -> argparse.ArgumentParser:
     changed = subparsers.add_parser("state-changed")
     changed.add_argument("--before-json", required=True, type=Path)
     changed.add_argument("--after-json", required=True, type=Path)
+
+    unknown = subparsers.add_parser("mutation-unknown")
+    unknown.add_argument("--candidate", required=True, type=Path)
+    unknown.add_argument("--reason-code", required=True)
+    unknown.add_argument("--requery-json", required=True, type=Path)
+    unknown.add_argument("--release-tag", required=True)
+    unknown.add_argument("--release-rebuild", required=True, type=int)
+    unknown.add_argument("--assets-repo", required=True)
+    unknown.add_argument("--bridge-commit", required=True)
+    unknown.add_argument("--upstream-tag", required=True)
+    unknown.add_argument("--upstream-commit", required=True)
+    unknown.add_argument("--native-release-tag", required=True)
+    unknown.add_argument("--native-manifest-sha256", required=True)
+    unknown.add_argument("--native-commit", required=True)
+    unknown.add_argument("--emscripten-version", required=True)
+    unknown.add_argument("--orchestrator-correlation-id", required=True)
+    unknown.add_argument("--github-run-id", required=True)
+    unknown.add_argument("--github-run-url", required=True)
 
     inspect = subparsers.add_parser("classify")
     inspect.add_argument("--repository", required=True, type=Path)
@@ -499,11 +600,16 @@ def _parser() -> argparse.ArgumentParser:
     inspect.add_argument("--native-manifest-sha256", required=True)
     inspect.add_argument("--native-commit", required=True)
     inspect.add_argument("--emscripten-version", required=True)
+    inspect.add_argument("--orchestrator-correlation-id", required=True)
+    inspect.add_argument("--github-run-id", required=True)
+    inspect.add_argument("--github-run-url", required=True)
     return parser
 
 
-def _fatal(reason: str) -> dict[str, object]:
-    return {
+def _fatal(
+    reason: str, identity: CandidateIdentity | None = None
+) -> dict[str, object]:
+    result: dict[str, object] = {
         "schema_version": 1,
         "state": "collision",
         "allowed": False,
@@ -514,6 +620,18 @@ def _fatal(reason: str) -> dict[str, object]:
         "retryable": False,
         "mutated": False,
     }
+    if identity is not None:
+        result.update(
+            {
+                "assets_repository": identity.assets_repo,
+                "release_tag": identity.release_tag,
+                "orchestrator_correlation_id": identity.orchestrator_correlation_id,
+                "github_run_id": identity.github_run_id,
+                "github_run_url": identity.github_run_url,
+                "qualification_gates": QUALIFICATION_GATES,
+            }
+        )
+    return result
 
 
 def main() -> int:
@@ -528,6 +646,17 @@ def main() -> int:
             after = _read_json(args.after_json, "after publication state")
             print(json.dumps(publication_state_changed(before, after)))
             return 0
+        if args.command == "mutation-unknown":
+            print(json.dumps(
+                mutation_unknown_from_requery(
+                    args.candidate,
+                    _identity(args),
+                    args.reason_code,
+                    args.requery_json,
+                ),
+                sort_keys=True,
+            ))
+            return 0
         release = _read_json(args.release_json, "GitHub Release") if args.release_json else None
         result = classify(
             repository=args.repository,
@@ -538,7 +667,12 @@ def main() -> int:
             release=release,
         )
     except (ContractError, OSError) as error:
-        result = _fatal(str(error))
+        identity = (
+            _identity(args)
+            if args.command in {"classify", "mutation-unknown"}
+            else None
+        )
+        result = _fatal(str(error), identity)
     print(json.dumps(result, sort_keys=True))
     return 0 if result.get("allowed") is True else 1
 

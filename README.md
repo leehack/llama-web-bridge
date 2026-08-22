@@ -289,8 +289,10 @@ Publish workflow:
 
 Trigger modes:
 
-- Reusable `workflow_call` from the central llamadart pin-upgrade orchestrator
-- Manual workflow dispatch with the same exact inputs
+- Bridge-owned manual workflow dispatch. The central llamadart pin-upgrade
+  orchestrator may dispatch this workflow through GitHub's API, but the workflow
+  is deliberately not reusable because reusable job environments execute in the
+  caller repository's context.
 
 There is no push, tag, schedule, or ordinary-CI publication trigger.
 
@@ -299,7 +301,7 @@ Required environment-scoped secret:
 - `WEBGPU_BRIDGE_ASSETS_PAT` (read access to provenance repositories and write
   access to `leehack/llama-web-bridge-assets`)
 
-Every request supplies the exact bridge source SHA, upstream llama.cpp
+Every request supplies a required orchestrator correlation ID, the exact bridge source SHA, upstream llama.cpp
 tag/commit, native release tag plus `assets.json` SHA-256, output release
 tag/rebuild, and an exact assertion of the fixed assets repository. It also sets
 `publish_approved=true` only after explicit maintainer approval.
@@ -307,8 +309,9 @@ tag/rebuild, and an exact assertion of the fixed assets repository. It also sets
 Publication is deliberately blocked until repository administrators externally
 create `bridge-assets-publication`, configure at least one required reviewer,
 and store `WEBGPU_BRIDGE_ASSETS_PAT` as an environment-scoped secret. The live
-repository did not have that protected environment when this workflow was
-implemented; merging this code does not establish the approval gate. The
+bridge repository did not have that environment at the latest readiness check;
+`llamadart` did not have it either, but its environment cannot gate this
+bridge-owned workflow. Merging this code does not establish the approval gate. The
 workflow verifies the environment through GitHub's API before entering it, so a
 missing environment cannot be silently auto-created and treated as protected.
 
@@ -318,10 +321,23 @@ new release is ordered after the previous manifest without collision or
 rollback. It builds exact wasm32 and memory64 artifacts with `emsdk.version`,
 runs mandatory state, multimodal, ASR, and TTS gates, and publishes a
 schema-v2 manifest containing release tag, capabilities, bridge/upstream/native
-commits, and per-artifact SHA-256 values. The manifest is byte-deterministic for
-the same inputs and artifacts. Exact partial publication states are recovered
-only after branch, tag, release metadata, provenance, and asset-digest checks;
+commits, orchestrator correlation ID, exact bridge workflow run ID/URL, explicit
+state/multimodal/ASR/TTS gate conclusions, and per-artifact SHA-256 values. The
+manifest is byte-deterministic for the same inputs and artifacts. Exact partial
+publication states are recovered only after branch, tag, release metadata,
+provenance, and asset-digest checks;
 mismatches fail closed with a machine-readable JSON outcome.
+If a credentialed ref or release mutation is followed by an unavailable or
+empty re-query, the workflow emits a durable, retryable `mutation-unknown`
+outcome with `mutated: null`; it never guesses that publication did or did not
+occur.
+Every build run also uploads `bridge-qualification-outcome`, recording the
+exact success/failure/skipped conclusion for each mandatory gate with the same
+correlation ID and run ID/URL, including when qualification stops early.
+The workflow run ID is part of the immutable candidate fingerprint. Recover a
+partial publication with GitHub's rerun operation, which preserves the run ID;
+a new dispatch has a new run identity and must not overwrite the earlier
+candidate under the same output tag.
 
 GitHub artifact tags follow the shared convention:
 

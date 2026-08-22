@@ -106,7 +106,7 @@ jobs:
             echo "- Native release: \`${NATIVE_REPO}@${NATIVE_TAG}\`"
             echo "- Native manifest SHA-256: \`${NATIVE_MANIFEST_SHA256}\`"
             echo
-            echo "After explicit approval, the central llamadart pin-upgrade orchestrator may call \`publish_assets.yml\` with these inputs plus a collision-free output tag/rebuild."
+            echo "After explicit approval, the central llamadart pin-upgrade orchestrator may dispatch the bridge-owned \`publish_assets.yml\` through GitHub's API with these inputs, a required correlation ID, and a collision-free output tag/rebuild."
           } >> "${GITHUB_STEP_SUMMARY}"
 
       - name: Upload prepared candidate

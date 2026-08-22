@@ -1,8 +1,15 @@
 name: Build and Publish Exact Bridge Assets
 
 on:
-  workflow_call:
-    inputs: &release_inputs
+  # This workflow is intentionally bridge-owned and non-reusable. A central
+  # orchestrator may dispatch it, but the environment gate must execute in this
+  # repository rather than in the caller's repository context.
+  workflow_dispatch:
+    inputs:
+      orchestrator_correlation_id:
+        description: Required central-orchestrator correlation identifier
+        required: true
+        type: string
       bridge_source_sha:
         description: Exact full llama-web-bridge source commit to build
         required: true
@@ -37,18 +44,9 @@ on:
         default: leehack/llama-web-bridge-assets
         type: string
       publish_approved:
-        description: Explicit approval from the calling orchestrator
+        description: Explicit approval recorded by the dispatching orchestrator
         required: true
         type: boolean
-    secrets:
-      WEBGPU_BRIDGE_ASSETS_PAT:
-        required: false
-    outputs:
-      publication_outcome:
-        description: Machine-readable exact publication/recovery outcome
-        value: ${{ jobs.publish-assets.outputs.publication_outcome }}
-  workflow_dispatch:
-    inputs: *release_inputs
 
 permissions:
   contents: read
@@ -66,6 +64,9 @@ env:
   RELEASE_TAG: ${{ inputs.release_tag }}
   RELEASE_REBUILD: ${{ inputs.release_rebuild }}
   ASSETS_REPO: leehack/llama-web-bridge-assets
+  ORCHESTRATOR_CORRELATION_ID: ${{ inputs.orchestrator_correlation_id }}
+  GITHUB_RUN_ID_STRING: ${{ github.run_id }}
+  GITHUB_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
 
 concurrency:
   group: publish-bridge-assets-leehack-llama-web-bridge-assets
@@ -79,7 +80,9 @@ jobs:
       - name: Validate approval boundary
         env:
           PUBLISH_APPROVED: ${{ inputs.publish_approved }}
+          GH_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
           if [ "${PUBLISH_APPROVED}" != "true" ]; then
             echo "error: publish_approved=true requires explicit maintainer approval"
             exit 1
@@ -88,10 +91,30 @@ jobs:
             echo "error: assets_repo must be exactly ${APPROVED_ASSETS_REPO}"
             exit 1
           fi
+          if [ "${GITHUB_REPOSITORY}" != "${BRIDGE_REPO}" ]; then
+            echo "error: publication workflow must execute in ${BRIDGE_REPO}"
+            exit 1
+          fi
+          if [[ ! "${ORCHESTRATOR_CORRELATION_ID}" =~ ^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$ ]]; then
+            echo "error: invalid orchestrator_correlation_id"
+            exit 1
+          fi
+          if [[ ! "${BRIDGE_SOURCE_SHA}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "error: bridge_source_sha must be a full lowercase commit SHA"
+            exit 1
+          fi
+          bridge_default="$(gh api "repos/${BRIDGE_REPO}" --jq '.default_branch')"
+          source_status="$(gh api \
+            "repos/${BRIDGE_REPO}/compare/${BRIDGE_SOURCE_SHA}...${bridge_default}" \
+            --jq '.status')"
+          if [ "${source_status}" != "ahead" ] && [ "${source_status}" != "identical" ]; then
+            echo "error: bridge source is not reachable from ${BRIDGE_REPO}'s default branch"
+            exit 1
+          fi
 
   build-and-gate:
     name: Build exact source and run release gates
-    needs: validate-request
+    needs: verify-publication-environment
     runs-on: ubuntu-latest
     outputs:
       native_commit: ${{ steps.native.outputs.native_commit }}
@@ -140,6 +163,11 @@ jobs:
           python3 scripts/release_contract.py validate-release \
             --release-tag "${RELEASE_TAG}" --release-rebuild "${RELEASE_REBUILD}" \
             --upstream-tag "${UPSTREAM_TAG}"
+          python3 - "${ORCHESTRATOR_CORRELATION_ID}" <<'PY'
+          import sys
+          from scripts.release_contract import require_correlation_id
+          require_correlation_id(sys.argv[1])
+          PY
           python3 - "${ASSETS_REPO}" "${NATIVE_REPO}" <<'PY'
           import sys
           from scripts.release_contract import require_repository
@@ -276,21 +304,25 @@ jobs:
           python3 -m playwright install chromium
 
       - name: Run durable state persistence gate
+        id: state_gate
         env:
           BRIDGE_DIST_DIR: ${{ runner.temp }}/webgpu_bridge_dist
         run: python3 scripts/state_persistence_browser_smoke.py
 
       - name: Run durable multimodal gate
+        id: multimodal_gate
         env:
           BRIDGE_DIST_DIR: ${{ runner.temp }}/webgpu_bridge_dist
         run: python3 scripts/multimodal_browser_smoke.py
 
       - name: Run durable Qwen3-ASR gate
+        id: asr_gate
         env:
           BRIDGE_DIST_DIR: ${{ runner.temp }}/webgpu_bridge_dist
         run: python3 scripts/speech_to_text_browser_smoke.py
 
       - name: Run durable Qwen3-TTS memory64 gate
+        id: tts_gate
         run: |
           python3 scripts/text_to_speech_browser_smoke.py \
             --dist-dir "${{ runner.temp }}/webgpu_bridge_dist" \
@@ -311,7 +343,9 @@ jobs:
             --upstream-tag "${UPSTREAM_TAG}" --upstream-commit "${UPSTREAM_COMMIT}" \
             --native-repo "${NATIVE_REPO}" --native-release-tag "${NATIVE_RELEASE_TAG}" \
             --native-manifest-sha256 "${NATIVE_MANIFEST_SHA256}" --native-commit "${NATIVE_COMMIT}" \
-            --emscripten-version "${EMSCRIPTEN_VERSION}"
+            --emscripten-version "${EMSCRIPTEN_VERSION}" \
+            --orchestrator-correlation-id "${ORCHESTRATOR_CORRELATION_ID}" \
+            --github-run-id "${GITHUB_RUN_ID_STRING}" --github-run-url "${GITHUB_RUN_URL}"
           (cd "${OUT_DIR}" && sha256sum --check sha256sums.txt)
 
       - name: Upload gated bridge assets
@@ -329,6 +363,31 @@ jobs:
             ${{ runner.temp }}/webgpu_bridge_dist/manifest.json
             ${{ runner.temp }}/webgpu_bridge_dist/sha256sums.txt
 
+      - name: Record exact qualification conclusions
+        if: always()
+        env:
+          STATE_CONCLUSION: ${{ steps.state_gate.outcome || 'skipped' }}
+          MULTIMODAL_CONCLUSION: ${{ steps.multimodal_gate.outcome || 'skipped' }}
+          ASR_CONCLUSION: ${{ steps.asr_gate.outcome || 'skipped' }}
+          TTS_CONCLUSION: ${{ steps.tts_gate.outcome || 'skipped' }}
+        run: |
+          jq -n --arg correlation "${ORCHESTRATOR_CORRELATION_ID}" \
+            --arg run_id "${GITHUB_RUN_ID_STRING}" --arg run_url "${GITHUB_RUN_URL}" \
+            --arg state "${STATE_CONCLUSION}" --arg multimodal "${MULTIMODAL_CONCLUSION}" \
+            --arg asr "${ASR_CONCLUSION}" --arg tts "${TTS_CONCLUSION}" \
+            '{schema_version:1,orchestrator_correlation_id:$correlation,
+              github_run_id:$run_id,github_run_url:$run_url,
+              qualification_gates:{state_persistence:$state,multimodal:$multimodal,
+                speech_to_text:$asr,text_to_speech:$tts}}' \
+            > "${RUNNER_TEMP}/qualification-outcome.json"
+
+      - name: Upload exact qualification conclusions
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bridge-qualification-outcome
+          path: ${{ runner.temp }}/qualification-outcome.json
+
       - name: Upload smoke diagnostics
         if: failure()
         uses: actions/upload-artifact@v4
@@ -345,6 +404,11 @@ jobs:
     name: Verify externally configured approval environment
     needs: validate-request
     runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      environment_name: ${{ steps.environment.outputs.environment_name }}
     steps:
       - name: Checkout bridge environment contract
         uses: actions/checkout@v4
@@ -353,6 +417,7 @@ jobs:
           ref: ${{ env.BRIDGE_SOURCE_SHA }}
           persist-credentials: false
       - name: Fail closed unless required reviewers exist
+        id: environment
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -361,12 +426,18 @@ jobs:
             > "${RUNNER_TEMP}/publication-environment.json"
           python3 scripts/release_contract.py validate-environment \
             --environment-json "${RUNNER_TEMP}/publication-environment.json"
+          echo "environment_name=bridge-assets-publication" >> "${GITHUB_OUTPUT}"
 
   publish-assets:
     name: Publish or recover exact approved assets
-    needs: [build-and-gate, verify-publication-environment]
+    needs: [verify-publication-environment, build-and-gate]
     runs-on: ubuntu-latest
-    environment: bridge-assets-publication
+    # Resolve the environment name only after the bridge-owned API check proves
+    # that it already exists with required reviewers. A missing environment is
+    # never referenced by this privileged job and therefore cannot be accepted
+    # as an auto-created, unprotected gate.
+    environment:
+      name: ${{ needs.verify-publication-environment.outputs.environment_name }}
     outputs:
       publication_outcome: ${{ steps.final.outputs.publication_outcome }}
     steps:
@@ -455,6 +526,8 @@ jobs:
             --native-manifest-sha256 "${NATIVE_MANIFEST_SHA256}"
             --native-commit "${NATIVE_COMMIT}"
             --emscripten-version "${EMSCRIPTEN_VERSION}"
+            --orchestrator-correlation-id "${ORCHESTRATOR_CORRELATION_ID}"
+            --github-run-id "${GITHUB_RUN_ID_STRING}" --github-run-url "${GITHUB_RUN_URL}"
           )
           [ -n "${tag_commit}" ] && args+=(--tag-commit "${tag_commit}")
           args+=("${release_args[@]}")
@@ -487,15 +560,21 @@ jobs:
             echo "Native: \`${NATIVE_REPO}@${NATIVE_RELEASE_TAG}\`"
             echo "Native manifest SHA-256: \`${NATIVE_MANIFEST_SHA256}\`"
             echo "Emscripten: \`${{ needs.build-and-gate.outputs.emscripten_version }}\`"
+            echo "Orchestrator correlation: \`${ORCHESTRATOR_CORRELATION_ID}\`"
+            echo "Bridge workflow run: \`${GITHUB_RUN_ID_STRING}\` (${GITHUB_RUN_URL})"
+            echo "Qualification gates: state=passed, multimodal=passed, ASR=passed, TTS=passed"
           } > "${RUNNER_TEMP}/asset-release-notes.md"
 
       - name: Apply only the classified ref mutation
+        id: mutate
         env:
           GH_TOKEN: ${{ secrets.WEBGPU_BRIDGE_ASSETS_PAT }}
           ACTION: ${{ steps.preflight.outputs.action }}
           ASSETS_BRANCH: ${{ steps.preflight.outputs.assets_branch }}
         run: |
           set -euo pipefail
+          ref_push_attempted=false
+          push_exit_status=0
           if [ "${ACTION}" = "publish-refs-and-release" ]; then
             cp bridge-dist/* assets-repo/
             git -C assets-repo config user.name "github-actions[bot]"
@@ -508,17 +587,23 @@ jobs:
             git -C assets-repo commit -m "chore: publish webgpu bridge ${RELEASE_TAG}"
             git -C assets-repo tag "${RELEASE_TAG}"
             gh auth setup-git
+            ref_push_attempted=true
             set +e
             git -C assets-repo push --atomic origin \
               "HEAD:refs/heads/${ASSETS_BRANCH}" "refs/tags/${RELEASE_TAG}"
+            push_exit_status=$?
             set -e
           elif [ "${ACTION}" = "publish-tag-and-release" ]; then
             git -C assets-repo tag "${RELEASE_TAG}" "refs/remotes/origin/${ASSETS_BRANCH}"
             gh auth setup-git
+            ref_push_attempted=true
             set +e
             git -C assets-repo push origin "refs/tags/${RELEASE_TAG}"
+            push_exit_status=$?
             set -e
           fi
+          echo "ref_push_attempted=${ref_push_attempted}" >> "${GITHUB_OUTPUT}"
+          echo "push_exit_status=${push_exit_status}" >> "${GITHUB_OUTPUT}"
 
       - name: Re-fetch and finish or safely classify partial publication
         id: finish
@@ -526,6 +611,8 @@ jobs:
           GH_TOKEN: ${{ secrets.WEBGPU_BRIDGE_ASSETS_PAT }}
           ASSETS_BRANCH: ${{ steps.preflight.outputs.assets_branch }}
           INITIAL_OUTCOME: ${{ steps.preflight.outputs.initial_outcome }}
+          REF_PUSH_ATTEMPTED: ${{ steps.mutate.outputs.ref_push_attempted }}
+          PUSH_EXIT_STATUS: ${{ steps.mutate.outputs.push_exit_status }}
           NATIVE_COMMIT: ${{ needs.build-and-gate.outputs.native_commit }}
           EMSCRIPTEN_VERSION: ${{ needs.build-and-gate.outputs.emscripten_version }}
         run: |
@@ -534,7 +621,23 @@ jobs:
             python3 bridge-source/scripts/release_publication_state.py state-changed \
               --before-json "${RUNNER_TEMP}/preflight.json" --after-json "$1"
           }
-          classify_remote() {
+          write_mutation_unknown() {
+            python3 bridge-source/scripts/release_publication_state.py mutation-unknown \
+              --candidate bridge-dist --reason-code "$1" \
+              --requery-json "$2" \
+              --release-tag "${RELEASE_TAG}" --release-rebuild "${RELEASE_REBUILD}" \
+              --assets-repo "${ASSETS_REPO}" --bridge-commit "${BRIDGE_SOURCE_SHA}" \
+              --upstream-tag "${UPSTREAM_TAG}" --upstream-commit "${UPSTREAM_COMMIT}" \
+              --native-release-tag "${NATIVE_RELEASE_TAG}" \
+              --native-manifest-sha256 "${NATIVE_MANIFEST_SHA256}" \
+              --native-commit "${NATIVE_COMMIT}" --emscripten-version "${EMSCRIPTEN_VERSION}" \
+              --orchestrator-correlation-id "${ORCHESTRATOR_CORRELATION_ID}" \
+              --github-run-id "${GITHUB_RUN_ID_STRING}" --github-run-url "${GITHUB_RUN_URL}" \
+              > "${RUNNER_TEMP}/publication-outcome.json"
+            cat "${RUNNER_TEMP}/publication-outcome.json"
+          }
+          classify_remote() (
+            set -euo pipefail
             git -C assets-repo fetch --force origin \
               "+refs/heads/${ASSETS_BRANCH}:refs/remotes/origin/${ASSETS_BRANCH}"
             branch_commit="$(git -C assets-repo rev-parse "refs/remotes/origin/${ASSETS_BRANCH}")"
@@ -568,10 +671,39 @@ jobs:
               --upstream-tag "${UPSTREAM_TAG}" --upstream-commit "${UPSTREAM_COMMIT}" \
               --native-release-tag "${NATIVE_RELEASE_TAG}" \
               --native-manifest-sha256 "${NATIVE_MANIFEST_SHA256}" \
-              --native-commit "${NATIVE_COMMIT}" --emscripten-version "${EMSCRIPTEN_VERSION}"
-          }
+              --native-commit "${NATIVE_COMMIT}" --emscripten-version "${EMSCRIPTEN_VERSION}" \
+              --orchestrator-correlation-id "${ORCHESTRATOR_CORRELATION_ID}" \
+              --github-run-id "${GITHUB_RUN_ID_STRING}" --github-run-url "${GITHUB_RUN_URL}"
+          )
 
-          if ! classify_remote > "${RUNNER_TEMP}/post-refs.json"; then
+          set +e
+          classify_remote > "${RUNNER_TEMP}/post-refs.json" \
+            2> "${RUNNER_TEMP}/post-refs.err"
+          post_refs_status=$?
+          set -e
+          if ! jq -e 'type == "object" and .schema_version == 1 and has("state") and
+              .reason_code != "invalid-input-or-state" and
+              .orchestrator_correlation_id == env.ORCHESTRATOR_CORRELATION_ID and
+              .github_run_id == env.GITHUB_RUN_ID_STRING and
+              .github_run_url == env.GITHUB_RUN_URL and
+              .qualification_gates == {state_persistence:"passed",multimodal:"passed",
+                speech_to_text:"passed",text_to_speech:"passed"}' \
+            "${RUNNER_TEMP}/post-refs.json" >/dev/null 2>&1; then
+            cat "${RUNNER_TEMP}/post-refs.err" >&2
+            if [ "${REF_PUSH_ATTEMPTED}" = "true" ]; then
+              echo "ref push exit status ${PUSH_EXIT_STATUS}; exact re-query unavailable" >&2
+              write_mutation_unknown ref-requery-failed "${RUNNER_TEMP}/post-refs.json"
+            else
+              jq '.state="remote-requery-failed" | .allowed=false | .action="none" |
+                  .outcome="remote-requery-failed" | .reason_code="remote-requery-failed" |
+                  .reason="exact remote state could not be re-read before mutation" |
+                  .retryable=true | .mutated=false' \
+                "${RUNNER_TEMP}/preflight.json" > "${RUNNER_TEMP}/publication-outcome.json"
+              cat "${RUNNER_TEMP}/publication-outcome.json"
+            fi
+            exit 1
+          fi
+          if [ "${post_refs_status}" -ne 0 ]; then
             cat "${RUNNER_TEMP}/post-refs.json"
             jq --argjson mutated "$(state_changed "${RUNNER_TEMP}/post-refs.json")" \
               '.mutated=$mutated' "${RUNNER_TEMP}/post-refs.json" \
@@ -579,7 +711,9 @@ jobs:
             exit 1
           fi
           post_action="$(jq -r '.action' "${RUNNER_TEMP}/post-refs.json")"
+          release_mutation_attempted=false
           if [ "${post_action}" = "create-release" ]; then
+            release_mutation_attempted=true
             prerelease_args=()
             if [[ "${RELEASE_TAG}" == b* ]] || [[ "${RELEASE_TAG}" =~ -[1-9][0-9]*$ ]]; then
               prerelease_args=(--prerelease)
@@ -591,6 +725,7 @@ jobs:
               echo "release creation returned failure; re-querying exact state" >&2
             fi
           elif [ "${post_action}" = "upload-release-assets" ]; then
+            release_mutation_attempted=true
             mapfile -t missing_assets < <(
               jq -er '.missing_release_assets[]' "${RUNNER_TEMP}/post-refs.json"
             )
@@ -614,7 +749,26 @@ jobs:
             fi
           fi
           if [ "${post_action}" = "create-release" ] || [ "${post_action}" = "upload-release-assets" ]; then
-            if ! classify_remote > "${RUNNER_TEMP}/post-release.json"; then
+            set +e
+            classify_remote > "${RUNNER_TEMP}/post-release.json" \
+              2> "${RUNNER_TEMP}/post-release.err"
+            post_release_status=$?
+            set -e
+            if ! jq -e 'type == "object" and .schema_version == 1 and has("state") and
+                .reason_code != "invalid-input-or-state" and
+                .orchestrator_correlation_id == env.ORCHESTRATOR_CORRELATION_ID and
+                .github_run_id == env.GITHUB_RUN_ID_STRING and
+                .github_run_url == env.GITHUB_RUN_URL and
+                .qualification_gates == {state_persistence:"passed",multimodal:"passed",
+                  speech_to_text:"passed",text_to_speech:"passed"}' \
+              "${RUNNER_TEMP}/post-release.json" >/dev/null 2>&1; then
+              cat "${RUNNER_TEMP}/post-release.err" >&2
+              if [ "${release_mutation_attempted}" = "true" ]; then
+                write_mutation_unknown release-requery-failed "${RUNNER_TEMP}/post-release.json"
+              fi
+              exit 1
+            fi
+            if [ "${post_release_status}" -ne 0 ]; then
               cat "${RUNNER_TEMP}/post-release.json"
               jq --argjson mutated "$(state_changed "${RUNNER_TEMP}/post-release.json")" \
                 '.mutated=$mutated' "${RUNNER_TEMP}/post-release.json" \
@@ -649,7 +803,15 @@ jobs:
         if: always()
         run: |
           if [ ! -f "${RUNNER_TEMP}/publication-outcome.json" ]; then
-            jq -n '{schema_version:1,state:"failed-before-classification",allowed:false,action:"none",outcome:"collision",reason_code:"workflow-failure",retryable:false,mutated:false}' \
+            jq -n --arg correlation "${ORCHESTRATOR_CORRELATION_ID}" \
+              --arg run_id "${GITHUB_RUN_ID_STRING}" --arg run_url "${GITHUB_RUN_URL}" \
+              '{schema_version:1,state:"failed-before-classification",allowed:false,
+                action:"none",outcome:"workflow-failure",reason_code:"workflow-failure",
+                retryable:false,mutated:false,
+                orchestrator_correlation_id:$correlation,github_run_id:$run_id,
+                github_run_url:$run_url,
+                qualification_gates:{state_persistence:"passed",multimodal:"passed",
+                  speech_to_text:"passed",text_to_speech:"passed"}}' \
               > "${RUNNER_TEMP}/publication-outcome.json"
           fi
           outcome="$(jq -c . "${RUNNER_TEMP}/publication-outcome.json")"

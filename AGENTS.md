@@ -158,8 +158,10 @@ publication because the bridge exposes Qwen3-TTS.
     `FORCE_JAVASCRIPT_ACTIONS_TO_NODE24` so action-runtime regressions are caught
     before Node 20 deprecation becomes a hard failure.
 - Publish workflow: `.github/workflows/publish_assets.yml`
-  - Is callable by the central orchestrator and manually dispatchable. It
-    requires exact bridge source SHA, upstream tag/commit, native tag plus
+  - Is a bridge-owned, non-reusable manual workflow that the central orchestrator
+    may dispatch through GitHub's API. This keeps the environment gate in the
+    bridge repository rather than the caller context. It requires an orchestrator
+    correlation ID, exact bridge source SHA, upstream tag/commit, native tag plus
     manifest SHA-256, output tag/rebuild, and assets repository inputs. It does
     not read `llama_cpp.version`.
   - Uses the same `emsdk.version` compiler identity as CI and records the
@@ -178,7 +180,10 @@ publication because the bridge exposes Qwen3-TTS.
     and TTS durable release smokes; callers cannot downgrade exposed
     capabilities.
   - Publishes schema-v2 provenance with release tag, capabilities, bridge,
-    upstream, and native commits, and per-artifact SHA-256 values.
+    upstream, and native commits, exact run ID/URL, mandatory gate conclusions,
+    correlation ID, and per-artifact SHA-256 values. An unreadable post-mutation
+    remote state must emit retryable `mutation-unknown`, never guessed mutation
+    state.
   - Any future npm package version has an independent monotonic sequence and
     uses stable/nightly dist-tags; GitHub `vM.m.p-N` tags must not be reused as
     npm versions because npm orders them as prereleases.

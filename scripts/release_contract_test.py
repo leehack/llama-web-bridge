@@ -18,10 +18,12 @@ from release_contract import (
     parse_release_tag,
     parse_upstream_tag,
     read_previous_manifest,
+    require_correlation_id,
     resolve_native_manifest,
     select_stable_native_release,
     validate_native_file,
     validate_native_release,
+    validate_github_prerelease,
     validate_publication_environment,
     validate_release_identity,
 )
@@ -53,15 +55,27 @@ class ReleaseContractTest(unittest.TestCase):
         for tag, prerelease in expected.items():
             with self.subTest(tag=tag):
                 self.assertEqual(parse_release_tag(tag).github_prerelease, prerelease)
+                self.assertEqual(validate_github_prerelease(tag, prerelease), prerelease)
+                with self.assertRaises(ContractError):
+                    validate_github_prerelease(tag, not prerelease)
+        self.assertTrue(validate_github_prerelease("v0.2.0-llamadart.1", True))
 
     def test_stable_native_discovery_enumerates_wrappers(self) -> None:
         releases = [
-            {"tag_name": "b10599", "draft": False, "prerelease": False},
+            {"tag_name": "b10599", "draft": False, "prerelease": True},
             {"tag_name": "v0.2.0", "draft": False, "prerelease": False},
             {"tag_name": "v0.2.0-2", "draft": False, "prerelease": True},
+            {"tag_name": "v0.3.0-1", "draft": False, "prerelease": False},
+            {"tag_name": "v9.0.0", "draft": False, "prerelease": True},
             {"tag_name": "v9.0.0", "draft": True, "prerelease": False},
         ]
         self.assertEqual(select_stable_native_release(releases), "v0.2.0-2")
+
+    def test_correlation_id_rejects_injection_and_ambiguity(self) -> None:
+        self.assertEqual(require_correlation_id("llamadart-pin:run-123"), "llamadart-pin:run-123")
+        for invalid in ("", " leading", "two words", "line\nbreak", "x" * 129, "../escape"):
+            with self.subTest(invalid=invalid), self.assertRaises(ContractError):
+                require_correlation_id(invalid)
 
     def test_publication_environment_requires_live_reviewer_rule(self) -> None:
         configured = {
@@ -211,6 +225,7 @@ class ReleaseContractTest(unittest.TestCase):
             release = {
                 "tag_name": tag,
                 "draft": False,
+                "prerelease": False,
                 "target_commitish": "b" * 40,
                 "assets": github_assets,
             }
@@ -219,7 +234,7 @@ class ReleaseContractTest(unittest.TestCase):
                 tag, tag, "a" * 40,
             )
             self.assertEqual(identity.native_commit, "b" * 40)
-            for mutation in ("hook", "digest", "inventory"):
+            for mutation in ("hook", "digest", "inventory", "prerelease"):
                 bad_manifest = json.loads(json.dumps(manifest))
                 bad_release = json.loads(json.dumps(release))
                 if mutation == "hook":
@@ -232,7 +247,10 @@ class ReleaseContractTest(unittest.TestCase):
                     bad_release["assets"][0]["digest"] = "sha256:" + "0" * 64
                     bad_digest = manifest_digest
                 else:
-                    bad_release["assets"].pop(0)
+                    if mutation == "inventory":
+                        bad_release["assets"].pop(0)
+                    else:
+                        bad_release["prerelease"] = True
                     bad_digest = manifest_digest
                 with self.subTest(mutation=mutation), self.assertRaises(ContractError):
                     validate_native_release(

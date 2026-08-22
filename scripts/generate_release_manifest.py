@@ -13,6 +13,7 @@ from release_contract import (
     BRIDGE_REPOSITORY,
     ContractError,
     NATIVE_REPOSITORY,
+    require_correlation_id,
     require_repository,
     require_sha256,
     validate_release_identity,
@@ -50,6 +51,13 @@ CAPABILITIES: dict[str, object] = {
     },
 }
 
+QUALIFICATION_GATES: dict[str, str] = {
+    "state_persistence": "passed",
+    "multimodal": "passed",
+    "speech_to_text": "passed",
+    "text_to_speech": "passed",
+}
+
 
 def _commit(value: str, field: str) -> str:
     if len(value) != 40 or any(character not in "0123456789abcdef" for character in value):
@@ -72,6 +80,14 @@ def generate(args: argparse.Namespace) -> dict[str, object]:
     if args.native_repo != NATIVE_REPOSITORY:
         raise ContractError(f"native_repo must be exactly {NATIVE_REPOSITORY}")
     require_sha256(args.native_manifest_sha256, "native_manifest_sha256")
+    correlation_id = require_correlation_id(args.orchestrator_correlation_id)
+    if not args.github_run_id.isdigit() or args.github_run_id.startswith("0"):
+        raise ContractError("github_run_id must be a positive decimal string")
+    expected_run_url = (
+        f"https://github.com/{BRIDGE_REPOSITORY}/actions/runs/{args.github_run_id}"
+    )
+    if args.github_run_url != expected_run_url:
+        raise ContractError(f"github_run_url must be exactly {expected_run_url}")
     bridge_commit = _commit(args.bridge_commit, "bridge_commit")
     upstream_commit = _commit(args.upstream_commit, "upstream_commit")
     native_commit = _commit(args.native_commit, "native_commit")
@@ -103,6 +119,10 @@ def generate(args: argparse.Namespace) -> dict[str, object]:
         "native_manifest_sha256": args.native_manifest_sha256,
         "native_commit": native_commit,
         "emscripten_version": args.emscripten_version,
+        "orchestrator_correlation_id": correlation_id,
+        "github_run_id": args.github_run_id,
+        "github_run_url": args.github_run_url,
+        "qualification_gates": QUALIFICATION_GATES,
         "capabilities": CAPABILITIES,
         "artifacts": files,
         # Compatibility aliases are read by existing consumers. New tooling must
@@ -139,6 +159,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--native-manifest-sha256", required=True)
     parser.add_argument("--native-commit", required=True)
     parser.add_argument("--emscripten-version", required=True)
+    parser.add_argument("--orchestrator-correlation-id", required=True)
+    parser.add_argument("--github-run-id", required=True)
+    parser.add_argument("--github-run-url", required=True)
     return parser
 
 

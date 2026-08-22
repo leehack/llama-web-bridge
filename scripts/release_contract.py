@@ -46,6 +46,7 @@ class Transition(str, Enum):
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _COMMIT_RE = re.compile(r"[0-9a-f]{40}")
 _REPO_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
+_CORRELATION_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
 _UPSTREAM_STABLE_RE = re.compile(
     r"v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
 )
@@ -114,6 +115,14 @@ def require_sha256(value: str, field: str = "sha256") -> str:
 def require_repository(value: str, field: str) -> str:
     if _REPO_RE.fullmatch(value) is None:
         raise ContractError(f"{field} must use owner/repository syntax")
+    return value
+
+
+def require_correlation_id(value: str) -> str:
+    if _CORRELATION_ID_RE.fullmatch(value) is None:
+        raise ContractError(
+            "orchestrator_correlation_id must be 1-128 safe identifier characters"
+        )
     return value
 
 
@@ -214,6 +223,15 @@ def validate_release_identity(release_tag: str, rebuild: int, upstream_tag: str)
             f"release tag {release_tag!r} does not preserve upstream identity {upstream_tag!r}"
         )
     return release
+
+
+def validate_github_prerelease(tag: str, actual: Any, *, allow_legacy: bool = True) -> bool:
+    version = parse_release_tag(tag, allow_legacy=allow_legacy)
+    if actual is not version.github_prerelease:
+        raise ContractError(
+            f"GitHub prerelease state for {tag!r} must be {version.github_prerelease}"
+        )
+    return version.github_prerelease
 
 
 def resolve_native_manifest(
@@ -361,6 +379,7 @@ def validate_native_release(
     )
     if release.get("tag_name") != native_release_tag or release.get("draft") is not False:
         raise ContractError("native GitHub release identity/draft state is not canonical")
+    validate_github_prerelease(native_release_tag, release.get("prerelease"))
     if release.get("target_commitish") != identity.native_commit:
         raise ContractError("native GitHub release target does not match native_commit")
 
@@ -454,7 +473,10 @@ def select_stable_native_release(releases: list[Any]) -> str:
             version = parse_release_tag(tag, allow_legacy=True)
         except ContractError:
             continue
-        if version.channel == Channel.STABLE:
+        if (
+            version.channel == Channel.STABLE
+            and release.get("prerelease") is version.github_prerelease
+        ):
             candidates.append(version)
     if not candidates:
         raise ContractError("no supported non-draft stable native release exists")

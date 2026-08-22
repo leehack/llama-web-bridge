@@ -17,7 +17,10 @@ from release_publication_state import (
     APPROVED_ASSETS_REPOSITORY,
     CandidateIdentity,
     PUBLICATION_FILES,
+    _fatal,
     classify,
+    mutation_unknown_from_requery,
+    mutation_unknown_outcome,
     publication_state_changed,
     require_approved_assets_repo,
     validate_candidate,
@@ -59,6 +62,9 @@ class ReleasePublicationStateTest(unittest.TestCase):
             native_manifest_sha256="c" * 64,
             native_commit="d" * 40,
             emscripten_version="6.0.8",
+            orchestrator_correlation_id="llamadart-pin:run-123",
+            github_run_id="123456789",
+            github_run_url="https://github.com/leehack/llama-web-bridge/actions/runs/123456789",
         )
         generate(argparse.Namespace(
             out_dir=self.candidate,
@@ -75,6 +81,9 @@ class ReleasePublicationStateTest(unittest.TestCase):
             native_manifest_sha256="c" * 64,
             native_commit="d" * 40,
             emscripten_version="6.0.8",
+            orchestrator_correlation_id=self.identity.orchestrator_correlation_id,
+            github_run_id=self.identity.github_run_id,
+            github_run_url=self.identity.github_run_url,
         ))
         previous = {
             "bridge_assets_tag": "v0.1.23",
@@ -111,7 +120,11 @@ class ReleasePublicationStateTest(unittest.TestCase):
             "draft": False,
             "prerelease": False,
             "target_commitish": commit,
-            "body": f"Candidate fingerprint: `{fingerprint}`",
+            "body": (
+                f"Candidate fingerprint: `{fingerprint}`\n"
+                f"Orchestrator correlation: `{self.identity.orchestrator_correlation_id}`\n"
+                f"Bridge workflow run: {self.identity.github_run_url}"
+            ),
             "assets": assets,
         }
 
@@ -172,6 +185,9 @@ class ReleasePublicationStateTest(unittest.TestCase):
             native_manifest_sha256=self.identity.native_manifest_sha256,
             native_commit=self.identity.native_commit,
             emscripten_version=self.identity.emscripten_version,
+            orchestrator_correlation_id=self.identity.orchestrator_correlation_id,
+            github_run_id=self.identity.github_run_id,
+            github_run_url=self.identity.github_run_url,
         )
         generate(argparse.Namespace(
             out_dir=self.candidate,
@@ -188,6 +204,9 @@ class ReleasePublicationStateTest(unittest.TestCase):
             native_manifest_sha256=rebuild.native_manifest_sha256,
             native_commit=rebuild.native_commit,
             emscripten_version=rebuild.emscripten_version,
+            orchestrator_correlation_id=rebuild.orchestrator_correlation_id,
+            github_run_id=rebuild.github_run_id,
+            github_run_url=rebuild.github_run_url,
         ))
         shutil.copy2(self.candidate / "manifest.json", self.repository / "manifest.json")
         git(self.repository, "add", "manifest.json")
@@ -227,6 +246,81 @@ class ReleasePublicationStateTest(unittest.TestCase):
         git(self.repository, "tag", "v0.2.0", candidate_commit)
         accepted_but_client_failed = self.inspect(tag=candidate_commit, release=False)
         self.assertTrue(publication_state_changed(before, accepted_but_client_failed))
+
+    def test_empty_requery_after_ambiguous_push_is_retryable_mutation_unknown(self) -> None:
+        empty_requery = self.candidate.parent / "empty-requery.json"
+        empty_requery.write_bytes(b"")
+        outcome = mutation_unknown_from_requery(
+            self.candidate,
+            self.identity,
+            "ref-requery-failed",
+            empty_requery,
+        )
+        self.assertEqual(outcome["state"], "mutation-unknown")
+        self.assertEqual(outcome["outcome"], "mutation-unknown")
+        self.assertEqual(outcome["reason_code"], "ref-requery-failed")
+        self.assertTrue(outcome["retryable"])
+        self.assertIsNone(outcome["mutated"])
+        self.assertEqual(outcome["mutation_status"], "unknown")
+        self.assertEqual(
+            outcome["orchestrator_correlation_id"], "llamadart-pin:run-123"
+        )
+        self.assertEqual(outcome["github_run_id"], "123456789")
+        self.assertEqual(
+            outcome["qualification_gates"]["text_to_speech"], "passed"
+        )
+        with self.assertRaises(ContractError):
+            mutation_unknown_outcome(self.candidate, self.identity, "attacker-value")
+        empty_requery.write_text(json.dumps({"schema_version": 1, "state": "exact"}))
+        with self.assertRaises(ContractError):
+            mutation_unknown_from_requery(
+                self.candidate,
+                self.identity,
+                "ref-requery-failed",
+                empty_requery,
+            )
+
+    def test_empty_release_requery_is_retryable_mutation_unknown(self) -> None:
+        empty_requery = self.candidate.parent / "empty-release-requery.json"
+        empty_requery.write_bytes(b"")
+        outcome = mutation_unknown_from_requery(
+            self.candidate,
+            self.identity,
+            "release-requery-failed",
+            empty_requery,
+        )
+        self.assertEqual(outcome["state"], "mutation-unknown")
+        self.assertEqual(outcome["reason_code"], "release-requery-failed")
+        self.assertTrue(outcome["retryable"])
+        self.assertIsNone(outcome["mutated"])
+
+    def test_fatal_classifier_requery_is_not_treated_as_exact_remote_state(self) -> None:
+        fatal_requery = self.candidate.parent / "fatal-requery.json"
+        fatal_requery.write_text(
+            json.dumps(_fatal("empty branch identity", self.identity))
+        )
+        outcome = mutation_unknown_from_requery(
+            self.candidate,
+            self.identity,
+            "ref-requery-failed",
+            fatal_requery,
+        )
+        self.assertEqual(outcome["state"], "mutation-unknown")
+        self.assertTrue(outcome["retryable"])
+        self.assertIsNone(outcome["mutated"])
+
+    def test_fatal_outcome_preserves_run_and_qualification_provenance(self) -> None:
+        outcome = _fatal("invalid candidate", self.identity)
+        self.assertEqual(
+            outcome["orchestrator_correlation_id"],
+            self.identity.orchestrator_correlation_id,
+        )
+        self.assertEqual(outcome["github_run_id"], self.identity.github_run_id)
+        self.assertEqual(outcome["github_run_url"], self.identity.github_run_url)
+        self.assertEqual(outcome["qualification_gates"]["state_persistence"], "passed")
+        self.assertEqual(outcome["qualification_gates"]["multimodal"], "passed")
+        self.assertEqual(outcome["qualification_gates"]["speech_to_text"], "passed")
+        self.assertEqual(outcome["qualification_gates"]["text_to_speech"], "passed")
 
     def test_ambiguous_release_create_failure_is_recovered_after_exact_requery(self) -> None:
         candidate_commit = self.publish_branch_candidate()
@@ -326,6 +420,11 @@ class ReleasePublicationStateTest(unittest.TestCase):
         release["assets"][0]["digest"] = "sha256:" + "0" * 64
         self.assertFalse(self.inspect(tag=candidate_commit, release=release)["allowed"])
         release = self.release_data(candidate_commit)
+        release["body"] = release["body"].replace(
+            self.identity.orchestrator_correlation_id, "different-run"
+        )
+        self.assertFalse(self.inspect(tag=candidate_commit, release=release)["allowed"])
+        release = self.release_data(candidate_commit)
         release["assets"].append({
             "name": "unexpected.bin",
             "state": "uploaded",
@@ -345,6 +444,21 @@ class ReleasePublicationStateTest(unittest.TestCase):
                 tag_commit=None,
                 release=None,
             )
+
+    def test_candidate_run_and_gate_provenance_tampering_fails_closed(self) -> None:
+        for field, value in (
+            ("orchestrator_correlation_id", "different-run"),
+            ("github_run_url", "https://github.com/attacker/repo/actions/runs/123"),
+            ("qualification_gates", {"state_persistence": "passed"}),
+        ):
+            manifest_path = self.candidate / "manifest.json"
+            original = manifest_path.read_text(encoding="utf-8")
+            manifest = json.loads(original)
+            manifest[field] = value
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            with self.subTest(field=field), self.assertRaises(ContractError):
+                validate_candidate(self.candidate, self.identity)
+            manifest_path.write_text(original, encoding="utf-8")
 
     def test_rollback_has_machine_readable_outcome(self) -> None:
         newer = json.loads((self.repository / "manifest.json").read_text())
@@ -370,6 +484,9 @@ class ReleasePublicationStateTest(unittest.TestCase):
             native_manifest_sha256=self.identity.native_manifest_sha256,
             native_commit=self.identity.native_commit,
             emscripten_version=self.identity.emscripten_version,
+            orchestrator_correlation_id=self.identity.orchestrator_correlation_id,
+            github_run_id=self.identity.github_run_id,
+            github_run_url=self.identity.github_run_url,
         )
         generate(argparse.Namespace(
             out_dir=self.candidate,
@@ -386,6 +503,9 @@ class ReleasePublicationStateTest(unittest.TestCase):
             native_manifest_sha256=identity.native_manifest_sha256,
             native_commit=identity.native_commit,
             emscripten_version=identity.emscripten_version,
+            orchestrator_correlation_id=identity.orchestrator_correlation_id,
+            github_run_id=identity.github_run_id,
+            github_run_url=identity.github_run_url,
         ))
         state = classify(
             repository=self.repository,
