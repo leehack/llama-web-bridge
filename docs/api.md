@@ -211,6 +211,8 @@ Common `options` keys:
 | `warmup` | Marks a warmup generation. Some multimodal worker setup failures return an empty string instead of failing warmup. |
 | `emitCurrentTextOnToken` | Direct runtime defaults to current text and uses `null` when set to `false`; worker mode sends current text only when this is `true` and otherwise sends `''`. |
 | `tokenEventEncoding` | `'bytes'` (default) sends `Uint8Array` pieces; `'text'` sends string pieces. Worker events may already provide text pieces. |
+| `tokenEventFlushMs` | Worker mode coalesces token events for up to this many milliseconds, for both byte and text encoding. `0` (default) disables coalescing. Values are clamped to `0..200`. |
+| `tokenEventFlushChars` | When worker coalescing is enabled, flush once the buffered decoded text reaches this many JavaScript characters. `0` (default) disables the size threshold. Values are clamped to `1..1024` when positive. |
 | `parts` | Optional multimodal parts for image/audio prompts after a projector is loaded. |
 | `mediaMaxPredict` | Cap for multimodal generation token count. |
 

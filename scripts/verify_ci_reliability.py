@@ -111,6 +111,9 @@ def main() -> int:
     tts_smoke = read_required("scripts/text_to_speech_browser_smoke.py", errors)
     tts_contract = read_required("scripts/verify_text_to_speech_api.py", errors)
     embedding_contract = read_required("scripts/embedding_json_contract_test.mjs", errors)
+    worker_token_contract = read_required(
+        "scripts/worker_token_coalescing_test.mjs", errors
+    )
     ci = read_required(".github/workflows/ci.yml", errors)
     publish = read_required(".github/workflows/publish_assets.yml", errors)
     auto_update = read_required(".github/workflows/auto_llama_cpp_update.yml", errors)
@@ -178,10 +181,23 @@ def main() -> int:
         and '"build:js"' in package_json
         and '"syntax:js"' in package_json
         and '"test:embedding-json"' in package_json
+        and '"test:worker-token-coalescing"' in package_json
         and '"yaml": "2.8.1"' in package_json
         and '"esbuild"' in package_json
         and '"typescript"' in package_json,
         "package.json must define JS build/typecheck/syntax scripts and pin esbuild + TypeScript dev dependencies",
+        errors,
+    )
+    require(
+        "tokenEventEncoding: 'bytes'" in worker_token_contract
+        and "tokenEventFlushMs: 100" in worker_token_contract
+        and "tokenEventFlushChars: 3" in worker_token_contract
+        and "split-unicode-threshold" in worker_token_contract
+        and "byte-timer-flush" in worker_token_contract
+        and "text-timer-flush" in worker_token_contract
+        and "cleared timers must not emit after an error" in worker_token_contract
+        and "Uint8Array.from" in worker_token_contract,
+        "worker token coalescing contract must cover byte batching, decoded-character thresholds, and error cleanup",
         errors,
     )
     require(
