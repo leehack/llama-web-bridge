@@ -171,11 +171,14 @@ approval. The central orchestrator may call it, or a maintainer may dispatch it,
 with the exact bridge SHA, upstream tag/commit, native release tag plus
 `assets.json` SHA-256, output release tag/rebuild, and assets repository.
 
-The request must set `publish_approved=true` and then pass the protected
-`bridge-assets-publication` environment. The workflow verifies all identities,
-ordering, ancestry, checksums, and collisions; builds wasm32 and memory64; runs
-state/multimodal and advertised ASR/TTS gates; generates the schema-v2 manifest;
-and atomically pushes the assets commit and tag before creating the release.
+The request must set `publish_approved=true`. Publication remains blocked until
+repository administrators separately create `bridge-assets-publication`, add
+required reviewers, and store the assets PAT as an environment-scoped secret;
+the workflow fails closed if that protection is absent. It verifies all
+identities plus native GitHub asset digests/inventory, builds wasm32 and
+memory64, runs mandatory state/multimodal/ASR/TTS gates, generates a
+deterministic schema-v2 manifest, and recovers exact partial states while
+rejecting any mismatch.
 
 GitHub artifact tags are `vMAJOR.MINOR.PATCH`, `vMAJOR.MINOR.PATCH-N`, `bNNNN`,
 or `bNNNN-N`. Historical `bNNNN-llamadart.N` and prior wrapper forms are

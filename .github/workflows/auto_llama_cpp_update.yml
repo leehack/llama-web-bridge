@@ -52,7 +52,12 @@ jobs:
             if [ -n "${REQUESTED_NATIVE_TAG}" ]; then
               NATIVE_TAG="${REQUESTED_NATIVE_TAG}"
             else
-              NATIVE_TAG="$(gh release view --repo "${NATIVE_REPO}" --json tagName --jq '.tagName')"
+              gh api --paginate --slurp "repos/${NATIVE_REPO}/releases?per_page=100" \
+                > "${RUNNER_TEMP}/native-release-pages.json"
+              jq 'add' "${RUNNER_TEMP}/native-release-pages.json" \
+                > "${RUNNER_TEMP}/native-releases.json"
+              NATIVE_TAG="$(python3 scripts/release_contract.py select-stable-native-release \
+                --releases-json "${RUNNER_TEMP}/native-releases.json")"
             fi
           else
             echo "error: unsupported release channel ${REQUESTED_CHANNEL}"

@@ -6,11 +6,13 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-from datetime import datetime, timezone
 from pathlib import Path
 
 from release_contract import (
+    ASSETS_REPOSITORY,
+    BRIDGE_REPOSITORY,
     ContractError,
+    NATIVE_REPOSITORY,
     require_repository,
     require_sha256,
     validate_release_identity,
@@ -27,6 +29,27 @@ ARTIFACTS = (
     "llama_webgpu_core_mem64.wasm",
 )
 
+CAPABILITIES: dict[str, object] = {
+    "wasm32": True,
+    "memory64": True,
+    "state_persistence": {"direct": True, "worker": True},
+    "multimodal": {"direct": True, "worker": True},
+    "speech_to_text": {
+        "advertised": True,
+        "direct": True,
+        "worker": True,
+        "wasm32": True,
+        "memory64": True,
+    },
+    "text_to_speech": {
+        "advertised": True,
+        "direct": True,
+        "worker": True,
+        "wasm32": False,
+        "memory64": True,
+    },
+}
+
 
 def _commit(value: str, field: str) -> str:
     if len(value) != 40 or any(character not in "0123456789abcdef" for character in value):
@@ -42,6 +65,12 @@ def generate(args: argparse.Namespace) -> dict[str, object]:
     require_repository(args.bridge_repo, "bridge_repo")
     require_repository(args.upstream_repo, "upstream_repo")
     require_repository(args.native_repo, "native_repo")
+    if args.assets_repo != ASSETS_REPOSITORY:
+        raise ContractError(f"assets_repo must be exactly {ASSETS_REPOSITORY}")
+    if args.bridge_repo != BRIDGE_REPOSITORY:
+        raise ContractError(f"bridge_repo must be exactly {BRIDGE_REPOSITORY}")
+    if args.native_repo != NATIVE_REPOSITORY:
+        raise ContractError(f"native_repo must be exactly {NATIVE_REPOSITORY}")
     require_sha256(args.native_manifest_sha256, "native_manifest_sha256")
     bridge_commit = _commit(args.bridge_commit, "bridge_commit")
     upstream_commit = _commit(args.upstream_commit, "upstream_commit")
@@ -57,27 +86,6 @@ def generate(args: argparse.Namespace) -> dict[str, object]:
         digest = hashlib.sha256(data).hexdigest()
         files[name] = {"size_bytes": len(data), "sha256": digest}
         checksums.append(f"{digest}  {name}")
-
-    capabilities: dict[str, object] = {
-        "wasm32": True,
-        "memory64": True,
-        "state_persistence": {"direct": True, "worker": True},
-        "multimodal": {"direct": True, "worker": True},
-        "speech_to_text": {
-            "advertised": args.enable_asr,
-            "direct": args.enable_asr,
-            "worker": args.enable_asr,
-            "wasm32": args.enable_asr,
-            "memory64": args.enable_asr,
-        },
-        "text_to_speech": {
-            "advertised": args.enable_tts,
-            "direct": args.enable_tts,
-            "worker": args.enable_tts,
-            "wasm32": False,
-            "memory64": args.enable_tts,
-        },
-    }
 
     manifest: dict[str, object] = {
         "schema_version": 2,
@@ -95,8 +103,7 @@ def generate(args: argparse.Namespace) -> dict[str, object]:
         "native_manifest_sha256": args.native_manifest_sha256,
         "native_commit": native_commit,
         "emscripten_version": args.emscripten_version,
-        "capabilities": capabilities,
-        "generated_at_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "capabilities": CAPABILITIES,
         "artifacts": files,
         # Compatibility aliases are read by existing consumers. New tooling must
         # use the explicit schema-v2 names above.
@@ -132,8 +139,6 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--native-manifest-sha256", required=True)
     parser.add_argument("--native-commit", required=True)
     parser.add_argument("--emscripten-version", required=True)
-    parser.add_argument("--enable-asr", action="store_true")
-    parser.add_argument("--enable-tts", action="store_true")
     return parser
 
 

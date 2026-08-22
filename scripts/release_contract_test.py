@@ -14,11 +14,15 @@ from release_contract import (
     Transition,
     compare_releases,
     compare_upstream,
+    expected_native_artifacts,
     parse_release_tag,
     parse_upstream_tag,
     read_previous_manifest,
     resolve_native_manifest,
+    select_stable_native_release,
     validate_native_file,
+    validate_native_release,
+    validate_publication_environment,
     validate_release_identity,
 )
 
@@ -38,6 +42,42 @@ class ReleaseContractTest(unittest.TestCase):
                     (parsed.channel, parsed.upstream_parts, parsed.rebuild), expected
                 )
                 self.assertFalse(parsed.legacy)
+
+    def test_github_prerelease_matches_native_policy(self) -> None:
+        expected = {
+            "v0.2.0": False,
+            "v0.2.0-1": True,
+            "b10514": True,
+            "b10514-2": True,
+        }
+        for tag, prerelease in expected.items():
+            with self.subTest(tag=tag):
+                self.assertEqual(parse_release_tag(tag).github_prerelease, prerelease)
+
+    def test_stable_native_discovery_enumerates_wrappers(self) -> None:
+        releases = [
+            {"tag_name": "b10599", "draft": False, "prerelease": False},
+            {"tag_name": "v0.2.0", "draft": False, "prerelease": False},
+            {"tag_name": "v0.2.0-2", "draft": False, "prerelease": True},
+            {"tag_name": "v9.0.0", "draft": True, "prerelease": False},
+        ]
+        self.assertEqual(select_stable_native_release(releases), "v0.2.0-2")
+
+    def test_publication_environment_requires_live_reviewer_rule(self) -> None:
+        configured = {
+            "name": "bridge-assets-publication",
+            "protection_rules": [{
+                "type": "required_reviewers",
+                "reviewers": [{"type": "User", "reviewer": {"login": "maintainer"}}],
+            }],
+        }
+        self.assertEqual(validate_publication_environment(configured), 1)
+        for invalid in (
+            {"name": "bridge-assets-publication", "protection_rules": []},
+            {"name": "wrong", "protection_rules": configured["protection_rules"]},
+        ):
+            with self.subTest(invalid=invalid), self.assertRaises(ContractError):
+                validate_publication_environment(invalid)
 
     def test_legacy_wrappers_are_consumption_only(self) -> None:
         for tag in ("b10514-llamadart.2", "v0.2.0-llamadart.1"):
@@ -124,6 +164,82 @@ class ReleaseContractTest(unittest.TestCase):
                 validate_native_file(
                     path, "0" * 64, "v0.2.0-1", "v0.2.0", "a" * 40
                 )
+
+    def test_native_release_verifies_github_digest_hook_and_inventory(self) -> None:
+        tag = "v0.2.0"
+        expected = expected_native_artifacts(tag)
+        artifacts = []
+        checksum_lines = []
+        github_assets = []
+        for index, (name, (platform, arch, backend, module)) in enumerate(expected.items()):
+            digest = hashlib.sha256(f"artifact-{index}".encode()).hexdigest()
+            size = index + 100
+            artifacts.append({
+                "module": module,
+                "platform": platform,
+                "arch": arch,
+                "backend": backend,
+                "file": name,
+                "sha256": digest,
+                "size": size,
+            })
+            checksum_lines.append(f"{digest}  {name}")
+            github_assets.append({
+                "name": name, "state": "uploaded", "size": size,
+                "digest": f"sha256:{digest}",
+            })
+        manifest = {
+            "tag": tag,
+            "llama_cpp_tag": tag,
+            "llama_cpp_commit": "a" * 40,
+            "native_commit": "b" * 40,
+            "generated_at": "2026-08-22T00:00:00Z",
+            "hook_contract_version": 1,
+            "artifacts": artifacts,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            manifest_path = Path(directory, "assets.json")
+            checksums_path = Path(directory, "SHA256SUMS")
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            checksums_path.write_text("\n".join(checksum_lines) + "\n", encoding="utf-8")
+            manifest_digest = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+            checksum_digest = hashlib.sha256(checksums_path.read_bytes()).hexdigest()
+            github_assets.extend([
+                {"name": "assets.json", "state": "uploaded", "size": manifest_path.stat().st_size, "digest": f"sha256:{manifest_digest}"},
+                {"name": "SHA256SUMS", "state": "uploaded", "size": checksums_path.stat().st_size, "digest": f"sha256:{checksum_digest}"},
+            ])
+            release = {
+                "tag_name": tag,
+                "draft": False,
+                "target_commitish": "b" * 40,
+                "assets": github_assets,
+            }
+            identity = validate_native_release(
+                manifest_path, checksums_path, release, manifest_digest,
+                tag, tag, "a" * 40,
+            )
+            self.assertEqual(identity.native_commit, "b" * 40)
+            for mutation in ("hook", "digest", "inventory"):
+                bad_manifest = json.loads(json.dumps(manifest))
+                bad_release = json.loads(json.dumps(release))
+                if mutation == "hook":
+                    bad_manifest["hook_contract_version"] = 2
+                    manifest_path.write_text(json.dumps(bad_manifest), encoding="utf-8")
+                    bad_digest = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+                    bad_release["assets"][-2]["digest"] = f"sha256:{bad_digest}"
+                    bad_release["assets"][-2]["size"] = manifest_path.stat().st_size
+                elif mutation == "digest":
+                    bad_release["assets"][0]["digest"] = "sha256:" + "0" * 64
+                    bad_digest = manifest_digest
+                else:
+                    bad_release["assets"].pop(0)
+                    bad_digest = manifest_digest
+                with self.subTest(mutation=mutation), self.assertRaises(ContractError):
+                    validate_native_release(
+                        manifest_path, checksums_path, bad_release, bad_digest,
+                        tag, tag, "a" * 40,
+                    )
+                manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
 
     def test_rejects_mismatched_native_identity(self) -> None:
         base = {

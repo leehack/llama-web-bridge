@@ -294,24 +294,34 @@ Trigger modes:
 
 There is no push, tag, schedule, or ordinary-CI publication trigger.
 
-Required repository secret:
+Required environment-scoped secret:
 
 - `WEBGPU_BRIDGE_ASSETS_PAT` (read access to provenance repositories and write
   access to `leehack/llama-web-bridge-assets`)
 
 Every request supplies the exact bridge source SHA, upstream llama.cpp
 tag/commit, native release tag plus `assets.json` SHA-256, output release
-tag/rebuild, and assets repository. It also sets `publish_approved=true` only
-after explicit maintainer approval; the publish job then waits on the protected
-`bridge-assets-publication` environment.
+tag/rebuild, and an exact assertion of the fixed assets repository. It also sets
+`publish_approved=true` only after explicit maintainer approval.
+
+Publication is deliberately blocked until repository administrators externally
+create `bridge-assets-publication`, configure at least one required reviewer,
+and store `WEBGPU_BRIDGE_ASSETS_PAT` as an environment-scoped secret. The live
+repository did not have that protected environment when this workflow was
+implemented; merging this code does not establish the approval gate. The
+workflow verifies the environment through GitHub's API before entering it, so a
+missing environment cannot be silently auto-created and treated as protected.
 
 The workflow verifies that bridge source is already merged, all upstream/native
 tag and commit identities match, the native manifest checksum matches, and the
 new release is ordered after the previous manifest without collision or
 rollback. It builds exact wasm32 and memory64 artifacts with `emsdk.version`,
-runs state and multimodal gates plus advertised ASR/TTS gates, and publishes a
+runs mandatory state, multimodal, ASR, and TTS gates, and publishes a
 schema-v2 manifest containing release tag, capabilities, bridge/upstream/native
-commits, and per-artifact SHA-256 values.
+commits, and per-artifact SHA-256 values. The manifest is byte-deterministic for
+the same inputs and artifacts. Exact partial publication states are recovered
+only after branch, tag, release metadata, provenance, and asset-digest checks;
+mismatches fail closed with a machine-readable JSON outcome.
 
 GitHub artifact tags follow the shared convention:
 

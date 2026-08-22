@@ -32,14 +32,9 @@ on:
         required: true
         type: number
       assets_repo:
-        description: Asset repository in owner/repo form
+        description: Exact approved asset repository assertion
         required: false
         default: leehack/llama-web-bridge-assets
-        type: string
-      release_capabilities:
-        description: "Canonical capabilities: state,multimodal optionally followed by asr and/or tts"
-        required: false
-        default: state,multimodal
         type: string
       publish_approved:
         description: Explicit approval from the calling orchestrator
@@ -47,7 +42,11 @@ on:
         type: boolean
     secrets:
       WEBGPU_BRIDGE_ASSETS_PAT:
-        required: true
+        required: false
+    outputs:
+      publication_outcome:
+        description: Machine-readable exact publication/recovery outcome
+        value: ${{ jobs.publish-assets.outputs.publication_outcome }}
   workflow_dispatch:
     inputs: *release_inputs
 
@@ -60,15 +59,16 @@ env:
   UPSTREAM_TAG: ${{ inputs.upstream_tag }}
   UPSTREAM_COMMIT: ${{ inputs.upstream_commit }}
   NATIVE_REPO: leehack/llamadart-native
+  BRIDGE_REPO: leehack/llama-web-bridge
+  APPROVED_ASSETS_REPO: leehack/llama-web-bridge-assets
   NATIVE_RELEASE_TAG: ${{ inputs.native_release_tag }}
   NATIVE_MANIFEST_SHA256: ${{ inputs.native_manifest_sha256 }}
   RELEASE_TAG: ${{ inputs.release_tag }}
   RELEASE_REBUILD: ${{ inputs.release_rebuild }}
-  ASSETS_REPO: ${{ inputs.assets_repo }}
-  RELEASE_CAPABILITIES: ${{ inputs.release_capabilities }}
+  ASSETS_REPO: leehack/llama-web-bridge-assets
 
 concurrency:
-  group: publish-bridge-assets-${{ inputs.assets_repo }}
+  group: publish-bridge-assets-leehack-llama-web-bridge-assets
   cancel-in-progress: false
 
 jobs:
@@ -82,6 +82,10 @@ jobs:
         run: |
           if [ "${PUBLISH_APPROVED}" != "true" ]; then
             echo "error: publish_approved=true requires explicit maintainer approval"
+            exit 1
+          fi
+          if [ "${{ inputs.assets_repo }}" != "${APPROVED_ASSETS_REPO}" ]; then
+            echo "error: assets_repo must be exactly ${APPROVED_ASSETS_REPO}"
             exit 1
           fi
 
@@ -121,8 +125,10 @@ jobs:
       - name: Checkout exact bridge source
         uses: actions/checkout@v4
         with:
+          repository: leehack/llama-web-bridge
           ref: ${{ env.BRIDGE_SOURCE_SHA }}
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Validate exact bridge and release inputs
         run: |
@@ -134,10 +140,6 @@ jobs:
           python3 scripts/release_contract.py validate-release \
             --release-tag "${RELEASE_TAG}" --release-rebuild "${RELEASE_REBUILD}" \
             --upstream-tag "${UPSTREAM_TAG}"
-          case "${RELEASE_CAPABILITIES}" in
-            state,multimodal|state,multimodal,asr|state,multimodal,tts|state,multimodal,asr,tts) ;;
-            *) echo "error: release_capabilities must be a canonical supported capability list"; exit 1 ;;
-          esac
           python3 - "${ASSETS_REPO}" "${NATIVE_REPO}" <<'PY'
           import sys
           from scripts.release_contract import require_repository
@@ -145,17 +147,27 @@ jobs:
           require_repository(sys.argv[2], "native_repo")
           PY
 
-      - name: Download and verify native release manifest
+      - name: Download and independently verify native release inventory
         id: native
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           mkdir -p "${RUNNER_TEMP}/native-release"
-          gh release download "${NATIVE_RELEASE_TAG}" --repo "${NATIVE_REPO}" \
-            --pattern assets.json --dir "${RUNNER_TEMP}/native-release"
-          IDENTITY="$(python3 scripts/release_contract.py validate-native \
+          gh api "repos/${NATIVE_REPO}/releases/tags/${NATIVE_RELEASE_TAG}" \
+            > "${RUNNER_TEMP}/native-release/release.json"
+          for name in assets.json SHA256SUMS; do
+            asset_id="$(jq -er --arg name "${name}" \
+              '[.assets[] | select(.name == $name)] | if length == 1 then .[0].id else error("missing/duplicate asset") end' \
+              "${RUNNER_TEMP}/native-release/release.json")"
+            gh api -H "Accept: application/octet-stream" \
+              "repos/${NATIVE_REPO}/releases/assets/${asset_id}" \
+              > "${RUNNER_TEMP}/native-release/${name}"
+          done
+          IDENTITY="$(python3 scripts/release_contract.py validate-native-release \
             --manifest "${RUNNER_TEMP}/native-release/assets.json" \
+            --checksums "${RUNNER_TEMP}/native-release/SHA256SUMS" \
+            --release-json "${RUNNER_TEMP}/native-release/release.json" \
             --manifest-sha256 "${NATIVE_MANIFEST_SHA256}" \
             --native-release-tag "${NATIVE_RELEASE_TAG}" \
             --upstream-tag "${UPSTREAM_TAG}" --upstream-commit "${UPSTREAM_COMMIT}")"
@@ -192,6 +204,7 @@ jobs:
           git diff --exit-code -- js/llama_webgpu_bridge.js js/llama_webgpu_bridge_worker.js js/llama_webgpu_bridge.d.ts
           python3 scripts/release_contract_test.py
           python3 scripts/generate_release_manifest_test.py
+          python3 scripts/release_publication_state_test.py
           python3 scripts/verify_state_persistence_api.py
           python3 scripts/verify_text_to_speech_api.py
           python3 scripts/wasm64_runtime_patch_contract_test.py
@@ -226,21 +239,18 @@ jobs:
           key: release-smoke-${{ env.LLAMA_WEBGPU_SMOKE_MODEL_SHA256 }}-${{ env.LLAMA_WEBGPU_MULTIMODAL_MODEL_SHA256 }}-${{ env.LLAMA_WEBGPU_MULTIMODAL_MMPROJ_SHA256 }}
 
       - name: Cache ASR models
-        if: contains(inputs.release_capabilities, 'asr')
         uses: actions/cache@v4
         with:
           path: ~/.cache/llama-web-bridge/speech-smoke-models
           key: speech-smoke-${{ env.LLAMA_WEBGPU_SPEECH_MODEL_SHA256 }}-${{ env.LLAMA_WEBGPU_SPEECH_MMPROJ_SHA256 }}
 
       - name: Cache TTS models
-        if: contains(inputs.release_capabilities, 'tts')
         uses: actions/cache@v4
         with:
           path: ~/.cache/llama-web-bridge/text-to-speech-smoke-models
           key: text-to-speech-smoke-${{ env.LLAMA_WEBGPU_TTS_MODEL_SHA256 }}-${{ env.LLAMA_WEBGPU_TTS_MMPROJ_SHA256 }}
 
       - name: Download verified TTS models
-        if: contains(inputs.release_capabilities, 'tts')
         run: |
           set -euo pipefail
           cache_dir="${LLAMA_WEBGPU_TTS_MODEL_CACHE/#\~/$HOME}"
@@ -276,13 +286,11 @@ jobs:
         run: python3 scripts/multimodal_browser_smoke.py
 
       - name: Run durable Qwen3-ASR gate
-        if: contains(inputs.release_capabilities, 'asr')
         env:
           BRIDGE_DIST_DIR: ${{ runner.temp }}/webgpu_bridge_dist
         run: python3 scripts/speech_to_text_browser_smoke.py
 
       - name: Run durable Qwen3-TTS memory64 gate
-        if: contains(inputs.release_capabilities, 'tts')
         run: |
           python3 scripts/text_to_speech_browser_smoke.py \
             --dist-dir "${{ runner.temp }}/webgpu_bridge_dist" \
@@ -295,20 +303,15 @@ jobs:
         env:
           OUT_DIR: ${{ runner.temp }}/webgpu_bridge_dist
           NATIVE_COMMIT: ${{ steps.native.outputs.native_commit }}
-          ENABLE_ASR: ${{ contains(inputs.release_capabilities, 'asr') }}
-          ENABLE_TTS: ${{ contains(inputs.release_capabilities, 'tts') }}
         run: |
           set -euo pipefail
-          args=()
-          [ "${ENABLE_ASR}" = "true" ] && args+=(--enable-asr)
-          [ "${ENABLE_TTS}" = "true" ] && args+=(--enable-tts)
           python3 scripts/generate_release_manifest.py \
             --out-dir "${OUT_DIR}" --release-tag "${RELEASE_TAG}" --release-rebuild "${RELEASE_REBUILD}" \
-            --assets-repo "${ASSETS_REPO}" --bridge-repo "${GITHUB_REPOSITORY}" --bridge-commit "${BRIDGE_SOURCE_SHA}" \
+            --assets-repo "${ASSETS_REPO}" --bridge-repo "${BRIDGE_REPO}" --bridge-commit "${BRIDGE_SOURCE_SHA}" \
             --upstream-tag "${UPSTREAM_TAG}" --upstream-commit "${UPSTREAM_COMMIT}" \
             --native-repo "${NATIVE_REPO}" --native-release-tag "${NATIVE_RELEASE_TAG}" \
             --native-manifest-sha256 "${NATIVE_MANIFEST_SHA256}" --native-commit "${NATIVE_COMMIT}" \
-            --emscripten-version "${EMSCRIPTEN_VERSION}" "${args[@]}"
+            --emscripten-version "${EMSCRIPTEN_VERSION}"
           (cd "${OUT_DIR}" && sha256sum --check sha256sums.txt)
 
       - name: Upload gated bridge assets
@@ -338,25 +341,50 @@ jobs:
             ${{ env.LLAMA_WEBGPU_TTS_ARTIFACTS_DIR }}
           if-no-files-found: ignore
 
+  verify-publication-environment:
+    name: Verify externally configured approval environment
+    needs: validate-request
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout bridge environment contract
+        uses: actions/checkout@v4
+        with:
+          repository: leehack/llama-web-bridge
+          ref: ${{ env.BRIDGE_SOURCE_SHA }}
+          persist-credentials: false
+      - name: Fail closed unless required reviewers exist
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api "repos/${BRIDGE_REPO}/environments/bridge-assets-publication" \
+            > "${RUNNER_TEMP}/publication-environment.json"
+          python3 scripts/release_contract.py validate-environment \
+            --environment-json "${RUNNER_TEMP}/publication-environment.json"
+
   publish-assets:
-    name: Publish approved assets atomically
-    needs: build-and-gate
+    name: Publish or recover exact approved assets
+    needs: [build-and-gate, verify-publication-environment]
     runs-on: ubuntu-latest
     environment: bridge-assets-publication
+    outputs:
+      publication_outcome: ${{ steps.final.outputs.publication_outcome }}
     steps:
-      - name: Checkout exact bridge source for validation
+      - name: Checkout exact bridge owner source
         uses: actions/checkout@v4
         with:
+          repository: leehack/llama-web-bridge
           ref: ${{ env.BRIDGE_SOURCE_SHA }}
           fetch-depth: 0
+          persist-credentials: false
           path: bridge-source
 
-      - name: Checkout assets repository
+      - name: Checkout fixed assets target without persisted credentials
         uses: actions/checkout@v4
         with:
-          repository: ${{ env.ASSETS_REPO }}
-          token: ${{ secrets.WEBGPU_BRIDGE_ASSETS_PAT }}
+          repository: leehack/llama-web-bridge-assets
           fetch-depth: 0
+          persist-credentials: false
           path: assets-repo
 
       - name: Download gated bridge assets
@@ -365,83 +393,272 @@ jobs:
           name: exact-webgpu-bridge-dist
           path: bridge-dist
 
-      - name: Revalidate checksums, ordering, ancestry, and collisions
+      - name: Verify source ancestry and classify exact remote state
+        id: preflight
         env:
           GH_TOKEN: ${{ secrets.WEBGPU_BRIDGE_ASSETS_PAT }}
+          NATIVE_COMMIT: ${{ needs.build-and-gate.outputs.native_commit }}
+          EMSCRIPTEN_VERSION: ${{ needs.build-and-gate.outputs.emscripten_version }}
         run: |
           set -euo pipefail
+          test -n "${GH_TOKEN}"
+          python3 bridge-source/scripts/release_publication_state.py validate-target \
+            --assets-repo "${ASSETS_REPO}" >/dev/null
           (cd bridge-dist && sha256sum --check sha256sums.txt)
-          jq -e --arg release "${RELEASE_TAG}" --arg bridge "${BRIDGE_SOURCE_SHA}" \
-            --arg upstream "${UPSTREAM_COMMIT}" --arg native "${{ needs.build-and-gate.outputs.native_commit }}" \
-            '.schema_version == 2 and .release_tag == $release and .bridge_commit == $bridge and .upstream_commit == $upstream and .native_commit == $native' \
-            bridge-dist/manifest.json >/dev/null
-          if git -C assets-repo ls-remote --exit-code --tags origin "refs/tags/${RELEASE_TAG}" >/dev/null 2>&1; then
-            echo "error: asset tag collision: ${RELEASE_TAG}"
-            exit 1
-          fi
-          if gh release view "${RELEASE_TAG}" --repo "${ASSETS_REPO}" >/dev/null 2>&1; then
-            echo "error: asset release collision: ${RELEASE_TAG}"
+
+          bridge_default="$(gh api "repos/${BRIDGE_REPO}" --jq '.default_branch')"
+          source_status="$(gh api \
+            "repos/${BRIDGE_REPO}/compare/${BRIDGE_SOURCE_SHA}...${bridge_default}" \
+            --jq '.status')"
+          if [ "${source_status}" != "ahead" ] && [ "${source_status}" != "identical" ]; then
+            echo "error: bridge source is not reachable from ${BRIDGE_REPO}'s default branch"
             exit 1
           fi
 
-          DEFAULT_BRANCH="$(gh api "repos/${GITHUB_REPOSITORY}" --jq '.default_branch')"
-          SOURCE_STATUS="$(gh api "repos/${GITHUB_REPOSITORY}/compare/${BRIDGE_SOURCE_SHA}...${DEFAULT_BRANCH}" --jq '.status')"
-          if [ "${SOURCE_STATUS}" != "ahead" ] && [ "${SOURCE_STATUS}" != "identical" ]; then
-            echo "error: bridge source is not reachable from the default branch; source changes require an ordinary merged PR"
+          assets_branch="$(gh api "repos/${ASSETS_REPO}" --jq '.default_branch')"
+          git -C assets-repo fetch --force origin \
+            "+refs/heads/${assets_branch}:refs/remotes/origin/${assets_branch}"
+          branch_commit="$(git -C assets-repo rev-parse "refs/remotes/origin/${assets_branch}")"
+
+          tag_lines="$(git -C assets-repo ls-remote origin \
+            "refs/tags/${RELEASE_TAG}" "refs/tags/${RELEASE_TAG}^{}")"
+          tag_commit="$(awk '$2 ~ /\^\{\}$/ {print $1}' <<<"${tag_lines}")"
+          if [ -z "${tag_commit}" ]; then
+            tag_commit="$(awk 'NR == 1 {print $1}' <<<"${tag_lines}")"
+          fi
+          if [ -n "${tag_commit}" ]; then
+            git -C assets-repo fetch --force origin \
+              "refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"
+          fi
+
+          release_args=()
+          set +e
+          gh api "repos/${ASSETS_REPO}/releases/tags/${RELEASE_TAG}" \
+            > "${RUNNER_TEMP}/existing-release.json" 2> "${RUNNER_TEMP}/release-lookup.err"
+          lookup_status=$?
+          set -e
+          if [ "${lookup_status}" -eq 0 ]; then
+            release_args=(--release-json "${RUNNER_TEMP}/existing-release.json")
+          elif ! grep -q '(HTTP 404)' "${RUNNER_TEMP}/release-lookup.err"; then
+            cat "${RUNNER_TEMP}/release-lookup.err" >&2
+            exit "${lookup_status}"
+          fi
+
+          args=(
+            --repository assets-repo --candidate bridge-dist
+            --branch-commit "${branch_commit}"
+            --release-tag "${RELEASE_TAG}" --release-rebuild "${RELEASE_REBUILD}"
+            --assets-repo "${ASSETS_REPO}"
+            --bridge-commit "${BRIDGE_SOURCE_SHA}"
+            --upstream-tag "${UPSTREAM_TAG}" --upstream-commit "${UPSTREAM_COMMIT}"
+            --native-release-tag "${NATIVE_RELEASE_TAG}"
+            --native-manifest-sha256 "${NATIVE_MANIFEST_SHA256}"
+            --native-commit "${NATIVE_COMMIT}"
+            --emscripten-version "${EMSCRIPTEN_VERSION}"
+          )
+          [ -n "${tag_commit}" ] && args+=(--tag-commit "${tag_commit}")
+          args+=("${release_args[@]}")
+          if ! python3 bridge-source/scripts/release_publication_state.py classify \
+            "${args[@]}" > "${RUNNER_TEMP}/preflight.json"; then
+            cat "${RUNNER_TEMP}/preflight.json"
+            cp "${RUNNER_TEMP}/preflight.json" "${RUNNER_TEMP}/publication-outcome.json"
             exit 1
           fi
+          cat "${RUNNER_TEMP}/preflight.json"
+          {
+            echo "assets_branch=${assets_branch}"
+            echo "action=$(jq -r '.action' "${RUNNER_TEMP}/preflight.json")"
+            echo "initial_outcome=$(jq -r '.outcome' "${RUNNER_TEMP}/preflight.json")"
+            echo "fingerprint=$(jq -r '.candidate_fingerprint' "${RUNNER_TEMP}/preflight.json")"
+          } >> "${GITHUB_OUTPUT}"
 
-          previous_args=()
-          [ -f assets-repo/manifest.json ] && previous_args=(--previous-manifest assets-repo/manifest.json)
-          RELEASE_JSON="$(python3 bridge-source/scripts/release_contract.py validate-release \
-            --release-tag "${RELEASE_TAG}" --release-rebuild "${RELEASE_REBUILD}" \
-            --upstream-tag "${UPSTREAM_TAG}" "${previous_args[@]}")"
-          PREVIOUS_BRIDGE="$(jq -r '.previous_bridge_commit // empty' <<<"${RELEASE_JSON}")"
-          if [ -n "${PREVIOUS_BRIDGE}" ] && [ "${PREVIOUS_BRIDGE}" != "${BRIDGE_SOURCE_SHA}" ]; then
-            STATUS="$(gh api "repos/${GITHUB_REPOSITORY}/compare/${PREVIOUS_BRIDGE}...${BRIDGE_SOURCE_SHA}" --jq '.status')"
-            if [ "${STATUS}" != "ahead" ]; then
-              echo "error: bridge source must advance or remain unchanged; compare status is ${STATUS}"
-              exit 1
-            fi
-          fi
-
-      - name: Generate provenance release notes
+      - name: Prepare deterministic release notes
+        env:
+          FINGERPRINT: ${{ steps.preflight.outputs.fingerprint }}
         run: |
           {
             echo "Exact-input WebGPU bridge asset release."
             echo
-            echo "## Provenance"
+            echo "Candidate fingerprint: \`${FINGERPRINT}\`"
             echo
-            echo "- Release tag: \`${RELEASE_TAG}\` (rebuild \`${RELEASE_REBUILD}\`)"
-            echo "- Bridge commit: \`${BRIDGE_SOURCE_SHA}\`"
-            echo "- llama.cpp: \`${UPSTREAM_TAG}@${UPSTREAM_COMMIT}\`"
-            echo "- Native: \`${NATIVE_REPO}@${NATIVE_RELEASE_TAG}\`"
-            echo "- Native manifest SHA-256: \`${NATIVE_MANIFEST_SHA256}\`"
-            echo "- Emscripten: \`${{ needs.build-and-gate.outputs.emscripten_version }}\`"
-            echo "- [Manifest](https://github.com/${ASSETS_REPO}/blob/${RELEASE_TAG}/manifest.json)"
-            echo "- [Checksums](https://github.com/${ASSETS_REPO}/blob/${RELEASE_TAG}/sha256sums.txt)"
+            echo "Release: \`${RELEASE_TAG}\` (rebuild \`${RELEASE_REBUILD}\`)"
+            echo "Bridge: \`${BRIDGE_REPO}@${BRIDGE_SOURCE_SHA}\`"
+            echo "llama.cpp: \`${UPSTREAM_TAG}@${UPSTREAM_COMMIT}\`"
+            echo "Native: \`${NATIVE_REPO}@${NATIVE_RELEASE_TAG}\`"
+            echo "Native manifest SHA-256: \`${NATIVE_MANIFEST_SHA256}\`"
+            echo "Emscripten: \`${{ needs.build-and-gate.outputs.emscripten_version }}\`"
           } > "${RUNNER_TEMP}/asset-release-notes.md"
 
-      - name: Commit assets and push branch plus tag atomically
-        run: |
-          set -euo pipefail
-          cp bridge-dist/* assets-repo/
-          git -C assets-repo config user.name "github-actions[bot]"
-          git -C assets-repo config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git -C assets-repo add llama_webgpu_bridge.js llama_webgpu_bridge_worker.js llama_webgpu_bridge.d.ts \
-            llama_webgpu_core.js llama_webgpu_core.wasm llama_webgpu_core_mem64.js llama_webgpu_core_mem64.wasm \
-            manifest.json sha256sums.txt
-          if git -C assets-repo diff --cached --quiet; then
-            echo "error: exact release produced no asset changes"
-            exit 1
-          fi
-          git -C assets-repo commit -m "chore: publish webgpu bridge ${RELEASE_TAG}"
-          git -C assets-repo tag "${RELEASE_TAG}"
-          git -C assets-repo push --atomic origin HEAD "refs/tags/${RELEASE_TAG}"
-
-      - name: Create immutable GitHub release
+      - name: Apply only the classified ref mutation
         env:
           GH_TOKEN: ${{ secrets.WEBGPU_BRIDGE_ASSETS_PAT }}
+          ACTION: ${{ steps.preflight.outputs.action }}
+          ASSETS_BRANCH: ${{ steps.preflight.outputs.assets_branch }}
         run: |
-          gh release create "${RELEASE_TAG}" --repo "${ASSETS_REPO}" --verify-tag \
-            --title "${RELEASE_TAG}" --notes-file "${RUNNER_TEMP}/asset-release-notes.md"
+          set -euo pipefail
+          if [ "${ACTION}" = "publish-refs-and-release" ]; then
+            cp bridge-dist/* assets-repo/
+            git -C assets-repo config user.name "github-actions[bot]"
+            git -C assets-repo config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git -C assets-repo add -- llama_webgpu_bridge.js \
+              llama_webgpu_bridge_worker.js llama_webgpu_bridge.d.ts \
+              llama_webgpu_core.js llama_webgpu_core.wasm \
+              llama_webgpu_core_mem64.js llama_webgpu_core_mem64.wasm \
+              manifest.json sha256sums.txt
+            git -C assets-repo commit -m "chore: publish webgpu bridge ${RELEASE_TAG}"
+            git -C assets-repo tag "${RELEASE_TAG}"
+            gh auth setup-git
+            set +e
+            git -C assets-repo push --atomic origin \
+              "HEAD:refs/heads/${ASSETS_BRANCH}" "refs/tags/${RELEASE_TAG}"
+            set -e
+          elif [ "${ACTION}" = "publish-tag-and-release" ]; then
+            git -C assets-repo tag "${RELEASE_TAG}" "refs/remotes/origin/${ASSETS_BRANCH}"
+            gh auth setup-git
+            set +e
+            git -C assets-repo push origin "refs/tags/${RELEASE_TAG}"
+            set -e
+          fi
+
+      - name: Re-fetch and finish or safely classify partial publication
+        id: finish
+        env:
+          GH_TOKEN: ${{ secrets.WEBGPU_BRIDGE_ASSETS_PAT }}
+          ASSETS_BRANCH: ${{ steps.preflight.outputs.assets_branch }}
+          INITIAL_OUTCOME: ${{ steps.preflight.outputs.initial_outcome }}
+          NATIVE_COMMIT: ${{ needs.build-and-gate.outputs.native_commit }}
+          EMSCRIPTEN_VERSION: ${{ needs.build-and-gate.outputs.emscripten_version }}
+        run: |
+          set -euo pipefail
+          state_changed() {
+            python3 bridge-source/scripts/release_publication_state.py state-changed \
+              --before-json "${RUNNER_TEMP}/preflight.json" --after-json "$1"
+          }
+          classify_remote() {
+            git -C assets-repo fetch --force origin \
+              "+refs/heads/${ASSETS_BRANCH}:refs/remotes/origin/${ASSETS_BRANCH}"
+            branch_commit="$(git -C assets-repo rev-parse "refs/remotes/origin/${ASSETS_BRANCH}")"
+            tag_lines="$(git -C assets-repo ls-remote origin \
+              "refs/tags/${RELEASE_TAG}" "refs/tags/${RELEASE_TAG}^{}")"
+            tag_commit="$(awk '$2 ~ /\^\{\}$/ {print $1}' <<<"${tag_lines}")"
+            [ -n "${tag_commit}" ] || tag_commit="$(awk 'NR == 1 {print $1}' <<<"${tag_lines}")"
+            tag_args=()
+            if [ -n "${tag_commit}" ]; then
+              git -C assets-repo fetch --force origin \
+                "refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"
+              tag_args=(--tag-commit "${tag_commit}")
+            fi
+            release_args=()
+            set +e
+            gh api "repos/${ASSETS_REPO}/releases/tags/${RELEASE_TAG}" \
+              > "${RUNNER_TEMP}/current-release.json" 2> "${RUNNER_TEMP}/current-release.err"
+            lookup_status=$?
+            set -e
+            if [ "${lookup_status}" -eq 0 ]; then
+              release_args=(--release-json "${RUNNER_TEMP}/current-release.json")
+            elif ! grep -q '(HTTP 404)' "${RUNNER_TEMP}/current-release.err"; then
+              cat "${RUNNER_TEMP}/current-release.err" >&2
+              return "${lookup_status}"
+            fi
+            python3 bridge-source/scripts/release_publication_state.py classify \
+              --repository assets-repo --candidate bridge-dist \
+              --branch-commit "${branch_commit}" "${tag_args[@]}" "${release_args[@]}" \
+              --release-tag "${RELEASE_TAG}" --release-rebuild "${RELEASE_REBUILD}" \
+              --assets-repo "${ASSETS_REPO}" --bridge-commit "${BRIDGE_SOURCE_SHA}" \
+              --upstream-tag "${UPSTREAM_TAG}" --upstream-commit "${UPSTREAM_COMMIT}" \
+              --native-release-tag "${NATIVE_RELEASE_TAG}" \
+              --native-manifest-sha256 "${NATIVE_MANIFEST_SHA256}" \
+              --native-commit "${NATIVE_COMMIT}" --emscripten-version "${EMSCRIPTEN_VERSION}"
+          }
+
+          if ! classify_remote > "${RUNNER_TEMP}/post-refs.json"; then
+            cat "${RUNNER_TEMP}/post-refs.json"
+            jq --argjson mutated "$(state_changed "${RUNNER_TEMP}/post-refs.json")" \
+              '.mutated=$mutated' "${RUNNER_TEMP}/post-refs.json" \
+              > "${RUNNER_TEMP}/publication-outcome.json"
+            exit 1
+          fi
+          post_action="$(jq -r '.action' "${RUNNER_TEMP}/post-refs.json")"
+          if [ "${post_action}" = "create-release" ]; then
+            prerelease_args=()
+            if [[ "${RELEASE_TAG}" == b* ]] || [[ "${RELEASE_TAG}" =~ -[1-9][0-9]*$ ]]; then
+              prerelease_args=(--prerelease)
+            fi
+            if ! gh release create "${RELEASE_TAG}" bridge-dist/* \
+              --repo "${ASSETS_REPO}" --verify-tag --target "$(jq -r '.tag_commit' "${RUNNER_TEMP}/post-refs.json")" \
+              --title "${RELEASE_TAG}" --notes-file "${RUNNER_TEMP}/asset-release-notes.md" \
+              "${prerelease_args[@]}"; then
+              echo "release creation returned failure; re-querying exact state" >&2
+            fi
+          elif [ "${post_action}" = "upload-release-assets" ]; then
+            mapfile -t missing_assets < <(
+              jq -er '.missing_release_assets[]' "${RUNNER_TEMP}/post-refs.json"
+            )
+            upload_paths=()
+            for name in "${missing_assets[@]}"; do
+              case "${name}" in
+                llama_webgpu_bridge.js|llama_webgpu_bridge_worker.js|llama_webgpu_bridge.d.ts|\
+                llama_webgpu_core.js|llama_webgpu_core.wasm|\
+                llama_webgpu_core_mem64.js|llama_webgpu_core_mem64.wasm|\
+                manifest.json|sha256sums.txt) upload_paths+=("bridge-dist/${name}") ;;
+                *) echo "error: classifier returned unexpected release asset ${name}"; exit 1 ;;
+              esac
+            done
+            if [ "${#upload_paths[@]}" -eq 0 ]; then
+              echo "error: partial release classification contained no missing assets"
+              exit 1
+            fi
+            if ! gh release upload "${RELEASE_TAG}" "${upload_paths[@]}" \
+              --repo "${ASSETS_REPO}"; then
+              echo "release asset upload returned failure; re-querying exact state" >&2
+            fi
+          fi
+          if [ "${post_action}" = "create-release" ] || [ "${post_action}" = "upload-release-assets" ]; then
+            if ! classify_remote > "${RUNNER_TEMP}/post-release.json"; then
+              cat "${RUNNER_TEMP}/post-release.json"
+              jq --argjson mutated "$(state_changed "${RUNNER_TEMP}/post-release.json")" \
+                '.mutated=$mutated' "${RUNNER_TEMP}/post-release.json" \
+                > "${RUNNER_TEMP}/publication-outcome.json"
+              exit 1
+            fi
+            if [ "$(jq -r '.state' "${RUNNER_TEMP}/post-release.json")" != "complete" ]; then
+              jq --argjson mutated "$(state_changed "${RUNNER_TEMP}/post-release.json")" \
+                '.outcome="recoverable-partial" | .reason_code="release-mutation-retry-required" | .retryable=true | .mutated=$mutated' \
+                "${RUNNER_TEMP}/post-release.json" > "${RUNNER_TEMP}/publication-outcome.json"
+              cat "${RUNNER_TEMP}/publication-outcome.json"
+              exit 1
+            fi
+            source="${RUNNER_TEMP}/post-release.json"
+          elif [ "${post_action}" = "none" ]; then
+            source="${RUNNER_TEMP}/post-refs.json"
+          else
+            jq --argjson mutated "$(state_changed "${RUNNER_TEMP}/post-refs.json")" \
+              '.outcome="recoverable-partial" | .reason_code="ref-mutation-retry-required" | .retryable=true | .mutated=$mutated' \
+              "${RUNNER_TEMP}/post-refs.json" > "${RUNNER_TEMP}/publication-outcome.json"
+            cat "${RUNNER_TEMP}/publication-outcome.json"
+            exit 1
+          fi
+          jq --arg outcome "${INITIAL_OUTCOME}" \
+            --argjson mutated "$(state_changed "${source}")" \
+            '.outcome=$outcome | .mutated=$mutated | .retryable=false' \
+            "${source}" > "${RUNNER_TEMP}/publication-outcome.json"
+          cat "${RUNNER_TEMP}/publication-outcome.json"
+
+      - name: Export machine-readable publication outcome
+        id: final
+        if: always()
+        run: |
+          if [ ! -f "${RUNNER_TEMP}/publication-outcome.json" ]; then
+            jq -n '{schema_version:1,state:"failed-before-classification",allowed:false,action:"none",outcome:"collision",reason_code:"workflow-failure",retryable:false,mutated:false}' \
+              > "${RUNNER_TEMP}/publication-outcome.json"
+          fi
+          outcome="$(jq -c . "${RUNNER_TEMP}/publication-outcome.json")"
+          echo "publication_outcome=${outcome}" >> "${GITHUB_OUTPUT}"
+          echo "${outcome}"
+
+      - name: Upload publication outcome
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bridge-publication-outcome
+          path: ${{ runner.temp }}/publication-outcome.json

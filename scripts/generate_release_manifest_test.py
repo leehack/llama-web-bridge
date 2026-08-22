@@ -33,10 +33,11 @@ class GenerateReleaseManifestTest(unittest.TestCase):
                 native_manifest_sha256="c" * 64,
                 native_commit="d" * 40,
                 emscripten_version="6.0.8",
-                enable_asr=True,
-                enable_tts=False,
             )
             manifest = generate(args)
+            first_bytes = (out_dir / "manifest.json").read_bytes()
+            generate(args)
+            self.assertEqual((out_dir / "manifest.json").read_bytes(), first_bytes)
             self.assertEqual(manifest["schema_version"], 2)
             self.assertEqual(manifest["release_tag"], "v0.2.0-1")
             self.assertEqual(manifest["bridge_commit"], "a" * 40)
@@ -44,7 +45,8 @@ class GenerateReleaseManifestTest(unittest.TestCase):
             self.assertEqual(manifest["native_commit"], "d" * 40)
             self.assertEqual(manifest["bridge_assets_tag"], "v0.2.0-1")
             self.assertTrue(manifest["capabilities"]["speech_to_text"]["advertised"])
-            self.assertFalse(manifest["capabilities"]["text_to_speech"]["advertised"])
+            self.assertTrue(manifest["capabilities"]["text_to_speech"]["advertised"])
+            self.assertNotIn("generated_at_utc", manifest)
 
             payload = json.loads((out_dir / "manifest.json").read_text())
             artifact = ARTIFACTS[0]

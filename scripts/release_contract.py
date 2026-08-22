@@ -20,6 +20,12 @@ from pathlib import Path
 from typing import Any, Mapping
 
 
+BRIDGE_REPOSITORY = "leehack/llama-web-bridge"
+ASSETS_REPOSITORY = "leehack/llama-web-bridge-assets"
+NATIVE_REPOSITORY = "leehack/llamadart-native"
+NATIVE_HOOK_CONTRACT_VERSION = 1
+
+
 class ContractError(ValueError):
     """Raised when release provenance is ambiguous or unsafe."""
 
@@ -78,6 +84,11 @@ class ReleaseVersion:
         if self.channel == Channel.DEVELOPMENT:
             return f"b{self.upstream_parts[0]}"
         return "v" + ".".join(str(part) for part in self.upstream_parts)
+
+    @property
+    def github_prerelease(self) -> bool:
+        """Match llamadart-native: nightlies and every rebuild are prereleases."""
+        return self.channel == Channel.DEVELOPMENT or self.rebuild > 0
 
 
 @dataclass(frozen=True)
@@ -273,6 +284,202 @@ def validate_native_file(
     return identity
 
 
+_NATIVE_ARTIFACTS = {
+    "android-arm64": ("android", "arm64", "core", "core"),
+    "android-x64": ("android", "x64", "core", "core"),
+    "ios-arm64": ("ios", "arm64", "core", "core"),
+    "ios-arm64-sim": ("ios", "arm64-sim", "core", "core"),
+    "ios-x86_64-sim": ("ios", "x86_64-sim", "core", "core"),
+    "linux-arm64": ("linux", "arm64", "core", "core"),
+    "linux-x64": ("linux", "x64", "core", "core"),
+    "macos-arm64": ("macos", "arm64", "core", "core"),
+    "macos-x86_64": ("macos", "x86_64", "core", "core"),
+    "windows-arm64": ("windows", "arm64", "core", "core"),
+    "windows-x64": ("windows", "x64", "core", "core"),
+}
+
+
+def expected_native_artifacts(tag: str) -> dict[str, tuple[str, str, str, str]]:
+    result = {
+        f"llamadart-native-{bundle}-{tag}.tar.gz": metadata
+        for bundle, metadata in _NATIVE_ARTIFACTS.items()
+    }
+    result[f"llamadart-native-apple-xcframework-{tag}.zip"] = (
+        "apple",
+        "universal",
+        "core",
+        "spm-xcframework",
+    )
+    result[f"llamadart-native-headers-{tag}.tar.gz"] = (
+        "all",
+        "universal",
+        "core",
+        "headers",
+    )
+    return result
+
+
+def _release_assets(release: Mapping[str, Any]) -> dict[str, Mapping[str, Any]]:
+    raw_assets = release.get("assets")
+    if not isinstance(raw_assets, list):
+        raise ContractError("native GitHub release is missing its asset inventory")
+    assets: dict[str, Mapping[str, Any]] = {}
+    for item in raw_assets:
+        if not isinstance(item, Mapping) or not isinstance(item.get("name"), str):
+            raise ContractError("native GitHub release contains an invalid asset record")
+        name = item["name"]
+        if name in assets:
+            raise ContractError(f"native GitHub release has duplicate asset {name!r}")
+        if item.get("state") != "uploaded":
+            raise ContractError(f"native GitHub asset {name!r} is not uploaded")
+        digest = item.get("digest")
+        if not isinstance(digest, str) or not digest.startswith("sha256:"):
+            raise ContractError(f"native GitHub asset {name!r} has no SHA-256 digest")
+        require_sha256(digest.removeprefix("sha256:"), f"GitHub digest for {name}")
+        if not isinstance(item.get("size"), int) or item["size"] < 0:
+            raise ContractError(f"native GitHub asset {name!r} has an invalid size")
+        assets[name] = item
+    return assets
+
+
+def validate_native_release(
+    manifest_path: Path,
+    checksums_path: Path,
+    release: Mapping[str, Any],
+    expected_sha256: str,
+    native_release_tag: str,
+    upstream_tag: str,
+    upstream_commit: str,
+) -> NativeIdentity:
+    """Validate native provenance against both downloaded bytes and GitHub metadata."""
+    identity = validate_native_file(
+        manifest_path,
+        expected_sha256,
+        native_release_tag,
+        upstream_tag,
+        upstream_commit,
+    )
+    if release.get("tag_name") != native_release_tag or release.get("draft") is not False:
+        raise ContractError("native GitHub release identity/draft state is not canonical")
+    if release.get("target_commitish") != identity.native_commit:
+        raise ContractError("native GitHub release target does not match native_commit")
+
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if payload.get("hook_contract_version") != NATIVE_HOOK_CONTRACT_VERSION:
+        raise ContractError(
+            f"unsupported native hook_contract_version: {payload.get('hook_contract_version')!r}"
+        )
+    artifacts = payload.get("artifacts")
+    if not isinstance(artifacts, list):
+        raise ContractError("native manifest artifacts must be a list")
+    expected = expected_native_artifacts(native_release_tag)
+    manifest_assets: dict[str, Mapping[str, Any]] = {}
+    for artifact in artifacts:
+        if not isinstance(artifact, Mapping) or not isinstance(artifact.get("file"), str):
+            raise ContractError("native manifest contains an invalid artifact record")
+        name = artifact["file"]
+        if name in manifest_assets:
+            raise ContractError(f"native manifest has duplicate artifact {name!r}")
+        manifest_assets[name] = artifact
+    if set(manifest_assets) != set(expected):
+        raise ContractError("native manifest artifact inventory is incomplete or unexpected")
+
+    github_assets = _release_assets(release)
+    required_release_assets = {*expected, "assets.json", "SHA256SUMS"}
+    if set(github_assets) != required_release_assets:
+        raise ContractError("native GitHub release asset inventory is incomplete or unexpected")
+
+    manifest_bytes = manifest_path.read_bytes()
+    manifest_digest = hashlib.sha256(manifest_bytes).hexdigest()
+    manifest_meta = github_assets["assets.json"]
+    if (
+        manifest_meta["digest"] != f"sha256:{manifest_digest}"
+        or manifest_meta["size"] != len(manifest_bytes)
+        or manifest_digest != expected_sha256
+    ):
+        raise ContractError("native assets.json bytes do not match GitHub digest/size")
+
+    checksum_bytes = checksums_path.read_bytes()
+    checksum_digest = hashlib.sha256(checksum_bytes).hexdigest()
+    checksum_meta = github_assets["SHA256SUMS"]
+    if (
+        checksum_meta["digest"] != f"sha256:{checksum_digest}"
+        or checksum_meta["size"] != len(checksum_bytes)
+    ):
+        raise ContractError("native SHA256SUMS bytes do not match GitHub digest/size")
+    checksum_lines: dict[str, str] = {}
+    for line in checksum_bytes.decode("utf-8").splitlines():
+        match = re.fullmatch(r"([0-9a-f]{64})  ([A-Za-z0-9_.-]+)", line)
+        if match is None or match.group(2) in checksum_lines:
+            raise ContractError(f"invalid native SHA256SUMS line: {line!r}")
+        checksum_lines[match.group(2)] = match.group(1)
+    if set(checksum_lines) != set(expected):
+        raise ContractError("native SHA256SUMS inventory does not match manifest artifacts")
+
+    expected_keys = {"module", "platform", "arch", "backend", "file", "sha256", "size"}
+    for name, (platform, arch, backend, module) in expected.items():
+        artifact = manifest_assets[name]
+        if set(artifact) != expected_keys:
+            raise ContractError(f"native manifest schema mismatch for {name}")
+        digest = artifact.get("sha256")
+        size = artifact.get("size")
+        github = github_assets[name]
+        if (
+            artifact.get("platform") != platform
+            or artifact.get("arch") != arch
+            or artifact.get("backend") != backend
+            or artifact.get("module") != module
+        ):
+            raise ContractError(f"native artifact metadata mismatch for {name}")
+        if (
+            not isinstance(digest, str)
+            or checksum_lines[name] != digest
+            or github["digest"] != f"sha256:{digest}"
+            or github["size"] != size
+        ):
+            raise ContractError(f"native artifact checksum/size mismatch for {name}")
+    return identity
+
+
+def select_stable_native_release(releases: list[Any]) -> str:
+    """Select the highest supported stable-channel tag without GitHub latest semantics."""
+    candidates: list[ReleaseVersion] = []
+    for release in releases:
+        if not isinstance(release, Mapping) or release.get("draft") is not False:
+            continue
+        tag = release.get("tag_name")
+        if not isinstance(tag, str):
+            continue
+        try:
+            version = parse_release_tag(tag, allow_legacy=True)
+        except ContractError:
+            continue
+        if version.channel == Channel.STABLE:
+            candidates.append(version)
+    if not candidates:
+        raise ContractError("no supported non-draft stable native release exists")
+    selected = max(candidates, key=lambda value: (*value.upstream_parts, value.rebuild))
+    return selected.tag
+
+
+def validate_publication_environment(environment: Mapping[str, Any]) -> int:
+    """Require an already-created environment with at least one reviewer."""
+    if environment.get("name") != "bridge-assets-publication":
+        raise ContractError("publication environment identity is missing or incorrect")
+    rules = environment.get("protection_rules")
+    if not isinstance(rules, list):
+        raise ContractError("publication environment has no protection rules")
+    reviewer_count = 0
+    for rule in rules:
+        if isinstance(rule, Mapping) and rule.get("type") == "required_reviewers":
+            reviewers = rule.get("reviewers")
+            if isinstance(reviewers, list):
+                reviewer_count += len(reviewers)
+    if reviewer_count < 1:
+        raise ContractError("publication environment has no required reviewers")
+    return reviewer_count
+
+
 def read_previous_manifest(path: Path) -> tuple[str, str, str]:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
@@ -307,6 +514,15 @@ def _parser() -> argparse.ArgumentParser:
     native.add_argument("--upstream-tag", required=True)
     native.add_argument("--upstream-commit", required=True)
 
+    native_release = subparsers.add_parser("validate-native-release")
+    native_release.add_argument("--manifest", required=True, type=Path)
+    native_release.add_argument("--checksums", required=True, type=Path)
+    native_release.add_argument("--release-json", required=True, type=Path)
+    native_release.add_argument("--manifest-sha256", required=True)
+    native_release.add_argument("--native-release-tag", required=True)
+    native_release.add_argument("--upstream-tag", required=True)
+    native_release.add_argument("--upstream-commit", required=True)
+
     compare = subparsers.add_parser("compare-upstream")
     compare.add_argument("current")
     compare.add_argument("target")
@@ -314,6 +530,12 @@ def _parser() -> argparse.ArgumentParser:
     scan = subparsers.add_parser("scan-native")
     scan.add_argument("--manifest", required=True, type=Path)
     scan.add_argument("--native-release-tag", required=True)
+
+    select = subparsers.add_parser("select-stable-native-release")
+    select.add_argument("--releases-json", required=True, type=Path)
+
+    environment = subparsers.add_parser("validate-environment")
+    environment.add_argument("--environment-json", required=True, type=Path)
 
     return parser
 
@@ -365,12 +587,43 @@ def main() -> int:
                 args.upstream_commit,
             )
             print(json.dumps(identity.__dict__, sort_keys=True))
+        elif args.command == "validate-native-release":
+            release_payload = json.loads(args.release_json.read_text(encoding="utf-8"))
+            if not isinstance(release_payload, Mapping):
+                raise ContractError("native GitHub release root must be an object")
+            identity = validate_native_release(
+                args.manifest,
+                args.checksums,
+                release_payload,
+                args.manifest_sha256,
+                args.native_release_tag,
+                args.upstream_tag,
+                args.upstream_commit,
+            )
+            print(json.dumps(identity.__dict__, sort_keys=True))
         elif args.command == "compare-upstream":
             print(compare_upstream(args.current, args.target).value)
-        else:
+        elif args.command == "scan-native":
             payload = json.loads(args.manifest.read_text(encoding="utf-8"))
             identity = resolve_native_manifest(payload, args.native_release_tag)
             print(json.dumps(identity.__dict__, sort_keys=True))
+        elif args.command == "select-stable-native-release":
+            releases = json.loads(args.releases_json.read_text(encoding="utf-8"))
+            if not isinstance(releases, list):
+                raise ContractError("native release listing must be a JSON array")
+            print(select_stable_native_release(releases))
+        else:
+            environment_payload = json.loads(
+                args.environment_json.read_text(encoding="utf-8")
+            )
+            if not isinstance(environment_payload, Mapping):
+                raise ContractError("publication environment root must be an object")
+            print(json.dumps({
+                "environment": "bridge-assets-publication",
+                "required_reviewers": validate_publication_environment(
+                    environment_payload
+                ),
+            }, sort_keys=True))
     except (ContractError, OSError, json.JSONDecodeError) as error:
         raise SystemExit(f"error: {error}") from error
     return 0

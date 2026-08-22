@@ -333,6 +333,8 @@ def main() -> int:
     require(
         "NATIVE_REPO: leehack/llamadart-native" in auto_update
         and "release-candidate.json" in auto_update
+        and "select-stable-native-release" in auto_update
+        and "gh release view" not in auto_update
         and "native_manifest_sha256" in auto_update
         and "scripts/release_contract.py scan-native" in auto_update
         and "gh workflow run" not in auto_update
@@ -398,14 +400,24 @@ def main() -> int:
         and "release_tag:" in publish
         and "release_rebuild:" in publish
         and "assets_repo:" in publish
-        and "release_capabilities:" in publish
+        and "release_capabilities:" not in publish
         and "publish_approved:" in publish
         and "llama_cpp.version" not in publish,
         "publish_assets.yml must expose exact bridge/upstream/native/output inputs without depending on a bridge pin",
         errors,
     )
     require(
+        "BRIDGE_REPO: leehack/llama-web-bridge" in publish
+        and len(re.findall(r"repository: leehack/llama-web-bridge\s*$", publish, re.MULTILINE)) == 3
+        and '--bridge-repo "${BRIDGE_REPO}"' in publish
+        and 'repos/${GITHUB_REPOSITORY}' not in publish,
+        "reusable publication must always checkout and verify the owning bridge repository, never the caller",
+        errors,
+    )
+    require(
         "publish_approved=true requires explicit maintainer approval" in publish
+        and "Verify externally configured approval environment" in publish
+        and "release_contract.py validate-environment" in publish
         and "environment: bridge-assets-publication" in publish
         and "push:" not in publish.split("permissions:", 1)[0]
         and "schedule:" not in publish,
@@ -413,7 +425,9 @@ def main() -> int:
         errors,
     )
     require(
-        "scripts/release_contract.py validate-native" in publish
+        "scripts/release_contract.py validate-native-release" in publish
+        and '"repos/${NATIVE_REPO}/releases/assets/${asset_id}"' in publish
+        and "--checksums \"${RUNNER_TEMP}/native-release/SHA256SUMS\"" in publish
         and "--manifest-sha256 \"${NATIVE_MANIFEST_SHA256}\"" in publish
         and "git clone --depth 1 --branch \"${UPSTREAM_TAG}\"" in publish
         and "git clone --depth 1 --branch \"${NATIVE_RELEASE_TAG}\"" in publish
@@ -423,31 +437,33 @@ def main() -> int:
     )
     require(
         "concurrency:" in publish
-        and "group: publish-bridge-assets" in publish
+        and "group: publish-bridge-assets-leehack-llama-web-bridge-assets" in publish
         and "cancel-in-progress: false" in publish,
         "publish_assets.yml must serialize asset publishes so automatic and manual releases cannot race",
         errors,
     )
     require(
-        "--previous-manifest assets-repo/manifest.json" in publish
-        and "asset tag collision" in publish
-        and "asset release collision" in publish
-        and "bridge source must advance or remain unchanged" in publish
-        and "source changes require an ordinary merged PR" in publish
+        "scripts/release_publication_state.py classify" in publish
+        and "recoverable-partial" in publish
+        and "upload-release-assets" in publish
+        and "gh release upload" in publish
+        and "publication_outcome" in publish
+        and 'cp "${RUNNER_TEMP}/preflight.json" "${RUNNER_TEMP}/publication-outcome.json"' in publish
+        and "state_changed()" in publish
+        and "persist-credentials: false" in publish
         and "sha256sum --check sha256sums.txt" in publish
         and "git -C assets-repo push --atomic" in publish,
-        "publication must reject collision, rollback, diverged source, and checksum failures before an atomic branch/tag push",
+        "publication must classify exact retry states, emit outcomes, lock credentials, and recheck after mutation",
         errors,
     )
     require(
         "Run durable state persistence gate" in publish
         and "Run durable multimodal gate" in publish
         and "Run durable Qwen3-ASR gate" in publish
-        and "if: contains(inputs.release_capabilities, 'asr')" in publish
         and "Run durable Qwen3-TTS memory64 gate" in publish
-        and "if: contains(inputs.release_capabilities, 'tts')" in publish
+        and "contains(inputs.release_capabilities" not in publish
         and "WEBGPU_BRIDGE_BUILD_MEM64: 1" in publish,
-        "exact publication must build wasm32/memory64 and run durable state, multimodal, and advertised ASR/TTS gates",
+        "exact publication must always build wasm32/memory64 and run state, multimodal, ASR, and TTS gates",
         errors,
     )
     require(
@@ -458,7 +474,7 @@ def main() -> int:
         and '"release_tag": release.tag' in read_required(
             "scripts/generate_release_manifest.py", errors
         )
-        and '"capabilities": capabilities' in read_required(
+        and '"capabilities": CAPABILITIES' in read_required(
             "scripts/generate_release_manifest.py", errors
         )
         and '"bridge_commit": bridge_commit' in read_required(
