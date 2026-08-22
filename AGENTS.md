@@ -127,8 +127,9 @@ python3 scripts/text_to_speech_browser_smoke.py \
   --gpu-layers 99
 ```
 
-Keep this gate opt-in because the pair is large and memory64-only in practice,
-but require it before publishing assets advertised for Qwen3-TTS.
+Keep this gate opt-in in ordinary CI because the pair is large and
+memory64-only in practice. The asset release workflow must run it for every
+publication because the bridge exposes Qwen3-TTS.
 
 ## CI / Release
 
@@ -163,15 +164,19 @@ but require it before publishing assets advertised for Qwen3-TTS.
     not read `llama_cpp.version`.
   - Uses the same `emsdk.version` compiler identity as CI and records the
     runtime-verified version in `manifest.json`.
-  - Requires `publish_approved=true`, `WEBGPU_BRIDGE_ASSETS_PAT`, and approval
-    through the protected `bridge-assets-publication` environment.
+  - Requires `publish_approved=true`. Publication remains blocked until an
+    administrator externally creates `bridge-assets-publication`, configures
+    required reviewers, and stores `WEBGPU_BRIDGE_ASSETS_PAT` as an
+    environment-scoped secret. Do not describe that environment as protected
+    without current live evidence.
   - Emits only stable `vMAJOR.MINOR.PATCH[-N]` or development `bNNNN[-N]` tags.
     Historical `*-llamadart.N` forms are accepted only when reading old
     manifests and are never emitted.
   - Rejects identity/checksum mismatches, rollback, channel reversal, diverged
     bridge source, output collisions, and unmerged bridge source commits.
-  - Builds exact wasm32/memory64 assets and always runs state and multimodal
-    smokes. ASR/TTS are advertised only when their opt-in durable gates run.
+  - Builds exact wasm32/memory64 assets and always runs state, multimodal, ASR,
+    and TTS durable release smokes; callers cannot downgrade exposed
+    capabilities.
   - Publishes schema-v2 provenance with release tag, capabilities, bridge,
     upstream, and native commits, and per-artifact SHA-256 values.
   - Any future npm package version has an independent monotonic sequence and
