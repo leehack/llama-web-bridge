@@ -998,14 +998,15 @@ function installBridgeWorkerHost() {
             return;
           }
 
-          const pieceBytes = Uint8Array.from(
-            toUint8Array(piece) || new Uint8Array(),
-          );
-          if (pieceBytes.byteLength === 0) {
+          const normalizedPieceBytes = toUint8Array(piece) || new Uint8Array();
+          if (normalizedPieceBytes.byteLength === 0) {
             return;
           }
 
           if (tokenEventFlushMs > 0) {
+            const pieceBytes = Array.isArray(piece)
+              ? normalizedPieceBytes
+              : Uint8Array.from(normalizedPieceBytes);
             pendingPieceBytes.push(pieceBytes);
             pendingPieceByteLength += pieceBytes.byteLength;
             pendingPieceCharLength += pendingPieceCharDecoder.decode(
@@ -1037,7 +1038,7 @@ function installBridgeWorkerHost() {
             id,
             event: 'token',
             payload: {
-              piece: Array.from(pieceBytes),
+              piece: Array.from(normalizedPieceBytes),
               currentText: shouldEmitCurrentText ? String(currentText || '') : '',
             },
           });
