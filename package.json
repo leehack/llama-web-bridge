@@ -5,10 +5,11 @@
   "type": "module",
   "scripts": {
     "build:js": "node scripts/build_js_bridge.mjs",
-    "check:js": "npm run typecheck:js && npm run build:js && npm run syntax:js && npm run test:embedding-json && npm run test:tts-recovery",
+    "check:js": "npm run typecheck:js && npm run build:js && npm run syntax:js && npm run test:embedding-json && npm run test:tts-recovery && npm run test:worker-state",
     "syntax:js": "node --check js/llama_webgpu_bridge.js && node --check js/llama_webgpu_bridge_worker.js",
     "test:embedding-json": "node scripts/embedding_json_contract_test.mjs",
     "test:tts-recovery": "node scripts/text_to_speech_recovery_test.mjs",
+    "test:worker-state": "node scripts/worker_runtime_state_test.mjs",
     "typecheck:js": "tsc -p tsconfig.bridge.json --noEmit"
   },
   "devDependencies": {

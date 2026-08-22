@@ -126,8 +126,8 @@ def write_harness(web_root: Path) -> None:
           seed: 42,
           tokenEventEncoding: 'text',
           parts: [{ type: 'image', bytes: imageBytes }],
-          mediaMaxImagePixels: 307200,
-          mediaMaxImageEdge: 768,
+          mediaMaxImagePixels: 50000,
+          mediaMaxImageEdge: 300,
         });
         const outputText = String(output || '').trim();
         assert(outputText.length > 0, `${mode} returned empty multimodal output`);
@@ -135,10 +135,19 @@ def write_harness(web_root: Path) -> None:
           outputText.toLowerCase().includes('hello'),
           `${mode} did not recognize the synthetic HELLO image: ${outputText}`,
         );
+        const metadata = bridge.getModelMetadata();
+        const runtimeNotes = String(metadata['llamadart.webgpu.runtime_notes'] || '');
+        assert(
+          runtimeNotes.includes('media_image_resized:320x180->'),
+          `${mode} did not expose the image-resize diagnostic: ${runtimeNotes}`,
+        );
         modeResults.push({
           mode,
           elapsedMs: Math.round(performance.now() - startedAt),
           output: outputText.slice(0, 160),
+          imageResizeDiagnostic: runtimeNotes
+            .split(';')
+            .find((note) => note.startsWith('media_image_resized:')),
         });
       } finally {
         await bridge.dispose();
