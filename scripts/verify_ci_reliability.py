@@ -115,6 +115,13 @@ def main() -> int:
     publish = read_required(".github/workflows/publish_assets.yml", errors)
     auto_update = read_required(".github/workflows/auto_llama_cpp_update.yml", errors)
     build_bridge = read_required("scripts/build_bridge.sh", errors)
+    emscripten_version_check = read_required(
+        "scripts/verify_emscripten_version.py", errors
+    )
+    wasm64_patch = read_required("scripts/patch_wasm64_runtime.py", errors)
+    wasm64_patch_contract = read_required(
+        "scripts/wasm64_runtime_patch_contract_test.py", errors
+    )
     js_build = read_required("scripts/build_js_bridge.mjs", errors)
     package_json = read_required("package.json", errors)
     tsconfig = read_required("tsconfig.bridge.json", errors)
@@ -124,6 +131,7 @@ def main() -> int:
     cmake = read_required("CMakeLists.txt", errors)
     core = read_required("src/llama_webgpu_core.cpp", errors)
     version = read_required("llama_cpp.version", errors).strip()
+    emscripten_version = read_required("emsdk.version", errors).strip()
     agents = read_required("AGENTS.md", errors)
     readme = read_required("README.md", errors)
     api_docs = read_required("docs/api.md", errors)
@@ -255,6 +263,65 @@ def main() -> int:
     require(
         version.startswith("b") and version[1:].isdigit(),
         "llama_cpp.version must contain a llama.cpp release tag like b9165",
+        errors,
+    )
+    require(
+        re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", emscripten_version) is not None,
+        "emsdk.version must contain one exact Emscripten semantic version",
+        errors,
+    )
+    for name, workflow in (("ci.yml", ci), ("publish_assets.yml", publish)):
+        require(
+            "Resolve Emscripten SDK pin" in workflow
+            and "scripts/verify_emscripten_version.py --print-pin" in workflow
+            and "version: ${{ env.EMSCRIPTEN_VERSION }}" in workflow
+            and "Verify resolved Emscripten compiler" in workflow
+            and 'scripts/verify_emscripten_version.py --emit-github-env "$GITHUB_ENV"'
+            in workflow
+            and "version: latest" not in workflow,
+            f"{name} must install emsdk.version and verify the resolved emcc version before building",
+            errors,
+        )
+    require(
+        "emsdk.version" in emscripten_version_check
+        and '["emcc", "--version"]' in emscripten_version_check
+        and "resolved != expected" in emscripten_version_check
+        and "EMSCRIPTEN_VERSION={resolved}" in emscripten_version_check
+        and "scripts/verify_emscripten_version.py" in build_bridge
+        and build_bridge.find("scripts/verify_emscripten_version.py")
+        < build_bridge.find('echo "[bridge] configuring with emcmake"'),
+        "the Emscripten verifier must compare emcc against emsdk.version, export the resolved compiler identity, and gate direct builds",
+        errors,
+    )
+    require(
+        "'emscripten_version': os.environ['EMSCRIPTEN_VERSION']" in publish,
+        "the asset manifest must record the runtime-verified Emscripten compiler version",
+        errors,
+    )
+    required_wasmfs_symbols = (
+        "__wasmfs_read",
+        "__wasmfs_pread",
+        "__wasmfs_write",
+        "__wasmfs_pwrite",
+        "__wasmfs_mmap",
+    )
+    require(
+        all(symbol in wasm64_patch for symbol in required_wasmfs_symbols)
+        and "if count == 0" in wasm64_patch
+        and "inspect the pinned Emscripten output" in wasm64_patch
+        and "scripts/patch_wasm64_runtime.py" in build_bridge
+        and "llama_webgpu_core_mem64.js" in build_bridge,
+        "the wasm64 generated-JS transform must require every named WASMFS symbol and report actionable failures",
+        errors,
+    )
+    require(
+        "test_each_single_match_still_fails_the_five_symbol_contract"
+        in wasm64_patch_contract
+        and "test_each_missing_symbol_is_named_independently"
+        in wasm64_patch_contract
+        and "CURRENT_EMSCRIPTEN_OUTPUT" in wasm64_patch_contract
+        and "Validate wasm64 runtime patch contract" in ci,
+        "CI must prove one-of-five matches cannot pass and retain the current Emscripten output contract",
         errors,
     )
     require(
@@ -536,8 +603,9 @@ def main() -> int:
         and "speech_to_text_browser_smoke.py" in agents
         and "text_to_speech_browser_smoke.py" in agents
         and "llama_cpp.version" in agents
+        and "emsdk.version" in agents
         and "auto_llama_cpp_update.yml" in agents,
-        "AGENTS.md must document the JS build gate, agent PR workflow, browser smoke expectations, and llama.cpp auto-update policy",
+        "AGENTS.md must document the JS build gate, agent PR workflow, browser smoke expectations, and pinned toolchain policies",
         errors,
     )
     require(
@@ -553,8 +621,9 @@ def main() -> int:
         and "scripts/text_to_speech_browser_smoke.py" in readme
         and "scripts/verify_ci_reliability.py" in readme
         and "llama_cpp.version" in readme
+        and "emsdk.version" in readme
         and "auto_llama_cpp_update.yml" in readme,
-        "README.md must document the public API reference, CI reliability, JS build/type-checking, diagnostics, Node 24 action-runtime coverage, and llama.cpp pin automation",
+        "README.md must document the public API reference, CI reliability, JS build/type-checking, diagnostics, and pinned toolchain automation",
         errors,
     )
     for api_name in (
@@ -610,8 +679,9 @@ def main() -> int:
         and "scripts/text_to_speech_browser_smoke.py" in contributing
         and "--model-sha256" in contributing
         and "--mmproj-sha256" in contributing
-        and "llama_cpp.version" in contributing,
-        "CONTRIBUTING.md must document JS build/type-checking, maintainer/agent workflow guardrails, checksum-pinned smoke usage, and llama.cpp pin handling",
+        and "llama_cpp.version" in contributing
+        and "emsdk.version" in contributing,
+        "CONTRIBUTING.md must document JS build/type-checking, maintainer/agent workflow guardrails, checksum-pinned smoke usage, and toolchain pin handling",
         errors,
     )
 

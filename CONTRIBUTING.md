@@ -9,7 +9,7 @@ Published artifacts are consumed from `llama-web-bridge-assets`.
 
 ## Prerequisites
 
-- Emscripten SDK (`emcmake`, `emcc`)
+- Emscripten SDK (`emcmake`, `emcc`) matching `emsdk.version`
 - Node.js/npm for JS bridge bundling and TypeScript `checkJs`
 - CMake toolchain
 - Access to a llama.cpp checkout matching `llama_cpp.version`
@@ -149,6 +149,9 @@ query strings, and fragments before printing the location.
 - Preserve `llama_cpp.version` as the single source of truth for default CI and
   publish builds. Manual publish overrides are allowed for temporary validation,
   but tag-triggered publishes should use the pinned file.
+- Preserve `emsdk.version` as the single compiler source for CI and publish.
+  Both workflows must verify the active `emcc` version, and published manifests
+  must record that verified identity.
 - Main-branch CI automatically dispatches `publish_assets.yml` after a successful
   build/smoke only when the pushed commit range changed `llama_cpp.version`. The
   dispatch passes the validated source SHA and lets the serialized publish
