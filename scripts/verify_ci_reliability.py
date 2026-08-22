@@ -275,7 +275,10 @@ def main() -> int:
             "Resolve Emscripten SDK pin" in workflow
             and "scripts/verify_emscripten_version.py --print-pin" in workflow
             and "version: ${{ env.EMSCRIPTEN_VERSION }}" in workflow
-            and "Verify resolved Emscripten compiler" in workflow
+            and (
+                "Verify resolved Emscripten compiler" in workflow
+                or "Verify compiler and build wasm32 plus memory64" in workflow
+            )
             and 'scripts/verify_emscripten_version.py --emit-github-env "$GITHUB_ENV"'
             in workflow
             and "version: latest" not in workflow,
@@ -294,7 +297,10 @@ def main() -> int:
         errors,
     )
     require(
-        "'emscripten_version': os.environ['EMSCRIPTEN_VERSION']" in publish,
+        "--emscripten-version \"${EMSCRIPTEN_VERSION}\"" in publish
+        and '"emscripten_version": args.emscripten_version' in read_required(
+            "scripts/generate_release_manifest.py", errors
+        ),
         "the asset manifest must record the runtime-verified Emscripten compiler version",
         errors,
     )
@@ -325,14 +331,15 @@ def main() -> int:
         errors,
     )
     require(
-        "PARITY_REPO: leehack/llamadart-native" in auto_update
-        and "gh api repos/ggml-org/llama.cpp/releases/latest" in auto_update
-        and 'gh api "repos/${PARITY_REPO}/releases/latest"' in auto_update
-        and "gh release list --repo ggml-org/llama.cpp --limit 1" not in auto_update
-        and '[[ "$UPSTREAM_LATEST_TAG" =~ ^b[0-9]+$ ]]' in auto_update
-        and '[[ "$TARGET_TAG" =~ ^b[0-9]+$ ]]' in auto_update
-        and '"${TARGET_TAG#b}" -lt "${CURRENT_TAG#b}"' in auto_update,
-        "auto_llama_cpp_update.yml must target the latest published native release, retain raw upstream context, reject non-bNNNNN tags, and prevent downgrades",
+        "NATIVE_REPO: leehack/llamadart-native" in auto_update
+        and "release-candidate.json" in auto_update
+        and "native_manifest_sha256" in auto_update
+        and "scripts/release_contract.py scan-native" in auto_update
+        and "gh workflow run" not in auto_update
+        and "create-pull-request" not in auto_update
+        and "git push" not in auto_update
+        and "did not change" in auto_update,
+        "the scheduled native scan must only prepare exact candidate inputs and must not change pins, open PRs, dispatch publication, or push",
         errors,
     )
     require(
@@ -374,52 +381,44 @@ def main() -> int:
         errors,
     )
     require(
-        "dispatch-publish-assets:" in ci
-        and "needs: build-webgpu-bridge" in ci
-        and "if: github.event_name == 'push' && github.ref == 'refs/heads/main'" in ci
-        and "actions: write" in ci
-        and "fetch-depth: 0" in ci
-        and "git diff --quiet \"${BEFORE_SHA}\" \"${GITHUB_SHA}\" -- \"${VERSION_FILE}\"" in ci
-        and "gh workflow run publish_assets.yml" in ci
-        and "-f assets_tag=auto" in ci
-        and "-f assets_repo=\"${ASSETS_REPO}\"" in ci
-        and "-f source_ref=\"${GITHUB_SHA}\"" in ci,
-        "ci.yml must dispatch asset publishing only after successful main pushes that changed llama_cpp.version, with actions:write scoped to the dispatch job and auto tag resolution delegated to publish_assets.yml",
+        "dispatch-publish-assets:" not in ci
+        and "gh workflow run publish_assets.yml" not in ci
+        and "actions: write" not in ci,
+        "ordinary CI must never dispatch or authorize cross-repository asset publication",
         errors,
     )
     require(
-        "REQUESTED_LLAMA_CPP_TAG" in publish
-        and "source_ref:" in publish
-        and "REQUESTED_SOURCE_REF" in publish
-        and "ref: ${{ env.REQUESTED_SOURCE_REF }}" in publish
-        and "tr -d '[:space:]' < llama_cpp.version" in publish
-        and "outputs:" in publish
-        and "llama_cpp_tag: ${{ steps.resolve-publish-parameters.outputs.llama_cpp_tag }}" in publish
-        and "assets_tag: ${{ steps.resolve-publish-parameters.outputs.assets_tag }}" in publish
-        and "source_commit: ${{ steps.resolve-publish-parameters.outputs.source_commit }}" in publish
-        and "LLAMA_CPP_TAG: ${{ needs.build-bridge-assets.outputs.llama_cpp_tag }}" in publish
-        and "SOURCE_COMMIT: ${{ needs.build-bridge-assets.outputs.source_commit }}" in publish
-        and "llama.cpp tag must match b[0-9]+" in publish
-        and "default: b9116" not in publish
-        and "|| 'b9116'" not in publish,
-        "publish_assets.yml must default to llama_cpp.version, support an explicit source ref, pass resolved tags/commit across jobs, and still allow a manual override",
+        "workflow_call:" in publish
+        and "workflow_dispatch:" in publish
+        and "bridge_source_sha:" in publish
+        and "upstream_tag:" in publish
+        and "upstream_commit:" in publish
+        and "native_release_tag:" in publish
+        and "native_manifest_sha256:" in publish
+        and "release_tag:" in publish
+        and "release_rebuild:" in publish
+        and "assets_repo:" in publish
+        and "release_capabilities:" in publish
+        and "publish_approved:" in publish
+        and "llama_cpp.version" not in publish,
+        "publish_assets.yml must expose exact bridge/upstream/native/output inputs without depending on a bridge pin",
         errors,
     )
     require(
-        "if [ \"${ASSETS_TAG}\" = \"auto\" ]; then" in publish
-        and "assets_tag=auto requires source_ref to be a full source commit SHA" in publish
-        and "checked-out source commit ${SOURCE_COMMIT} does not match requested source_ref" in publish
-        and "gh release view --repo \"${ASSETS_REPO}\" --json tagName" in publish
-        and "RESOLVED_ASSETS_TAG=\"v${MAJOR}.${MINOR}.$((PATCH + 1))\"" in publish
-        and "assets tag must be a vMAJOR.MINOR.PATCH tag or auto" in publish,
-        "publish_assets.yml must resolve automatic next patch asset tags inside the serialized publish workflow",
+        "publish_approved=true requires explicit maintainer approval" in publish
+        and "environment: bridge-assets-publication" in publish
+        and "push:" not in publish.split("permissions:", 1)[0]
+        and "schedule:" not in publish,
+        "cross-repository publication must require explicit input confirmation plus the protected publication environment and have no automatic trigger",
         errors,
     )
     require(
-        "-f source_ref=\"${GITHUB_SHA}\"" in ci
-        and "SOURCE_COMMIT=\"$(git rev-parse HEAD)\"" in publish
-        and "OUT_DIR: ${{ runner.temp }}/webgpu_bridge_dist\n          ASSETS_TAG: ${{ env.ASSETS_TAG }}" not in publish,
-        "CI-dispatched publishes must build the exact validated source SHA and manifest generation must inherit the runtime-resolved assets tag",
+        "scripts/release_contract.py validate-native" in publish
+        and "--manifest-sha256 \"${NATIVE_MANIFEST_SHA256}\"" in publish
+        and "git clone --depth 1 --branch \"${UPSTREAM_TAG}\"" in publish
+        and "git clone --depth 1 --branch \"${NATIVE_RELEASE_TAG}\"" in publish
+        and "checked-out bridge source does not match the requested full SHA" in publish,
+        "publication must verify exact bridge, upstream tag/commit, native tag/commit, and native manifest checksum identities",
         errors,
     )
     require(
@@ -430,54 +429,51 @@ def main() -> int:
         errors,
     )
     require(
-        "Read previous asset metadata" in publish
-        and "id: previous-release" in publish
-        and "PREVIOUS_ASSETS_TAG: ${{ steps.previous-release.outputs.assets_tag }}"
-        in publish
-        and "PREVIOUS_SOURCE_COMMIT: ${{ steps.previous-release.outputs.source_commit }}"
-        in publish
-        and "PREVIOUS_LLAMA_CPP_TAG: ${{ steps.previous-release.outputs.llama_cpp_tag }}"
-        in publish
-        and "compare/${PREVIOUS_SOURCE_COMMIT}...${SOURCE_COMMIT}" in publish
-        and "compare/${PREVIOUS_LLAMA_CPP_TAG}...${LLAMA_CPP_TAG}" in publish
-        and 'SOURCE_COMPARE_STATUS" != "ahead"' in publish
-        and "source commit must advance" in publish
-        and "Commit list truncated to" in publish
-        and "llama.cpp tag must not move backward" in publish
-        and "${ASSETS_REPO}/blob/${ASSETS_TAG}/manifest.json" in publish
-        and "${ASSETS_REPO}/blob/${ASSETS_TAG}/sha256sums.txt" in publish
-        and '--notes-file "$NOTES_FILE"' in publish
-        and "State persistence APIs included:" not in publish,
-        "publish_assets.yml must derive release-specific notes from the previous manifest instead of reusing a feature-specific description",
-        errors,
-    )
-    release_notes_index = publish.find("- name: Generate asset release notes")
-    publish_assets_index = publish.find("- name: Publish assets and tag")
-    create_release_index = publish.find("- name: Create or update assets release")
-    require(
-        -1 < release_notes_index < publish_assets_index < create_release_index,
-        "publish_assets.yml must validate and generate release notes before pushing assets or creating the release",
+        "--previous-manifest assets-repo/manifest.json" in publish
+        and "asset tag collision" in publish
+        and "asset release collision" in publish
+        and "bridge source must advance or remain unchanged" in publish
+        and "source changes require an ordinary merged PR" in publish
+        and "sha256sum --check sha256sums.txt" in publish
+        and "git -C assets-repo push --atomic" in publish,
+        "publication must reject collision, rollback, diverged source, and checksum failures before an atomic branch/tag push",
         errors,
     )
     require(
-        "concurrency:" in auto_update
-        and "group: llama-cpp-auto-update" in auto_update
-        and "UPDATE_BRANCH: automation/bump-llama-cpp" in auto_update
-        and "ggml-org/llama.cpp" in auto_update
-        and "create-pull-request" in auto_update
-        and "actions: read" in auto_update
-        and "contents: read" in auto_update
-        and "pull-requests: read" in auto_update
-        and "id: create-pr" in auto_update
-        and "token: ${{ secrets.WEBGPU_BRIDGE_ASSETS_PAT }}" in auto_update
-        and "--event pull_request" in auto_update
-        and "gh workflow run ci.yml" not in auto_update
-        and "body-path: /tmp/llama_cpp_update_pr.md" in auto_update
-        and "Upstream changelog" in auto_update
-        and "Native parity release" in auto_update
-        and "Raw upstream latest observed" in auto_update
-        and "not racing a non-automation PR" in auto_update,
-        "auto_llama_cpp_update.yml must use maintainer-authored PR events, follow native release parity, wait for exact-head PR CI, and avoid racing human PRs",
+        "Run durable state persistence gate" in publish
+        and "Run durable multimodal gate" in publish
+        and "Run durable Qwen3-ASR gate" in publish
+        and "if: contains(inputs.release_capabilities, 'asr')" in publish
+        and "Run durable Qwen3-TTS memory64 gate" in publish
+        and "if: contains(inputs.release_capabilities, 'tts')" in publish
+        and "WEBGPU_BRIDGE_BUILD_MEM64: 1" in publish,
+        "exact publication must build wasm32/memory64 and run durable state, multimodal, and advertised ASR/TTS gates",
+        errors,
+    )
+    require(
+        "scripts/generate_release_manifest.py" in publish
+        and '"schema_version": 2' in read_required(
+            "scripts/generate_release_manifest.py", errors
+        )
+        and '"release_tag": release.tag' in read_required(
+            "scripts/generate_release_manifest.py", errors
+        )
+        and '"capabilities": capabilities' in read_required(
+            "scripts/generate_release_manifest.py", errors
+        )
+        and '"bridge_commit": bridge_commit' in read_required(
+            "scripts/generate_release_manifest.py", errors
+        )
+        and '"upstream_commit": upstream_commit' in read_required(
+            "scripts/generate_release_manifest.py", errors
+        )
+        and '"native_commit": native_commit' in read_required(
+            "scripts/generate_release_manifest.py", errors
+        )
+        and '"sha256": digest' in read_required(
+            "scripts/generate_release_manifest.py", errors
+        ),
+        "published manifests must carry schema, capability, three-source provenance, and per-artifact SHA-256 fields",
         errors,
     )
 

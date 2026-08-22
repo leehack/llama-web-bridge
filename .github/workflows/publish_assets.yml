@@ -1,53 +1,182 @@
-name: Publish Bridge Assets
+name: Build and Publish Exact Bridge Assets
 
 on:
-  workflow_dispatch:
-    inputs:
-      assets_tag:
-        description: Tag to publish to assets repo (for example v0.1.1), or auto for the next patch tag
+  workflow_call:
+    inputs: &release_inputs
+      bridge_source_sha:
+        description: Exact full llama-web-bridge source commit to build
         required: true
+        type: string
+      upstream_tag:
+        description: Exact llama.cpp vMAJOR.MINOR.PATCH or bNNNN tag
+        required: true
+        type: string
+      upstream_commit:
+        description: Exact full commit resolved by upstream_tag
+        required: true
+        type: string
+      native_release_tag:
+        description: Exact native release tag that owns assets.json
+        required: true
+        type: string
+      native_manifest_sha256:
+        description: Expected SHA-256 of the native release assets.json
+        required: true
+        type: string
+      release_tag:
+        description: Exact output tag vMAJOR.MINOR.PATCH[-N] or bNNNN[-N]
+        required: true
+        type: string
+      release_rebuild:
+        description: Rebuild counter encoded by release_tag
+        required: true
+        type: number
       assets_repo:
-        description: Asset repository in owner/repo format
-        required: true
+        description: Asset repository in owner/repo form
+        required: false
         default: leehack/llama-web-bridge-assets
-      llama_cpp_tag:
-        description: Optional llama.cpp tag override; defaults to llama_cpp.version
+        type: string
+      release_capabilities:
+        description: "Canonical capabilities: state,multimodal optionally followed by asr and/or tts"
         required: false
-        default: ''
-      source_ref:
-        description: Optional llama-web-bridge source ref/SHA to build; defaults to the workflow ref
-        required: false
-        default: ''
-  push:
-    tags:
-      - 'v*'
-
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
-  ASSETS_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.assets_tag || github.ref_name }}
-  ASSETS_REPO: ${{ github.event_name == 'workflow_dispatch' && inputs.assets_repo || 'leehack/llama-web-bridge-assets' }}
-  REQUESTED_LLAMA_CPP_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.llama_cpp_tag || '' }}
-  REQUESTED_SOURCE_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.source_ref || github.sha }}
+        default: state,multimodal
+        type: string
+      publish_approved:
+        description: Explicit approval from the calling orchestrator
+        required: true
+        type: boolean
+    secrets:
+      WEBGPU_BRIDGE_ASSETS_PAT:
+        required: true
+  workflow_dispatch:
+    inputs: *release_inputs
 
 permissions:
   contents: read
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  BRIDGE_SOURCE_SHA: ${{ inputs.bridge_source_sha }}
+  UPSTREAM_TAG: ${{ inputs.upstream_tag }}
+  UPSTREAM_COMMIT: ${{ inputs.upstream_commit }}
+  NATIVE_REPO: leehack/llamadart-native
+  NATIVE_RELEASE_TAG: ${{ inputs.native_release_tag }}
+  NATIVE_MANIFEST_SHA256: ${{ inputs.native_manifest_sha256 }}
+  RELEASE_TAG: ${{ inputs.release_tag }}
+  RELEASE_REBUILD: ${{ inputs.release_rebuild }}
+  ASSETS_REPO: ${{ inputs.assets_repo }}
+  RELEASE_CAPABILITIES: ${{ inputs.release_capabilities }}
+
 concurrency:
-  group: publish-bridge-assets
+  group: publish-bridge-assets-${{ inputs.assets_repo }}
   cancel-in-progress: false
 
 jobs:
-  build-bridge-assets:
-    name: Build bridge assets
+  validate-request:
+    name: Require explicit publication approval
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate approval boundary
+        env:
+          PUBLISH_APPROVED: ${{ inputs.publish_approved }}
+        run: |
+          if [ "${PUBLISH_APPROVED}" != "true" ]; then
+            echo "error: publish_approved=true requires explicit maintainer approval"
+            exit 1
+          fi
+
+  build-and-gate:
+    name: Build exact source and run release gates
+    needs: validate-request
     runs-on: ubuntu-latest
     outputs:
-      llama_cpp_tag: ${{ steps.resolve-publish-parameters.outputs.llama_cpp_tag }}
-      assets_tag: ${{ steps.resolve-publish-parameters.outputs.assets_tag }}
-      source_commit: ${{ steps.resolve-publish-parameters.outputs.source_commit }}
+      native_commit: ${{ steps.native.outputs.native_commit }}
+      emscripten_version: ${{ steps.emscripten.outputs.emscripten_version }}
+    env:
+      LLAMA_WEBGPU_SMOKE_MODEL_URL: https://huggingface.co/aladar/llama-2-tiny-random-GGUF/resolve/main/llama-2-tiny-random.gguf
+      LLAMA_WEBGPU_SMOKE_MODEL_SHA256: 81f226c62d28ed4a1a9b9fa080fcd9f0cc40e0f9d5680036583ff98fbcd035cb
+      LLAMA_WEBGPU_SMOKE_MODEL_CACHE: ~/.cache/llama-web-bridge/state-smoke-models
+      LLAMA_WEBGPU_SMOKE_ARTIFACTS_DIR: /tmp/state-persistence-smoke-artifacts
+      LLAMA_WEBGPU_MULTIMODAL_MODEL_URL: https://huggingface.co/unsloth/Qwen3.5-0.8B-GGUF/resolve/main/Qwen3.5-0.8B-Q4_K_M.gguf
+      LLAMA_WEBGPU_MULTIMODAL_MODEL_SHA256: bd258782e35f7f458f8aced1adc053e6e92e89bc735ba3be89d38a06121dc517
+      LLAMA_WEBGPU_MULTIMODAL_MMPROJ_URL: https://huggingface.co/unsloth/Qwen3.5-0.8B-GGUF/resolve/main/mmproj-F16.gguf
+      LLAMA_WEBGPU_MULTIMODAL_MMPROJ_SHA256: 56e4c6cfe73b0c82e3e82bc518d7591997e61d81f723fc41a586f4fa69ea2453
+      LLAMA_WEBGPU_MULTIMODAL_MODEL_CACHE: ~/.cache/llama-web-bridge/multimodal-smoke-models
+      LLAMA_WEBGPU_MULTIMODAL_ARTIFACTS_DIR: /tmp/multimodal-smoke-artifacts
+      LLAMA_WEBGPU_MULTIMODAL_TIMEOUT_MS: 420000
+      LLAMA_WEBGPU_SPEECH_MODEL_URL: https://huggingface.co/ggml-org/Qwen3-ASR-0.6B-GGUF/resolve/928ab958557df9aa2ef1c93e0e83c7ad0933fae2/Qwen3-ASR-0.6B-Q8_0.gguf?download=true
+      LLAMA_WEBGPU_SPEECH_MODEL_SHA256: bca259818b50ca7c4c05e9bdb35a5dc04fa039653a6d6f3f0f331f96f6aa1971
+      LLAMA_WEBGPU_SPEECH_MMPROJ_URL: https://huggingface.co/ggml-org/Qwen3-ASR-0.6B-GGUF/resolve/928ab958557df9aa2ef1c93e0e83c7ad0933fae2/mmproj-Qwen3-ASR-0.6B-Q8_0.gguf?download=true
+      LLAMA_WEBGPU_SPEECH_MMPROJ_SHA256: 41a342b5e4c514e968cb756de6cd1b7be39eff43c44c57a2ef5fc6522e36603d
+      LLAMA_WEBGPU_SPEECH_MODEL_CACHE: ~/.cache/llama-web-bridge/speech-smoke-models
+      LLAMA_WEBGPU_SPEECH_ARTIFACTS_DIR: /tmp/speech-to-text-smoke-artifacts
+      LLAMA_WEBGPU_SPEECH_TIMEOUT_MS: 900000
+      LLAMA_WEBGPU_TTS_MODEL_URL: https://huggingface.co/ggml-org/Qwen3-TTS-12Hz-1.7B-Base-GGUF/resolve/ca27d74bc954b73dadab5b71ca265d87fc861a7c/Qwen3-TTS-12Hz-1.7B-Base-Q4_K_M.gguf?download=true
+      LLAMA_WEBGPU_TTS_MODEL_SHA256: 8d18c94acb2addd042f97da63c98be144eafa76d0d9495177eab65130cf85129
+      LLAMA_WEBGPU_TTS_MMPROJ_URL: https://huggingface.co/ggml-org/Qwen3-TTS-12Hz-1.7B-Base-GGUF/resolve/ca27d74bc954b73dadab5b71ca265d87fc861a7c/mmproj-Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf?download=true
+      LLAMA_WEBGPU_TTS_MMPROJ_SHA256: 6fd65188839bcd6ecc91b277ad471e22a0edfada4699a0fe82f1165c18cfcce2
+      LLAMA_WEBGPU_TTS_MODEL_CACHE: ~/.cache/llama-web-bridge/text-to-speech-smoke-models
+      LLAMA_WEBGPU_TTS_ARTIFACTS_DIR: /tmp/text-to-speech-smoke-artifacts
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout exact bridge source
+        uses: actions/checkout@v4
         with:
-          ref: ${{ env.REQUESTED_SOURCE_REF }}
+          ref: ${{ env.BRIDGE_SOURCE_SHA }}
+          fetch-depth: 0
+
+      - name: Validate exact bridge and release inputs
+        run: |
+          set -euo pipefail
+          if [[ ! "${BRIDGE_SOURCE_SHA}" =~ ^[0-9a-f]{40}$ ]] || [ "$(git rev-parse HEAD)" != "${BRIDGE_SOURCE_SHA}" ]; then
+            echo "error: checked-out bridge source does not match the requested full SHA"
+            exit 1
+          fi
+          python3 scripts/release_contract.py validate-release \
+            --release-tag "${RELEASE_TAG}" --release-rebuild "${RELEASE_REBUILD}" \
+            --upstream-tag "${UPSTREAM_TAG}"
+          case "${RELEASE_CAPABILITIES}" in
+            state,multimodal|state,multimodal,asr|state,multimodal,tts|state,multimodal,asr,tts) ;;
+            *) echo "error: release_capabilities must be a canonical supported capability list"; exit 1 ;;
+          esac
+          python3 - "${ASSETS_REPO}" "${NATIVE_REPO}" <<'PY'
+          import sys
+          from scripts.release_contract import require_repository
+          require_repository(sys.argv[1], "assets_repo")
+          require_repository(sys.argv[2], "native_repo")
+          PY
+
+      - name: Download and verify native release manifest
+        id: native
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/native-release"
+          gh release download "${NATIVE_RELEASE_TAG}" --repo "${NATIVE_REPO}" \
+            --pattern assets.json --dir "${RUNNER_TEMP}/native-release"
+          IDENTITY="$(python3 scripts/release_contract.py validate-native \
+            --manifest "${RUNNER_TEMP}/native-release/assets.json" \
+            --manifest-sha256 "${NATIVE_MANIFEST_SHA256}" \
+            --native-release-tag "${NATIVE_RELEASE_TAG}" \
+            --upstream-tag "${UPSTREAM_TAG}" --upstream-commit "${UPSTREAM_COMMIT}")"
+          echo "native_commit=$(jq -r '.native_commit' <<<"${IDENTITY}")" >> "${GITHUB_OUTPUT}"
+
+      - name: Verify exact upstream and native tag commits
+        env:
+          NATIVE_COMMIT: ${{ steps.native.outputs.native_commit }}
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "${UPSTREAM_TAG}" https://github.com/ggml-org/llama.cpp.git third_party/llama_cpp
+          if [ "$(git -C third_party/llama_cpp rev-parse HEAD)" != "${UPSTREAM_COMMIT}" ]; then
+            echo "error: upstream tag does not resolve to requested commit"
+            exit 1
+          fi
+          git clone --depth 1 --branch "${NATIVE_RELEASE_TAG}" \
+            "https://github.com/${NATIVE_REPO}.git" "${RUNNER_TEMP}/native-source"
+          if [ "$(git -C "${RUNNER_TEMP}/native-source" rev-parse HEAD)" != "${NATIVE_COMMIT}" ]; then
+            echo "error: native tag does not resolve to manifest native_commit"
+            exit 1
+          fi
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -55,168 +184,137 @@ jobs:
           node-version: 24
           cache: npm
 
-      - name: Install JS dependencies
-        run: npm ci --ignore-scripts
-
-      - name: Validate JS bridge build
+      - name: Validate generated JS and release contracts
         run: |
+          npm ci --ignore-scripts
           npm run check:js
           git ls-files --error-unmatch js/llama_webgpu_bridge.js js/llama_webgpu_bridge_worker.js js/llama_webgpu_bridge.d.ts
           git diff --exit-code -- js/llama_webgpu_bridge.js js/llama_webgpu_bridge_worker.js js/llama_webgpu_bridge.d.ts
-
-      - name: Resolve publish parameters
-        id: resolve-publish-parameters
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-
-          SOURCE_COMMIT="$(git rev-parse HEAD)"
-
-          if [ "${ASSETS_TAG}" = "auto" ]; then
-            if [[ ! "${REQUESTED_SOURCE_REF}" =~ ^[0-9a-f]{40}$ ]]; then
-              echo "error: assets_tag=auto requires source_ref to be a full source commit SHA: ${REQUESTED_SOURCE_REF}"
-              exit 1
-            fi
-            if [ "${SOURCE_COMMIT}" != "${REQUESTED_SOURCE_REF}" ]; then
-              echo "error: checked-out source commit ${SOURCE_COMMIT} does not match requested source_ref ${REQUESTED_SOURCE_REF}"
-              exit 1
-            fi
-          fi
-
-          if [ "${ASSETS_TAG}" = "auto" ]; then
-            LATEST_ASSETS_TAG="$(gh release view --repo "${ASSETS_REPO}" --json tagName --jq '.tagName // ""')"
-            if [[ ! "${LATEST_ASSETS_TAG}" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
-              echo "error: latest assets release tag is not a vMAJOR.MINOR.PATCH tag: ${LATEST_ASSETS_TAG}"
-              exit 1
-            fi
-            MAJOR="${BASH_REMATCH[1]}"
-            MINOR="${BASH_REMATCH[2]}"
-            PATCH="${BASH_REMATCH[3]}"
-            RESOLVED_ASSETS_TAG="v${MAJOR}.${MINOR}.$((PATCH + 1))"
-          else
-            RESOLVED_ASSETS_TAG="${ASSETS_TAG}"
-          fi
-
-          if [[ ! "${RESOLVED_ASSETS_TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "error: assets tag must be a vMAJOR.MINOR.PATCH tag or auto: ${RESOLVED_ASSETS_TAG}"
-            exit 1
-          fi
-
-          if [ -n "$REQUESTED_LLAMA_CPP_TAG" ]; then
-            LLAMA_CPP_TAG="$REQUESTED_LLAMA_CPP_TAG"
-          else
-            LLAMA_CPP_TAG="$(tr -d '[:space:]' < llama_cpp.version)"
-          fi
-          if [ -z "$LLAMA_CPP_TAG" ]; then
-            echo "error: llama.cpp tag is empty"
-            exit 1
-          fi
-          if [[ ! "$LLAMA_CPP_TAG" =~ ^b[0-9]+$ ]]; then
-            echo "error: llama.cpp tag must match b[0-9]+: ${LLAMA_CPP_TAG}"
-            exit 1
-          fi
-          echo "ASSETS_TAG=$RESOLVED_ASSETS_TAG" >> "$GITHUB_ENV"
-          echo "LLAMA_CPP_TAG=$LLAMA_CPP_TAG" >> "$GITHUB_ENV"
-          echo "assets_tag=$RESOLVED_ASSETS_TAG" >> "$GITHUB_OUTPUT"
-          echo "llama_cpp_tag=$LLAMA_CPP_TAG" >> "$GITHUB_OUTPUT"
-          echo "source_commit=$SOURCE_COMMIT" >> "$GITHUB_OUTPUT"
-          echo "event=${{ github.event_name }}"
-          echo "assets_tag=${RESOLVED_ASSETS_TAG}"
-          echo "assets_repo=${ASSETS_REPO}"
-          echo "llama_cpp_tag=${LLAMA_CPP_TAG}"
-          echo "source_commit=${SOURCE_COMMIT}"
-
-      - name: Clone llama.cpp source
-        run: |
-          git clone --depth 1 --branch "${LLAMA_CPP_TAG}" https://github.com/ggml-org/llama.cpp.git third_party/llama_cpp
+          python3 scripts/release_contract_test.py
+          python3 scripts/generate_release_manifest_test.py
+          python3 scripts/verify_state_persistence_api.py
+          python3 scripts/verify_text_to_speech_api.py
+          python3 scripts/wasm64_runtime_patch_contract_test.py
+          python3 scripts/verify_ci_reliability.py
 
       - name: Resolve Emscripten SDK pin
+        id: emscripten
         run: |
           EMSCRIPTEN_VERSION="$(python3 scripts/verify_emscripten_version.py --print-pin)"
-          echo "EMSCRIPTEN_VERSION=${EMSCRIPTEN_VERSION}" >> "$GITHUB_ENV"
-          echo "Using Emscripten ${EMSCRIPTEN_VERSION}"
+          echo "EMSCRIPTEN_VERSION=${EMSCRIPTEN_VERSION}" >> "${GITHUB_ENV}"
+          echo "emscripten_version=${EMSCRIPTEN_VERSION}" >> "${GITHUB_OUTPUT}"
 
-      - name: Setup Emscripten SDK
+      - name: Setup pinned Emscripten SDK
         uses: mymindstorm/setup-emsdk@v14
         with:
           version: ${{ env.EMSCRIPTEN_VERSION }}
 
-      - name: Verify resolved Emscripten compiler
-        run: python3 scripts/verify_emscripten_version.py --emit-github-env "$GITHUB_ENV"
-
-      - name: Build bridge artifacts
+      - name: Verify compiler and build wasm32 plus memory64
         env:
           OUT_DIR: ${{ runner.temp }}/webgpu_bridge_dist
           WEBGPU_BRIDGE_BUILD_MEM64: 1
-        run: ./scripts/build_bridge.sh
+        run: |
+          python3 scripts/verify_emscripten_version.py --emit-github-env "$GITHUB_ENV"
+          ./scripts/build_bridge.sh
 
-      - name: Generate manifest and checksums
+      - name: Cache release smoke models
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/llama-web-bridge/state-smoke-models
+            ~/.cache/llama-web-bridge/multimodal-smoke-models
+          key: release-smoke-${{ env.LLAMA_WEBGPU_SMOKE_MODEL_SHA256 }}-${{ env.LLAMA_WEBGPU_MULTIMODAL_MODEL_SHA256 }}-${{ env.LLAMA_WEBGPU_MULTIMODAL_MMPROJ_SHA256 }}
+
+      - name: Cache ASR models
+        if: contains(inputs.release_capabilities, 'asr')
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/llama-web-bridge/speech-smoke-models
+          key: speech-smoke-${{ env.LLAMA_WEBGPU_SPEECH_MODEL_SHA256 }}-${{ env.LLAMA_WEBGPU_SPEECH_MMPROJ_SHA256 }}
+
+      - name: Cache TTS models
+        if: contains(inputs.release_capabilities, 'tts')
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/llama-web-bridge/text-to-speech-smoke-models
+          key: text-to-speech-smoke-${{ env.LLAMA_WEBGPU_TTS_MODEL_SHA256 }}-${{ env.LLAMA_WEBGPU_TTS_MMPROJ_SHA256 }}
+
+      - name: Download verified TTS models
+        if: contains(inputs.release_capabilities, 'tts')
+        run: |
+          set -euo pipefail
+          cache_dir="${LLAMA_WEBGPU_TTS_MODEL_CACHE/#\~/$HOME}"
+          mkdir -p "${cache_dir}"
+          model_path="${cache_dir}/Qwen3-TTS-12Hz-1.7B-Base-Q4_K_M.gguf"
+          mmproj_path="${cache_dir}/mmproj-Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf"
+          download_verified() {
+            local url="$1" sha="$2" path="$3"
+            if [ -f "${path}" ] && echo "${sha}  ${path}" | sha256sum --check --status; then return; fi
+            rm -f "${path}" "${path}.download"
+            curl --fail --location --retry 5 --retry-all-errors --output "${path}.download" "${url}"
+            echo "${sha}  ${path}.download" | sha256sum --check --status
+            mv "${path}.download" "${path}"
+          }
+          download_verified "${LLAMA_WEBGPU_TTS_MODEL_URL}" "${LLAMA_WEBGPU_TTS_MODEL_SHA256}" "${model_path}"
+          download_verified "${LLAMA_WEBGPU_TTS_MMPROJ_URL}" "${LLAMA_WEBGPU_TTS_MMPROJ_SHA256}" "${mmproj_path}"
+          echo "LLAMA_WEBGPU_TTS_MODEL_PATH=${model_path}" >> "${GITHUB_ENV}"
+          echo "LLAMA_WEBGPU_TTS_MMPROJ_PATH=${mmproj_path}" >> "${GITHUB_ENV}"
+
+      - name: Install Playwright Chromium
+        run: |
+          python3 -m pip install --user playwright
+          python3 -m playwright install chromium
+
+      - name: Run durable state persistence gate
+        env:
+          BRIDGE_DIST_DIR: ${{ runner.temp }}/webgpu_bridge_dist
+        run: python3 scripts/state_persistence_browser_smoke.py
+
+      - name: Run durable multimodal gate
+        env:
+          BRIDGE_DIST_DIR: ${{ runner.temp }}/webgpu_bridge_dist
+        run: python3 scripts/multimodal_browser_smoke.py
+
+      - name: Run durable Qwen3-ASR gate
+        if: contains(inputs.release_capabilities, 'asr')
+        env:
+          BRIDGE_DIST_DIR: ${{ runner.temp }}/webgpu_bridge_dist
+        run: python3 scripts/speech_to_text_browser_smoke.py
+
+      - name: Run durable Qwen3-TTS memory64 gate
+        if: contains(inputs.release_capabilities, 'tts')
+        run: |
+          python3 scripts/text_to_speech_browser_smoke.py \
+            --dist-dir "${{ runner.temp }}/webgpu_bridge_dist" \
+            --model-path "${LLAMA_WEBGPU_TTS_MODEL_PATH}" --mmproj-path "${LLAMA_WEBGPU_TTS_MMPROJ_PATH}" \
+            --model-sha256 "${LLAMA_WEBGPU_TTS_MODEL_SHA256}" --mmproj-sha256 "${LLAMA_WEBGPU_TTS_MMPROJ_SHA256}" \
+            --memory-mode wasm64 --runtime-mode all --max-frames 24 \
+            --artifacts-dir "${LLAMA_WEBGPU_TTS_ARTIFACTS_DIR}"
+
+      - name: Generate schema-v2 manifest and checksums
         env:
           OUT_DIR: ${{ runner.temp }}/webgpu_bridge_dist
-          SOURCE_REPO: ${{ github.repository }}
-          SOURCE_COMMIT: ${{ steps.resolve-publish-parameters.outputs.source_commit }}
+          NATIVE_COMMIT: ${{ steps.native.outputs.native_commit }}
+          ENABLE_ASR: ${{ contains(inputs.release_capabilities, 'asr') }}
+          ENABLE_TTS: ${{ contains(inputs.release_capabilities, 'tts') }}
         run: |
-          test -f "$OUT_DIR/llama_webgpu_bridge.js"
-          test -f "$OUT_DIR/llama_webgpu_bridge_worker.js"
-          test -f "$OUT_DIR/llama_webgpu_bridge.d.ts"
-          test -f "$OUT_DIR/llama_webgpu_core.js"
-          test -f "$OUT_DIR/llama_webgpu_core.wasm"
-          test -f "$OUT_DIR/llama_webgpu_core_mem64.js"
-          test -f "$OUT_DIR/llama_webgpu_core_mem64.wasm"
+          set -euo pipefail
+          args=()
+          [ "${ENABLE_ASR}" = "true" ] && args+=(--enable-asr)
+          [ "${ENABLE_TTS}" = "true" ] && args+=(--enable-tts)
+          python3 scripts/generate_release_manifest.py \
+            --out-dir "${OUT_DIR}" --release-tag "${RELEASE_TAG}" --release-rebuild "${RELEASE_REBUILD}" \
+            --assets-repo "${ASSETS_REPO}" --bridge-repo "${GITHUB_REPOSITORY}" --bridge-commit "${BRIDGE_SOURCE_SHA}" \
+            --upstream-tag "${UPSTREAM_TAG}" --upstream-commit "${UPSTREAM_COMMIT}" \
+            --native-repo "${NATIVE_REPO}" --native-release-tag "${NATIVE_RELEASE_TAG}" \
+            --native-manifest-sha256 "${NATIVE_MANIFEST_SHA256}" --native-commit "${NATIVE_COMMIT}" \
+            --emscripten-version "${EMSCRIPTEN_VERSION}" "${args[@]}"
+          (cd "${OUT_DIR}" && sha256sum --check sha256sums.txt)
 
-          python3 - <<'PY'
-          import hashlib
-          import json
-          import os
-          from datetime import datetime, timezone
-
-          out_dir = os.environ['OUT_DIR']
-          files = [
-              'llama_webgpu_bridge.js',
-              'llama_webgpu_bridge_worker.js',
-              'llama_webgpu_bridge.d.ts',
-              'llama_webgpu_core.js',
-              'llama_webgpu_core.wasm',
-              'llama_webgpu_core_mem64.js',
-              'llama_webgpu_core_mem64.wasm',
-          ]
-
-          manifest = {
-              'bridge_assets_tag': os.environ['ASSETS_TAG'],
-              'source_repository': os.environ['SOURCE_REPO'],
-              'source_commit': os.environ['SOURCE_COMMIT'],
-              'llama_cpp_tag': os.environ['LLAMA_CPP_TAG'],
-              'emscripten_version': os.environ['EMSCRIPTEN_VERSION'],
-              'generated_at_utc': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
-              'files': {},
-          }
-
-          checksums = []
-          for name in files:
-              path = os.path.join(out_dir, name)
-              with open(path, 'rb') as f:
-                  data = f.read()
-              digest = hashlib.sha256(data).hexdigest()
-              manifest['files'][name] = {
-                  'size_bytes': len(data),
-                  'sha256': digest,
-              }
-              checksums.append(f'{digest}  {name}')
-
-          with open(os.path.join(out_dir, 'manifest.json'), 'w', encoding='utf-8') as f:
-              json.dump(manifest, f, indent=2)
-              f.write('\n')
-
-          with open(os.path.join(out_dir, 'sha256sums.txt'), 'w', encoding='utf-8') as f:
-              f.write('\n'.join(checksums))
-              f.write('\n')
-          PY
-
-      - name: Upload built assets
+      - name: Upload gated bridge assets
         uses: actions/upload-artifact@v4
         with:
-          name: webgpu-bridge-dist
+          name: exact-webgpu-bridge-dist
           path: |
             ${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_bridge.js
             ${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_bridge_worker.js
@@ -228,208 +326,122 @@ jobs:
             ${{ runner.temp }}/webgpu_bridge_dist/manifest.json
             ${{ runner.temp }}/webgpu_bridge_dist/sha256sums.txt
 
-  publish-assets-repo:
-    name: Publish to assets repository
-    needs: build-bridge-assets
+      - name: Upload smoke diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: exact-release-smoke-diagnostics
+          path: |
+            ${{ env.LLAMA_WEBGPU_SMOKE_ARTIFACTS_DIR }}
+            ${{ env.LLAMA_WEBGPU_MULTIMODAL_ARTIFACTS_DIR }}
+            ${{ env.LLAMA_WEBGPU_SPEECH_ARTIFACTS_DIR }}
+            ${{ env.LLAMA_WEBGPU_TTS_ARTIFACTS_DIR }}
+          if-no-files-found: ignore
+
+  publish-assets:
+    name: Publish approved assets atomically
+    needs: build-and-gate
     runs-on: ubuntu-latest
-    env:
-      ASSETS_TAG: ${{ needs.build-bridge-assets.outputs.assets_tag }}
+    environment: bridge-assets-publication
     steps:
-      - name: Validate assets PAT secret
-        env:
-          ASSETS_PAT: ${{ secrets.WEBGPU_BRIDGE_ASSETS_PAT }}
-        run: |
-          if [ -z "$ASSETS_PAT" ]; then
-            echo "error: WEBGPU_BRIDGE_ASSETS_PAT secret is required"
-            exit 1
-          fi
+      - name: Checkout exact bridge source for validation
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.BRIDGE_SOURCE_SHA }}
+          fetch-depth: 0
+          path: bridge-source
 
       - name: Checkout assets repository
         uses: actions/checkout@v4
         with:
           repository: ${{ env.ASSETS_REPO }}
           token: ${{ secrets.WEBGPU_BRIDGE_ASSETS_PAT }}
+          fetch-depth: 0
           path: assets-repo
 
-      - name: Read previous asset metadata
-        id: previous-release
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          MANIFEST="assets-repo/manifest.json"
-          if [ ! -f "$MANIFEST" ]; then
-            echo "No previous manifest found; release notes will describe an initial asset publish."
-            exit 0
-          fi
-
-          PREVIOUS_ASSETS_TAG="$(jq -r '.bridge_assets_tag // empty' "$MANIFEST")"
-          PREVIOUS_SOURCE_COMMIT="$(jq -r '.source_commit // empty' "$MANIFEST")"
-          PREVIOUS_LLAMA_CPP_TAG="$(jq -r '.llama_cpp_tag // empty' "$MANIFEST")"
-
-          if [[ ! "$PREVIOUS_ASSETS_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "error: previous manifest has an invalid bridge_assets_tag: $PREVIOUS_ASSETS_TAG"
-            exit 1
-          fi
-          if [[ ! "$PREVIOUS_SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
-            echo "error: previous manifest has an invalid source_commit: $PREVIOUS_SOURCE_COMMIT"
-            exit 1
-          fi
-          if [[ ! "$PREVIOUS_LLAMA_CPP_TAG" =~ ^b[0-9]+$ ]]; then
-            echo "error: previous manifest has an invalid llama_cpp_tag: $PREVIOUS_LLAMA_CPP_TAG"
-            exit 1
-          fi
-
-          {
-            echo "assets_tag=$PREVIOUS_ASSETS_TAG"
-            echo "source_commit=$PREVIOUS_SOURCE_COMMIT"
-            echo "llama_cpp_tag=$PREVIOUS_LLAMA_CPP_TAG"
-          } >> "$GITHUB_OUTPUT"
-
-      - name: Download bridge assets artifact
+      - name: Download gated bridge assets
         uses: actions/download-artifact@v4
         with:
-          name: webgpu-bridge-dist
+          name: exact-webgpu-bridge-dist
           path: bridge-dist
 
-      - name: Generate asset release notes
+      - name: Revalidate checksums, ordering, ancestry, and collisions
         env:
           GH_TOKEN: ${{ secrets.WEBGPU_BRIDGE_ASSETS_PAT }}
-          ASSETS_TAG: ${{ env.ASSETS_TAG }}
-          ASSETS_REPO: ${{ env.ASSETS_REPO }}
-          LLAMA_CPP_TAG: ${{ needs.build-bridge-assets.outputs.llama_cpp_tag }}
-          SOURCE_REPO: ${{ github.repository }}
-          SOURCE_COMMIT: ${{ needs.build-bridge-assets.outputs.source_commit }}
-          PREVIOUS_ASSETS_TAG: ${{ steps.previous-release.outputs.assets_tag }}
-          PREVIOUS_SOURCE_COMMIT: ${{ steps.previous-release.outputs.source_commit }}
-          PREVIOUS_LLAMA_CPP_TAG: ${{ steps.previous-release.outputs.llama_cpp_tag }}
         run: |
           set -euo pipefail
-
-          NOTES_FILE="${RUNNER_TEMP}/asset-release-notes.md"
-          SOURCE_URL="https://github.com/${SOURCE_REPO}/commit/${SOURCE_COMMIT}"
-          SOURCE_COMPARE_JSON=""
-          SOURCE_COMPARE_COMMIT_COUNT=""
-          SOURCE_COMPARE_TOTAL_COMMITS=""
-
-          if [ -n "$PREVIOUS_ASSETS_TAG" ] && [ "$PREVIOUS_SOURCE_COMMIT" != "$SOURCE_COMMIT" ]; then
-            SOURCE_COMPARE_JSON="${RUNNER_TEMP}/source-compare.json"
-            gh api "repos/${SOURCE_REPO}/compare/${PREVIOUS_SOURCE_COMMIT}...${SOURCE_COMMIT}" > "$SOURCE_COMPARE_JSON"
-
-            SOURCE_COMPARE_STATUS="$(jq -r '.status' "$SOURCE_COMPARE_JSON")"
-            if [ "$SOURCE_COMPARE_STATUS" != "ahead" ]; then
-              echo "error: source commit must advance from ${PREVIOUS_SOURCE_COMMIT}; compare status is ${SOURCE_COMPARE_STATUS}"
-              exit 1
-            fi
-
-            SOURCE_COMPARE_COMMIT_COUNT="$(jq -r '.commits | length' "$SOURCE_COMPARE_JSON")"
-            SOURCE_COMPARE_TOTAL_COMMITS="$(jq -r '.total_commits' "$SOURCE_COMPARE_JSON")"
-            if [ "$SOURCE_COMPARE_COMMIT_COUNT" -eq 0 ]; then
-              echo "error: forward source comparison returned no commits"
-              exit 1
-            fi
+          (cd bridge-dist && sha256sum --check sha256sums.txt)
+          jq -e --arg release "${RELEASE_TAG}" --arg bridge "${BRIDGE_SOURCE_SHA}" \
+            --arg upstream "${UPSTREAM_COMMIT}" --arg native "${{ needs.build-and-gate.outputs.native_commit }}" \
+            '.schema_version == 2 and .release_tag == $release and .bridge_commit == $bridge and .upstream_commit == $upstream and .native_commit == $native' \
+            bridge-dist/manifest.json >/dev/null
+          if git -C assets-repo ls-remote --exit-code --tags origin "refs/tags/${RELEASE_TAG}" >/dev/null 2>&1; then
+            echo "error: asset tag collision: ${RELEASE_TAG}"
+            exit 1
           fi
-
-          if [ -n "$PREVIOUS_LLAMA_CPP_TAG" ] \
-            && [ "${LLAMA_CPP_TAG#b}" -lt "${PREVIOUS_LLAMA_CPP_TAG#b}" ]; then
-            echo "error: llama.cpp tag must not move backward from ${PREVIOUS_LLAMA_CPP_TAG} to ${LLAMA_CPP_TAG}"
+          if gh release view "${RELEASE_TAG}" --repo "${ASSETS_REPO}" >/dev/null 2>&1; then
+            echo "error: asset release collision: ${RELEASE_TAG}"
             exit 1
           fi
 
+          DEFAULT_BRANCH="$(gh api "repos/${GITHUB_REPOSITORY}" --jq '.default_branch')"
+          SOURCE_STATUS="$(gh api "repos/${GITHUB_REPOSITORY}/compare/${BRIDGE_SOURCE_SHA}...${DEFAULT_BRANCH}" --jq '.status')"
+          if [ "${SOURCE_STATUS}" != "ahead" ] && [ "${SOURCE_STATUS}" != "identical" ]; then
+            echo "error: bridge source is not reachable from the default branch; source changes require an ordinary merged PR"
+            exit 1
+          fi
+
+          previous_args=()
+          [ -f assets-repo/manifest.json ] && previous_args=(--previous-manifest assets-repo/manifest.json)
+          RELEASE_JSON="$(python3 bridge-source/scripts/release_contract.py validate-release \
+            --release-tag "${RELEASE_TAG}" --release-rebuild "${RELEASE_REBUILD}" \
+            --upstream-tag "${UPSTREAM_TAG}" "${previous_args[@]}")"
+          PREVIOUS_BRIDGE="$(jq -r '.previous_bridge_commit // empty' <<<"${RELEASE_JSON}")"
+          if [ -n "${PREVIOUS_BRIDGE}" ] && [ "${PREVIOUS_BRIDGE}" != "${BRIDGE_SOURCE_SHA}" ]; then
+            STATUS="$(gh api "repos/${GITHUB_REPOSITORY}/compare/${PREVIOUS_BRIDGE}...${BRIDGE_SOURCE_SHA}" --jq '.status')"
+            if [ "${STATUS}" != "ahead" ]; then
+              echo "error: bridge source must advance or remain unchanged; compare status is ${STATUS}"
+              exit 1
+            fi
+          fi
+
+      - name: Generate provenance release notes
+        run: |
           {
-            echo "Bridge assets published from [${SOURCE_REPO}@${SOURCE_COMMIT:0:7}](${SOURCE_URL}) using llama.cpp ${LLAMA_CPP_TAG}."
+            echo "Exact-input WebGPU bridge asset release."
             echo
-
-            if [ -n "$PREVIOUS_ASSETS_TAG" ]; then
-              echo "## Changes since ${PREVIOUS_ASSETS_TAG}"
-              echo
-
-              if [ "$PREVIOUS_SOURCE_COMMIT" = "$SOURCE_COMMIT" ]; then
-                echo "- Bridge source commit unchanged."
-              else
-                SOURCE_COMPARE_URL="https://github.com/${SOURCE_REPO}/compare/${PREVIOUS_SOURCE_COMMIT}...${SOURCE_COMMIT}"
-                echo "- Bridge source: [compare ${PREVIOUS_SOURCE_COMMIT:0:7}...${SOURCE_COMMIT:0:7}](${SOURCE_COMPARE_URL})"
-              fi
-
-              if [ "$PREVIOUS_LLAMA_CPP_TAG" = "$LLAMA_CPP_TAG" ]; then
-                echo "- llama.cpp: ${LLAMA_CPP_TAG} (unchanged)"
-              else
-                LLAMA_CPP_COMPARE_URL="https://github.com/ggml-org/llama.cpp/compare/${PREVIOUS_LLAMA_CPP_TAG}...${LLAMA_CPP_TAG}"
-                echo "- llama.cpp: [${PREVIOUS_LLAMA_CPP_TAG}...${LLAMA_CPP_TAG}](${LLAMA_CPP_COMPARE_URL})"
-              fi
-
-              if [ "$PREVIOUS_SOURCE_COMMIT" != "$SOURCE_COMMIT" ]; then
-                echo
-                echo "### Bridge commits"
-                echo
-                # Backticks are intentional Markdown passed literally to jq.
-                # shellcheck disable=SC2016
-                jq -r '.commits[] | "- " + (.commit.message | split("\n")[0]) + " (`" + (.sha[0:7]) + "`)"' \
-                  "$SOURCE_COMPARE_JSON"
-                if [ "$SOURCE_COMPARE_COMMIT_COUNT" -lt "$SOURCE_COMPARE_TOTAL_COMMITS" ]; then
-                  echo
-                  echo "Commit list truncated to ${SOURCE_COMPARE_COMMIT_COUNT} of ${SOURCE_COMPARE_TOTAL_COMMITS} commits; use the bridge compare link for the complete range."
-                fi
-              fi
-            else
-              echo "Initial published WebGPU bridge asset bundle."
-            fi
-
+            echo "## Provenance"
             echo
-            echo "## Artifact metadata"
-            echo
-            echo "- Asset tag: \`${ASSETS_TAG}\`"
-            echo "- Bridge source commit: [\`${SOURCE_COMMIT}\`](${SOURCE_URL})"
-            echo "- llama.cpp tag: [\`${LLAMA_CPP_TAG}\`](https://github.com/ggml-org/llama.cpp/releases/tag/${LLAMA_CPP_TAG})"
-            echo "- Artifact manifest: [\`manifest.json\`](https://github.com/${ASSETS_REPO}/blob/${ASSETS_TAG}/manifest.json)"
-            echo "- Checksums: [\`sha256sums.txt\`](https://github.com/${ASSETS_REPO}/blob/${ASSETS_TAG}/sha256sums.txt)"
-          } > "$NOTES_FILE"
+            echo "- Release tag: \`${RELEASE_TAG}\` (rebuild \`${RELEASE_REBUILD}\`)"
+            echo "- Bridge commit: \`${BRIDGE_SOURCE_SHA}\`"
+            echo "- llama.cpp: \`${UPSTREAM_TAG}@${UPSTREAM_COMMIT}\`"
+            echo "- Native: \`${NATIVE_REPO}@${NATIVE_RELEASE_TAG}\`"
+            echo "- Native manifest SHA-256: \`${NATIVE_MANIFEST_SHA256}\`"
+            echo "- Emscripten: \`${{ needs.build-and-gate.outputs.emscripten_version }}\`"
+            echo "- [Manifest](https://github.com/${ASSETS_REPO}/blob/${RELEASE_TAG}/manifest.json)"
+            echo "- [Checksums](https://github.com/${ASSETS_REPO}/blob/${RELEASE_TAG}/sha256sums.txt)"
+          } > "${RUNNER_TEMP}/asset-release-notes.md"
 
-      - name: Publish assets and tag
-        run: |
-          if git -C assets-repo ls-remote --exit-code --tags origin "refs/tags/$ASSETS_TAG" >/dev/null 2>&1; then
-            echo "error: tag already exists in assets repo: $ASSETS_TAG"
-            exit 1
-          fi
-
-          cp bridge-dist/* assets-repo/
-
-          cd assets-repo
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-          git add llama_webgpu_bridge.js llama_webgpu_bridge_worker.js llama_webgpu_bridge.d.ts llama_webgpu_core.js llama_webgpu_core.wasm llama_webgpu_core_mem64.js llama_webgpu_core_mem64.wasm manifest.json sha256sums.txt
-
-          if git diff --cached --quiet; then
-            echo "No asset changes detected; skipping commit and tag."
-            exit 0
-          fi
-
-          git commit -m "chore: publish webgpu bridge $ASSETS_TAG"
-          git push origin HEAD
-
-          git tag "$ASSETS_TAG"
-          git push origin "$ASSETS_TAG"
-
-      - name: Create or update assets release
-        env:
-          GH_TOKEN: ${{ secrets.WEBGPU_BRIDGE_ASSETS_PAT }}
-          ASSETS_TAG: ${{ env.ASSETS_TAG }}
-          ASSETS_REPO: ${{ env.ASSETS_REPO }}
+      - name: Commit assets and push branch plus tag atomically
         run: |
           set -euo pipefail
-
-          NOTES_FILE="${RUNNER_TEMP}/asset-release-notes.md"
-
-          if gh release view "$ASSETS_TAG" --repo "$ASSETS_REPO" >/dev/null 2>&1; then
-            gh release edit "$ASSETS_TAG" \
-              --repo "$ASSETS_REPO" \
-              --title "$ASSETS_TAG" \
-              --notes-file "$NOTES_FILE"
-          else
-            gh release create "$ASSETS_TAG" \
-              --repo "$ASSETS_REPO" \
-              --verify-tag \
-              --title "$ASSETS_TAG" \
-              --notes-file "$NOTES_FILE"
+          cp bridge-dist/* assets-repo/
+          git -C assets-repo config user.name "github-actions[bot]"
+          git -C assets-repo config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git -C assets-repo add llama_webgpu_bridge.js llama_webgpu_bridge_worker.js llama_webgpu_bridge.d.ts \
+            llama_webgpu_core.js llama_webgpu_core.wasm llama_webgpu_core_mem64.js llama_webgpu_core_mem64.wasm \
+            manifest.json sha256sums.txt
+          if git -C assets-repo diff --cached --quiet; then
+            echo "error: exact release produced no asset changes"
+            exit 1
           fi
+          git -C assets-repo commit -m "chore: publish webgpu bridge ${RELEASE_TAG}"
+          git -C assets-repo tag "${RELEASE_TAG}"
+          git -C assets-repo push --atomic origin HEAD "refs/tags/${RELEASE_TAG}"
+
+      - name: Create immutable GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.WEBGPU_BRIDGE_ASSETS_PAT }}
+        run: |
+          gh release create "${RELEASE_TAG}" --repo "${ASSETS_REPO}" --verify-tag \
+            --title "${RELEASE_TAG}" --notes-file "${RUNNER_TEMP}/asset-release-notes.md"

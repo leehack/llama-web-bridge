@@ -146,22 +146,17 @@ query strings, and fragments before printing the location.
 - Keep `scripts/text_to_speech_browser_smoke.py` opt-in because its model pair
   is large and requires memory64, but require it before publishing assets
   advertised for Qwen3-TTS.
-- Preserve `llama_cpp.version` as the single source of truth for default CI and
-  publish builds. Manual publish overrides are allowed for temporary validation,
-  but tag-triggered publishes should use the pinned file.
+- Preserve `llama_cpp.version` as the default ordinary CI/development build pin.
+  Exact release publication receives upstream identity from the orchestrator and
+  must not require a bridge pin PR.
 - Preserve `emsdk.version` as the single compiler source for CI and publish.
   Both workflows must verify the active `emcc` version, and published manifests
   must record that verified identity.
-- Main-branch CI automatically dispatches `publish_assets.yml` after a successful
-  build/smoke only when the pushed commit range changed `llama_cpp.version`. The
-  dispatch passes the validated source SHA and lets the serialized publish
-  workflow compute the next patch tag from `llama-web-bridge-assets`; PR CI must
-  never publish assets.
-- The auto-update workflow manages the stable `automation/bump-llama-cpp` branch
-  and updates an existing PR instead of opening duplicates. It should include the
-  upstream release notes, compare link, and commit range in the PR body, then
-  create the PR with `WEBGPU_BRIDGE_ASSETS_PAT` so normal `pull_request` CI runs
-  automatically, and wait for the exact automation head SHA.
+- Main-branch and PR CI never dispatch publication. Scheduled discovery only
+  prepares `release-candidate.json` and a job summary.
+- Bridge source changes still require ordinary PRs. A dependency-version release
+  may reuse an already-merged exact bridge source SHA without changing
+  `llama_cpp.version`.
 - Preserve `FORCE_JAVASCRIPT_ACTIONS_TO_NODE24` in CI and publish workflows so
   GitHub Action runtime changes are detected before they become mandatory.
 - Upload state-persistence smoke diagnostics only on failure; successful CI runs
@@ -171,32 +166,22 @@ query strings, and fragments before printing the location.
 
 ## Publish Process
 
-Use workflow `.github/workflows/publish_assets.yml`:
+Use `.github/workflows/publish_assets.yml` only after explicit publication
+approval. The central orchestrator may call it, or a maintainer may dispatch it,
+with the exact bridge SHA, upstream tag/commit, native release tag plus
+`assets.json` SHA-256, output release tag/rebuild, and assets repository.
 
-Automatic publish from CI:
+The request must set `publish_approved=true` and then pass the protected
+`bridge-assets-publication` environment. The workflow verifies all identities,
+ordering, ancestry, checksums, and collisions; builds wasm32 and memory64; runs
+state/multimodal and advertised ASR/TTS gates; generates the schema-v2 manifest;
+and atomically pushes the assets commit and tag before creating the release.
 
-1. Merge a PR that changes `llama_cpp.version`.
-2. Let the `main` CI build and browser smoke pass.
-3. The final CI job dispatches `publish_assets.yml` with `assets_tag=auto` and
-   `source_ref` set to the validated main commit. The serialized publish workflow
-   computes the next patch assets tag and leaves `llama_cpp_tag` empty so the
-   publish reads the merged pin.
-
-Manual publish:
-
-1. Set input `assets_tag` (new tag).
-2. Optionally set `assets_repo`; leave `llama_cpp_tag` empty to use
-   `llama_cpp.version`, or set it only for an explicit temporary override.
-3. Ensure `WEBGPU_BRIDGE_ASSETS_PAT` is configured with contents and
-   pull-request write access to this repository plus write access to the assets
-   repository.
-4. Workflow builds, generates `manifest.json`/`sha256sums.txt`, pushes to
-   assets repo, creates matching tag there, and uses the build job's resolved
-   `llama.cpp` tag output in release notes. It reads the previous asset manifest
-   before publishing so the release body includes bridge and llama.cpp compare
-   links plus the intervening bridge commit subjects. The workflow rejects
-   backward/diverged source publishes and backward llama.cpp pins before it
-   pushes assets or tags, and reports any compare-list truncation.
+GitHub artifact tags are `vMAJOR.MINOR.PATCH`, `vMAJOR.MINOR.PATCH-N`, `bNNNN`,
+or `bNNNN-N`. Historical `bNNNN-llamadart.N` and prior wrapper forms are
+read-only compatibility inputs. Any future npm package must use an independently
+monotonic version with stable/nightly dist-tags because npm treats
+`vMAJOR.MINOR.PATCH-N` as a prerelease.
 
 ## Repository Boundaries
 
