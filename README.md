@@ -301,10 +301,12 @@ Required environment-scoped secret:
 - `WEBGPU_BRIDGE_ASSETS_PAT` (read access to provenance repositories and write
   access to `leehack/llama-web-bridge-assets`)
 
-Every request supplies a required orchestrator correlation ID, the exact bridge source SHA, upstream llama.cpp
-tag/commit, native release tag plus `assets.json` SHA-256, output release
-tag/rebuild, and an exact assertion of the fixed assets repository. It also sets
-`publish_approved=true` only after explicit maintainer approval.
+Every request supplies a required orchestrator correlation ID, the exact bridge
+source SHA, upstream llama.cpp tag/commit, native release tag plus `assets.json`
+SHA-256, output release tag/rebuild, and an exact assertion of the fixed assets
+repository. Dispatch values enter shell scripts only through environment
+variables and quoted expansions. The request sets `publish_approved=true` only
+after explicit maintainer approval.
 
 Publication is deliberately blocked until repository administrators externally
 create `bridge-assets-publication`, configure at least one required reviewer,
@@ -312,13 +314,16 @@ and store `WEBGPU_BRIDGE_ASSETS_PAT` as an environment-scoped secret. The live
 bridge repository did not have that environment at the latest readiness check;
 `llamadart` did not have it either, but its environment cannot gate this
 bridge-owned workflow. Merging this code does not establish the approval gate. The
-workflow verifies the environment through GitHub's API before entering it, so a
-missing environment cannot be silently auto-created and treated as protected.
+workflow verifies the environment through GitHub's API before entering it and
+again after reviewer approval, immediately before the first PAT-bearing step.
+A missing or weakened reviewer rule therefore fails closed.
 
 The workflow verifies that bridge source is already merged, all upstream/native
 tag and commit identities match, the native manifest checksum matches, and the
-new release is ordered after the previous manifest without collision or
-rollback. It builds exact wasm32 and memory64 artifacts with `emsdk.version`,
+new release advances its own channel history without collision or rollback.
+Stable releases compare only with stable history; development releases and
+rebuilds compare only with the development history and upstream line. It builds
+exact wasm32 and memory64 artifacts with `emsdk.version`,
 runs mandatory state, multimodal, ASR, and TTS gates, and publishes a
 schema-v2 manifest containing release tag, capabilities, bridge/upstream/native
 commits, orchestrator correlation ID, exact bridge workflow run ID/URL, explicit

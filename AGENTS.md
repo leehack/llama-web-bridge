@@ -170,12 +170,16 @@ publication because the bridge exposes Qwen3-TTS.
     administrator externally creates `bridge-assets-publication`, configures
     required reviewers, and stores `WEBGPU_BRIDGE_ASSETS_PAT` as an
     environment-scoped secret. Do not describe that environment as protected
-    without current live evidence.
+    without current live evidence. Revalidate the reviewer rule after approval
+    and immediately before the first PAT-bearing step.
   - Emits only stable `vMAJOR.MINOR.PATCH[-N]` or development `bNNNN[-N]` tags.
     Historical `*-llamadart.N` forms are accepted only when reading old
     manifests and are never emitted.
-  - Rejects identity/checksum mismatches, rollback, channel reversal, diverged
-    bridge source, output collisions, and unmerged bridge source commits.
+  - Orders stable and development histories independently, while rejecting
+    rollback or collisions within each channel, diverged bridge source, output
+    identity/checksum mismatches, and unmerged bridge source commits.
+  - Transports dispatch inputs through workflow environment variables; never
+    embed `${{ inputs.* }}` directly in a shell `run` block.
   - Builds exact wasm32/memory64 assets and always runs state, multimodal, ASR,
     and TTS durable release smokes; callers cannot downgrade exposed
     capabilities.

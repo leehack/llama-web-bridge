@@ -176,8 +176,10 @@ The request must set `publish_approved=true`. Publication remains blocked until
 repository administrators separately create `bridge-assets-publication`, add
 required reviewers, and store the assets PAT as an environment-scoped secret;
 the workflow fails closed if that protection is absent. It verifies all
-identities plus native GitHub asset digests/inventory, builds wasm32 and
-memory64, runs mandatory state/multimodal/ASR/TTS gates, generates a
+identities plus native GitHub asset digests/inventory and revalidates required
+reviewers after approval immediately before the first PAT-bearing step. It
+builds wasm32 and memory64, runs mandatory state/multimodal/ASR/TTS gates,
+orders stable and development histories independently, generates a
 deterministic schema-v2 manifest, and recovers exact partial states while
 rejecting any mismatch. Manifest and outcome records include the exact bridge
 workflow run ID/URL and explicit conclusions for every mandatory capability
@@ -192,6 +194,9 @@ or `bNNNN-N`. Historical `bNNNN-llamadart.N` and prior wrapper forms are
 read-only compatibility inputs. Any future npm package must use an independently
 monotonic version with stable/nightly dist-tags because npm treats
 `vMAJOR.MINOR.PATCH-N` as a prerelease.
+
+Never interpolate `${{ inputs.* }}` directly inside a workflow `run` script.
+Transport dispatch inputs through `env` and use quoted shell expansions.
 
 ## Repository Boundaries
 

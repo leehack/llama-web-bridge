@@ -151,6 +151,65 @@ class ReleasePublicationStateTest(unittest.TestCase):
         git(self.repository, "commit", "-q", "-m", "candidate")
         return self.head
 
+    def commit_history_manifest(self, release_tag: str, upstream_tag: str) -> None:
+        manifest = {
+            "bridge_assets_tag": release_tag,
+            "llama_cpp_tag": upstream_tag,
+            "source_commit": "e" * 40,
+        }
+        (self.repository / "manifest.json").write_text(json.dumps(manifest) + "\n")
+        git(self.repository, "add", "manifest.json")
+        git(self.repository, "commit", "-q", "-m", f"history {release_tag}")
+
+    def regenerate_candidate(
+        self, release_tag: str, release_rebuild: int, upstream_tag: str
+    ) -> CandidateIdentity:
+        identity = CandidateIdentity(
+            release_tag=release_tag,
+            release_rebuild=release_rebuild,
+            assets_repo=APPROVED_ASSETS_REPOSITORY,
+            bridge_commit=self.identity.bridge_commit,
+            upstream_tag=upstream_tag,
+            upstream_commit=self.identity.upstream_commit,
+            native_release_tag=release_tag,
+            native_manifest_sha256=self.identity.native_manifest_sha256,
+            native_commit=self.identity.native_commit,
+            emscripten_version=self.identity.emscripten_version,
+            orchestrator_correlation_id=self.identity.orchestrator_correlation_id,
+            github_run_id=self.identity.github_run_id,
+            github_run_url=self.identity.github_run_url,
+        )
+        generate(argparse.Namespace(
+            out_dir=self.candidate,
+            release_tag=identity.release_tag,
+            release_rebuild=identity.release_rebuild,
+            assets_repo=APPROVED_ASSETS_REPOSITORY,
+            bridge_repo="leehack/llama-web-bridge",
+            bridge_commit=identity.bridge_commit,
+            upstream_repo="ggml-org/llama.cpp",
+            upstream_tag=identity.upstream_tag,
+            upstream_commit=identity.upstream_commit,
+            native_repo="leehack/llamadart-native",
+            native_release_tag=identity.native_release_tag,
+            native_manifest_sha256=identity.native_manifest_sha256,
+            native_commit=identity.native_commit,
+            emscripten_version=identity.emscripten_version,
+            orchestrator_correlation_id=identity.orchestrator_correlation_id,
+            github_run_id=identity.github_run_id,
+            github_run_url=identity.github_run_url,
+        ))
+        return identity
+
+    def classify_identity(self, identity: CandidateIdentity) -> dict[str, object]:
+        return classify(
+            repository=self.repository,
+            candidate=self.candidate,
+            identity=identity,
+            branch_commit=self.head,
+            tag_commit=None,
+            release=None,
+        )
+
     def test_target_is_locked_before_credentials(self) -> None:
         self.assertEqual(
             require_approved_assets_repo(APPROVED_ASSETS_REPOSITORY),
@@ -164,6 +223,44 @@ class ReleasePublicationStateTest(unittest.TestCase):
         self.assertEqual(state["state"], "absent")
         self.assertEqual(state["action"], "publish-refs-and-release")
         self.assertEqual(state["outcome"], "newly-published")
+
+    def test_development_advances_from_current_legacy_stable_tag(self) -> None:
+        self.commit_history_manifest("v0.1.37", "b10514")
+        identity = self.regenerate_candidate("b10515", 0, "b10515")
+        state = self.classify_identity(identity)
+        self.assertTrue(state["allowed"])
+        self.assertEqual(state["action"], "publish-refs-and-release")
+
+    def test_development_history_rejects_rollback_and_collision(self) -> None:
+        self.commit_history_manifest("v0.1.37", "b10514")
+        rollback = self.regenerate_candidate("b10513", 0, "b10513")
+        rollback_state = self.classify_identity(rollback)
+        self.assertEqual(rollback_state["outcome"], "rollback")
+        collision = self.regenerate_candidate("b10514", 0, "b10514")
+        collision_state = self.classify_identity(collision)
+        self.assertEqual(collision_state["outcome"], "collision")
+
+    def test_development_rebuild_advances_on_its_upstream_line(self) -> None:
+        self.commit_history_manifest("v0.1.37", "b10514")
+        identity = self.regenerate_candidate("b10514-1", 1, "b10514")
+        state = self.classify_identity(identity)
+        self.assertTrue(state["allowed"])
+
+    def test_development_rebuild_history_rejects_rollback_and_collision(self) -> None:
+        self.commit_history_manifest("b10514-2", "b10514")
+        rollback = self.regenerate_candidate("b10514-1", 1, "b10514")
+        rollback_state = self.classify_identity(rollback)
+        self.assertEqual(rollback_state["outcome"], "rollback")
+        collision = self.regenerate_candidate("b10514-2", 2, "b10514")
+        collision_state = self.classify_identity(collision)
+        self.assertEqual(collision_state["outcome"], "collision")
+
+    def test_stable_history_ignores_later_development_publication(self) -> None:
+        self.commit_history_manifest("v0.2.0", "v0.2.0")
+        self.commit_history_manifest("b10515", "b10515")
+        identity = self.regenerate_candidate("v0.2.1", 0, "v0.2.1")
+        state = self.classify_identity(identity)
+        self.assertTrue(state["allowed"])
 
     def test_branch_only_is_safely_resumable(self) -> None:
         self.publish_branch_candidate()

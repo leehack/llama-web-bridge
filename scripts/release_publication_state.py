@@ -16,6 +16,7 @@ from generate_release_manifest import ARTIFACTS, CAPABILITIES, QUALIFICATION_GAT
 from release_contract import (
     ASSETS_REPOSITORY,
     BRIDGE_REPOSITORY,
+    Channel,
     NATIVE_REPOSITORY,
     ContractError,
     Transition,
@@ -208,10 +209,12 @@ def _is_ancestor(repository: Path, ancestor: str, descendant: str) -> bool:
     return _git(repository, "merge-base", "--is-ancestor", ancestor, descendant).returncode == 0
 
 
-def _previous_identity(repository: Path, commit: str) -> tuple[str, str]:
+def _manifest_history_identity(
+    repository: Path, commit: str
+) -> tuple[str, str] | None:
     raw = _git_file(repository, commit, "manifest.json")
     if raw is None:
-        raise ContractError("assets branch is missing manifest.json")
+        return None
     try:
         manifest = json.loads(raw)
     except json.JSONDecodeError as error:
@@ -222,24 +225,65 @@ def _previous_identity(repository: Path, commit: str) -> tuple[str, str]:
     upstream_tag = manifest.get("upstream_tag", manifest.get("llama_cpp_tag"))
     if not isinstance(release_tag, str) or not isinstance(upstream_tag, str):
         raise ContractError("assets branch manifest is missing release/upstream tags")
-    parse_release_tag(release_tag, allow_legacy=True)
-    parse_upstream_tag(upstream_tag)
-    return release_tag, upstream_tag
+    release = parse_release_tag(release_tag, allow_legacy=True)
+    upstream = parse_upstream_tag(upstream_tag)
+    if (
+        release.channel == upstream.channel
+        and release.upstream_parts == upstream.parts
+    ):
+        return release.tag, upstream.tag
+    if manifest.get("schema_version") == 2:
+        raise ContractError(
+            "schema-v2 assets manifest release/upstream identities do not match"
+        )
+    # Historical manifests used a bridge package version independently from the
+    # llama.cpp line. For ordering only, treat that immutable artifact as the
+    # rebuild-0 boundary for its recorded upstream tag.
+    return upstream.tag, upstream.tag
+
+
+def _previous_channel_identity(
+    repository: Path, commit: str, channel: Channel
+) -> tuple[str, str] | None:
+    history = _git(repository, "rev-list", "--first-parent", commit, text=True)
+    if history.returncode != 0:
+        raise ContractError("could not inspect assets branch channel history")
+    for index, history_commit in enumerate(history.stdout.splitlines()):
+        previous = _manifest_history_identity(repository, history_commit)
+        if previous is None:
+            if index == 0:
+                raise ContractError("assets branch is missing manifest.json")
+            continue
+        _, previous_upstream = previous
+        if parse_upstream_tag(previous_upstream).channel == channel:
+            return previous
+    return None
 
 
 def _validate_transition(repository: Path, previous: str, identity: CandidateIdentity) -> None:
-    previous_release, previous_upstream = _previous_identity(repository, previous)
+    candidate = parse_release_tag(identity.release_tag)
+    previous_identity = _previous_channel_identity(
+        repository, previous, candidate.channel
+    )
+    if previous_identity is None:
+        if candidate.rebuild != 0:
+            raise RollbackError(
+                "the first artifact in a release channel must use rebuild 0"
+            )
+        return
+    previous_release, previous_upstream = previous_identity
     try:
         release_transition = compare_releases(previous_release, identity.release_tag)
     except ContractError as error:
         raise RollbackError(str(error)) from error
     upstream_transition = compare_upstream(previous_upstream, identity.upstream_tag)
-    if release_transition not in (Transition.FORWARD, Transition.STABLE_MIGRATION):
+    if release_transition == Transition.EQUAL:
+        raise ContractError(
+            f"release tag {identity.release_tag!r} already exists in channel history"
+        )
+    if release_transition != Transition.FORWARD:
         raise RollbackError(f"release transition is {release_transition.value}")
-    if upstream_transition in (
-        Transition.BACKWARD,
-        Transition.FORBIDDEN_STABLE_TO_DEVELOPMENT,
-    ):
+    if upstream_transition not in (Transition.EQUAL, Transition.FORWARD):
         raise RollbackError(f"upstream transition is {upstream_transition.value}")
 
 

@@ -63,6 +63,7 @@ env:
   NATIVE_MANIFEST_SHA256: ${{ inputs.native_manifest_sha256 }}
   RELEASE_TAG: ${{ inputs.release_tag }}
   RELEASE_REBUILD: ${{ inputs.release_rebuild }}
+  REQUESTED_ASSETS_REPO: ${{ inputs.assets_repo }}
   ASSETS_REPO: leehack/llama-web-bridge-assets
   ORCHESTRATOR_CORRELATION_ID: ${{ inputs.orchestrator_correlation_id }}
   GITHUB_RUN_ID_STRING: ${{ github.run_id }}
@@ -87,7 +88,7 @@ jobs:
             echo "error: publish_approved=true requires explicit maintainer approval"
             exit 1
           fi
-          if [ "${{ inputs.assets_repo }}" != "${APPROVED_ASSETS_REPO}" ]; then
+          if [ "${REQUESTED_ASSETS_REPO}" != "${APPROVED_ASSETS_REPO}" ]; then
             echo "error: assets_repo must be exactly ${APPROVED_ASSETS_REPO}"
             exit 1
           fi
@@ -432,6 +433,9 @@ jobs:
     name: Publish or recover exact approved assets
     needs: [verify-publication-environment, build-and-gate]
     runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
     # Resolve the environment name only after the bridge-owned API check proves
     # that it already exists with required reviewers. A missing environment is
     # never referenced by this privileged job and therefore cannot be accepted
@@ -463,6 +467,16 @@ jobs:
         with:
           name: exact-webgpu-bridge-dist
           path: bridge-dist
+
+      - name: Revalidate approved environment protection after approval
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api "repos/${BRIDGE_REPO}/environments/bridge-assets-publication" \
+            > "${RUNNER_TEMP}/post-approval-publication-environment.json"
+          python3 bridge-source/scripts/release_contract.py validate-environment \
+            --environment-json "${RUNNER_TEMP}/post-approval-publication-environment.json"
 
       - name: Verify source ancestry and classify exact remote state
         id: preflight

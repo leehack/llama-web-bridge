@@ -136,7 +136,11 @@ def main() -> int:
     readme = read_required("README.md", errors)
     api_docs = read_required("docs/api.md", errors)
     contributing = read_required("CONTRIBUTING.md", errors)
+    workflow_input_transport = read_required(
+        "scripts/workflow_input_transport_test.mjs", errors
+    )
     typechecked_files = list_typescript_files(errors)
+    publish_job = publish.split("\n  publish-assets:\n", 1)[-1]
 
     require_well_formed_markdown_tables("docs/api.md", api_docs, errors)
 
@@ -155,13 +159,26 @@ def main() -> int:
             f"{name} must quote FORCE_JAVASCRIPT_ACTIONS_TO_NODE24 so the workflow env value is a string",
             errors,
         )
-
+    transport_result = subprocess.run(
+        ["node", "scripts/workflow_input_transport_test.mjs"],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    require(
+        bool(workflow_input_transport) and transport_result.returncode == 0,
+        "resolved workflow input transport contract failed: "
+        + (transport_result.stderr.strip() or transport_result.stdout.strip()),
+        errors,
+    )
     require(
         '"check:js"' in package_json
         and '"typecheck:js"' in package_json
         and '"build:js"' in package_json
         and '"syntax:js"' in package_json
         and '"test:embedding-json"' in package_json
+        and '"yaml": "2.8.1"' in package_json
         and '"esbuild"' in package_json
         and '"typescript"' in package_json,
         "package.json must define JS build/typecheck/syntax scripts and pin esbuild + TypeScript dev dependencies",
@@ -409,6 +426,9 @@ def main() -> int:
         and "release_tag:" in publish
         and "release_rebuild:" in publish
         and "assets_repo:" in publish
+        and "REQUESTED_ASSETS_REPO: ${{ inputs.assets_repo }}" in publish
+        and 'if [ "${REQUESTED_ASSETS_REPO}" != "${APPROVED_ASSETS_REPO}" ]'
+        in publish
         and "release_capabilities:" not in publish
         and "publish_approved:" in publish
         and "llama_cpp.version" not in publish,
@@ -442,6 +462,27 @@ def main() -> int:
         and "push:" not in publish.split("permissions:", 1)[0]
         and "schedule:" not in publish,
         "cross-repository publication must require explicit input confirmation plus a preverified dynamic protected environment and have no automatic trigger",
+        errors,
+    )
+    post_approval_environment_check = publish_job.find(
+        "Revalidate approved environment protection after approval"
+    )
+    first_pat_reference = publish_job.find("secrets.WEBGPU_BRIDGE_ASSETS_PAT")
+    require(
+        publish.count("release_contract.py validate-environment") == 2
+        and re.search(
+            r"publish-assets:\s+.*?permissions:\s+actions: read\s+contents: read",
+            publish,
+            re.DOTALL,
+        )
+        is not None
+        and post_approval_environment_check >= 0
+        and first_pat_reference > post_approval_environment_check
+        and publish_job[
+            post_approval_environment_check:first_pat_reference
+        ].count("\n      - name:")
+        == 1,
+        "the privileged job must revalidate required reviewers after approval and immediately before its first PAT-bearing step",
         errors,
     )
     require(
