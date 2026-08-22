@@ -131,10 +131,19 @@ jobs:
         run: |
           git clone --depth 1 --branch "${LLAMA_CPP_TAG}" https://github.com/ggml-org/llama.cpp.git third_party/llama_cpp
 
+      - name: Resolve Emscripten SDK pin
+        run: |
+          EMSCRIPTEN_VERSION="$(python3 scripts/verify_emscripten_version.py --print-pin)"
+          echo "EMSCRIPTEN_VERSION=${EMSCRIPTEN_VERSION}" >> "$GITHUB_ENV"
+          echo "Using Emscripten ${EMSCRIPTEN_VERSION}"
+
       - name: Setup Emscripten SDK
         uses: mymindstorm/setup-emsdk@v14
         with:
-          version: latest
+          version: ${{ env.EMSCRIPTEN_VERSION }}
+
+      - name: Verify resolved Emscripten compiler
+        run: python3 scripts/verify_emscripten_version.py --emit-github-env "$GITHUB_ENV"
 
       - name: Build bridge artifacts
         env:
@@ -178,6 +187,7 @@ jobs:
               'source_repository': os.environ['SOURCE_REPO'],
               'source_commit': os.environ['SOURCE_COMMIT'],
               'llama_cpp_tag': os.environ['LLAMA_CPP_TAG'],
+              'emscripten_version': os.environ['EMSCRIPTEN_VERSION'],
               'generated_at_utc': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
               'files': {},
           }

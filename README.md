@@ -24,7 +24,7 @@ metadata, cancellation, disposal, and worker-host bootstrap.
 
 Requirements:
 
-- Emscripten SDK (`emcmake`, `emcc`) in `PATH`
+- Emscripten SDK (`emcmake`, `emcc`) matching `emsdk.version` in `PATH`
 - Node.js/npm for the JS bridge build pipeline (`npm ci`, `npm run check:js`)
 - llama.cpp source checkout matching `llama_cpp.version` or a compatible checkout exposing
   `llama_state_save_file` / `llama_state_load_file` with the signatures used by
@@ -196,6 +196,12 @@ are easy to regress during agent-driven maintenance:
 - both CI and publish workflows resolve the default llama.cpp tag from
   `llama_cpp.version`, so tag-triggered asset publishes cannot silently rebuild
   against a stale workflow default;
+- both workflows install the exact compiler in `emsdk.version`, verify the
+  resolved `emcc` identity, and record it as `emscripten_version` in published
+  `manifest.json` provenance;
+- the memory64 build requires independent matches for the generated
+  `__wasmfs_read`, `__wasmfs_pread`, `__wasmfs_write`, `__wasmfs_pwrite`, and
+  `__wasmfs_mmap` wrappers before applying their BigInt boundary patch;
 - `.github/workflows/auto_llama_cpp_update.yml` opens or updates one stable
   `automation/bump-llama-cpp` PR when the latest published `llamadart-native`
   release advances, with the matching upstream release notes, compare link,
@@ -303,10 +309,11 @@ Required repository secret:
 
 The publish workflow carries the resolved `llama.cpp` tag from the build job to
 the release job as an explicit job output, so the asset release notes match the
-`manifest.json` `llama_cpp_tag` value. It also reads the previous asset manifest
-before replacing it and derives release-specific bridge and llama.cpp compare
-links plus the intervening bridge commit subjects. Release descriptions are not
-maintained as a static feature list. Backward/diverged source publishes and
+`manifest.json` `llama_cpp_tag` value. The manifest also records the verified
+compiler resolved from `emsdk.version`. The workflow reads the previous asset
+manifest before replacing it and derives release-specific bridge and llama.cpp
+compare links plus the intervening bridge commit subjects. Release descriptions
+are not maintained as a static feature list. Backward/diverged source publishes and
 backward llama.cpp pins fail before asset mutation; oversized commit ranges
 explicitly report when GitHub's compare response truncates the rendered list.
 

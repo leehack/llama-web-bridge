@@ -81,18 +81,30 @@ jobs:
           echo "LLAMA_CPP_TAG=$LLAMA_CPP_TAG" >> "$GITHUB_ENV"
           echo "Using llama.cpp ${LLAMA_CPP_TAG}"
 
+      - name: Resolve Emscripten SDK pin
+        run: |
+          EMSCRIPTEN_VERSION="$(python3 scripts/verify_emscripten_version.py --print-pin)"
+          echo "EMSCRIPTEN_VERSION=${EMSCRIPTEN_VERSION}" >> "$GITHUB_ENV"
+          echo "Using Emscripten ${EMSCRIPTEN_VERSION}"
+
       - name: Validate state persistence API contract
         run: python3 scripts/verify_state_persistence_api.py
 
       - name: Validate text-to-speech API contract
         run: python3 scripts/verify_text_to_speech_api.py
 
+      - name: Validate wasm64 runtime patch contract
+        run: python3 scripts/wasm64_runtime_patch_contract_test.py
+
       - name: Validate Python smoke syntax
         run: |
           python3 -m py_compile \
             scripts/verify_state_persistence_api.py \
             scripts/verify_text_to_speech_api.py \
+            scripts/verify_emscripten_version.py \
             scripts/verify_ci_reliability.py \
+            scripts/patch_wasm64_runtime.py \
+            scripts/wasm64_runtime_patch_contract_test.py \
             scripts/state_persistence_browser_smoke.py \
             scripts/multimodal_browser_smoke.py \
             scripts/speech_to_text_browser_smoke.py \
@@ -162,7 +174,10 @@ jobs:
       - name: Setup Emscripten SDK
         uses: mymindstorm/setup-emsdk@v14
         with:
-          version: latest
+          version: ${{ env.EMSCRIPTEN_VERSION }}
+
+      - name: Verify resolved Emscripten compiler
+        run: python3 scripts/verify_emscripten_version.py --emit-github-env "$GITHUB_ENV"
 
       - name: Build bridge artifacts
         env:

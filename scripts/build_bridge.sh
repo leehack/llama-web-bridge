@@ -38,7 +38,7 @@ Build llama-web-bridge wasm/js artifacts.
 
 Requirements:
   npm               JS bridge bundling/type-checking
-  emcmake, emcc     Emscripten SDK tools in PATH
+  emcmake, emcc     Emscripten SDK matching emsdk.version in PATH
   cmake             CMake configure/build driver
   llama.cpp         Source checkout via LLAMA_CPP_DIR or ../llama.cpp
 
@@ -71,6 +71,9 @@ if ! command -v emcc >/dev/null 2>&1; then
   echo "error: emcc not found in PATH"
   exit 1
 fi
+
+echo "[bridge] verifying Emscripten SDK pin"
+python3 "$BRIDGE_DIR/scripts/verify_emscripten_version.py"
 
 if ! command -v cmake >/dev/null 2>&1; then
   echo "error: cmake not found in PATH"
@@ -168,56 +171,8 @@ if [[ "$BUILD_MEM64" == "1" ]]; then
   cp "$CORE_MEM64_WASM" "$OUT_DIR/llama_webgpu_core_mem64.wasm"
 
   echo "[bridge] applying wasm64 runtime bigint interop patch"
-  python3 - <<'PY' "$OUT_DIR/llama_webgpu_core_mem64.js"
-from pathlib import Path
-import re
-import sys
-
-target = Path(sys.argv[1])
-text = target.read_text(encoding='utf-8', errors='ignore')
-
-def bigint_or_name(name):
-    return rf"(?:BigInt\(\s*{name}\s*\)|{name})"
-
-data_buffer = bigint_or_name("dataBuffer")
-length = bigint_or_name("length")
-position = bigint_or_name("position")
-offset = bigint_or_name("offset")
-
-replacements = [
-    (
-        rf"__wasmfs_read\(\s*stream\.fd\s*,\s*{data_buffer}\s*,\s*{length}\s*\)",
-        "__wasmfs_read(stream.fd,BigInt(dataBuffer),BigInt(length))",
-    ),
-    (
-        rf"__wasmfs_pread\(\s*stream\.fd\s*,\s*{data_buffer}\s*,\s*{length}\s*,\s*{position}\s*\)",
-        "__wasmfs_pread(stream.fd,BigInt(dataBuffer),BigInt(length),BigInt(position))",
-    ),
-    (
-        rf"__wasmfs_write\(\s*stream\.fd\s*,\s*{data_buffer}\s*,\s*{length}\s*\)",
-        "__wasmfs_write(stream.fd,BigInt(dataBuffer),BigInt(length))",
-    ),
-    (
-        rf"__wasmfs_pwrite\(\s*stream\.fd\s*,\s*{data_buffer}\s*,\s*{length}\s*,\s*{position}\s*\)",
-        "__wasmfs_pwrite(stream.fd,BigInt(dataBuffer),BigInt(length),BigInt(position))",
-    ),
-    (
-        rf"__wasmfs_mmap\(\s*{length}\s*,\s*prot\s*,\s*flags\s*,\s*stream\.fd\s*,\s*{offset}\s*\)",
-        "__wasmfs_mmap(BigInt(length),prot,flags,stream.fd,BigInt(offset))",
-    ),
-]
-
-changed = False
-for pattern, replacement in replacements:
-    text, count = re.subn(pattern, replacement, text)
-    if count > 0:
-        changed = True
-
-if not changed:
-    raise SystemExit('error: wasm64 runtime patch did not match expected symbols')
-
-target.write_text(text, encoding='utf-8')
-PY
+  python3 "$BRIDGE_DIR/scripts/patch_wasm64_runtime.py" \
+    "$OUT_DIR/llama_webgpu_core_mem64.js"
 fi
 
 echo "[bridge] done"

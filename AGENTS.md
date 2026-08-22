@@ -29,6 +29,7 @@ Useful environment overrides:
 
 - `LLAMA_CPP_DIR` (defaults to `third_party/llama_cpp`; CI clones the tag from
   `llama_cpp.version`)
+- The local Emscripten SDK must match the exact release in `emsdk.version`.
 - `BUILD_DIR`
 - `OUT_DIR`
 - `CMAKE_BUILD_TYPE`
@@ -133,6 +134,8 @@ but require it before publishing assets advertised for Qwen3-TTS.
 
 - CI build gate: `.github/workflows/ci.yml`
   - Resolves the default llama.cpp checkout from `llama_cpp.version`.
+  - Resolves `emsdk.version`, installs that exact compiler, verifies the active
+    `emcc` identity, and contract-tests all five required wasm64 WASMFS patches.
   - After a successful `push` run on `main`, dispatches the publish workflow only
     when the pushed commit range changed `llama_cpp.version`. The dispatch uses
     job-scoped `actions: write`, passes the validated source SHA, and lets the
@@ -170,6 +173,8 @@ but require it before publishing assets advertised for Qwen3-TTS.
     temporary explicit override.
   - Passes the resolved `llama.cpp` tag as a job output so asset release notes
     match the generated manifest.
+  - Uses the same `emsdk.version` compiler identity as CI and records the
+    runtime-verified version in `manifest.json`.
   - Requires `WEBGPU_BRIDGE_ASSETS_PAT` with contents and pull-request write
     access to this repository plus write access to the assets repository.
   - Serializes publishes with workflow concurrency so manual and CI-dispatched
