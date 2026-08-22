@@ -889,7 +889,9 @@ function installBridgeWorkerHost() {
         let pendingPieceBytes = [];
         let pendingPieceByteLength = 0;
         let pendingPieceCharLength = 0;
-        let pendingPieceCharDecoder = new TextDecoder();
+        let pendingPieceCharDecoder = tokenEventFlushChars > 0
+          ? new TextDecoder()
+          : null;
         let pendingCurrentText = '';
         let flushTimer = null;
 
@@ -935,7 +937,9 @@ function installBridgeWorkerHost() {
           pendingPieceBytes = [];
           pendingPieceByteLength = 0;
           pendingPieceCharLength = 0;
-          pendingPieceCharDecoder = new TextDecoder();
+          pendingPieceCharDecoder = tokenEventFlushChars > 0
+            ? new TextDecoder()
+            : null;
           pendingCurrentText = '';
         };
 
@@ -1009,10 +1013,12 @@ function installBridgeWorkerHost() {
               : Uint8Array.from(normalizedPieceBytes);
             pendingPieceBytes.push(pieceBytes);
             pendingPieceByteLength += pieceBytes.byteLength;
-            pendingPieceCharLength += pendingPieceCharDecoder.decode(
-              pieceBytes,
-              { stream: true },
-            ).length;
+            if (pendingPieceCharDecoder != null) {
+              pendingPieceCharLength += pendingPieceCharDecoder.decode(
+                pieceBytes,
+                { stream: true },
+              ).length;
+            }
             if (shouldEmitCurrentText) {
               pendingCurrentText = String(currentText || '');
             }
