@@ -1,243 +1,116 @@
-name: Auto-update llama.cpp Pin
+name: Scan Native-Aligned llama.cpp Releases
 
 on:
   schedule:
-    # Daily UTC, aligned with llamadart-native auto_native_release.yml.
+    # Daily UTC, aligned with llamadart-native discovery. This scan never
+    # publishes, dispatches another workflow, or changes a bridge pin.
     - cron: '23 3 * * *'
   workflow_dispatch:
+    inputs:
+      release_channel:
+        description: Native release channel to inspect
+        required: true
+        default: stable
+        type: choice
+        options:
+          - stable
+          - development
+      native_release_tag:
+        description: Exact native tag; required for development, optional for stable
+        required: false
+        default: ''
+        type: string
 
 permissions:
-  actions: read
   contents: read
-  pull-requests: read
-
-concurrency:
-  group: llama-cpp-auto-update
-  cancel-in-progress: false
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
-  VERSION_FILE: llama_cpp.version
-  UPDATE_BRANCH: automation/bump-llama-cpp
-  PARITY_REPO: leehack/llamadart-native
+  NATIVE_REPO: leehack/llamadart-native
 
 jobs:
-  update-llama-cpp-pin:
-    name: Check for native-aligned llama.cpp release
+  prepare-release-candidate:
+    name: Prepare exact-input release candidate
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
-      - name: Resolve update metadata
-        id: meta
+      - name: Resolve native-aligned candidate
         env:
           GH_TOKEN: ${{ github.token }}
+          REQUESTED_CHANNEL: ${{ github.event_name == 'workflow_dispatch' && inputs.release_channel || 'stable' }}
+          REQUESTED_NATIVE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.native_release_tag || '' }}
         run: |
           set -euo pipefail
-
-          CURRENT_TAG="$(tr -d '[:space:]' < "$VERSION_FILE")"
-          if [ -z "$CURRENT_TAG" ]; then
-            echo "error: $VERSION_FILE is empty"
-            exit 1
-          fi
-
-          # Keep the Web bridge on the latest llama.cpp tag already published by
-          # llamadart-native. Raw upstream latest is review context only: Web
-          # must not advance ahead of the native release without an explicit
-          # maintainer-authored compatibility exception.
-          UPSTREAM_LATEST_TAG="$(gh api repos/ggml-org/llama.cpp/releases/latest --jq ".tag_name")"
-          if [ -z "$UPSTREAM_LATEST_TAG" ] || [ "$UPSTREAM_LATEST_TAG" = "null" ]; then
-            echo "error: could not resolve latest stable ggml-org/llama.cpp release tag"
-            exit 1
-          fi
-          if ! [[ "$UPSTREAM_LATEST_TAG" =~ ^b[0-9]+$ ]]; then
-            echo "error: latest stable ggml-org/llama.cpp release tag does not match bNNNNN: $UPSTREAM_LATEST_TAG"
-            exit 1
-          fi
-
-          TARGET_TAG="$(gh api "repos/${PARITY_REPO}/releases/latest" --jq ".tag_name")"
-          if [ -z "$TARGET_TAG" ] || [ "$TARGET_TAG" = "null" ]; then
-            echo "error: could not resolve latest published ${PARITY_REPO} release tag"
-            exit 1
-          fi
-          if ! [[ "$TARGET_TAG" =~ ^b[0-9]+$ ]]; then
-            echo "error: latest published ${PARITY_REPO} release tag does not match bNNNNN: $TARGET_TAG"
-            exit 1
-          fi
-          if ! gh release view "$TARGET_TAG" --repo ggml-org/llama.cpp >/dev/null; then
-            echo "error: ${PARITY_REPO} release ${TARGET_TAG} has no matching stable llama.cpp release"
-            exit 1
-          fi
-
-          {
-            echo "current_tag=$CURRENT_TAG"
-            echo "target_tag=$TARGET_TAG"
-            echo "upstream_latest_tag=$UPSTREAM_LATEST_TAG"
-          } >> "$GITHUB_OUTPUT"
-
-          if [ "$CURRENT_TAG" = "$TARGET_TAG" ]; then
-            {
-              echo "update_needed=false"
-              echo "skip_reason=$VERSION_FILE already matches latest ${PARITY_REPO} release $TARGET_TAG (raw upstream latest: $UPSTREAM_LATEST_TAG)"
-            } >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          if [ "${TARGET_TAG#b}" -lt "${CURRENT_TAG#b}" ]; then
-            {
-              echo "update_needed=false"
-              echo "skip_reason=refusing to move $VERSION_FILE backward from $CURRENT_TAG to latest ${PARITY_REPO} release $TARGET_TAG"
-            } >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          for pr in $(gh pr list --repo "$GITHUB_REPOSITORY" --state open --json number,headRefName --jq ".[] | select(.headRefName != \"$UPDATE_BRANCH\") | .number"); do
-            if gh pr diff "$pr" --repo "$GITHUB_REPOSITORY" --name-only | grep -qx "$VERSION_FILE"; then
-              {
-                echo "update_needed=false"
-                echo "skip_reason=PR #$pr already changes $VERSION_FILE; not racing a non-automation PR"
-              } >> "$GITHUB_OUTPUT"
-              exit 0
+          if [ "${REQUESTED_CHANNEL}" = "development" ]; then
+            if [ -z "${REQUESTED_NATIVE_TAG}" ]; then
+              echo "error: development scans require an exact native_release_tag"
+              exit 1
             fi
-          done
-
-          printf '%s\n' "$TARGET_TAG" > "$VERSION_FILE"
-
-          RELEASE_URL="$(gh release view "$TARGET_TAG" --repo ggml-org/llama.cpp --json url --jq ".url")"
-          PARITY_RELEASE_URL="$(gh release view "$TARGET_TAG" --repo "$PARITY_REPO" --json url --jq ".url")"
-          COMPARE_URL="https://github.com/ggml-org/llama.cpp/compare/${CURRENT_TAG}...${TARGET_TAG}"
-          {
-            echo "release_url=$RELEASE_URL"
-            echo "parity_release_url=$PARITY_RELEASE_URL"
-            echo "compare_url=$COMPARE_URL"
-            echo "update_needed=true"
-          } >> "$GITHUB_OUTPUT"
-
-          gh release view "$TARGET_TAG" --repo ggml-org/llama.cpp --json body --jq ".body // \"\"" > /tmp/llama_cpp_release_notes.md
-          gh api "repos/ggml-org/llama.cpp/compare/${CURRENT_TAG}...${TARGET_TAG}" \
-            --jq ".commits[:80][] | \"- \" + (.commit.message | split(\"\\n\")[0]) + \" (\`\" + (.sha[0:7]) + \"\`)\"" \
-            > /tmp/llama_cpp_commits.md || true
-
-          {
-            echo "## llama.cpp update"
-            echo
-            echo "- Previous pin: \`$CURRENT_TAG\`"
-            echo "- New pin: \`$TARGET_TAG\`"
-            echo "- Native parity release: $PARITY_RELEASE_URL"
-            echo "- Raw upstream latest observed: \`$UPSTREAM_LATEST_TAG\`"
-            echo "- Upstream release: $RELEASE_URL"
-            echo "- Compare: $COMPARE_URL"
-            echo
-            echo "## Upstream changelog"
-            echo
-            echo "<details>"
-            echo "<summary>Release notes for $TARGET_TAG</summary>"
-            echo
-            if [ -s /tmp/llama_cpp_release_notes.md ]; then
-              cat /tmp/llama_cpp_release_notes.md
+            NATIVE_TAG="${REQUESTED_NATIVE_TAG}"
+          elif [ "${REQUESTED_CHANNEL}" = "stable" ]; then
+            if [ -n "${REQUESTED_NATIVE_TAG}" ]; then
+              NATIVE_TAG="${REQUESTED_NATIVE_TAG}"
             else
-              echo "No GitHub release notes were published for this tag. Use the compare link above as the source of truth."
+              gh api --paginate --slurp "repos/${NATIVE_REPO}/releases?per_page=100" \
+                > "${RUNNER_TEMP}/native-release-pages.json"
+              jq 'add' "${RUNNER_TEMP}/native-release-pages.json" \
+                > "${RUNNER_TEMP}/native-releases.json"
+              NATIVE_TAG="$(python3 scripts/release_contract.py select-stable-native-release \
+                --releases-json "${RUNNER_TEMP}/native-releases.json")"
             fi
-            echo
-            echo "</details>"
-            echo
-            echo "## Commit range"
-            echo
-            echo "<details>"
-            echo "<summary>Commits from $CURRENT_TAG to $TARGET_TAG (first 80)</summary>"
-            echo
-            if [ -s /tmp/llama_cpp_commits.md ]; then
-              cat /tmp/llama_cpp_commits.md
-            else
-              echo "Commit list unavailable; see $COMPARE_URL."
-            fi
-            echo
-            echo "</details>"
-            echo
-            echo "## Web bridge review focus"
-            echo
-            echo "Please pay extra attention to upstream changes touching:"
-            echo
-            echo "- WebGPU, WASM, Emscripten, pthreads, or memory64 build behavior"
-            echo "- ggml backend APIs used by the bridge"
-            echo "- model loading, tokenizer, chat template, context/state persistence, or cache semantics"
-            echo "- CMake/build flags that can affect the generated JS/WASM artifacts"
-            echo
-            echo "## Validation"
-            echo
-            echo "- [ ] Emscripten build passed"
-            echo "- [ ] Browser WebGPU/state-persistence smoke passed"
-            echo "- [ ] Generated bridge artifacts include wasm32 and memory64 outputs"
-            echo "- [ ] No stale hard-coded llama.cpp tag remains in CI/publish defaults"
-            echo
-            echo "## Automation behavior"
-            echo
-            echo "This PR is managed from the stable branch \`$UPDATE_BRANCH\`. The scheduled workflow follows the latest published \`$PARITY_REPO\` release instead of raw upstream latest, so Web does not advance ahead of native without an explicit maintainer-authored exception. It updates this same PR when the native parity target advances and skips if a non-automation PR already changes \`$VERSION_FILE\`."
-          } > /tmp/llama_cpp_update_pr.md
+          else
+            echo "error: unsupported release channel ${REQUESTED_CHANNEL}"
+            exit 1
+          fi
 
-      - name: Report skip reason
-        if: steps.meta.outputs.update_needed == 'false'
-        run: echo "${{ steps.meta.outputs.skip_reason }}"
+          mkdir -p "${RUNNER_TEMP}/candidate"
+          gh release download "${NATIVE_TAG}" --repo "${NATIVE_REPO}" \
+            --pattern assets.json --dir "${RUNNER_TEMP}/candidate"
+          NATIVE_MANIFEST="${RUNNER_TEMP}/candidate/assets.json"
+          IDENTITY="$(python3 scripts/release_contract.py scan-native \
+            --manifest "${NATIVE_MANIFEST}" --native-release-tag "${NATIVE_TAG}")"
+          UPSTREAM_TAG="$(jq -r '.upstream_tag' <<<"${IDENTITY}")"
+          UPSTREAM_COMMIT="$(jq -r '.upstream_commit' <<<"${IDENTITY}")"
+          NATIVE_COMMIT="$(jq -r '.native_commit' <<<"${IDENTITY}")"
+          NATIVE_MANIFEST_SHA256="$(sha256sum "${NATIVE_MANIFEST}" | cut -d' ' -f1)"
+          BRIDGE_SOURCE_SHA="$(git rev-parse HEAD)"
 
-      - name: Create or update llama.cpp bump PR
-        id: create-pr
-        if: steps.meta.outputs.update_needed == 'true'
-        uses: peter-evans/create-pull-request@v7
+          if [ "${REQUESTED_CHANNEL}" = "stable" ] && [[ ! "${UPSTREAM_TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "error: stable candidate did not resolve an exact stable upstream tag: ${UPSTREAM_TAG}"
+            exit 1
+          fi
+          if [ "${REQUESTED_CHANNEL}" = "development" ] && [[ ! "${UPSTREAM_TAG}" =~ ^b[0-9]+$ ]]; then
+            echo "error: development candidate did not resolve an exact bNNNN upstream tag: ${UPSTREAM_TAG}"
+            exit 1
+          fi
+
+          jq -n \
+            --arg bridge_source_sha "${BRIDGE_SOURCE_SHA}" \
+            --arg upstream_tag "${UPSTREAM_TAG}" \
+            --arg upstream_commit "${UPSTREAM_COMMIT}" \
+            --arg native_repo "${NATIVE_REPO}" \
+            --arg native_release_tag "${NATIVE_TAG}" \
+            --arg native_manifest_sha256 "${NATIVE_MANIFEST_SHA256}" \
+            --arg native_commit "${NATIVE_COMMIT}" \
+            '{bridge_source_sha:$bridge_source_sha,upstream_tag:$upstream_tag,upstream_commit:$upstream_commit,native_repo:$native_repo,native_release_tag:$native_release_tag,native_manifest_sha256:$native_manifest_sha256,native_commit:$native_commit}' \
+            > release-candidate.json
+
+          {
+            echo "### Native-aligned Web release candidate"
+            echo
+            echo "This scheduled scan only prepared exact inputs. It did not change \`llama_cpp.version\`, open a PR, dispatch publication, create a tag, or update a downstream pin."
+            echo
+            echo "- Bridge source: \`${BRIDGE_SOURCE_SHA}\`"
+            echo "- llama.cpp: \`${UPSTREAM_TAG}@${UPSTREAM_COMMIT}\`"
+            echo "- Native release: \`${NATIVE_REPO}@${NATIVE_TAG}\`"
+            echo "- Native manifest SHA-256: \`${NATIVE_MANIFEST_SHA256}\`"
+            echo
+            echo "After explicit approval, the central llamadart pin-upgrade orchestrator may dispatch the bridge-owned \`publish_assets.yml\` through GitHub's API with these inputs, a required correlation ID, and a collision-free output tag/rebuild."
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Upload prepared candidate
+        uses: actions/upload-artifact@v4
         with:
-          # PRs created with GITHUB_TOKEN leave pull_request workflows waiting
-          # for approval. The maintainer PAT emits a normal PR event instead.
-          token: ${{ secrets.WEBGPU_BRIDGE_ASSETS_PAT }}
-          branch: ${{ env.UPDATE_BRANCH }}
-          base: main
-          delete-branch: true
-          title: 'chore: bump llama.cpp to ${{ steps.meta.outputs.target_tag }}'
-          commit-message: 'chore: bump llama.cpp to ${{ steps.meta.outputs.target_tag }}'
-          body-path: /tmp/llama_cpp_update_pr.md
-          labels: |
-            dependencies
-            automated
-
-      - name: Wait for automation PR CI
-        if: steps.create-pr.outputs.pull-request-number != ''
-        timeout-minutes: 45
-        env:
-          GH_TOKEN: ${{ github.token }}
-          PR_NUMBER: ${{ steps.create-pr.outputs.pull-request-number }}
-          PR_HEAD_SHA: ${{ steps.create-pr.outputs.pull-request-head-sha }}
-        run: |
-          set -euo pipefail
-
-          if [ -z "$PR_HEAD_SHA" ] || [ "$PR_HEAD_SHA" = "null" ]; then
-            PR_HEAD_SHA="$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json headRefOid --jq ".headRefOid")"
-          fi
-          if [ -z "$PR_HEAD_SHA" ] || [ "$PR_HEAD_SHA" = "null" ]; then
-            echo "error: could not resolve head SHA for automation PR #$PR_NUMBER"
-            exit 1
-          fi
-
-          run_id=""
-          for attempt in $(seq 1 30); do
-            run_id="$(gh run list \
-              --repo "$GITHUB_REPOSITORY" \
-              --workflow ci.yml \
-              --branch "$UPDATE_BRANCH" \
-              --commit "$PR_HEAD_SHA" \
-              --event pull_request \
-              --json databaseId \
-              --jq ".[0].databaseId // \"\"")"
-            if [ -n "$run_id" ]; then
-              break
-            fi
-            echo "Waiting for pull_request CI run for $PR_HEAD_SHA (attempt $attempt/30)."
-            sleep 10
-          done
-
-          if [ -z "$run_id" ]; then
-            echo "error: pull_request CI run for $PR_HEAD_SHA was not found"
-            exit 1
-          fi
-
-          echo "Watching CI run $run_id for automation PR #$PR_NUMBER at $PR_HEAD_SHA."
-          gh run watch "$run_id" --repo "$GITHUB_REPOSITORY" --exit-status --interval 30
+          name: bridge-release-candidate
+          path: release-candidate.json

@@ -193,23 +193,18 @@ are easy to regress during agent-driven maintenance:
   the JS source, regenerates the readable browser ESM wrapper/declaration files
   with esbuild, and then fails on any stale checked-in generated output via
   `git diff --exit-code`;
-- both CI and publish workflows resolve the default llama.cpp tag from
-  `llama_cpp.version`, so tag-triggered asset publishes cannot silently rebuild
-  against a stale workflow default;
+- ordinary CI resolves its development pin from `llama_cpp.version`; exact
+  publication instead requires a provenance-checked upstream tag and commit, so
+  dependency publication does not require a bridge pin PR;
 - both workflows install the exact compiler in `emsdk.version`, verify the
   resolved `emcc` identity, and record it as `emscripten_version` in published
   `manifest.json` provenance;
 - the memory64 build requires independent matches for the generated
   `__wasmfs_read`, `__wasmfs_pread`, `__wasmfs_write`, `__wasmfs_pwrite`, and
   `__wasmfs_mmap` wrappers before applying their BigInt boundary patch;
-- `.github/workflows/auto_llama_cpp_update.yml` opens or updates one stable
-  `automation/bump-llama-cpp` PR when the latest published `llamadart-native`
-  release advances, with the matching upstream release notes, compare link,
-  commit range, and raw upstream latest tag in the PR body; this keeps native
-  and Web on the same llama.cpp release unless a maintainer explicitly authors
-  a compatibility exception, then creates the PR with the maintainer token so
-  the normal `pull_request` CI starts automatically and waits for the exact
-  head-SHA validation run;
+- `.github/workflows/auto_llama_cpp_update.yml` only validates and uploads a
+  native-aligned `release-candidate.json`; scheduled discovery never changes a
+  bridge pin, opens a PR, dispatches publication, tags, or pushes;
 - both CI and publish workflows opt into `FORCE_JAVASCRIPT_ACTIONS_TO_NODE24`
   to catch action-runtime deprecation issues early;
 - the state-persistence browser smoke supports an integrity-checked tiny GGUF
@@ -294,54 +289,73 @@ Publish workflow:
 
 Trigger modes:
 
-- Automatic after a llama.cpp pin merge: when `main` CI succeeds for a push that
-  changed `llama_cpp.version`, CI dispatches `publish_assets.yml` with
-  `assets_tag=auto` and the validated source SHA. The serialized publish workflow
-  resolves the next patch tag from `leehack/llama-web-bridge-assets`.
-- Automatic tag publish: push a `v*` tag in this repo (for example `v0.1.5`)
-- Manual: run workflow dispatch with explicit inputs
+- Bridge-owned manual workflow dispatch. The central llamadart pin-upgrade
+  orchestrator may dispatch this workflow through GitHub's API, but the workflow
+  is deliberately not reusable because reusable job environments execute in the
+  caller repository's context.
 
-Required repository secret:
+There is no push, tag, schedule, or ordinary-CI publication trigger.
 
-- `WEBGPU_BRIDGE_ASSETS_PAT` (maintainer token with contents and pull-request
-  write access to `leehack/llama-web-bridge`, plus write access to
-  `leehack/llama-web-bridge-assets`)
+Required environment-scoped secret:
 
-The publish workflow carries the resolved `llama.cpp` tag from the build job to
-the release job as an explicit job output, so the asset release notes match the
-`manifest.json` `llama_cpp_tag` value. The manifest also records the verified
-compiler resolved from `emsdk.version`. The workflow reads the previous asset
-manifest before replacing it and derives release-specific bridge and llama.cpp
-compare links plus the intervening bridge commit subjects. Release descriptions
-are not maintained as a static feature list. Backward/diverged source publishes and
-backward llama.cpp pins fail before asset mutation; oversized commit ranges
-explicitly report when GitHub's compare response truncates the rendered list.
+- `WEBGPU_BRIDGE_ASSETS_PAT` (read access to provenance repositories and write
+  access to `leehack/llama-web-bridge-assets`)
 
-Automatic llama.cpp pin publish:
+Every request supplies a required orchestrator correlation ID, the exact bridge
+source SHA, upstream llama.cpp tag/commit, native release tag plus `assets.json`
+SHA-256, output release tag/rebuild, and an exact assertion of the fixed assets
+repository. Dispatch values enter shell scripts only through environment
+variables and quoted expansions. The request sets `publish_approved=true` only
+after explicit maintainer approval.
 
-1. Merge a PR that changes `llama_cpp.version`.
-2. `CI` builds and browser-smokes the merged `main` commit.
-3. If CI succeeds, the final CI job dispatches `Publish Bridge Assets` with the
-   validated source SHA, `assets_tag=auto`, and no `llama_cpp_tag` override. The
-   publish workflow resolves the next patch tag and the manifest uses the merged
-   pin.
+Publication is deliberately blocked until repository administrators externally
+create `bridge-assets-publication`, configure at least one required reviewer,
+and store `WEBGPU_BRIDGE_ASSETS_PAT` as an environment-scoped secret. The live
+bridge repository did not have that environment at the latest readiness check;
+`llamadart` did not have it either, but its environment cannot gate this
+bridge-owned workflow. Merging this code does not establish the approval gate. The
+workflow verifies the environment through GitHub's API before entering it and
+again after reviewer approval, immediately before the first PAT-bearing step.
+A missing or weakened reviewer rule therefore fails closed.
 
-Tag publish example:
+The workflow verifies that bridge source is already merged, all upstream/native
+tag and commit identities match, the native manifest checksum matches, and the
+new release advances its own channel history without collision or rollback.
+Stable releases compare only with stable history; development releases and
+rebuilds compare only with the development history and upstream line. It builds
+exact wasm32 and memory64 artifacts with `emsdk.version`,
+runs mandatory state, multimodal, ASR, and TTS gates, and publishes a
+schema-v2 manifest containing release tag, capabilities, bridge/upstream/native
+commits, orchestrator correlation ID, exact bridge workflow run ID/URL, explicit
+state/multimodal/ASR/TTS gate conclusions, and per-artifact SHA-256 values. The
+manifest is byte-deterministic for the same inputs and artifacts. Exact partial
+publication states are recovered only after branch, tag, release metadata,
+provenance, and asset-digest checks;
+mismatches fail closed with a machine-readable JSON outcome.
+If a credentialed ref or release mutation is followed by an unavailable or
+empty re-query, the workflow emits a durable, retryable `mutation-unknown`
+outcome with `mutated: null`; it never guesses that publication did or did not
+occur.
+Every build run also uploads `bridge-qualification-outcome`, recording the
+exact success/failure/skipped conclusion for each mandatory gate with the same
+correlation ID and run ID/URL, including when qualification stops early.
+The workflow run ID is part of the immutable candidate fingerprint. Recover a
+partial publication with GitHub's rerun operation, which preserves the run ID;
+a new dispatch has a new run identity and must not overwrite the earlier
+candidate under the same output tag.
 
-1. Create/push a release tag in this repo (for example `v0.1.5`)
-2. `Publish Bridge Assets` runs automatically and publishes the same tag to
-   `leehack/llama-web-bridge-assets`
-3. Workflow also creates/updates the matching GitHub Release in
-   `leehack/llama-web-bridge-assets`
+GitHub artifact tags follow the shared convention:
 
-Manual override example:
+- stable: `vMAJOR.MINOR.PATCH`
+- stable rebuild: `vMAJOR.MINOR.PATCH-N`
+- development: `bNNNN`
+- development rebuild: `bNNNN-N`
 
-1. Run `Publish Bridge Assets` workflow
-2. Inputs:
-   - `assets_tag`: `v0.1.5`
-   - `assets_repo`: `leehack/llama-web-bridge-assets`
-   - `llama_cpp_tag`: leave empty to use `llama_cpp.version`, or set an explicit
-     temporary override such as `b9165`
+Historical `bNNNN-llamadart.N` and earlier wrapper forms are accepted only when
+reading existing manifests and are never emitted. Any future npm package must
+use an independently monotonic version sequence with stable/nightly dist-tags;
+`vMAJOR.MINOR.PATCH-N` is prerelease-ordered by npm and must not be reused as the
+npm version.
 
 After publish, assets are CDN-available at:
 

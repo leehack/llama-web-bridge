@@ -127,8 +127,9 @@ python3 scripts/text_to_speech_browser_smoke.py \
   --gpu-layers 99
 ```
 
-Keep this gate opt-in because the pair is large and memory64-only in practice,
-but require it before publishing assets advertised for Qwen3-TTS.
+Keep this gate opt-in in ordinary CI because the pair is large and
+memory64-only in practice. The asset release workflow must run it for every
+publication because the bridge exposes Qwen3-TTS.
 
 ## CI / Release
 
@@ -136,25 +137,13 @@ but require it before publishing assets advertised for Qwen3-TTS.
   - Resolves the default llama.cpp checkout from `llama_cpp.version`.
   - Resolves `emsdk.version`, installs that exact compiler, verifies the active
     `emcc` identity, and contract-tests all five required wasm64 WASMFS patches.
-  - After a successful `push` run on `main`, dispatches the publish workflow only
-    when the pushed commit range changed `llama_cpp.version`. The dispatch uses
-    job-scoped `actions: write`, passes the validated source SHA, and lets the
-    serialized publish workflow resolve the next patch assets tag; PR CI never
-    publishes assets.
-- Automated llama.cpp bump PR: `.github/workflows/auto_llama_cpp_update.yml`
-  - Runs on a schedule/manual dispatch, compares `llama_cpp.version` against the
-    latest published `leehack/llamadart-native` release, and manages one stable
-    `automation/bump-llama-cpp` PR. Raw upstream latest is review context only;
-    Web must not advance ahead of native without an explicit maintainer-authored
-    compatibility exception.
-  - The PR body must include the upstream release notes, compare URL, commit
-    range, raw upstream latest tag, and WebGPU/WASM review focus. If a newer
-    native parity release appears while the PR is still open, update the same PR
-    instead of opening a duplicate.
-  - Create/update the PR with `WEBGPU_BRIDGE_ASSETS_PAT` so normal
-    `pull_request` CI starts without approval, then wait for the exact head SHA.
-  - Skip instead of racing when a non-automation PR already changes
-    `llama_cpp.version`.
+  - Never dispatches asset publication. Bridge source changes, including changes
+    to the default development pin, use ordinary PRs and ordinary CI.
+- Native-aligned candidate scan: `.github/workflows/auto_llama_cpp_update.yml`
+  - Scheduled/manual runs download the selected native `assets.json`, validate
+    its exact upstream/native identities, and upload `release-candidate.json`.
+  - The scan only prepares and reports candidate inputs. It never changes
+    `llama_cpp.version`, opens a PR, dispatches publication, tags, or pushes.
 - CI reliability contract: `scripts/verify_ci_reliability.py`
   - Keep this script updated when changing browser smoke behavior, action
     versions, JS build/type-checking, or workflow diagnostics.
@@ -169,25 +158,39 @@ but require it before publishing assets advertised for Qwen3-TTS.
     `FORCE_JAVASCRIPT_ACTIONS_TO_NODE24` so action-runtime regressions are caught
     before Node 20 deprecation becomes a hard failure.
 - Publish workflow: `.github/workflows/publish_assets.yml`
-  - Defaults to `llama_cpp.version`; workflow-dispatch `llama_cpp_tag` is only a
-    temporary explicit override.
-  - Passes the resolved `llama.cpp` tag as a job output so asset release notes
-    match the generated manifest.
+  - Is a bridge-owned, non-reusable manual workflow that the central orchestrator
+    may dispatch through GitHub's API. This keeps the environment gate in the
+    bridge repository rather than the caller context. It requires an orchestrator
+    correlation ID, exact bridge source SHA, upstream tag/commit, native tag plus
+    manifest SHA-256, output tag/rebuild, and assets repository inputs. It does
+    not read `llama_cpp.version`.
   - Uses the same `emsdk.version` compiler identity as CI and records the
     runtime-verified version in `manifest.json`.
-  - Requires `WEBGPU_BRIDGE_ASSETS_PAT` with contents and pull-request write
-    access to this repository plus write access to the assets repository.
-  - Serializes publishes with workflow concurrency so manual and CI-dispatched
-    asset releases cannot race.
-  - Supports `assets_tag=auto` plus `source_ref=<sha>` for CI-dispatched
-    publishes from the exact source commit that already passed `main` CI.
-  - Builds release notes from the previous asset manifest, including bridge and
-    llama.cpp compare links plus the intervening bridge commit subjects. Do not
-    replace this with a static feature-specific release description.
-  - Rejects backward or diverged source publishes and backward llama.cpp pins
-    before pushing asset commits or tags. Large compare ranges must disclose
-    when GitHub's compare response truncates the rendered commit list.
-  - Pushes assets + tag to `llama-web-bridge-assets`
+  - Requires `publish_approved=true`. Publication remains blocked until an
+    administrator externally creates `bridge-assets-publication`, configures
+    required reviewers, and stores `WEBGPU_BRIDGE_ASSETS_PAT` as an
+    environment-scoped secret. Do not describe that environment as protected
+    without current live evidence. Revalidate the reviewer rule after approval
+    and immediately before the first PAT-bearing step.
+  - Emits only stable `vMAJOR.MINOR.PATCH[-N]` or development `bNNNN[-N]` tags.
+    Historical `*-llamadart.N` forms are accepted only when reading old
+    manifests and are never emitted.
+  - Orders stable and development histories independently, while rejecting
+    rollback or collisions within each channel, diverged bridge source, output
+    identity/checksum mismatches, and unmerged bridge source commits.
+  - Transports dispatch inputs through workflow environment variables; never
+    embed `${{ inputs.* }}` directly in a shell `run` block.
+  - Builds exact wasm32/memory64 assets and always runs state, multimodal, ASR,
+    and TTS durable release smokes; callers cannot downgrade exposed
+    capabilities.
+  - Publishes schema-v2 provenance with release tag, capabilities, bridge,
+    upstream, and native commits, exact run ID/URL, mandatory gate conclusions,
+    correlation ID, and per-artifact SHA-256 values. An unreadable post-mutation
+    remote state must emit retryable `mutation-unknown`, never guessed mutation
+    state.
+  - Any future npm package version has an independent monotonic sequence and
+    uses stable/nightly dist-tags; GitHub `vM.m.p-N` tags must not be reused as
+    npm versions because npm orders them as prereleases.
 
 ## Change Boundaries
 
