@@ -139,6 +139,19 @@ query strings, and fragments before printing the location.
   changing `.github/workflows/ci.yml`, `.github/workflows/publish_assets.yml`,
   `.github/workflows/auto_llama_cpp_update.yml`, JS build pipeline files, or
   `scripts/state_persistence_browser_smoke.py`.
+- Rotate all 7 model/projector SHA-256 pins in the five files that hard-code
+  them together: `README.md`, `AGENTS.md`, `CONTRIBUTING.md`,
+  `.github/workflows/ci.yml`, `.github/workflows/publish_assets.yml`.
+  `scripts/verify_ci_reliability.py` requires the five sets to be identical with
+  exactly 7 pins each; a stale `publish_assets.yml` breaks the release job, not
+  just CI.
+- The script also compares pins role by role across the two workflows, whose env
+  keys name the role, so a swap between roles in one workflow fails the gate. A
+  swap applied identically to both passes, as does one confined to the three
+  markdown files, whose bare `--model-sha256` / `--mmproj-sha256` flags carry no
+  role -- check each markdown pin by hand against the `--model-url` /
+  `--model-path` / `--mmproj-path` value directly above it, whose filename names
+  the model or projector the pin belongs to.
 - Keep `scripts/multimodal_browser_smoke.py` in normal CI for every llama.cpp
   pin update; build-only validation does not cover mtmd prompt ingestion.
 - Keep `scripts/speech_to_text_browser_smoke.py` opt-in because its model pair

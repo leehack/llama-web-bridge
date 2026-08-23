@@ -147,6 +147,9 @@ publication because the bridge exposes Qwen3-TTS.
 - CI reliability contract: `scripts/verify_ci_reliability.py`
   - Keep this script updated when changing browser smoke behavior, action
     versions, JS build/type-checking, or workflow diagnostics.
+  - Requires the 7 model/projector SHA-256 pins to be one identical set across
+    the five files that hard-code them, and role-consistent between the two
+    workflows. CONTRIBUTING.md owns the rotation rules and the residual gaps.
   - CI and publish must run `npm run check:js`, which regenerates the checked-in
     generated bridge wrapper outputs and declarations, and then fail with
     `git diff --exit-code` if those generated outputs are stale.
