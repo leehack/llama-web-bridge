@@ -111,6 +111,9 @@ def main() -> int:
     tts_smoke = read_required("scripts/text_to_speech_browser_smoke.py", errors)
     tts_contract = read_required("scripts/verify_text_to_speech_api.py", errors)
     embedding_contract = read_required("scripts/embedding_json_contract_test.mjs", errors)
+    worker_token_contract = read_required(
+        "scripts/worker_token_coalescing_test.mjs", errors
+    )
     worker_state_contract = read_required(
         "scripts/worker_runtime_state_test.mjs", errors
     )
@@ -181,6 +184,7 @@ def main() -> int:
         and '"build:js"' in package_json
         and '"syntax:js"' in package_json
         and '"test:embedding-json"' in package_json
+        and '"test:worker-token-coalescing"' in package_json
         and '"test:worker-state"' in package_json
         and '"yaml": "2.8.1"' in package_json
         and '"esbuild"' in package_json
@@ -201,6 +205,20 @@ def main() -> int:
         and "bridge.getModelMetadata()" in multimodal_smoke
         and "imageResizeDiagnostic" in multimodal_smoke,
         "multimodal real-model smoke must verify image-resize diagnostics in direct and worker metadata",
+        errors,
+    )
+    require(
+        "tokenEventEncoding: 'bytes'" in worker_token_contract
+        and "tokenEventFlushMs: 100" in worker_token_contract
+        and "tokenEventFlushChars: 3" in worker_token_contract
+        and "split-unicode-threshold" in worker_token_contract
+        and "split-unicode-timer-boundary" in worker_token_contract
+        and "waitForMessageCount" in worker_token_contract
+        and "byte-timer-flush" in worker_token_contract
+        and "text-timer-flush" in worker_token_contract
+        and "cleared timers must not emit after an error" in worker_token_contract
+        and "Uint8Array.from" in worker_token_contract,
+        "worker token coalescing contract must cover byte batching, decoded-character thresholds, and error cleanup",
         errors,
     )
     require(

@@ -885,6 +885,13 @@ function installBridgeWorkerHost() {
         const shouldEmitCurrentText = options.emitCurrentTextOnToken === true;
 
         let pendingPieceText = '';
+        /** @type {Uint8Array[]} */
+        let pendingPieceBytes = [];
+        let pendingPieceByteLength = 0;
+        let pendingPieceCharLength = 0;
+        let pendingPieceCharDecoder = tokenEventFlushChars > 0
+          ? new TextDecoder()
+          : null;
         let pendingCurrentText = '';
         let flushTimer = null;
 
@@ -906,14 +913,49 @@ function installBridgeWorkerHost() {
           pendingCurrentText = '';
         };
 
-        const scheduleTokenTextFlush = () => {
+        const flushTokenBytePayload = () => {
+          if (pendingPieceByteLength === 0) {
+            return;
+          }
+
+          const piece = new Uint8Array(pendingPieceByteLength);
+          let offset = 0;
+          for (const chunk of pendingPieceBytes) {
+            piece.set(chunk, offset);
+            offset += chunk.byteLength;
+          }
+
+          self.postMessage({
+            type: 'event',
+            id,
+            event: 'token',
+            payload: {
+              piece: Array.from(piece),
+              currentText: shouldEmitCurrentText ? pendingCurrentText : '',
+            },
+          });
+          pendingPieceBytes = [];
+          pendingPieceByteLength = 0;
+          pendingPieceCharLength = 0;
+          pendingCurrentText = '';
+        };
+
+        const flushTokenPayload = () => {
+          if (tokenEventEncoding === 'text') {
+            flushTokenTextPayload();
+            return;
+          }
+          flushTokenBytePayload();
+        };
+
+        const scheduleTokenFlush = () => {
           if (tokenEventFlushMs <= 0 || flushTimer != null) {
             return;
           }
 
           flushTimer = globalThis.setTimeout(() => {
             flushTimer = null;
-            flushTokenTextPayload();
+            flushTokenPayload();
           }, tokenEventFlushMs);
         };
 
@@ -941,7 +983,7 @@ function installBridgeWorkerHost() {
                 return;
               }
 
-              scheduleTokenTextFlush();
+              scheduleTokenFlush();
               return;
             }
 
@@ -957,21 +999,63 @@ function installBridgeWorkerHost() {
             return;
           }
 
+          const normalizedPieceBytes = toUint8Array(piece) || new Uint8Array();
+          if (normalizedPieceBytes.byteLength === 0) {
+            return;
+          }
+
+          if (tokenEventFlushMs > 0) {
+            const pieceBytes = Array.isArray(piece)
+              ? normalizedPieceBytes
+              : Uint8Array.from(normalizedPieceBytes);
+            pendingPieceBytes.push(pieceBytes);
+            pendingPieceByteLength += pieceBytes.byteLength;
+            if (pendingPieceCharDecoder != null) {
+              pendingPieceCharLength += pendingPieceCharDecoder.decode(
+                pieceBytes,
+                { stream: true },
+              ).length;
+            }
+            if (shouldEmitCurrentText) {
+              pendingCurrentText = String(currentText || '');
+            }
+
+            if (
+              tokenEventFlushChars > 0
+              && pendingPieceCharLength >= tokenEventFlushChars
+            ) {
+              if (flushTimer != null) {
+                globalThis.clearTimeout(flushTimer);
+                flushTimer = null;
+              }
+              flushTokenBytePayload();
+              return;
+            }
+
+            scheduleTokenFlush();
+            return;
+          }
+
           self.postMessage({
             type: 'event',
             id,
             event: 'token',
             payload: {
-              piece: Array.from(piece || []),
+              piece: Array.from(normalizedPieceBytes),
               currentText: shouldEmitCurrentText ? String(currentText || '') : '',
             },
           });
         };
 
-        const value = await bridge.createCompletion(prompt, options);
-        if (flushTimer != null) {
-          globalThis.clearTimeout(flushTimer);
-          flushTimer = null;
+        let value;
+        try {
+          value = await bridge.createCompletion(prompt, options);
+        } finally {
+          if (flushTimer != null) {
+            globalThis.clearTimeout(flushTimer);
+            flushTimer = null;
+          }
+          flushTokenPayload();
         }
         flushTokenTextPayload();
         self.postMessage({ type: 'result', id, value, state: snapshotBridgeState(bridge) });
