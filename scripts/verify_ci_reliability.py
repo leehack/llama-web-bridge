@@ -111,6 +111,9 @@ def main() -> int:
     tts_smoke = read_required("scripts/text_to_speech_browser_smoke.py", errors)
     tts_contract = read_required("scripts/verify_text_to_speech_api.py", errors)
     embedding_contract = read_required("scripts/embedding_json_contract_test.mjs", errors)
+    worker_state_contract = read_required(
+        "scripts/worker_runtime_state_test.mjs", errors
+    )
     ci = read_required(".github/workflows/ci.yml", errors)
     publish = read_required(".github/workflows/publish_assets.yml", errors)
     auto_update = read_required(".github/workflows/auto_llama_cpp_update.yml", errors)
@@ -178,10 +181,26 @@ def main() -> int:
         and '"build:js"' in package_json
         and '"syntax:js"' in package_json
         and '"test:embedding-json"' in package_json
+        and '"test:worker-state"' in package_json
         and '"yaml": "2.8.1"' in package_json
         and '"esbuild"' in package_json
         and '"typescript"' in package_json,
-        "package.json must define JS build/typecheck/syntax scripts and pin esbuild + TypeScript dev dependencies",
+        "package.json must define JS build/typecheck/syntax/runtime-state scripts and pin esbuild + TypeScript dev dependencies",
+        errors,
+    )
+    require(
+        "generation_stopped_context_limit" in worker_state_contract
+        and "tts_runtime_diagnostic" in worker_state_contract
+        and "_callWorker" in worker_state_contract
+        and "speechResponse.transfers" in worker_state_contract,
+        "worker state contract must exercise completion/TTS diagnostics, public shadow state, and PCM transfer",
+        errors,
+    )
+    require(
+        "media_image_resized:320x180->" in multimodal_smoke
+        and "bridge.getModelMetadata()" in multimodal_smoke
+        and "imageResizeDiagnostic" in multimodal_smoke,
+        "multimodal real-model smoke must verify image-resize diagnostics in direct and worker metadata",
         errors,
     )
     require(

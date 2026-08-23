@@ -974,7 +974,7 @@ function installBridgeWorkerHost() {
           flushTimer = null;
         }
         flushTokenTextPayload();
-        self.postMessage({ type: 'result', id, value });
+        self.postMessage({ type: 'result', id, value, state: snapshotBridgeState(bridge) });
         return;
       }
 
@@ -994,7 +994,10 @@ function installBridgeWorkerHost() {
         const transfers = value?.pcm?.buffer instanceof ArrayBuffer
           ? [value.pcm.buffer]
           : [];
-        self.postMessage({ type: 'result', id, value }, transfers);
+        self.postMessage(
+          { type: 'result', id, value, state: snapshotBridgeState(bridge) },
+          transfers,
+        );
         return;
       }
 
