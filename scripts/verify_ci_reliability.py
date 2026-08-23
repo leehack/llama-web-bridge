@@ -10,6 +10,46 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 
+# These files hand-copy the model/projector SHA-256 pins. A rotation that misses
+# one leaves CI green while a contributor hits an opaque checksum failure -- or,
+# for publish_assets.yml, while the release job that consumes the pins fails.
+MODEL_SHA_PIN_FILES = (
+    "README.md",
+    "AGENTS.md",
+    "CONTRIBUTING.md",
+    ".github/workflows/ci.yml",
+    ".github/workflows/publish_assets.yml",
+)
+EXPECTED_MODEL_SHA_PIN_COUNT = 7
+SHA256_HEX_PATTERN = re.compile(r"(?<![0-9a-fA-F])[0-9a-fA-F]{64}(?![0-9a-fA-F])")
+# A pin is a 64-hex literal introduced by a `--<name>-sha256` smoke CLI flag or a
+# `*_SHA256:` workflow env key, joined to it by spacing, `=`, quotes, or a shell
+# line continuation. A bare newline never joins the two, so an empty env value
+# cannot adopt the next 64-hex line. Any other 64-hex literal is reported and
+# skipped, never compared as a model pin.
+MODEL_SHA_PIN_MARKER = re.compile(
+    r"""(--[A-Za-z0-9][A-Za-z0-9-]*-sha256|_SHA256:)(?:[ \t="'`]|\\\r?\n)+\Z"""
+)
+# The set check above is role-blind: swapping two pins between roles inside one
+# file keeps every value present and passes, yet the workflows pair each SHA with
+# a role-specific URL and fail checksum verification at release time. Both
+# workflows name the role in the env key, so comparing key-to-hex between them
+# catches a swap made in one of them. Not caught: a swap applied identically to
+# both workflows, or one confined to README.md, AGENTS.md, and CONTRIBUTING.md,
+# whose bare `--model-sha256` / `--mmproj-sha256` flags carry no role and whose
+# pin order differs between README.md and the other two -- there the role lives
+# only in the `--model-url` / `--model-path` / `--mmproj-path` value beside each
+# flag: a URL for the state-persistence pin, a `/path/to/<file>` placeholder for
+# the other six, each naming a distinct model or projector file.
+WORKFLOW_MODEL_SHA_PIN_FILES = (
+    ".github/workflows/ci.yml",
+    ".github/workflows/publish_assets.yml",
+)
+WORKFLOW_MODEL_SHA_PIN_ASSIGNMENT = re.compile(
+    r"""^[ \t]*([A-Z][A-Z0-9_]*_SHA256):[ \t]*["']?([0-9a-fA-F]{64})["']?[ \t]*$""",
+    re.MULTILINE,
+)
+
 
 def read_required(relative_path: str, errors: list[str]) -> str:
     path = ROOT / relative_path
@@ -101,6 +141,123 @@ def require_well_formed_markdown_tables(relative_path: str, content: str, errors
             f"{relative_path}:{line_number} markdown table row has {pipe_count} unescaped pipes, expected {expected_pipe_count} from table starting at line {expected_line_number}; escape literal pipes as \\|",
             errors,
         )
+
+
+def extract_model_sha_pins(relative_path: str, content: str, errors: list[str]) -> set[str]:
+    pins: list[str] = []
+    for match in SHA256_HEX_PATTERN.finditer(content):
+        pin = match.group(0)
+        line_number = content.count("\n", 0, match.start()) + 1
+        is_pin = MODEL_SHA_PIN_MARKER.search(content[: match.start()]) is not None
+        require(
+            is_pin,
+            f"{relative_path}:{line_number} has 64-hex literal {pin} that is not a "
+            "--<name>-sha256 argument or a *_SHA256 workflow env value; the model "
+            "pin consistency check only understands model pins",
+            errors,
+        )
+        if not is_pin:
+            continue
+        pins.append(pin)
+
+    duplicates = sorted({pin for pin in pins if pins.count(pin) > 1})
+    require(
+        not duplicates,
+        f"{relative_path} repeats model SHA-256 pin(s) {', '.join(duplicates)}; "
+        "each pinned model/projector must appear exactly once per file",
+        errors,
+    )
+    require(
+        len(pins) == EXPECTED_MODEL_SHA_PIN_COUNT,
+        f"{relative_path} declares {len(pins)} model SHA-256 pins, expected "
+        f"{EXPECTED_MODEL_SHA_PIN_COUNT}; update EXPECTED_MODEL_SHA_PIN_COUNT in "
+        "scripts/verify_ci_reliability.py when the pinned model set changes",
+        errors,
+    )
+    return set(pins)
+
+
+def require_identical_model_sha_pins(
+    pins_by_file: dict[str, set[str]], errors: list[str]
+) -> None:
+    if len({frozenset(pins) for pins in pins_by_file.values()}) <= 1:
+        return
+
+    reported = len(errors)
+    for relative_path, pins in pins_by_file.items():
+        others = [other for path, other in pins_by_file.items() if path != relative_path]
+        if not others:
+            continue
+        unique = sorted(pins.difference(*others))
+        missing = sorted(set.intersection(*others) - pins)
+        if not unique and not missing:
+            continue
+        details = []
+        if unique:
+            details.append("only in this file: " + ", ".join(unique))
+        if missing:
+            details.append("present everywhere else but missing here: " + ", ".join(missing))
+        errors.append(
+            f"{relative_path} model SHA-256 pins diverge ({'; '.join(details)}); "
+            "every pin must be byte-identical across " + ", ".join(MODEL_SHA_PIN_FILES)
+        )
+
+    if len(errors) == reported:
+        errors.append(
+            "model SHA-256 pins differ across "
+            + ", ".join(MODEL_SHA_PIN_FILES)
+            + " with partially overlapping sets: "
+            + "; ".join(
+                f"{path}=[{', '.join(sorted(pins))}]"
+                for path, pins in pins_by_file.items()
+            )
+        )
+
+
+def extract_workflow_model_sha_pin_roles(
+    relative_path: str, content: str, errors: list[str]
+) -> dict[str, str]:
+    roles: dict[str, str] = {}
+    for match in WORKFLOW_MODEL_SHA_PIN_ASSIGNMENT.finditer(content):
+        key, pin = match.group(1), match.group(2)
+        line_number = content.count("\n", 0, match.start()) + 1
+        require(
+            key not in roles,
+            f"{relative_path}:{line_number} redefines model SHA-256 env key {key} "
+            f"(was {roles.get(key)}, now {pin}); each role must be declared once",
+            errors,
+        )
+        roles[key] = pin
+    require(
+        len(roles) == EXPECTED_MODEL_SHA_PIN_COUNT,
+        f"{relative_path} declares {len(roles)} role-bearing model SHA-256 env "
+        f"keys, expected {EXPECTED_MODEL_SHA_PIN_COUNT}; every pin must be a "
+        "literal `<ROLE>_SHA256: <64-hex>` assignment so the role-to-hash check "
+        "can compare it across workflows",
+        errors,
+    )
+    return roles
+
+
+def require_identical_workflow_model_sha_pin_roles(
+    roles_by_file: dict[str, dict[str, str]], errors: list[str]
+) -> None:
+    paths = list(roles_by_file)
+    base_path = paths[0]
+    base = roles_by_file[base_path]
+    for other_path in paths[1:]:
+        other = roles_by_file[other_path]
+        for key in sorted(set(base) | set(other)):
+            base_pin = base.get(key, "absent")
+            other_pin = other.get(key, "absent")
+            require(
+                base_pin == other_pin,
+                f"model SHA-256 env key {key} is bound to {base_pin} in "
+                f"{base_path} but to {other_pin} in {other_path}; each role must "
+                "carry the same pin in both workflows because every SHA is paired "
+                "with a role-specific model URL",
+                errors,
+            )
 
 
 def main() -> int:
@@ -816,6 +973,31 @@ def main() -> int:
         and "llama_cpp.version" in contributing
         and "emsdk.version" in contributing,
         "CONTRIBUTING.md must document JS build/type-checking, maintainer/agent workflow guardrails, checksum-pinned smoke usage, and toolchain pin handling",
+        errors,
+    )
+    pin_file_contents = {
+        "README.md": readme,
+        "AGENTS.md": agents,
+        "CONTRIBUTING.md": contributing,
+        ".github/workflows/ci.yml": ci,
+        ".github/workflows/publish_assets.yml": publish,
+    }
+    require_identical_model_sha_pins(
+        {
+            relative_path: extract_model_sha_pins(
+                relative_path, pin_file_contents[relative_path], errors
+            )
+            for relative_path in MODEL_SHA_PIN_FILES
+        },
+        errors,
+    )
+    require_identical_workflow_model_sha_pin_roles(
+        {
+            relative_path: extract_workflow_model_sha_pin_roles(
+                relative_path, pin_file_contents[relative_path], errors
+            )
+            for relative_path in WORKFLOW_MODEL_SHA_PIN_FILES
+        },
         errors,
     )
 
