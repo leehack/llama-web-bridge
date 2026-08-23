@@ -797,7 +797,8 @@ function installBridgeWorkerHost() {
           }
           flushTokenPayload();
         }
-        self.postMessage({ type: "result", id, value: value2 });
+        flushTokenTextPayload();
+        self.postMessage({ type: "result", id, value: value2, state: snapshotBridgeState(bridge) });
         return;
       }
       if (method === "loadMultimodalProjector") {
@@ -813,7 +814,10 @@ function installBridgeWorkerHost() {
         };
         const value2 = await bridge.synthesizeSpeech(options);
         const transfers = value2?.pcm?.buffer instanceof ArrayBuffer ? [value2.pcm.buffer] : [];
-        self.postMessage({ type: "result", id, value: value2 }, transfers);
+        self.postMessage(
+          { type: "result", id, value: value2, state: snapshotBridgeState(bridge) },
+          transfers
+        );
         return;
       }
       if (method === "unloadMultimodalProjector") {
