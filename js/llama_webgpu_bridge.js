@@ -698,7 +698,6 @@ function installBridgeWorkerHost() {
           pendingPieceBytes = [];
           pendingPieceByteLength = 0;
           pendingPieceCharLength = 0;
-          pendingPieceCharDecoder = tokenEventFlushChars > 0 ? new TextDecoder() : null;
           pendingCurrentText = "";
         };
         const flushTokenPayload = () => {

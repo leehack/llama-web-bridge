@@ -193,6 +193,8 @@ def main() -> int:
         and "tokenEventFlushMs: 100" in worker_token_contract
         and "tokenEventFlushChars: 3" in worker_token_contract
         and "split-unicode-threshold" in worker_token_contract
+        and "split-unicode-timer-boundary" in worker_token_contract
+        and "waitForMessageCount" in worker_token_contract
         and "byte-timer-flush" in worker_token_contract
         and "text-timer-flush" in worker_token_contract
         and "cleared timers must not emit after an error" in worker_token_contract

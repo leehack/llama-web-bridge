@@ -15,6 +15,18 @@ function messagesFor(id) {
   return posted.filter(({ message }) => message.id === id).map(({ message }) => message);
 }
 
+async function waitForMessageCount(id, expected, timeoutMs = 500) {
+  const deadline = Date.now() + timeoutMs;
+  while (messagesFor(id).length < expected && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  assert.equal(
+    messagesFor(id).length,
+    expected,
+    `timed out waiting for ${expected} worker messages for request ${id}`,
+  );
+}
+
 try {
   globalThis.self = {
     postMessage(message) {
@@ -64,19 +76,29 @@ try {
     }
     if (prompt === 'byte-timer-flush') {
       options.onToken(encoder.encode('ab'), 'ab');
-      await new Promise((resolve) => setTimeout(resolve, 20));
-      assert.equal(messagesFor(7).length, 1, 'byte timer must flush while completion is pending');
+      await waitForMessageCount(7, 1);
       options.onToken(encoder.encode('cd'), 'abcd');
-      await new Promise((resolve) => setTimeout(resolve, 20));
+      await waitForMessageCount(7, 2);
       return 'abcd';
     }
     if (prompt === 'text-timer-flush') {
       options.onToken('ab', 'ab');
-      await new Promise((resolve) => setTimeout(resolve, 20));
-      assert.equal(messagesFor(8).length, 1, 'text timer must flush while completion is pending');
+      await waitForMessageCount(8, 1);
       options.onToken('cd', 'abcd');
-      await new Promise((resolve) => setTimeout(resolve, 20));
+      await waitForMessageCount(8, 2);
       return 'abcd';
+    }
+    if (prompt === 'split-unicode-timer-boundary') {
+      const smile = encoder.encode('🙂');
+      options.onToken(smile.slice(0, 3), '');
+      await waitForMessageCount(9, 1);
+      options.onToken(smile.slice(3), '🙂');
+      assert.equal(
+        messagesFor(9).length,
+        2,
+        'decoder state must survive a timer flush and count the completed emoji',
+      );
+      return '🙂';
     }
     throw new Error(`Unexpected prompt: ${prompt}`);
   };
@@ -171,7 +193,7 @@ try {
   assert.equal(errorMessages[0].type, 'event');
   assert.equal(decoder.decode(Uint8Array.from(errorMessages[0].payload.piece)), 'x');
   assert.equal(errorMessages[1].type, 'error');
-  await new Promise((resolve) => setTimeout(resolve, 40));
+  await new Promise((resolve) => setTimeout(resolve, 200));
   assert.equal(messagesFor(5).length, 2, 'cleared timers must not emit after an error');
 
   await globalThis.self.onmessage({
@@ -244,6 +266,28 @@ try {
     textTimerMessages.slice(0, 2).map(({ payload }) => payload.currentText),
     ['ab', 'abcd'],
   );
+
+  await globalThis.self.onmessage({
+    data: {
+      type: 'call',
+      id: 9,
+      method: 'createCompletion',
+      args: ['split-unicode-timer-boundary', {
+        tokenEventEncoding: 'bytes',
+        tokenEventFlushMs: 10,
+        tokenEventFlushChars: 2,
+        emitCurrentTextOnToken: true,
+      }],
+    },
+  });
+  const boundaryMessages = messagesFor(9);
+  assert.deepEqual(boundaryMessages.map(({ type }) => type), ['event', 'event', 'result']);
+  const boundaryBytes = Uint8Array.from([
+    ...boundaryMessages[0].payload.piece,
+    ...boundaryMessages[1].payload.piece,
+  ]);
+  assert.equal(decoder.decode(boundaryBytes), '🙂');
+  assert.equal(boundaryMessages[1].payload.currentText, '🙂');
 } finally {
   globalThis.self = originalSelf;
   LlamaWebGpuBridge.prototype.createCompletion = originalCreateCompletion;
