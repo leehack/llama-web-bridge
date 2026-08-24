@@ -631,7 +631,8 @@ def main() -> int:
     )
     require(
         "BRIDGE_REPO: leehack/llama-web-bridge" in publish
-        and len(re.findall(r"repository: leehack/llama-web-bridge\s*$", publish, re.MULTILINE)) == 3
+        and len(re.findall(r"repository: leehack/llama-web-bridge\s*$", publish, re.MULTILINE)) == 4
+        and publish.count("ref: ${{ github.sha }}") == 2
         and '--bridge-repo "${BRIDGE_REPO}"' in publish
         and 'repos/${GITHUB_REPOSITORY}' not in publish,
         "dispatch-only publication must always checkout and verify the owning bridge repository",
@@ -649,6 +650,12 @@ def main() -> int:
         and publish.count("ENVIRONMENT_READ_TOKEN: ${{ secrets.BRIDGE_PUBLICATION_ENV_READ_TOKEN }}")
         == 2
         and publish.count('GH_TOKEN="${ENVIRONMENT_READ_TOKEN}" gh api') == 2
+        and publish.count("gh api --paginate --slurp") == 2
+        and publish.count("secrets?per_page=100") == 2
+        and publish.count(
+            "{total_count: ([.[].total_count] | max // 0), secrets: [.[].secrets[]]}"
+        )
+        == 2
         and publish.count(
             "BRIDGE_PUBLICATION_ENV_READ_TOKEN is required for read-only environment metadata verification"
         )
@@ -660,6 +667,7 @@ def main() -> int:
         )
         is not None
         and 'if [ "${GITHUB_REPOSITORY}" != "${BRIDGE_REPO}" ]' in publish
+        and 'if [ "${GITHUB_REF}" != "refs/heads/${bridge_default}" ]' in publish
         and 'echo "environment_name=bridge-assets-publication" >> "${GITHUB_OUTPUT}"'
         in publish
         and "name: ${{ needs.verify-publication-environment.outputs.environment_name }}"
@@ -693,6 +701,8 @@ def main() -> int:
         and 'GH_TOKEN="${ENVIRONMENT_READ_TOKEN}" gh api' in publish_job[
             post_approval_environment_check:first_pat_reference
         ]
+        and "python3 publication-policy/scripts/release_contract.py validate-environment"
+        in publish_job[post_approval_environment_check:first_pat_reference]
         and publish_job[
             post_approval_environment_check:first_pat_reference
         ].count("\n      - name:")

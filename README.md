@@ -324,8 +324,13 @@ secret; `github.token` does not have the Environments permission needed to list
 environment secret names. Merging this code does not establish either setting.
 The workflow uses the default job token to read environment and branch-policy
 metadata and uses the distinct read credential only to list environment-secret
-names. It performs both checks before entering the environment and again after
-reviewer approval, immediately before the first publication-PAT-bearing step.
+names. The read credential must not also exist in the environment, where it
+would shadow the repository/organization value after approval. The workflow
+normalizes the complete paginated secret-name inventory and performs both
+checks before entering the environment and again after reviewer approval,
+immediately before the first publication-PAT-bearing step. The policy validator
+comes from the trusted workflow commit on `main`, while the requested historical
+bridge source remains the exact build input.
 The publication PAT remains unavailable until approval. Missing or weakened
 bypass, reviewer, branch, credential, or secret-scope protection therefore
 fails closed.

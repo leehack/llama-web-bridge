@@ -499,19 +499,43 @@ def validate_publication_environment(
     if not isinstance(rules, list):
         raise ContractError("publication environment has no protection rules")
     reviewer_count = 0
+    reviewer_rule_count = 0
+    reviewer_identities: set[tuple[str, int]] = set()
     branch_rule_count = 0
     for rule in rules:
         if not isinstance(rule, Mapping):
             continue
         if rule.get("type") == "required_reviewers":
+            reviewer_rule_count += 1
             if rule.get("prevent_self_review") is not True:
                 raise ContractError("publication environment must prevent self review")
             reviewers = rule.get("reviewers")
-            if isinstance(reviewers, list):
-                reviewer_count += len(reviewers)
+            if not isinstance(reviewers, list) or not reviewers:
+                raise ContractError("publication environment has no required reviewers")
+            for reviewer_entry in reviewers:
+                if not isinstance(reviewer_entry, Mapping):
+                    raise ContractError("publication environment reviewer inventory is invalid")
+                reviewer_type = reviewer_entry.get("type")
+                reviewer = reviewer_entry.get("reviewer")
+                if reviewer_type not in ("User", "Team") or not isinstance(
+                    reviewer, Mapping
+                ):
+                    raise ContractError("publication environment reviewer inventory is invalid")
+                reviewer_id = reviewer.get("id")
+                if (
+                    not isinstance(reviewer_id, int)
+                    or isinstance(reviewer_id, bool)
+                    or reviewer_id <= 0
+                ):
+                    raise ContractError("publication environment reviewer inventory is invalid")
+                identity = (reviewer_type, reviewer_id)
+                if identity in reviewer_identities:
+                    raise ContractError("publication environment reviewer inventory is invalid")
+                reviewer_identities.add(identity)
+                reviewer_count += 1
         elif rule.get("type") == "branch_policy":
             branch_rule_count += 1
-    if reviewer_count < 1:
+    if reviewer_rule_count != 1 or reviewer_count < 1:
         raise ContractError("publication environment has no required reviewers")
     if branch_rule_count != 1:
         raise ContractError("publication environment must have one branch policy rule")
@@ -569,6 +593,10 @@ def validate_publication_environment(
     if "WEBGPU_BRIDGE_ASSETS_PAT" not in secret_names:
         raise ContractError(
             "publication environment is missing WEBGPU_BRIDGE_ASSETS_PAT"
+        )
+    if "BRIDGE_PUBLICATION_ENV_READ_TOKEN" in secret_names:
+        raise ContractError(
+            "BRIDGE_PUBLICATION_ENV_READ_TOKEN must not be environment scoped"
         )
     return reviewer_count
 

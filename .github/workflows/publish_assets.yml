@@ -105,6 +105,10 @@ jobs:
             exit 1
           fi
           bridge_default="$(gh api "repos/${BRIDGE_REPO}" --jq '.default_branch')"
+          if [ "${GITHUB_REF}" != "refs/heads/${bridge_default}" ]; then
+            echo "error: publication workflow must be dispatched from ${BRIDGE_REPO}'s default branch"
+            exit 1
+          fi
           source_status="$(gh api \
             "repos/${BRIDGE_REPO}/compare/${BRIDGE_SOURCE_SHA}...${bridge_default}" \
             --jq '.status')"
@@ -411,11 +415,11 @@ jobs:
     outputs:
       environment_name: ${{ steps.environment.outputs.environment_name }}
     steps:
-      - name: Checkout bridge environment contract
+      - name: Checkout trusted publication policy contract
         uses: actions/checkout@v4
         with:
           repository: leehack/llama-web-bridge
-          ref: ${{ env.BRIDGE_SOURCE_SHA }}
+          ref: ${{ github.sha }}
           persist-credentials: false
       - name: Fail closed unless the protected approval policy exists
         id: environment
@@ -432,9 +436,10 @@ jobs:
             > "${RUNNER_TEMP}/publication-environment.json"
           gh api "repos/${BRIDGE_REPO}/environments/bridge-assets-publication/deployment-branch-policies" \
             > "${RUNNER_TEMP}/publication-branch-policies.json"
-          GH_TOKEN="${ENVIRONMENT_READ_TOKEN}" gh api \
-            "repos/${BRIDGE_REPO}/environments/bridge-assets-publication/secrets" \
-            > "${RUNNER_TEMP}/publication-environment-secrets.json"
+          GH_TOKEN="${ENVIRONMENT_READ_TOKEN}" gh api --paginate --slurp \
+            "repos/${BRIDGE_REPO}/environments/bridge-assets-publication/secrets?per_page=100" \
+            | jq -c '{total_count: ([.[].total_count] | max // 0), secrets: [.[].secrets[]]}' \
+              > "${RUNNER_TEMP}/publication-environment-secrets.json"
           python3 scripts/release_contract.py validate-environment \
             --environment-json "${RUNNER_TEMP}/publication-environment.json" \
             --branch-policies-json "${RUNNER_TEMP}/publication-branch-policies.json" \
@@ -457,6 +462,14 @@ jobs:
     outputs:
       publication_outcome: ${{ steps.final.outputs.publication_outcome }}
     steps:
+      - name: Checkout trusted publication policy contract
+        uses: actions/checkout@v4
+        with:
+          repository: leehack/llama-web-bridge
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          path: publication-policy
+
       - name: Checkout exact bridge owner source
         uses: actions/checkout@v4
         with:
@@ -494,10 +507,11 @@ jobs:
             > "${RUNNER_TEMP}/post-approval-publication-environment.json"
           gh api "repos/${BRIDGE_REPO}/environments/bridge-assets-publication/deployment-branch-policies" \
             > "${RUNNER_TEMP}/post-approval-publication-branch-policies.json"
-          GH_TOKEN="${ENVIRONMENT_READ_TOKEN}" gh api \
-            "repos/${BRIDGE_REPO}/environments/bridge-assets-publication/secrets" \
-            > "${RUNNER_TEMP}/post-approval-publication-environment-secrets.json"
-          python3 bridge-source/scripts/release_contract.py validate-environment \
+          GH_TOKEN="${ENVIRONMENT_READ_TOKEN}" gh api --paginate --slurp \
+            "repos/${BRIDGE_REPO}/environments/bridge-assets-publication/secrets?per_page=100" \
+            | jq -c '{total_count: ([.[].total_count] | max // 0), secrets: [.[].secrets[]]}' \
+              > "${RUNNER_TEMP}/post-approval-publication-environment-secrets.json"
+          python3 publication-policy/scripts/release_contract.py validate-environment \
             --environment-json "${RUNNER_TEMP}/post-approval-publication-environment.json" \
             --branch-policies-json "${RUNNER_TEMP}/post-approval-publication-branch-policies.json" \
             --environment-secrets-json "${RUNNER_TEMP}/post-approval-publication-environment-secrets.json"

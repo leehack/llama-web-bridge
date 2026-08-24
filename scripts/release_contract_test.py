@@ -86,7 +86,10 @@ class ReleaseContractTest(unittest.TestCase):
                     "type": "required_reviewers",
                     "prevent_self_review": True,
                     "reviewers": [
-                        {"type": "User", "reviewer": {"login": "maintainer"}}
+                        {
+                            "type": "User",
+                            "reviewer": {"id": 1234, "login": "maintainer"},
+                        }
                     ],
                 },
                 {"type": "branch_policy"},
@@ -132,6 +135,38 @@ class ReleaseContractTest(unittest.TestCase):
                 },
             },
             "wrong-name": {**configured, "name": "wrong"},
+            "malformed-reviewer-entry": {
+                **configured,
+                "protection_rules": [
+                    {
+                        **configured["protection_rules"][0],
+                        "reviewers": [{}],
+                    },
+                    {"type": "branch_policy"},
+                ],
+            },
+            "null-reviewer-entry": {
+                **configured,
+                "protection_rules": [
+                    {
+                        **configured["protection_rules"][0],
+                        "reviewers": [None],
+                    },
+                    {"type": "branch_policy"},
+                ],
+            },
+            "missing-reviewer-id": {
+                **configured,
+                "protection_rules": [
+                    {
+                        **configured["protection_rules"][0],
+                        "reviewers": [
+                            {"type": "User", "reviewer": {"login": "maintainer"}}
+                        ],
+                    },
+                    {"type": "branch_policy"},
+                ],
+            },
         }
         for label, invalid in invalid_cases.items():
             with self.subTest(label=label), self.assertRaises(ContractError):
@@ -172,6 +207,13 @@ class ReleaseContractTest(unittest.TestCase):
             {"total_count": 1, "secrets": [{"name": "INVALID-NAME"}]},
             {"total_count": 1, "secrets": [{"name": "GITHUB_RESERVED"}]},
             {"total_count": 1, "secrets": [{"name": "webgpu_bridge_assets_pat"}]},
+            {
+                "total_count": 2,
+                "secrets": [
+                    {"name": "WEBGPU_BRIDGE_ASSETS_PAT"},
+                    {"name": "BRIDGE_PUBLICATION_ENV_READ_TOKEN"},
+                ],
+            },
             {
                 "total_count": 2,
                 "secrets": [

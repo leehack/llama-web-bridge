@@ -178,10 +178,13 @@ publication because the bridge exposes Qwen3-TTS.
     repository or organization Actions secret,
     `BRIDGE_PUBLICATION_ENV_READ_TOKEN`, must be a credential scoped to this
     repository with only Environments read permission; use it only for the
-    pre-approval and post-approval environment-secret name inventory. Use the
-    default job token for environment and branch-policy metadata. Revalidate
-    the bypass, reviewer, branch, and environment-secret metadata after
-    approval and immediately before the first publication-PAT-bearing step.
+    pre-approval and post-approval complete environment-secret name inventory,
+    and reject an environment-scoped copy that could shadow it after approval.
+    Use the default job token for environment and branch-policy metadata. Use
+    the trusted workflow commit's validator rather than the requested historical
+    bridge build source. Revalidate the bypass, reviewer, branch, and
+    environment-secret metadata after approval and immediately before the first
+    publication-PAT-bearing step.
   - Emits only stable `vMAJOR.MINOR.PATCH[-N]` or development `bNNNN[-N]` tags.
     Historical `*-llamadart.N` forms are accepted only when reading old
     manifests and are never emitted.

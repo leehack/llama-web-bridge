@@ -196,8 +196,12 @@ permission. The workflow fails closed if either external credential or the
 environment protection is absent. It verifies all identities plus native
 GitHub asset digests/inventory, uses the default job token for environment and
 main-branch policy metadata, and uses the separate read credential only for the
-environment-secret name inventory. It repeats those checks after approval
-immediately before the first publication-PAT-bearing step. The API
+complete paginated environment-secret name inventory. Do not duplicate the read
+credential in the environment, where environment-secret precedence would
+shadow the intended repository/organization credential after approval. The
+workflow repeats those checks after approval immediately before the first
+publication-PAT-bearing step, using the trusted workflow commit's validator so
+an older requested build-source SHA remains compatible. The API
 check proves the expected secret name is environment-scoped without reading its
 value. It
 builds wasm32 and memory64, runs mandatory state/multimodal/ASR/TTS gates,
