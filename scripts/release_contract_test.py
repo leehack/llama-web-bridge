@@ -136,6 +136,10 @@ class ReleaseContractTest(unittest.TestCase):
                 },
             },
             "wrong-name": {**configured, "name": "wrong"},
+            "malformed-protection-rule": {
+                **configured,
+                "protection_rules": [*configured["protection_rules"], None],
+            },
             "malformed-reviewer-entry": {
                 **configured,
                 "protection_rules": [

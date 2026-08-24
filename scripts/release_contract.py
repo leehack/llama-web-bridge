@@ -504,7 +504,7 @@ def validate_publication_environment(
     branch_rule_count = 0
     for rule in rules:
         if not isinstance(rule, Mapping):
-            continue
+            raise ContractError("publication environment protection rules are invalid")
         if rule.get("type") == "required_reviewers":
             reviewer_rule_count += 1
             if rule.get("prevent_self_review") is not True:
