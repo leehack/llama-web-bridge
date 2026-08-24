@@ -183,7 +183,9 @@ publication because the bridge exposes Qwen3-TTS.
     and reject an environment-scoped copy that could shadow it after approval.
     Use the default job token for environment and branch-policy metadata. Use
     the trusted workflow commit's validator rather than the requested historical
-    bridge build source. Revalidate the bypass, reviewer, branch, and
+    bridge build source. Require the reviewer inventory to equal the pinned
+    maintainer identity, because any configured reviewer may approve. Revalidate
+    the bypass, reviewer, branch, and
     environment-secret metadata after approval and immediately before the first
     publication-PAT-bearing step.
   - Emits only stable `vMAJOR.MINOR.PATCH[-N]` or development `bNNNN[-N]` tags.

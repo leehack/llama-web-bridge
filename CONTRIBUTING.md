@@ -202,7 +202,9 @@ credential in the environment, where environment-secret precedence would
 shadow the intended repository/organization credential after approval. The
 workflow repeats those checks after approval immediately before the first
 publication-PAT-bearing step, using the trusted workflow commit's validator so
-an older requested build-source SHA remains compatible. The API
+an older requested build-source SHA remains compatible. Keep the reviewer
+inventory equal to the pinned maintainer identity; do not add an unapproved
+reviewer who could approve alone. The API
 check proves the expected secret name is environment-scoped without reading its
 value. It
 builds wasm32 and memory64, runs mandatory state/multimodal/ASR/TTS gates,

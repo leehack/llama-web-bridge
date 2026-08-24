@@ -330,7 +330,9 @@ normalizes the complete paginated secret-name inventory and performs both
 checks before entering the environment and again after reviewer approval,
 immediately before the first publication-PAT-bearing step. The policy validator
 comes from the trusted workflow commit on `main`, while the requested historical
-bridge source remains the exact build input.
+bridge source remains the exact build input. The required-reviewer inventory
+must exactly match the pinned maintainer identity; adding an unapproved reviewer
+fails closed because any configured reviewer can approve the environment.
 The publication PAT remains unavailable until approval. Missing or weakened
 bypass, reviewer, branch, credential, or secret-scope protection therefore
 fails closed.

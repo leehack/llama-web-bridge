@@ -538,9 +538,9 @@ def validate_publication_environment(
             branch_rule_count += 1
     if reviewer_rule_count != 1 or reviewer_count < 1:
         raise ContractError("publication environment has no required reviewers")
-    if reviewer_identities.isdisjoint(APPROVED_PUBLICATION_REVIEWER_IDENTITIES):
+    if reviewer_identities != APPROVED_PUBLICATION_REVIEWER_IDENTITIES:
         raise ContractError(
-            "publication environment has no approved maintainer reviewer"
+            "publication environment reviewers must exactly match the approved inventory"
         )
     if branch_rule_count != 1:
         raise ContractError("publication environment must have one branch policy rule")

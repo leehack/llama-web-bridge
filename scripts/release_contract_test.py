@@ -198,6 +198,19 @@ class ReleaseContractTest(unittest.TestCase):
                     {"type": "branch_policy"},
                 ],
             },
+            "mixed-approved-and-unapproved-reviewers": {
+                **configured,
+                "protection_rules": [
+                    {
+                        **configured["protection_rules"][0],
+                        "reviewers": [
+                            {"type": "User", "reviewer": {"id": 1233094}},
+                            {"type": "User", "reviewer": {"id": 999999}},
+                        ],
+                    },
+                    {"type": "branch_policy"},
+                ],
+            },
             "duplicate-reviewer-id": {
                 **configured,
                 "protection_rules": [
