@@ -817,6 +817,14 @@ int32_t begin_generation_impl(
     float repeat_penalty,
     const char * grammar,
     uint32_t seed) {
+  // Defence in depth behind the bridge's single-writer queue: reject before
+  // touching any shared state, so a stray second begin cannot destroy the
+  // in-flight generation's output, sampler, or g_last_error. The caller maps
+  // -7 to a fixed message instead of reading g_last_error.
+  if (g_generation_active) {
+    return -7;
+  }
+
   clear_error();
   g_last_output.clear();
   g_last_piece.clear();

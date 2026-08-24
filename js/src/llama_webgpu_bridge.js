@@ -1,6 +1,15 @@
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder();
 const defaultModelCacheName = 'llamadart-webgpu-model-cache-v1';
+// Stable lifecycle error; consumers match on it to distinguish a disposed
+// bridge from a transient runtime failure.
+const BRIDGE_DISPOSED_MESSAGE = 'Bridge has been disposed.';
+// llamadart_webgpu_begin_generation returns this when a generation is already
+// active. The core leaves g_last_error untouched in that case, so the message is
+// fixed here rather than read from the shared buffer.
+const GENERATION_ALREADY_ACTIVE_RC = -7;
+const GENERATION_ALREADY_ACTIVE_MESSAGE =
+  'Generation is already active on this bridge runtime.';
 
 function basenameFromUrl(url) {
   try {
@@ -4337,6 +4346,10 @@ class LlamaWebGpuBridgeRuntime {
         ),
       );
 
+      if (beginRc === GENERATION_ALREADY_ACTIVE_RC) {
+        throw new Error(GENERATION_ALREADY_ACTIVE_MESSAGE);
+      }
+
       if (beginRc !== 0) {
         throw new Error(this._coreErrorMessage('Failed to start generation', beginRc));
       }
@@ -4884,6 +4897,10 @@ export class LlamaWebGpuBridge {
     this._loadedMmProjUrl = null;
     this._multimodalWorkerCpuMode = false;
     this._bridgeWarnRecent = new Map();
+    this._operationQueueTail = null;
+    this._disposed = false;
+    this._disposePromise = null;
+    this._disposalWaiters = new Set();
 
     if (this._shouldUseWorker()) {
       try {
@@ -4898,6 +4915,7 @@ export class LlamaWebGpuBridge {
 
     if (!this._workerProxy) {
       this._runtime = this._createRuntime();
+      this._captureDirectRuntimeState();
     }
   }
 
@@ -4906,6 +4924,209 @@ export class LlamaWebGpuBridge {
       ...this._config,
       disableWorker: true,
     });
+  }
+
+  /**
+   * llama.cpp exposes one model/context per bridge instance and publishes
+   * results through process-global C buffers (`last_output`, `last_tokens_json`,
+   * `last_detokenized`, `last_embedding_json`, ...). Every async call that reads
+   * or mutates that runtime therefore has to own it exclusively for its whole
+   * duration: a second caller interleaving between the work ccall and the buffer
+   * read would otherwise observe the other caller's result. This FIFO queue is
+   * the single-writer lock, shared by the worker and direct-runtime paths.
+   *
+   * A caller whose signal is already aborted, or that aborts while still queued,
+   * never runs and never dispatches; its slot is skipped in turn without
+   * touching the unrelated operation that currently owns the runtime. Once an
+   * operation has started, cancellation is unchanged: the per-method abort
+   * listeners and `cancel()` handle it exactly as before.
+   *
+   * @template T
+   * @param {() => Promise<T>} run
+   * @param {{ signal?: AbortSignal|null, abortMessage?: string, allowDisposed?: boolean }} [options]
+   * @returns {Promise<T>}
+   */
+  _runExclusive(run, options = {}) {
+    const signal = options.signal || null;
+    const abortMessage = options.abortMessage || 'Bridge operation was cancelled.';
+    const allowDisposed = options.allowDisposed === true;
+    const abortError = () => new DOMException(abortMessage, 'AbortError');
+
+    if (!allowDisposed && this._disposed) {
+      return Promise.reject(new Error(BRIDGE_DISPOSED_MESSAGE));
+    }
+    if (signal?.aborted) {
+      return Promise.reject(abortError());
+    }
+
+    const predecessor = this._operationQueueTail;
+    /** @type {() => void} */
+    let releaseSuccessor = () => {};
+    const queueSlot = new Promise((resolve) => {
+      releaseSuccessor = () => resolve(undefined);
+    });
+    this._operationQueueTail = queueSlot;
+
+    let started = false;
+    const ordered = (async () => {
+      if (predecessor) {
+        await predecessor;
+      }
+      if (signal?.aborted) {
+        throw abortError();
+      }
+      if (!allowDisposed && this._disposed) {
+        throw new Error(BRIDGE_DISPOSED_MESSAGE);
+      }
+      started = true;
+      try {
+        return await run();
+      } finally {
+        // Refresh the snapshot on success and failure alike, while this
+        // operation still owns the slot, so the synchronous getters never have
+        // to read the runtime themselves.
+        this._captureDirectRuntimeState();
+      }
+    })();
+
+    const release = () => {
+      if (this._operationQueueTail === queueSlot) {
+        this._operationQueueTail = null;
+      }
+      releaseSuccessor();
+    };
+    ordered.then(release, release);
+
+    const watchesAbort = signal != null && typeof signal.addEventListener === 'function';
+    const watchesDisposal = !allowDisposed;
+    if (!watchesAbort && !watchesDisposal) {
+      return ordered;
+    }
+
+    // Reject the caller as soon as it is cancelled or the bridge is disposed
+    // while still waiting. The slot stays in the chain and is skipped in turn.
+    let removeAbortListener = null;
+    let removeDisposalWaiter = null;
+    const abandonedWhileQueued = new Promise((_, reject) => {
+      if (watchesAbort) {
+        const onAbort = () => {
+          if (!started) {
+            reject(abortError());
+          }
+        };
+        signal.addEventListener('abort', onAbort, { once: true });
+        removeAbortListener = () => signal.removeEventListener('abort', onAbort);
+      }
+
+      if (watchesDisposal) {
+        removeDisposalWaiter = this._addDisposalWaiter(() => {
+          if (!started) {
+            reject(new Error(BRIDGE_DISPOSED_MESSAGE));
+          }
+        });
+      }
+    });
+
+    const raced = Promise.race([ordered, abandonedWhileQueued]);
+    const detach = () => {
+      removeAbortListener?.();
+      removeDisposalWaiter?.();
+    };
+    raced.then(detach, detach);
+    return raced;
+  }
+
+  /**
+   * Registers a disposal listener for the lifetime of one pending operation and
+   * returns its remover. A listener set is used rather than a long-lived promise
+   * because a promise reaction cannot be detached.
+   *
+   * @param {() => void} onDisposed
+   * @returns {() => void}
+   */
+  _addDisposalWaiter(onDisposed) {
+    if (!this._disposalWaiters) {
+      this._disposalWaiters = new Set();
+    }
+    const waiters = this._disposalWaiters;
+    waiters.add(onDisposed);
+    return () => {
+      waiters.delete(onDisposed);
+    };
+  }
+
+  /**
+   * Lifecycle gate for the helpers that stay off the queue. They must not
+   * dispatch to a torn-down worker, and must not lazily recreate the runtime
+   * disposal just released.
+   */
+  _throwIfDisposed() {
+    if (this._disposed) {
+      throw new Error(BRIDGE_DISPOSED_MESSAGE);
+    }
+  }
+
+  _notifyDisposalWaiters() {
+    const waiters = this._disposalWaiters;
+    if (!waiters || waiters.size === 0) {
+      return;
+    }
+    this._disposalWaiters = new Set();
+    for (const waiter of waiters) {
+      try {
+        waiter();
+      } catch (_) {
+        // A waiter only rejects its own caller; never block disposal.
+      }
+    }
+  }
+
+  /**
+   * Mirror the direct runtime's model/context state into facade fields so the
+   * synchronous getters can answer from cache. Reading them straight from the
+   * runtime would ccall into the singleton core outside the queue, racing
+   * whichever async operation currently owns it.
+   */
+  _captureDirectRuntimeState() {
+    // Worker mode owns the snapshot through _applyShadowState; a stale direct
+    // runtime must never overwrite it.
+    if (this._workerProxy || !this._runtime) {
+      return;
+    }
+
+    try {
+      this._metadata = this._runtime.getModelMetadata();
+      this._contextSize = this._runtime.getContextSize();
+      this._gpuActive = this._runtime.isGpuActive();
+      this._backendName = this._runtime.getBackendName();
+      this._supportsVision = this._runtime.supportsVision();
+      this._supportsAudio = this._runtime.supportsAudio();
+    } catch (_) {
+      // Keep the previously cached snapshot when the core is unavailable.
+    }
+  }
+
+  /**
+   * prefetch/evict stay off the queue because they only touch Cache Storage and
+   * the network. In direct mode their plain-JS cache bookkeeping is copied into
+   * the facade snapshot. A worker-backed snapshot remains wholly worker-owned so
+   * a separate cache-only runtime cannot misdescribe the active worker model.
+   */
+  _refreshCacheMetadataSnapshot() {
+    const runtime = this._runtime;
+    if (this._workerProxy || !runtime) {
+      return;
+    }
+
+    this._metadata = {
+      ...(this._metadata || {}),
+      'llamadart.webgpu.model_source': String(runtime._modelSource ?? ''),
+      'llamadart.webgpu.model_cache_state': String(runtime._modelCacheState ?? ''),
+      'llamadart.webgpu.model_cache_name': String(runtime._modelCacheName ?? ''),
+      'llamadart.webgpu.runtime_notes': Array.isArray(runtime._runtimeNotes)
+        ? runtime._runtimeNotes.join(';')
+        : '',
+    };
   }
 
   _sanitizeModelLoadOptions(options = {}) {
@@ -5548,20 +5769,32 @@ export class LlamaWebGpuBridge {
   }
 
   async _callWorker(method, args, onEvent, transferList = []) {
-    if (!this._workerProxy) {
+    const proxy = this._workerProxy;
+    if (!proxy) {
       throw new Error('Bridge worker proxy is not available');
     }
 
     try {
-      const response = await this._workerProxy.call(method, args, onEvent, transferList);
-      this._applyShadowState(response.state);
+      const response = await proxy.call(method, args, onEvent, transferList);
+      this._applyShadowStateFrom(proxy, response.state);
       return response.value;
     } catch (error) {
       if (error && typeof error === 'object' && error.state) {
-        this._applyShadowState(error.state);
+        this._applyShadowStateFrom(proxy, error.state);
       }
       throw error;
     }
+  }
+
+  /**
+   * The getters now answer from the facade snapshot, so a response from a proxy
+   * that has since been replaced must not write into the current worker's state.
+   */
+  _applyShadowStateFrom(proxy, state) {
+    if (proxy !== this._workerProxy) {
+      return;
+    }
+    this._applyShadowState(state);
   }
 
   /**
@@ -5569,6 +5802,17 @@ export class LlamaWebGpuBridge {
    * @param {Record<string, any>} [options]
    */
   async loadModelFromUrl(url, options = {}) {
+    return this._runExclusive(
+      () => this._loadModelFromUrlUnlocked(url, options),
+      { signal: options?.signal, abortMessage: 'Model load was cancelled.' },
+    );
+  }
+
+  /**
+   * @param {string|string[]} url
+   * @param {Record<string, any>} [options]
+   */
+  async _loadModelFromUrlUnlocked(url, options = {}) {
     if (!this._workerProxy) {
       const result = await this._runtime.loadModelFromUrl(url, options);
       this._rememberLoadedModel(url, options);
@@ -5627,17 +5871,27 @@ export class LlamaWebGpuBridge {
   }
 
   async prefetchModelToCache(url, options = {}) {
+    this._throwIfDisposed();
     if (!this._runtime) {
       this._runtime = this._createRuntime();
     }
-    return this._runtime.prefetchModelToCache(url, options);
+    try {
+      return await this._runtime.prefetchModelToCache(url, options);
+    } finally {
+      this._refreshCacheMetadataSnapshot();
+    }
   }
 
   async evictModelFromCache(url, options = {}) {
+    this._throwIfDisposed();
     if (!this._runtime) {
       this._runtime = this._createRuntime();
     }
-    return this._runtime.evictModelFromCache(url, options);
+    try {
+      return await this._runtime.evictModelFromCache(url, options);
+    } finally {
+      this._refreshCacheMetadataSnapshot();
+    }
   }
 
   /**
@@ -5645,6 +5899,17 @@ export class LlamaWebGpuBridge {
    * @param {Record<string, any>} [options]
    */
   async createCompletion(prompt, options = {}) {
+    return this._runExclusive(
+      () => this._createCompletionUnlocked(prompt, options),
+      { signal: options?.signal, abortMessage: 'Generation was cancelled.' },
+    );
+  }
+
+  /**
+   * @param {string} prompt
+   * @param {Record<string, any>} [options]
+   */
+  async _createCompletionUnlocked(prompt, options = {}) {
     const isWarmup = options?.warmup === true;
     const hasRetriedEmptyMultimodal =
       options?.__llamadartEmptyRetryAttempted === true;
@@ -5796,7 +6061,7 @@ export class LlamaWebGpuBridge {
               );
             }
 
-            return this.createCompletion(prompt, {
+            return this._createCompletionUnlocked(prompt, {
               ...options,
               __llamadartEmptyRetryAttempted: true,
             });
@@ -5848,6 +6113,10 @@ export class LlamaWebGpuBridge {
   }
 
   async loadMultimodalProjector(url) {
+    return this._runExclusive(() => this._loadMultimodalProjectorUnlocked(url));
+  }
+
+  async _loadMultimodalProjectorUnlocked(url) {
     const startedWithWorker = this._workerProxy != null;
     const invokeRuntimeLoad = async () => {
       if (!this._runtime) {
@@ -5906,6 +6175,10 @@ export class LlamaWebGpuBridge {
   }
 
   async unloadMultimodalProjector() {
+    return this._runExclusive(() => this._unloadMultimodalProjectorUnlocked());
+  }
+
+  async _unloadMultimodalProjectorUnlocked() {
     if (!this._workerProxy) {
       const result = await this._runtime.unloadMultimodalProjector();
       this._loadedMmProjUrl = null;
@@ -5930,20 +6203,18 @@ export class LlamaWebGpuBridge {
   }
 
   supportsVision() {
-    if (this._workerProxy) {
-      return this._supportsVision;
-    }
-    return this._runtime.supportsVision();
+    return this._supportsVision;
   }
 
   supportsAudio() {
-    if (this._workerProxy) {
-      return this._supportsAudio;
-    }
-    return this._runtime.supportsAudio();
+    return this._supportsAudio;
   }
 
   async getTextToSpeechCapabilities() {
+    return this._runExclusive(() => this._getTextToSpeechCapabilitiesUnlocked());
+  }
+
+  async _getTextToSpeechCapabilitiesUnlocked() {
     if (!this._workerProxy) {
       return this._runtime.getTextToSpeechCapabilities();
     }
@@ -5959,6 +6230,17 @@ export class LlamaWebGpuBridge {
 
   /** @param {Partial<import('./llama_webgpu_bridge.d.ts').TextToSpeechOptions>} [options] */
   async synthesizeSpeech(options = {}) {
+    return this._runExclusive(
+      () => this._synthesizeSpeechUnlocked(options),
+      {
+        signal: options?.signal,
+        abortMessage: 'Text-to-speech synthesis was cancelled.',
+      },
+    );
+  }
+
+  /** @param {Partial<import('./llama_webgpu_bridge.d.ts').TextToSpeechOptions>} [options] */
+  async _synthesizeSpeechUnlocked(options = {}) {
     if (options.signal?.aborted) {
       throw new DOMException('Text-to-speech synthesis was cancelled.', 'AbortError');
     }
@@ -6036,6 +6318,10 @@ export class LlamaWebGpuBridge {
   }
 
   async tokenize(text, addSpecial = true) {
+    return this._runExclusive(() => this._tokenizeUnlocked(text, addSpecial));
+  }
+
+  async _tokenizeUnlocked(text, addSpecial = true) {
     if (!this._workerProxy) {
       return this._runtime.tokenize(text, addSpecial);
     }
@@ -6051,6 +6337,10 @@ export class LlamaWebGpuBridge {
   }
 
   async stateSaveFile(path, tokens = []) {
+    return this._runExclusive(() => this._stateSaveFileUnlocked(path, tokens));
+  }
+
+  async _stateSaveFileUnlocked(path, tokens = []) {
     if (!this._workerProxy) {
       return this._runtime.stateSaveFile(path, tokens);
     }
@@ -6061,7 +6351,20 @@ export class LlamaWebGpuBridge {
     return this._callWorker('stateSaveFile', [path, normalized]);
   }
 
-  async stateLoadFile(path, tokenCapacity = this.getContextSize()) {
+  // The capacity default is resolved inside the slot: evaluating it as a
+  // parameter default would read runtime state before the queue was taken.
+  async stateLoadFile(path, tokenCapacity = undefined) {
+    return this._runExclusive(() => this._stateLoadFileUnlocked(path, tokenCapacity));
+  }
+
+  _resolveTokenCapacity(tokenCapacity) {
+    return Number(tokenCapacity) > 0
+      ? Math.trunc(Number(tokenCapacity))
+      : this.getContextSize();
+  }
+
+  async _stateLoadFileUnlocked(path, tokenCapacity) {
+    tokenCapacity = this._resolveTokenCapacity(tokenCapacity);
     if (!this._workerProxy) {
       return this._runtime.stateLoadFile(path, tokenCapacity);
     }
@@ -6070,6 +6373,10 @@ export class LlamaWebGpuBridge {
   }
 
   async stateSaveBytes(tokens = []) {
+    return this._runExclusive(() => this._stateSaveBytesUnlocked(tokens));
+  }
+
+  async _stateSaveBytesUnlocked(tokens = []) {
     if (!this._workerProxy) {
       return this._runtime.stateSaveBytes(tokens);
     }
@@ -6080,7 +6387,12 @@ export class LlamaWebGpuBridge {
     return this._callWorker('stateSaveBytes', [normalized]);
   }
 
-  async stateLoadBytes(bytes, tokenCapacity = this.getContextSize()) {
+  async stateLoadBytes(bytes, tokenCapacity = undefined) {
+    return this._runExclusive(() => this._stateLoadBytesUnlocked(bytes, tokenCapacity));
+  }
+
+  async _stateLoadBytesUnlocked(bytes, tokenCapacity) {
+    tokenCapacity = this._resolveTokenCapacity(tokenCapacity);
     if (!this._workerProxy) {
       return this._runtime.stateLoadBytes(bytes, tokenCapacity);
     }
@@ -6100,6 +6412,10 @@ export class LlamaWebGpuBridge {
   }
 
   async detokenize(tokens, special = false) {
+    return this._runExclusive(() => this._detokenizeUnlocked(tokens, special));
+  }
+
+  async _detokenizeUnlocked(tokens, special = false) {
     if (!this._workerProxy) {
       return this._runtime.detokenize(tokens, special);
     }
@@ -6119,6 +6435,10 @@ export class LlamaWebGpuBridge {
   }
 
   async embed(text, options = {}) {
+    return this._runExclusive(() => this._embedUnlocked(text, options));
+  }
+
+  async _embedUnlocked(text, options = {}) {
     if (!this._workerProxy) {
       return this._runtime.embed(text, options);
     }
@@ -6134,6 +6454,10 @@ export class LlamaWebGpuBridge {
   }
 
   async embedBatch(texts, options = {}) {
+    return this._runExclusive(() => this._embedBatchUnlocked(texts, options));
+  }
+
+  async _embedBatchUnlocked(texts, options = {}) {
     const normalized = Array.isArray(texts)
       ? texts
       : Array.from(texts || []);
@@ -6165,7 +6489,7 @@ export class LlamaWebGpuBridge {
         : null;
 
     return {
-      ...this._runtime.getModelMetadata(),
+      ...(this._metadata || {}),
       'llamadart.webgpu.execution': 'main-thread',
       ...(workerReason == null
         ? {}
@@ -6173,36 +6497,35 @@ export class LlamaWebGpuBridge {
     };
   }
 
+  // The synchronous getters answer from the facade snapshot in both modes.
+  // Reading the direct runtime here would ccall into the singleton core outside
+  // the queue and race whichever async operation currently owns it; the snapshot
+  // is refreshed by _captureDirectRuntimeState() while the slot is held.
   getContextSize() {
-    if (this._workerProxy) {
-      return this._contextSize || 0;
-    }
-    return this._runtime.getContextSize();
+    return this._contextSize || 0;
   }
 
   isGpuActive() {
-    if (this._workerProxy) {
-      return this._gpuActive;
-    }
-    return this._runtime.isGpuActive();
+    return this._gpuActive;
   }
 
   getBackendName() {
-    if (this._workerProxy) {
-      return this._backendName;
-    }
-    return this._runtime.getBackendName();
+    return this._backendName;
   }
 
   setLogLevel(level) {
+    this._throwIfDisposed();
     if (Number.isFinite(level)) {
       this._config.logLevel = Math.max(0, Math.min(4, Math.trunc(level)));
     }
 
     if (this._workerProxy) {
-      this._callWorker('setLogLevel', [level]).catch((error) => {
-        this._disableWorkerFallback(error);
-      });
+      // Log-level delivery is best effort and runs outside the queue, so a
+      // failure must not replace worker topology here: doing so could strand a
+      // state-bearing response from the operation that currently owns the queue.
+      // The next real queued operation performs the normal fallback under
+      // queue ownership.
+      this._callWorker('setLogLevel', [level]).catch(() => {});
       if (this._runtime) {
         this._runtime.setLogLevel(level);
       }
@@ -6221,23 +6544,77 @@ export class LlamaWebGpuBridge {
     }
   }
 
-  async dispose() {
-    if (this._workerProxy) {
-      await this._workerProxy.dispose();
-      this._workerProxy = null;
-      this._metadata = {};
-      this._contextSize = 0;
-      this._gpuActive = false;
-      this._backendName = 'WASM (Prototype bridge)';
-      this._supportsVision = false;
-      this._supportsAudio = false;
+  /**
+   * Marks the bridge disposed synchronously, then tears down on the queue so
+   * teardown never runs underneath an operation that still owns the runtime.
+   * Work queued before disposal is rejected with a stable lifecycle error rather
+   * than dereferencing a torn-down runtime. Not `async`, so repeated calls hand
+   * back the identical teardown promise.
+   *
+   * @returns {Promise<void>}
+   */
+  dispose() {
+    if (this._disposed) {
+      return this._disposePromise;
+    }
+
+    this._disposed = true;
+
+    // Reserve the public promise before teardown can run synchronously. A
+    // runtime logger (or another teardown callback) may re-enter dispose()
+    // before _runExclusive() returns; it must observe this exact promise rather
+    // than the still-unassigned field.
+    /** @type {(value?: void | PromiseLike<void>) => void} */
+    let resolveDispose = () => {};
+    /** @type {(reason?: any) => void} */
+    let rejectDispose = () => {};
+    this._disposePromise = new Promise((resolve, reject) => {
+      resolveDispose = resolve;
+      rejectDispose = reject;
+    });
+    this._notifyDisposalWaiters();
+
+    try {
+      const teardown = this._runExclusive(
+        () => this._disposeUnlocked(),
+        { allowDisposed: true },
+      );
+      teardown.then(
+        () => resolveDispose(),
+        (error) => rejectDispose(error),
+      );
+    } catch (error) {
+      rejectDispose(error);
+    }
+    return this._disposePromise;
+  }
+
+  async _disposeUnlocked() {
+    const workerProxy = this._workerProxy;
+    this._workerProxy = null;
+    const workerDisposePromise = this._workerDisposePromise;
+    this._workerDisposePromise = null;
+
+    if (workerProxy) {
+      await workerProxy.dispose();
+    }
+    if (workerDisposePromise) {
+      await workerDisposePromise;
     }
 
     if (this._runtime) {
-      await this._runtime.dispose();
+      const runtime = this._runtime;
       this._runtime = null;
+      await runtime.dispose();
     }
 
+    // The getters read this snapshot, so teardown must clear it in both modes.
+    this._metadata = {};
+    this._contextSize = 0;
+    this._gpuActive = false;
+    this._backendName = 'WASM (Prototype bridge)';
+    this._supportsVision = false;
+    this._supportsAudio = false;
     this._loadedModelUrl = null;
     this._loadedModelOptions = null;
     this._loadedMmProjUrl = null;
@@ -6245,6 +6622,12 @@ export class LlamaWebGpuBridge {
   }
 
   async applyChatTemplate(messages, addAssistant = true, customTemplate = null) {
+    return this._runExclusive(
+      () => this._applyChatTemplateUnlocked(messages, addAssistant, customTemplate),
+    );
+  }
+
+  async _applyChatTemplateUnlocked(messages, addAssistant = true, customTemplate = null) {
     if (!this._workerProxy) {
       return this._runtime.applyChatTemplate(messages, addAssistant, customTemplate);
     }
@@ -6252,6 +6635,8 @@ export class LlamaWebGpuBridge {
     try {
       return await this._callWorker('applyChatTemplate', [messages, addAssistant, customTemplate]);
     } catch (error) {
+      // The worker can reject after dispose already tore the runtime down;
+      // falling back here would rebuild it.
       this._disableWorkerFallback(error);
       return this._runtime.applyChatTemplate(messages, addAssistant, customTemplate);
     }

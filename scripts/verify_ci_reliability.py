@@ -274,6 +274,9 @@ def main() -> int:
     worker_state_contract = read_required(
         "scripts/worker_runtime_state_test.mjs", errors
     )
+    operation_queue_contract = read_required(
+        "scripts/bridge_operation_queue_test.mjs", errors
+    )
     ci = read_required(".github/workflows/ci.yml", errors)
     publish = read_required(".github/workflows/publish_assets.yml", errors)
     auto_update = read_required(".github/workflows/auto_llama_cpp_update.yml", errors)
@@ -347,6 +350,62 @@ def main() -> int:
         and '"esbuild"' in package_json
         and '"typescript"' in package_json,
         "package.json must define JS build/typecheck/syntax/runtime-state scripts and pin esbuild + TypeScript dev dependencies",
+        errors,
+    )
+    require(
+        '"test:operation-queue"' in package_json
+        and "npm run test:operation-queue" in package_json,
+        "check:js must define and run the bridge operation queue contract",
+        errors,
+    )
+    require(
+        "const CASES = [" in operation_queue_contract
+        and "the operation queue deadlocked" in operation_queue_contract,
+        "the operation queue contract must keep its per-case harness; the behavioural "
+        "semantics are asserted by that test, not by this scan",
+        errors,
+    )
+    require(
+        "_runExclusive(" in js_source and "_runExclusive(" in js_output,
+        "the single-writer operation queue must be present in bridge source and in the "
+        "generated bridge output",
+        errors,
+    )
+    require(
+        "_captureDirectRuntimeState()" in js_source
+        and "_captureDirectRuntimeState()" in js_output,
+        "the facade must snapshot direct runtime state so synchronous getters never ccall "
+        "outside the operation queue",
+        errors,
+    )
+    require(
+        "single-writer" in api_docs and "FIFO" in api_docs,
+        "docs/api.md must document the single-writer FIFO operation queue",
+        errors,
+    )
+    begin_generation_body = core[core.find("int32_t begin_generation_impl(") :]
+    begin_generation_body = begin_generation_body[: begin_generation_body.find("\n}\n")]
+    begin_guard_index = begin_generation_body.find("if (g_generation_active) {")
+    begin_guard_block = begin_generation_body[
+        begin_guard_index : begin_generation_body.find("}", begin_guard_index) + 1
+    ]
+    require(
+        begin_guard_index > 0
+        and "return -7;" in begin_guard_block
+        and "set_error" not in begin_guard_block
+        and "g_last_" not in begin_guard_block
+        and all(
+            begin_guard_index < begin_generation_body.find(destructive)
+            for destructive in (
+                "clear_error();",
+                "g_last_output.clear();",
+                "g_last_piece.clear();",
+                "end_generation_state();",
+            )
+        ),
+        "begin_generation_impl must reject a re-entrant begin with a bare return -7, "
+        "before clearing the last output, overwriting g_last_error, or ending the active "
+        "generation state",
         errors,
     )
     require(

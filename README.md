@@ -124,10 +124,12 @@ against the KV cache. Passing the wrong token list can make later prompt-prefix
 reuse incorrect. Passing `[]` is allowed, but gives the bridge no restored
 prefix-token metadata to reuse.
 
-`stateLoad*` requires `tokenCapacity` to be positive, large enough for the stored
-token list, and no larger than the active context size. If omitted, the JS API
-uses `bridge.getContextSize()`. Empty `stateLoadBytes` input is rejected. All
-four state methods require a loaded model.
+For `stateLoad*`, a `tokenCapacity` whose numeric conversion is greater than zero
+is truncated and used; all other values fall back to
+`bridge.getContextSize()`. The resolved capacity must be large enough for the
+stored token list and no larger than the active context size. Empty
+`stateLoadBytes` input is rejected. All four state methods require a loaded
+model.
 
 `stateSaveFile` and `stateLoadFile` operate on the active WASMFS instance. In a
 browser this filesystem is virtual and not durable by default, and worker-mode
@@ -135,7 +137,8 @@ paths live inside the worker runtime. Use `stateSaveBytes` and `stateLoadBytes`
 when the application needs to persist snapshots in IndexedDB, OPFS, Cache API, or
 another app-managed durable store.
 
-State save/load is rejected while generation is active. On successful load the
+State save/load requests issued while generation is active wait in the bridge's
+FIFO operation queue and run after generation settles. On successful load the
 bridge restores the prompt token list returned as `{ tokens }`, so reissuing the
 same prompt can reuse the loaded KV state via the existing prompt-prefix reuse
 path.

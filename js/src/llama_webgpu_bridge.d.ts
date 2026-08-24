@@ -120,6 +120,24 @@ export interface StateLoadResult {
 
 export function enableBridgeWorkerHost(): void;
 
+/**
+ * Operations that reach the singleton llama.cpp runtime (model/projector load,
+ * completion, tokenize/detokenize, embeddings, state APIs, text-to-speech,
+ * chat templating) run on one per-instance FIFO queue: overlapping calls wait
+ * their turn instead of interleaving. `cancel` and `setLogLevel` stay off that
+ * queue so control signals reach a running operation; `setLogLevel` delivery is
+ * best effort and never switches execution mode on failure.
+ *
+ * A call whose `signal` aborts before it starts rejects with an `AbortError`
+ * `DOMException` without dispatching and without cancelling the operation that
+ * currently owns the runtime. Cancellation of an already-started operation is
+ * unchanged from previous releases.
+ *
+ * After `dispose()`, new and still-queued operations reject with
+ * `Bridge has been disposed.`; the operation already running settles first and
+ * teardown follows. `dispose()` returns the identical promise when called more
+ * than once. See docs/api.md "Operation serialization".
+ */
 export class LlamaWebGpuBridge {
   static supportsSafariAdaptiveGpu: boolean;
 

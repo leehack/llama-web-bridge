@@ -78,6 +78,56 @@ active bridge runtime.
 Most methods require a model loaded by `loadModelFromUrl()` and reject with
 `Error` when the model or runtime capability is unavailable.
 
+## Operation serialization
+
+A bridge instance owns a single llama.cpp model and context, and llama.cpp
+publishes results through process-global buffers (last generated output, last
+token array, last detokenized string, last embedding). Overlapping calls would
+therefore read each other's results, so the facade holds a **single-writer FIFO
+queue** in front of every operation that reaches that runtime, in both worker and
+direct runtime mode:
+
+`loadModelFromUrl`, `loadMultimodalProjector`, `unloadMultimodalProjector`,
+`getTextToSpeechCapabilities`, `synthesizeSpeech`, `createCompletion`,
+`tokenize`, `detokenize`, `stateSaveFile`, `stateLoadFile`, `stateSaveBytes`,
+`stateLoadBytes`, `embed`, `embedBatch`, `applyChatTemplate`.
+
+Calling any of these while another is in flight does not reject and does not
+interleave: the call waits its turn and runs in call order. A failing operation
+releases the queue for the calls behind it. The queue is per bridge instance;
+separate instances never block each other.
+
+These methods are deliberately **not** queued:
+
+| Method | Reason |
+| --- | --- |
+| `cancel()` | Control signal; it must reach a running operation instead of waiting behind it. |
+| `setLogLevel(level)` | Synchronous, best-effort control signal. Its worker RPC is fire-and-forget: a failure is absorbed and never switches execution to the direct runtime, because doing so outside the queue could strand a response belonging to the operation that currently owns it. The next queued operation performs the normal fallback. |
+| `prefetchModelToCache()`, `evictModelFromCache()` | Cache Storage and network only; they never enter the wasm core. |
+| `getModelMetadata()`, `getContextSize()`, `isGpuActive()`, `getBackendName()`, `supportsVision()`, `supportsAudio()` | Synchronous accessors served from a facade snapshot that queued operations refresh, so they never call into the core and cannot race the operation that owns it. |
+
+### Cancellation while queued
+
+`createCompletion()`, `synthesizeSpeech()` and `loadModelFromUrl()` accept a
+`signal`. A call whose signal is **already aborted, or that aborts while it is
+still waiting in the queue**, rejects with an `AbortError` `DOMException`, never
+dispatches to the worker and never enters the core; its slot is skipped when its
+turn arrives, and `cancel()` is *not* invoked, so the unrelated operation that
+currently owns the runtime is unaffected.
+
+Once an operation has started, cancellation is unchanged from previous releases:
+`cancel()` and the per-operation abort handling apply as before. This release
+adds no new interruption guarantee for work that is already running.
+
+### Disposal
+
+`dispose()` marks the bridge disposed synchronously and then tears down on the
+queue, so teardown never runs underneath an operation that still owns the
+runtime. Calls made after disposal, and calls still waiting in the queue, reject
+with `Bridge has been disposed.` The operation that was already running is not
+interrupted by disposal — it settles first, and teardown follows. `dispose()` is
+idempotent and repeated calls return the identical promise object.
+
 ## Constructor
 
 ```ts
@@ -278,10 +328,12 @@ and stores the supplied token list in the session metadata. The method returns
 stateLoadFile(path: string, tokenCapacity = bridge.getContextSize()): Promise<{ tokens: number[] }>
 ```
 
-Loads a state/session file from the active runtime's WASMFS. `tokenCapacity` must
-be positive, at least large enough for the stored token list, and no larger than
-the active context size. The resolved `{ tokens }` value is the token list stored
-at save time.
+Loads a state/session file from the active runtime's WASMFS. A `tokenCapacity`
+whose numeric conversion is greater than zero is truncated and used; all other
+values fall back to the active context size. The resolved capacity must be at
+least large enough for the stored token list and no larger than the active
+context size. The resolved `{ tokens }` value is the token list stored at save
+time.
 
 ### `stateSaveBytes(tokens?)`
 
@@ -302,9 +354,10 @@ stateLoadBytes(
 ): Promise<{ tokens: number[] }>
 ```
 
-Loads state from bytes by staging them into a temporary runtime file. Empty input
-is rejected. Worker mode transfers an internal copy to the worker, so
-caller-owned `ArrayBuffer` or `Uint8Array` inputs are not detached.
+Loads state from bytes by staging them into a temporary runtime file. It uses the
+same `tokenCapacity` resolution as `stateLoadFile()`. Empty input is rejected.
+Worker mode transfers an internal copy to the worker, so caller-owned
+`ArrayBuffer` or `Uint8Array` inputs are not detached.
 
 ## Embeddings
 
@@ -390,11 +443,16 @@ Returns the versioned capability record for the loaded model/projector. Check
 synthesizeSpeech(options: TextToSpeechOptions): Promise<TextToSpeechResult>
 ```
 
-When worker-mode WebGPU synthesis aborts or stalls before returning audio, the
+When a worker-mode WebGPU synthesis request fails with an eligible
+infrastructure error — a WebGPU dispatch workgroup-limit failure or a worker
+request timeout, and only when the model was not already loaded CPU-only — the
 bridge disposes that worker and retries the request once in a CPU-backed
 main-thread runtime. The retry reloads the cached model and projector, so it is
 slower than the normal WebGPU path but avoids leaving a capable browser with an
 unrecoverable speech control after transient GPU memory or device loss.
+
+User cancellation is never retried: aborting `signal` or calling `cancel()`
+rejects with an `AbortError` `DOMException` and runs no CPU fallback.
 
 Synthesizes speech and returns mono `Float32Array` PCM plus its sample rate,
 sample count, generated-frame count, and truncation flag. The bridge does not
@@ -412,11 +470,13 @@ from the returned PCM.
 | `signal` | `AbortSignal` for cancellation. Cancellation rejects with `AbortError`. |
 | `onProgress` | Receives task state, remaining prompt tokens, generated frames, and truncation state. |
 
-Direct and worker modes use the same API. Worker mode transfers the output PCM
-buffer to the caller and does not silently repeat a failed long-running task on
-the main thread. Callers may retry explicitly. A bridge instance rejects a
-second concurrent synthesis, and shared context operations reject overlap with
-active token generation or TTS.
+Direct and worker modes use the same API, and worker mode transfers the output
+PCM buffer to the caller. Apart from the single eligible CPU retry described
+above, a failed request is surfaced to the caller, who may retry explicitly.
+
+A second synthesis is not rejected. It — and any other shared-runtime operation
+issued while synthesis is running — waits in the FIFO queue and runs in call
+order; see [Operation serialization](#operation-serialization).
 
 ## Runtime metadata and diagnostics
 

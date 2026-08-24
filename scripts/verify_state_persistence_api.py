@@ -149,8 +149,9 @@ def main() -> int:
     require(
         "stateSave*` snapshots the current llama.cpp context" in README
         and "The `tokens` argument is stored" in README
-        and "`stateLoad*` requires `tokenCapacity`" in README,
-        "README must document snapshot timing, token metadata semantics, and tokenCapacity requirements",
+        and "whose numeric conversion is greater than zero" in README
+        and "all other values fall back" in README,
+        "README must document snapshot timing, token metadata semantics, and tokenCapacity fallback requirements",
         errors,
     )
 
