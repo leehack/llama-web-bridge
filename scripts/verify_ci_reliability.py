@@ -652,8 +652,13 @@ def main() -> int:
         and publish.count('GH_TOKEN="${ENVIRONMENT_READ_TOKEN}" gh api') == 2
         and publish.count("gh api --paginate --slurp") == 2
         and publish.count("secrets?per_page=100") == 2
+        and publish.count("normalize-environment-secrets") == 2
         and publish.count(
-            "{total_count: ([.[].total_count] | max // 0), secrets: [.[].secrets[]]}"
+            '"${RUNNER_TEMP}/publication-environment-secret-pages.json"'
+        )
+        == 2
+        and publish.count(
+            '"${RUNNER_TEMP}/post-approval-publication-environment-secret-pages.json"'
         )
         == 2
         and publish.count(

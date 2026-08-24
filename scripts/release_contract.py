@@ -601,6 +601,40 @@ def validate_publication_environment(
     return reviewer_count
 
 
+def normalize_environment_secret_pages(pages: Any) -> dict[str, Any]:
+    """Flatten a complete paginated environment-secret inventory fail closed."""
+    if not isinstance(pages, list) or not pages:
+        raise ContractError("publication environment secret pages are invalid")
+
+    expected_count: int | None = None
+    secrets: list[Any] = []
+    for page in pages:
+        if not isinstance(page, Mapping):
+            raise ContractError("publication environment secret pages are invalid")
+        page_count = page.get("total_count")
+        page_secrets = page.get("secrets")
+        if (
+            not isinstance(page_count, int)
+            or isinstance(page_count, bool)
+            or page_count < 0
+            or not isinstance(page_secrets, list)
+        ):
+            raise ContractError("publication environment secret pages are invalid")
+        if expected_count is None:
+            expected_count = page_count
+        elif page_count != expected_count:
+            raise ContractError(
+                "publication environment secret page counts are inconsistent"
+            )
+        secrets.extend(page_secrets)
+
+    if expected_count != len(secrets):
+        raise ContractError(
+            "publication environment secret pages do not contain the complete inventory"
+        )
+    return {"total_count": expected_count, "secrets": secrets}
+
+
 def read_previous_manifest(path: Path) -> tuple[str, str, str]:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
@@ -659,6 +693,9 @@ def _parser() -> argparse.ArgumentParser:
     environment.add_argument("--environment-json", required=True, type=Path)
     environment.add_argument("--branch-policies-json", required=True, type=Path)
     environment.add_argument("--environment-secrets-json", required=True, type=Path)
+
+    normalize_secrets = subparsers.add_parser("normalize-environment-secrets")
+    normalize_secrets.add_argument("--pages-json", required=True, type=Path)
 
     return parser
 
@@ -735,6 +772,9 @@ def main() -> int:
             if not isinstance(releases, list):
                 raise ContractError("native release listing must be a JSON array")
             print(select_stable_native_release(releases))
+        elif args.command == "normalize-environment-secrets":
+            pages = json.loads(args.pages_json.read_text(encoding="utf-8"))
+            print(json.dumps(normalize_environment_secret_pages(pages), sort_keys=True))
         else:
             environment_payload = json.loads(
                 args.environment_json.read_text(encoding="utf-8")

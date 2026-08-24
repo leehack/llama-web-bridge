@@ -17,6 +17,7 @@ from release_contract import (
     expected_native_artifacts,
     parse_release_tag,
     parse_upstream_tag,
+    normalize_environment_secret_pages,
     read_previous_manifest,
     require_correlation_id,
     resolve_native_manifest,
@@ -167,6 +168,19 @@ class ReleaseContractTest(unittest.TestCase):
                     {"type": "branch_policy"},
                 ],
             },
+            "duplicate-reviewer-id": {
+                **configured,
+                "protection_rules": [
+                    {
+                        **configured["protection_rules"][0],
+                        "reviewers": [
+                            {"type": "User", "reviewer": {"id": 1234}},
+                            {"type": "User", "reviewer": {"id": 1234}},
+                        ],
+                    },
+                    {"type": "branch_policy"},
+                ],
+            },
         }
         for label, invalid in invalid_cases.items():
             with self.subTest(label=label), self.assertRaises(ContractError):
@@ -236,6 +250,44 @@ class ReleaseContractTest(unittest.TestCase):
                 validate_publication_environment(
                     configured, branch_policies, invalid_secrets
                 )
+
+    def test_environment_secret_pages_fail_closed_before_normalization(self) -> None:
+        self.assertEqual(
+            normalize_environment_secret_pages(
+                [
+                    {"total_count": 2, "secrets": [{"name": "FIRST"}]},
+                    {"total_count": 2, "secrets": [{"name": "SECOND"}]},
+                ]
+            ),
+            {
+                "total_count": 2,
+                "secrets": [{"name": "FIRST"}, {"name": "SECOND"}],
+            },
+        )
+        self.assertEqual(
+            normalize_environment_secret_pages(
+                [{"total_count": 0, "secrets": []}]
+            ),
+            {"total_count": 0, "secrets": []},
+        )
+
+        for invalid_pages in (
+            [],
+            {},
+            [None],
+            [{"total_count": True, "secrets": [{}]}],
+            [{"total_count": -1, "secrets": []}],
+            [{"total_count": 0, "secrets": "invalid"}],
+            [
+                {"total_count": 2, "secrets": [{"name": "FIRST"}]},
+                {"total_count": 1, "secrets": [{"name": "SECOND"}]},
+            ],
+            [{"total_count": 2, "secrets": [{"name": "ONLY"}]}],
+        ):
+            with self.subTest(invalid_pages=invalid_pages), self.assertRaises(
+                ContractError
+            ):
+                normalize_environment_secret_pages(invalid_pages)
 
     def test_legacy_wrappers_are_consumption_only(self) -> None:
         for tag in ("b10514-llamadart.2", "v0.2.0-llamadart.1"):

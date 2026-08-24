@@ -438,8 +438,10 @@ jobs:
             > "${RUNNER_TEMP}/publication-branch-policies.json"
           GH_TOKEN="${ENVIRONMENT_READ_TOKEN}" gh api --paginate --slurp \
             "repos/${BRIDGE_REPO}/environments/bridge-assets-publication/secrets?per_page=100" \
-            | jq -c '{total_count: ([.[].total_count] | max // 0), secrets: [.[].secrets[]]}' \
-              > "${RUNNER_TEMP}/publication-environment-secrets.json"
+            > "${RUNNER_TEMP}/publication-environment-secret-pages.json"
+          python3 scripts/release_contract.py normalize-environment-secrets \
+            --pages-json "${RUNNER_TEMP}/publication-environment-secret-pages.json" \
+            > "${RUNNER_TEMP}/publication-environment-secrets.json"
           python3 scripts/release_contract.py validate-environment \
             --environment-json "${RUNNER_TEMP}/publication-environment.json" \
             --branch-policies-json "${RUNNER_TEMP}/publication-branch-policies.json" \
@@ -509,8 +511,11 @@ jobs:
             > "${RUNNER_TEMP}/post-approval-publication-branch-policies.json"
           GH_TOKEN="${ENVIRONMENT_READ_TOKEN}" gh api --paginate --slurp \
             "repos/${BRIDGE_REPO}/environments/bridge-assets-publication/secrets?per_page=100" \
-            | jq -c '{total_count: ([.[].total_count] | max // 0), secrets: [.[].secrets[]]}' \
-              > "${RUNNER_TEMP}/post-approval-publication-environment-secrets.json"
+            > "${RUNNER_TEMP}/post-approval-publication-environment-secret-pages.json"
+          python3 publication-policy/scripts/release_contract.py \
+            normalize-environment-secrets \
+            --pages-json "${RUNNER_TEMP}/post-approval-publication-environment-secret-pages.json" \
+            > "${RUNNER_TEMP}/post-approval-publication-environment-secrets.json"
           python3 publication-policy/scripts/release_contract.py validate-environment \
             --environment-json "${RUNNER_TEMP}/post-approval-publication-environment.json" \
             --branch-policies-json "${RUNNER_TEMP}/post-approval-publication-branch-policies.json" \
