@@ -775,11 +775,31 @@ const CASES = [
     );
   }],
 
-  ['state load invalid explicit capacities preserve context-size fallback', async () => {
+  ['state load explicit capacities handle conversion exceptions and single coercion', async () => {
     const { bridge, core } = createDirectBridge();
     const resolved = [];
+    let coercions = 0;
+    const throwingPrimitive = {
+      [Symbol.toPrimitive]() {
+        throw new TypeError('cannot convert token capacity');
+      },
+    };
+    const coercible = {
+      valueOf() {
+        coercions += 1;
+        return 9.75;
+      },
+    };
 
-    for (const tokenCapacity of [0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
+    for (const tokenCapacity of [
+      0,
+      -1,
+      Number.NaN,
+      Number.POSITIVE_INFINITY,
+      Symbol('invalid'),
+      throwingPrimitive,
+      coercible,
+    ]) {
       await bridge.stateLoadBytes(new Uint8Array([1, 2, 3]), tokenCapacity);
       resolved.push(
         opTrace(core).filter(([kind]) => kind === 'stateLoad').at(-1)?.[1],
@@ -788,9 +808,10 @@ const CASES = [
 
     assert.deepEqual(
       resolved,
-      [128, 128, 128, Number.POSITIVE_INFINITY],
-      'explicit capacities retain the exact origin/main numeric-conversion semantics',
+      [128, 128, 128, Number.POSITIVE_INFINITY, 128, 128, 9],
+      'invalid capacities fall back while valid numeric conversion is truncated',
     );
+    assert.equal(coercions, 1, 'a capacity object must be coerced only once');
   }],
 
   // Disposal marks synchronously, rejects queued and new work, and tears down

@@ -5088,7 +5088,13 @@ var LlamaWebGpuBridge = class {
     return this._runExclusive(() => this._stateLoadFileUnlocked(path, tokenCapacity));
   }
   _resolveTokenCapacity(tokenCapacity) {
-    return Number(tokenCapacity) > 0 ? Math.trunc(Number(tokenCapacity)) : this.getContextSize();
+    let numericCapacity;
+    try {
+      numericCapacity = Number(tokenCapacity);
+    } catch {
+      return this.getContextSize();
+    }
+    return numericCapacity > 0 ? Math.trunc(numericCapacity) : this.getContextSize();
   }
   async _stateLoadFileUnlocked(path, tokenCapacity) {
     tokenCapacity = this._resolveTokenCapacity(tokenCapacity);

@@ -6358,8 +6358,14 @@ export class LlamaWebGpuBridge {
   }
 
   _resolveTokenCapacity(tokenCapacity) {
-    return Number(tokenCapacity) > 0
-      ? Math.trunc(Number(tokenCapacity))
+    let numericCapacity;
+    try {
+      numericCapacity = Number(tokenCapacity);
+    } catch {
+      return this.getContextSize();
+    }
+    return numericCapacity > 0
+      ? Math.trunc(numericCapacity)
       : this.getContextSize();
   }
 
