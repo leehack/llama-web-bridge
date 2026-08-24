@@ -187,10 +187,19 @@ upstream tag/commit, native release tag plus
 
 The request must set `publish_approved=true`. Publication remains blocked until
 repository administrators separately create `bridge-assets-publication`, add
-required reviewers, and store the assets PAT as an environment-scoped secret;
-the workflow fails closed if that protection is absent. It verifies all
-identities plus native GitHub asset digests/inventory and revalidates required
-reviewers after approval immediately before the first PAT-bearing step. It
+required reviewers, disable administrator bypass and self-review, restrict the
+custom deployment branch policy to `main`, and store the assets PAT as an
+environment-scoped secret. Administrators must also configure the separate
+repository or organization Actions secret `BRIDGE_PUBLICATION_ENV_READ_TOKEN`
+as a fine-grained credential scoped to this repository with Environments read
+permission. The workflow fails closed if either external credential or the
+environment protection is absent. It verifies all identities plus native
+GitHub asset digests/inventory, uses the default job token for environment and
+main-branch policy metadata, and uses the separate read credential only for the
+environment-secret name inventory. It repeats those checks after approval
+immediately before the first publication-PAT-bearing step. The API
+check proves the expected secret name is environment-scoped without reading its
+value. It
 builds wasm32 and memory64, runs mandatory state/multimodal/ASR/TTS gates,
 orders stable and development histories independently, generates a
 deterministic schema-v2 manifest, and recovers exact partial states while

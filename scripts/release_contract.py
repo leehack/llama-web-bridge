@@ -47,6 +47,7 @@ _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _COMMIT_RE = re.compile(r"[0-9a-f]{40}")
 _REPO_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 _CORRELATION_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
+_GITHUB_SECRET_NAME_RE = re.compile(r"[A-Z_][A-Z0-9_]*")
 _UPSTREAM_STABLE_RE = re.compile(
     r"v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
 )
@@ -484,21 +485,91 @@ def select_stable_native_release(releases: list[Any]) -> str:
     return selected.tag
 
 
-def validate_publication_environment(environment: Mapping[str, Any]) -> int:
-    """Require an already-created environment with at least one reviewer."""
+def validate_publication_environment(
+    environment: Mapping[str, Any],
+    branch_policies: Mapping[str, Any],
+    environment_secrets: Mapping[str, Any],
+) -> int:
+    """Require the exact fail-closed publication environment policy."""
     if environment.get("name") != "bridge-assets-publication":
         raise ContractError("publication environment identity is missing or incorrect")
+    if environment.get("can_admins_bypass") is not False:
+        raise ContractError("publication environment must disable administrator bypass")
     rules = environment.get("protection_rules")
     if not isinstance(rules, list):
         raise ContractError("publication environment has no protection rules")
     reviewer_count = 0
+    branch_rule_count = 0
     for rule in rules:
-        if isinstance(rule, Mapping) and rule.get("type") == "required_reviewers":
+        if not isinstance(rule, Mapping):
+            continue
+        if rule.get("type") == "required_reviewers":
+            if rule.get("prevent_self_review") is not True:
+                raise ContractError("publication environment must prevent self review")
             reviewers = rule.get("reviewers")
             if isinstance(reviewers, list):
                 reviewer_count += len(reviewers)
+        elif rule.get("type") == "branch_policy":
+            branch_rule_count += 1
     if reviewer_count < 1:
         raise ContractError("publication environment has no required reviewers")
+    if branch_rule_count != 1:
+        raise ContractError("publication environment must have one branch policy rule")
+
+    deployment_policy = environment.get("deployment_branch_policy")
+    if not isinstance(deployment_policy, Mapping) or deployment_policy != {
+        "protected_branches": False,
+        "custom_branch_policies": True,
+    }:
+        raise ContractError(
+            "publication environment must use only custom deployment branch policies"
+        )
+
+    policies = branch_policies.get("branch_policies")
+    policy_count = branch_policies.get("total_count")
+    if (
+        not isinstance(policy_count, int)
+        or isinstance(policy_count, bool)
+        or policy_count != 1
+        or not isinstance(policies, list)
+        or len(policies) != 1
+        or not isinstance(policies[0], Mapping)
+        or policies[0].get("name") != "main"
+        or policies[0].get("type") != "branch"
+    ):
+        raise ContractError(
+            "publication environment must allow deployments only from the main branch"
+        )
+
+    secrets = environment_secrets.get("secrets")
+    secret_count = environment_secrets.get("total_count")
+    if not isinstance(secrets, list):
+        raise ContractError("publication environment secret inventory is invalid")
+    secret_names: list[str] = []
+    for secret in secrets:
+        if not isinstance(secret, Mapping) or not isinstance(secret.get("name"), str):
+            raise ContractError("publication environment secret inventory is invalid")
+        name = secret["name"]
+        canonical_name = name.upper()
+        if (
+            name != canonical_name
+            or _GITHUB_SECRET_NAME_RE.fullmatch(name) is None
+            or name.startswith("GITHUB_")
+        ):
+            raise ContractError("publication environment secret inventory is invalid")
+        secret_names.append(canonical_name)
+    if (
+        not isinstance(secret_count, int)
+        or isinstance(secret_count, bool)
+        or secret_count < 0
+        or secret_count != len(secrets)
+        or len(set(secret_names)) != len(secret_names)
+    ):
+        raise ContractError("publication environment secret inventory is invalid")
+    if "WEBGPU_BRIDGE_ASSETS_PAT" not in secret_names:
+        raise ContractError(
+            "publication environment is missing WEBGPU_BRIDGE_ASSETS_PAT"
+        )
     return reviewer_count
 
 
@@ -558,6 +629,8 @@ def _parser() -> argparse.ArgumentParser:
 
     environment = subparsers.add_parser("validate-environment")
     environment.add_argument("--environment-json", required=True, type=Path)
+    environment.add_argument("--branch-policies-json", required=True, type=Path)
+    environment.add_argument("--environment-secrets-json", required=True, type=Path)
 
     return parser
 
@@ -638,12 +711,24 @@ def main() -> int:
             environment_payload = json.loads(
                 args.environment_json.read_text(encoding="utf-8")
             )
+            branch_policies_payload = json.loads(
+                args.branch_policies_json.read_text(encoding="utf-8")
+            )
+            environment_secrets_payload = json.loads(
+                args.environment_secrets_json.read_text(encoding="utf-8")
+            )
             if not isinstance(environment_payload, Mapping):
                 raise ContractError("publication environment root must be an object")
+            if not isinstance(branch_policies_payload, Mapping):
+                raise ContractError("publication branch policies root must be an object")
+            if not isinstance(environment_secrets_payload, Mapping):
+                raise ContractError("publication environment secrets root must be an object")
             print(json.dumps({
                 "environment": "bridge-assets-publication",
                 "required_reviewers": validate_publication_environment(
-                    environment_payload
+                    environment_payload,
+                    branch_policies_payload,
+                    environment_secrets_payload,
                 ),
             }, sort_keys=True))
     except (ContractError, OSError, json.JSONDecodeError) as error:

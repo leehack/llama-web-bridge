@@ -641,6 +641,18 @@ def main() -> int:
         "publish_approved=true requires explicit maintainer approval" in publish
         and "Verify externally configured approval environment" in publish
         and "release_contract.py validate-environment" in publish
+        and publish.count("deployment-branch-policies") == 2
+        and publish.count("--branch-policies-json") == 2
+        and publish.count("bridge-assets-publication/secrets") == 2
+        and publish.count("--environment-secrets-json") == 2
+        and publish.count("secrets.BRIDGE_PUBLICATION_ENV_READ_TOKEN") == 2
+        and publish.count("ENVIRONMENT_READ_TOKEN: ${{ secrets.BRIDGE_PUBLICATION_ENV_READ_TOKEN }}")
+        == 2
+        and publish.count('GH_TOKEN="${ENVIRONMENT_READ_TOKEN}" gh api') == 2
+        and publish.count(
+            "BRIDGE_PUBLICATION_ENV_READ_TOKEN is required for read-only environment metadata verification"
+        )
+        == 2
         and re.search(
             r"verify-publication-environment:\s+.*?permissions:\s+actions: read\s+contents: read",
             publish,
@@ -655,13 +667,17 @@ def main() -> int:
         and "environment: bridge-assets-publication" not in publish
         and "push:" not in publish.split("permissions:", 1)[0]
         and "schedule:" not in publish,
-        "cross-repository publication must require explicit input confirmation plus a preverified dynamic protected environment and have no automatic trigger",
+        "cross-repository publication must require explicit input confirmation plus a preverified fail-closed environment policy and have no automatic trigger",
         errors,
     )
     post_approval_environment_check = publish_job.find(
         "Revalidate approved environment protection after approval"
     )
     first_pat_reference = publish_job.find("secrets.WEBGPU_BRIDGE_ASSETS_PAT")
+    post_approval_read_token_reference = publish_job.find(
+        "secrets.BRIDGE_PUBLICATION_ENV_READ_TOKEN",
+        post_approval_environment_check,
+    )
     require(
         publish.count("release_contract.py validate-environment") == 2
         and re.search(
@@ -671,12 +687,17 @@ def main() -> int:
         )
         is not None
         and post_approval_environment_check >= 0
+        and post_approval_read_token_reference > post_approval_environment_check
         and first_pat_reference > post_approval_environment_check
+        and first_pat_reference > post_approval_read_token_reference
+        and 'GH_TOKEN="${ENVIRONMENT_READ_TOKEN}" gh api' in publish_job[
+            post_approval_environment_check:first_pat_reference
+        ]
         and publish_job[
             post_approval_environment_check:first_pat_reference
         ].count("\n      - name:")
         == 1,
-        "the privileged job must revalidate required reviewers after approval and immediately before its first PAT-bearing step",
+        "the privileged job must revalidate bypass, reviewer, main-branch, and environment-secret protections after approval and immediately before its first PAT-bearing step",
         errors,
     )
     require(

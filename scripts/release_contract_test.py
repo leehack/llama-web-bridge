@@ -77,21 +77,123 @@ class ReleaseContractTest(unittest.TestCase):
             with self.subTest(invalid=invalid), self.assertRaises(ContractError):
                 require_correlation_id(invalid)
 
-    def test_publication_environment_requires_live_reviewer_rule(self) -> None:
+    def test_publication_environment_requires_fail_closed_policy(self) -> None:
         configured = {
             "name": "bridge-assets-publication",
-            "protection_rules": [{
-                "type": "required_reviewers",
-                "reviewers": [{"type": "User", "reviewer": {"login": "maintainer"}}],
-            }],
+            "can_admins_bypass": False,
+            "protection_rules": [
+                {
+                    "type": "required_reviewers",
+                    "prevent_self_review": True,
+                    "reviewers": [
+                        {"type": "User", "reviewer": {"login": "maintainer"}}
+                    ],
+                },
+                {"type": "branch_policy"},
+            ],
+            "deployment_branch_policy": {
+                "protected_branches": False,
+                "custom_branch_policies": True,
+            },
         }
-        self.assertEqual(validate_publication_environment(configured), 1)
-        for invalid in (
-            {"name": "bridge-assets-publication", "protection_rules": []},
-            {"name": "wrong", "protection_rules": configured["protection_rules"]},
+        branch_policies = {
+            "total_count": 1,
+            "branch_policies": [{"name": "main", "type": "branch"}],
+        }
+        environment_secrets = {
+            "total_count": 1,
+            "secrets": [{"name": "WEBGPU_BRIDGE_ASSETS_PAT"}],
+        }
+        self.assertEqual(
+            validate_publication_environment(
+                configured, branch_policies, environment_secrets
+            ),
+            1,
+        )
+
+        invalid_cases = {
+            "missing-reviewers": {**configured, "protection_rules": [{"type": "branch_policy"}]},
+            "admin-bypass": {**configured, "can_admins_bypass": True},
+            "self-review": {
+                **configured,
+                "protection_rules": [
+                    {
+                        **configured["protection_rules"][0],
+                        "prevent_self_review": False,
+                    },
+                    {"type": "branch_policy"},
+                ],
+            },
+            "all-protected-branches": {
+                **configured,
+                "deployment_branch_policy": {
+                    "protected_branches": True,
+                    "custom_branch_policies": False,
+                },
+            },
+            "wrong-name": {**configured, "name": "wrong"},
+        }
+        for label, invalid in invalid_cases.items():
+            with self.subTest(label=label), self.assertRaises(ContractError):
+                validate_publication_environment(
+                    invalid, branch_policies, environment_secrets
+                )
+
+        for invalid_policies in (
+            {"total_count": True, "branch_policies": [{"name": "main", "type": "branch"}]},
+            {"total_count": 0, "branch_policies": []},
+            {
+                "total_count": 1,
+                "branch_policies": [{"name": "release/*", "type": "branch"}],
+            },
+            {
+                "total_count": 2,
+                "branch_policies": [
+                    {"name": "main", "type": "branch"},
+                    {"name": "release/*", "type": "branch"},
+                ],
+            },
         ):
-            with self.subTest(invalid=invalid), self.assertRaises(ContractError):
-                validate_publication_environment(invalid)
+            with self.subTest(invalid_policies=invalid_policies), self.assertRaises(
+                ContractError
+            ):
+                validate_publication_environment(
+                    configured, invalid_policies, environment_secrets
+                )
+
+        for invalid_secrets in (
+            {},
+            {"total_count": True, "secrets": [{"name": "WEBGPU_BRIDGE_ASSETS_PAT"}]},
+            {"total_count": 0, "secrets": []},
+            {"total_count": 1, "secrets": [{"name": "WRONG_PAT"}]},
+            {"total_count": 1, "secrets": "WEBGPU_BRIDGE_ASSETS_PAT"},
+            {"total_count": 1, "secrets": [{"name": ""}]},
+            {"total_count": 1, "secrets": [{"name": "1INVALID"}]},
+            {"total_count": 1, "secrets": [{"name": "INVALID-NAME"}]},
+            {"total_count": 1, "secrets": [{"name": "GITHUB_RESERVED"}]},
+            {"total_count": 1, "secrets": [{"name": "webgpu_bridge_assets_pat"}]},
+            {
+                "total_count": 2,
+                "secrets": [
+                    {"name": "WEBGPU_BRIDGE_ASSETS_PAT"},
+                    {"name": "WEBGPU_BRIDGE_ASSETS_PAT"},
+                ],
+            },
+            {
+                "total_count": 2,
+                "secrets": [
+                    {"name": "WEBGPU_BRIDGE_ASSETS_PAT"},
+                    {"name": "webgpu_bridge_assets_pat"},
+                ],
+            },
+            {"total_count": 1, "secrets": [{}]},
+        ):
+            with self.subTest(invalid_secrets=invalid_secrets), self.assertRaises(
+                ContractError
+            ):
+                validate_publication_environment(
+                    configured, branch_policies, invalid_secrets
+                )
 
     def test_legacy_wrappers_are_consumption_only(self) -> None:
         for tag in ("b10514-llamadart.2", "v0.2.0-llamadart.1"):

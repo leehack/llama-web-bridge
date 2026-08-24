@@ -296,10 +296,16 @@ Trigger modes:
 
 There is no push, tag, schedule, or ordinary-CI publication trigger.
 
-Required environment-scoped secret:
+Required externally configured credentials:
 
+- Repository or organization Actions secret `BRIDGE_PUBLICATION_ENV_READ_TOKEN`
+  (a fine-grained, read-only credential scoped to
+  `leehack/llama-web-bridge` with Environments read permission, used only to
+  list environment-secret name metadata before and after approval; the default
+  job token reads the environment and branch-policy metadata)
 - `WEBGPU_BRIDGE_ASSETS_PAT` (read access to provenance repositories and write
-  access to `leehack/llama-web-bridge-assets`)
+  access to `leehack/llama-web-bridge-assets`, stored only in the publication
+  environment)
 
 Every request supplies a required orchestrator correlation ID, the exact bridge
 source SHA, upstream llama.cpp tag/commit, native release tag plus `assets.json`
@@ -309,14 +315,20 @@ variables and quoted expansions. The request sets `publish_approved=true` only
 after explicit maintainer approval.
 
 Publication is deliberately blocked until repository administrators externally
-create `bridge-assets-publication`, configure at least one required reviewer,
-and store `WEBGPU_BRIDGE_ASSETS_PAT` as an environment-scoped secret. The live
-bridge repository did not have that environment at the latest readiness check;
-`llamadart` did not have it either, but its environment cannot gate this
-bridge-owned workflow. Merging this code does not establish the approval gate. The
-workflow verifies the environment through GitHub's API before entering it and
-again after reviewer approval, immediately before the first PAT-bearing step.
-A missing or weakened reviewer rule therefore fails closed.
+configure `bridge-assets-publication` with administrator bypass disabled,
+self-review prevented, at least one required reviewer, and a single custom
+deployment branch policy for `main`, then store `WEBGPU_BRIDGE_ASSETS_PAT` as an
+environment-scoped secret. They must also store the distinct read-only
+`BRIDGE_PUBLICATION_ENV_READ_TOKEN` as a repository or organization Actions
+secret; `github.token` does not have the Environments permission needed to list
+environment secret names. Merging this code does not establish either setting.
+The workflow uses the default job token to read environment and branch-policy
+metadata and uses the distinct read credential only to list environment-secret
+names. It performs both checks before entering the environment and again after
+reviewer approval, immediately before the first publication-PAT-bearing step.
+The publication PAT remains unavailable until approval. Missing or weakened
+bypass, reviewer, branch, credential, or secret-scope protection therefore
+fails closed.
 
 The workflow verifies that bridge source is already merged, all upstream/native
 tag and commit identities match, the native manifest checksum matches, and the
