@@ -89,7 +89,7 @@ class ReleaseContractTest(unittest.TestCase):
                     "reviewers": [
                         {
                             "type": "User",
-                            "reviewer": {"id": 1234, "login": "maintainer"},
+                            "reviewer": {"id": 1233094, "login": "leehack"},
                         }
                     ],
                 },
@@ -135,6 +135,20 @@ class ReleaseContractTest(unittest.TestCase):
                     "custom_branch_policies": False,
                 },
             },
+            "numeric-deployment-policy": {
+                **configured,
+                "deployment_branch_policy": {
+                    "protected_branches": 0,
+                    "custom_branch_policies": 1,
+                },
+            },
+            "extra-deployment-policy-key": {
+                **configured,
+                "deployment_branch_policy": {
+                    **configured["deployment_branch_policy"],
+                    "unexpected": False,
+                },
+            },
             "wrong-name": {**configured, "name": "wrong"},
             "malformed-protection-rule": {
                 **configured,
@@ -172,14 +186,26 @@ class ReleaseContractTest(unittest.TestCase):
                     {"type": "branch_policy"},
                 ],
             },
+            "unapproved-reviewer-id": {
+                **configured,
+                "protection_rules": [
+                    {
+                        **configured["protection_rules"][0],
+                        "reviewers": [
+                            {"type": "User", "reviewer": {"id": 1234}}
+                        ],
+                    },
+                    {"type": "branch_policy"},
+                ],
+            },
             "duplicate-reviewer-id": {
                 **configured,
                 "protection_rules": [
                     {
                         **configured["protection_rules"][0],
                         "reviewers": [
-                            {"type": "User", "reviewer": {"id": 1234}},
-                            {"type": "User", "reviewer": {"id": 1234}},
+                            {"type": "User", "reviewer": {"id": 1233094}},
+                            {"type": "User", "reviewer": {"id": 1233094}},
                         ],
                     },
                     {"type": "branch_policy"},

@@ -316,7 +316,7 @@ after explicit maintainer approval.
 
 Publication is deliberately blocked until repository administrators externally
 configure `bridge-assets-publication` with administrator bypass disabled,
-self-review prevented, at least one required reviewer, and a single custom
+self-review prevented, the pinned repository-owner maintainer reviewer, and a single custom
 deployment branch policy for `main`, then store `WEBGPU_BRIDGE_ASSETS_PAT` as an
 environment-scoped secret. They must also store the distinct read-only
 `BRIDGE_PUBLICATION_ENV_READ_TOKEN` as a repository or organization Actions

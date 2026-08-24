@@ -171,7 +171,8 @@ publication because the bridge exposes Qwen3-TTS.
     runtime-verified version in `manifest.json`.
   - Requires `publish_approved=true`. Publication remains blocked until an
     administrator externally creates `bridge-assets-publication`, configures
-    required reviewers, disables administrator bypass and self-review, restricts
+    the pinned repository-owner maintainer reviewer, disables administrator
+    bypass and self-review, restricts
     custom deployment branches to `main`, and stores
     `WEBGPU_BRIDGE_ASSETS_PAT` as an environment-scoped secret. Do not describe
     that environment as protected without current live evidence. A separate

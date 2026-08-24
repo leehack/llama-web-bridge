@@ -187,7 +187,8 @@ upstream tag/commit, native release tag plus
 
 The request must set `publish_approved=true`. Publication remains blocked until
 repository administrators separately create `bridge-assets-publication`, add
-required reviewers, disable administrator bypass and self-review, restrict the
+the pinned repository-owner maintainer reviewer, disable administrator bypass
+and self-review, restrict the
 custom deployment branch policy to `main`, and store the assets PAT as an
 environment-scoped secret. Administrators must also configure the separate
 repository or organization Actions secret `BRIDGE_PUBLICATION_ENV_READ_TOKEN`

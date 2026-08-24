@@ -24,6 +24,7 @@ BRIDGE_REPOSITORY = "leehack/llama-web-bridge"
 ASSETS_REPOSITORY = "leehack/llama-web-bridge-assets"
 NATIVE_REPOSITORY = "leehack/llamadart-native"
 NATIVE_HOOK_CONTRACT_VERSION = 1
+APPROVED_PUBLICATION_REVIEWER_IDENTITIES = frozenset({("User", 1233094)})
 
 
 class ContractError(ValueError):
@@ -537,14 +538,23 @@ def validate_publication_environment(
             branch_rule_count += 1
     if reviewer_rule_count != 1 or reviewer_count < 1:
         raise ContractError("publication environment has no required reviewers")
+    if reviewer_identities.isdisjoint(APPROVED_PUBLICATION_REVIEWER_IDENTITIES):
+        raise ContractError(
+            "publication environment has no approved maintainer reviewer"
+        )
     if branch_rule_count != 1:
         raise ContractError("publication environment must have one branch policy rule")
 
     deployment_policy = environment.get("deployment_branch_policy")
-    if not isinstance(deployment_policy, Mapping) or deployment_policy != {
-        "protected_branches": False,
-        "custom_branch_policies": True,
-    }:
+    if (
+        not isinstance(deployment_policy, Mapping)
+        or set(deployment_policy) != {
+            "protected_branches",
+            "custom_branch_policies",
+        }
+        or deployment_policy.get("protected_branches") is not False
+        or deployment_policy.get("custom_branch_policies") is not True
+    ):
         raise ContractError(
             "publication environment must use only custom deployment branch policies"
         )
