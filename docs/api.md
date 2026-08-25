@@ -80,31 +80,26 @@ Most methods require a model loaded by `loadModelFromUrl()` and reject with
 
 ## Operation serialization
 
-A bridge instance owns a single llama.cpp model and context, and llama.cpp
-publishes results through process-global buffers (last generated output, last
-token array, last detokenized string, last embedding). Overlapping calls would
-therefore read each other's results, so the facade holds a **single-writer FIFO
-queue** in front of every operation that reaches that runtime, in both worker and
-direct runtime mode:
+Runtime-backed methods execute through a per-instance single-writer FIFO queue in
+both worker and direct runtime modes:
 
 `loadModelFromUrl`, `loadMultimodalProjector`, `unloadMultimodalProjector`,
 `getTextToSpeechCapabilities`, `synthesizeSpeech`, `createCompletion`,
 `tokenize`, `detokenize`, `stateSaveFile`, `stateLoadFile`, `stateSaveBytes`,
 `stateLoadBytes`, `embed`, `embedBatch`, `applyChatTemplate`.
 
-Calling any of these while another is in flight does not reject and does not
-interleave: the call waits its turn and runs in call order. A failing operation
-releases the queue for the calls behind it. The queue is per bridge instance;
-separate instances never block each other.
+Overlapping calls wait their turn and run in call order. A failing operation
+releases the queue for the calls behind it, and separate bridge instances never
+block each other.
 
 These methods are deliberately **not** queued:
 
-| Method | Reason |
+| Method | Observable guarantee |
 | --- | --- |
-| `cancel()` | Control signal; it must reach a running operation instead of waiting behind it. |
-| `setLogLevel(level)` | Synchronous, best-effort control signal. Its worker RPC is fire-and-forget: a failure is absorbed and never switches execution to the direct runtime, because doing so outside the queue could strand a response belonging to the operation that currently owns it. The next queued operation performs the normal fallback. |
-| `prefetchModelToCache()`, `evictModelFromCache()` | Cache Storage and network only; they never enter the wasm core. |
-| `getModelMetadata()`, `getContextSize()`, `isGpuActive()`, `getBackendName()`, `supportsVision()`, `supportsAudio()` | Synchronous accessors served from a facade snapshot that queued operations refresh, so they never call into the core and cannot race the operation that owns it. |
+| `cancel()` | Control signal that reaches a running operation immediately. |
+| `setLogLevel(level)` | Synchronous, best-effort control signal; delivery failures are absorbed without switching execution modes. |
+| `prefetchModelToCache()`, `evictModelFromCache()` | Cache and network operations that do not enter the model runtime. |
+| `getModelMetadata()`, `getContextSize()`, `isGpuActive()`, `getBackendName()`, `supportsVision()`, `supportsAudio()` | Synchronous accessors served from the current bridge snapshot. |
 
 ### Cancellation while queued
 
@@ -122,8 +117,7 @@ adds no new interruption guarantee for work that is already running.
 ### Disposal
 
 `dispose()` marks the bridge disposed synchronously and then tears down on the
-queue, so teardown never runs underneath an operation that still owns the
-runtime. Calls made after disposal, and calls still waiting in the queue, reject
+queue. Calls made after disposal, and calls still waiting in the queue, reject
 with `Bridge has been disposed.` The operation that was already running is not
 interrupted by disposal — it settles first, and teardown follows. `dispose()` is
 idempotent and repeated calls return the identical promise object.

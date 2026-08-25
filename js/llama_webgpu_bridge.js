@@ -3971,6 +3971,16 @@ var LlamaWebGpuBridge = class {
     });
     this._operationQueueTail = queueSlot;
     let started = false;
+    let removeAbortListener = null;
+    let removeDisposalWaiter = null;
+    const detachWatchers = () => {
+      removeAbortListener?.();
+      removeDisposalWaiter?.();
+      removeAbortListener = null;
+      removeDisposalWaiter = null;
+    };
+    const watchesAbort = signal != null && typeof signal.addEventListener === "function";
+    const watchesDisposal = !allowDisposed;
     const ordered = (async () => {
       if (predecessor) {
         await predecessor;
@@ -3982,6 +3992,7 @@ var LlamaWebGpuBridge = class {
         throw new Error(BRIDGE_DISPOSED_MESSAGE);
       }
       started = true;
+      detachWatchers();
       try {
         return await run();
       } finally {
@@ -3995,37 +4006,23 @@ var LlamaWebGpuBridge = class {
       releaseSuccessor();
     };
     ordered.then(release, release);
-    const watchesAbort = signal != null && typeof signal.addEventListener === "function";
-    const watchesDisposal = !allowDisposed;
-    if (!watchesAbort && !watchesDisposal) {
+    if (started || !watchesAbort && !watchesDisposal) {
       return ordered;
     }
-    let removeAbortListener = null;
-    let removeDisposalWaiter = null;
     const abandonedWhileQueued = new Promise((_, reject) => {
       if (watchesAbort) {
-        const onAbort = () => {
-          if (!started) {
-            reject(abortError());
-          }
-        };
+        const onAbort = () => reject(abortError());
         signal.addEventListener("abort", onAbort, { once: true });
         removeAbortListener = () => signal.removeEventListener("abort", onAbort);
       }
       if (watchesDisposal) {
         removeDisposalWaiter = this._addDisposalWaiter(() => {
-          if (!started) {
-            reject(new Error(BRIDGE_DISPOSED_MESSAGE));
-          }
+          reject(new Error(BRIDGE_DISPOSED_MESSAGE));
         });
       }
     });
     const raced = Promise.race([ordered, abandonedWhileQueued]);
-    const detach = () => {
-      removeAbortListener?.();
-      removeDisposalWaiter?.();
-    };
-    raced.then(detach, detach);
+    raced.then(detachWatchers, detachWatchers);
     return raced;
   }
   /**
@@ -4037,9 +4034,6 @@ var LlamaWebGpuBridge = class {
    * @returns {() => void}
    */
   _addDisposalWaiter(onDisposed) {
-    if (!this._disposalWaiters) {
-      this._disposalWaiters = /* @__PURE__ */ new Set();
-    }
     const waiters = this._disposalWaiters;
     waiters.add(onDisposed);
     return () => {
@@ -4058,15 +4052,12 @@ var LlamaWebGpuBridge = class {
   }
   _notifyDisposalWaiters() {
     const waiters = this._disposalWaiters;
-    if (!waiters || waiters.size === 0) {
+    if (waiters.size === 0) {
       return;
     }
     this._disposalWaiters = /* @__PURE__ */ new Set();
     for (const waiter of waiters) {
-      try {
-        waiter();
-      } catch (_) {
-      }
+      waiter();
     }
   }
   /**
@@ -5257,18 +5248,14 @@ var LlamaWebGpuBridge = class {
       rejectDispose = reject;
     });
     this._notifyDisposalWaiters();
-    try {
-      const teardown = this._runExclusive(
-        () => this._disposeUnlocked(),
-        { allowDisposed: true }
-      );
-      teardown.then(
-        () => resolveDispose(),
-        (error) => rejectDispose(error)
-      );
-    } catch (error) {
-      rejectDispose(error);
-    }
+    const teardown = this._runExclusive(
+      () => this._disposeUnlocked(),
+      { allowDisposed: true }
+    );
+    teardown.then(
+      () => resolveDispose(),
+      (error) => rejectDispose(error)
+    );
     return this._disposePromise;
   }
   async _disposeUnlocked() {

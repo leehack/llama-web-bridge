@@ -4968,6 +4968,16 @@ export class LlamaWebGpuBridge {
     this._operationQueueTail = queueSlot;
 
     let started = false;
+    let removeAbortListener = null;
+    let removeDisposalWaiter = null;
+    const detachWatchers = () => {
+      removeAbortListener?.();
+      removeDisposalWaiter?.();
+      removeAbortListener = null;
+      removeDisposalWaiter = null;
+    };
+    const watchesAbort = signal != null && typeof signal.addEventListener === 'function';
+    const watchesDisposal = !allowDisposed;
     const ordered = (async () => {
       if (predecessor) {
         await predecessor;
@@ -4979,6 +4989,7 @@ export class LlamaWebGpuBridge {
         throw new Error(BRIDGE_DISPOSED_MESSAGE);
       }
       started = true;
+      detachWatchers();
       try {
         return await run();
       } finally {
@@ -4997,42 +5008,28 @@ export class LlamaWebGpuBridge {
     };
     ordered.then(release, release);
 
-    const watchesAbort = signal != null && typeof signal.addEventListener === 'function';
-    const watchesDisposal = !allowDisposed;
-    if (!watchesAbort && !watchesDisposal) {
+    if (started || (!watchesAbort && !watchesDisposal)) {
       return ordered;
     }
 
     // Reject the caller as soon as it is cancelled or the bridge is disposed
     // while still waiting. The slot stays in the chain and is skipped in turn.
-    let removeAbortListener = null;
-    let removeDisposalWaiter = null;
     const abandonedWhileQueued = new Promise((_, reject) => {
       if (watchesAbort) {
-        const onAbort = () => {
-          if (!started) {
-            reject(abortError());
-          }
-        };
+        const onAbort = () => reject(abortError());
         signal.addEventListener('abort', onAbort, { once: true });
         removeAbortListener = () => signal.removeEventListener('abort', onAbort);
       }
 
       if (watchesDisposal) {
         removeDisposalWaiter = this._addDisposalWaiter(() => {
-          if (!started) {
-            reject(new Error(BRIDGE_DISPOSED_MESSAGE));
-          }
+          reject(new Error(BRIDGE_DISPOSED_MESSAGE));
         });
       }
     });
 
     const raced = Promise.race([ordered, abandonedWhileQueued]);
-    const detach = () => {
-      removeAbortListener?.();
-      removeDisposalWaiter?.();
-    };
-    raced.then(detach, detach);
+    raced.then(detachWatchers, detachWatchers);
     return raced;
   }
 
@@ -5045,9 +5042,6 @@ export class LlamaWebGpuBridge {
    * @returns {() => void}
    */
   _addDisposalWaiter(onDisposed) {
-    if (!this._disposalWaiters) {
-      this._disposalWaiters = new Set();
-    }
     const waiters = this._disposalWaiters;
     waiters.add(onDisposed);
     return () => {
@@ -5068,16 +5062,12 @@ export class LlamaWebGpuBridge {
 
   _notifyDisposalWaiters() {
     const waiters = this._disposalWaiters;
-    if (!waiters || waiters.size === 0) {
+    if (waiters.size === 0) {
       return;
     }
     this._disposalWaiters = new Set();
     for (const waiter of waiters) {
-      try {
-        waiter();
-      } catch (_) {
-        // A waiter only rejects its own caller; never block disposal.
-      }
+      waiter();
     }
   }
 
@@ -6580,18 +6570,14 @@ export class LlamaWebGpuBridge {
     });
     this._notifyDisposalWaiters();
 
-    try {
-      const teardown = this._runExclusive(
-        () => this._disposeUnlocked(),
-        { allowDisposed: true },
-      );
-      teardown.then(
-        () => resolveDispose(),
-        (error) => rejectDispose(error),
-      );
-    } catch (error) {
-      rejectDispose(error);
-    }
+    const teardown = this._runExclusive(
+      () => this._disposeUnlocked(),
+      { allowDisposed: true },
+    );
+    teardown.then(
+      () => resolveDispose(),
+      (error) => rejectDispose(error),
+    );
     return this._disposePromise;
   }
 
@@ -6641,8 +6627,8 @@ export class LlamaWebGpuBridge {
     try {
       return await this._callWorker('applyChatTemplate', [messages, addAssistant, customTemplate]);
     } catch (error) {
-      // The worker can reject after dispose already tore the runtime down;
-      // falling back here would rebuild it.
+      // Template fallback runs while this operation owns the queue slot, so
+      // worker replacement cannot race another runtime-backed call.
       this._disableWorkerFallback(error);
       return this._runtime.applyChatTemplate(messages, addAssistant, customTemplate);
     }

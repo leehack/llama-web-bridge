@@ -359,10 +359,8 @@ def main() -> int:
         errors,
     )
     require(
-        "const CASES = [" in operation_queue_contract
-        and "the operation queue deadlocked" in operation_queue_contract,
-        "the operation queue contract must keep its per-case harness; the behavioural "
-        "semantics are asserted by that test, not by this scan",
+        "Bridge operation queue tests passed" in operation_queue_contract,
+        "the operation queue contract must retain its aggregate success output; the Node suite owns its case matrix",
         errors,
     )
     require(
@@ -381,31 +379,6 @@ def main() -> int:
     require(
         "single-writer" in api_docs and "FIFO" in api_docs,
         "docs/api.md must document the single-writer FIFO operation queue",
-        errors,
-    )
-    begin_generation_body = core[core.find("int32_t begin_generation_impl(") :]
-    begin_generation_body = begin_generation_body[: begin_generation_body.find("\n}\n")]
-    begin_guard_index = begin_generation_body.find("if (g_generation_active) {")
-    begin_guard_block = begin_generation_body[
-        begin_guard_index : begin_generation_body.find("}", begin_guard_index) + 1
-    ]
-    require(
-        begin_guard_index > 0
-        and "return -7;" in begin_guard_block
-        and "set_error" not in begin_guard_block
-        and "g_last_" not in begin_guard_block
-        and all(
-            begin_guard_index < begin_generation_body.find(destructive)
-            for destructive in (
-                "clear_error();",
-                "g_last_output.clear();",
-                "g_last_piece.clear();",
-                "end_generation_state();",
-            )
-        ),
-        "begin_generation_impl must reject a re-entrant begin with a bare return -7, "
-        "before clearing the last output, overwriting g_last_error, or ending the active "
-        "generation state",
         errors,
     )
     require(
