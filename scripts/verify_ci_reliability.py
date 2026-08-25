@@ -681,6 +681,24 @@ def main() -> int:
         "\n## Change Boundaries",
         errors,
     )
+    readme_publication = extract_section(
+        "README.md",
+        readme,
+        "## Publishing",
+        "\n## Maintainer Docs",
+        errors,
+    )
+    readme_publication_text = " ".join(readme_publication.split())
+    readme_publication_credentials = extract_section(
+        "README.md",
+        readme_publication,
+        "Required externally configured credentials:",
+        "\nEvery request supplies",
+        errors,
+    )
+    readme_publication_credentials_text = " ".join(
+        readme_publication_credentials.split()
+    )
     typechecked_files = list_typescript_files(errors)
     verify_environment_job = publish.split(
         "\n  verify-publication-environment:\n", 1
@@ -1070,12 +1088,62 @@ def main() -> int:
             for content in (
                 publish,
                 agents,
+                readme_publication,
                 contributing,
                 release_contract,
                 release_contract_test,
             )
         ),
         "the single-credential publication contract must not reintroduce a second token or environment-secret inventory API path",
+        errors,
+    )
+    require(
+        "solo-maintainer publication contract does not require a reviewer rule"
+        in readme_publication_text
+        and "administrator bypass disabled" in readme_publication_text
+        and "exact `main` branch policy" in readme_publication_text
+        and "environment-scoped secret" in readme_publication_text
+        and "`WEBGPU_BRIDGE_ASSETS_PAT`" in readme_publication_credentials
+        and "only externally configured publication credential"
+        in readme_publication_credentials
+        and readme_publication_credentials.count("\n- ") == 1
+        and readme_publication_credentials_text
+        == (
+            "Required externally configured credentials: - "
+            "`WEBGPU_BRIDGE_ASSETS_PAT` (read access to provenance repositories "
+            "and write access to `leehack/llama-web-bridge-assets`, stored only "
+            "in the publication environment). This is the only externally "
+            "configured publication credential."
+        )
+        and "`github.token`" in readme_publication_text
+        and "after explicit dispatch approval is validated" in readme_publication_text
+        and "immediately before the first publication-PAT-bearing step"
+        in readme_publication_text
+        and "trusted workflow commit on `main`" in readme_publication_text
+        and "requested historical bridge source remains the exact build input"
+        in readme_publication_text
+        and "credential is non-empty" in readme_publication_text
+        and "does not print its value" in readme_publication_text
+        and readme_publication_text.lower().count("reviewer") == 1
+        and "self-review" not in readme_publication_text.lower()
+        and "self review" not in readme_publication_text.lower()
+        and re.search(
+            r"\b(?:second|additional|separate|another|distinct)\b.{0,64}"
+            r"\b(?:credential|token|secret)\b",
+            readme_publication_text,
+            re.IGNORECASE,
+        )
+        is None
+        and all(
+            obsolete not in readme_publication_text
+            for obsolete in (
+                "self-review prevented",
+                "pinned repository-owner maintainer reviewer",
+                "required-reviewer inventory",
+                "after reviewer approval",
+            )
+        ),
+        "README Publishing guidance must match the solo-maintainer, single-credential, main-only publication contract",
         errors,
     )
     post_approval_environment_check = publish_job.find(
