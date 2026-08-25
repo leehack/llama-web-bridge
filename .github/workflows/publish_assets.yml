@@ -105,6 +105,10 @@ jobs:
             exit 1
           fi
           bridge_default="$(gh api "repos/${BRIDGE_REPO}" --jq '.default_branch')"
+          if [ "${GITHUB_REF}" != "refs/heads/${bridge_default}" ]; then
+            echo "error: publication workflow must be dispatched from ${BRIDGE_REPO}'s default branch"
+            exit 1
+          fi
           source_status="$(gh api \
             "repos/${BRIDGE_REPO}/compare/${BRIDGE_SOURCE_SHA}...${bridge_default}" \
             --jq '.status')"
@@ -402,7 +406,7 @@ jobs:
           if-no-files-found: ignore
 
   verify-publication-environment:
-    name: Verify externally configured approval environment
+    name: Verify externally configured publication environment
     needs: validate-request
     runs-on: ubuntu-latest
     permissions:
@@ -411,13 +415,13 @@ jobs:
     outputs:
       environment_name: ${{ steps.environment.outputs.environment_name }}
     steps:
-      - name: Checkout bridge environment contract
+      - name: Checkout trusted publication policy contract
         uses: actions/checkout@v4
         with:
           repository: leehack/llama-web-bridge
-          ref: ${{ env.BRIDGE_SOURCE_SHA }}
+          ref: ${{ github.sha }}
           persist-credentials: false
-      - name: Fail closed unless required reviewers exist
+      - name: Fail closed unless the publication environment policy exists
         id: environment
         env:
           GH_TOKEN: ${{ github.token }}
@@ -425,8 +429,11 @@ jobs:
           set -euo pipefail
           gh api "repos/${BRIDGE_REPO}/environments/bridge-assets-publication" \
             > "${RUNNER_TEMP}/publication-environment.json"
+          gh api "repos/${BRIDGE_REPO}/environments/bridge-assets-publication/deployment-branch-policies" \
+            > "${RUNNER_TEMP}/publication-branch-policies.json"
           python3 scripts/release_contract.py validate-environment \
-            --environment-json "${RUNNER_TEMP}/publication-environment.json"
+            --environment-json "${RUNNER_TEMP}/publication-environment.json" \
+            --branch-policies-json "${RUNNER_TEMP}/publication-branch-policies.json"
           echo "environment_name=bridge-assets-publication" >> "${GITHUB_OUTPUT}"
 
   publish-assets:
@@ -437,14 +444,22 @@ jobs:
       actions: read
       contents: read
     # Resolve the environment name only after the bridge-owned API check proves
-    # that it already exists with required reviewers. A missing environment is
-    # never referenced by this privileged job and therefore cannot be accepted
-    # as an auto-created, unprotected gate.
+    # that it already exists with the required main-only deployment policy. A
+    # missing environment is never referenced by this privileged job and
+    # therefore cannot be accepted as an auto-created gate.
     environment:
       name: ${{ needs.verify-publication-environment.outputs.environment_name }}
     outputs:
       publication_outcome: ${{ steps.final.outputs.publication_outcome }}
     steps:
+      - name: Checkout trusted publication policy contract
+        uses: actions/checkout@v4
+        with:
+          repository: leehack/llama-web-bridge
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          path: publication-policy
+
       - name: Checkout exact bridge owner source
         uses: actions/checkout@v4
         with:
@@ -468,15 +483,18 @@ jobs:
           name: exact-webgpu-bridge-dist
           path: bridge-dist
 
-      - name: Revalidate approved environment protection after approval
+      - name: Revalidate publication environment policy before using PAT
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           gh api "repos/${BRIDGE_REPO}/environments/bridge-assets-publication" \
             > "${RUNNER_TEMP}/post-approval-publication-environment.json"
-          python3 bridge-source/scripts/release_contract.py validate-environment \
-            --environment-json "${RUNNER_TEMP}/post-approval-publication-environment.json"
+          gh api "repos/${BRIDGE_REPO}/environments/bridge-assets-publication/deployment-branch-policies" \
+            > "${RUNNER_TEMP}/post-approval-publication-branch-policies.json"
+          python3 publication-policy/scripts/release_contract.py validate-environment \
+            --environment-json "${RUNNER_TEMP}/post-approval-publication-environment.json" \
+            --branch-policies-json "${RUNNER_TEMP}/post-approval-publication-branch-policies.json"
 
       - name: Verify source ancestry and classify exact remote state
         id: preflight
@@ -486,7 +504,10 @@ jobs:
           EMSCRIPTEN_VERSION: ${{ needs.build-and-gate.outputs.emscripten_version }}
         run: |
           set -euo pipefail
-          test -n "${GH_TOKEN}"
+          if [ -z "${GH_TOKEN}" ]; then
+            echo "error: WEBGPU_BRIDGE_ASSETS_PAT is required for asset publication"
+            exit 1
+          fi
           python3 bridge-source/scripts/release_publication_state.py validate-target \
             --assets-repo "${ASSETS_REPO}" >/dev/null
           (cd bridge-dist && sha256sum --check sha256sums.txt)
@@ -587,6 +608,10 @@ jobs:
           ASSETS_BRANCH: ${{ steps.preflight.outputs.assets_branch }}
         run: |
           set -euo pipefail
+          if [ -z "${GH_TOKEN}" ]; then
+            echo "error: WEBGPU_BRIDGE_ASSETS_PAT is required for asset publication"
+            exit 1
+          fi
           ref_push_attempted=false
           push_exit_status=0
           if [ "${ACTION}" = "publish-refs-and-release" ]; then
@@ -631,6 +656,10 @@ jobs:
           EMSCRIPTEN_VERSION: ${{ needs.build-and-gate.outputs.emscripten_version }}
         run: |
           set -euo pipefail
+          if [ -z "${GH_TOKEN}" ]; then
+            echo "error: WEBGPU_BRIDGE_ASSETS_PAT is required for asset publication"
+            exit 1
+          fi
           state_changed() {
             python3 bridge-source/scripts/release_publication_state.py state-changed \
               --before-json "${RUNNER_TEMP}/preflight.json" --after-json "$1"

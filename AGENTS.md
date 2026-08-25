@@ -170,11 +170,17 @@ publication because the bridge exposes Qwen3-TTS.
   - Uses the same `emsdk.version` compiler identity as CI and records the
     runtime-verified version in `manifest.json`.
   - Requires `publish_approved=true`. Publication remains blocked until an
-    administrator externally creates `bridge-assets-publication`, configures
-    required reviewers, and stores `WEBGPU_BRIDGE_ASSETS_PAT` as an
-    environment-scoped secret. Do not describe that environment as protected
-    without current live evidence. Revalidate the reviewer rule after approval
-    and immediately before the first PAT-bearing step.
+    administrator externally creates `bridge-assets-publication`, disables
+    administrator bypass, restricts custom deployment branches to `main`, and
+    stores `WEBGPU_BRIDGE_ASSETS_PAT` as an environment-scoped secret. The
+    solo-maintainer publication contract does not require a reviewer rule. Do
+    not describe that environment as protected without current live evidence.
+    Use the default job token to validate the environment identity,
+    administrator-bypass setting, and exact `main` branch policy before approval
+    and again after approval. Use the trusted workflow commit's validator rather
+    than the requested historical bridge build source. Immediately before any
+    network use of the environment-scoped publication PAT, fail closed unless
+    the injected credential is non-empty, without printing its value.
   - Emits only stable `vMAJOR.MINOR.PATCH[-N]` or development `bNNNN[-N]` tags.
     Historical `*-llamadart.N` forms are accepted only when reading old
     manifests and are never emitted.

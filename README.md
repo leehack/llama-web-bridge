@@ -299,10 +299,11 @@ Trigger modes:
 
 There is no push, tag, schedule, or ordinary-CI publication trigger.
 
-Required environment-scoped secret:
+Required externally configured credentials:
 
 - `WEBGPU_BRIDGE_ASSETS_PAT` (read access to provenance repositories and write
-  access to `leehack/llama-web-bridge-assets`)
+  access to `leehack/llama-web-bridge-assets`, stored only in the publication
+  environment). This is the only externally configured publication credential.
 
 Every request supplies a required orchestrator correlation ID, the exact bridge
 source SHA, upstream llama.cpp tag/commit, native release tag plus `assets.json`
@@ -312,14 +313,20 @@ variables and quoted expansions. The request sets `publish_approved=true` only
 after explicit maintainer approval.
 
 Publication is deliberately blocked until repository administrators externally
-create `bridge-assets-publication`, configure at least one required reviewer,
-and store `WEBGPU_BRIDGE_ASSETS_PAT` as an environment-scoped secret. The live
-bridge repository did not have that environment at the latest readiness check;
-`llamadart` did not have it either, but its environment cannot gate this
-bridge-owned workflow. Merging this code does not establish the approval gate. The
-workflow verifies the environment through GitHub's API before entering it and
-again after reviewer approval, immediately before the first PAT-bearing step.
-A missing or weakened reviewer rule therefore fails closed.
+configure `bridge-assets-publication` with administrator bypass disabled,
+restrict exactly one custom deployment branch policy to `main`, and store
+`WEBGPU_BRIDGE_ASSETS_PAT` as an environment-scoped secret. The solo-maintainer
+publication contract does not require a reviewer rule or two-person quorum.
+Merging this code does not establish the external settings.
+The workflow uses `github.token` to validate the environment identity,
+administrator-bypass setting, and exact `main` branch policy after explicit
+dispatch approval is validated and again immediately before the first
+publication-PAT-bearing step. The policy validator comes from the trusted
+workflow commit on `main`, while the requested historical bridge source remains
+the exact build input. Before any network use of the injected publication PAT,
+each PAT-bearing step fails closed unless the credential is non-empty and does
+not print its value. Missing or weakened bypass, branch, credential, or PAT
+guard protection therefore fails closed.
 
 The workflow verifies that bridge source is already merged, all upstream/native
 tag and commit identities match, the native manifest checksum matches, and the

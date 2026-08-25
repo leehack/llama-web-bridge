@@ -186,11 +186,19 @@ upstream tag/commit, native release tag plus
 `assets.json` SHA-256, output release tag/rebuild, and assets repository.
 
 The request must set `publish_approved=true`. Publication remains blocked until
-repository administrators separately create `bridge-assets-publication`, add
-required reviewers, and store the assets PAT as an environment-scoped secret;
-the workflow fails closed if that protection is absent. It verifies all
-identities plus native GitHub asset digests/inventory and revalidates required
-reviewers after approval immediately before the first PAT-bearing step. It
+repository administrators separately create `bridge-assets-publication`, disable
+administrator bypass, restrict the custom deployment branch policy to `main`,
+and store the assets PAT as an environment-scoped secret. The solo-maintainer
+publication contract does not require a reviewer rule, `prevent_self_review`, or
+a two-person approval quorum. The workflow uses the default job token to verify
+the environment identity, disabled administrator bypass, and exact `main`
+deployment branch policy before approval. It repeats those checks after approval
+immediately before the first publication-PAT-bearing step, using the trusted
+workflow commit's validator so an older requested build-source SHA remains
+compatible. The environment-scoped `WEBGPU_BRIDGE_ASSETS_PAT` is the only
+external credential; each step that can use it fails closed unless the injected
+value is non-empty and never prints the value. The workflow also verifies all
+identities plus native GitHub asset digests/inventory. It
 builds wasm32 and memory64, runs mandatory state/multimodal/ASR/TTS gates,
 orders stable and development histories independently, generates a
 deterministic schema-v2 manifest, and recovers exact partial states while

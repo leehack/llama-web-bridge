@@ -484,22 +484,61 @@ def select_stable_native_release(releases: list[Any]) -> str:
     return selected.tag
 
 
-def validate_publication_environment(environment: Mapping[str, Any]) -> int:
-    """Require an already-created environment with at least one reviewer."""
+def validate_publication_environment(
+    environment: Mapping[str, Any],
+    branch_policies: Mapping[str, Any],
+) -> None:
+    """Require the exact fail-closed solo-maintainer publication policy."""
     if environment.get("name") != "bridge-assets-publication":
         raise ContractError("publication environment identity is missing or incorrect")
+    if environment.get("can_admins_bypass") is not False:
+        raise ContractError("publication environment must disable administrator bypass")
     rules = environment.get("protection_rules")
     if not isinstance(rules, list):
         raise ContractError("publication environment has no protection rules")
-    reviewer_count = 0
+    branch_rule_count = 0
     for rule in rules:
-        if isinstance(rule, Mapping) and rule.get("type") == "required_reviewers":
-            reviewers = rule.get("reviewers")
-            if isinstance(reviewers, list):
-                reviewer_count += len(reviewers)
-    if reviewer_count < 1:
-        raise ContractError("publication environment has no required reviewers")
-    return reviewer_count
+        if not isinstance(rule, Mapping):
+            raise ContractError("publication environment protection rules are invalid")
+        rule_type = rule.get("type")
+        if rule_type == "required_reviewers":
+            raise ContractError(
+                "solo-maintainer publication environment must not require reviewers"
+            )
+        if rule_type == "branch_policy":
+            branch_rule_count += 1
+    if branch_rule_count != 1:
+        raise ContractError("publication environment must have one branch policy rule")
+
+    deployment_policy = environment.get("deployment_branch_policy")
+    if (
+        not isinstance(deployment_policy, Mapping)
+        or set(deployment_policy) != {
+            "protected_branches",
+            "custom_branch_policies",
+        }
+        or deployment_policy.get("protected_branches") is not False
+        or deployment_policy.get("custom_branch_policies") is not True
+    ):
+        raise ContractError(
+            "publication environment must use only custom deployment branch policies"
+        )
+
+    policies = branch_policies.get("branch_policies")
+    policy_count = branch_policies.get("total_count")
+    if (
+        not isinstance(policy_count, int)
+        or isinstance(policy_count, bool)
+        or policy_count != 1
+        or not isinstance(policies, list)
+        or len(policies) != 1
+        or not isinstance(policies[0], Mapping)
+        or policies[0].get("name") != "main"
+        or policies[0].get("type") != "branch"
+    ):
+        raise ContractError(
+            "publication environment must allow deployments only from the main branch"
+        )
 
 
 def read_previous_manifest(path: Path) -> tuple[str, str, str]:
@@ -558,6 +597,7 @@ def _parser() -> argparse.ArgumentParser:
 
     environment = subparsers.add_parser("validate-environment")
     environment.add_argument("--environment-json", required=True, type=Path)
+    environment.add_argument("--branch-policies-json", required=True, type=Path)
 
     return parser
 
@@ -638,13 +678,19 @@ def main() -> int:
             environment_payload = json.loads(
                 args.environment_json.read_text(encoding="utf-8")
             )
+            branch_policies_payload = json.loads(
+                args.branch_policies_json.read_text(encoding="utf-8")
+            )
             if not isinstance(environment_payload, Mapping):
                 raise ContractError("publication environment root must be an object")
+            if not isinstance(branch_policies_payload, Mapping):
+                raise ContractError("publication branch policies root must be an object")
+            validate_publication_environment(
+                environment_payload,
+                branch_policies_payload,
+            )
             print(json.dumps({
                 "environment": "bridge-assets-publication",
-                "required_reviewers": validate_publication_environment(
-                    environment_payload
-                ),
             }, sort_keys=True))
     except (ContractError, OSError, json.JSONDecodeError) as error:
         raise SystemExit(f"error: {error}") from error

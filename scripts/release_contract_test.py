@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -77,21 +79,144 @@ class ReleaseContractTest(unittest.TestCase):
             with self.subTest(invalid=invalid), self.assertRaises(ContractError):
                 require_correlation_id(invalid)
 
-    def test_publication_environment_requires_live_reviewer_rule(self) -> None:
+    def test_publication_environment_requires_fail_closed_policy(self) -> None:
         configured = {
             "name": "bridge-assets-publication",
-            "protection_rules": [{
-                "type": "required_reviewers",
-                "reviewers": [{"type": "User", "reviewer": {"login": "maintainer"}}],
-            }],
+            "can_admins_bypass": False,
+            "protection_rules": [{"type": "branch_policy"}],
+            "deployment_branch_policy": {
+                "protected_branches": False,
+                "custom_branch_policies": True,
+            },
         }
-        self.assertEqual(validate_publication_environment(configured), 1)
-        for invalid in (
-            {"name": "bridge-assets-publication", "protection_rules": []},
-            {"name": "wrong", "protection_rules": configured["protection_rules"]},
+        branch_policies = {
+            "total_count": 1,
+            "branch_policies": [{"name": "main", "type": "branch"}],
+        }
+        self.assertIsNone(
+            validate_publication_environment(configured, branch_policies)
+        )
+
+        invalid_cases = {
+            "required-reviewers": {
+                **configured,
+                "protection_rules": [
+                    {
+                        "type": "required_reviewers",
+                        "prevent_self_review": True,
+                        "reviewers": [
+                            {
+                                "type": "User",
+                                "reviewer": {"id": 1233094, "login": "leehack"},
+                            }
+                        ],
+                    },
+                    {"type": "branch_policy"},
+                ],
+            },
+            "required-reviewers-with-self-review-allowed": {
+                **configured,
+                "protection_rules": [
+                    {
+                        "type": "required_reviewers",
+                        "prevent_self_review": False,
+                        "reviewers": [],
+                    },
+                    {"type": "branch_policy"},
+                ],
+            },
+            "admin-bypass": {**configured, "can_admins_bypass": True},
+            "all-protected-branches": {
+                **configured,
+                "deployment_branch_policy": {
+                    "protected_branches": True,
+                    "custom_branch_policies": False,
+                },
+            },
+            "numeric-deployment-policy": {
+                **configured,
+                "deployment_branch_policy": {
+                    "protected_branches": 0,
+                    "custom_branch_policies": 1,
+                },
+            },
+            "extra-deployment-policy-key": {
+                **configured,
+                "deployment_branch_policy": {
+                    **configured["deployment_branch_policy"],
+                    "unexpected": False,
+                },
+            },
+            "wrong-name": {**configured, "name": "wrong"},
+            "malformed-protection-rule": {
+                **configured,
+                "protection_rules": [*configured["protection_rules"], None],
+            },
+        }
+        for label, invalid in invalid_cases.items():
+            with self.subTest(label=label), self.assertRaises(ContractError):
+                validate_publication_environment(invalid, branch_policies)
+
+        for invalid_policies in (
+            {"total_count": True, "branch_policies": [{"name": "main", "type": "branch"}]},
+            {"total_count": 0, "branch_policies": []},
+            {
+                "total_count": 1,
+                "branch_policies": [{"name": "release/*", "type": "branch"}],
+            },
+            {
+                "total_count": 2,
+                "branch_policies": [
+                    {"name": "main", "type": "branch"},
+                    {"name": "release/*", "type": "branch"},
+                ],
+            },
         ):
-            with self.subTest(invalid=invalid), self.assertRaises(ContractError):
-                validate_publication_environment(invalid)
+            with self.subTest(invalid_policies=invalid_policies), self.assertRaises(
+                ContractError
+            ):
+                validate_publication_environment(configured, invalid_policies)
+
+    def test_validate_environment_cli_reports_only_environment_identity(self) -> None:
+        configured = {
+            "name": "bridge-assets-publication",
+            "can_admins_bypass": False,
+            "protection_rules": [{"type": "branch_policy"}],
+            "deployment_branch_policy": {
+                "protected_branches": False,
+                "custom_branch_policies": True,
+            },
+        }
+        branch_policies = {
+            "total_count": 1,
+            "branch_policies": [{"name": "main", "type": "branch"}],
+        }
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_path = Path(temporary_directory)
+            environment_path = temporary_path / "environment.json"
+            branch_policies_path = temporary_path / "branch-policies.json"
+            environment_path.write_text(json.dumps(configured), encoding="utf-8")
+            branch_policies_path.write_text(
+                json.dumps(branch_policies), encoding="utf-8"
+            )
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(Path(__file__).with_name("release_contract.py")),
+                    "validate-environment",
+                    "--environment-json",
+                    str(environment_path),
+                    "--branch-policies-json",
+                    str(branch_policies_path),
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        self.assertEqual(
+            json.loads(result.stdout),
+            {"environment": "bridge-assets-publication"},
+        )
 
     def test_legacy_wrappers_are_consumption_only(self) -> None:
         for tag in ("b10514-llamadart.2", "v0.2.0-llamadart.1"):
