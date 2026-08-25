@@ -274,6 +274,9 @@ def main() -> int:
     worker_state_contract = read_required(
         "scripts/worker_runtime_state_test.mjs", errors
     )
+    operation_queue_contract = read_required(
+        "scripts/bridge_operation_queue_test.mjs", errors
+    )
     ci = read_required(".github/workflows/ci.yml", errors)
     publish = read_required(".github/workflows/publish_assets.yml", errors)
     auto_update = read_required(".github/workflows/auto_llama_cpp_update.yml", errors)
@@ -347,6 +350,35 @@ def main() -> int:
         and '"esbuild"' in package_json
         and '"typescript"' in package_json,
         "package.json must define JS build/typecheck/syntax/runtime-state scripts and pin esbuild + TypeScript dev dependencies",
+        errors,
+    )
+    require(
+        '"test:operation-queue"' in package_json
+        and "npm run test:operation-queue" in package_json,
+        "check:js must define and run the bridge operation queue contract",
+        errors,
+    )
+    require(
+        "Bridge operation queue tests passed" in operation_queue_contract,
+        "the operation queue contract must retain its aggregate success output; the Node suite owns its case matrix",
+        errors,
+    )
+    require(
+        "_runExclusive(" in js_source and "_runExclusive(" in js_output,
+        "the single-writer operation queue must be present in bridge source and in the "
+        "generated bridge output",
+        errors,
+    )
+    require(
+        "_captureDirectRuntimeState()" in js_source
+        and "_captureDirectRuntimeState()" in js_output,
+        "the facade must snapshot direct runtime state so synchronous getters never ccall "
+        "outside the operation queue",
+        errors,
+    )
+    require(
+        "single-writer" in api_docs and "FIFO" in api_docs,
+        "docs/api.md must document the single-writer FIFO operation queue",
         errors,
     )
     require(

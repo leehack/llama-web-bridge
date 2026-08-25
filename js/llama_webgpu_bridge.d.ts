@@ -122,6 +122,12 @@ export interface StateLoadResult {
 
 export function enableBridgeWorkerHost(): void;
 
+/**
+ * Runtime-backed async operations use a per-instance FIFO queue. Queued aborts
+ * skip dispatch without cancelling the active owner; `cancel` and `setLogLevel`
+ * remain out of band; disposal rejects queued/new work while active work settles
+ * first. See docs/api.md "Operation serialization".
+ */
 export class LlamaWebGpuBridge {
   static supportsSafariAdaptiveGpu: boolean;
 
