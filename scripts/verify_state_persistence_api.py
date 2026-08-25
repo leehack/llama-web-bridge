@@ -126,7 +126,8 @@ def main() -> int:
         errors,
     )
     require(
-        "_worker.postMessage({ type: 'call', id, method, args }, transfers)" in JS,
+        "const message = { type: 'call', id, method, args };" in JS
+        and "this._worker.postMessage(message, transfers)" in JS,
         "worker proxy calls must support transfer lists",
         errors,
     )

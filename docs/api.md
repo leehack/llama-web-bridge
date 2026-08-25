@@ -96,7 +96,7 @@ These methods are deliberately **not** queued:
 
 | Method | Observable guarantee |
 | --- | --- |
-| `cancel()` | Control signal that reaches a running operation immediately. |
+| `cancel()` | Out-of-band control signal that reaches the running operation immediately, scoped to the worker generation and runtime that operation captured. |
 | `setLogLevel(level)` | Synchronous, best-effort control signal; delivery failures are absorbed without switching execution modes. |
 | `prefetchModelToCache()`, `evictModelFromCache()` | Cache and network operations that do not enter the model runtime. |
 | `getModelMetadata()`, `getContextSize()`, `isGpuActive()`, `getBackendName()`, `supportsVision()`, `supportsAudio()` | Synchronous accessors served from the current bridge snapshot. |
@@ -110,9 +110,19 @@ dispatches to the worker and never enters the core; its slot is skipped when its
 turn arrives, and `cancel()` is *not* invoked, so the unrelated operation that
 currently owns the runtime is unaffected.
 
-Once an operation has started, cancellation is unchanged from previous releases:
-`cancel()` and the per-operation abort handling apply as before. This release
-adds no new interruption guarantee for work that is already running.
+Once an operation has started, cancellation is scoped to that operation.
+Aborting its `signal`, or calling `cancel()` while it owns the runtime, reaches
+the worker generation and runtime the operation captured when it started, so a
+cancel issued after an internal worker restart or main-thread fallback still
+targets the owner of the request being cancelled rather than the replacement. A
+queued successor is unaffected and dispatches normally once the cancelled
+operation reaches a terminal state.
+
+Cancellation remains cooperative, not preemptive. A direct model transfer is
+checked before each stream read/write and immediately before native model-load
+entry; an abort that arrives before that entry skips the native call and removes
+partial files. Once an unpreemptible native call has started, cancellation waits
+for it to return and then discards and cleans up its result.
 
 ### Disposal
 
@@ -251,7 +261,7 @@ Common `options` keys:
 | `grammar` | Optional llama.cpp grammar string. |
 | `seed` | Integer seed; random when omitted. |
 | `onToken(piece, currentText)` | Token callback. By default `piece` is a `Uint8Array` containing stable UTF-8 bytes. Direct runtime mode provides the current full text by default; worker mode provides `''` unless `emitCurrentTextOnToken: true` is set. |
-| `signal` | `AbortSignal`; aborting calls `cancel()`. |
+| `signal` | `AbortSignal`; aborting cancels this operation and rejects with `AbortError`. |
 | `warmup` | Marks a warmup generation. Some multimodal worker setup failures return an empty string instead of failing warmup. |
 | `emitCurrentTextOnToken` | Direct runtime defaults to current text and uses `null` when set to `false`; worker mode sends current text only when this is `true` and otherwise sends `''`. |
 | `tokenEventEncoding` | `'bytes'` (default) sends `Uint8Array` pieces; `'text'` sends string pieces. Worker events may already provide text pieces. |
@@ -545,8 +555,13 @@ cancel(): void
 ```
 
 Best-effort cancellation for active model transfer, token generation, or
-text-to-speech synthesis. It aborts the current transfer controller when
-present and asks the core/worker to stop the active task.
+text-to-speech synthesis. It aborts the transfer controller of the operation
+that currently owns the runtime and asks that operation's captured worker
+generation and runtime to stop, so an internal worker restart or main-thread
+fallback cannot redirect the cancel to an unrelated replacement. It never
+cancels a queued operation, and it stays out-of-band: it does not wait behind
+the operation it controls. After disposal it is a no-op and never resurrects
+torn-down state.
 
 ### `dispose()`
 
