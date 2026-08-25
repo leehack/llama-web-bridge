@@ -1003,16 +1003,31 @@ const CASES = [
   }],
 ];
 
+const CASE_TIMEOUT_MS = 2000;
+
+// The watchdog must be cleared on every exit path, or a passing case leaves a
+// pending timer that keeps Node alive for the full timeout after the suite ends.
+async function runWithDeadline(run) {
+  let timeoutHandle = null;
+  try {
+    return await Promise.race([
+      run(),
+      new Promise((_, reject) => {
+        timeoutHandle = setTimeout(
+          () => reject(new Error(`timed out after ${CASE_TIMEOUT_MS}ms; lifecycle case deadlocked`)),
+          CASE_TIMEOUT_MS,
+        );
+      }),
+    ]);
+  } finally {
+    clearTimeout(timeoutHandle);
+  }
+}
+
 const failures = [];
 for (const [name, run] of CASES) {
   try {
-    await Promise.race([
-      run(),
-      new Promise((_, reject) => setTimeout(
-        () => reject(new Error('timed out after 2000ms; lifecycle case deadlocked')),
-        2000,
-      )),
-    ]);
+    await runWithDeadline(run);
   } catch (error) {
     failures.push(`${name}: ${error?.message || error}`);
   }
