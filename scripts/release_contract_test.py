@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -17,7 +19,6 @@ from release_contract import (
     expected_native_artifacts,
     parse_release_tag,
     parse_upstream_tag,
-    normalize_environment_secret_pages,
     read_previous_manifest,
     require_correlation_id,
     resolve_native_manifest,
@@ -92,15 +93,8 @@ class ReleaseContractTest(unittest.TestCase):
             "total_count": 1,
             "branch_policies": [{"name": "main", "type": "branch"}],
         }
-        environment_secrets = {
-            "total_count": 1,
-            "secrets": [{"name": "WEBGPU_BRIDGE_ASSETS_PAT"}],
-        }
-        self.assertEqual(
-            validate_publication_environment(
-                configured, branch_policies, environment_secrets
-            ),
-            0,
+        self.assertIsNone(
+            validate_publication_environment(configured, branch_policies)
         )
 
         invalid_cases = {
@@ -161,9 +155,7 @@ class ReleaseContractTest(unittest.TestCase):
         }
         for label, invalid in invalid_cases.items():
             with self.subTest(label=label), self.assertRaises(ContractError):
-                validate_publication_environment(
-                    invalid, branch_policies, environment_secrets
-                )
+                validate_publication_environment(invalid, branch_policies)
 
         for invalid_policies in (
             {"total_count": True, "branch_policies": [{"name": "main", "type": "branch"}]},
@@ -183,88 +175,48 @@ class ReleaseContractTest(unittest.TestCase):
             with self.subTest(invalid_policies=invalid_policies), self.assertRaises(
                 ContractError
             ):
-                validate_publication_environment(
-                    configured, invalid_policies, environment_secrets
-                )
+                validate_publication_environment(configured, invalid_policies)
 
-        for invalid_secrets in (
-            {},
-            {"total_count": True, "secrets": [{"name": "WEBGPU_BRIDGE_ASSETS_PAT"}]},
-            {"total_count": 0, "secrets": []},
-            {"total_count": 1, "secrets": [{"name": "WRONG_PAT"}]},
-            {"total_count": 1, "secrets": "WEBGPU_BRIDGE_ASSETS_PAT"},
-            {"total_count": 1, "secrets": [{"name": ""}]},
-            {"total_count": 1, "secrets": [{"name": "1INVALID"}]},
-            {"total_count": 1, "secrets": [{"name": "INVALID-NAME"}]},
-            {"total_count": 1, "secrets": [{"name": "GITHUB_RESERVED"}]},
-            {"total_count": 1, "secrets": [{"name": "webgpu_bridge_assets_pat"}]},
-            {
-                "total_count": 2,
-                "secrets": [
-                    {"name": "WEBGPU_BRIDGE_ASSETS_PAT"},
-                    {"name": "BRIDGE_PUBLICATION_ENV_READ_TOKEN"},
-                ],
+    def test_validate_environment_cli_reports_only_environment_identity(self) -> None:
+        configured = {
+            "name": "bridge-assets-publication",
+            "can_admins_bypass": False,
+            "protection_rules": [{"type": "branch_policy"}],
+            "deployment_branch_policy": {
+                "protected_branches": False,
+                "custom_branch_policies": True,
             },
-            {
-                "total_count": 2,
-                "secrets": [
-                    {"name": "WEBGPU_BRIDGE_ASSETS_PAT"},
-                    {"name": "WEBGPU_BRIDGE_ASSETS_PAT"},
-                ],
-            },
-            {
-                "total_count": 2,
-                "secrets": [
-                    {"name": "WEBGPU_BRIDGE_ASSETS_PAT"},
-                    {"name": "webgpu_bridge_assets_pat"},
-                ],
-            },
-            {"total_count": 1, "secrets": [{}]},
-        ):
-            with self.subTest(invalid_secrets=invalid_secrets), self.assertRaises(
-                ContractError
-            ):
-                validate_publication_environment(
-                    configured, branch_policies, invalid_secrets
-                )
-
-    def test_environment_secret_pages_fail_closed_before_normalization(self) -> None:
-        self.assertEqual(
-            normalize_environment_secret_pages(
+        }
+        branch_policies = {
+            "total_count": 1,
+            "branch_policies": [{"name": "main", "type": "branch"}],
+        }
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_path = Path(temporary_directory)
+            environment_path = temporary_path / "environment.json"
+            branch_policies_path = temporary_path / "branch-policies.json"
+            environment_path.write_text(json.dumps(configured), encoding="utf-8")
+            branch_policies_path.write_text(
+                json.dumps(branch_policies), encoding="utf-8"
+            )
+            result = subprocess.run(
                 [
-                    {"total_count": 2, "secrets": [{"name": "FIRST"}]},
-                    {"total_count": 2, "secrets": [{"name": "SECOND"}]},
-                ]
-            ),
-            {
-                "total_count": 2,
-                "secrets": [{"name": "FIRST"}, {"name": "SECOND"}],
-            },
-        )
+                    sys.executable,
+                    str(Path(__file__).with_name("release_contract.py")),
+                    "validate-environment",
+                    "--environment-json",
+                    str(environment_path),
+                    "--branch-policies-json",
+                    str(branch_policies_path),
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
         self.assertEqual(
-            normalize_environment_secret_pages(
-                [{"total_count": 0, "secrets": []}]
-            ),
-            {"total_count": 0, "secrets": []},
+            json.loads(result.stdout),
+            {"environment": "bridge-assets-publication"},
         )
-
-        for invalid_pages in (
-            [],
-            {},
-            [None],
-            [{"total_count": True, "secrets": [{}]}],
-            [{"total_count": -1, "secrets": []}],
-            [{"total_count": 0, "secrets": "invalid"}],
-            [
-                {"total_count": 2, "secrets": [{"name": "FIRST"}]},
-                {"total_count": 1, "secrets": [{"name": "SECOND"}]},
-            ],
-            [{"total_count": 2, "secrets": [{"name": "ONLY"}]}],
-        ):
-            with self.subTest(invalid_pages=invalid_pages), self.assertRaises(
-                ContractError
-            ):
-                normalize_environment_secret_pages(invalid_pages)
 
     def test_legacy_wrappers_are_consumption_only(self) -> None:
         for tag in ("b10514-llamadart.2", "v0.2.0-llamadart.1"):

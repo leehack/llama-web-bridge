@@ -425,27 +425,15 @@ jobs:
         id: environment
         env:
           GH_TOKEN: ${{ github.token }}
-          ENVIRONMENT_READ_TOKEN: ${{ secrets.BRIDGE_PUBLICATION_ENV_READ_TOKEN }}
         run: |
           set -euo pipefail
-          if [ -z "${ENVIRONMENT_READ_TOKEN}" ]; then
-            echo "error: BRIDGE_PUBLICATION_ENV_READ_TOKEN is required for read-only environment metadata verification"
-            exit 1
-          fi
           gh api "repos/${BRIDGE_REPO}/environments/bridge-assets-publication" \
             > "${RUNNER_TEMP}/publication-environment.json"
           gh api "repos/${BRIDGE_REPO}/environments/bridge-assets-publication/deployment-branch-policies" \
             > "${RUNNER_TEMP}/publication-branch-policies.json"
-          GH_TOKEN="${ENVIRONMENT_READ_TOKEN}" gh api --paginate --slurp \
-            "repos/${BRIDGE_REPO}/environments/bridge-assets-publication/secrets?per_page=100" \
-            > "${RUNNER_TEMP}/publication-environment-secret-pages.json"
-          python3 scripts/release_contract.py normalize-environment-secrets \
-            --pages-json "${RUNNER_TEMP}/publication-environment-secret-pages.json" \
-            > "${RUNNER_TEMP}/publication-environment-secrets.json"
           python3 scripts/release_contract.py validate-environment \
             --environment-json "${RUNNER_TEMP}/publication-environment.json" \
-            --branch-policies-json "${RUNNER_TEMP}/publication-branch-policies.json" \
-            --environment-secrets-json "${RUNNER_TEMP}/publication-environment-secrets.json"
+            --branch-policies-json "${RUNNER_TEMP}/publication-branch-policies.json"
           echo "environment_name=bridge-assets-publication" >> "${GITHUB_OUTPUT}"
 
   publish-assets:
@@ -456,9 +444,9 @@ jobs:
       actions: read
       contents: read
     # Resolve the environment name only after the bridge-owned API check proves
-    # that it already exists with the required main-only deployment policy and
-    # environment-scoped PAT. A missing environment is never referenced by this
-    # privileged job and therefore cannot be accepted as an auto-created gate.
+    # that it already exists with the required main-only deployment policy. A
+    # missing environment is never referenced by this privileged job and
+    # therefore cannot be accepted as an auto-created gate.
     environment:
       name: ${{ needs.verify-publication-environment.outputs.environment_name }}
     outputs:
@@ -498,28 +486,15 @@ jobs:
       - name: Revalidate publication environment policy before using PAT
         env:
           GH_TOKEN: ${{ github.token }}
-          ENVIRONMENT_READ_TOKEN: ${{ secrets.BRIDGE_PUBLICATION_ENV_READ_TOKEN }}
         run: |
           set -euo pipefail
-          if [ -z "${ENVIRONMENT_READ_TOKEN}" ]; then
-            echo "error: BRIDGE_PUBLICATION_ENV_READ_TOKEN is required for read-only environment metadata verification"
-            exit 1
-          fi
           gh api "repos/${BRIDGE_REPO}/environments/bridge-assets-publication" \
             > "${RUNNER_TEMP}/post-approval-publication-environment.json"
           gh api "repos/${BRIDGE_REPO}/environments/bridge-assets-publication/deployment-branch-policies" \
             > "${RUNNER_TEMP}/post-approval-publication-branch-policies.json"
-          GH_TOKEN="${ENVIRONMENT_READ_TOKEN}" gh api --paginate --slurp \
-            "repos/${BRIDGE_REPO}/environments/bridge-assets-publication/secrets?per_page=100" \
-            > "${RUNNER_TEMP}/post-approval-publication-environment-secret-pages.json"
-          python3 publication-policy/scripts/release_contract.py \
-            normalize-environment-secrets \
-            --pages-json "${RUNNER_TEMP}/post-approval-publication-environment-secret-pages.json" \
-            > "${RUNNER_TEMP}/post-approval-publication-environment-secrets.json"
           python3 publication-policy/scripts/release_contract.py validate-environment \
             --environment-json "${RUNNER_TEMP}/post-approval-publication-environment.json" \
-            --branch-policies-json "${RUNNER_TEMP}/post-approval-publication-branch-policies.json" \
-            --environment-secrets-json "${RUNNER_TEMP}/post-approval-publication-environment-secrets.json"
+            --branch-policies-json "${RUNNER_TEMP}/post-approval-publication-branch-policies.json"
 
       - name: Verify source ancestry and classify exact remote state
         id: preflight
@@ -529,7 +504,10 @@ jobs:
           EMSCRIPTEN_VERSION: ${{ needs.build-and-gate.outputs.emscripten_version }}
         run: |
           set -euo pipefail
-          test -n "${GH_TOKEN}"
+          if [ -z "${GH_TOKEN}" ]; then
+            echo "error: WEBGPU_BRIDGE_ASSETS_PAT is required for asset publication"
+            exit 1
+          fi
           python3 bridge-source/scripts/release_publication_state.py validate-target \
             --assets-repo "${ASSETS_REPO}" >/dev/null
           (cd bridge-dist && sha256sum --check sha256sums.txt)
@@ -630,6 +608,10 @@ jobs:
           ASSETS_BRANCH: ${{ steps.preflight.outputs.assets_branch }}
         run: |
           set -euo pipefail
+          if [ -z "${GH_TOKEN}" ]; then
+            echo "error: WEBGPU_BRIDGE_ASSETS_PAT is required for asset publication"
+            exit 1
+          fi
           ref_push_attempted=false
           push_exit_status=0
           if [ "${ACTION}" = "publish-refs-and-release" ]; then
@@ -674,6 +656,10 @@ jobs:
           EMSCRIPTEN_VERSION: ${{ needs.build-and-gate.outputs.emscripten_version }}
         run: |
           set -euo pipefail
+          if [ -z "${GH_TOKEN}" ]; then
+            echo "error: WEBGPU_BRIDGE_ASSETS_PAT is required for asset publication"
+            exit 1
+          fi
           state_changed() {
             python3 bridge-source/scripts/release_publication_state.py state-changed \
               --before-json "${RUNNER_TEMP}/preflight.json" --after-json "$1"

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import subprocess
 import sys
@@ -49,6 +50,66 @@ WORKFLOW_MODEL_SHA_PIN_ASSIGNMENT = re.compile(
     r"""^[ \t]*([A-Z][A-Z0-9_]*_SHA256):[ \t]*["']?([0-9a-fA-F]{64})["']?[ \t]*$""",
     re.MULTILINE,
 )
+PUBLICATION_PAT_NAME = "WEBGPU_BRIDGE_ASSETS_PAT"
+PUBLICATION_PAT_REFERENCE = re.compile(
+    r"secrets\s*(?:\.\s*WEBGPU_BRIDGE_ASSETS_PAT|\[\s*['\"]WEBGPU_BRIDGE_ASSETS_PAT['\"]\s*\])"
+)
+PUBLICATION_PAT_GUARD_ERROR = (
+    "error: WEBGPU_BRIDGE_ASSETS_PAT is required for asset publication"
+)
+EXPECTED_PUBLICATION_PAT_STEPS = (
+    ("publish-assets", "Verify source ancestry and classify exact remote state"),
+    ("publish-assets", "Apply only the classified ref mutation"),
+    ("publish-assets", "Re-fetch and finish or safely classify partial publication"),
+)
+RESOLVE_WORKFLOW_STEPS_JS = r"""
+const fs = require('fs');
+const YAML = require('yaml');
+
+const workflow = YAML.parse(fs.readFileSync(0, 'utf8'), { merge: true });
+const mapping = (value) =>
+  value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+const patReference = /secrets\s*(?:\.\s*WEBGPU_BRIDGE_ASSETS_PAT|\[\s*['"]WEBGPU_BRIDGE_ASSETS_PAT['"]\s*\])/;
+const containsPat = (value) => {
+  if (typeof value === 'string') return patReference.test(value);
+  if (Array.isArray(value)) return value.some(containsPat);
+  if (value && typeof value === 'object') return Object.values(value).some(containsPat);
+  return false;
+};
+
+const rootEnv = mapping(mapping(workflow).env);
+const resolved = [];
+const patOutsideEnv = [];
+const rootOutsideEnv = { ...mapping(workflow) };
+delete rootOutsideEnv.env;
+delete rootOutsideEnv.jobs;
+if (containsPat(rootOutsideEnv)) patOutsideEnv.push('workflow root properties');
+for (const [jobName, rawJob] of Object.entries(mapping(mapping(workflow).jobs))) {
+  const job = mapping(rawJob);
+  const jobEnv = { ...rootEnv, ...mapping(job.env) };
+  const jobOutsideEnv = { ...job };
+  delete jobOutsideEnv.env;
+  delete jobOutsideEnv.steps;
+  if (containsPat(jobOutsideEnv)) patOutsideEnv.push(`job ${jobName} properties`);
+  const steps = Array.isArray(job.steps) ? job.steps : [];
+  steps.forEach((rawStep, index) => {
+    const step = mapping(rawStep);
+    const stepOutsideEnv = { ...step };
+    delete stepOutsideEnv.env;
+    resolved.push({
+      job: jobName,
+      index,
+      name: typeof step.name === 'string' ? step.name : '',
+      env: { ...jobEnv, ...mapping(step.env) },
+      run: typeof step.run === 'string' ? step.run : '',
+      patOutsideEnv: containsPat(stepOutsideEnv)
+        ? `step ${jobName}/${typeof step.name === 'string' ? step.name : index} properties`
+        : '',
+    });
+  });
+}
+process.stdout.write(JSON.stringify({ steps: resolved, patOutsideEnv }));
+"""
 
 
 def read_required(relative_path: str, errors: list[str]) -> str:
@@ -63,6 +124,297 @@ def read_required(relative_path: str, errors: list[str]) -> str:
 def require(condition: bool, message: str, errors: list[str]) -> None:
     if not condition:
         errors.append(message)
+
+
+def resolve_workflow_steps(
+    workflow: str,
+) -> tuple[list[dict[str, object]], list[str], list[str]]:
+    try:
+        result = subprocess.run(
+            ["node", "-e", RESOLVE_WORKFLOW_STEPS_JS],
+            cwd=ROOT,
+            input=workflow,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError as exc:
+        return [], [], [f"failed to run Node yaml workflow resolver: {exc}"]
+
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip()
+        return [], [], [f"Node yaml workflow resolver failed: {detail}"]
+    try:
+        resolved = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        return [], [], [f"Node yaml workflow resolver returned invalid JSON: {exc}"]
+    if not isinstance(resolved, dict):
+        return [], [], ["Node yaml workflow resolver did not return an object"]
+    steps = resolved.get("steps")
+    pat_outside_env = resolved.get("patOutsideEnv")
+    if not isinstance(steps, list) or not isinstance(pat_outside_env, list):
+        return [], [], ["Node yaml workflow resolver returned invalid contract data"]
+    return steps, [str(location) for location in pat_outside_env], []
+
+
+def shell_variable_reference(variable: str) -> re.Pattern[str]:
+    escaped = re.escape(variable)
+    return re.compile(rf"\$(?:\{{{escaped}(?:[^A-Za-z0-9_][^}}]*)?\}}|{escaped}\b)")
+
+
+def fail_closed_guard_end(script: str, variable: str) -> int:
+    escaped = re.escape(variable)
+    blank_or_comment = r"[ \t]*(?:\#[^\r\n]*)?\r?\n"
+    guard = re.compile(
+        rf"\A(?:{blank_or_comment})*"
+        rf"[ \t]*set[ \t]+-euo[ \t]+pipefail[ \t]*\r?\n"
+        rf"(?:{blank_or_comment})*"
+        rf"[ \t]*if[ \t]+\[[ \t]+-z[ \t]+\"\$\{{{escaped}\}}\"[ \t]+\];"
+        rf"[ \t]+then[ \t]*\r?\n"
+        rf"[ \t]*echo[ \t]+\"{re.escape(PUBLICATION_PAT_GUARD_ERROR)}\"[ \t]*\r?\n"
+        rf"[ \t]*exit[ \t]+[1-9][0-9]*[ \t]*\r?\n"
+        rf"[ \t]*fi(?:[ \t]*\r?\n|[ \t]*\Z)"
+    )
+    match = guard.match(script)
+    return match.end() if match else -1
+
+
+def first_sensitive_command(script: str) -> tuple[int, str] | None:
+    offset = 0
+    for line in script.splitlines(keepends=True):
+        code = line.lstrip()
+        if not code or code.startswith("#"):
+            offset += len(line)
+            continue
+        command = re.search(r"\b(?:gh|curl|wget)\b", code)
+        git_operation = re.search(
+            r"\bgit\b[^\n]*?\b(?:clone|fetch|pull|push|ls-remote|remote|add|commit|tag)\b",
+            code,
+        )
+        matches = [match for match in (command, git_operation) if match is not None]
+        if matches:
+            match = min(matches, key=lambda item: item.start())
+            return offset + len(line) - len(code) + match.start(), match.group(0)
+        offset += len(line)
+    return None
+
+
+def credential_logging_errors(script: str, variables: list[str]) -> list[str]:
+    collapsed = re.sub(r"\\\r?\n", " ", script)
+    found: list[str] = []
+    if re.search(r"(?m)^\s*set\s+(?:-[A-Za-z]*x[A-Za-z]*\b|-o\s+xtrace\b)", collapsed):
+        found.append("set -x/xtrace")
+    if re.search(r"\bprintenv\b", collapsed):
+        found.append("printenv")
+    if re.search(
+        r"(?m)(?:^|[;&|])\s*(?:command\s+)?"
+        r"[\"']?(?:env|/(?:[^/\s;&|]+/)*env)[\"']?\s*(?:$|[;&|>])",
+        collapsed,
+    ):
+        found.append("bare env")
+    for variable in variables:
+        reference = shell_variable_reference(variable)
+        for line in collapsed.splitlines():
+            if re.search(r"\b(?:echo|printf)\b", line) and reference.search(line):
+                found.append(f"echo/printf of {variable}")
+                break
+    return found
+
+
+def validate_publication_pat_contract(
+    workflow: str, expected_steps: tuple[tuple[str, str], ...]
+) -> list[str]:
+    steps, pat_outside_env, resolution_errors = resolve_workflow_steps(workflow)
+    if resolution_errors:
+        return resolution_errors
+
+    errors = [
+        f"{location} references {PUBLICATION_PAT_NAME} outside resolved env"
+        for location in pat_outside_env
+    ]
+    pat_steps: list[tuple[dict[str, object], list[str]]] = []
+    for step in steps:
+        job = str(step.get("job", ""))
+        name = str(step.get("name", ""))
+        if step.get("patOutsideEnv"):
+            errors.append(
+                f"{step['patOutsideEnv']} references {PUBLICATION_PAT_NAME} outside resolved env"
+            )
+        env = step.get("env", {})
+        if not isinstance(env, dict):
+            continue
+        variables = [
+            str(key)
+            for key, value in env.items()
+            if PUBLICATION_PAT_REFERENCE.search(str(value))
+        ]
+        if variables:
+            pat_steps.append((step, variables))
+
+    actual_steps = [(str(step.get("job", "")), str(step.get("name", ""))) for step, _ in pat_steps]
+    if sorted(actual_steps) != sorted(expected_steps):
+        errors.append(
+            f"PAT-bearing steps are {actual_steps!r}, expected exactly {list(expected_steps)!r}"
+        )
+
+    for step, variables in pat_steps:
+        job = str(step.get("job", ""))
+        name = str(step.get("name", ""))
+        script = str(step.get("run", ""))
+        for variable in variables:
+            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", variable) is None:
+                errors.append(f"{job}/{name} binds the PAT to invalid shell variable {variable!r}")
+                continue
+            guard_end = fail_closed_guard_end(script, variable)
+            if guard_end < 0:
+                errors.append(
+                    f"{job}/{name} must start with set -euo pipefail followed immediately "
+                    f"by the canonical executable empty-token guard for {variable}"
+                )
+                continue
+            sensitive = first_sensitive_command(script)
+            if sensitive is not None and sensitive[0] < guard_end:
+                errors.append(
+                    f"{job}/{name} runs sensitive command {sensitive[1]!r} before its {variable} credential guard"
+                )
+        for logging_path in credential_logging_errors(script, variables):
+            errors.append(f"{job}/{name} exposes the PAT through {logging_path}")
+    return errors
+
+
+def require_publication_pat_contract_self_tests(errors: list[str]) -> None:
+    expected = (("publish-assets", "Safe publication"),)
+    safe_fixture = """
+env: &publication-env
+  RELEASE_CREDENTIAL: '${{ secrets.WEBGPU_BRIDGE_ASSETS_PAT }}'
+jobs:
+  publish-assets:
+    steps:
+      - name: Safe publication
+        env:
+          <<: *publication-env
+        run: |
+          set -euo pipefail
+          # The credential guard must be the first executable block after setup.
+          if [ -z "${RELEASE_CREDENTIAL}" ]; then
+            echo "error: WEBGPU_BRIDGE_ASSETS_PAT is required for asset publication"
+            exit 1
+          fi
+          git -C assets push origin main
+"""
+    require(
+        not validate_publication_pat_contract(safe_fixture, expected),
+        "publication PAT contract rejected its safe YAML merge/alternate-variable fixture",
+        errors,
+    )
+
+    canonical_empty_guard = (
+        'if [ -z "${TOKEN_ALIAS}" ]; then\n'
+        f'  echo "{PUBLICATION_PAT_GUARD_ERROR}"\n'
+        "  exit 1\n"
+        "fi"
+    )
+    canonical_script = "set -euo pipefail\n" + canonical_empty_guard
+    canonical_guard_error = "canonical executable empty-token guard for TOKEN_ALIAS"
+    unsafe_scripts = {
+        "missing guard": ("set -euo pipefail\ntrue", canonical_guard_error),
+        "non-executing false-and-exit empty-token block": (
+            "set -euo pipefail\n"
+            'false && if [ -z "${TOKEN_ALIAS}" ]; then\n'
+            f'  echo "{PUBLICATION_PAT_GUARD_ERROR}"\n'
+            "  exit 1\n"
+            "fi",
+            canonical_guard_error,
+        ),
+        "single-quoted non-expanding parameter guard": (
+            "set -euo pipefail\n"
+            ": '${TOKEN_ALIAS:?WEBGPU_BRIDGE_ASSETS_PAT is required}'\n"
+            "git -C assets push origin main",
+            canonical_guard_error,
+        ),
+        "indirect gh invocation before guard": (
+            "set -euo pipefail\n"
+            "client=gh\n"
+            '"${client}" api repos/example/assets\n'
+            + canonical_empty_guard,
+            canonical_guard_error,
+        ),
+        "set -x": (
+            canonical_script + "\nset -x",
+            "set -x/xtrace",
+        ),
+        "printenv": (
+            canonical_script + "\nprintenv",
+            "through printenv",
+        ),
+        "bare env": (
+            canonical_script + "\nenv",
+            "through bare env",
+        ),
+        "absolute-path env": (canonical_script + "\n/usr/bin/env", "through bare env"),
+        "echo leakage": (
+            canonical_script + '\necho "${TOKEN_ALIAS}"',
+            "echo/printf of TOKEN_ALIAS",
+        ),
+        "printf leakage": (
+            canonical_script + "\nprintf '%s' \"$TOKEN_ALIAS\"",
+            "echo/printf of TOKEN_ALIAS",
+        ),
+        "secret expansion in guard error": (
+            "set -euo pipefail\n"
+            'if [ -z "${TOKEN_ALIAS}" ]; then\n'
+            '  echo "error: ${TOKEN_ALIAS} is required"\n'
+            "  exit 1\n"
+            "fi",
+            canonical_guard_error,
+        ),
+    }
+    for fixture_name, (script, expected_error) in unsafe_scripts.items():
+        indented_script = "".join(
+            f"          {line}\n" for line in script.splitlines()
+        )
+        fixture = f"""
+jobs:
+  publish-assets:
+    steps:
+      - name: Safe publication
+        env:
+          TOKEN_ALIAS: "${{{{secrets.WEBGPU_BRIDGE_ASSETS_PAT}}}}"
+        run: |-
+{indented_script}"""
+        fixture_errors = validate_publication_pat_contract(fixture, expected)
+        require(
+            any(expected_error in error for error in fixture_errors),
+            f"publication PAT contract did not reject adversarial fixture "
+            f"{fixture_name} for the expected reason ({expected_error})",
+            errors,
+        )
+
+    job_container_credential_fixture = """
+jobs:
+  publish-assets:
+    container:
+      image: example.invalid/publisher:latest
+      credentials:
+        username: publisher
+        password: ${{ secrets.WEBGPU_BRIDGE_ASSETS_PAT }}
+    steps:
+      - name: Safe publication
+        run: echo safe
+"""
+    fixture_errors = validate_publication_pat_contract(
+        job_container_credential_fixture, expected
+    )
+    require(
+        any(
+            "job publish-assets properties references "
+            f"{PUBLICATION_PAT_NAME} outside resolved env" in error
+            for error in fixture_errors
+        ),
+        "publication PAT contract did not reject a job-level container "
+        "credentials password PAT reference",
+        errors,
+    )
 
 
 def extract_section(
@@ -317,6 +669,8 @@ def main() -> int:
     readme = read_required("README.md", errors)
     api_docs = read_required("docs/api.md", errors)
     contributing = read_required("CONTRIBUTING.md", errors)
+    release_contract = read_required("scripts/release_contract.py", errors)
+    release_contract_test = read_required("scripts/release_contract_test.py", errors)
     workflow_input_transport = read_required(
         "scripts/workflow_input_transport_test.mjs", errors
     )
@@ -328,9 +682,13 @@ def main() -> int:
         errors,
     )
     typechecked_files = list_typescript_files(errors)
+    verify_environment_job = publish.split(
+        "\n  verify-publication-environment:\n", 1
+    )[-1].split("\n  publish-assets:\n", 1)[0]
     publish_job = publish.split("\n  publish-assets:\n", 1)[-1]
 
     require_well_formed_markdown_tables("docs/api.md", api_docs, errors)
+    require_publication_pat_contract_self_tests(errors)
 
     for name, workflow in (
         ("ci.yml", ci),
@@ -669,27 +1027,15 @@ def main() -> int:
         and "release_contract.py validate-environment" in publish
         and publish.count("deployment-branch-policies") == 2
         and publish.count("--branch-policies-json") == 2
-        and publish.count("bridge-assets-publication/secrets") == 2
-        and publish.count("--environment-secrets-json") == 2
-        and publish.count("secrets.BRIDGE_PUBLICATION_ENV_READ_TOKEN") == 2
-        and publish.count("ENVIRONMENT_READ_TOKEN: ${{ secrets.BRIDGE_PUBLICATION_ENV_READ_TOKEN }}")
-        == 2
-        and publish.count('GH_TOKEN="${ENVIRONMENT_READ_TOKEN}" gh api') == 2
-        and publish.count("gh api --paginate --slurp") == 2
-        and publish.count("secrets?per_page=100") == 2
-        and publish.count("normalize-environment-secrets") == 2
-        and publish.count(
-            '"${RUNNER_TEMP}/publication-environment-secret-pages.json"'
+        and verify_environment_job.count("GH_TOKEN: ${{ github.token }}") == 1
+        and "secrets." not in verify_environment_job
+        and verify_environment_job.count(
+            'gh api "repos/${BRIDGE_REPO}/environments/bridge-assets-publication"'
         )
-        == 2
-        and publish.count(
-            '"${RUNNER_TEMP}/post-approval-publication-environment-secret-pages.json"'
-        )
-        == 2
-        and publish.count(
-            "BRIDGE_PUBLICATION_ENV_READ_TOKEN is required for read-only environment metadata verification"
-        )
-        == 2
+        == 1
+        and verify_environment_job.count("deployment-branch-policies") == 1
+        and "scripts/release_contract.py validate-environment"
+        in verify_environment_job
         and re.search(
             r"verify-publication-environment:\s+.*?permissions:\s+actions: read\s+contents: read",
             publish,
@@ -710,14 +1056,32 @@ def main() -> int:
         "cross-repository publication must require explicit input confirmation plus a preverified fail-closed environment policy and have no automatic trigger",
         errors,
     )
+    obsolete_environment_secret_contract = (
+        "BRIDGE_PUBLICATION_ENV_READ_TOKEN",
+        "bridge-assets-publication/secrets",
+        "--environment-secrets-json",
+        "normalize-environment-secrets",
+        "publication-environment-secret-pages",
+    )
+    require(
+        all(
+            obsolete not in content
+            for obsolete in obsolete_environment_secret_contract
+            for content in (
+                publish,
+                agents,
+                contributing,
+                release_contract,
+                release_contract_test,
+            )
+        ),
+        "the single-credential publication contract must not reintroduce a second token or environment-secret inventory API path",
+        errors,
+    )
     post_approval_environment_check = publish_job.find(
         "Revalidate publication environment policy before using PAT"
     )
     first_pat_reference = publish_job.find("secrets.WEBGPU_BRIDGE_ASSETS_PAT")
-    post_approval_read_token_reference = publish_job.find(
-        "secrets.BRIDGE_PUBLICATION_ENV_READ_TOKEN",
-        post_approval_environment_check,
-    )
     require(
         publish.count("release_contract.py validate-environment") == 2
         and re.search(
@@ -727,20 +1091,28 @@ def main() -> int:
         )
         is not None
         and post_approval_environment_check >= 0
-        and post_approval_read_token_reference > post_approval_environment_check
         and first_pat_reference > post_approval_environment_check
-        and first_pat_reference > post_approval_read_token_reference
-        and 'GH_TOKEN="${ENVIRONMENT_READ_TOKEN}" gh api' in publish_job[
+        and "GH_TOKEN: ${{ github.token }}" in publish_job[
             post_approval_environment_check:first_pat_reference
         ]
+        and "secrets." not in publish_job[
+            post_approval_environment_check:first_pat_reference
+        ]
+        and publish_job[post_approval_environment_check:first_pat_reference].count(
+            "gh api"
+        )
+        == 2
         and "python3 publication-policy/scripts/release_contract.py validate-environment"
         in publish_job[post_approval_environment_check:first_pat_reference]
         and publish_job[
             post_approval_environment_check:first_pat_reference
         ].count("\n      - name:")
         == 1,
-        "the privileged job must revalidate bypass, main-branch, and environment-secret protections after approval and immediately before its first PAT-bearing step",
+        "the privileged job must revalidate environment identity, bypass, and main-branch policy with github.token after approval and immediately before its first PAT-bearing step",
         errors,
+    )
+    errors.extend(
+        validate_publication_pat_contract(publish, EXPECTED_PUBLICATION_PAT_STEPS)
     )
     require(
         "scripts/release_contract.py validate-native-release" in publish
@@ -966,8 +1338,9 @@ def main() -> int:
         "solo-maintainer publication contract does not require a reviewer rule" in agents_publication
         and "custom deployment branches to `main`" in agents_publication
         and "`WEBGPU_BRIDGE_ASSETS_PAT` as an environment-scoped secret" in agents_publication
-        and "`BRIDGE_PUBLICATION_ENV_READ_TOKEN`" in agents_publication
-        and "Revalidate the main-branch and environment-secret metadata" in agents_publication
+        and "Use the default job token to validate the environment identity" in agents_publication
+        and "fail closed unless" in agents_publication
+        and "without printing its value" in agents_publication
         and "pinned repository-owner maintainer reviewer" not in agents_publication
         and "required_reviewers" not in agents_publication
         and "prevent_self_review" not in agents_publication

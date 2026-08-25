@@ -47,7 +47,6 @@ _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _COMMIT_RE = re.compile(r"[0-9a-f]{40}")
 _REPO_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 _CORRELATION_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
-_GITHUB_SECRET_NAME_RE = re.compile(r"[A-Z_][A-Z0-9_]*")
 _UPSTREAM_STABLE_RE = re.compile(
     r"v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
 )
@@ -488,8 +487,7 @@ def select_stable_native_release(releases: list[Any]) -> str:
 def validate_publication_environment(
     environment: Mapping[str, Any],
     branch_policies: Mapping[str, Any],
-    environment_secrets: Mapping[str, Any],
-) -> int:
+) -> None:
     """Require the exact fail-closed solo-maintainer publication policy."""
     if environment.get("name") != "bridge-assets-publication":
         raise ContractError("publication environment identity is missing or incorrect")
@@ -541,75 +539,6 @@ def validate_publication_environment(
         raise ContractError(
             "publication environment must allow deployments only from the main branch"
         )
-
-    secrets = environment_secrets.get("secrets")
-    secret_count = environment_secrets.get("total_count")
-    if not isinstance(secrets, list):
-        raise ContractError("publication environment secret inventory is invalid")
-    secret_names: list[str] = []
-    for secret in secrets:
-        if not isinstance(secret, Mapping) or not isinstance(secret.get("name"), str):
-            raise ContractError("publication environment secret inventory is invalid")
-        name = secret["name"]
-        canonical_name = name.upper()
-        if (
-            name != canonical_name
-            or _GITHUB_SECRET_NAME_RE.fullmatch(name) is None
-            or name.startswith("GITHUB_")
-        ):
-            raise ContractError("publication environment secret inventory is invalid")
-        secret_names.append(canonical_name)
-    if (
-        not isinstance(secret_count, int)
-        or isinstance(secret_count, bool)
-        or secret_count < 0
-        or secret_count != len(secrets)
-        or len(set(secret_names)) != len(secret_names)
-    ):
-        raise ContractError("publication environment secret inventory is invalid")
-    if "WEBGPU_BRIDGE_ASSETS_PAT" not in secret_names:
-        raise ContractError(
-            "publication environment is missing WEBGPU_BRIDGE_ASSETS_PAT"
-        )
-    if "BRIDGE_PUBLICATION_ENV_READ_TOKEN" in secret_names:
-        raise ContractError(
-            "BRIDGE_PUBLICATION_ENV_READ_TOKEN must not be environment scoped"
-        )
-    return 0
-
-
-def normalize_environment_secret_pages(pages: Any) -> dict[str, Any]:
-    """Flatten a complete paginated environment-secret inventory fail closed."""
-    if not isinstance(pages, list) or not pages:
-        raise ContractError("publication environment secret pages are invalid")
-
-    expected_count: int | None = None
-    secrets: list[Any] = []
-    for page in pages:
-        if not isinstance(page, Mapping):
-            raise ContractError("publication environment secret pages are invalid")
-        page_count = page.get("total_count")
-        page_secrets = page.get("secrets")
-        if (
-            not isinstance(page_count, int)
-            or isinstance(page_count, bool)
-            or page_count < 0
-            or not isinstance(page_secrets, list)
-        ):
-            raise ContractError("publication environment secret pages are invalid")
-        if expected_count is None:
-            expected_count = page_count
-        elif page_count != expected_count:
-            raise ContractError(
-                "publication environment secret page counts are inconsistent"
-            )
-        secrets.extend(page_secrets)
-
-    if expected_count != len(secrets):
-        raise ContractError(
-            "publication environment secret pages do not contain the complete inventory"
-        )
-    return {"total_count": expected_count, "secrets": secrets}
 
 
 def read_previous_manifest(path: Path) -> tuple[str, str, str]:
@@ -669,10 +598,6 @@ def _parser() -> argparse.ArgumentParser:
     environment = subparsers.add_parser("validate-environment")
     environment.add_argument("--environment-json", required=True, type=Path)
     environment.add_argument("--branch-policies-json", required=True, type=Path)
-    environment.add_argument("--environment-secrets-json", required=True, type=Path)
-
-    normalize_secrets = subparsers.add_parser("normalize-environment-secrets")
-    normalize_secrets.add_argument("--pages-json", required=True, type=Path)
 
     return parser
 
@@ -749,9 +674,6 @@ def main() -> int:
             if not isinstance(releases, list):
                 raise ContractError("native release listing must be a JSON array")
             print(select_stable_native_release(releases))
-        elif args.command == "normalize-environment-secrets":
-            pages = json.loads(args.pages_json.read_text(encoding="utf-8"))
-            print(json.dumps(normalize_environment_secret_pages(pages), sort_keys=True))
         else:
             environment_payload = json.loads(
                 args.environment_json.read_text(encoding="utf-8")
@@ -759,22 +681,16 @@ def main() -> int:
             branch_policies_payload = json.loads(
                 args.branch_policies_json.read_text(encoding="utf-8")
             )
-            environment_secrets_payload = json.loads(
-                args.environment_secrets_json.read_text(encoding="utf-8")
-            )
             if not isinstance(environment_payload, Mapping):
                 raise ContractError("publication environment root must be an object")
             if not isinstance(branch_policies_payload, Mapping):
                 raise ContractError("publication branch policies root must be an object")
-            if not isinstance(environment_secrets_payload, Mapping):
-                raise ContractError("publication environment secrets root must be an object")
+            validate_publication_environment(
+                environment_payload,
+                branch_policies_payload,
+            )
             print(json.dumps({
                 "environment": "bridge-assets-publication",
-                "required_reviewers": validate_publication_environment(
-                    environment_payload,
-                    branch_policies_payload,
-                    environment_secrets_payload,
-                ),
             }, sort_keys=True))
     except (ContractError, OSError, json.JSONDecodeError) as error:
         raise SystemExit(f"error: {error}") from error

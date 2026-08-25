@@ -175,15 +175,12 @@ publication because the bridge exposes Qwen3-TTS.
     stores `WEBGPU_BRIDGE_ASSETS_PAT` as an environment-scoped secret. The
     solo-maintainer publication contract does not require a reviewer rule. Do
     not describe that environment as protected without current live evidence.
-    A separate repository or organization Actions secret,
-    `BRIDGE_PUBLICATION_ENV_READ_TOKEN`, must be a credential scoped to this
-    repository with only Environments read permission; use it only for the
-    pre-approval and post-approval complete environment-secret name inventory,
-    and reject an environment-scoped copy that could shadow it after approval.
-    Use the default job token for environment and branch-policy metadata. Use
-    the trusted workflow commit's validator rather than the requested historical
-    bridge build source. Revalidate the main-branch and environment-secret metadata
-    after approval and immediately before the first publication-PAT-bearing step.
+    Use the default job token to validate the environment identity,
+    administrator-bypass setting, and exact `main` branch policy before approval
+    and again after approval. Use the trusted workflow commit's validator rather
+    than the requested historical bridge build source. Immediately before any
+    network use of the environment-scoped publication PAT, fail closed unless
+    the injected credential is non-empty, without printing its value.
   - Emits only stable `vMAJOR.MINOR.PATCH[-N]` or development `bNNNN[-N]` tags.
     Historical `*-llamadart.N` forms are accepted only when reading old
     manifests and are never emitted.
