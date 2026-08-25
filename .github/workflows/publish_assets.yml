@@ -406,7 +406,7 @@ jobs:
           if-no-files-found: ignore
 
   verify-publication-environment:
-    name: Verify externally configured approval environment
+    name: Verify externally configured publication environment
     needs: validate-request
     runs-on: ubuntu-latest
     permissions:
@@ -421,7 +421,7 @@ jobs:
           repository: leehack/llama-web-bridge
           ref: ${{ github.sha }}
           persist-credentials: false
-      - name: Fail closed unless the protected approval policy exists
+      - name: Fail closed unless the publication environment policy exists
         id: environment
         env:
           GH_TOKEN: ${{ github.token }}
@@ -456,9 +456,9 @@ jobs:
       actions: read
       contents: read
     # Resolve the environment name only after the bridge-owned API check proves
-    # that it already exists with required reviewers. A missing environment is
-    # never referenced by this privileged job and therefore cannot be accepted
-    # as an auto-created, unprotected gate.
+    # that it already exists with the required main-only deployment policy and
+    # environment-scoped PAT. A missing environment is never referenced by this
+    # privileged job and therefore cannot be accepted as an auto-created gate.
     environment:
       name: ${{ needs.verify-publication-environment.outputs.environment_name }}
     outputs:
@@ -495,7 +495,7 @@ jobs:
           name: exact-webgpu-bridge-dist
           path: bridge-dist
 
-      - name: Revalidate approved environment protection after approval
+      - name: Revalidate publication environment policy before using PAT
         env:
           GH_TOKEN: ${{ github.token }}
           ENVIRONMENT_READ_TOKEN: ${{ secrets.BRIDGE_PUBLICATION_ENV_READ_TOKEN }}

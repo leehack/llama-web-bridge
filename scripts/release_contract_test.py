@@ -82,19 +82,7 @@ class ReleaseContractTest(unittest.TestCase):
         configured = {
             "name": "bridge-assets-publication",
             "can_admins_bypass": False,
-            "protection_rules": [
-                {
-                    "type": "required_reviewers",
-                    "prevent_self_review": True,
-                    "reviewers": [
-                        {
-                            "type": "User",
-                            "reviewer": {"id": 1233094, "login": "leehack"},
-                        }
-                    ],
-                },
-                {"type": "branch_policy"},
-            ],
+            "protection_rules": [{"type": "branch_policy"}],
             "deployment_branch_policy": {
                 "protected_branches": False,
                 "custom_branch_policies": True,
@@ -112,22 +100,38 @@ class ReleaseContractTest(unittest.TestCase):
             validate_publication_environment(
                 configured, branch_policies, environment_secrets
             ),
-            1,
+            0,
         )
 
         invalid_cases = {
-            "missing-reviewers": {**configured, "protection_rules": [{"type": "branch_policy"}]},
-            "admin-bypass": {**configured, "can_admins_bypass": True},
-            "self-review": {
+            "required-reviewers": {
                 **configured,
                 "protection_rules": [
                     {
-                        **configured["protection_rules"][0],
-                        "prevent_self_review": False,
+                        "type": "required_reviewers",
+                        "prevent_self_review": True,
+                        "reviewers": [
+                            {
+                                "type": "User",
+                                "reviewer": {"id": 1233094, "login": "leehack"},
+                            }
+                        ],
                     },
                     {"type": "branch_policy"},
                 ],
             },
+            "required-reviewers-with-self-review-allowed": {
+                **configured,
+                "protection_rules": [
+                    {
+                        "type": "required_reviewers",
+                        "prevent_self_review": False,
+                        "reviewers": [],
+                    },
+                    {"type": "branch_policy"},
+                ],
+            },
+            "admin-bypass": {**configured, "can_admins_bypass": True},
             "all-protected-branches": {
                 **configured,
                 "deployment_branch_policy": {
@@ -153,76 +157,6 @@ class ReleaseContractTest(unittest.TestCase):
             "malformed-protection-rule": {
                 **configured,
                 "protection_rules": [*configured["protection_rules"], None],
-            },
-            "malformed-reviewer-entry": {
-                **configured,
-                "protection_rules": [
-                    {
-                        **configured["protection_rules"][0],
-                        "reviewers": [{}],
-                    },
-                    {"type": "branch_policy"},
-                ],
-            },
-            "null-reviewer-entry": {
-                **configured,
-                "protection_rules": [
-                    {
-                        **configured["protection_rules"][0],
-                        "reviewers": [None],
-                    },
-                    {"type": "branch_policy"},
-                ],
-            },
-            "missing-reviewer-id": {
-                **configured,
-                "protection_rules": [
-                    {
-                        **configured["protection_rules"][0],
-                        "reviewers": [
-                            {"type": "User", "reviewer": {"login": "maintainer"}}
-                        ],
-                    },
-                    {"type": "branch_policy"},
-                ],
-            },
-            "unapproved-reviewer-id": {
-                **configured,
-                "protection_rules": [
-                    {
-                        **configured["protection_rules"][0],
-                        "reviewers": [
-                            {"type": "User", "reviewer": {"id": 1234}}
-                        ],
-                    },
-                    {"type": "branch_policy"},
-                ],
-            },
-            "mixed-approved-and-unapproved-reviewers": {
-                **configured,
-                "protection_rules": [
-                    {
-                        **configured["protection_rules"][0],
-                        "reviewers": [
-                            {"type": "User", "reviewer": {"id": 1233094}},
-                            {"type": "User", "reviewer": {"id": 999999}},
-                        ],
-                    },
-                    {"type": "branch_policy"},
-                ],
-            },
-            "duplicate-reviewer-id": {
-                **configured,
-                "protection_rules": [
-                    {
-                        **configured["protection_rules"][0],
-                        "reviewers": [
-                            {"type": "User", "reviewer": {"id": 1233094}},
-                            {"type": "User", "reviewer": {"id": 1233094}},
-                        ],
-                    },
-                    {"type": "branch_policy"},
-                ],
             },
         }
         for label, invalid in invalid_cases.items():

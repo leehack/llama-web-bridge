@@ -65,6 +65,24 @@ def require(condition: bool, message: str, errors: list[str]) -> None:
         errors.append(message)
 
 
+def extract_section(
+    relative_path: str,
+    content: str,
+    start_marker: str,
+    end_marker: str,
+    errors: list[str],
+) -> str:
+    start = content.find(start_marker)
+    if start < 0:
+        errors.append(f"{relative_path} is missing the expected section marker: {start_marker}")
+        return ""
+    end = content.find(end_marker, start + len(start_marker))
+    if end < 0:
+        errors.append(f"{relative_path} is missing the expected section terminator: {end_marker}")
+        return content[start:]
+    return content[start:end]
+
+
 def list_typescript_files(errors: list[str]) -> set[Path]:
     tsc = ROOT / "node_modules" / "typescript" / "bin" / "tsc"
     try:
@@ -301,6 +319,13 @@ def main() -> int:
     contributing = read_required("CONTRIBUTING.md", errors)
     workflow_input_transport = read_required(
         "scripts/workflow_input_transport_test.mjs", errors
+    )
+    agents_publication = extract_section(
+        "AGENTS.md",
+        agents,
+        "- Publish workflow: `.github/workflows/publish_assets.yml`",
+        "\n## Change Boundaries",
+        errors,
     )
     typechecked_files = list_typescript_files(errors)
     publish_job = publish.split("\n  publish-assets:\n", 1)[-1]
@@ -640,7 +665,7 @@ def main() -> int:
     )
     require(
         "publish_approved=true requires explicit maintainer approval" in publish
-        and "Verify externally configured approval environment" in publish
+        and "Verify externally configured publication environment" in publish
         and "release_contract.py validate-environment" in publish
         and publish.count("deployment-branch-policies") == 2
         and publish.count("--branch-policies-json") == 2
@@ -678,13 +703,15 @@ def main() -> int:
         and "name: ${{ needs.verify-publication-environment.outputs.environment_name }}"
         in publish
         and "environment: bridge-assets-publication" not in publish
+        and "required reviewers" not in publish
+        and "prevent_self_review" not in publish
         and "push:" not in publish.split("permissions:", 1)[0]
         and "schedule:" not in publish,
         "cross-repository publication must require explicit input confirmation plus a preverified fail-closed environment policy and have no automatic trigger",
         errors,
     )
     post_approval_environment_check = publish_job.find(
-        "Revalidate approved environment protection after approval"
+        "Revalidate publication environment policy before using PAT"
     )
     first_pat_reference = publish_job.find("secrets.WEBGPU_BRIDGE_ASSETS_PAT")
     post_approval_read_token_reference = publish_job.find(
@@ -712,7 +739,7 @@ def main() -> int:
             post_approval_environment_check:first_pat_reference
         ].count("\n      - name:")
         == 1,
-        "the privileged job must revalidate bypass, reviewer, main-branch, and environment-secret protections after approval and immediately before its first PAT-bearing step",
+        "the privileged job must revalidate bypass, main-branch, and environment-secret protections after approval and immediately before its first PAT-bearing step",
         errors,
     )
     require(
@@ -933,6 +960,21 @@ def main() -> int:
         and "emsdk.version" in agents
         and "auto_llama_cpp_update.yml" in agents,
         "AGENTS.md must document the JS build gate, agent PR workflow, browser smoke expectations, and pinned toolchain policies",
+        errors,
+    )
+    require(
+        "solo-maintainer publication contract does not require a reviewer rule" in agents_publication
+        and "custom deployment branches to `main`" in agents_publication
+        and "`WEBGPU_BRIDGE_ASSETS_PAT` as an environment-scoped secret" in agents_publication
+        and "`BRIDGE_PUBLICATION_ENV_READ_TOKEN`" in agents_publication
+        and "Revalidate the main-branch and environment-secret metadata" in agents_publication
+        and "pinned repository-owner maintainer reviewer" not in agents_publication
+        and "required_reviewers" not in agents_publication
+        and "prevent_self_review" not in agents_publication
+        and "bypass and self-review" not in agents_publication
+        and "Require the reviewer inventory" not in agents_publication
+        and "Revalidate the bypass, reviewer" not in agents_publication,
+        "AGENTS.md publish guidance must preserve the solo-maintainer PAT/main-only contract without pinned-reviewer, self-review, quorum, or reviewer-revalidation requirements",
         errors,
     )
     require(

@@ -170,24 +170,20 @@ publication because the bridge exposes Qwen3-TTS.
   - Uses the same `emsdk.version` compiler identity as CI and records the
     runtime-verified version in `manifest.json`.
   - Requires `publish_approved=true`. Publication remains blocked until an
-    administrator externally creates `bridge-assets-publication`, configures
-    the pinned repository-owner maintainer reviewer, disables administrator
-    bypass and self-review, restricts
-    custom deployment branches to `main`, and stores
-    `WEBGPU_BRIDGE_ASSETS_PAT` as an environment-scoped secret. Do not describe
-    that environment as protected without current live evidence. A separate
-    repository or organization Actions secret,
+    administrator externally creates `bridge-assets-publication`, disables
+    administrator bypass, restricts custom deployment branches to `main`, and
+    stores `WEBGPU_BRIDGE_ASSETS_PAT` as an environment-scoped secret. The
+    solo-maintainer publication contract does not require a reviewer rule. Do
+    not describe that environment as protected without current live evidence.
+    A separate repository or organization Actions secret,
     `BRIDGE_PUBLICATION_ENV_READ_TOKEN`, must be a credential scoped to this
     repository with only Environments read permission; use it only for the
     pre-approval and post-approval complete environment-secret name inventory,
     and reject an environment-scoped copy that could shadow it after approval.
     Use the default job token for environment and branch-policy metadata. Use
     the trusted workflow commit's validator rather than the requested historical
-    bridge build source. Require the reviewer inventory to equal the pinned
-    maintainer identity, because any configured reviewer may approve. Revalidate
-    the bypass, reviewer, branch, and
-    environment-secret metadata after approval and immediately before the first
-    publication-PAT-bearing step.
+    bridge build source. Revalidate the main-branch and environment-secret metadata
+    after approval and immediately before the first publication-PAT-bearing step.
   - Emits only stable `vMAJOR.MINOR.PATCH[-N]` or development `bNNNN[-N]` tags.
     Historical `*-llamadart.N` forms are accepted only when reading old
     manifests and are never emitted.

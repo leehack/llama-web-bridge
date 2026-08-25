@@ -24,7 +24,6 @@ BRIDGE_REPOSITORY = "leehack/llama-web-bridge"
 ASSETS_REPOSITORY = "leehack/llama-web-bridge-assets"
 NATIVE_REPOSITORY = "leehack/llamadart-native"
 NATIVE_HOOK_CONTRACT_VERSION = 1
-APPROVED_PUBLICATION_REVIEWER_IDENTITIES = frozenset({("User", 1233094)})
 
 
 class ContractError(ValueError):
@@ -491,7 +490,7 @@ def validate_publication_environment(
     branch_policies: Mapping[str, Any],
     environment_secrets: Mapping[str, Any],
 ) -> int:
-    """Require the exact fail-closed publication environment policy."""
+    """Require the exact fail-closed solo-maintainer publication policy."""
     if environment.get("name") != "bridge-assets-publication":
         raise ContractError("publication environment identity is missing or incorrect")
     if environment.get("can_admins_bypass") is not False:
@@ -499,49 +498,17 @@ def validate_publication_environment(
     rules = environment.get("protection_rules")
     if not isinstance(rules, list):
         raise ContractError("publication environment has no protection rules")
-    reviewer_count = 0
-    reviewer_rule_count = 0
-    reviewer_identities: set[tuple[str, int]] = set()
     branch_rule_count = 0
     for rule in rules:
         if not isinstance(rule, Mapping):
             raise ContractError("publication environment protection rules are invalid")
-        if rule.get("type") == "required_reviewers":
-            reviewer_rule_count += 1
-            if rule.get("prevent_self_review") is not True:
-                raise ContractError("publication environment must prevent self review")
-            reviewers = rule.get("reviewers")
-            if not isinstance(reviewers, list) or not reviewers:
-                raise ContractError("publication environment has no required reviewers")
-            for reviewer_entry in reviewers:
-                if not isinstance(reviewer_entry, Mapping):
-                    raise ContractError("publication environment reviewer inventory is invalid")
-                reviewer_type = reviewer_entry.get("type")
-                reviewer = reviewer_entry.get("reviewer")
-                if reviewer_type not in ("User", "Team") or not isinstance(
-                    reviewer, Mapping
-                ):
-                    raise ContractError("publication environment reviewer inventory is invalid")
-                reviewer_id = reviewer.get("id")
-                if (
-                    not isinstance(reviewer_id, int)
-                    or isinstance(reviewer_id, bool)
-                    or reviewer_id <= 0
-                ):
-                    raise ContractError("publication environment reviewer inventory is invalid")
-                identity = (reviewer_type, reviewer_id)
-                if identity in reviewer_identities:
-                    raise ContractError("publication environment reviewer inventory is invalid")
-                reviewer_identities.add(identity)
-                reviewer_count += 1
-        elif rule.get("type") == "branch_policy":
+        rule_type = rule.get("type")
+        if rule_type == "required_reviewers":
+            raise ContractError(
+                "solo-maintainer publication environment must not require reviewers"
+            )
+        if rule_type == "branch_policy":
             branch_rule_count += 1
-    if reviewer_rule_count != 1 or reviewer_count < 1:
-        raise ContractError("publication environment has no required reviewers")
-    if reviewer_identities != APPROVED_PUBLICATION_REVIEWER_IDENTITIES:
-        raise ContractError(
-            "publication environment reviewers must exactly match the approved inventory"
-        )
     if branch_rule_count != 1:
         raise ContractError("publication environment must have one branch policy rule")
 
@@ -608,7 +575,7 @@ def validate_publication_environment(
         raise ContractError(
             "BRIDGE_PUBLICATION_ENV_READ_TOKEN must not be environment scoped"
         )
-    return reviewer_count
+    return 0
 
 
 def normalize_environment_secret_pages(pages: Any) -> dict[str, Any]:

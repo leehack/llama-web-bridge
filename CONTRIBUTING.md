@@ -186,11 +186,11 @@ upstream tag/commit, native release tag plus
 `assets.json` SHA-256, output release tag/rebuild, and assets repository.
 
 The request must set `publish_approved=true`. Publication remains blocked until
-repository administrators separately create `bridge-assets-publication`, add
-the pinned repository-owner maintainer reviewer, disable administrator bypass
-and self-review, restrict the
-custom deployment branch policy to `main`, and store the assets PAT as an
-environment-scoped secret. Administrators must also configure the separate
+repository administrators separately create `bridge-assets-publication`, disable
+administrator bypass, restrict the custom deployment branch policy to `main`,
+and store the assets PAT as an environment-scoped secret. The solo-maintainer
+publication contract does not require a reviewer rule, `prevent_self_review`, or
+a two-person approval quorum. Administrators must also configure the separate
 repository or organization Actions secret `BRIDGE_PUBLICATION_ENV_READ_TOKEN`
 as a fine-grained credential scoped to this repository with Environments read
 permission. The workflow fails closed if either external credential or the
@@ -202,9 +202,7 @@ credential in the environment, where environment-secret precedence would
 shadow the intended repository/organization credential after approval. The
 workflow repeats those checks after approval immediately before the first
 publication-PAT-bearing step, using the trusted workflow commit's validator so
-an older requested build-source SHA remains compatible. Keep the reviewer
-inventory equal to the pinned maintainer identity; do not add an unapproved
-reviewer who could approve alone. The API
+an older requested build-source SHA remains compatible. The API
 check proves the expected secret name is environment-scoped without reading its
 value. It
 builds wasm32 and memory64, runs mandatory state/multimodal/ASR/TTS gates,
