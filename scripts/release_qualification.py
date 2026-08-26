@@ -369,6 +369,10 @@ _CREDENTIAL_NAME_PATTERN = (
     r"[A-Za-z0-9_.-]*"
 )
 _CREDENTIAL_NAME_RE = re.compile(rf"(?i)\A{_CREDENTIAL_NAME_PATTERN}\Z")
+_AUTHORIZATION_NAME_PATTERN = (
+    r"(?:[A-Za-z0-9]+[._-])*authorization(?:[._-][A-Za-z0-9]+)*"
+)
+_AUTHORIZATION_NAME_RE = re.compile(rf"(?i)\A{_AUTHORIZATION_NAME_PATTERN}\Z")
 _LLAMA_TOKEN_COUNTER_NAME_RE = re.compile(
     r"(?i)\A(?:[A-Za-z0-9_-]+\.)*n_tokens(?:[_-][A-Za-z0-9_-]+)?\Z"
 )
@@ -384,10 +388,13 @@ _CREDENTIAL_ASSIGNMENT_RE = re.compile(
     r'''(?P<value>"(?:\\.|[^"\\\r\n])*"|'(?:\\.|[^'\\\r\n])*'|\S+)'''
 )
 _AUTHORIZATION_RE = re.compile(
-    r'''(?im)(?:"authorization"|'authorization'|\bauthorization)\s*:\s*'''
-    r'''(?:"(?:bearer|basic)\s+(?:\\.|[^"\\\r\n])*"|'''
-    r"'(?:bearer|basic)\s+(?:\\.|[^'\\\r\n])*'|"
-    r'''(?:bearer|basic)\s+\S+)'''
+    rf'''(?im)(?:"{_AUTHORIZATION_NAME_PATTERN}"|'{_AUTHORIZATION_NAME_PATTERN}'|'''
+    rf'''\b{_AUTHORIZATION_NAME_PATTERN})\s*[:=]\s*'''
+    r'''(?:"(?:\\.|[^"\\\r\n])*"|'(?:\\.|[^'\\\r\n])*'|'''
+    r'''[^\r\n]+)'''
+)
+_AUTH_SCHEME_RE = re.compile(
+    r"(?im)\b(?:bearer|basic)[ \t]+\S+[ \t]*(?=\r?$)"
 )
 
 
@@ -410,7 +417,7 @@ def _redact_credential_assignment(match: re.Match[str]) -> str:
 def sanitize_diagnostic_text(text: str) -> str:
     """Drop credentials, query strings, and fragments from any URL in diagnostics."""
     def replace(match: re.Match[str]) -> str:
-        candidate = match.group(0)
+        candidate = match.group(0).replace(r"\/", "/")
         try:
             parts = urlsplit(candidate)
             if not parts.netloc or parts.hostname is None:
@@ -422,8 +429,11 @@ def sanitize_diagnostic_text(text: str) -> str:
         netloc = parts.netloc.rsplit("@", 1)[-1]
         return urlunsplit((parts.scheme, netloc, parts.path, "", ""))
 
-    sanitized = re.sub(r"(?i)https?://[^\s\"'<>]+", replace, text)
+    sanitized = re.sub(
+        r'''(?i)https?:(?:\\/|/){2}[^\s"'<>]+''', replace, text
+    )
     sanitized = _AUTHORIZATION_RE.sub("Authorization: <redacted>", sanitized)
+    sanitized = _AUTH_SCHEME_RE.sub(REDACTED_CREDENTIAL, sanitized)
     return _CREDENTIAL_ASSIGNMENT_RE.sub(_redact_credential_assignment, sanitized)
 
 
@@ -437,7 +447,7 @@ def sanitize_diagnostic_value(value: Any) -> Any:
                 REDACTED_CREDENTIAL
                 if isinstance(key, str)
                 and (
-                    key.casefold() == "authorization"
+                    _AUTHORIZATION_NAME_RE.fullmatch(key)
                     or (
                         _CREDENTIAL_NAME_RE.fullmatch(key)
                         and not (
@@ -460,10 +470,16 @@ def sanitize_diagnostic_value(value: Any) -> Any:
 def sanitize_diagnostic_stdout(stdout: str) -> str:
     """Sanitize child stdout without destroying the structure a reader needs."""
     try:
-        payload = json.loads(stdout)
-    except json.JSONDecodeError:
-        return sanitize_diagnostic_text(stdout)
-    return json.dumps(sanitize_diagnostic_value(payload), ensure_ascii=True) + "\n"
+        payload = json.loads(
+            stdout, parse_constant=_reject_nonstandard_json_constant
+        )
+        payload = sanitize_diagnostic_value(payload)
+        serialized = json.dumps(payload, ensure_ascii=True, allow_nan=False)
+    except (ContractError, json.JSONDecodeError, ValueError):
+        serialized = json.dumps(
+            sanitize_diagnostic_text(stdout), ensure_ascii=True, allow_nan=False
+        )
+    return serialized + "\n"
 
 
 def harness_source_sha256(scripts_dir: Path) -> str:

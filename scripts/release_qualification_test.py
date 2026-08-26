@@ -1900,6 +1900,24 @@ class QualificationTest(unittest.TestCase):
                     "https://<redacted-url>",
                 )
 
+    def test_json_escaped_url_is_redacted_in_malformed_fallback(self) -> None:
+        malformed = (
+            r'{"modelUrl":"https:\/\/url-user:url-pass@example.com/model.gguf'
+            r'?sig=query-secret#fragment-secret"'
+        )
+        serialized = rq.sanitize_diagnostic_stdout(malformed)
+        decoded = json.loads(serialized)
+        self.assertIsInstance(decoded, str)
+        for leaked in (
+            "url-user",
+            "url-pass",
+            "query-secret",
+            "fragment-secret",
+            "sig=",
+        ):
+            self.assertNotIn(leaked, serialized)
+        self.assertIn("https://example.com/model.gguf", decoded)
+
     def test_url_sanitization_is_case_insensitive(self) -> None:
         raw = "HTTPS://user:pass@example.com/m.gguf?sig=secret#frag"
         sanitized = rq.sanitize_diagnostic_text(raw)
@@ -2011,6 +2029,72 @@ class QualificationTest(unittest.TestCase):
         counters = '"n_tokens": 65, "n_tokens_batch": 65'
         self.assertEqual(rq.sanitize_diagnostic_text(counters), counters)
 
+    def test_authorization_assignments_are_redacted_in_text_fallback(self) -> None:
+        for raw in (
+            '{"Authorization":"opaque-secret"',
+            "Authorization=Bearer bearer-secret",
+            "authorization = Basic basic-secret",
+        ):
+            with self.subTest(raw=raw):
+                serialized = rq.sanitize_diagnostic_stdout(raw)
+                self.assertIsInstance(json.loads(serialized), str)
+                for leaked in ("opaque-secret", "bearer-secret", "basic-secret"):
+                    self.assertNotIn(leaked, serialized)
+
+    def test_non_scheme_authorization_value_is_fully_redacted(self) -> None:
+        serialized = rq.sanitize_diagnostic_stdout(
+            "Authorization: Digest username=alice, response=digest-secret"
+        )
+        self.assertIsInstance(json.loads(serialized), str)
+        for leaked in ("alice", "digest-secret", "response="):
+            self.assertNotIn(leaked, serialized)
+
+    def test_authorization_redaction_preserves_unrelated_diagnostics(self) -> None:
+        diagnostics = (
+            "authorizationStatus=enabled\n"
+            "Basic validation completed\n"
+            "Bearer capacity remains available"
+        )
+        self.assertEqual(rq.sanitize_diagnostic_text(diagnostics), diagnostics)
+
+        structured = {
+            "authorizationStatus": "enabled",
+            "note": "Basic validation completed",
+        }
+        self.assertEqual(
+            json.loads(rq.sanitize_diagnostic_stdout(json.dumps(structured))),
+            structured,
+        )
+
+    def test_bearer_and_basic_credentials_are_redacted_in_all_fallbacks(self) -> None:
+        malformed = (
+            "Bearer bare-bearer-secret\n"
+            "Basic bare-basic-secret\n"
+            "access_token=Bearer assigned-bearer-secret"
+        )
+        serialized = rq.sanitize_diagnostic_stdout(malformed)
+        self.assertIsInstance(json.loads(serialized), str)
+        for leaked in (
+            "bare-bearer-secret",
+            "bare-basic-secret",
+            "assigned-bearer-secret",
+        ):
+            self.assertNotIn(leaked, serialized)
+
+        structured = rq.sanitize_diagnostic_stdout(
+            json.dumps(
+                {
+                    "bearerLog": "Bearer structured-bearer-secret",
+                    "basicLog": "Basic structured-basic-secret",
+                }
+            )
+        )
+        for leaked in (
+            "structured-bearer-secret",
+            "structured-basic-secret",
+        ):
+            self.assertNotIn(leaked, structured)
+
     def test_structured_stdout_diagnostic_stays_valid_json(self) -> None:
         diagnostics = self.tmp / "structured-diagnostics"
         diagnostics.mkdir()
@@ -2049,6 +2133,26 @@ class QualificationTest(unittest.TestCase):
         self.assertIn(r"\ud800", serialized)
         self.assertEqual(json.loads(serialized)["note"], "\ud800")
 
+    def test_nonstandard_or_nonfinite_stdout_uses_json_string_fallback(self) -> None:
+        def reject_nonstandard_constant(value: str) -> None:
+            raise ValueError(f"non-standard JSON constant: {value}")
+
+        for raw in (
+            "NaN",
+            "Infinity",
+            "-Infinity",
+            "1e9999",
+            '{"apiKey":"must-not-escape","metric":NaN}',
+            '{"apiKey":"must-not-escape","metric":1e9999}',
+        ):
+            with self.subTest(raw=raw):
+                serialized = rq.sanitize_diagnostic_stdout(raw)
+                decoded = json.loads(
+                    serialized, parse_constant=reject_nonstandard_constant
+                )
+                self.assertIsInstance(decoded, str)
+                self.assertNotIn("must-not-escape", serialized)
+
     def test_structured_authorization_values_are_redacted(self) -> None:
         payload = {
             "headers": {
@@ -2066,6 +2170,28 @@ class QualificationTest(unittest.TestCase):
                 }
             },
         )
+
+    def test_flattened_authorization_names_are_redacted(self) -> None:
+        payload = {
+            "headers.authorization": "Bearer dotted-secret",
+            "HTTP_AUTHORIZATION": "Basic environment-secret",
+        }
+        serialized = rq.sanitize_diagnostic_stdout(json.dumps(payload))
+        self.assertEqual(
+            json.loads(serialized),
+            {
+                "headers.authorization": rq.REDACTED_CREDENTIAL,
+                "HTTP_AUTHORIZATION": rq.REDACTED_CREDENTIAL,
+            },
+        )
+        self.assertNotIn("dotted-secret", serialized)
+        self.assertNotIn("environment-secret", serialized)
+
+        malformed = rq.sanitize_diagnostic_stdout(
+            "HTTP_AUTHORIZATION=Bearer text-secret"
+        )
+        self.assertIsInstance(json.loads(malformed), str)
+        self.assertNotIn("text-secret", malformed)
 
     def test_structured_keys_cannot_leak_urls_or_assignments(self) -> None:
         payload = {
@@ -2175,8 +2301,12 @@ class QualificationTest(unittest.TestCase):
                     timeout_seconds=30,
                 )
         self.assertIn("failed with exit status 1", str(ctx.exception))
+        stdout_diagnostic = (
+            diagnostics / "malformed-probe-stdout.json"
+        ).read_text(encoding="utf-8")
+        self.assertIsInstance(json.loads(stdout_diagnostic), str)
         persisted = (
-            (diagnostics / "malformed-probe-stdout.json").read_text(encoding="utf-8")
+            stdout_diagnostic
             + (diagnostics / "malformed-probe-stderr.log").read_text(encoding="utf-8")
             + captured_stderr.getvalue()
         )
