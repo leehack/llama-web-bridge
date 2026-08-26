@@ -45,6 +45,7 @@ class Transition(str, Enum):
 
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _COMMIT_RE = re.compile(r"[0-9a-f]{40}")
+_HEX_COMMITISH_RE = re.compile(r"[0-9A-Fa-f]{4,40}")
 _REPO_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 _CORRELATION_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
 _UPSTREAM_STABLE_RE = re.compile(
@@ -63,6 +64,7 @@ _LEGACY_STABLE_RE = re.compile(
 _LEGACY_DEVELOPMENT_RE = re.compile(
     r"b(0|[1-9][0-9]*)-llamadart\.([1-9][0-9]*)"
 )
+_LS_REMOTE_LINE_RE = re.compile(r"([0-9a-f]{40})\t(\S+)")
 
 
 @dataclass(frozen=True)
@@ -74,17 +76,25 @@ class UpstreamVersion:
 
 @dataclass(frozen=True)
 class ReleaseVersion:
+    """A release tag's own identity, independent of any upstream llama.cpp tag.
+
+    Bridge asset releases version independently of llama.cpp, so ``version_parts``
+    is the tag's own version. Native releases separately promise that their base
+    tag *is* their upstream tag; only the native validators enforce that.
+    """
+
     tag: str
     channel: Channel
-    upstream_parts: tuple[int, ...]
+    version_parts: tuple[int, ...]
     rebuild: int
     legacy: bool = False
 
     @property
-    def upstream_tag(self) -> str:
+    def base_tag(self) -> str:
+        """The tag with its rebuild suffix removed."""
         if self.channel == Channel.DEVELOPMENT:
-            return f"b{self.upstream_parts[0]}"
-        return "v" + ".".join(str(part) for part in self.upstream_parts)
+            return f"b{self.version_parts[0]}"
+        return "v" + ".".join(str(part) for part in self.version_parts)
 
     @property
     def github_prerelease(self) -> bool:
@@ -178,51 +188,115 @@ def parse_release_tag(tag: str, *, allow_legacy: bool = False) -> ReleaseVersion
     )
 
 
-def compare_upstream(current_tag: str, target_tag: str) -> Transition:
-    current = parse_upstream_tag(current_tag)
-    target = parse_upstream_tag(target_tag)
-    if current.tag == target.tag:
-        return Transition.EQUAL
-    if current.channel == target.channel:
-        return Transition.FORWARD if target.parts > current.parts else Transition.BACKWARD
-    if current.channel == Channel.DEVELOPMENT and target.channel == Channel.STABLE:
+def _compare_versions(
+    current_channel: Channel,
+    current_parts: tuple[int, ...],
+    target_channel: Channel,
+    target_parts: tuple[int, ...],
+) -> Transition:
+    """Order two same-kind identities: within a channel, then across channels."""
+    if current_channel == target_channel:
+        if current_parts == target_parts:
+            return Transition.EQUAL
+        return Transition.FORWARD if target_parts > current_parts else Transition.BACKWARD
+    if current_channel == Channel.DEVELOPMENT and target_channel == Channel.STABLE:
         return Transition.STABLE_MIGRATION
     return Transition.FORBIDDEN_STABLE_TO_DEVELOPMENT
 
 
+def compare_upstream(current_tag: str, target_tag: str) -> Transition:
+    current = parse_upstream_tag(current_tag)
+    target = parse_upstream_tag(target_tag)
+    return _compare_versions(
+        current.channel, current.parts, target.channel, target.parts
+    )
+
+
 def compare_releases(current_tag: str, target_tag: str) -> Transition:
+    """Order two release tags by their own identity, never by an upstream tag."""
     current = parse_release_tag(current_tag, allow_legacy=True)
     target = parse_release_tag(target_tag)
 
-    if current.upstream_tag == target.upstream_tag:
+    transition = _compare_versions(
+        current.channel, current.version_parts, target.channel, target.version_parts
+    )
+    if transition == Transition.EQUAL:
         if current.rebuild == target.rebuild:
             return Transition.EQUAL
         return Transition.FORWARD if target.rebuild > current.rebuild else Transition.BACKWARD
 
-    upstream_transition = compare_upstream(current.upstream_tag, target.upstream_tag)
-    if upstream_transition in (Transition.FORWARD, Transition.STABLE_MIGRATION):
+    if transition in (Transition.FORWARD, Transition.STABLE_MIGRATION):
         if target.rebuild != 0:
             raise ContractError(
-                "the first artifact for a new upstream version must use rebuild 0"
+                "the first artifact for a new release version must use rebuild 0"
             )
-        return upstream_transition
-    return upstream_transition
+    return transition
 
 
 def validate_release_identity(release_tag: str, rebuild: int, upstream_tag: str) -> ReleaseVersion:
+    """Validate a bridge asset release tag and its independent upstream tag.
+
+    Bridge assets version independently of llama.cpp: ``v0.1.38`` may ship
+    upstream ``v0.2.0``. Both identities are still syntactically exact, and the
+    tag must encode the requested rebuild.
+    """
     if rebuild < 0:
         raise ContractError("release_rebuild must be zero or greater")
     release = parse_release_tag(release_tag)
-    upstream = parse_upstream_tag(upstream_tag)
+    parse_upstream_tag(upstream_tag)
     if release.rebuild != rebuild:
         raise ContractError(
             f"release tag {release_tag!r} encodes rebuild {release.rebuild}, not {rebuild}"
         )
-    if release.channel != upstream.channel or release.upstream_parts != upstream.parts:
-        raise ContractError(
-            f"release tag {release_tag!r} does not preserve upstream identity {upstream_tag!r}"
-        )
     return release
+
+
+def _require_native_upstream_identity(
+    native_version: ReleaseVersion, upstream: UpstreamVersion
+) -> None:
+    """Native releases, unlike bridge assets, encode their upstream tag."""
+    if (
+        native_version.channel != upstream.channel
+        or native_version.version_parts != upstream.parts
+    ):
+        raise ContractError(
+            f"native release {native_version.tag!r} does not preserve upstream "
+            f"identity {upstream.tag!r}"
+        )
+
+
+def validate_native_identity(
+    native_release_tag: str, rebuild: int, upstream_tag: str
+) -> ReleaseVersion:
+    if rebuild < 0:
+        raise ContractError("release_rebuild must be zero or greater")
+    native_release = parse_release_tag(native_release_tag)
+    upstream = parse_upstream_tag(upstream_tag)
+    if native_release.rebuild != rebuild:
+        raise ContractError(
+            f"native release tag {native_release_tag!r} encodes rebuild "
+            f"{native_release.rebuild}, not {rebuild}"
+        )
+    _require_native_upstream_identity(native_release, upstream)
+    return native_release
+
+
+def validate_native_request(
+    native_release_tag: str,
+    upstream_tag: str,
+    upstream_commit: Any,
+    manifest_sha256: str,
+) -> ReleaseVersion:
+    """Validate native release inputs before using them in network requests."""
+    native_release = parse_release_tag(native_release_tag)
+    validate_native_identity(
+        native_release_tag,
+        native_release.rebuild,
+        upstream_tag,
+    )
+    _require_commit(upstream_commit, "upstream_commit")
+    require_sha256(manifest_sha256, "native_manifest_sha256")
+    return native_release
 
 
 def validate_github_prerelease(tag: str, actual: Any, *, allow_legacy: bool = True) -> bool:
@@ -251,17 +325,11 @@ def resolve_native_manifest(
     native_version = parse_release_tag(native_tag, allow_legacy=True)
     upstream_tag = manifest.get("llama_cpp_tag")
     if upstream_tag is None and native_version.rebuild == 0:
-        upstream_tag = native_version.upstream_tag
+        upstream_tag = native_version.base_tag
     if not isinstance(upstream_tag, str):
         raise ContractError("native manifest is missing an exact llama_cpp_tag")
     upstream = parse_upstream_tag(upstream_tag)
-    if (
-        native_version.channel != upstream.channel
-        or native_version.upstream_parts != upstream.parts
-    ):
-        raise ContractError(
-            f"native release {native_tag!r} does not preserve upstream identity {upstream_tag!r}"
-        )
+    _require_native_upstream_identity(native_version, upstream)
 
     return NativeIdentity(
         release_tag=native_tag,
@@ -360,6 +428,43 @@ def _release_assets(release: Mapping[str, Any]) -> dict[str, Mapping[str, Any]]:
     return assets
 
 
+def resolve_tag_commit(ls_remote_output: str, tag: str) -> str:
+    """Resolve the immutable commit a release tag names, peeling annotated tags.
+
+    ``git ls-remote`` must be invoked with both ``refs/tags/<tag>`` and
+    ``refs/tags/<tag>^{}`` patterns: the peeled entry is the only line that
+    carries the commit for an annotated tag, and it is not tail-matched by the
+    unpeeled pattern.
+    """
+    parse_release_tag(tag)
+    plain_ref = f"refs/tags/{tag}"
+    peeled_ref = f"{plain_ref}^{{}}"
+    refs: dict[str, str] = {}
+    for line in ls_remote_output.splitlines():
+        if not line:
+            raise ContractError("git ls-remote returned a blank line")
+        match = _LS_REMOTE_LINE_RE.fullmatch(line)
+        if match is None:
+            raise ContractError(f"invalid git ls-remote line: {line!r}")
+        object_id, ref = match.group(1), match.group(2)
+        if ref not in (plain_ref, peeled_ref):
+            raise ContractError(f"git ls-remote returned unrelated ref {ref!r}")
+        if ref in refs:
+            qualifier = "conflicting" if refs[ref] != object_id else "duplicate"
+            raise ContractError(
+                f"git ls-remote reported {qualifier} objects for {ref!r}"
+            )
+        refs[ref] = object_id
+
+    plain_object = refs.get(plain_ref)
+    if plain_object is None:
+        raise ContractError(f"tag {tag!r} does not exist in the remote repository")
+    peeled_object = refs.get(peeled_ref)
+    if peeled_object == plain_object:
+        raise ContractError("peeled tag commit must differ from its annotated tag object")
+    return peeled_object or plain_object
+
+
 def validate_native_release(
     manifest_path: Path,
     checksums_path: Path,
@@ -368,6 +473,7 @@ def validate_native_release(
     native_release_tag: str,
     upstream_tag: str,
     upstream_commit: str,
+    native_tag_commit: Any,
 ) -> NativeIdentity:
     """Validate native provenance against both downloaded bytes and GitHub metadata."""
     identity = validate_native_file(
@@ -380,8 +486,35 @@ def validate_native_release(
     if release.get("tag_name") != native_release_tag or release.get("draft") is not False:
         raise ContractError("native GitHub release identity/draft state is not canonical")
     validate_github_prerelease(native_release_tag, release.get("prerelease"))
-    if release.get("target_commitish") != identity.native_commit:
-        raise ContractError("native GitHub release target does not match native_commit")
+    # target_commitish is mutable: GitHub reports the branch a release was cut
+    # from, not the tag's commit. Trust only the independently resolved
+    # immutable tag commit, and still reject a target_commitish that pins a
+    # different commit outright.
+    if _require_commit(native_tag_commit, "native_tag_commit") != identity.native_commit:
+        raise ContractError(
+            "resolved native release tag commit does not match manifest native_commit"
+        )
+    target_commitish = release.get("target_commitish")
+    if (
+        not isinstance(target_commitish, str)
+        or not target_commitish
+        or target_commitish != target_commitish.strip()
+    ):
+        raise ContractError("native GitHub release has invalid target_commitish")
+    if _COMMIT_RE.fullmatch(target_commitish) is not None:
+        if target_commitish != identity.native_commit:
+            raise ContractError("native GitHub release target does not match native_commit")
+    elif _HEX_COMMITISH_RE.fullmatch(target_commitish) is not None:
+        raise ContractError("native GitHub release target has an ambiguous commit form")
+    elif target_commitish.startswith("refs/tags/"):
+        raise ContractError("native GitHub release target must not name another tag ref")
+    else:
+        try:
+            parse_release_tag(target_commitish)
+        except ContractError:
+            pass
+        else:
+            raise ContractError("native GitHub release target must not be tag-shaped")
 
     payload = json.loads(manifest_path.read_text(encoding="utf-8"))
     if payload.get("hook_contract_version") != NATIVE_HOOK_CONTRACT_VERSION:
@@ -480,7 +613,7 @@ def select_stable_native_release(releases: list[Any]) -> str:
             candidates.append(version)
     if not candidates:
         raise ContractError("no supported non-draft stable native release exists")
-    selected = max(candidates, key=lambda value: (*value.upstream_parts, value.rebuild))
+    selected = max(candidates, key=lambda value: (*value.version_parts, value.rebuild))
     return selected.tag
 
 
@@ -548,9 +681,24 @@ def read_previous_manifest(path: Path) -> tuple[str, str, str]:
         raise ContractError(f"could not read previous manifest: {error}") from error
     if not isinstance(payload, Mapping):
         raise ContractError("previous manifest root must be a JSON object")
-    release_tag = payload.get("release_tag", payload.get("bridge_assets_tag"))
-    upstream_tag = payload.get("upstream_tag", payload.get("llama_cpp_tag"))
-    bridge_commit = payload.get("bridge_commit", payload.get("source_commit"))
+    release_tag = payload.get("release_tag")
+    legacy_release_tag = payload.get("bridge_assets_tag")
+    if release_tag is None:
+        release_tag = legacy_release_tag
+    elif legacy_release_tag is not None and legacy_release_tag != release_tag:
+        raise ContractError("previous manifest release tag aliases conflict")
+    upstream_tag = payload.get("upstream_tag")
+    legacy_upstream_tag = payload.get("llama_cpp_tag")
+    if upstream_tag is None:
+        upstream_tag = legacy_upstream_tag
+    elif legacy_upstream_tag is not None and legacy_upstream_tag != upstream_tag:
+        raise ContractError("previous manifest upstream tag aliases conflict")
+    bridge_commit = payload.get("bridge_commit")
+    legacy_bridge_commit = payload.get("source_commit")
+    if bridge_commit is None:
+        bridge_commit = legacy_bridge_commit
+    elif legacy_bridge_commit is not None and legacy_bridge_commit != bridge_commit:
+        raise ContractError("previous manifest bridge commit aliases conflict")
     if not isinstance(release_tag, str) or not isinstance(upstream_tag, str):
         raise ContractError("previous manifest is missing release/upstream tag identity")
     parse_release_tag(release_tag, allow_legacy=True)
@@ -583,6 +731,17 @@ def _parser() -> argparse.ArgumentParser:
     native_release.add_argument("--native-release-tag", required=True)
     native_release.add_argument("--upstream-tag", required=True)
     native_release.add_argument("--upstream-commit", required=True)
+    native_release.add_argument("--native-tag-commit", required=True)
+
+    native_request = subparsers.add_parser("validate-native-request")
+    native_request.add_argument("--native-release-tag", required=True)
+    native_request.add_argument("--upstream-tag", required=True)
+    native_request.add_argument("--upstream-commit", required=True)
+    native_request.add_argument("--manifest-sha256", required=True)
+
+    resolve_tag = subparsers.add_parser("resolve-tag-commit")
+    resolve_tag.add_argument("--ls-remote", required=True, type=Path)
+    resolve_tag.add_argument("--tag", required=True)
 
     compare = subparsers.add_parser("compare-upstream")
     compare.add_argument("current")
@@ -613,7 +772,7 @@ def main() -> int:
                 "release_tag": release.tag,
                 "release_channel": release.channel.value,
                 "release_rebuild": release.rebuild,
-                "upstream_tag": release.upstream_tag,
+                "upstream_tag": args.upstream_tag,
             }
             if args.previous_manifest:
                 previous_tag, previous_upstream, previous_bridge = read_previous_manifest(
@@ -661,8 +820,31 @@ def main() -> int:
                 args.native_release_tag,
                 args.upstream_tag,
                 args.upstream_commit,
+                args.native_tag_commit,
             )
             print(json.dumps(identity.__dict__, sort_keys=True))
+        elif args.command == "validate-native-request":
+            native_release = validate_native_request(
+                args.native_release_tag,
+                args.upstream_tag,
+                args.upstream_commit,
+                args.manifest_sha256,
+            )
+            print(
+                json.dumps(
+                    {
+                        "native_release_tag": native_release.tag,
+                        "upstream_tag": args.upstream_tag,
+                    },
+                    sort_keys=True,
+                )
+            )
+        elif args.command == "resolve-tag-commit":
+            print(
+                resolve_tag_commit(
+                    args.ls_remote.read_text(encoding="utf-8"), args.tag
+                )
+            )
         elif args.command == "compare-upstream":
             print(compare_upstream(args.current, args.target).value)
         elif args.command == "scan-native":

@@ -57,12 +57,12 @@ class ReleasePublicationStateTest(unittest.TestCase):
             assets_repo=APPROVED_ASSETS_REPOSITORY,
             bridge_commit="a" * 40,
             upstream_tag="v0.2.0",
-            upstream_commit="b" * 40,
+            upstream_commit="bb4caa7540188872173c44d161602d9271386413",
             native_release_tag="v0.2.0",
-            native_manifest_sha256="c" * 64,
-            native_commit="d" * 40,
+            native_manifest_sha256="2e5d29d7f98f0d71e75d3fa63b7c55f3b2a7933247cc34ea2b1c5e053d142452",
+            native_commit="e5c240e34b525da953ed98dc743516eef78cb738",
             emscripten_version="6.0.8",
-            orchestrator_correlation_id="llamadart-pin:run-123",
+            orchestrator_correlation_id="kanban:t_fcc0b814:web-v0.1.38",
             github_run_id="123456789",
             github_run_url="https://github.com/leehack/llama-web-bridge/actions/runs/123456789",
         )
@@ -75,11 +75,11 @@ class ReleasePublicationStateTest(unittest.TestCase):
             bridge_commit="a" * 40,
             upstream_repo="ggml-org/llama.cpp",
             upstream_tag="v0.2.0",
-            upstream_commit="b" * 40,
+            upstream_commit=self.identity.upstream_commit,
             native_repo="leehack/llamadart-native",
             native_release_tag="v0.2.0",
-            native_manifest_sha256="c" * 64,
-            native_commit="d" * 40,
+            native_manifest_sha256=self.identity.native_manifest_sha256,
+            native_commit=self.identity.native_commit,
             emscripten_version="6.0.8",
             orchestrator_correlation_id=self.identity.orchestrator_correlation_id,
             github_run_id=self.identity.github_run_id,
@@ -162,7 +162,11 @@ class ReleasePublicationStateTest(unittest.TestCase):
         git(self.repository, "commit", "-q", "-m", f"history {release_tag}")
 
     def regenerate_candidate(
-        self, release_tag: str, release_rebuild: int, upstream_tag: str
+        self,
+        release_tag: str,
+        release_rebuild: int,
+        upstream_tag: str,
+        native_release_tag: str | None = None,
     ) -> CandidateIdentity:
         identity = CandidateIdentity(
             release_tag=release_tag,
@@ -171,7 +175,7 @@ class ReleasePublicationStateTest(unittest.TestCase):
             bridge_commit=self.identity.bridge_commit,
             upstream_tag=upstream_tag,
             upstream_commit=self.identity.upstream_commit,
-            native_release_tag=release_tag,
+            native_release_tag=native_release_tag or release_tag,
             native_manifest_sha256=self.identity.native_manifest_sha256,
             native_commit=self.identity.native_commit,
             emscripten_version=self.identity.emscripten_version,
@@ -232,7 +236,7 @@ class ReleasePublicationStateTest(unittest.TestCase):
         self.assertEqual(state["action"], "publish-refs-and-release")
 
     def test_development_history_rejects_rollback_and_collision(self) -> None:
-        self.commit_history_manifest("v0.1.37", "b10514")
+        self.commit_history_manifest("b10514", "b10514")
         rollback = self.regenerate_candidate("b10513", 0, "b10513")
         rollback_state = self.classify_identity(rollback)
         self.assertEqual(rollback_state["outcome"], "rollback")
@@ -240,11 +244,19 @@ class ReleasePublicationStateTest(unittest.TestCase):
         collision_state = self.classify_identity(collision)
         self.assertEqual(collision_state["outcome"], "collision")
 
-    def test_development_rebuild_advances_on_its_upstream_line(self) -> None:
-        self.commit_history_manifest("v0.1.37", "b10514")
+    def test_development_rebuild_advances_on_its_own_release_line(self) -> None:
+        self.commit_history_manifest("b10514", "b10514")
         identity = self.regenerate_candidate("b10514-1", 1, "b10514")
         state = self.classify_identity(identity)
         self.assertTrue(state["allowed"])
+
+    def test_first_release_in_a_channel_must_use_rebuild_zero(self) -> None:
+        """A rebuild of an asset tag never published in this channel is fail-closed."""
+        self.commit_history_manifest("v0.1.37", "b10514")
+        identity = self.regenerate_candidate("b10514-1", 1, "b10514")
+        state = self.classify_identity(identity)
+        self.assertFalse(state["allowed"])
+        self.assertEqual(state["outcome"], "rollback")
 
     def test_development_rebuild_history_rejects_rollback_and_collision(self) -> None:
         self.commit_history_manifest("b10514-2", "b10514")
@@ -254,6 +266,148 @@ class ReleasePublicationStateTest(unittest.TestCase):
         collision = self.regenerate_candidate("b10514-2", 2, "b10514")
         collision_state = self.classify_identity(collision)
         self.assertEqual(collision_state["outcome"], "collision")
+
+    def test_chief_candidate_advances_independent_release_and_upstream_lines(self) -> None:
+        """v0.1.38/v0.2.0 after v0.1.37/b10514: assets advance, upstream migrates."""
+        self.commit_history_manifest("v0.1.37", "b10514")
+        identity = self.regenerate_candidate("v0.1.38", 0, "v0.2.0", "v0.2.0-1")
+        state = self.classify_identity(identity)
+        self.assertTrue(state["allowed"], state["reason"])
+        self.assertEqual(state["state"], "absent")
+        self.assertEqual(state["action"], "publish-refs-and-release")
+        self.assertEqual(state["outcome"], "newly-published")
+        self.assertEqual(state["release_tag"], "v0.1.38")
+
+    def test_schema_v2_stores_independent_release_and_upstream_identities(self) -> None:
+        identity = self.regenerate_candidate("v0.1.38", 0, "v0.2.0", "v0.2.0-1")
+        self.assertIsInstance(validate_candidate(self.candidate, identity), str)
+        manifest = json.loads((self.candidate / "manifest.json").read_text())
+        self.assertEqual(manifest["schema_version"], 2)
+        self.assertEqual(manifest["release_tag"], "v0.1.38")
+        self.assertEqual(manifest["upstream_tag"], "v0.2.0")
+        self.assertEqual(manifest["release_channel"], "stable")
+        self.assertEqual(manifest["release_rebuild"], 0)
+        self.assertEqual(manifest["native_release_tag"], "v0.2.0-1")
+        # Legacy aliases must mirror their own field, never the other identity.
+        self.assertEqual(manifest["bridge_assets_tag"], "v0.1.38")
+        self.assertEqual(manifest["llama_cpp_tag"], "v0.2.0")
+
+    def test_schema_v2_history_is_read_without_fabricating_identities(self) -> None:
+        self.regenerate_candidate("v0.1.38", 0, "v0.2.0", "v0.2.0-1")
+        shutil.copy2(self.candidate / "manifest.json", self.repository / "manifest.json")
+        git(self.repository, "add", "manifest.json")
+        git(self.repository, "commit", "-q", "-m", "schema-v2 history")
+
+        advance = self.regenerate_candidate("v0.1.39", 0, "v0.2.1", "v0.2.1")
+        self.assertTrue(self.classify_identity(advance)["allowed"])
+        # Ordering uses the recorded v0.1.38, not the recorded upstream v0.2.0.
+        release_rollback = self.regenerate_candidate("v0.1.37", 0, "v0.2.0", "v0.2.0-1")
+        self.assertEqual(self.classify_identity(release_rollback)["outcome"], "rollback")
+        # ...and the upstream dimension uses the recorded v0.2.0, not v0.1.38.
+        upstream_rollback = self.regenerate_candidate(
+            "v0.1.39", 0, "v0.1.9", "v0.1.9"
+        )
+        upstream_state = self.classify_identity(upstream_rollback)
+        self.assertEqual(upstream_state["outcome"], "rollback")
+        self.assertIn("upstream transition is backward", upstream_state["reason"])
+
+    def test_conflicting_history_aliases_fail_closed(self) -> None:
+        for field, value in (
+            ("bridge_assets_tag", "v0.1.37"),
+            ("llama_cpp_tag", "b10514"),
+        ):
+            manifest = {
+                "release_tag": "v0.1.38",
+                "bridge_assets_tag": "v0.1.38",
+                "upstream_tag": "v0.2.0",
+                "llama_cpp_tag": "v0.2.0",
+            }
+            manifest[field] = value
+            (self.repository / "manifest.json").write_text(json.dumps(manifest) + "\n")
+            git(self.repository, "add", "manifest.json")
+            git(self.repository, "commit", "-q", "-m", f"conflicting {field}")
+            identity = self.regenerate_candidate(
+                "v0.1.39", 0, "v0.2.1", "v0.2.1"
+            )
+            with self.subTest(field=field):
+                state = self.classify_identity(identity)
+                self.assertFalse(state["allowed"])
+                self.assertEqual(state["outcome"], "collision")
+                self.assertIn("aliases conflict", state["reason"])
+
+    def test_independent_release_rollback_and_collision_are_rejected(self) -> None:
+        self.commit_history_manifest("v0.1.38", "v0.2.0")
+        rollback = self.regenerate_candidate("v0.1.37", 0, "v0.2.0", "v0.2.0-1")
+        rollback_state = self.classify_identity(rollback)
+        self.assertEqual(rollback_state["outcome"], "rollback")
+        self.assertFalse(rollback_state["allowed"])
+        collision = self.regenerate_candidate("v0.1.38", 0, "v0.2.0", "v0.2.0-1")
+        collision_state = self.classify_identity(collision)
+        self.assertEqual(collision_state["outcome"], "collision")
+        self.assertFalse(collision_state["allowed"])
+
+    def test_independent_upstream_rollback_is_rejected(self) -> None:
+        """The asset tag advances legally, but the upstream line must not regress."""
+        self.commit_history_manifest("v0.1.38", "v0.2.1")
+        identity = self.regenerate_candidate("v0.1.39", 0, "v0.2.0", "v0.2.0-1")
+        state = self.classify_identity(identity)
+        self.assertFalse(state["allowed"])
+        self.assertEqual(state["outcome"], "rollback")
+        self.assertIn("upstream transition is backward", state["reason"])
+
+    def test_stable_to_development_upstream_is_forbidden(self) -> None:
+        self.commit_history_manifest("v0.1.38", "v0.2.0")
+        identity = self.regenerate_candidate("v0.1.39", 0, "b10600", "b10600")
+        state = self.classify_identity(identity)
+        self.assertFalse(state["allowed"])
+        self.assertEqual(state["outcome"], "rollback")
+        self.assertIn(
+            "upstream transition is forbidden-stable-to-development", state["reason"]
+        )
+
+    def test_new_release_version_must_restart_rebuild_numbering(self) -> None:
+        self.commit_history_manifest("v0.1.37", "b10514")
+        identity = self.regenerate_candidate("v0.1.38-1", 1, "v0.2.0", "v0.2.0-1")
+        state = self.classify_identity(identity)
+        self.assertFalse(state["allowed"])
+        self.assertEqual(state["outcome"], "rollback")
+
+    def test_release_rebuild_must_match_the_release_tag(self) -> None:
+        identity = self.regenerate_candidate("v0.1.38", 0, "v0.2.0", "v0.2.0-1")
+        mismatched = CandidateIdentity(
+            **{**identity.__dict__, "release_rebuild": 1}
+        )
+        with self.assertRaises(ContractError):
+            validate_candidate(self.candidate, mismatched)
+
+    def test_candidate_upstream_tag_syntax_stays_exact(self) -> None:
+        identity = self.regenerate_candidate("v0.1.38", 0, "v0.2.0", "v0.2.0-1")
+        for invalid in ("main", "v0.2", "v0.2.0-1", "b10514-1", ""):
+            with self.subTest(upstream_tag=invalid):
+                broken = CandidateIdentity(
+                    **{**identity.__dict__, "upstream_tag": invalid}
+                )
+                with self.assertRaises(ContractError):
+                    validate_candidate(self.candidate, broken)
+
+    def test_native_release_tag_must_still_encode_its_upstream(self) -> None:
+        """Bridge assets decouple from upstream; native releases never do."""
+        accepted = self.regenerate_candidate(
+            "v0.1.38", 0, "v0.2.0", "v0.2.0-1"
+        )
+        self.assertIsInstance(validate_candidate(self.candidate, accepted), str)
+        for native_tag, upstream_tag in (
+            ("v0.1.38", "v0.2.0"),
+            ("v0.2.1-1", "v0.2.0"),
+            ("b10514", "v0.2.0"),
+            ("b10515", "b10514"),
+        ):
+            with self.subTest(native_tag=native_tag, upstream_tag=upstream_tag):
+                identity = self.regenerate_candidate(
+                    "v0.1.38", 0, upstream_tag, native_tag
+                )
+                with self.assertRaises(ContractError):
+                    validate_candidate(self.candidate, identity)
 
     def test_stable_history_ignores_later_development_publication(self) -> None:
         self.commit_history_manifest("v0.2.0", "v0.2.0")
@@ -360,7 +514,8 @@ class ReleasePublicationStateTest(unittest.TestCase):
         self.assertIsNone(outcome["mutated"])
         self.assertEqual(outcome["mutation_status"], "unknown")
         self.assertEqual(
-            outcome["orchestrator_correlation_id"], "llamadart-pin:run-123"
+            outcome["orchestrator_correlation_id"],
+            "kanban:t_fcc0b814:web-v0.1.38",
         )
         self.assertEqual(outcome["github_run_id"], "123456789")
         self.assertEqual(

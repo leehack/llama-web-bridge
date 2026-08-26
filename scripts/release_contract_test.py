@@ -22,11 +22,14 @@ from release_contract import (
     read_previous_manifest,
     require_correlation_id,
     resolve_native_manifest,
+    resolve_tag_commit,
     select_stable_native_release,
     validate_native_file,
     validate_native_release,
+    validate_native_request,
     validate_github_prerelease,
     validate_publication_environment,
+    validate_native_identity,
     validate_release_identity,
 )
 
@@ -43,7 +46,7 @@ class ReleaseContractTest(unittest.TestCase):
             with self.subTest(tag=tag):
                 parsed = parse_release_tag(tag)
                 self.assertEqual(
-                    (parsed.channel, parsed.upstream_parts, parsed.rebuild), expected
+                    (parsed.channel, parsed.version_parts, parsed.rebuild), expected
                 )
                 self.assertFalse(parsed.legacy)
 
@@ -246,6 +249,58 @@ class ReleaseContractTest(unittest.TestCase):
             with self.subTest(tag=tag), self.assertRaises(ContractError):
                 parse_upstream_tag(tag)
 
+    def test_ordinary_pin_accepts_either_upstream_channel(self) -> None:
+        """scripts/verify_ci_reliability.py gates llama_cpp.version with this parser."""
+        pin_path = Path(__file__).resolve().parents[1] / "llama_cpp.version"
+        pin_contents = pin_path.read_text(encoding="utf-8")
+        self.assertEqual(pin_contents, "v0.2.0\n")
+        pin = pin_contents.removesuffix("\n")
+        self.assertIn(
+            parse_upstream_tag(pin).channel, (Channel.STABLE, Channel.DEVELOPMENT)
+        )
+        for tag, channel in (("v0.2.0", Channel.STABLE), ("b10514", Channel.DEVELOPMENT)):
+            with self.subTest(tag=tag):
+                self.assertEqual(parse_upstream_tag(tag).channel, channel)
+        for invalid in (
+            "",
+            "0.2.0",
+            "v0.2",
+            "v0.2.0.1",
+            "v0.2.0-1",
+            "V0.2.0",
+            "b",
+            "b10514-1",
+            "b10514\n",
+            "B10514",
+            "main",
+            "bb4caa7540188872173c44d161602d9271386413",
+        ):
+            with self.subTest(invalid=invalid), self.assertRaises(ContractError):
+                parse_upstream_tag(invalid)
+
+    def test_native_request_is_validated_before_network_use(self) -> None:
+        accepted = validate_native_request(
+            "v0.2.0-1",
+            "v0.2.0",
+            "bb4caa7540188872173c44d161602d9271386413",
+            "2e5d29d7f98f0d71e75d3fa63b7c55f3b2a7933247cc34ea2b1c5e053d142452",
+        )
+        self.assertEqual(accepted.base_tag, "v0.2.0")
+        for label, native_tag, upstream_tag, upstream_commit, manifest_sha256 in (
+            ("malformed-tag", "v0.2.0-rc.1", "v0.2.0", "a" * 40, "b" * 64),
+            ("wrong-upstream", "v0.2.0-1", "v0.2.1", "a" * 40, "b" * 64),
+            ("malformed-upstream", "v0.2.0-1", "main", "a" * 40, "b" * 64),
+            ("malformed-commit", "v0.2.0-1", "v0.2.0", "abc123", "b" * 64),
+            ("malformed-sha256", "v0.2.0-1", "v0.2.0", "a" * 40, "B" * 64),
+        ):
+            with self.subTest(case=label), self.assertRaises(ContractError):
+                validate_native_request(
+                    native_tag,
+                    upstream_tag,
+                    upstream_commit,
+                    manifest_sha256,
+                )
+
     def test_channel_and_rebuild_ordering(self) -> None:
         cases = (
             ("b10514", "b10515", Transition.FORWARD),
@@ -266,18 +321,74 @@ class ReleaseContractTest(unittest.TestCase):
         with self.assertRaises(ContractError):
             compare_releases("v0.2.0", "v0.2.1-1")
 
-    def test_release_must_preserve_upstream_and_rebuild(self) -> None:
+    def test_release_and_upstream_orderings_are_independent(self) -> None:
+        """The chief candidate: assets v0.1.37 -> v0.1.38 while upstream b10514 -> v0.2.0."""
+        self.assertEqual(compare_releases("v0.1.37", "v0.1.38"), Transition.FORWARD)
         self.assertEqual(
-            validate_release_identity("v0.2.0-2", 2, "v0.2.0").upstream_tag,
-            "v0.2.0",
+            compare_upstream("b10514", "v0.2.0"), Transition.STABLE_MIGRATION
+        )
+        self.assertEqual(compare_releases("v0.1.38", "v0.1.37"), Transition.BACKWARD)
+        self.assertEqual(compare_releases("v0.1.38", "v0.1.38"), Transition.EQUAL)
+        self.assertEqual(compare_releases("v0.1.38", "v0.1.38-1"), Transition.FORWARD)
+        self.assertEqual(compare_releases("v0.1.38-2", "v0.1.38-1"), Transition.BACKWARD)
+        self.assertEqual(
+            compare_upstream("v0.2.0", "b10600"),
+            Transition.FORBIDDEN_STABLE_TO_DEVELOPMENT,
+        )
+        self.assertEqual(compare_upstream("v0.2.1", "v0.2.0"), Transition.BACKWARD)
+        # A new asset version must restart at rebuild 0 regardless of upstream.
+        with self.assertRaises(ContractError):
+            compare_releases("v0.1.37", "v0.1.38-1")
+
+    def test_release_identity_is_independent_of_upstream(self) -> None:
+        """Bridge assets version independently: v0.1.38 may ship upstream v0.2.0."""
+        candidate = validate_release_identity("v0.1.38", 0, "v0.2.0")
+        self.assertEqual(
+            (candidate.tag, candidate.channel, candidate.version_parts, candidate.rebuild),
+            ("v0.1.38", Channel.STABLE, (0, 1, 38), 0),
         )
         for release, rebuild, upstream in (
-            ("v0.2.0-2", 1, "v0.2.0"),
-            ("v0.2.1", 0, "v0.2.0"),
-            ("b10514", 0, "v0.2.0"),
+            ("v0.2.0-2", 2, "v0.2.0"),
+            ("v0.1.38", 0, "b10514"),
+            ("b10600", 0, "v0.2.0"),
+            ("v0.1.38-3", 3, "v0.2.0"),
         ):
-            with self.subTest(release=release), self.assertRaises(ContractError):
+            with self.subTest(release=release, upstream=upstream):
+                self.assertEqual(
+                    validate_release_identity(release, rebuild, upstream).tag, release
+                )
+
+    def test_release_identity_keeps_strict_syntax_and_rebuild(self) -> None:
+        for label, release, rebuild, upstream in (
+            ("rebuild-mismatch", "v0.2.0-2", 1, "v0.2.0"),
+            ("rebuild-negative", "v0.1.38", -1, "v0.2.0"),
+            ("rebuild-zero-mismatch", "v0.1.38-1", 0, "v0.2.0"),
+            ("malformed-release", "v0.1", 0, "v0.2.0"),
+            ("prerelease-release", "v0.1.38-rc.1", 0, "v0.2.0"),
+            ("legacy-release", "v0.1.38-llamadart.1", 1, "v0.2.0"),
+            ("malformed-upstream", "v0.1.38", 0, "main"),
+            ("rebuild-bearing-upstream", "v0.1.38", 0, "v0.2.0-1"),
+        ):
+            with self.subTest(case=label), self.assertRaises(ContractError):
                 validate_release_identity(release, rebuild, upstream)
+
+    def test_native_identity_still_encodes_its_upstream(self) -> None:
+        self.assertEqual(
+            validate_native_identity("v0.2.0-1", 1, "v0.2.0").tag, "v0.2.0-1"
+        )
+        self.assertEqual(
+            validate_native_identity("b10514", 0, "b10514").tag, "b10514"
+        )
+        for label, native_tag, rebuild, upstream in (
+            ("stable-upstream-mismatch", "v0.2.0-1", 1, "v0.2.1"),
+            ("independent-versioning-forbidden", "v0.1.38", 0, "v0.2.0"),
+            ("channel-mismatch", "b10514", 0, "v0.2.0"),
+            ("development-upstream-mismatch", "b10514", 0, "b10515"),
+            ("rebuild-mismatch", "v0.2.0-1", 0, "v0.2.0"),
+            ("negative-rebuild", "v0.2.0-1", -1, "v0.2.0"),
+        ):
+            with self.subTest(case=label), self.assertRaises(ContractError):
+                validate_native_identity(native_tag, rebuild, upstream)
 
     def test_native_manifest_provenance_and_checksum(self) -> None:
         manifest = {
@@ -304,8 +415,15 @@ class ReleaseContractTest(unittest.TestCase):
                     path, "0" * 64, "v0.2.0-1", "v0.2.0", "a" * 40
                 )
 
-    def test_native_release_verifies_github_digest_hook_and_inventory(self) -> None:
-        tag = "v0.2.0"
+    @staticmethod
+    def _native_release_fixture(
+        directory: str,
+        tag: str = "v0.2.0-1",
+        upstream_tag: str = "v0.2.0",
+    ) -> dict:
+        """Build the real v0.2.0-1 release shape with a branch target."""
+        upstream_commit = "bb4caa7540188872173c44d161602d9271386413"
+        native_commit = "e5c240e34b525da953ed98dc743516eef78cb738"
         expected = expected_native_artifacts(tag)
         artifacts = []
         checksum_lines = []
@@ -329,36 +447,56 @@ class ReleaseContractTest(unittest.TestCase):
             })
         manifest = {
             "tag": tag,
-            "llama_cpp_tag": tag,
-            "llama_cpp_commit": "a" * 40,
-            "native_commit": "b" * 40,
+            "llama_cpp_tag": upstream_tag,
+            "llama_cpp_commit": upstream_commit,
+            "native_commit": native_commit,
             "generated_at": "2026-08-22T00:00:00Z",
             "hook_contract_version": 1,
             "artifacts": artifacts,
         }
-        with tempfile.TemporaryDirectory() as directory:
-            manifest_path = Path(directory, "assets.json")
-            checksums_path = Path(directory, "SHA256SUMS")
-            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
-            checksums_path.write_text("\n".join(checksum_lines) + "\n", encoding="utf-8")
-            manifest_digest = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
-            checksum_digest = hashlib.sha256(checksums_path.read_bytes()).hexdigest()
-            github_assets.extend([
-                {"name": "assets.json", "state": "uploaded", "size": manifest_path.stat().st_size, "digest": f"sha256:{manifest_digest}"},
-                {"name": "SHA256SUMS", "state": "uploaded", "size": checksums_path.stat().st_size, "digest": f"sha256:{checksum_digest}"},
-            ])
-            release = {
+        manifest_path = Path(directory, "assets.json")
+        checksums_path = Path(directory, "SHA256SUMS")
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        checksums_path.write_text("\n".join(checksum_lines) + "\n", encoding="utf-8")
+        manifest_digest = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+        checksum_digest = hashlib.sha256(checksums_path.read_bytes()).hexdigest()
+        github_assets.extend([
+            {"name": "assets.json", "state": "uploaded", "size": manifest_path.stat().st_size, "digest": f"sha256:{manifest_digest}"},
+            {"name": "SHA256SUMS", "state": "uploaded", "size": checksums_path.stat().st_size, "digest": f"sha256:{checksum_digest}"},
+        ])
+        return {
+            "tag": tag,
+            "upstream_tag": upstream_tag,
+            "upstream_commit": upstream_commit,
+            "native_commit": native_commit,
+            "manifest": manifest,
+            "manifest_path": manifest_path,
+            "checksums_path": checksums_path,
+            "manifest_digest": manifest_digest,
+            "release": {
                 "tag_name": tag,
                 "draft": False,
-                "prerelease": False,
-                "target_commitish": "b" * 40,
+                "prerelease": True,
+                "target_commitish": "main",
                 "assets": github_assets,
-            }
+            },
+        }
+
+    def test_native_release_verifies_github_digest_hook_and_inventory(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = self._native_release_fixture(directory)
+            tag = fixture["tag"]
+            manifest = fixture["manifest"]
+            manifest_path = fixture["manifest_path"]
+            checksums_path = fixture["checksums_path"]
+            manifest_digest = fixture["manifest_digest"]
+            release = fixture["release"]
             identity = validate_native_release(
                 manifest_path, checksums_path, release, manifest_digest,
-                tag, tag, "a" * 40,
+                tag, fixture["upstream_tag"], fixture["upstream_commit"],
+                fixture["native_commit"],
             )
-            self.assertEqual(identity.native_commit, "b" * 40)
+            self.assertEqual(identity.native_commit, fixture["native_commit"])
             for mutation in ("hook", "digest", "inventory", "prerelease"):
                 bad_manifest = json.loads(json.dumps(manifest))
                 bad_release = json.loads(json.dumps(release))
@@ -375,14 +513,147 @@ class ReleaseContractTest(unittest.TestCase):
                     if mutation == "inventory":
                         bad_release["assets"].pop(0)
                     else:
-                        bad_release["prerelease"] = True
+                        bad_release["prerelease"] = False
                     bad_digest = manifest_digest
                 with self.subTest(mutation=mutation), self.assertRaises(ContractError):
                     validate_native_release(
                         manifest_path, checksums_path, bad_release, bad_digest,
-                        tag, tag, "a" * 40,
+                        tag, fixture["upstream_tag"], fixture["upstream_commit"],
+                        fixture["native_commit"],
                     )
                 manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    def test_native_release_trusts_only_the_resolved_immutable_tag_commit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = self._native_release_fixture(directory)
+            tag = fixture["tag"]
+
+            def validate(release: dict, native_tag_commit) -> None:
+                validate_native_release(
+                    fixture["manifest_path"],
+                    fixture["checksums_path"],
+                    release,
+                    fixture["manifest_digest"],
+                    tag,
+                    fixture["upstream_tag"],
+                    fixture["upstream_commit"],
+                    native_tag_commit,
+                )
+
+            branch_target = fixture["release"]
+            self.assertEqual(branch_target["target_commitish"], "main")
+            validate(branch_target, fixture["native_commit"])
+            validate(
+                {**branch_target, "target_commitish": fixture["native_commit"]},
+                fixture["native_commit"],
+            )
+
+            for label, native_tag_commit in (
+                ("mismatch", "c" * 40),
+                ("missing", None),
+                ("empty", ""),
+                ("branch-name", "main"),
+                ("short", "b" * 39),
+                ("uppercase", "B" * 40),
+                ("non-string", 0),
+            ):
+                with self.subTest(native_tag_commit=label), self.assertRaises(
+                    ContractError
+                ):
+                    validate(branch_target, native_tag_commit)
+
+            for label, target_commitish in (
+                ("other-commit", "c" * 40),
+                ("missing", None),
+                ("empty", ""),
+                ("abbreviated-commit", "c" * 12),
+                ("uppercase-commit", "C" * 40),
+                ("whitespace", " main"),
+                ("tag-ref", "refs/tags/v0.1.0"),
+                ("tag-shaped", "v0.1.0"),
+            ):
+                with self.subTest(target_commitish=label), self.assertRaises(
+                    ContractError
+                ):
+                    validate(
+                        {**branch_target, "target_commitish": target_commitish},
+                        fixture["native_commit"],
+                    )
+
+    def test_resolve_tag_commit_peels_annotated_tags(self) -> None:
+        upstream_annotated = (
+            "8a35040e02747e136d901793604572c7ca6d0793\trefs/tags/v0.2.0\n"
+            "bb4caa7540188872173c44d161602d9271386413\trefs/tags/v0.2.0^{}\n"
+        )
+        self.assertEqual(
+            resolve_tag_commit(upstream_annotated, "v0.2.0"),
+            "bb4caa7540188872173c44d161602d9271386413",
+        )
+        annotated = (
+            "246e18e254d74452a32210992cefbcab8dc65010\trefs/tags/v0.2.0-1\n"
+            "e5c240e34b525da953ed98dc743516eef78cb738\trefs/tags/v0.2.0-1^{}\n"
+        )
+        self.assertEqual(
+            resolve_tag_commit(annotated, "v0.2.0-1"),
+            "e5c240e34b525da953ed98dc743516eef78cb738",
+        )
+        lightweight = "246e18e254d74452a32210992cefbcab8dc65010\trefs/tags/v0.2.0-1\n"
+        self.assertEqual(
+            resolve_tag_commit(lightweight, "v0.2.0-1"),
+            "246e18e254d74452a32210992cefbcab8dc65010",
+        )
+
+        for label, output in (
+            ("missing", ""),
+            ("blank-lines-only", "\n\n"),
+            ("unrelated-ref", "b" * 40 + "\trefs/tags/v0.2.0-10\n"),
+            ("branch-ref", "b" * 40 + "\trefs/heads/main\n"),
+            ("malformed-line", "not-a-sha\trefs/tags/v0.2.0-1\n"),
+            ("space-separated", "b" * 40 + " refs/tags/v0.2.0-1\n"),
+            (
+                "duplicate",
+                ("b" * 40 + "\trefs/tags/v0.2.0-1\n") * 2,
+            ),
+            ("conflicting", "b" * 40 + "\trefs/tags/v0.2.0-1\n" + "c" * 40 + "\trefs/tags/v0.2.0-1\n"),
+            ("peeled-only", "c" * 40 + "\trefs/tags/v0.2.0-1^{}\n"),
+            (
+                "same-object-and-commit",
+                "b" * 40 + "\trefs/tags/v0.2.0-1\n"
+                + "b" * 40 + "\trefs/tags/v0.2.0-1^{}\n",
+            ),
+            ("embedded-blank", "b" * 40 + "\trefs/tags/v0.2.0-1\n\n"),
+        ):
+            with self.subTest(output=label), self.assertRaises(ContractError):
+                resolve_tag_commit(output, "v0.2.0-1")
+
+        with self.assertRaises(ContractError):
+            resolve_tag_commit(lightweight, "v0.2.0-1;touch-pwned")
+
+    def test_resolve_tag_commit_cli_emits_only_the_peeled_commit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            refs = Path(directory, "tag-refs.txt")
+            refs.write_text(
+                "246e18e254d74452a32210992cefbcab8dc65010\trefs/tags/v0.2.0-1\n"
+                "e5c240e34b525da953ed98dc743516eef78cb738\trefs/tags/v0.2.0-1^{}\n",
+                encoding="utf-8",
+            )
+            command = [
+                sys.executable,
+                str(Path(__file__).with_name("release_contract.py")),
+                "resolve-tag-commit",
+                "--ls-remote",
+                str(refs),
+                "--tag",
+                "v0.2.0-1",
+            ]
+            result = subprocess.run(command, check=True, capture_output=True, text=True)
+            self.assertEqual(
+                result.stdout.strip(), "e5c240e34b525da953ed98dc743516eef78cb738"
+            )
+
+            refs.write_text("", encoding="utf-8")
+            failure = subprocess.run(command, capture_output=True, text=True)
+            self.assertNotEqual(failure.returncode, 0)
 
     def test_rejects_mismatched_native_identity(self) -> None:
         base = {
@@ -432,6 +703,26 @@ class ReleaseContractTest(unittest.TestCase):
                 encoding="utf-8",
             )
             self.assertEqual(read_previous_manifest(legacy)[0], "b10514-llamadart.1")
+
+            for field, value in (
+                ("bridge_assets_tag", "v0.2.1"),
+                ("llama_cpp_tag", "v0.2.1"),
+                ("source_commit", "d" * 40),
+            ):
+                conflicting = Path(directory, f"conflicting-{field}.json")
+                conflicting.write_text(
+                    json.dumps(
+                        {
+                            "release_tag": "v0.2.0-1",
+                            "upstream_tag": "v0.2.0",
+                            "bridge_commit": "c" * 40,
+                            field: value,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                with self.subTest(field=field), self.assertRaises(ContractError):
+                    read_previous_manifest(conflicting)
 
 
 if __name__ == "__main__":

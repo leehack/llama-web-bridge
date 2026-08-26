@@ -196,9 +196,11 @@ are easy to regress during agent-driven maintenance:
   the JS source, regenerates the readable browser ESM wrapper/declaration files
   with esbuild, and then fails on any stale checked-in generated output via
   `git diff --exit-code`;
-- ordinary CI resolves its development pin from `llama_cpp.version`; exact
-  publication instead requires a provenance-checked upstream tag and commit, so
-  dependency publication does not require a bridge pin PR;
+- ordinary CI resolves its build pin from `llama_cpp.version`, which holds one
+  exact upstream tag in either channel (stable `vMAJOR.MINOR.PATCH` or
+  development `bNNNN`); exact publication instead requires a provenance-checked
+  upstream tag and commit, so dependency publication does not require a bridge
+  pin PR;
 - both workflows install the exact compiler in `emsdk.version`, verify the
   resolved `emcc` identity, and record it as `emscripten_version` in published
   `manifest.json` provenance;

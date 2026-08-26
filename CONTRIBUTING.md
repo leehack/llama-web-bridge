@@ -160,8 +160,10 @@ query strings, and fragments before printing the location.
   is large and requires memory64, but require it before publishing assets
   advertised for Qwen3-TTS.
 - Preserve `llama_cpp.version` as the default ordinary CI/development build pin.
-  Exact release publication receives upstream identity from the orchestrator and
-  must not require a bridge pin PR.
+  It holds exactly one upstream tag in either channel, stable
+  `vMAJOR.MINOR.PATCH` or development `bNNNN`; `scripts/verify_ci_reliability.py`
+  rejects every other form. Exact release publication receives upstream identity
+  from the orchestrator and must not require a bridge pin PR.
 - Preserve `emsdk.version` as the single compiler source for CI and publish.
   Both workflows must verify the active `emcc` version, and published manifests
   must record that verified identity.
