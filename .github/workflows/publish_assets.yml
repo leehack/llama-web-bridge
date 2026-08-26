@@ -168,6 +168,10 @@ jobs:
           python3 scripts/release_contract.py validate-release \
             --release-tag "${RELEASE_TAG}" --release-rebuild "${RELEASE_REBUILD}" \
             --upstream-tag "${UPSTREAM_TAG}"
+          python3 scripts/release_contract.py validate-native-request \
+            --native-release-tag "${NATIVE_RELEASE_TAG}" \
+            --upstream-tag "${UPSTREAM_TAG}" --upstream-commit "${UPSTREAM_COMMIT}" \
+            --manifest-sha256 "${NATIVE_MANIFEST_SHA256}"
           python3 - "${ORCHESTRATOR_CORRELATION_ID}" <<'PY'
           import sys
           from scripts.release_contract import require_correlation_id
@@ -180,10 +184,34 @@ jobs:
           require_repository(sys.argv[2], "native_repo")
           PY
 
+      - name: Resolve immutable upstream and native release tag commits
+        id: native_tag
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/native-release"
+          git ls-remote https://github.com/ggml-org/llama.cpp.git \
+            "refs/tags/${UPSTREAM_TAG}" "refs/tags/${UPSTREAM_TAG}^{}" \
+            > "${RUNNER_TEMP}/upstream-tag-refs.txt"
+          RESOLVED_UPSTREAM_COMMIT="$(python3 scripts/release_contract.py resolve-tag-commit \
+            --ls-remote "${RUNNER_TEMP}/upstream-tag-refs.txt" \
+            --tag "${UPSTREAM_TAG}")"
+          if [ "${RESOLVED_UPSTREAM_COMMIT}" != "${UPSTREAM_COMMIT}" ]; then
+            echo "error: resolved upstream tag commit does not match upstream_commit"
+            exit 1
+          fi
+          git ls-remote "https://github.com/${NATIVE_REPO}.git" \
+            "refs/tags/${NATIVE_RELEASE_TAG}" "refs/tags/${NATIVE_RELEASE_TAG}^{}" \
+            > "${RUNNER_TEMP}/native-release/tag-refs.txt"
+          NATIVE_TAG_COMMIT="$(python3 scripts/release_contract.py resolve-tag-commit \
+            --ls-remote "${RUNNER_TEMP}/native-release/tag-refs.txt" \
+            --tag "${NATIVE_RELEASE_TAG}")"
+          echo "native_tag_commit=${NATIVE_TAG_COMMIT}" >> "${GITHUB_OUTPUT}"
+
       - name: Download and independently verify native release inventory
         id: native
         env:
           GH_TOKEN: ${{ github.token }}
+          NATIVE_TAG_COMMIT: ${{ steps.native_tag.outputs.native_tag_commit }}
         run: |
           set -euo pipefail
           mkdir -p "${RUNNER_TEMP}/native-release"
@@ -203,7 +231,8 @@ jobs:
             --release-json "${RUNNER_TEMP}/native-release/release.json" \
             --manifest-sha256 "${NATIVE_MANIFEST_SHA256}" \
             --native-release-tag "${NATIVE_RELEASE_TAG}" \
-            --upstream-tag "${UPSTREAM_TAG}" --upstream-commit "${UPSTREAM_COMMIT}")"
+            --upstream-tag "${UPSTREAM_TAG}" --upstream-commit "${UPSTREAM_COMMIT}" \
+            --native-tag-commit "${NATIVE_TAG_COMMIT}")"
           echo "native_commit=$(jq -r '.native_commit' <<<"${IDENTITY}")" >> "${GITHUB_OUTPUT}"
 
       - name: Verify exact upstream and native tag commits
@@ -526,15 +555,22 @@ jobs:
             "+refs/heads/${assets_branch}:refs/remotes/origin/${assets_branch}"
           branch_commit="$(git -C assets-repo rev-parse "refs/remotes/origin/${assets_branch}")"
 
-          tag_lines="$(git -C assets-repo ls-remote origin \
-            "refs/tags/${RELEASE_TAG}" "refs/tags/${RELEASE_TAG}^{}")"
-          tag_commit="$(awk '$2 ~ /\^\{\}$/ {print $1}' <<<"${tag_lines}")"
-          if [ -z "${tag_commit}" ]; then
-            tag_commit="$(awk 'NR == 1 {print $1}' <<<"${tag_lines}")"
+          git -C assets-repo ls-remote origin \
+            "refs/tags/${RELEASE_TAG}" "refs/tags/${RELEASE_TAG}^{}" \
+            > "${RUNNER_TEMP}/existing-asset-tag-refs.txt"
+          tag_commit=""
+          if [ -s "${RUNNER_TEMP}/existing-asset-tag-refs.txt" ]; then
+            tag_commit="$(python3 bridge-source/scripts/release_contract.py resolve-tag-commit \
+              --ls-remote "${RUNNER_TEMP}/existing-asset-tag-refs.txt" \
+              --tag "${RELEASE_TAG}")"
           fi
           if [ -n "${tag_commit}" ]; then
             git -C assets-repo fetch --force origin \
               "refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"
+            if [ "$(git -C assets-repo rev-parse "refs/tags/${RELEASE_TAG}^{commit}")" != "${tag_commit}" ]; then
+              echo "error: fetched asset release tag changed after immutable resolution"
+              exit 1
+            fi
           fi
 
           release_args=()
@@ -684,14 +720,23 @@ jobs:
             git -C assets-repo fetch --force origin \
               "+refs/heads/${ASSETS_BRANCH}:refs/remotes/origin/${ASSETS_BRANCH}"
             branch_commit="$(git -C assets-repo rev-parse "refs/remotes/origin/${ASSETS_BRANCH}")"
-            tag_lines="$(git -C assets-repo ls-remote origin \
-              "refs/tags/${RELEASE_TAG}" "refs/tags/${RELEASE_TAG}^{}")"
-            tag_commit="$(awk '$2 ~ /\^\{\}$/ {print $1}' <<<"${tag_lines}")"
-            [ -n "${tag_commit}" ] || tag_commit="$(awk 'NR == 1 {print $1}' <<<"${tag_lines}")"
+            git -C assets-repo ls-remote origin \
+              "refs/tags/${RELEASE_TAG}" "refs/tags/${RELEASE_TAG}^{}" \
+              > "${RUNNER_TEMP}/current-asset-tag-refs.txt"
+            tag_commit=""
+            if [ -s "${RUNNER_TEMP}/current-asset-tag-refs.txt" ]; then
+              tag_commit="$(python3 bridge-source/scripts/release_contract.py resolve-tag-commit \
+                --ls-remote "${RUNNER_TEMP}/current-asset-tag-refs.txt" \
+                --tag "${RELEASE_TAG}")"
+            fi
             tag_args=()
             if [ -n "${tag_commit}" ]; then
               git -C assets-repo fetch --force origin \
                 "refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"
+              if [ "$(git -C assets-repo rev-parse "refs/tags/${RELEASE_TAG}^{commit}")" != "${tag_commit}" ]; then
+                echo "error: fetched asset release tag changed after immutable resolution"
+                return 1
+              fi
               tag_args=(--tag-commit "${tag_commit}")
             fi
             release_args=()

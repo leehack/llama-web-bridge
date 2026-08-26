@@ -16,7 +16,6 @@ from generate_release_manifest import ARTIFACTS, CAPABILITIES, QUALIFICATION_GAT
 from release_contract import (
     ASSETS_REPOSITORY,
     BRIDGE_REPOSITORY,
-    Channel,
     NATIVE_REPOSITORY,
     ContractError,
     Transition,
@@ -26,6 +25,7 @@ from release_contract import (
     parse_upstream_tag,
     require_correlation_id,
     require_sha256,
+    validate_native_identity,
 )
 
 
@@ -86,9 +86,15 @@ def validate_candidate(directory: Path, identity: CandidateIdentity) -> str:
     release = parse_release_tag(identity.release_tag)
     if release.rebuild != identity.release_rebuild:
         raise ContractError("release_rebuild does not match release_tag")
-    upstream = parse_upstream_tag(identity.upstream_tag)
-    if release.channel != upstream.channel or release.upstream_parts != upstream.parts:
-        raise ContractError("release_tag does not preserve upstream identity")
+    # Bridge asset versions are independent of llama.cpp versions; both tags are
+    # still syntactically exact and are recorded separately in the manifest.
+    parse_upstream_tag(identity.upstream_tag)
+    native_release = parse_release_tag(identity.native_release_tag)
+    validate_native_identity(
+        identity.native_release_tag,
+        native_release.rebuild,
+        identity.upstream_tag,
+    )
     _require_commit(identity.bridge_commit, "bridge_commit")
     _require_commit(identity.upstream_commit, "upstream_commit")
     _require_commit(identity.native_commit, "native_commit")
@@ -221,70 +227,92 @@ def _manifest_history_identity(
         raise ContractError(f"assets branch manifest is invalid: {error}") from error
     if not isinstance(manifest, Mapping):
         raise ContractError("assets branch manifest root must be an object")
-    release_tag = manifest.get("release_tag", manifest.get("bridge_assets_tag"))
-    upstream_tag = manifest.get("upstream_tag", manifest.get("llama_cpp_tag"))
+    release_tag = manifest.get("release_tag")
+    legacy_release_tag = manifest.get("bridge_assets_tag")
+    if release_tag is None:
+        release_tag = legacy_release_tag
+    elif legacy_release_tag is not None and legacy_release_tag != release_tag:
+        raise ContractError("assets branch manifest release tag aliases conflict")
+    upstream_tag = manifest.get("upstream_tag")
+    legacy_upstream_tag = manifest.get("llama_cpp_tag")
+    if upstream_tag is None:
+        upstream_tag = legacy_upstream_tag
+    elif legacy_upstream_tag is not None and legacy_upstream_tag != upstream_tag:
+        raise ContractError("assets branch manifest upstream tag aliases conflict")
     if not isinstance(release_tag, str) or not isinstance(upstream_tag, str):
         raise ContractError("assets branch manifest is missing release/upstream tags")
+    # Both identities are read exactly as recorded. Bridge asset versions have
+    # always been independent of the llama.cpp line, in every schema, so neither
+    # tag may be fabricated from the other.
     release = parse_release_tag(release_tag, allow_legacy=True)
     upstream = parse_upstream_tag(upstream_tag)
-    if (
-        release.channel == upstream.channel
-        and release.upstream_parts == upstream.parts
-    ):
-        return release.tag, upstream.tag
-    if manifest.get("schema_version") == 2:
-        raise ContractError(
-            "schema-v2 assets manifest release/upstream identities do not match"
-        )
-    # Historical manifests used a bridge package version independently from the
-    # llama.cpp line. For ordering only, treat that immutable artifact as the
-    # rebuild-0 boundary for its recorded upstream tag.
-    return upstream.tag, upstream.tag
+    return release.tag, upstream.tag
 
 
-def _previous_channel_identity(
-    repository: Path, commit: str, channel: Channel
-) -> tuple[str, str] | None:
+def _history_identities(repository: Path, commit: str) -> list[tuple[str, str]]:
+    """Read every recorded (release_tag, upstream_tag) newest-first."""
     history = _git(repository, "rev-list", "--first-parent", commit, text=True)
     if history.returncode != 0:
         raise ContractError("could not inspect assets branch channel history")
+    identities: list[tuple[str, str]] = []
     for index, history_commit in enumerate(history.stdout.splitlines()):
         previous = _manifest_history_identity(repository, history_commit)
         if previous is None:
             if index == 0:
                 raise ContractError("assets branch is missing manifest.json")
             continue
-        _, previous_upstream = previous
-        if parse_upstream_tag(previous_upstream).channel == channel:
-            return previous
-    return None
+        identities.append(previous)
+    return identities
 
 
 def _validate_transition(repository: Path, previous: str, identity: CandidateIdentity) -> None:
+    """Order the asset release and upstream lines independently, both fail-closed.
+
+    Asset release tags are ordered within their own channel, because stable and
+    development asset histories advance independently. The upstream llama.cpp
+    line is a single global line, so it is ordered against the newest recorded
+    entry regardless of which asset channel published it.
+    """
     candidate = parse_release_tag(identity.release_tag)
-    previous_identity = _previous_channel_identity(
-        repository, previous, candidate.channel
+    history = _history_identities(repository, previous)
+    previous_identity = next(
+        (
+            entry
+            for entry in history
+            if parse_release_tag(entry[0], allow_legacy=True).channel == candidate.channel
+        ),
+        None,
     )
+
     if previous_identity is None:
         if candidate.rebuild != 0:
             raise RollbackError(
                 "the first artifact in a release channel must use rebuild 0"
             )
-        return
-    previous_release, previous_upstream = previous_identity
-    try:
-        release_transition = compare_releases(previous_release, identity.release_tag)
-    except ContractError as error:
-        raise RollbackError(str(error)) from error
-    upstream_transition = compare_upstream(previous_upstream, identity.upstream_tag)
-    if release_transition == Transition.EQUAL:
-        raise ContractError(
-            f"release tag {identity.release_tag!r} already exists in channel history"
-        )
-    if release_transition != Transition.FORWARD:
-        raise RollbackError(f"release transition is {release_transition.value}")
-    if upstream_transition not in (Transition.EQUAL, Transition.FORWARD):
-        raise RollbackError(f"upstream transition is {upstream_transition.value}")
+    else:
+        previous_release, _ = previous_identity
+        try:
+            release_transition = compare_releases(previous_release, identity.release_tag)
+        except ContractError as error:
+            raise RollbackError(str(error)) from error
+        if release_transition == Transition.EQUAL:
+            raise ContractError(
+                f"release tag {identity.release_tag!r} already exists in channel history"
+            )
+        if release_transition != Transition.FORWARD:
+            raise RollbackError(f"release transition is {release_transition.value}")
+
+    if history:
+        _, latest_upstream = history[0]
+        upstream_transition = compare_upstream(latest_upstream, identity.upstream_tag)
+        # A development-to-stable upstream migration is a legal advance; only
+        # backward and stable-to-development moves are rollbacks.
+        if upstream_transition not in (
+            Transition.EQUAL,
+            Transition.FORWARD,
+            Transition.STABLE_MIGRATION,
+        ):
+            raise RollbackError(f"upstream transition is {upstream_transition.value}")
 
 
 def _validate_candidate_commit(

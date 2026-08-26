@@ -9,6 +9,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from release_contract import ContractError, parse_upstream_tag
+
 ROOT = Path(__file__).resolve().parents[1]
 
 # These files hand-copy the model/projector SHA-256 pins. A rotation that misses
@@ -669,7 +671,12 @@ def main() -> int:
     js_dts = read_required("js/llama_webgpu_bridge.d.ts", errors)
     cmake = read_required("CMakeLists.txt", errors)
     core = read_required("src/llama_webgpu_core.cpp", errors)
-    version = read_required("llama_cpp.version", errors).strip()
+    version_contents = read_required("llama_cpp.version", errors)
+    version = (
+        version_contents[:-1]
+        if version_contents.endswith("\n")
+        else version_contents
+    )
     emscripten_version = read_required("emsdk.version", errors).strip()
     agents = read_required("AGENTS.md", errors)
     readme = read_required("README.md", errors)
@@ -918,9 +925,17 @@ def main() -> int:
             errors,
         )
 
+    # The ordinary pin follows the same upstream channels the release contract
+    # emits, so a stable llama.cpp release is a valid development pin too.
+    try:
+        parse_upstream_tag(version)
+        version_is_exact = True
+    except ContractError:
+        version_is_exact = False
     require(
-        version.startswith("b") and version[1:].isdigit(),
-        "llama_cpp.version must contain a llama.cpp release tag like b9165",
+        version_is_exact and "\n" not in version and "\r" not in version,
+        "llama_cpp.version must contain one exact llama.cpp release tag: stable "
+        "vMAJOR.MINOR.PATCH like v0.2.0 or development bNNNN like b9165",
         errors,
     )
     require(
@@ -1237,6 +1252,56 @@ def main() -> int:
         and "git clone --depth 1 --branch \"${NATIVE_RELEASE_TAG}\"" in publish
         and "checked-out bridge source does not match the requested full SHA" in publish,
         "publication must verify exact bridge, upstream tag/commit, native tag/commit, and native manifest checksum identities",
+        errors,
+    )
+    native_request_validation = publish.find(
+        "scripts/release_contract.py validate-native-request"
+    )
+    upstream_tag_lookup = publish.find(
+        "git ls-remote https://github.com/ggml-org/llama.cpp.git"
+    )
+    native_tag_lookup = publish.find(
+        'git ls-remote "https://github.com/${NATIVE_REPO}.git"'
+    )
+    require(
+        "git ls-remote https://github.com/ggml-org/llama.cpp.git" in publish
+        and '"refs/tags/${UPSTREAM_TAG}" "refs/tags/${UPSTREAM_TAG}^{}"' in publish
+        and "resolved upstream tag commit does not match upstream_commit" in publish
+        and "git ls-remote \"https://github.com/${NATIVE_REPO}.git\"" in publish
+        and "\"refs/tags/${NATIVE_RELEASE_TAG}\" \"refs/tags/${NATIVE_RELEASE_TAG}^{}\""
+        in publish
+        and "scripts/release_contract.py resolve-tag-commit" in publish
+        and "NATIVE_TAG_COMMIT: ${{ steps.native_tag.outputs.native_tag_commit }}"
+        in publish
+        and "--native-tag-commit \"${NATIVE_TAG_COMMIT}\"" in publish
+        and "resolved native release tag commit does not match manifest native_commit"
+        in release_contract,
+        "publication must resolve the immutable native release tag commit itself and reject any release whose manifest native_commit differs, because target_commitish reports a mutable branch",
+        errors,
+    )
+    require(
+        0 <= native_request_validation < upstream_tag_lookup < native_tag_lookup
+        and "--native-release-tag \"${NATIVE_RELEASE_TAG}\"" in publish[
+            native_request_validation:native_tag_lookup
+        ]
+        and "--upstream-commit \"${UPSTREAM_COMMIT}\"" in publish[
+            native_request_validation:native_tag_lookup
+        ]
+        and "--manifest-sha256 \"${NATIVE_MANIFEST_SHA256}\"" in publish[
+            native_request_validation:native_tag_lookup
+        ],
+        "publication must validate native tag, upstream commit, and manifest SHA-256 inputs before the first native network request",
+        errors,
+    )
+    require(
+        publish.count(
+            "bridge-source/scripts/release_contract.py resolve-tag-commit"
+        )
+        == 2
+        and publish.count("fetched asset release tag changed after immutable resolution")
+        == 2
+        and "awk '$2 ~ /\\^\\{\\}$/ {print $1}'" not in publish,
+        "publication preflight and recovery must resolve existing asset tags with the strict annotated/lightweight tag parser and verify the fetched ref did not change",
         errors,
     )
     require(
