@@ -362,27 +362,107 @@ def decode_attestation(blob: str) -> tuple[dict[str, Any], str]:
     return payload, canonical
 
 
+REDACTED_CREDENTIAL = "<redacted-credential>"
+
+_CREDENTIAL_NAME_PATTERN = (
+    r"[A-Za-z0-9_-]*(?:token|secret|password|credential|api[_-]?key)"
+    r"[A-Za-z0-9_-]*"
+)
+_CREDENTIAL_NAME_RE = re.compile(rf"(?i)\A{_CREDENTIAL_NAME_PATTERN}\Z")
+_LLAMA_TOKEN_COUNTER_NAME_RE = re.compile(
+    r"(?i)\An_tokens(?:[_-][A-Za-z0-9_-]+)?\Z"
+)
+_CREDENTIAL_NAME_EXCEPT_PLURAL_TOKENS_RE = re.compile(
+    r"(?i)\A[A-Za-z0-9_-]*"
+    r"(?:token(?!s(?:\b|[_-]))|secret|password|credential|api[_-]?key)"
+    r"[A-Za-z0-9_-]*\Z"
+)
+_COUNTER_TEXT_VALUE_RE = re.compile(r"\A[0-9]+[.,;)}\]]?\Z")
+_CREDENTIAL_ASSIGNMENT_RE = re.compile(
+    rf'''(?im)(?:(?P<key_quote>["'])(?P<quoted_name>{_CREDENTIAL_NAME_PATTERN})'''
+    rf'''(?P=key_quote)|\b(?P<name>{_CREDENTIAL_NAME_PATTERN}))\s*[:=]\s*'''
+    r'''(?P<value>"(?:\\.|[^"\\\r\n])*"|'(?:\\.|[^'\\\r\n])*'|\S+)'''
+)
+_AUTHORIZATION_RE = re.compile(
+    r'''(?im)(?:"authorization"|'authorization'|\bauthorization)\s*:\s*'''
+    r'''(?:"(?:bearer|basic)\s+(?:\\.|[^"\\\r\n])*"|'''
+    r"'(?:bearer|basic)\s+(?:\\.|[^'\\\r\n])*'|"
+    r'''(?:bearer|basic)\s+\S+)'''
+)
+
+
+def _is_llama_token_counter_name(name: str) -> bool:
+    return (
+        _LLAMA_TOKEN_COUNTER_NAME_RE.fullmatch(name) is not None
+        and _CREDENTIAL_NAME_EXCEPT_PLURAL_TOKENS_RE.fullmatch(name) is None
+    )
+
+
+def _redact_credential_assignment(match: re.Match[str]) -> str:
+    name = match.group("name") or match.group("quoted_name")
+    if _is_llama_token_counter_name(name) and _COUNTER_TEXT_VALUE_RE.fullmatch(
+        match.group("value")
+    ):
+        return match.group(0)
+    return REDACTED_CREDENTIAL
+
+
 def sanitize_diagnostic_text(text: str) -> str:
     """Drop credentials, query strings, and fragments from any URL in diagnostics."""
     def replace(match: re.Match[str]) -> str:
-        parts = urlsplit(match.group(0))
+        candidate = match.group(0)
+        try:
+            parts = urlsplit(candidate)
+            if not parts.netloc or parts.hostname is None:
+                raise ValueError("HTTP(S) URL is missing its authority")
+            _ = parts.port
+        except ValueError:
+            return f"{candidate.split(':', 1)[0]}://<redacted-url>"
         netloc = parts.netloc.rsplit("@", 1)[-1]
         return urlunsplit((parts.scheme, netloc, parts.path, "", ""))
 
-    sanitized = re.sub(r"https?://[^\s\"'<>]+", replace, text)
-    sanitized = re.sub(
-        r"(?im)\bauthorization\s*:\s*(?:bearer|basic)\s+\S+",
-        "Authorization: <redacted>",
-        sanitized,
-    )
-    sanitized = re.sub(
-        r"(?im)\b(?:[A-Za-z0-9_-]*(?:token|secret|password|credential)"
-        r"[A-Za-z0-9_-]*|[A-Za-z0-9_-]*api[_-]?key[A-Za-z0-9_-]*)"
-        r"\s*[:=]\s*\S+",
-        "<redacted-credential>",
-        sanitized,
-    )
-    return sanitized
+    sanitized = re.sub(r"(?i)https?://[^\s\"'<>]+", replace, text)
+    sanitized = _AUTHORIZATION_RE.sub("Authorization: <redacted>", sanitized)
+    return _CREDENTIAL_ASSIGNMENT_RE.sub(_redact_credential_assignment, sanitized)
+
+
+def sanitize_diagnostic_value(value: Any) -> Any:
+    """Sanitize decoded JSON in place of its serialization, so it stays valid JSON."""
+    if isinstance(value, str):
+        return sanitize_diagnostic_text(value)
+    if isinstance(value, Mapping):
+        return {
+            (sanitize_diagnostic_text(key) if isinstance(key, str) else key): (
+                REDACTED_CREDENTIAL
+                if isinstance(key, str)
+                and (
+                    key.casefold() == "authorization"
+                    or (
+                        _CREDENTIAL_NAME_RE.fullmatch(key)
+                        and not (
+                            _is_llama_token_counter_name(key)
+                            and isinstance(item, int)
+                            and not isinstance(item, bool)
+                            and item >= 0
+                        )
+                    )
+                )
+                else sanitize_diagnostic_value(item)
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [sanitize_diagnostic_value(item) for item in value]
+    return value
+
+
+def sanitize_diagnostic_stdout(stdout: str) -> str:
+    """Sanitize child stdout without destroying the structure a reader needs."""
+    try:
+        payload = json.loads(stdout)
+    except json.JSONDecodeError:
+        return sanitize_diagnostic_text(stdout)
+    return json.dumps(sanitize_diagnostic_value(payload), ensure_ascii=True) + "\n"
 
 
 def harness_source_sha256(scripts_dir: Path) -> str:
@@ -1226,16 +1306,15 @@ def _stop_smoke_process(
 
 def _write_smoke_diagnostics(
     diagnostics_dir: Path, label: str, stdout: str, stderr: str
-) -> tuple[str, str]:
-    sanitized_stdout = sanitize_diagnostic_text(stdout)
+) -> str:
     sanitized_stderr = sanitize_diagnostic_text(stderr)
     (diagnostics_dir / f"{label}-stderr.log").write_text(
         sanitized_stderr, encoding="utf-8"
     )
     (diagnostics_dir / f"{label}-stdout.json").write_text(
-        sanitized_stdout, encoding="utf-8"
+        sanitize_diagnostic_stdout(stdout), encoding="utf-8"
     )
-    return sanitized_stdout, sanitized_stderr
+    return sanitized_stderr
 
 
 def _run_smoke(
@@ -1252,6 +1331,8 @@ def _run_smoke(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         env=_child_env(),
         start_new_session=os.name == "posix",
     )
@@ -1265,14 +1346,14 @@ def _run_smoke(
         stdout, stderr = _stop_smoke_process(proc)
         _write_smoke_diagnostics(diagnostics_dir, label, stdout, stderr)
         raise
-    stdout, stderr = _write_smoke_diagnostics(
+    sanitized_stderr = _write_smoke_diagnostics(
         diagnostics_dir, label, stdout, stderr
     )
     if timed_out:
-        sys.stderr.write(stderr)
+        sys.stderr.write(sanitized_stderr)
         raise ContractError(f"{label} gate timed out after {timeout_seconds:g} seconds")
     if proc.returncode != 0:
-        sys.stderr.write(stderr)
+        sys.stderr.write(sanitized_stderr)
         raise ContractError(f"{label} gate failed with exit status {proc.returncode}")
     try:
         payload = json.loads(stdout)

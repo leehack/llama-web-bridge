@@ -1859,6 +1859,229 @@ class QualificationTest(unittest.TestCase):
         self.assertIn("https://huggingface.co/model.gguf", sanitized)
         self.assertIn("https://example.com/a/b", sanitized)
 
+    def test_real_credentials_are_redacted_no_matter_where_they_appear(self) -> None:
+        raw = (
+            "Authorization: Basic dXNlcjpwYXNz\n"
+            "apiKey: plain-secret\n"
+            "MY_PASSWORD=hunter2\n"
+            "service.credential = cred-value\n"
+            "client_secret=shhh\n"
+            "fetch https://example.com/m.gguf?sig=abc#frag"
+        )
+        sanitized = rq.sanitize_diagnostic_text(raw)
+        for leaked in (
+            "dXNlcjpwYXNz",
+            "plain-secret",
+            "hunter2",
+            "cred-value",
+            "shhh",
+            "sig=abc",
+            "#frag",
+        ):
+            self.assertNotIn(leaked, sanitized)
+        self.assertIn("https://example.com/m.gguf", sanitized)
+
+    def test_malformed_url_diagnostic_is_redacted_without_raising(self) -> None:
+        raw = "failed https://user:pass@[broken?token=super-secret#frag"
+        sanitized = rq.sanitize_diagnostic_text(raw)
+        for leaked in ("user", "pass", "super-secret", "token=", "#frag"):
+            self.assertNotIn(leaked, sanitized)
+        self.assertIn("https://<redacted-url>", sanitized)
+
+    def test_malformed_url_authorities_are_redacted_without_leaking(self) -> None:
+        for raw in (
+            "https:///user:pass@example.com/model.gguf?token=secret#frag",
+            "https://user:password/model.gguf?token=secret#frag",
+        ):
+            with self.subTest(raw=raw):
+                self.assertEqual(
+                    rq.sanitize_diagnostic_text(raw),
+                    "https://<redacted-url>",
+                )
+
+    def test_url_sanitization_is_case_insensitive(self) -> None:
+        raw = "HTTPS://user:pass@example.com/m.gguf?sig=secret#frag"
+        sanitized = rq.sanitize_diagnostic_text(raw)
+        for leaked in ("user", "pass", "sig=secret", "#frag"):
+            self.assertNotIn(leaked, sanitized)
+        self.assertEqual(sanitized, "https://example.com/m.gguf")
+
+    def test_llama_token_counters_are_not_treated_as_credentials(self) -> None:
+        raw = (
+            "llama_context: n_tokens = 65\n"
+            "llama_context: n_tokens_batch = 65\n"
+            "decoded n_tokens=65 n_tokens_batch=65\n"
+        )
+        self.assertEqual(rq.sanitize_diagnostic_text(raw), raw)
+
+    def test_plural_token_credentials_do_not_use_the_counter_carveout(self) -> None:
+        raw = (
+            "access_tokens=access-secret\n"
+            'refresh_tokens_json="refresh secret"\n'
+            "n_tokens=counter-shaped-secret\n"
+            "n_tokens_secret=65\n"
+        )
+        sanitized = rq.sanitize_diagnostic_text(raw)
+        for leaked in ("access-secret", "refresh secret", "counter-shaped-secret"):
+            self.assertNotIn(leaked, sanitized)
+        self.assertNotIn("n_tokens_secret", sanitized)
+
+        structured = json.loads(
+            rq.sanitize_diagnostic_stdout(
+                json.dumps(
+                    {
+                        "access_tokens": "access-secret",
+                        "n_tokens": "counter-shaped-secret",
+                        "n_tokens_batch": 65,
+                        "n_tokens_api_key": 65,
+                    }
+                )
+            )
+        )
+        self.assertEqual(structured["access_tokens"], rq.REDACTED_CREDENTIAL)
+        self.assertEqual(structured["n_tokens"], rq.REDACTED_CREDENTIAL)
+        self.assertEqual(structured["n_tokens_batch"], 65)
+        self.assertEqual(structured["n_tokens_api_key"], rq.REDACTED_CREDENTIAL)
+
+    def test_credential_names_with_alphanumeric_suffixes_are_redacted(self) -> None:
+        raw = (
+            "tokenValue=token-secret\n"
+            "secretValue=secret-secret\n"
+            "passwordValue=password-secret\n"
+            "credentialValue=credential-secret\n"
+            "apiKeyV2=api-key-secret\n"
+        )
+        sanitized = rq.sanitize_diagnostic_text(raw)
+        for leaked in (
+            "token-secret",
+            "secret-secret",
+            "password-secret",
+            "credential-secret",
+            "api-key-secret",
+        ):
+            self.assertNotIn(leaked, sanitized)
+
+    def test_quoted_credential_assignment_values_are_fully_redacted(self) -> None:
+        raw = (
+            'PASSWORD="correct horse battery staple"\n'
+            "api_key='quoted api key'\n"
+        )
+        sanitized = rq.sanitize_diagnostic_text(raw)
+        for leaked in ("correct", "horse", "battery", "staple", "quoted", "api key"):
+            self.assertNotIn(leaked, sanitized)
+        self.assertEqual(
+            sanitized,
+            f"{rq.REDACTED_CREDENTIAL}\n{rq.REDACTED_CREDENTIAL}\n",
+        )
+
+    def test_quoted_credential_keys_are_redacted_in_text_fallback(self) -> None:
+        malformed_json = (
+            '{"apiKey": "plain secret", '
+            '"Authorization": "Bearer bearer-secret", '
+            '"password": "hunter2"'
+        )
+        sanitized = rq.sanitize_diagnostic_stdout(malformed_json)
+        self.assertNotIn("plain secret", sanitized)
+        self.assertNotIn("bearer-secret", sanitized)
+        self.assertNotIn("hunter2", sanitized)
+
+        counters = '"n_tokens": 65, "n_tokens_batch": 65'
+        self.assertEqual(rq.sanitize_diagnostic_text(counters), counters)
+
+    def test_structured_stdout_diagnostic_stays_valid_json(self) -> None:
+        diagnostics = self.tmp / "structured-diagnostics"
+        diagnostics.mkdir()
+        payload = {
+            "ok": True,
+            "note": 'n_tokens = 65\nsaid "hi"\tthen stopped',
+            "apiKey": "plain-secret",
+            "modeResults": [
+                {"log": "Authorization: Bearer ghp_must_not_escape", "n_tokens": 65}
+            ],
+            "modelUrl": "https://example.com/m.gguf?token=secret123#frag",
+        }
+        rq._write_smoke_diagnostics(
+            diagnostics, "structured", json.dumps(payload), ""
+        )
+        persisted = json.loads(
+            (diagnostics / "structured-stdout.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(persisted["note"], payload["note"])
+        self.assertEqual(persisted["modeResults"][0]["n_tokens"], 65)
+        self.assertEqual(persisted["apiKey"], "<redacted-credential>")
+        self.assertEqual(persisted["modelUrl"], "https://example.com/m.gguf")
+        self.assertNotIn("ghp_must_not_escape", persisted["modeResults"][0]["log"])
+        self.assertNotIn(
+            "secret123",
+            (diagnostics / "structured-stdout.json").read_text(encoding="utf-8"),
+        )
+
+    def test_structured_stdout_preserves_escaped_unicode_safely(self) -> None:
+        diagnostics = self.tmp / "unicode-diagnostics"
+        diagnostics.mkdir()
+        rq._write_smoke_diagnostics(
+            diagnostics, "unicode", r'{"ok":true,"note":"\ud800"}', ""
+        )
+        serialized = (diagnostics / "unicode-stdout.json").read_text(encoding="utf-8")
+        self.assertIn(r"\ud800", serialized)
+        self.assertEqual(json.loads(serialized)["note"], "\ud800")
+
+    def test_structured_authorization_values_are_redacted(self) -> None:
+        payload = {
+            "headers": {
+                "Authorization": "Bearer bearer-secret",
+                "authorization": "Basic basic-secret",
+            }
+        }
+        sanitized = json.loads(rq.sanitize_diagnostic_stdout(json.dumps(payload)))
+        self.assertEqual(
+            sanitized,
+            {
+                "headers": {
+                    "Authorization": "<redacted-credential>",
+                    "authorization": "<redacted-credential>",
+                }
+            },
+        )
+
+    def test_structured_keys_cannot_leak_urls_or_assignments(self) -> None:
+        payload = {
+            "https://user:pass@example.com/m.gguf?sig=secret#frag": "url-key",
+            "api_key=key-secret": "assignment-key",
+            "ordinary": {"n_tokens": 65},
+        }
+        serialized = rq.sanitize_diagnostic_stdout(json.dumps(payload))
+        sanitized = json.loads(serialized)
+        for leaked in ("user", "pass", "sig=secret", "#frag", "key-secret"):
+            self.assertNotIn(leaked, serialized)
+        self.assertEqual(sanitized["https://example.com/m.gguf"], "url-key")
+        self.assertEqual(sanitized[rq.REDACTED_CREDENTIAL], "assignment-key")
+        self.assertEqual(sanitized["ordinary"]["n_tokens"], 65)
+
+    def test_successful_child_is_parsed_from_raw_stdout(self) -> None:
+        import sys as _sys
+
+        diagnostics = self.tmp / "raw-stdout-diagnostics"
+        diagnostics.mkdir()
+        payload = {
+            "ok": True,
+            "note": "n_tokens = 65 n_tokens_batch = 65",
+            "modelUrl": "https://example.com/m.gguf?token=secret123",
+        }
+        program = f"import json,sys; sys.stdout.write({json.dumps(json.dumps(payload))})"
+        parsed = rq._run_smoke(
+            [_sys.executable, "-c", program],
+            "raw-probe",
+            diagnostics,
+            timeout_seconds=30,
+        )
+        self.assertEqual(parsed, payload)
+        persisted = json.loads(
+            (diagnostics / "raw-probe-stdout.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(persisted["note"], payload["note"])
+        self.assertEqual(persisted["modelUrl"], "https://example.com/m.gguf")
+
     def test_max_rss_is_reported_in_bytes(self) -> None:
         import subprocess
         import sys as _sys
@@ -1907,6 +2130,36 @@ class QualificationTest(unittest.TestCase):
         self.assertIn("timed out", str(ctx.exception))
         diagnostic = (diagnostics / "timeout-probe-stderr.log").read_text()
         self.assertNotIn("secret", diagnostic)
+
+    def test_malformed_child_output_still_writes_sanitized_diagnostics(self) -> None:
+        import sys as _sys
+
+        diagnostics = self.tmp / "malformed-diagnostics"
+        diagnostics.mkdir()
+        program = (
+            "import sys; "
+            "sys.stdout.buffer.write(b'GH_TOKEN=stdout-secret\\nbad\\xff'); "
+            "sys.stderr.buffer.write(b'api_key=stderr-secret\\nbad\\xff'); "
+            "raise SystemExit(1)"
+        )
+        captured_stderr = io.StringIO()
+        with contextlib.redirect_stderr(captured_stderr):
+            with self.assertRaises(ContractError) as ctx:
+                rq._run_smoke(
+                    [_sys.executable, "-c", program],
+                    "malformed-probe",
+                    diagnostics,
+                    timeout_seconds=30,
+                )
+        self.assertIn("failed with exit status 1", str(ctx.exception))
+        persisted = (
+            (diagnostics / "malformed-probe-stdout.json").read_text(encoding="utf-8")
+            + (diagnostics / "malformed-probe-stderr.log").read_text(encoding="utf-8")
+            + captured_stderr.getvalue()
+        )
+        self.assertNotIn("stdout-secret", persisted)
+        self.assertNotIn("stderr-secret", persisted)
+        self.assertIn("\ufffd", persisted)
 
     def test_harness_digest_covers_every_heavy_gate_source(self) -> None:
         scripts_dir = Path(__file__).resolve().parent
