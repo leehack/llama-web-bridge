@@ -99,8 +99,31 @@ python3 scripts/multimodal_browser_smoke.py \
   --artifacts-dir /private/tmp/llama_web_bridge_multimodal_smoke_artifacts
 ```
 
-Before publishing assets intended for typed Qwen3-ASR, also run the opt-in
-speech smoke in wasm32 and memory64, through direct and worker runtimes:
+Heavy Qwen3-ASR and Qwen3-TTS gates never run on hosted runners. Before
+publishing, run the one required local qualification command against the exact
+candidate artifact produced by `.github/workflows/bridge_candidate.yml`:
+
+```bash
+python3 scripts/release_qualification.py qualify \
+  --candidate-run-id <CANDIDATE_RUN_ID> \
+  --speech-model-path /path/to/Qwen3-ASR-0.6B-Q8_0.gguf \
+  --speech-mmproj-path /path/to/mmproj-Qwen3-ASR-0.6B-Q8_0.gguf \
+  --speech-audio-path /path/to/asr_en.wav \
+  --tts-model-path /path/to/Qwen3-TTS-12Hz-1.7B-Base-Q4_K_M.gguf \
+  --tts-mmproj-path /path/to/mmproj-Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf \
+  --output-attestation /private/tmp/qualification-attestation.json \
+  --output-base64 /private/tmp/qualification-attestation.b64
+```
+
+Every model, projector, and fixture path is required. Smoke children receive a
+narrow non-secret environment allowlist, each gate has a bounded timeout, and
+the full process group is terminated on timeout or cancellation. The command
+never accepts an unprovenanced local dist and rejects local harness bytes that
+do not match the exact candidate bridge commit. Dispatch the resulting base64
+payload to `.github/workflows/qualification_attestation.yml` with the same
+candidate run ID.
+
+Run individual smokes when testing isolated changes:
 
 ```bash
 python3 scripts/speech_to_text_browser_smoke.py \
@@ -110,10 +133,6 @@ python3 scripts/speech_to_text_browser_smoke.py \
   --mmproj-path /path/to/mmproj-Qwen3-ASR-0.6B-Q8_0.gguf \
   --mmproj-sha256 41a342b5e4c514e968cb756de6cd1b7be39eff43c44c57a2ef5fc6522e36603d
 ```
-
-Before publishing assets intended for Qwen3-TTS, run the checksum-pinned
-memory64 smoke through direct and worker runtimes. The validated 1.48 GB pair is
-not a practical wasm32 product path:
 
 ```bash
 python3 scripts/text_to_speech_browser_smoke.py \
@@ -127,9 +146,10 @@ python3 scripts/text_to_speech_browser_smoke.py \
   --gpu-layers 99
 ```
 
-Keep this gate opt-in in ordinary CI because the pair is large and
-memory64-only in practice. The asset release workflow must run it for every
-publication because the bridge exposes Qwen3-TTS.
+The candidate manifest records `speech_to_text` and `text_to_speech` as
+`required-local-attestation`, never as a hosted pass. Publication fails closed
+unless a verified attestation from an exact successful ingestion run binds the
+candidate digest it is about to publish.
 
 ## CI / Release
 
@@ -139,6 +159,27 @@ publication because the bridge exposes Qwen3-TTS.
     `emcc` identity, and contract-tests all five required wasm64 WASMFS patches.
   - Never dispatches asset publication. Bridge source changes, including changes
     to the default development pin, use ordinary PRs and ordinary CI.
+- Candidate build: `.github/workflows/bridge_candidate.yml`
+  - The only workflow that builds publishable assets. It builds wasm32 and
+    memory64 once, runs the compiler, contract, state-persistence, and
+    multimodal gates it can afford, generates the schema-v2 manifest against its
+    own run ID/URL, and uploads `exact-webgpu-bridge-dist` plus an honest
+    `bridge-candidate-prequalification` record.
+  - Holds no publication environment and no PAT. Nothing rebuilds its artifact:
+    a rebuild would change the manifest, and therefore the digest, so no
+    attestation could ever match what is published. The workflow refuses
+    `github.run_attempt != 1`; dispatch a new candidate after failure rather than
+    rerunning it.
+- Attestation ingestion: `.github/workflows/qualification_attestation.yml`
+  - Maintainer-only. Takes the candidate run ID and a bounded single-line
+    base64 attestation; a raw multiline JSON input is not accepted.
+  - Proves the candidate run is a successful `bridge_candidate.yml`
+    `workflow_dispatch` in this repository whose head is on the default-branch
+    line whose complete inventory has exactly one live
+    `exact-webgpu-bridge-dist` artifact, downloads it by immutable artifact ID,
+    checks out the exact candidate source to recompute the harness digest,
+    decodes and canonicality-checks the payload, re-verifies it, and uploads
+    `qualification-attestation` using existing repository access and no PAT.
 - Native-aligned candidate scan: `.github/workflows/auto_llama_cpp_update.yml`
   - Scheduled/manual runs download the selected native `assets.json`, validate
     its exact upstream/native identities, and upload `release-candidate.json`.
@@ -148,27 +189,36 @@ publication because the bridge exposes Qwen3-TTS.
   - Keep this script updated when changing browser smoke behavior, action
     versions, JS build/type-checking, or workflow diagnostics.
   - Requires the 7 model/projector SHA-256 pins to be one identical set across
-    the five files that hard-code them, and role-consistent between the two
-    workflows. CONTRIBUTING.md owns the rotation rules and the residual gaps.
-  - CI and publish must run `npm run check:js`, which regenerates the checked-in
+    the five files that hard-code them -- `README.md`, `AGENTS.md`,
+    `CONTRIBUTING.md`, `ci.yml`, and `bridge_candidate.yml` -- and
+    role-consistent between the two workflows. CONTRIBUTING.md owns the rotation
+    rules and the residual gaps.
+  - CI, candidate, and publish must run `npm run check:js`, which regenerates the checked-in
     generated bridge wrapper outputs and declarations, and then fail with
     `git diff --exit-code` if those generated outputs are stale.
   - The CI smoke must use a pinned tiny GGUF URL plus SHA-256, cache the model in
     the same expanded `~/.cache/llama-web-bridge/state-smoke-models` directory
     used by `actions/cache`, and upload `state-persistence-smoke-artifacts` on
     failure.
-  - Both CI and publish workflows intentionally set
+  - CI, candidate, ingestion, and publish workflows intentionally set
     `FORCE_JAVASCRIPT_ACTIONS_TO_NODE24` so action-runtime regressions are caught
     before Node 20 deprecation becomes a hard failure.
 - Publish workflow: `.github/workflows/publish_assets.yml`
   - Is a bridge-owned, non-reusable manual workflow that the central orchestrator
-    may dispatch through GitHub's API. This keeps the environment gate in the
-    bridge repository rather than the caller context. It requires an orchestrator
+    may dispatch through GitHub's API using the repository owner's existing
+    authorized identity; other dispatch actors are rejected. This keeps the
+    environment gate in the bridge repository rather than the caller context. It requires an orchestrator
     correlation ID, exact bridge source SHA, upstream tag/commit, native tag plus
-    manifest SHA-256, output tag/rebuild, and assets repository inputs. It does
-    not read `llama_cpp.version`.
-  - Uses the same `emsdk.version` compiler identity as CI and records the
-    runtime-verified version in `manifest.json`.
+    manifest SHA-256, output tag/rebuild, required distinct `candidate_run_id`
+    and `attestation_run_id`, and assets repository inputs. It does not read
+    `llama_cpp.version`.
+  - Never builds. It downloads the exact candidate artifact from
+    `candidate_run_id` and the attestation from `attestation_run_id` by immutable
+    artifact ID after proving both runs' repository, workflow file, dispatch
+    event, default-branch-line head, success, complete inventory, and artifact
+    uniqueness.
+  - Compares the candidate manifest's `emscripten_version` against the
+    `emsdk.version` pin at the exact bridge source SHA.
   - Requires `publish_approved=true`. Publication remains blocked until an
     administrator externally creates `bridge-assets-publication`, disables
     administrator bypass, restricts custom deployment branches to `main`, and
@@ -189,9 +239,15 @@ publication because the bridge exposes Qwen3-TTS.
     identity/checksum mismatches, and unmerged bridge source commits.
   - Transports dispatch inputs through workflow environment variables; never
     embed `${{ inputs.* }}` directly in a shell `run` block.
-  - Builds exact wasm32/memory64 assets and always runs state, multimodal, ASR,
-    and TTS durable release smokes; callers cannot downgrade exposed
-    capabilities.
+  - Verifies the digest-bound attestation twice: once before approval and again
+    inside the privileged job against the artifact it is about to publish. The
+    attestation must match the candidate fingerprint, bridge/upstream/native
+    identities, compiler, release tag/rebuild, correlation ID, candidate run ID,
+    harness source digest, every required gate, and every required ASR/TTS
+    memory and runtime mode.
+  - Records the candidate run ID/URL as the publication identity, because that
+    is what the candidate manifest embeds. Retry by redispatching against the
+    same candidate and attestation runs.
   - Publishes schema-v2 provenance with release tag, capabilities, bridge,
     upstream, and native commits, exact run ID/URL, mandatory gate conclusions,
     correlation ID, and per-artifact SHA-256 values. An unreadable post-mutation
@@ -235,5 +291,6 @@ After publishing assets tag:
 - Every llama.cpp pin update must pass checksum-pinned real multimodal inference
   in both direct and worker runtimes; a successful WASM build alone is not
   sufficient.
-- Speech-capable asset releases must also pass the opt-in Qwen3-ASR smoke in
-  wasm32 and memory64; keep the large model pair out of default CI.
+- Speech-capable asset releases must pass the required local qualification in
+  wasm32 and memory64; never run the large Qwen3-ASR/Qwen3-TTS pairs on hosted
+  runners.

@@ -1,4 +1,4 @@
-name: Build and Publish Exact Bridge Assets
+name: Publish Exact Qualified Bridge Assets
 
 on:
   # This workflow is intentionally bridge-owned and non-reusable. A central
@@ -47,6 +47,14 @@ on:
         description: Explicit approval recorded by the dispatching orchestrator
         required: true
         type: boolean
+      candidate_run_id:
+        description: Required Build Exact Bridge Candidate run ID that produced the candidate to publish
+        required: true
+        type: string
+      attestation_run_id:
+        description: Required workflow run ID that ingested the maintainer qualification attestation
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -66,6 +74,19 @@ env:
   REQUESTED_ASSETS_REPO: ${{ inputs.assets_repo }}
   ASSETS_REPO: leehack/llama-web-bridge-assets
   ORCHESTRATOR_CORRELATION_ID: ${{ inputs.orchestrator_correlation_id }}
+  DISPATCHING_ACTOR: ${{ github.triggering_actor }}
+  REPOSITORY_OWNER: ${{ github.repository_owner }}
+  CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
+  ATTESTATION_RUN_ID: ${{ inputs.attestation_run_id }}
+  CANDIDATE_WORKFLOW_PATH: .github/workflows/bridge_candidate.yml
+  ATTESTATION_WORKFLOW_PATH: .github/workflows/qualification_attestation.yml
+  CANDIDATE_ARTIFACT_NAME: exact-webgpu-bridge-dist
+  ATTESTATION_ARTIFACT_NAME: qualification-attestation
+  # The candidate run is the artifact's provenance of record. Its ID and URL are
+  # what the candidate manifest embeds, so they -- not this publication run --
+  # are the identity every publication-state comparison is made against.
+  CANDIDATE_RUN_ID_STRING: ${{ inputs.candidate_run_id }}
+  CANDIDATE_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ inputs.candidate_run_id }}
   GITHUB_RUN_ID_STRING: ${{ github.run_id }}
   GITHUB_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
 
@@ -96,8 +117,32 @@ jobs:
             echo "error: publication workflow must execute in ${BRIDGE_REPO}"
             exit 1
           fi
+          if [ "${DISPATCHING_ACTOR}" != "${REPOSITORY_OWNER}" ]; then
+            echo "error: publication dispatch is restricted to ${REPOSITORY_OWNER}"
+            exit 1
+          fi
+          if [ "${GITHUB_ACTOR}" != "${REPOSITORY_OWNER}" ]; then
+            echo "error: publication actor is restricted to ${REPOSITORY_OWNER}"
+            exit 1
+          fi
+          if [ "${GITHUB_RUN_ATTEMPT}" != "1" ]; then
+            echo "error: publication run_attempt must be 1"
+            exit 1
+          fi
           if [[ ! "${ORCHESTRATOR_CORRELATION_ID}" =~ ^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$ ]]; then
             echo "error: invalid orchestrator_correlation_id"
+            exit 1
+          fi
+          if [[ ! "${CANDIDATE_RUN_ID}" =~ ^[1-9][0-9]*$ ]]; then
+            echo "error: candidate_run_id must be a positive integer"
+            exit 1
+          fi
+          if [[ ! "${ATTESTATION_RUN_ID}" =~ ^[1-9][0-9]*$ ]]; then
+            echo "error: attestation_run_id must be a positive integer"
+            exit 1
+          fi
+          if [ "${CANDIDATE_RUN_ID}" = "${ATTESTATION_RUN_ID}" ]; then
+            echo "error: candidate and attestation runs must be distinct runs"
             exit 1
           fi
           if [[ ! "${BRIDGE_SOURCE_SHA}" =~ ^[0-9a-f]{40}$ ]]; then
@@ -117,39 +162,26 @@ jobs:
             exit 1
           fi
 
-  build-and-gate:
-    name: Build exact source and run release gates
+  verify-candidate-and-attestation:
+    name: Verify the exact candidate and its maintainer qualification attestation
     needs: verify-publication-environment
     runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
     outputs:
       native_commit: ${{ steps.native.outputs.native_commit }}
       emscripten_version: ${{ steps.emscripten.outputs.emscripten_version }}
-    env:
-      LLAMA_WEBGPU_SMOKE_MODEL_URL: https://huggingface.co/aladar/llama-2-tiny-random-GGUF/resolve/main/llama-2-tiny-random.gguf
-      LLAMA_WEBGPU_SMOKE_MODEL_SHA256: 81f226c62d28ed4a1a9b9fa080fcd9f0cc40e0f9d5680036583ff98fbcd035cb
-      LLAMA_WEBGPU_SMOKE_MODEL_CACHE: ~/.cache/llama-web-bridge/state-smoke-models
-      LLAMA_WEBGPU_SMOKE_ARTIFACTS_DIR: /tmp/state-persistence-smoke-artifacts
-      LLAMA_WEBGPU_MULTIMODAL_MODEL_URL: https://huggingface.co/unsloth/Qwen3.5-0.8B-GGUF/resolve/main/Qwen3.5-0.8B-Q4_K_M.gguf
-      LLAMA_WEBGPU_MULTIMODAL_MODEL_SHA256: bd258782e35f7f458f8aced1adc053e6e92e89bc735ba3be89d38a06121dc517
-      LLAMA_WEBGPU_MULTIMODAL_MMPROJ_URL: https://huggingface.co/unsloth/Qwen3.5-0.8B-GGUF/resolve/main/mmproj-F16.gguf
-      LLAMA_WEBGPU_MULTIMODAL_MMPROJ_SHA256: 56e4c6cfe73b0c82e3e82bc518d7591997e61d81f723fc41a586f4fa69ea2453
-      LLAMA_WEBGPU_MULTIMODAL_MODEL_CACHE: ~/.cache/llama-web-bridge/multimodal-smoke-models
-      LLAMA_WEBGPU_MULTIMODAL_ARTIFACTS_DIR: /tmp/multimodal-smoke-artifacts
-      LLAMA_WEBGPU_MULTIMODAL_TIMEOUT_MS: 420000
-      LLAMA_WEBGPU_SPEECH_MODEL_URL: https://huggingface.co/ggml-org/Qwen3-ASR-0.6B-GGUF/resolve/928ab958557df9aa2ef1c93e0e83c7ad0933fae2/Qwen3-ASR-0.6B-Q8_0.gguf?download=true
-      LLAMA_WEBGPU_SPEECH_MODEL_SHA256: bca259818b50ca7c4c05e9bdb35a5dc04fa039653a6d6f3f0f331f96f6aa1971
-      LLAMA_WEBGPU_SPEECH_MMPROJ_URL: https://huggingface.co/ggml-org/Qwen3-ASR-0.6B-GGUF/resolve/928ab958557df9aa2ef1c93e0e83c7ad0933fae2/mmproj-Qwen3-ASR-0.6B-Q8_0.gguf?download=true
-      LLAMA_WEBGPU_SPEECH_MMPROJ_SHA256: 41a342b5e4c514e968cb756de6cd1b7be39eff43c44c57a2ef5fc6522e36603d
-      LLAMA_WEBGPU_SPEECH_MODEL_CACHE: ~/.cache/llama-web-bridge/speech-smoke-models
-      LLAMA_WEBGPU_SPEECH_ARTIFACTS_DIR: /tmp/speech-to-text-smoke-artifacts
-      LLAMA_WEBGPU_SPEECH_TIMEOUT_MS: 900000
-      LLAMA_WEBGPU_TTS_MODEL_URL: https://huggingface.co/ggml-org/Qwen3-TTS-12Hz-1.7B-Base-GGUF/resolve/ca27d74bc954b73dadab5b71ca265d87fc861a7c/Qwen3-TTS-12Hz-1.7B-Base-Q4_K_M.gguf?download=true
-      LLAMA_WEBGPU_TTS_MODEL_SHA256: 8d18c94acb2addd042f97da63c98be144eafa76d0d9495177eab65130cf85129
-      LLAMA_WEBGPU_TTS_MMPROJ_URL: https://huggingface.co/ggml-org/Qwen3-TTS-12Hz-1.7B-Base-GGUF/resolve/ca27d74bc954b73dadab5b71ca265d87fc861a7c/mmproj-Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf?download=true
-      LLAMA_WEBGPU_TTS_MMPROJ_SHA256: 6fd65188839bcd6ecc91b277ad471e22a0edfada4699a0fe82f1165c18cfcce2
-      LLAMA_WEBGPU_TTS_MODEL_CACHE: ~/.cache/llama-web-bridge/text-to-speech-smoke-models
-      LLAMA_WEBGPU_TTS_ARTIFACTS_DIR: /tmp/text-to-speech-smoke-artifacts
+      candidate_fingerprint: ${{ steps.attestation.outputs.candidate_fingerprint }}
+      candidate_artifact_id: ${{ steps.runs.outputs.candidate_artifact_id }}
     steps:
+      - name: Checkout trusted candidate verification policy
+        uses: actions/checkout@v4
+        with:
+          repository: leehack/llama-web-bridge
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
       - name: Checkout exact bridge source
         uses: actions/checkout@v4
         with:
@@ -157,11 +189,12 @@ jobs:
           ref: ${{ env.BRIDGE_SOURCE_SHA }}
           fetch-depth: 0
           persist-credentials: false
+          path: bridge-source
 
       - name: Validate exact bridge and release inputs
         run: |
           set -euo pipefail
-          if [[ ! "${BRIDGE_SOURCE_SHA}" =~ ^[0-9a-f]{40}$ ]] || [ "$(git rev-parse HEAD)" != "${BRIDGE_SOURCE_SHA}" ]; then
+          if [[ ! "${BRIDGE_SOURCE_SHA}" =~ ^[0-9a-f]{40}$ ]] || [ "$(git -C bridge-source rev-parse HEAD)" != "${BRIDGE_SOURCE_SHA}" ]; then
             echo "error: checked-out bridge source does not match the requested full SHA"
             exit 1
           fi
@@ -183,6 +216,27 @@ jobs:
           require_repository(sys.argv[1], "assets_repo")
           require_repository(sys.argv[2], "native_repo")
           PY
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Validate generated JS and release contracts
+        run: |
+          npm ci --ignore-scripts
+          npm run check:js
+          git ls-files --error-unmatch js/llama_webgpu_bridge.js js/llama_webgpu_bridge_worker.js js/llama_webgpu_bridge.d.ts
+          git diff --exit-code -- js/llama_webgpu_bridge.js js/llama_webgpu_bridge_worker.js js/llama_webgpu_bridge.d.ts
+          python3 scripts/release_contract_test.py
+          python3 scripts/generate_release_manifest_test.py
+          python3 scripts/release_publication_state_test.py
+          python3 scripts/release_qualification_test.py
+          python3 scripts/verify_state_persistence_api.py
+          python3 scripts/verify_text_to_speech_api.py
+          python3 scripts/wasm64_runtime_patch_contract_test.py
+          python3 scripts/verify_ci_reliability.py
 
       - name: Resolve immutable upstream and native release tag commits
         id: native_tag
@@ -252,167 +306,150 @@ jobs:
             exit 1
           fi
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 24
-          cache: npm
-
-      - name: Validate generated JS and release contracts
-        run: |
-          npm ci --ignore-scripts
-          npm run check:js
-          git ls-files --error-unmatch js/llama_webgpu_bridge.js js/llama_webgpu_bridge_worker.js js/llama_webgpu_bridge.d.ts
-          git diff --exit-code -- js/llama_webgpu_bridge.js js/llama_webgpu_bridge_worker.js js/llama_webgpu_bridge.d.ts
-          python3 scripts/release_contract_test.py
-          python3 scripts/generate_release_manifest_test.py
-          python3 scripts/release_publication_state_test.py
-          python3 scripts/verify_state_persistence_api.py
-          python3 scripts/verify_text_to_speech_api.py
-          python3 scripts/wasm64_runtime_patch_contract_test.py
-          python3 scripts/verify_ci_reliability.py
-
       - name: Resolve Emscripten SDK pin
         id: emscripten
         run: |
-          EMSCRIPTEN_VERSION="$(python3 scripts/verify_emscripten_version.py --print-pin)"
+          EMSCRIPTEN_VERSION="$(python3 bridge-source/scripts/verify_emscripten_version.py --print-pin)"
           echo "EMSCRIPTEN_VERSION=${EMSCRIPTEN_VERSION}" >> "${GITHUB_ENV}"
           echo "emscripten_version=${EMSCRIPTEN_VERSION}" >> "${GITHUB_OUTPUT}"
 
-      - name: Setup pinned Emscripten SDK
-        uses: mymindstorm/setup-emsdk@v14
-        with:
-          version: ${{ env.EMSCRIPTEN_VERSION }}
-
-      - name: Verify compiler and build wasm32 plus memory64
+      - name: Prove the candidate and attestation run identities
+        id: runs
         env:
-          OUT_DIR: ${{ runner.temp }}/webgpu_bridge_dist
-          WEBGPU_BRIDGE_BUILD_MEM64: 1
-        run: |
-          python3 scripts/verify_emscripten_version.py --emit-github-env "$GITHUB_ENV"
-          ./scripts/build_bridge.sh
-
-      - name: Cache release smoke models
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cache/llama-web-bridge/state-smoke-models
-            ~/.cache/llama-web-bridge/multimodal-smoke-models
-          key: release-smoke-${{ env.LLAMA_WEBGPU_SMOKE_MODEL_SHA256 }}-${{ env.LLAMA_WEBGPU_MULTIMODAL_MODEL_SHA256 }}-${{ env.LLAMA_WEBGPU_MULTIMODAL_MMPROJ_SHA256 }}
-
-      - name: Cache ASR models
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/llama-web-bridge/speech-smoke-models
-          key: speech-smoke-${{ env.LLAMA_WEBGPU_SPEECH_MODEL_SHA256 }}-${{ env.LLAMA_WEBGPU_SPEECH_MMPROJ_SHA256 }}
-
-      - name: Cache TTS models
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/llama-web-bridge/text-to-speech-smoke-models
-          key: text-to-speech-smoke-${{ env.LLAMA_WEBGPU_TTS_MODEL_SHA256 }}-${{ env.LLAMA_WEBGPU_TTS_MMPROJ_SHA256 }}
-
-      - name: Download verified TTS models
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          cache_dir="${LLAMA_WEBGPU_TTS_MODEL_CACHE/#\~/$HOME}"
-          mkdir -p "${cache_dir}"
-          model_path="${cache_dir}/Qwen3-TTS-12Hz-1.7B-Base-Q4_K_M.gguf"
-          mmproj_path="${cache_dir}/mmproj-Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf"
-          download_verified() {
-            local url="$1" sha="$2" path="$3"
-            if [ -f "${path}" ] && echo "${sha}  ${path}" | sha256sum --check --status; then return; fi
-            rm -f "${path}" "${path}.download"
-            curl --fail --location --retry 5 --retry-all-errors --output "${path}.download" "${url}"
-            echo "${sha}  ${path}.download" | sha256sum --check --status
-            mv "${path}.download" "${path}"
-          }
-          download_verified "${LLAMA_WEBGPU_TTS_MODEL_URL}" "${LLAMA_WEBGPU_TTS_MODEL_SHA256}" "${model_path}"
-          download_verified "${LLAMA_WEBGPU_TTS_MMPROJ_URL}" "${LLAMA_WEBGPU_TTS_MMPROJ_SHA256}" "${mmproj_path}"
-          echo "LLAMA_WEBGPU_TTS_MODEL_PATH=${model_path}" >> "${GITHUB_ENV}"
-          echo "LLAMA_WEBGPU_TTS_MMPROJ_PATH=${mmproj_path}" >> "${GITHUB_ENV}"
+          mkdir -p "${RUNNER_TEMP}/runs"
+          bridge_default="$(gh api "repos/${BRIDGE_REPO}" --jq '.default_branch')"
+          for pair in "candidate:${CANDIDATE_RUN_ID}:${CANDIDATE_WORKFLOW_PATH}:${CANDIDATE_ARTIFACT_NAME}" \
+                      "attestation:${ATTESTATION_RUN_ID}:${ATTESTATION_WORKFLOW_PATH}:${ATTESTATION_ARTIFACT_NAME}"; do
+            label="${pair%%:*}"; rest="${pair#*:}"
+            run_id="${rest%%:*}"; rest="${rest#*:}"
+            workflow_path="${rest%%:*}"; artifact_name="${rest#*:}"
+            run_attempt_args=(--run-attempt 1)
+            gh api "repos/${BRIDGE_REPO}/actions/runs/${run_id}" \
+              > "${RUNNER_TEMP}/runs/${label}-run.json"
+            gh api "repos/${BRIDGE_REPO}/actions/runs/${run_id}/artifacts?per_page=100" \
+              > "${RUNNER_TEMP}/runs/${label}-artifacts.json"
+            verification="$(python3 scripts/release_qualification.py verify-run \
+              --run-json "${RUNNER_TEMP}/runs/${label}-run.json" \
+              --artifacts-json "${RUNNER_TEMP}/runs/${label}-artifacts.json" \
+              --run-id "${run_id}" --workflow-path "${workflow_path}" \
+              --head-branch "${bridge_default}" --artifact-name "${artifact_name}" \
+              "${run_attempt_args[@]}" \
+            )"
+            head_sha="$(jq -er '.head_sha' <<<"${verification}")"
+            artifact_id="$(jq -er '.artifact_id' <<<"${verification}")"
+            if [ "${label}" = "candidate" ]; then
+              echo "CANDIDATE_ARTIFACT_ID=${artifact_id}" >> "${GITHUB_ENV}"
+              echo "candidate_artifact_id=${artifact_id}" >> "${GITHUB_OUTPUT}"
+            else
+              echo "ATTESTATION_ARTIFACT_ID=${artifact_id}" >> "${GITHUB_ENV}"
+            fi
+            run_status="$(gh api \
+              "repos/${BRIDGE_REPO}/compare/${head_sha}...${bridge_default}" \
+              --jq '.status')"
+            if [ "${run_status}" != "ahead" ] && [ "${run_status}" != "identical" ]; then
+              echo "error: ${label} run head ${head_sha} is not reachable from ${bridge_default}"
+              exit 1
+            fi
+          done
 
-      - name: Install Playwright Chromium
+      - name: Download the exact candidate artifact and its attestation
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          python3 -m pip install --user playwright
-          python3 -m playwright install chromium
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/candidate" "${RUNNER_TEMP}/attestation"
+          gh api -H "Accept: application/vnd.github+json" \
+            "repos/${BRIDGE_REPO}/actions/artifacts/${CANDIDATE_ARTIFACT_ID}/zip" \
+            > "${RUNNER_TEMP}/candidate.zip"
+          gh api -H "Accept: application/vnd.github+json" \
+            "repos/${BRIDGE_REPO}/actions/artifacts/${ATTESTATION_ARTIFACT_ID}/zip" \
+            > "${RUNNER_TEMP}/attestation.zip"
+          python3 - \
+            "${RUNNER_TEMP}/candidate.zip" "${RUNNER_TEMP}/candidate" \
+            "${RUNNER_TEMP}/attestation.zip" "${RUNNER_TEMP}/attestation" <<'PY'
+          import sys
+          from pathlib import Path
+          sys.path.insert(0, "scripts")
+          from release_qualification import _extract_flat_artifact_archive
+          _extract_flat_artifact_archive(
+              Path(sys.argv[1]), Path(sys.argv[2]), artifact_type="candidate"
+          )
+          _extract_flat_artifact_archive(
+              Path(sys.argv[3]), Path(sys.argv[4]), artifact_type="attestation"
+          )
+          PY
+          (cd "${RUNNER_TEMP}/candidate" && sha256sum --check sha256sums.txt)
 
-      - name: Run durable state persistence gate
-        id: state_gate
+      - name: Verify the attestation binds this exact candidate and every identity
+        id: attestation
         env:
-          BRIDGE_DIST_DIR: ${{ runner.temp }}/webgpu_bridge_dist
-        run: python3 scripts/state_persistence_browser_smoke.py
-
-      - name: Run durable multimodal gate
-        id: multimodal_gate
-        env:
-          BRIDGE_DIST_DIR: ${{ runner.temp }}/webgpu_bridge_dist
-        run: python3 scripts/multimodal_browser_smoke.py
-
-      - name: Run durable Qwen3-ASR gate
-        id: asr_gate
-        env:
-          BRIDGE_DIST_DIR: ${{ runner.temp }}/webgpu_bridge_dist
-        run: python3 scripts/speech_to_text_browser_smoke.py
-
-      - name: Run durable Qwen3-TTS memory64 gate
-        id: tts_gate
-        run: |
-          python3 scripts/text_to_speech_browser_smoke.py \
-            --dist-dir "${{ runner.temp }}/webgpu_bridge_dist" \
-            --model-path "${LLAMA_WEBGPU_TTS_MODEL_PATH}" --mmproj-path "${LLAMA_WEBGPU_TTS_MMPROJ_PATH}" \
-            --model-sha256 "${LLAMA_WEBGPU_TTS_MODEL_SHA256}" --mmproj-sha256 "${LLAMA_WEBGPU_TTS_MMPROJ_SHA256}" \
-            --memory-mode wasm64 --runtime-mode all --max-frames 24 \
-            --artifacts-dir "${LLAMA_WEBGPU_TTS_ARTIFACTS_DIR}"
-
-      - name: Generate schema-v2 manifest and checksums
-        env:
-          OUT_DIR: ${{ runner.temp }}/webgpu_bridge_dist
           NATIVE_COMMIT: ${{ steps.native.outputs.native_commit }}
         run: |
           set -euo pipefail
-          python3 scripts/generate_release_manifest.py \
-            --out-dir "${OUT_DIR}" --release-tag "${RELEASE_TAG}" --release-rebuild "${RELEASE_REBUILD}" \
-            --assets-repo "${ASSETS_REPO}" --bridge-repo "${BRIDGE_REPO}" --bridge-commit "${BRIDGE_SOURCE_SHA}" \
-            --upstream-tag "${UPSTREAM_TAG}" --upstream-commit "${UPSTREAM_COMMIT}" \
-            --native-repo "${NATIVE_REPO}" --native-release-tag "${NATIVE_RELEASE_TAG}" \
-            --native-manifest-sha256 "${NATIVE_MANIFEST_SHA256}" --native-commit "${NATIVE_COMMIT}" \
+          python3 scripts/release_qualification.py verify-attestation \
+            --attestation "${RUNNER_TEMP}/attestation/qualification-attestation.json" \
+            --candidate-dist "${RUNNER_TEMP}/candidate" \
+            --candidate-run-id "${CANDIDATE_RUN_ID}" \
+            --candidate-artifact-id "${CANDIDATE_ARTIFACT_ID}" \
+            --candidate-run-attempt 1 \
+            --harness-dir bridge-source/scripts \
+            --bridge-commit "${BRIDGE_SOURCE_SHA}" \
+            --upstream-tag "${UPSTREAM_TAG}" \
+            --upstream-commit "${UPSTREAM_COMMIT}" \
+            --native-release-tag "${NATIVE_RELEASE_TAG}" \
+            --native-manifest-sha256 "${NATIVE_MANIFEST_SHA256}" \
+            --native-commit "${NATIVE_COMMIT}" \
             --emscripten-version "${EMSCRIPTEN_VERSION}" \
-            --orchestrator-correlation-id "${ORCHESTRATOR_CORRELATION_ID}" \
-            --github-run-id "${GITHUB_RUN_ID_STRING}" --github-run-url "${GITHUB_RUN_URL}"
-          (cd "${OUT_DIR}" && sha256sum --check sha256sums.txt)
+            --release-tag "${RELEASE_TAG}" \
+            --release-rebuild "${RELEASE_REBUILD}" \
+            --orchestrator-correlation-id "${ORCHESTRATOR_CORRELATION_ID}"
+          FINGERPRINT="$(python3 scripts/release_qualification.py candidate-fingerprint \
+            --candidate-dist "${RUNNER_TEMP}/candidate")"
+          echo "candidate_fingerprint=${FINGERPRINT}" >> "${GITHUB_OUTPUT}"
 
-      - name: Upload gated bridge assets
+      - name: Upload the verified candidate assets
         uses: actions/upload-artifact@v4
         with:
           name: exact-webgpu-bridge-dist
+          if-no-files-found: error
           path: |
-            ${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_bridge.js
-            ${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_bridge_worker.js
-            ${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_bridge.d.ts
-            ${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_core.js
-            ${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_core.wasm
-            ${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_core_mem64.js
-            ${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_core_mem64.wasm
-            ${{ runner.temp }}/webgpu_bridge_dist/manifest.json
-            ${{ runner.temp }}/webgpu_bridge_dist/sha256sums.txt
+            ${{ runner.temp }}/candidate/llama_webgpu_bridge.js
+            ${{ runner.temp }}/candidate/llama_webgpu_bridge_worker.js
+            ${{ runner.temp }}/candidate/llama_webgpu_bridge.d.ts
+            ${{ runner.temp }}/candidate/llama_webgpu_core.js
+            ${{ runner.temp }}/candidate/llama_webgpu_core.wasm
+            ${{ runner.temp }}/candidate/llama_webgpu_core_mem64.js
+            ${{ runner.temp }}/candidate/llama_webgpu_core_mem64.wasm
+            ${{ runner.temp }}/candidate/manifest.json
+            ${{ runner.temp }}/candidate/sha256sums.txt
+
+      - name: Upload the verified qualification attestation
+        uses: actions/upload-artifact@v4
+        with:
+          name: verified-qualification-attestation
+          if-no-files-found: error
+          path: ${{ runner.temp }}/attestation/qualification-attestation.json
 
       - name: Record exact qualification conclusions
         if: always()
         env:
-          STATE_CONCLUSION: ${{ steps.state_gate.outcome || 'skipped' }}
-          MULTIMODAL_CONCLUSION: ${{ steps.multimodal_gate.outcome || 'skipped' }}
-          ASR_CONCLUSION: ${{ steps.asr_gate.outcome || 'skipped' }}
-          TTS_CONCLUSION: ${{ steps.tts_gate.outcome || 'skipped' }}
+          CANDIDATE_FINGERPRINT: ${{ steps.attestation.outputs.candidate_fingerprint }}
         run: |
           jq -n --arg correlation "${ORCHESTRATOR_CORRELATION_ID}" \
             --arg run_id "${GITHUB_RUN_ID_STRING}" --arg run_url "${GITHUB_RUN_URL}" \
-            --arg state "${STATE_CONCLUSION}" --arg multimodal "${MULTIMODAL_CONCLUSION}" \
-            --arg asr "${ASR_CONCLUSION}" --arg tts "${TTS_CONCLUSION}" \
+            --arg candidate_run "${CANDIDATE_RUN_ID}" \
+            --arg attestation_run "${ATTESTATION_RUN_ID}" \
+            --arg fingerprint "${CANDIDATE_FINGERPRINT}" \
             '{schema_version:1,orchestrator_correlation_id:$correlation,
               github_run_id:$run_id,github_run_url:$run_url,
-              qualification_gates:{state_persistence:$state,multimodal:$multimodal,
-                speech_to_text:$asr,text_to_speech:$tts}}' \
+              candidate_run_id:$candidate_run,attestation_run_id:$attestation_run,
+              candidate_fingerprint:$fingerprint,
+              qualification_gates:{state_persistence:"passed",multimodal:"passed",
+                speech_to_text:"required-local-attestation",
+                text_to_speech:"required-local-attestation"}}' \
             > "${RUNNER_TEMP}/qualification-outcome.json"
 
       - name: Upload exact qualification conclusions
@@ -421,18 +458,6 @@ jobs:
         with:
           name: bridge-qualification-outcome
           path: ${{ runner.temp }}/qualification-outcome.json
-
-      - name: Upload smoke diagnostics
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: exact-release-smoke-diagnostics
-          path: |
-            ${{ env.LLAMA_WEBGPU_SMOKE_ARTIFACTS_DIR }}
-            ${{ env.LLAMA_WEBGPU_MULTIMODAL_ARTIFACTS_DIR }}
-            ${{ env.LLAMA_WEBGPU_SPEECH_ARTIFACTS_DIR }}
-            ${{ env.LLAMA_WEBGPU_TTS_ARTIFACTS_DIR }}
-          if-no-files-found: ignore
 
   verify-publication-environment:
     name: Verify externally configured publication environment
@@ -467,7 +492,7 @@ jobs:
 
   publish-assets:
     name: Publish or recover exact approved assets
-    needs: [verify-publication-environment, build-and-gate]
+    needs: [verify-publication-environment, verify-candidate-and-attestation]
     runs-on: ubuntu-latest
     permissions:
       actions: read
@@ -478,6 +503,8 @@ jobs:
     # therefore cannot be accepted as an auto-created gate.
     environment:
       name: ${{ needs.verify-publication-environment.outputs.environment_name }}
+    env:
+      CANDIDATE_FINGERPRINT: ${{ needs.verify-candidate-and-attestation.outputs.candidate_fingerprint }}
     outputs:
       publication_outcome: ${{ steps.final.outputs.publication_outcome }}
     steps:
@@ -512,6 +539,38 @@ jobs:
           name: exact-webgpu-bridge-dist
           path: bridge-dist
 
+      - name: Download the verified qualification attestation
+        uses: actions/download-artifact@v4
+        with:
+          name: verified-qualification-attestation
+          path: attestation
+
+      - name: Re-verify the attestation against the candidate about to be published
+        env:
+          NATIVE_COMMIT: ${{ needs.verify-candidate-and-attestation.outputs.native_commit }}
+          EMSCRIPTEN_VERSION: ${{ needs.verify-candidate-and-attestation.outputs.emscripten_version }}
+          CANDIDATE_ARTIFACT_ID: ${{ needs.verify-candidate-and-attestation.outputs.candidate_artifact_id }}
+        run: |
+          set -euo pipefail
+          python3 publication-policy/scripts/release_qualification.py verify-attestation \
+            --attestation attestation/qualification-attestation.json \
+            --candidate-dist bridge-dist \
+            --candidate-fingerprint "${CANDIDATE_FINGERPRINT}" \
+            --candidate-run-id "${CANDIDATE_RUN_ID}" \
+            --candidate-artifact-id "${CANDIDATE_ARTIFACT_ID}" \
+            --candidate-run-attempt 1 \
+            --harness-dir bridge-source/scripts \
+            --bridge-commit "${BRIDGE_SOURCE_SHA}" \
+            --upstream-tag "${UPSTREAM_TAG}" \
+            --upstream-commit "${UPSTREAM_COMMIT}" \
+            --native-release-tag "${NATIVE_RELEASE_TAG}" \
+            --native-manifest-sha256 "${NATIVE_MANIFEST_SHA256}" \
+            --native-commit "${NATIVE_COMMIT}" \
+            --emscripten-version "${EMSCRIPTEN_VERSION}" \
+            --release-tag "${RELEASE_TAG}" \
+            --release-rebuild "${RELEASE_REBUILD}" \
+            --orchestrator-correlation-id "${ORCHESTRATOR_CORRELATION_ID}"
+
       - name: Revalidate publication environment policy before using PAT
         env:
           GH_TOKEN: ${{ github.token }}
@@ -529,15 +588,15 @@ jobs:
         id: preflight
         env:
           GH_TOKEN: ${{ secrets.WEBGPU_BRIDGE_ASSETS_PAT }}
-          NATIVE_COMMIT: ${{ needs.build-and-gate.outputs.native_commit }}
-          EMSCRIPTEN_VERSION: ${{ needs.build-and-gate.outputs.emscripten_version }}
+          NATIVE_COMMIT: ${{ needs.verify-candidate-and-attestation.outputs.native_commit }}
+          EMSCRIPTEN_VERSION: ${{ needs.verify-candidate-and-attestation.outputs.emscripten_version }}
         run: |
           set -euo pipefail
           if [ -z "${GH_TOKEN}" ]; then
             echo "error: WEBGPU_BRIDGE_ASSETS_PAT is required for asset publication"
             exit 1
           fi
-          python3 bridge-source/scripts/release_publication_state.py validate-target \
+          python3 publication-policy/scripts/release_publication_state.py validate-target \
             --assets-repo "${ASSETS_REPO}" >/dev/null
           (cd bridge-dist && sha256sum --check sha256sums.txt)
 
@@ -560,7 +619,7 @@ jobs:
             > "${RUNNER_TEMP}/existing-asset-tag-refs.txt"
           tag_commit=""
           if [ -s "${RUNNER_TEMP}/existing-asset-tag-refs.txt" ]; then
-            tag_commit="$(python3 bridge-source/scripts/release_contract.py resolve-tag-commit \
+            tag_commit="$(python3 publication-policy/scripts/release_contract.py resolve-tag-commit \
               --ls-remote "${RUNNER_TEMP}/existing-asset-tag-refs.txt" \
               --tag "${RELEASE_TAG}")"
           fi
@@ -598,11 +657,11 @@ jobs:
             --native-commit "${NATIVE_COMMIT}"
             --emscripten-version "${EMSCRIPTEN_VERSION}"
             --orchestrator-correlation-id "${ORCHESTRATOR_CORRELATION_ID}"
-            --github-run-id "${GITHUB_RUN_ID_STRING}" --github-run-url "${GITHUB_RUN_URL}"
+            --github-run-id "${CANDIDATE_RUN_ID_STRING}" --github-run-url "${CANDIDATE_RUN_URL}"
           )
           [ -n "${tag_commit}" ] && args+=(--tag-commit "${tag_commit}")
           args+=("${release_args[@]}")
-          if ! python3 bridge-source/scripts/release_publication_state.py classify \
+          if ! python3 publication-policy/scripts/release_publication_state.py classify \
             "${args[@]}" > "${RUNNER_TEMP}/preflight.json"; then
             cat "${RUNNER_TEMP}/preflight.json"
             cp "${RUNNER_TEMP}/preflight.json" "${RUNNER_TEMP}/publication-outcome.json"
@@ -630,10 +689,14 @@ jobs:
             echo "llama.cpp: \`${UPSTREAM_TAG}@${UPSTREAM_COMMIT}\`"
             echo "Native: \`${NATIVE_REPO}@${NATIVE_RELEASE_TAG}\`"
             echo "Native manifest SHA-256: \`${NATIVE_MANIFEST_SHA256}\`"
-            echo "Emscripten: \`${{ needs.build-and-gate.outputs.emscripten_version }}\`"
+            echo "Emscripten: \`${{ needs.verify-candidate-and-attestation.outputs.emscripten_version }}\`"
             echo "Orchestrator correlation: \`${ORCHESTRATOR_CORRELATION_ID}\`"
-            echo "Bridge workflow run: \`${GITHUB_RUN_ID_STRING}\` (${GITHUB_RUN_URL})"
-            echo "Qualification gates: state=passed, multimodal=passed, ASR=passed, TTS=passed"
+            echo "Candidate build run: \`${CANDIDATE_RUN_ID_STRING}\` (${CANDIDATE_RUN_URL})"
+            echo "Attestation ingestion run: \`${ATTESTATION_RUN_ID}\`"
+            echo "Publication run: \`${GITHUB_RUN_ID_STRING}\` (${GITHUB_RUN_URL})"
+            echo "Hosted gates: state=passed, multimodal=passed"
+            echo "Local qualification attestation: ASR=passed, TTS=passed"
+            echo "Unproven: real-device playback, intelligibility, speaker-reference fidelity"
           } > "${RUNNER_TEMP}/asset-release-notes.md"
 
       - name: Apply only the classified ref mutation
@@ -688,8 +751,8 @@ jobs:
           INITIAL_OUTCOME: ${{ steps.preflight.outputs.initial_outcome }}
           REF_PUSH_ATTEMPTED: ${{ steps.mutate.outputs.ref_push_attempted }}
           PUSH_EXIT_STATUS: ${{ steps.mutate.outputs.push_exit_status }}
-          NATIVE_COMMIT: ${{ needs.build-and-gate.outputs.native_commit }}
-          EMSCRIPTEN_VERSION: ${{ needs.build-and-gate.outputs.emscripten_version }}
+          NATIVE_COMMIT: ${{ needs.verify-candidate-and-attestation.outputs.native_commit }}
+          EMSCRIPTEN_VERSION: ${{ needs.verify-candidate-and-attestation.outputs.emscripten_version }}
         run: |
           set -euo pipefail
           if [ -z "${GH_TOKEN}" ]; then
@@ -697,11 +760,11 @@ jobs:
             exit 1
           fi
           state_changed() {
-            python3 bridge-source/scripts/release_publication_state.py state-changed \
+            python3 publication-policy/scripts/release_publication_state.py state-changed \
               --before-json "${RUNNER_TEMP}/preflight.json" --after-json "$1"
           }
           write_mutation_unknown() {
-            python3 bridge-source/scripts/release_publication_state.py mutation-unknown \
+            python3 publication-policy/scripts/release_publication_state.py mutation-unknown \
               --candidate bridge-dist --reason-code "$1" \
               --requery-json "$2" \
               --release-tag "${RELEASE_TAG}" --release-rebuild "${RELEASE_REBUILD}" \
@@ -711,7 +774,7 @@ jobs:
               --native-manifest-sha256 "${NATIVE_MANIFEST_SHA256}" \
               --native-commit "${NATIVE_COMMIT}" --emscripten-version "${EMSCRIPTEN_VERSION}" \
               --orchestrator-correlation-id "${ORCHESTRATOR_CORRELATION_ID}" \
-              --github-run-id "${GITHUB_RUN_ID_STRING}" --github-run-url "${GITHUB_RUN_URL}" \
+              --github-run-id "${CANDIDATE_RUN_ID_STRING}" --github-run-url "${CANDIDATE_RUN_URL}" \
               > "${RUNNER_TEMP}/publication-outcome.json"
             cat "${RUNNER_TEMP}/publication-outcome.json"
           }
@@ -725,7 +788,7 @@ jobs:
               > "${RUNNER_TEMP}/current-asset-tag-refs.txt"
             tag_commit=""
             if [ -s "${RUNNER_TEMP}/current-asset-tag-refs.txt" ]; then
-              tag_commit="$(python3 bridge-source/scripts/release_contract.py resolve-tag-commit \
+              tag_commit="$(python3 publication-policy/scripts/release_contract.py resolve-tag-commit \
                 --ls-remote "${RUNNER_TEMP}/current-asset-tag-refs.txt" \
                 --tag "${RELEASE_TAG}")"
             fi
@@ -751,7 +814,7 @@ jobs:
               cat "${RUNNER_TEMP}/current-release.err" >&2
               return "${lookup_status}"
             fi
-            python3 bridge-source/scripts/release_publication_state.py classify \
+            python3 publication-policy/scripts/release_publication_state.py classify \
               --repository assets-repo --candidate bridge-dist \
               --branch-commit "${branch_commit}" "${tag_args[@]}" "${release_args[@]}" \
               --release-tag "${RELEASE_TAG}" --release-rebuild "${RELEASE_REBUILD}" \
@@ -761,7 +824,7 @@ jobs:
               --native-manifest-sha256 "${NATIVE_MANIFEST_SHA256}" \
               --native-commit "${NATIVE_COMMIT}" --emscripten-version "${EMSCRIPTEN_VERSION}" \
               --orchestrator-correlation-id "${ORCHESTRATOR_CORRELATION_ID}" \
-              --github-run-id "${GITHUB_RUN_ID_STRING}" --github-run-url "${GITHUB_RUN_URL}"
+              --github-run-id "${CANDIDATE_RUN_ID_STRING}" --github-run-url "${CANDIDATE_RUN_URL}"
           )
 
           set +e
@@ -772,10 +835,12 @@ jobs:
           if ! jq -e 'type == "object" and .schema_version == 1 and has("state") and
               .reason_code != "invalid-input-or-state" and
               .orchestrator_correlation_id == env.ORCHESTRATOR_CORRELATION_ID and
-              .github_run_id == env.GITHUB_RUN_ID_STRING and
-              .github_run_url == env.GITHUB_RUN_URL and
+              .github_run_id == env.CANDIDATE_RUN_ID_STRING and
+              .github_run_url == env.CANDIDATE_RUN_URL and
+              .candidate_fingerprint == env.CANDIDATE_FINGERPRINT and
               .qualification_gates == {state_persistence:"passed",multimodal:"passed",
-                speech_to_text:"passed",text_to_speech:"passed"}' \
+                speech_to_text:"required-local-attestation",
+                text_to_speech:"required-local-attestation"}' \
             "${RUNNER_TEMP}/post-refs.json" >/dev/null 2>&1; then
             cat "${RUNNER_TEMP}/post-refs.err" >&2
             if [ "${REF_PUSH_ATTEMPTED}" = "true" ]; then
@@ -845,10 +910,12 @@ jobs:
             if ! jq -e 'type == "object" and .schema_version == 1 and has("state") and
                 .reason_code != "invalid-input-or-state" and
                 .orchestrator_correlation_id == env.ORCHESTRATOR_CORRELATION_ID and
-                .github_run_id == env.GITHUB_RUN_ID_STRING and
-                .github_run_url == env.GITHUB_RUN_URL and
+                .github_run_id == env.CANDIDATE_RUN_ID_STRING and
+                .github_run_url == env.CANDIDATE_RUN_URL and
+                .candidate_fingerprint == env.CANDIDATE_FINGERPRINT and
                 .qualification_gates == {state_persistence:"passed",multimodal:"passed",
-                  speech_to_text:"passed",text_to_speech:"passed"}' \
+                  speech_to_text:"required-local-attestation",
+                  text_to_speech:"required-local-attestation"}' \
               "${RUNNER_TEMP}/post-release.json" >/dev/null 2>&1; then
               cat "${RUNNER_TEMP}/post-release.err" >&2
               if [ "${release_mutation_attempted}" = "true" ]; then
@@ -892,14 +959,16 @@ jobs:
         run: |
           if [ ! -f "${RUNNER_TEMP}/publication-outcome.json" ]; then
             jq -n --arg correlation "${ORCHESTRATOR_CORRELATION_ID}" \
-              --arg run_id "${GITHUB_RUN_ID_STRING}" --arg run_url "${GITHUB_RUN_URL}" \
+              --arg run_id "${CANDIDATE_RUN_ID_STRING}" --arg run_url "${CANDIDATE_RUN_URL}" \
+              --arg fingerprint "${CANDIDATE_FINGERPRINT}" \
               '{schema_version:1,state:"failed-before-classification",allowed:false,
                 action:"none",outcome:"workflow-failure",reason_code:"workflow-failure",
-                retryable:false,mutated:false,
+                retryable:false,mutated:false,candidate_fingerprint:$fingerprint,
                 orchestrator_correlation_id:$correlation,github_run_id:$run_id,
                 github_run_url:$run_url,
                 qualification_gates:{state_persistence:"passed",multimodal:"passed",
-                  speech_to_text:"passed",text_to_speech:"passed"}}' \
+                  speech_to_text:"required-local-attestation",
+                  text_to_speech:"required-local-attestation"}}' \
               > "${RUNNER_TEMP}/publication-outcome.json"
           fi
           outcome="$(jq -c . "${RUNNER_TEMP}/publication-outcome.json")"

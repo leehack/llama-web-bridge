@@ -414,6 +414,19 @@ class ReleaseContractTest(unittest.TestCase):
                 validate_native_file(
                     path, "0" * 64, "v0.2.0-1", "v0.2.0", "a" * 40
                 )
+            duplicate = path.read_text(encoding="utf-8").replace(
+                "{", '{"native_commit":"' + "b" * 40 + '",', 1
+            )
+            path.write_text(duplicate, encoding="utf-8")
+            duplicate_digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            with self.assertRaises(ContractError):
+                validate_native_file(
+                    path,
+                    duplicate_digest,
+                    "v0.2.0-1",
+                    "v0.2.0",
+                    "a" * 40,
+                )
 
     @staticmethod
     def _native_release_fixture(

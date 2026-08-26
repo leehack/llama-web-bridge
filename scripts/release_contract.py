@@ -30,6 +30,22 @@ class ContractError(ValueError):
     """Raised when release provenance is ambiguous or unsafe."""
 
 
+def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ContractError(f"duplicate JSON key: {key!r}")
+        result[key] = value
+    return result
+
+
+def _strict_json_loads(text: str, label: str) -> Any:
+    try:
+        return json.loads(text, object_pairs_hook=_reject_duplicate_keys)
+    except json.JSONDecodeError as error:
+        raise ContractError(f"could not parse {label}: {error}") from error
+
+
 class Channel(str, Enum):
     DEVELOPMENT = "development"
     STABLE = "stable"
@@ -353,9 +369,10 @@ def validate_native_file(
             f"native manifest SHA-256 mismatch: expected {expected_sha256}, got {actual_sha256}"
         )
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as error:
         raise ContractError(f"could not read native manifest: {error}") from error
+    payload = _strict_json_loads(text, "native manifest")
     if not isinstance(payload, Mapping):
         raise ContractError("native manifest root must be a JSON object")
     identity = resolve_native_manifest(payload, native_release_tag)
@@ -516,7 +533,9 @@ def validate_native_release(
         else:
             raise ContractError("native GitHub release target must not be tag-shaped")
 
-    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    payload = _strict_json_loads(
+        manifest_path.read_text(encoding="utf-8"), "native release manifest"
+    )
     if payload.get("hook_contract_version") != NATIVE_HOOK_CONTRACT_VERSION:
         raise ContractError(
             f"unsupported native hook_contract_version: {payload.get('hook_contract_version')!r}"

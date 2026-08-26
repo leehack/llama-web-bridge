@@ -131,8 +131,27 @@ def write_harness(
         wasmUrlMem64: useMemory64 ? '/llama_webgpu_core_mem64.wasm' : undefined,
       }});
       const startedAt = performance.now();
+      // Local release qualification records each phase separately, so a
+      // regression in model load, decode, cancellation, or silence rejection is
+      // attributable instead of hidden inside one aggregate duration.
+      const phaseTimingsMs = {{
+        modelLoadMs: 0,
+        projectorLoadMs: 0,
+        coldTranscriptMs: 0,
+        cancellationMs: 0,
+        warmTranscriptMs: 0,
+        silenceMs: 0,
+      }};
+      const timePhase = async (name, run) => {{
+        const phaseStartedAt = performance.now();
+        try {{
+          return await run();
+        }} finally {{
+          phaseTimingsMs[name] = Math.round(performance.now() - phaseStartedAt);
+        }}
+      }};
       try {{
-        await bridge.loadModelFromUrl('/qwen3-asr-model.gguf', {{
+        await timePhase('modelLoadMs', () => bridge.loadModelFromUrl('/qwen3-asr-model.gguf', {{
           nCtx: 4096,
           nGpuLayers: 0,
           nThreads: 4,
@@ -140,8 +159,11 @@ def write_harness(
           nUbatch: 256,
           useCache: false,
           forceRemoteFetchBackend: false,
-        }});
-        await bridge.loadMultimodalProjector('/qwen3-asr-mmproj.gguf');
+        }}));
+        await timePhase(
+          'projectorLoadMs',
+          () => bridge.loadMultimodalProjector('/qwen3-asr-mmproj.gguf'),
+        );
         assert(bridge.supportsAudio(), `${{memoryMode}} ${{runtimeMode}} did not report audio support`);
 
         const transcribe = (
@@ -165,7 +187,10 @@ def write_harness(
           );
         const transcripts = [];
         for (let attempt = 0; attempt < 2; attempt += 1) {{
-          const output = await transcribe(audioBytes);
+          const output = await timePhase(
+            attempt === 0 ? 'coldTranscriptMs' : 'warmTranscriptMs',
+            () => transcribe(audioBytes),
+          );
           const outputText = String(output || '').trim();
           const normalized = normalizeTranscript(outputText);
           assert(normalized.length > 0, `${{memoryMode}} ${{runtimeMode}} returned an empty transcript`);
@@ -176,6 +201,7 @@ def write_harness(
           transcripts.push(outputText.slice(0, 512));
 
           if (attempt === 0) {{
+            const cancellationStartedAt = performance.now();
             const controller = new AbortController();
             let cancelledOutput = '';
             let cancellationState = 'resolved';
@@ -215,6 +241,9 @@ def write_harness(
             }} finally {{
               clearTimeout(tokenWatchdog);
               clearTimeout(cancellationWatchdog);
+              phaseTimingsMs.cancellationMs = Math.round(
+                performance.now() - cancellationStartedAt,
+              );
             }}
             assert(cancellationRequested, `${{memoryMode}} ${{runtimeMode}} did not emit a token to cancel`);
             assert(controller.signal.aborted, `${{memoryMode}} ${{runtimeMode}} cancellation was not requested`);
@@ -226,7 +255,10 @@ def write_harness(
           }}
         }}
 
-        const silenceOutput = String(await transcribe(silenceBytes) || '').trim();
+        const silenceOutput = String(await timePhase(
+          'silenceMs',
+          () => transcribe(silenceBytes),
+        ) || '').trim();
         assert(
           normalizeTranscript(silenceOutput).length === 0,
           `${{memoryMode}} ${{runtimeMode}} hallucinated speech from silence: ${{silenceOutput}}`,
@@ -236,6 +268,7 @@ def write_harness(
           memoryMode,
           runtimeMode,
           elapsedMs: Math.round(performance.now() - startedAt),
+          phaseTimingsMs,
           coldTranscript: transcripts[0],
           cancellation: transcripts[1],
           warmTranscript: transcripts[2],

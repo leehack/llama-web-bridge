@@ -11,7 +11,11 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from generate_release_manifest import ARTIFACTS, generate
+from generate_release_manifest import (
+    ARTIFACTS,
+    LOCAL_ATTESTATION_REQUIRED,
+    generate,
+)
 from release_contract import ContractError
 from release_publication_state import (
     APPROVED_ASSETS_REPOSITORY,
@@ -519,7 +523,8 @@ class ReleasePublicationStateTest(unittest.TestCase):
         )
         self.assertEqual(outcome["github_run_id"], "123456789")
         self.assertEqual(
-            outcome["qualification_gates"]["text_to_speech"], "passed"
+            outcome["qualification_gates"]["text_to_speech"],
+            LOCAL_ATTESTATION_REQUIRED,
         )
         with self.assertRaises(ContractError):
             mutation_unknown_outcome(self.candidate, self.identity, "attacker-value")
@@ -571,8 +576,14 @@ class ReleasePublicationStateTest(unittest.TestCase):
         self.assertEqual(outcome["github_run_url"], self.identity.github_run_url)
         self.assertEqual(outcome["qualification_gates"]["state_persistence"], "passed")
         self.assertEqual(outcome["qualification_gates"]["multimodal"], "passed")
-        self.assertEqual(outcome["qualification_gates"]["speech_to_text"], "passed")
-        self.assertEqual(outcome["qualification_gates"]["text_to_speech"], "passed")
+        self.assertEqual(
+            outcome["qualification_gates"]["speech_to_text"],
+            LOCAL_ATTESTATION_REQUIRED,
+        )
+        self.assertEqual(
+            outcome["qualification_gates"]["text_to_speech"],
+            LOCAL_ATTESTATION_REQUIRED,
+        )
 
     def test_ambiguous_release_create_failure_is_recovered_after_exact_requery(self) -> None:
         candidate_commit = self.publish_branch_candidate()
@@ -697,11 +708,45 @@ class ReleasePublicationStateTest(unittest.TestCase):
                 release=None,
             )
 
+    def test_candidate_inventory_must_be_exact(self) -> None:
+        (self.candidate / "unexpected.bin").write_bytes(b"not governed")
+        with self.assertRaises(ContractError):
+            validate_candidate(self.candidate, self.identity)
+
+    def test_candidate_manifest_duplicate_keys_fail_closed(self) -> None:
+        manifest_path = self.candidate / "manifest.json"
+        original = manifest_path.read_text(encoding="utf-8")
+        duplicate = original.replace(
+            "{\n", f'{{\n  "release_tag": "{self.identity.release_tag}",\n', 1
+        )
+        manifest_path.write_text(duplicate, encoding="utf-8")
+        with self.assertRaises(ContractError):
+            validate_candidate(self.candidate, self.identity)
+
+    def test_candidate_symlink_is_not_an_immutable_regular_file(self) -> None:
+        artifact = self.candidate / ARTIFACTS[0]
+        target = Path(self.temporary.name) / "outside-artifact"
+        target.write_bytes(artifact.read_bytes())
+        artifact.unlink()
+        artifact.symlink_to(target)
+        with self.assertRaises(ContractError):
+            validate_candidate(self.candidate, self.identity)
+
     def test_candidate_run_and_gate_provenance_tampering_fails_closed(self) -> None:
         for field, value in (
             ("orchestrator_correlation_id", "different-run"),
             ("github_run_url", "https://github.com/attacker/repo/actions/runs/123"),
             ("qualification_gates", {"state_persistence": "passed"}),
+            (
+                "qualification_gates",
+                {
+                    "state_persistence": "passed",
+                    "multimodal": "passed",
+                    "speech_to_text": "passed",
+                    "text_to_speech": "passed",
+                },
+            ),
+            ("unproven_capabilities", {"real_device_playback": "proven"}),
         ):
             manifest_path = self.candidate / "manifest.json"
             original = manifest_path.read_text(encoding="utf-8")

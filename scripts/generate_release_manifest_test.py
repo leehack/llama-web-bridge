@@ -10,6 +10,7 @@ import unittest
 from pathlib import Path
 
 from generate_release_manifest import ARTIFACTS, generate
+from release_contract import ContractError
 
 
 class GenerateReleaseManifestTest(unittest.TestCase):
@@ -55,13 +56,24 @@ class GenerateReleaseManifestTest(unittest.TestCase):
                 manifest["github_run_url"],
                 "https://github.com/leehack/llama-web-bridge/actions/runs/123456789",
             )
+            # Heavy real-model gates never run on a hosted runner, so the
+            # manifest must state the local-attestation requirement instead of
+            # claiming a pass that no hosted job produced.
             self.assertEqual(
                 manifest["qualification_gates"],
                 {
                     "state_persistence": "passed",
                     "multimodal": "passed",
-                    "speech_to_text": "passed",
-                    "text_to_speech": "passed",
+                    "speech_to_text": "required-local-attestation",
+                    "text_to_speech": "required-local-attestation",
+                },
+            )
+            self.assertEqual(
+                manifest["unproven_capabilities"],
+                {
+                    "real_device_intelligibility": "unproven",
+                    "real_device_playback": "unproven",
+                    "speaker_reference_fidelity": "unproven",
                 },
             )
             self.assertTrue(manifest["capabilities"]["speech_to_text"]["advertised"])
@@ -75,6 +87,17 @@ class GenerateReleaseManifestTest(unittest.TestCase):
             sums = (out_dir / "sha256sums.txt").read_text()
             self.assertIn(f"{expected}  {artifact}", sums)
             self.assertNotIn("manifest.json", sums)
+
+            for invalid_run_id in ("0", "01", "١٢٣", True, None):
+                args.github_run_id = invalid_run_id
+                args.github_run_url = (
+                    "https://github.com/leehack/llama-web-bridge/actions/runs/"
+                    f"{invalid_run_id}"
+                )
+                with self.subTest(run_id=invalid_run_id), self.assertRaises(
+                    ContractError
+                ):
+                    generate(args)
 
 
 if __name__ == "__main__":

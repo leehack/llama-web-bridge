@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import json
 from pathlib import Path
+import re
 
 from release_contract import (
     ASSETS_REPOSITORY,
@@ -51,12 +52,28 @@ CAPABILITIES: dict[str, object] = {
     },
 }
 
+# Heavy real-model ASR/TTS gates exhaust hosted runners, so they are proven by a
+# digest-bound local qualification attestation instead. The manifest records that
+# requirement rather than a hosted pass that never happened; publication refuses
+# to publish this artifact unless a verified attestation binds its exact digest.
+LOCAL_ATTESTATION_REQUIRED = "required-local-attestation"
+
 QUALIFICATION_GATES: dict[str, str] = {
     "state_persistence": "passed",
     "multimodal": "passed",
-    "speech_to_text": "passed",
-    "text_to_speech": "passed",
+    "speech_to_text": LOCAL_ATTESTATION_REQUIRED,
+    "text_to_speech": LOCAL_ATTESTATION_REQUIRED,
 }
+
+# Local qualification proves transcript, lifecycle, and WAV container
+# correctness. Nothing in any gate listens to generated audio on a real device.
+UNPROVEN_CAPABILITIES: dict[str, str] = {
+    "real_device_intelligibility": "unproven",
+    "real_device_playback": "unproven",
+    "speaker_reference_fidelity": "unproven",
+}
+
+_RUN_ID_RE = re.compile(r"^[1-9][0-9]*$")
 
 
 def _commit(value: str, field: str) -> str:
@@ -81,7 +98,10 @@ def generate(args: argparse.Namespace) -> dict[str, object]:
         raise ContractError(f"native_repo must be exactly {NATIVE_REPOSITORY}")
     require_sha256(args.native_manifest_sha256, "native_manifest_sha256")
     correlation_id = require_correlation_id(args.orchestrator_correlation_id)
-    if not args.github_run_id.isdigit() or args.github_run_id.startswith("0"):
+    if (
+        not isinstance(args.github_run_id, str)
+        or _RUN_ID_RE.fullmatch(args.github_run_id) is None
+    ):
         raise ContractError("github_run_id must be a positive decimal string")
     expected_run_url = (
         f"https://github.com/{BRIDGE_REPOSITORY}/actions/runs/{args.github_run_id}"
@@ -123,6 +143,7 @@ def generate(args: argparse.Namespace) -> dict[str, object]:
         "github_run_id": args.github_run_id,
         "github_run_url": args.github_run_url,
         "qualification_gates": QUALIFICATION_GATES,
+        "unproven_capabilities": UNPROVEN_CAPABILITIES,
         "capabilities": CAPABILITIES,
         "artifacts": files,
         # Compatibility aliases are read by existing consumers. New tooling must

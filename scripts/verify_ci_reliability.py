@@ -15,13 +15,14 @@ ROOT = Path(__file__).resolve().parents[1]
 
 # These files hand-copy the model/projector SHA-256 pins. A rotation that misses
 # one leaves CI green while a contributor hits an opaque checksum failure -- or,
-# for publish_assets.yml, while the release job that consumes the pins fails.
+# for bridge_candidate.yml, while the candidate job that consumes the pins fails.
+# publish_assets.yml no longer builds or smokes anything, so it holds no pins.
 MODEL_SHA_PIN_FILES = (
     "README.md",
     "AGENTS.md",
     "CONTRIBUTING.md",
     ".github/workflows/ci.yml",
-    ".github/workflows/publish_assets.yml",
+    ".github/workflows/bridge_candidate.yml",
 )
 EXPECTED_MODEL_SHA_PIN_COUNT = 7
 SHA256_HEX_PATTERN = re.compile(r"(?<![0-9a-fA-F])[0-9a-fA-F]{64}(?![0-9a-fA-F])")
@@ -46,7 +47,7 @@ MODEL_SHA_PIN_MARKER = re.compile(
 # the other six, each naming a distinct model or projector file.
 WORKFLOW_MODEL_SHA_PIN_FILES = (
     ".github/workflows/ci.yml",
-    ".github/workflows/publish_assets.yml",
+    ".github/workflows/bridge_candidate.yml",
 )
 WORKFLOW_MODEL_SHA_PIN_ASSIGNMENT = re.compile(
     r"""^[ \t]*([A-Z][A-Z0-9_]*_SHA256):[ \t]*["']?([0-9a-fA-F]{64})["']?[ \t]*$""",
@@ -639,6 +640,14 @@ def main() -> int:
     speech_smoke = read_required("scripts/speech_to_text_browser_smoke.py", errors)
     tts_smoke = read_required("scripts/text_to_speech_browser_smoke.py", errors)
     tts_contract = read_required("scripts/verify_text_to_speech_api.py", errors)
+    release_qualification = read_required("scripts/release_qualification.py", errors)
+    release_qualification_test = read_required(
+        "scripts/release_qualification_test.py", errors
+    )
+    qualification_attestation = read_required(
+        ".github/workflows/qualification_attestation.yml", errors
+    )
+    candidate = read_required(".github/workflows/bridge_candidate.yml", errors)
     embedding_contract = read_required("scripts/embedding_json_contract_test.mjs", errors)
     worker_token_contract = read_required(
         "scripts/worker_token_coalescing_test.mjs", errors
@@ -725,6 +734,8 @@ def main() -> int:
         ("ci.yml", ci),
         ("publish_assets.yml", publish),
         ("auto_llama_cpp_update.yml", auto_update),
+        ("qualification_attestation.yml", qualification_attestation),
+        ("bridge_candidate.yml", candidate),
     ):
         require(
             "FORCE_JAVASCRIPT_ACTIONS_TO_NODE24" in workflow,
@@ -900,19 +911,22 @@ def main() -> int:
     require(
         "verify_text_to_speech_api.py" in ci
         and "text_to_speech_browser_smoke.py" in ci
-        and "run_text_to_speech_smoke" in ci
         and "Qwen3-TTS-12Hz-1.7B-Base-GGUF/resolve/ca27d74bc954b73dadab5b71ca265d87fc861a7c" in ci
         and "LLAMA_WEBGPU_TTS_MODEL_SHA256" in ci
         and "LLAMA_WEBGPU_TTS_MMPROJ_SHA256" in ci
-        and "--memory-mode wasm64" in ci
-        and "--runtime-mode all" in ci
-        and "text-to-speech-smoke-artifacts" in ci
+        and "run_text_to_speech_smoke" not in ci
+        and "Run Qwen3-TTS browser smoke" not in ci
+        and "Download verified text-to-speech smoke models" not in ci
         and "LLAMADART_WEBGPU_TTS_API_VERSION" in tts_contract
         and 'RUNTIME_MODES = ("direct", "worker")' in tts_smoke,
-        "CI must syntax-check the TTS smoke, run its static API contract, and preserve the opt-in immutable real-model gate",
+        "CI must syntax-check the TTS smoke and run its static API contract without executing the heavy real-model gate on hosted runners",
         errors,
     )
-    for name, workflow in (("ci.yml", ci), ("publish_assets.yml", publish)):
+    for name, workflow in (
+        ("ci.yml", ci),
+        ("bridge_candidate.yml", candidate),
+        ("publish_assets.yml", publish),
+    ):
         require(
             "actions/setup-node@v4" in workflow
             and "node-version: 24" in workflow
@@ -943,7 +957,7 @@ def main() -> int:
         "emsdk.version must contain one exact Emscripten semantic version",
         errors,
     )
-    for name, workflow in (("ci.yml", ci), ("publish_assets.yml", publish)):
+    for name, workflow in (("ci.yml", ci), ("bridge_candidate.yml", candidate)):
         require(
             "Resolve Emscripten SDK pin" in workflow
             and "scripts/verify_emscripten_version.py --print-pin" in workflow
@@ -970,7 +984,8 @@ def main() -> int:
         errors,
     )
     require(
-        "--emscripten-version \"${EMSCRIPTEN_VERSION}\"" in publish
+        "--emscripten-version \"${EMSCRIPTEN_VERSION}\"" in candidate
+        and "--emscripten-version \"${EMSCRIPTEN_VERSION}\"" in publish
         and '"emscripten_version": args.emscripten_version' in read_required(
             "scripts/generate_release_manifest.py", errors
         ),
@@ -1082,21 +1097,23 @@ def main() -> int:
         and "release_tag:" in publish
         and "release_rebuild:" in publish
         and "assets_repo:" in publish
+        and "attestation_run_id:" in publish
         and "REQUESTED_ASSETS_REPO: ${{ inputs.assets_repo }}" in publish
         and 'if [ "${REQUESTED_ASSETS_REPO}" != "${APPROVED_ASSETS_REPO}" ]'
         in publish
         and "release_capabilities:" not in publish
         and "publish_approved:" in publish
         and "llama_cpp.version" not in publish,
-        "bridge-owned publish_assets.yml must expose exact orchestrator/bridge/upstream/native/output inputs without a bridge pin",
+        "bridge-owned publish_assets.yml must expose exact orchestrator/bridge/upstream/native/attestation/output inputs without a bridge pin",
         errors,
     )
     require(
         "BRIDGE_REPO: leehack/llama-web-bridge" in publish
-        and len(re.findall(r"repository: leehack/llama-web-bridge\s*$", publish, re.MULTILINE)) == 4
-        and publish.count("ref: ${{ github.sha }}") == 2
-        and '--bridge-repo "${BRIDGE_REPO}"' in publish
-        and 'repos/${GITHUB_REPOSITORY}' not in publish,
+        and len(re.findall(r"repository: leehack/llama-web-bridge\s*$", publish, re.MULTILINE)) == 5
+        and publish.count("ref: ${{ github.sha }}") == 3
+        and '--bridge-repo "${BRIDGE_REPO}"' in candidate
+        and 'repos/${GITHUB_REPOSITORY}' not in publish
+        and 'repos/${GITHUB_REPOSITORY}' not in candidate,
         "dispatch-only publication must always checkout and verify the owning bridge repository",
         errors,
     )
@@ -1181,7 +1198,8 @@ def main() -> int:
         and "immediately before the first publication-PAT-bearing step"
         in readme_publication_text
         and "trusted workflow commit on `main`" in readme_publication_text
-        and "requested historical bridge source remains the exact build input"
+        and "historical bridge source supplies only exact candidate harness "
+        "bytes, toolchain pin, and build identity"
         in readme_publication_text
         and "credential is non-empty" in readme_publication_text
         and "does not print its value" in readme_publication_text
@@ -1295,7 +1313,7 @@ def main() -> int:
     )
     require(
         publish.count(
-            "bridge-source/scripts/release_contract.py resolve-tag-commit"
+            "publication-policy/scripts/release_contract.py resolve-tag-commit"
         )
         == 2
         and publish.count("fetched asset release tag changed after immutable resolution")
@@ -1330,7 +1348,16 @@ def main() -> int:
             '.qualification_gates == {state_persistence:"passed",multimodal:"passed",'
         )
         == 2
-        and publish.count('speech_to_text:"passed",text_to_speech:"passed"}') >= 2
+        # Publication compares against the honest candidate manifest gates: the
+        # heavy gates are proven by the verified attestation, never by a hosted
+        # job, so a re-query that claims a hosted ASR/TTS pass fails closed.
+        and publish.count(
+            'speech_to_text:"required-local-attestation",'
+        )
+        >= 3
+        and 'speech_to_text:"passed"' not in publish
+        and 'text_to_speech:"passed"' not in publish
+        and ".candidate_fingerprint == env.CANDIDATE_FINGERPRINT" in publish
         and "persist-credentials: false" in publish
         and "sha256sum --check sha256sums.txt" in publish
         and "git -C assets-repo push --atomic" in publish,
@@ -1338,20 +1365,307 @@ def main() -> int:
         errors,
     )
     require(
-        "Run durable state persistence gate" in publish
-        and "Run durable multimodal gate" in publish
-        and "Run durable Qwen3-ASR gate" in publish
-        and "Run durable Qwen3-TTS memory64 gate" in publish
-        and "bridge-qualification-outcome" in publish
-        and "STATE_CONCLUSION:" in publish
-        and "TTS_CONCLUSION:" in publish
-        and "contains(inputs.release_capabilities" not in publish
-        and "WEBGPU_BRIDGE_BUILD_MEM64: 1" in publish,
-        "exact publication must always build wasm32/memory64 and run state, multimodal, ASR, and TTS gates",
+        "Run durable state persistence gate" in candidate
+        and "Run durable multimodal gate" in candidate
+        and "WEBGPU_BRIDGE_BUILD_MEM64: 1" in candidate
+        and candidate.count("./scripts/build_bridge.sh") == 1
+        and "GITHUB_RUN_ATTEMPT_STRING: ${{ github.run_attempt }}" in candidate
+        and '"${GITHUB_RUN_ATTEMPT_STRING}" != "1"' in candidate
+        and "STATE_CONCLUSION:" in candidate
+        and "MULTIMODAL_CONCLUSION:" in candidate
+        and "exact-webgpu-bridge-dist" in candidate
+        and "bridge-candidate-prequalification" in candidate
+        and "pending-local-qualification" in candidate
+        and "contains(inputs.release_capabilities" not in candidate
+        # The candidate workflow is the only place assets are built, and it is
+        # deliberately unprivileged: no publication environment, no PAT.
+        and "WEBGPU_BRIDGE_ASSETS_PAT" not in candidate
+        and "environment:" not in candidate
+        and "Run Qwen3-ASR browser smoke" not in candidate
+        and "Run Qwen3-TTS browser smoke" not in candidate,
+        "the candidate workflow must build wasm32/memory64 once, run the hosted state and multimodal gates, and upload an honest prequalification record without publication credentials",
         errors,
     )
     require(
-        "scripts/generate_release_manifest.py" in publish
+        all(
+            "DISPATCHING_ACTOR: ${{ github.triggering_actor }}" in workflow
+            and "REPOSITORY_OWNER: ${{ github.repository_owner }}" in workflow
+            and '"${DISPATCHING_ACTOR}" != "${REPOSITORY_OWNER}"' in workflow
+            for workflow in (candidate, qualification_attestation, publish)
+        ),
+        "candidate, attestation ingestion, and publication dispatches must be restricted to the repository owner identity",
+        errors,
+    )
+    require(
+        # A dispatching actor alone leaves the run's own actor and a re-run
+        # unproven, so both privileged workflows pin them too.
+        all(
+            '"${GITHUB_ACTOR}" != "${REPOSITORY_OWNER}"' in workflow
+            and '"${GITHUB_RUN_ATTEMPT}" != "1"' in workflow
+            for workflow in (qualification_attestation, publish)
+        )
+        and "workflow run actor must be" in release_qualification
+        and "workflow run triggering_actor must be" in release_qualification
+        and "test_wrong_workflow_run_actor_rejected" in release_qualification_test
+        and "test_wrong_workflow_run_triggering_actor_rejected"
+        in release_qualification_test,
+        "attestation ingestion and publication must pin the run actor and refuse replayed run attempts",
+        errors,
+    )
+    require(
+        # The attestation must bind the exact artifact it was produced from, and
+        # every verification site must re-assert that binding.
+        "candidate_artifact_id" in release_qualification
+        and "candidate_run_attempt" in release_qualification
+        and "attestation candidate_run_attempt must be 1" in release_qualification
+        and publish.count('--candidate-artifact-id "${CANDIDATE_ARTIFACT_ID}"') == 2
+        and publish.count("--candidate-run-attempt 1") == 2
+        and "candidate_artifact_id: ${{ steps.runs.outputs.candidate_artifact_id }}"
+        in publish
+        and "CANDIDATE_ARTIFACT_ID: ${{ needs.verify-candidate-and-attestation.outputs.candidate_artifact_id }}"
+        in publish
+        # Nothing consumes an attestation artifact id across jobs; exporting one
+        # would be unverified wiring that reads as a binding.
+        and "attestation_artifact_id" not in publish
+        and '--candidate-artifact-id "${CANDIDATE_ARTIFACT_ID}"'
+        in qualification_attestation
+        and "--candidate-run-attempt 1" in qualification_attestation
+        and "test_candidate_artifact_id_mismatch_rejected" in release_qualification_test
+        and "test_candidate_run_attempt_mismatch_rejected"
+        in release_qualification_test
+        and "test_attestation_receipt_contains_artifact_id_and_run_attempt"
+        in release_qualification_test,
+        "the attestation must bind the exact candidate artifact id and proven run attempt at every verification site",
+        errors,
+    )
+    require(
+        # Archive parsing must refuse a hostile archive from its metadata, before
+        # a single byte is decompressed into a trusted destination.
+        'artifact_type="candidate"' in publish
+        and 'artifact_type="attestation"' in publish
+        and 'artifact_type="candidate"' in qualification_attestation
+        and "ALLOWED_COMPRESS_TYPES" in release_qualification
+        and "MAX_COMPRESSION_RATIO" in release_qualification
+        and "MAX_CANDIDATE_MEMBER_BYTES" in release_qualification
+        and "MAX_CANDIDATE_TOTAL_BYTES" in release_qualification
+        and "CANDIDATE_ALLOWED_MEMBERS" in release_qualification
+        and "ATTESTATION_ALLOWED_MEMBERS" in release_qualification
+        and "_validate_local_header" in release_qualification
+        and "_stage_artifact_archive" in release_qualification
+        and "_preflight_zip_end_record" in release_qualification
+        and "_ZIP_ENCRYPTION_FLAGS" in release_qualification
+        and "_ZIP_DATA_DESCRIPTOR_FLAG" in release_qualification
+        and "dst_dir_fd=destination_fd" in release_qualification
+        and "_unlink_placed_members" in release_qualification
+        and "test_attestation_zip_bomb_rejected_on_compression_ratio"
+        in release_qualification_test
+        and "test_candidate_zip_bomb_rejected_on_compression_ratio"
+        in release_qualification_test
+        and "test_oversized_candidate_member_rejected_before_extraction"
+        in release_qualification_test
+        and "test_oversized_attestation_member_rejected_before_extraction"
+        in release_qualification_test
+        and "test_total_uncompressed_size_is_bounded_before_extraction"
+        in release_qualification_test
+        and "test_unsupported_compression_method_rejected"
+        in release_qualification_test
+        and "test_local_header_disagreeing_with_central_directory_rejected"
+        in release_qualification_test
+        and "test_local_header_name_disagreeing_with_central_directory_rejected"
+        in release_qualification_test
+        and "test_overlapping_members_rejected" in release_qualification_test
+        and "test_member_payload_cannot_overlap_the_central_directory"
+        in release_qualification_test
+        and "test_unclaimed_gap_before_central_directory_rejected"
+        in release_qualification_test
+        and "test_encrypted_zip_member_rejected" in release_qualification_test
+        and "test_data_descriptor_zip_member_rejected" in release_qualification_test
+        and "test_signed_github_style_data_descriptor_is_exactly_validated"
+        in release_qualification_test
+        and "test_local_and_central_flag_mismatch_rejected"
+        in release_qualification_test
+        and "test_nul_truncated_member_name_cannot_masquerade_as_allowlisted"
+        in release_qualification_test
+        and "test_member_extra_fields_and_comments_cannot_hide_metadata"
+        in release_qualification_test
+        and "test_local_only_extra_field_cannot_hide_metadata"
+        in release_qualification_test
+        and "test_unauthorized_artifact_member_rejected" in release_qualification_test
+        and "test_symlink_archive_member_rejected" in release_qualification_test
+        and "test_short_candidate_member_inventory_rejected"
+        in release_qualification_test
+        and "test_eocd_count_is_bounded_before_zipfile_parses_members"
+        in release_qualification_test
+        and "test_archive_preamble_cannot_hide_outside_the_member_inventory"
+        in release_qualification_test
+        and "test_failed_extraction_leaves_no_partial_trusted_output"
+        in release_qualification_test
+        and "test_interrupted_placement_leaves_no_partial_trusted_output"
+        in release_qualification_test
+        and "test_destination_swap_cannot_redirect_or_preserve_verified_output"
+        in release_qualification_test,
+        "artifact archives must be count- and byte-bounded, allow-listed, and local/central/descriptor consistent before extraction, and a rejected archive must leave no partial trusted output",
+        errors,
+    )
+    require(
+        # The transcript the heavy gate proves and the transcript qualification
+        # accepts must be one pinned value, not two copies that can drift.
+        "from speech_to_text_browser_smoke import DEFAULT_EXPECTED_TEXT"
+        in release_qualification
+        and "normalize_transcript(DEFAULT_EXPECTED_TEXT)" in release_qualification
+        and "Hmm. Oh, yeah, yeah." not in release_qualification
+        and "does not match expected transcript" in release_qualification
+        and "rejected but reported" in release_qualification
+        and "test_mutated_asr_cold_transcript_rejected" in release_qualification_test
+        and "test_mutated_asr_warm_transcript_rejected" in release_qualification_test
+        and "test_malformed_asr_cancellation_schema_rejected"
+        in release_qualification_test
+        and "test_rejected_cancellation_must_report_no_output"
+        in release_qualification_test
+        and "test_asr_silence_transcript_must_stay_empty" in release_qualification_test
+        and "test_tts_truncated_must_be_false" in release_qualification_test
+        and "test_tts_lifecycle_evidence_cancellation_tested_must_be_true"
+        in release_qualification_test
+        and "test_tts_lifecycle_evidence_pre_aborted_tested_must_be_true"
+        in release_qualification_test
+        and "test_tts_lifecycle_evidence_reuse_sample_count_must_be_positive"
+        in release_qualification_test
+        and "test_tts_lifecycle_evidence_unload_tested_must_be_true"
+        in release_qualification_test,
+        "attestation evidence must match the single pinned transcript and prove exact cancellation, silence, and TTS lifecycle semantics",
+        errors,
+    )
+    require(
+        # Publication consumes the candidate; rebuilding it would change the
+        # manifest and therefore the digest no attestation could then match.
+        "scripts/build_bridge.sh" not in publish
+        and "WEBGPU_BRIDGE_BUILD_MEM64" not in publish
+        and "setup-emsdk" not in publish
+        and "Run durable state persistence gate" not in publish
+        and "Run durable multimodal gate" not in publish
+        and "scripts/generate_release_manifest.py" not in publish
+        and "Prove the candidate and attestation run identities" in publish
+        and "scripts/release_qualification.py verify-run" in publish
+        and publish.count("scripts/release_qualification.py verify-attestation") == 2
+        and "--workflow-path \"${workflow_path}\"" in publish
+        and "--head-branch \"${bridge_default}\"" in publish
+        # A run head on the default-branch line, not merely on some branch, and
+        # not pinned to a moving head that an unrelated push would invalidate.
+        and 'repos/${BRIDGE_REPO}/compare/${head_sha}...${bridge_default}' in publish
+        and 'repos/${BRIDGE_REPO}/compare/${head_sha}...${bridge_default}'
+        in qualification_attestation
+        and "CANDIDATE_WORKFLOW_PATH: .github/workflows/bridge_candidate.yml" in publish
+        and "ATTESTATION_WORKFLOW_PATH: .github/workflows/qualification_attestation.yml"
+        in publish
+        and 'actions/artifacts/${CANDIDATE_ARTIFACT_ID}/zip' in publish
+        and 'actions/artifacts/${ATTESTATION_ARTIFACT_ID}/zip' in publish
+        and "?per_page=100" in publish
+        and "run_attempt_args=(--run-attempt 1)" in publish
+        and "_extract_flat_artifact_archive" in publish
+        and "Checkout trusted candidate verification policy" in publish
+        and "publication-policy/scripts/release_qualification.py verify-attestation"
+        in publish
+        and "publication-policy/scripts/release_publication_state.py classify"
+        in publish
+        and "bridge-source/scripts/release_qualification.py" not in publish
+        and "bridge-source/scripts/release_publication_state.py" not in publish
+        and "--harness-dir" in publish
+        and "exact-webgpu-bridge-dist" in publish
+        and "verified-qualification-attestation" in publish
+        and "bridge-qualification-outcome" in publish,
+        "publication must consume the exact candidate artifact, prove both run identities, and verify the digest-bound attestation instead of rebuilding",
+        errors,
+    )
+    require(
+        "Validate release qualification contract" in ci
+        and "scripts/release_qualification_test.py" in ci
+        and "scripts/release_qualification.py" in ci
+        and "scripts/release_qualification_test.py" in publish
+        and "scripts/release_qualification_test.py" in candidate
+        and "build_attestation" in release_qualification
+        and "validate_workflow_run" in release_qualification
+        and "validate_artifact_inventory" in release_qualification
+        and "verify_attestation" in release_qualification
+        and "harness_source_sha256" in release_qualification
+        and "require_harness_matches_bridge_source" in release_qualification
+        and "REQUIRED_UNPROVEN_CAPABILITIES" in release_qualification
+        and "real_device_intelligibility" in release_qualification
+        and "real_device_playback" in release_qualification
+        and "speaker_reference_fidelity" in release_qualification
+        # The heavy gates must prove every required memory/runtime mode and
+        # must never silently reach the network for a model or fixture.
+        and '("wasm32", "direct")' in release_qualification
+        and '("wasm32", "worker")' in release_qualification
+        and '("wasm64", "direct")' in release_qualification
+        and '("wasm64", "worker")' in release_qualification
+        and "LLAMA_WEBGPU_" in release_qualification
+        and "read_wav_identity" in release_qualification
+        and "phaseTimingsMs" in speech_smoke
+        and "coldTranscriptMs" in speech_smoke
+        and "warmTranscriptMs" in speech_smoke
+        and "cancellationMs" in speech_smoke
+        and "silenceMs" in speech_smoke
+        # Replay, unrelated-run, malformed, and duplicate payload cases are
+        # regression-tested rather than merely asserted in prose.
+        and "test_stale_attestation_replayed_against_new_release_rejected"
+        in release_qualification_test
+        and "test_publication_refuses_a_rebuilt_candidate_from_another_run"
+        in release_qualification_test
+        and "test_unrelated_or_unsuccessful_run_rejected" in release_qualification_test
+        and "test_candidate_run_must_be_the_first_build_attempt"
+        in release_qualification_test
+        and "test_run_attempt_one_is_mandatory_even_without_a_caller_override"
+        in release_qualification_test
+        and "test_missing_duplicate_expired_or_foreign_artifact_rejected"
+        in release_qualification_test
+        and "test_truncated_artifact_inventory_rejected"
+        in release_qualification_test
+        and "test_artifact_archive_rejects_path_escape_and_duplicate_members"
+        in release_qualification_test
+        and "test_tts_phase_rejects_wav_path_escape_and_symlink"
+        in release_qualification_test
+        and "test_tts_waveform_evidence_must_be_finite_and_non_silent"
+        in release_qualification_test
+        and "test_speech_result_evidence_is_required"
+        in release_qualification_test
+        and "test_smoke_timeout_is_bounded_and_writes_sanitized_diagnostics"
+        in release_qualification_test
+        and "test_local_harness_must_match_the_exact_bridge_source"
+        in release_qualification_test
+        and "test_noncanonical_transport_payload_rejected" in release_qualification_test
+        and "test_duplicate_keys_in_transport_payload_rejected"
+        in release_qualification_test
+        and "test_nonstandard_json_constants_rejected_before_schema_validation"
+        in release_qualification_test
+        and "test_verify_run_cli_defaults_to_the_mandatory_first_attempt"
+        in release_qualification_test
+        and "test_candidate_manifest_must_not_claim_a_hosted_heavy_gate_pass"
+        in release_qualification_test
+        and "attestation_base64:" in qualification_attestation
+        and "attestation_json:" not in qualification_attestation
+        and "Validate maintainer and repository boundary" in qualification_attestation
+        and '"${DISPATCHING_ACTOR}" != "${REPOSITORY_OWNER}"'
+        in qualification_attestation
+        and "Prove the candidate run identity and artifact uniqueness"
+        in qualification_attestation
+        and "scripts/release_qualification.py verify-run" in qualification_attestation
+        and "scripts/release_qualification.py decode-attestation"
+        in qualification_attestation
+        and "scripts/release_qualification.py verify-attestation"
+        in qualification_attestation
+        and "Checkout exact candidate harness source" in qualification_attestation
+        and "--harness-dir candidate-source/scripts" in qualification_attestation
+        and "?per_page=100" in qualification_attestation
+        and "--run-attempt 1" in qualification_attestation
+        and 'actions/artifacts/${CANDIDATE_ARTIFACT_ID}/zip'
+        in qualification_attestation
+        and "Upload verified qualification attestation" in qualification_attestation
+        and "WEBGPU_BRIDGE_ASSETS_PAT" not in qualification_attestation,
+        "CI, candidate, ingestion, and publication must enforce the digest-bound qualification contract with regression coverage for replay and malformed payloads",
+        errors,
+    )
+    require(
+        "scripts/generate_release_manifest.py" in candidate
         and '"schema_version": 2' in read_required(
             "scripts/generate_release_manifest.py", errors
         )
@@ -1377,6 +1691,17 @@ def main() -> int:
             "scripts/generate_release_manifest.py", errors
         )
         and '"qualification_gates": QUALIFICATION_GATES' in read_required(
+            "scripts/generate_release_manifest.py", errors
+        )
+        # The manifest must state the local-attestation requirement rather than
+        # claim a hosted heavy-gate pass that no hosted job ever produced.
+        and '"speech_to_text": LOCAL_ATTESTATION_REQUIRED' in read_required(
+            "scripts/generate_release_manifest.py", errors
+        )
+        and '"text_to_speech": LOCAL_ATTESTATION_REQUIRED' in read_required(
+            "scripts/generate_release_manifest.py", errors
+        )
+        and '"unproven_capabilities": UNPROVEN_CAPABILITIES' in read_required(
             "scripts/generate_release_manifest.py", errors
         )
         and '"sha256": digest' in read_required(
@@ -1480,11 +1805,12 @@ def main() -> int:
         errors,
     )
     require(
-        "run_speech_to_text_smoke" in ci
-        and "scripts/speech_to_text_browser_smoke.py" in ci
+        "scripts/speech_to_text_browser_smoke.py" in ci
         and "LLAMA_WEBGPU_SPEECH_MODEL_SHA256" in ci
-        and "LLAMA_WEBGPU_SPEECH_MMPROJ_SHA256" in ci,
-        "CI must expose the checksum-pinned Qwen3-ASR smoke as an opt-in manual gate",
+        and "LLAMA_WEBGPU_SPEECH_MMPROJ_SHA256" in ci
+        and "run_speech_to_text_smoke" not in ci
+        and "Run Qwen3-ASR browser smoke" not in ci,
+        "CI must syntax-check the checksum-pinned Qwen3-ASR harness without executing the heavy real-model gate on hosted runners",
         errors,
     )
     require(
@@ -1610,7 +1936,7 @@ def main() -> int:
         "AGENTS.md": agents,
         "CONTRIBUTING.md": contributing,
         ".github/workflows/ci.yml": ci,
-        ".github/workflows/publish_assets.yml": publish,
+        ".github/workflows/bridge_candidate.yml": candidate,
     }
     require_identical_model_sha_pins(
         {

@@ -96,11 +96,36 @@ python3 scripts/multimodal_browser_smoke.py \
   --artifacts-dir /tmp/llama-web-bridge-multimodal-smoke
 ```
 
-Before publishing assets intended to support typed Qwen3-ASR, run the opt-in
-checksum-pinned speech gate. It validates cold, cancellation, and warm-reuse
-results in wasm32 and memory64, through both direct and worker runtimes. Qwen's
-official English WAV fixture, its SHA-256, and the expected Web transcript are
-pinned by the script:
+Heavy Qwen3-ASR and Qwen3-TTS gates never run on hosted runners. Before
+publishing, run the one required local qualification command against the exact
+candidate artifact built by `.github/workflows/bridge_candidate.yml`:
+
+```bash
+python3 scripts/release_qualification.py qualify \
+  --candidate-run-id <CANDIDATE_RUN_ID> \
+  --speech-model-path /path/to/Qwen3-ASR-0.6B-Q8_0.gguf \
+  --speech-mmproj-path /path/to/mmproj-Qwen3-ASR-0.6B-Q8_0.gguf \
+  --speech-audio-path /path/to/asr_en.wav \
+  --tts-model-path /path/to/Qwen3-TTS-12Hz-1.7B-Base-Q4_K_M.gguf \
+  --tts-mmproj-path /path/to/mmproj-Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf \
+  --output-attestation /tmp/qualification-attestation.json \
+  --output-base64 /tmp/qualification-attestation.b64
+```
+
+The command downloads the candidate by immutable artifact ID only after proving
+the named run is a successful `bridge_candidate.yml` dispatch on the
+default-branch line whose complete inventory contains exactly one live
+`exact-webgpu-bridge-dist` artifact. It refuses an unprovenanced local dist,
+requires every model/projector/fixture path, gives smoke children only a narrow
+non-secret environment allowlist, bounds both gate timeouts, and terminates the
+full smoke process group on timeout or cancellation. It also compares the local
+harness bytes with the exact candidate bridge commit before running a model
+gate, so run it from a checkout that contains that commit. Dispatch the `.b64`
+payload and the same candidate run ID to
+`.github/workflows/qualification_attestation.yml`, then pass that ingestion run
+ID to publication as `attestation_run_id`.
+
+Direct individual smokes can also be run locally:
 
 ```bash
 python3 scripts/speech_to_text_browser_smoke.py \
@@ -111,11 +136,6 @@ python3 scripts/speech_to_text_browser_smoke.py \
   --mmproj-sha256 41a342b5e4c514e968cb756de6cd1b7be39eff43c44c57a2ef5fc6522e36603d \
   --artifacts-dir /tmp/llama-web-bridge-speech-smoke
 ```
-
-Before publishing assets intended to support Qwen3-TTS, run the opt-in
-checksum-pinned memory64 gate through both direct and worker runtimes. The
-validated model/projector pair is too large for a practical wasm32 product
-path:
 
 ```bash
 python3 scripts/text_to_speech_browser_smoke.py \
@@ -136,15 +156,20 @@ query strings, and fragments before printing the location.
 ## Agent Workflow Guardrails
 
 - Keep workflow reliability rules in `scripts/verify_ci_reliability.py` when
-  changing `.github/workflows/ci.yml`, `.github/workflows/publish_assets.yml`,
-  `.github/workflows/auto_llama_cpp_update.yml`, JS build pipeline files, or
+  changing `.github/workflows/ci.yml`, `.github/workflows/bridge_candidate.yml`,
+  `.github/workflows/publish_assets.yml`,
+  `.github/workflows/auto_llama_cpp_update.yml`,
+  `.github/workflows/qualification_attestation.yml`, JS build pipeline files,
+  `scripts/release_qualification.py`, or
   `scripts/state_persistence_browser_smoke.py`.
 - Rotate all 7 model/projector SHA-256 pins in the five files that hard-code
   them together: `README.md`, `AGENTS.md`, `CONTRIBUTING.md`,
-  `.github/workflows/ci.yml`, `.github/workflows/publish_assets.yml`.
+  `.github/workflows/ci.yml`, `.github/workflows/bridge_candidate.yml`.
   `scripts/verify_ci_reliability.py` requires the five sets to be identical with
-  exactly 7 pins each; a stale `publish_assets.yml` breaks the release job, not
-  just CI.
+  exactly 7 pins each; a stale `bridge_candidate.yml` breaks the candidate job,
+  not just CI. `publish_assets.yml` holds no pins because it neither builds nor
+  smokes. `scripts/release_qualification.py` carries the same 7 plus the pinned
+  ASR audio fixture, and every attestation must match them exactly.
 - The script also compares pins role by role across the two workflows, whose env
   keys name the role, so a swap between roles in one workflow fails the gate. A
   swap applied identically to both passes, as does one confined to the three
@@ -154,11 +179,16 @@ query strings, and fragments before printing the location.
   the model or projector the pin belongs to.
 - Keep `scripts/multimodal_browser_smoke.py` in normal CI for every llama.cpp
   pin update; build-only validation does not cover mtmd prompt ingestion.
-- Keep `scripts/speech_to_text_browser_smoke.py` opt-in because its model pair
-  is large, but require it before publishing assets advertised for typed ASR.
-- Keep `scripts/text_to_speech_browser_smoke.py` opt-in because its model pair
-  is large and requires memory64, but require it before publishing assets
-  advertised for Qwen3-TTS.
+- Heavy real-model ASR and TTS gates run only through
+  `scripts/release_qualification.py` during local qualification. Keep the
+  candidate manifest honest: `generate_release_manifest.py` must record those
+  two gates as `required-local-attestation`, never as a hosted pass, and must
+  keep real-device playback, intelligibility, and speaker-reference fidelity in
+  `unproven_capabilities`.
+- Nothing may rebuild the candidate after it is built. The manifest embeds the
+  candidate run ID/URL, so a rebuild changes the digest and no attestation could
+  match it. Candidate workflow attempts are first-attempt-only; after a failed
+  build or hosted gate, dispatch a new candidate run instead of rerunning one.
 - Preserve `llama_cpp.version` as the default ordinary CI/development build pin.
   It holds exactly one upstream tag in either channel, stable
   `vMAJOR.MINOR.PATCH` or development `bNNNN`; `scripts/verify_ci_reliability.py`
@@ -182,10 +212,12 @@ query strings, and fragments before printing the location.
 ## Publish Process
 
 Use `.github/workflows/publish_assets.yml` only after explicit publication
-approval. The central orchestrator or a maintainer dispatches this bridge-owned,
-non-reusable workflow with a required correlation ID, exact bridge SHA,
-upstream tag/commit, native release tag plus
-`assets.json` SHA-256, output release tag/rebuild, and assets repository.
+approval. The repository owner, either directly or through the central
+orchestrator using that existing authorized identity, dispatches this
+bridge-owned, non-reusable workflow with a required correlation ID, exact bridge SHA,
+upstream tag/commit, native release tag plus `assets.json` SHA-256,
+output release tag/rebuild, distinct required `candidate_run_id` and
+`attestation_run_id`, and assets repository.
 
 The request must set `publish_approved=true`. Publication remains blocked until
 repository administrators separately create `bridge-assets-publication`, disable
@@ -197,20 +229,27 @@ the environment identity, disabled administrator bypass, and exact `main`
 deployment branch policy before approval. It repeats those checks after approval
 immediately before the first publication-PAT-bearing step, using the trusted
 workflow commit's validator so an older requested build-source SHA remains
-compatible. The environment-scoped `WEBGPU_BRIDGE_ASSETS_PAT` is the only
+compatible. The trusted commit also supplies attestation, provenance, and
+publication-state policy; the historical source supplies only the exact harness
+bytes, toolchain pin, and build identity. The environment-scoped
+`WEBGPU_BRIDGE_ASSETS_PAT` is the only
 external credential; each step that can use it fails closed unless the injected
 value is non-empty and never prints the value. The workflow also verifies all
-identities plus native GitHub asset digests/inventory. It
-builds wasm32 and memory64, runs mandatory state/multimodal/ASR/TTS gates,
-orders stable and development histories independently, generates a
-deterministic schema-v2 manifest, and recovers exact partial states while
-rejecting any mismatch. Manifest and outcome records include the exact bridge
-workflow run ID/URL and explicit conclusions for every mandatory capability
-gate; unavailable post-mutation re-queries produce retryable
-`mutation-unknown` records rather than guessed state.
-Retry partial publication by rerunning the same GitHub Actions run so its
-fingerprinted run ID/URL remains stable. Do not redispatch a new run against an
-existing output tag.
+identities plus native GitHub asset digests/inventory. It never builds: it
+proves the repository, workflow file, dispatch event, default-branch-line head,
+success, complete artifact inventory, and uniqueness of both the candidate run
+and the attestation ingestion run, downloads both by immutable artifact ID, and
+verifies the attestation against the candidate twice -- once before approval and
+again inside the privileged job. It then orders stable and development histories
+independently and recovers exact partial states while rejecting any mismatch.
+Manifest and outcome records carry the candidate run ID/URL, because that is the
+identity the candidate manifest embeds; unavailable post-mutation re-queries
+produce retryable `mutation-unknown` records rather than guessed state.
+Publication run attempts are first-attempt-only: retry partial publication by
+redispatching a new publication run against the same `candidate_run_id` and
+`attestation_run_id`, never rerunning the old run. The fingerprinted identity
+comes from the candidate run, so it stays stable. A different candidate must
+never target an existing output tag.
 
 GitHub artifact tags are `vMAJOR.MINOR.PATCH`, `vMAJOR.MINOR.PATCH-N`, `bNNNN`,
 or `bNNNN-N`. Historical `bNNNN-llamadart.N` and prior wrapper forms are
