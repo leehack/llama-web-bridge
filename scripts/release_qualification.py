@@ -417,7 +417,8 @@ def sanitize_diagnostic_text(text: str) -> str:
                 raise ValueError("HTTP(S) URL is missing its authority")
             _ = parts.port
         except ValueError:
-            return f"{candidate.split(':', 1)[0]}://<redacted-url>"
+            scheme = candidate.split(":", 1)[0].lower()
+            return f"{scheme}://<redacted-url>"
         netloc = parts.netloc.rsplit("@", 1)[-1]
         return urlunsplit((parts.scheme, netloc, parts.path, "", ""))
 

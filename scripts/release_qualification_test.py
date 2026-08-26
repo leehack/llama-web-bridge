@@ -1892,6 +1892,7 @@ class QualificationTest(unittest.TestCase):
         for raw in (
             "https:///user:pass@example.com/model.gguf?token=secret#frag",
             "https://user:password/model.gguf?token=secret#frag",
+            "HTTPS:///user:pass@example.com/model.gguf?token=secret#frag",
         ):
             with self.subTest(raw=raw):
                 self.assertEqual(
