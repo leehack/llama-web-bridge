@@ -365,17 +365,17 @@ def decode_attestation(blob: str) -> tuple[dict[str, Any], str]:
 REDACTED_CREDENTIAL = "<redacted-credential>"
 
 _CREDENTIAL_NAME_PATTERN = (
-    r"[A-Za-z0-9_-]*(?:token|secret|password|credential|api[_-]?key)"
-    r"[A-Za-z0-9_-]*"
+    r"[A-Za-z0-9_.-]*(?:token|secret|password|credential|api[_-]?key)"
+    r"[A-Za-z0-9_.-]*"
 )
 _CREDENTIAL_NAME_RE = re.compile(rf"(?i)\A{_CREDENTIAL_NAME_PATTERN}\Z")
 _LLAMA_TOKEN_COUNTER_NAME_RE = re.compile(
-    r"(?i)\An_tokens(?:[_-][A-Za-z0-9_-]+)?\Z"
+    r"(?i)\A(?:[A-Za-z0-9_-]+\.)*n_tokens(?:[_-][A-Za-z0-9_-]+)?\Z"
 )
 _CREDENTIAL_NAME_EXCEPT_PLURAL_TOKENS_RE = re.compile(
-    r"(?i)\A[A-Za-z0-9_-]*"
+    r"(?i)\A[A-Za-z0-9_.-]*"
     r"(?:token(?!s(?:\b|[_-]))|secret|password|credential|api[_-]?key)"
-    r"[A-Za-z0-9_-]*\Z"
+    r"[A-Za-z0-9_.-]*\Z"
 )
 _COUNTER_TEXT_VALUE_RE = re.compile(r"\A[0-9]+[.,;)}\]]?\Z")
 _CREDENTIAL_ASSIGNMENT_RE = re.compile(

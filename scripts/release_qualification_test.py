@@ -1943,6 +1943,28 @@ class QualificationTest(unittest.TestCase):
         self.assertEqual(structured["n_tokens_batch"], 65)
         self.assertEqual(structured["n_tokens_api_key"], rq.REDACTED_CREDENTIAL)
 
+    def test_dotted_structured_credential_keys_are_redacted(self) -> None:
+        structured = json.loads(
+            rq.sanitize_diagnostic_stdout(
+                json.dumps(
+                    {
+                        "service.credential": "service-secret",
+                        "headers.apiKey": "header-secret",
+                        "llama_context.n_tokens": 65,
+                        "headers.apiKey.n_tokens": 65,
+                    }
+                )
+            )
+        )
+        self.assertEqual(
+            structured["service.credential"], rq.REDACTED_CREDENTIAL
+        )
+        self.assertEqual(structured["headers.apiKey"], rq.REDACTED_CREDENTIAL)
+        self.assertEqual(structured["llama_context.n_tokens"], 65)
+        self.assertEqual(
+            structured["headers.apiKey.n_tokens"], rq.REDACTED_CREDENTIAL
+        )
+
     def test_credential_names_with_alphanumeric_suffixes_are_redacted(self) -> None:
         raw = (
             "tokenValue=token-secret\n"
