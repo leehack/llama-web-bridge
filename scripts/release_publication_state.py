@@ -12,7 +12,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
-from generate_release_manifest import ARTIFACTS, CAPABILITIES, QUALIFICATION_GATES
+from generate_release_manifest import (
+    ARTIFACTS,
+    CAPABILITIES,
+    QUALIFICATION_GATES,
+    UNPROVEN_CAPABILITIES,
+)
 from release_contract import (
     ASSETS_REPOSITORY,
     BRIDGE_REPOSITORY,
@@ -32,6 +37,7 @@ from release_contract import (
 APPROVED_ASSETS_REPOSITORY = ASSETS_REPOSITORY
 PUBLICATION_FILES = (*ARTIFACTS, "manifest.json", "sha256sums.txt")
 _COMMIT_RE = re.compile(r"[0-9a-f]{40}")
+_RUN_ID_RE = re.compile(r"[1-9][0-9]*")
 _SUM_RE = re.compile(r"([0-9a-f]{64})  ([A-Za-z0-9_.-]+)")
 
 
@@ -71,9 +77,20 @@ def _require_commit(value: str, field: str) -> str:
     return value
 
 
+def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ContractError(f"duplicate JSON key: {key!r}")
+        result[key] = value
+    return result
+
+
 def _read_json(path: Path, label: str) -> Mapping[str, Any]:
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = json.loads(
+            path.read_text(encoding="utf-8"), object_pairs_hook=_reject_duplicate_keys
+        )
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
         raise ContractError(f"could not read {label}: {error}") from error
     if not isinstance(payload, Mapping):
@@ -82,6 +99,23 @@ def _read_json(path: Path, label: str) -> Mapping[str, Any]:
 
 
 def validate_candidate(directory: Path, identity: CandidateIdentity) -> str:
+    if not directory.is_dir() or directory.is_symlink():
+        raise ContractError("candidate must be a real directory")
+    entries = list(directory.iterdir())
+    actual_names = {entry.name for entry in entries}
+    if actual_names != set(PUBLICATION_FILES):
+        unexpected = sorted(actual_names - set(PUBLICATION_FILES))
+        missing = sorted(set(PUBLICATION_FILES) - actual_names)
+        raise ContractError(
+            "candidate directory must contain exactly the governed publication "
+            f"files (unexpected: {unexpected}, missing: {missing})"
+        )
+    for entry in entries:
+        if entry.is_symlink() or not entry.is_file():
+            raise ContractError(
+                f"candidate entry must be an immutable regular file: {entry.name}"
+            )
+
     require_approved_assets_repo(identity.assets_repo)
     release = parse_release_tag(identity.release_tag)
     if release.rebuild != identity.release_rebuild:
@@ -100,7 +134,10 @@ def validate_candidate(directory: Path, identity: CandidateIdentity) -> str:
     _require_commit(identity.native_commit, "native_commit")
     require_sha256(identity.native_manifest_sha256, "native_manifest_sha256")
     require_correlation_id(identity.orchestrator_correlation_id)
-    if not identity.github_run_id.isdigit() or identity.github_run_id.startswith("0"):
+    if (
+        not isinstance(identity.github_run_id, str)
+        or _RUN_ID_RE.fullmatch(identity.github_run_id) is None
+    ):
         raise ContractError("github_run_id must be a positive decimal string")
     expected_run_url = (
         f"https://github.com/{BRIDGE_REPOSITORY}/actions/runs/{identity.github_run_id}"
@@ -129,6 +166,7 @@ def validate_candidate(directory: Path, identity: CandidateIdentity) -> str:
         "github_run_id": identity.github_run_id,
         "github_run_url": identity.github_run_url,
         "qualification_gates": QUALIFICATION_GATES,
+        "unproven_capabilities": UNPROVEN_CAPABILITIES,
         "capabilities": CAPABILITIES,
         "bridge_assets_tag": identity.release_tag,
         "source_repository": BRIDGE_REPOSITORY,
@@ -222,7 +260,7 @@ def _manifest_history_identity(
     if raw is None:
         return None
     try:
-        manifest = json.loads(raw)
+        manifest = json.loads(raw, object_pairs_hook=_reject_duplicate_keys)
     except json.JSONDecodeError as error:
         raise ContractError(f"assets branch manifest is invalid: {error}") from error
     if not isinstance(manifest, Mapping):
@@ -498,8 +536,8 @@ def mutation_unknown_from_requery(
         data = b""
     if data.strip():
         try:
-            parsed = json.loads(data)
-        except (UnicodeDecodeError, json.JSONDecodeError):
+            parsed = json.loads(data, object_pairs_hook=_reject_duplicate_keys)
+        except (ContractError, UnicodeDecodeError, json.JSONDecodeError):
             parsed = None
         if (
             isinstance(parsed, Mapping)

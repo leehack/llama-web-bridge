@@ -1,0 +1,390 @@
+name: Build Exact Bridge Candidate
+
+on:
+  # The candidate is built exactly once, by this workflow, and is then consumed
+  # unchanged by local qualification, attestation ingestion, and publication.
+  # Rebuilding at publication time would produce a different manifest and a
+  # different digest, so no attestation could ever match the artifact published.
+  # This workflow holds no publication environment, no deployment branch policy,
+  # and no PAT; it only builds, gates, and uploads.
+  workflow_dispatch:
+    inputs:
+      orchestrator_correlation_id:
+        description: Required central-orchestrator correlation identifier
+        required: true
+        type: string
+      bridge_source_sha:
+        description: Exact full llama-web-bridge source commit to build
+        required: true
+        type: string
+      upstream_tag:
+        description: Exact llama.cpp vMAJOR.MINOR.PATCH or bNNNN tag
+        required: true
+        type: string
+      upstream_commit:
+        description: Exact full commit resolved by upstream_tag
+        required: true
+        type: string
+      native_release_tag:
+        description: Exact native release tag that owns assets.json
+        required: true
+        type: string
+      native_manifest_sha256:
+        description: Expected SHA-256 of the native release assets.json
+        required: true
+        type: string
+      release_tag:
+        description: Exact output tag vMAJOR.MINOR.PATCH[-N] or bNNNN[-N]
+        required: true
+        type: string
+      release_rebuild:
+        description: Rebuild counter encoded by release_tag
+        required: true
+        type: number
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  BRIDGE_SOURCE_SHA: ${{ inputs.bridge_source_sha }}
+  UPSTREAM_TAG: ${{ inputs.upstream_tag }}
+  UPSTREAM_COMMIT: ${{ inputs.upstream_commit }}
+  NATIVE_REPO: leehack/llamadart-native
+  BRIDGE_REPO: leehack/llama-web-bridge
+  NATIVE_RELEASE_TAG: ${{ inputs.native_release_tag }}
+  NATIVE_MANIFEST_SHA256: ${{ inputs.native_manifest_sha256 }}
+  RELEASE_TAG: ${{ inputs.release_tag }}
+  RELEASE_REBUILD: ${{ inputs.release_rebuild }}
+  ASSETS_REPO: leehack/llama-web-bridge-assets
+  ORCHESTRATOR_CORRELATION_ID: ${{ inputs.orchestrator_correlation_id }}
+  DISPATCHING_ACTOR: ${{ github.triggering_actor }}
+  REPOSITORY_OWNER: ${{ github.repository_owner }}
+  GITHUB_RUN_ID_STRING: ${{ github.run_id }}
+  GITHUB_RUN_ATTEMPT_STRING: ${{ github.run_attempt }}
+  GITHUB_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+concurrency:
+  group: build-bridge-candidate-${{ inputs.release_tag }}
+  cancel-in-progress: false
+
+jobs:
+  build-candidate:
+    name: Build exact source and run hosted release gates
+    runs-on: ubuntu-latest
+    env:
+      LLAMA_WEBGPU_SMOKE_MODEL_URL: https://huggingface.co/aladar/llama-2-tiny-random-GGUF/resolve/main/llama-2-tiny-random.gguf
+      LLAMA_WEBGPU_SMOKE_MODEL_SHA256: 81f226c62d28ed4a1a9b9fa080fcd9f0cc40e0f9d5680036583ff98fbcd035cb
+      LLAMA_WEBGPU_SMOKE_MODEL_CACHE: ~/.cache/llama-web-bridge/state-smoke-models
+      LLAMA_WEBGPU_SMOKE_ARTIFACTS_DIR: /tmp/state-persistence-smoke-artifacts
+      LLAMA_WEBGPU_MULTIMODAL_MODEL_URL: https://huggingface.co/unsloth/Qwen3.5-0.8B-GGUF/resolve/main/Qwen3.5-0.8B-Q4_K_M.gguf
+      LLAMA_WEBGPU_MULTIMODAL_MODEL_SHA256: bd258782e35f7f458f8aced1adc053e6e92e89bc735ba3be89d38a06121dc517
+      LLAMA_WEBGPU_MULTIMODAL_MMPROJ_URL: https://huggingface.co/unsloth/Qwen3.5-0.8B-GGUF/resolve/main/mmproj-F16.gguf
+      LLAMA_WEBGPU_MULTIMODAL_MMPROJ_SHA256: 56e4c6cfe73b0c82e3e82bc518d7591997e61d81f723fc41a586f4fa69ea2453
+      LLAMA_WEBGPU_MULTIMODAL_MODEL_CACHE: ~/.cache/llama-web-bridge/multimodal-smoke-models
+      LLAMA_WEBGPU_MULTIMODAL_ARTIFACTS_DIR: /tmp/multimodal-smoke-artifacts
+      LLAMA_WEBGPU_MULTIMODAL_TIMEOUT_MS: 420000
+      # Qwen3-ASR and Qwen3-TTS pins live here as the single hosted source of
+      # truth for the pinned model set even though this workflow never runs
+      # them: the heavy gates exhausted the hosted 4-vCPU/16 GB runner and are
+      # proven by digest-bound local qualification instead.
+      LLAMA_WEBGPU_SPEECH_MODEL_URL: https://huggingface.co/ggml-org/Qwen3-ASR-0.6B-GGUF/resolve/928ab958557df9aa2ef1c93e0e83c7ad0933fae2/Qwen3-ASR-0.6B-Q8_0.gguf?download=true
+      LLAMA_WEBGPU_SPEECH_MODEL_SHA256: bca259818b50ca7c4c05e9bdb35a5dc04fa039653a6d6f3f0f331f96f6aa1971
+      LLAMA_WEBGPU_SPEECH_MMPROJ_URL: https://huggingface.co/ggml-org/Qwen3-ASR-0.6B-GGUF/resolve/928ab958557df9aa2ef1c93e0e83c7ad0933fae2/mmproj-Qwen3-ASR-0.6B-Q8_0.gguf?download=true
+      LLAMA_WEBGPU_SPEECH_MMPROJ_SHA256: 41a342b5e4c514e968cb756de6cd1b7be39eff43c44c57a2ef5fc6522e36603d
+      LLAMA_WEBGPU_TTS_MODEL_URL: https://huggingface.co/ggml-org/Qwen3-TTS-12Hz-1.7B-Base-GGUF/resolve/ca27d74bc954b73dadab5b71ca265d87fc861a7c/Qwen3-TTS-12Hz-1.7B-Base-Q4_K_M.gguf?download=true
+      LLAMA_WEBGPU_TTS_MODEL_SHA256: 8d18c94acb2addd042f97da63c98be144eafa76d0d9495177eab65130cf85129
+      LLAMA_WEBGPU_TTS_MMPROJ_URL: https://huggingface.co/ggml-org/Qwen3-TTS-12Hz-1.7B-Base-GGUF/resolve/ca27d74bc954b73dadab5b71ca265d87fc861a7c/mmproj-Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf?download=true
+      LLAMA_WEBGPU_TTS_MMPROJ_SHA256: 6fd65188839bcd6ecc91b277ad471e22a0edfada4699a0fe82f1165c18cfcce2
+    steps:
+      - name: Validate candidate request boundary
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_REPOSITORY}" != "${BRIDGE_REPO}" ]; then
+            echo "error: candidate workflow must execute in ${BRIDGE_REPO}"
+            exit 1
+          fi
+          if [ "${DISPATCHING_ACTOR}" != "${REPOSITORY_OWNER}" ]; then
+            echo "error: candidate dispatch is restricted to ${REPOSITORY_OWNER}"
+            exit 1
+          fi
+          if [ "${GITHUB_RUN_ATTEMPT_STRING}" != "1" ]; then
+            echo "error: candidate builds are first-attempt-only; dispatch a new run instead of rebuilding"
+            exit 1
+          fi
+          if [[ ! "${ORCHESTRATOR_CORRELATION_ID}" =~ ^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$ ]]; then
+            echo "error: invalid orchestrator_correlation_id"
+            exit 1
+          fi
+          if [[ ! "${BRIDGE_SOURCE_SHA}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "error: bridge_source_sha must be a full lowercase commit SHA"
+            exit 1
+          fi
+          bridge_default="$(gh api "repos/${BRIDGE_REPO}" --jq '.default_branch')"
+          if [ "${GITHUB_REF}" != "refs/heads/${bridge_default}" ]; then
+            echo "error: candidate workflow must be dispatched from ${BRIDGE_REPO}'s default branch"
+            exit 1
+          fi
+          source_status="$(gh api \
+            "repos/${BRIDGE_REPO}/compare/${BRIDGE_SOURCE_SHA}...${bridge_default}" \
+            --jq '.status')"
+          if [ "${source_status}" != "ahead" ] && [ "${source_status}" != "identical" ]; then
+            echo "error: bridge source is not reachable from ${BRIDGE_REPO}'s default branch"
+            exit 1
+          fi
+
+      - name: Checkout exact bridge source
+        uses: actions/checkout@v4
+        with:
+          repository: leehack/llama-web-bridge
+          ref: ${{ env.BRIDGE_SOURCE_SHA }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate exact bridge and release inputs
+        run: |
+          set -euo pipefail
+          if [[ ! "${BRIDGE_SOURCE_SHA}" =~ ^[0-9a-f]{40}$ ]] || [ "$(git rev-parse HEAD)" != "${BRIDGE_SOURCE_SHA}" ]; then
+            echo "error: checked-out bridge source does not match the requested full SHA"
+            exit 1
+          fi
+          python3 scripts/release_contract.py validate-release \
+            --release-tag "${RELEASE_TAG}" --release-rebuild "${RELEASE_REBUILD}" \
+            --upstream-tag "${UPSTREAM_TAG}"
+          python3 scripts/release_contract.py validate-native-request \
+            --native-release-tag "${NATIVE_RELEASE_TAG}" \
+            --upstream-tag "${UPSTREAM_TAG}" --upstream-commit "${UPSTREAM_COMMIT}" \
+            --manifest-sha256 "${NATIVE_MANIFEST_SHA256}"
+          python3 - "${ORCHESTRATOR_CORRELATION_ID}" <<'PY'
+          import sys
+          from scripts.release_contract import require_correlation_id
+          require_correlation_id(sys.argv[1])
+          PY
+          python3 - "${ASSETS_REPO}" "${NATIVE_REPO}" <<'PY'
+          import sys
+          from scripts.release_contract import require_repository
+          require_repository(sys.argv[1], "assets_repo")
+          require_repository(sys.argv[2], "native_repo")
+          PY
+
+      - name: Resolve immutable upstream and native release tag commits
+        id: native_tag
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/native-release"
+          git ls-remote https://github.com/ggml-org/llama.cpp.git \
+            "refs/tags/${UPSTREAM_TAG}" "refs/tags/${UPSTREAM_TAG}^{}" \
+            > "${RUNNER_TEMP}/upstream-tag-refs.txt"
+          RESOLVED_UPSTREAM_COMMIT="$(python3 scripts/release_contract.py resolve-tag-commit \
+            --ls-remote "${RUNNER_TEMP}/upstream-tag-refs.txt" \
+            --tag "${UPSTREAM_TAG}")"
+          if [ "${RESOLVED_UPSTREAM_COMMIT}" != "${UPSTREAM_COMMIT}" ]; then
+            echo "error: resolved upstream tag commit does not match upstream_commit"
+            exit 1
+          fi
+          git ls-remote "https://github.com/${NATIVE_REPO}.git" \
+            "refs/tags/${NATIVE_RELEASE_TAG}" "refs/tags/${NATIVE_RELEASE_TAG}^{}" \
+            > "${RUNNER_TEMP}/native-release/tag-refs.txt"
+          NATIVE_TAG_COMMIT="$(python3 scripts/release_contract.py resolve-tag-commit \
+            --ls-remote "${RUNNER_TEMP}/native-release/tag-refs.txt" \
+            --tag "${NATIVE_RELEASE_TAG}")"
+          echo "native_tag_commit=${NATIVE_TAG_COMMIT}" >> "${GITHUB_OUTPUT}"
+
+      - name: Download and independently verify native release inventory
+        id: native
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NATIVE_TAG_COMMIT: ${{ steps.native_tag.outputs.native_tag_commit }}
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/native-release"
+          gh api "repos/${NATIVE_REPO}/releases/tags/${NATIVE_RELEASE_TAG}" \
+            > "${RUNNER_TEMP}/native-release/release.json"
+          for name in assets.json SHA256SUMS; do
+            asset_id="$(jq -er --arg name "${name}" \
+              '[.assets[] | select(.name == $name)] | if length == 1 then .[0].id else error("missing/duplicate asset") end' \
+              "${RUNNER_TEMP}/native-release/release.json")"
+            gh api -H "Accept: application/octet-stream" \
+              "repos/${NATIVE_REPO}/releases/assets/${asset_id}" \
+              > "${RUNNER_TEMP}/native-release/${name}"
+          done
+          IDENTITY="$(python3 scripts/release_contract.py validate-native-release \
+            --manifest "${RUNNER_TEMP}/native-release/assets.json" \
+            --checksums "${RUNNER_TEMP}/native-release/SHA256SUMS" \
+            --release-json "${RUNNER_TEMP}/native-release/release.json" \
+            --manifest-sha256 "${NATIVE_MANIFEST_SHA256}" \
+            --native-release-tag "${NATIVE_RELEASE_TAG}" \
+            --upstream-tag "${UPSTREAM_TAG}" --upstream-commit "${UPSTREAM_COMMIT}" \
+            --native-tag-commit "${NATIVE_TAG_COMMIT}")"
+          echo "native_commit=$(jq -r '.native_commit' <<<"${IDENTITY}")" >> "${GITHUB_OUTPUT}"
+
+      - name: Verify exact upstream and native tag commits
+        env:
+          NATIVE_COMMIT: ${{ steps.native.outputs.native_commit }}
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "${UPSTREAM_TAG}" https://github.com/ggml-org/llama.cpp.git third_party/llama_cpp
+          if [ "$(git -C third_party/llama_cpp rev-parse HEAD)" != "${UPSTREAM_COMMIT}" ]; then
+            echo "error: upstream tag does not resolve to requested commit"
+            exit 1
+          fi
+          git clone --depth 1 --branch "${NATIVE_RELEASE_TAG}" \
+            "https://github.com/${NATIVE_REPO}.git" "${RUNNER_TEMP}/native-source"
+          if [ "$(git -C "${RUNNER_TEMP}/native-source" rev-parse HEAD)" != "${NATIVE_COMMIT}" ]; then
+            echo "error: native tag does not resolve to manifest native_commit"
+            exit 1
+          fi
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Validate generated JS and release contracts
+        run: |
+          npm ci --ignore-scripts
+          npm run check:js
+          git ls-files --error-unmatch js/llama_webgpu_bridge.js js/llama_webgpu_bridge_worker.js js/llama_webgpu_bridge.d.ts
+          git diff --exit-code -- js/llama_webgpu_bridge.js js/llama_webgpu_bridge_worker.js js/llama_webgpu_bridge.d.ts
+          python3 scripts/release_contract_test.py
+          python3 scripts/generate_release_manifest_test.py
+          python3 scripts/release_publication_state_test.py
+          python3 scripts/release_qualification_test.py
+          python3 scripts/verify_state_persistence_api.py
+          python3 scripts/verify_text_to_speech_api.py
+          python3 scripts/wasm64_runtime_patch_contract_test.py
+          python3 scripts/verify_ci_reliability.py
+
+      - name: Resolve Emscripten SDK pin
+        id: emscripten
+        run: |
+          EMSCRIPTEN_VERSION="$(python3 scripts/verify_emscripten_version.py --print-pin)"
+          echo "EMSCRIPTEN_VERSION=${EMSCRIPTEN_VERSION}" >> "${GITHUB_ENV}"
+          echo "emscripten_version=${EMSCRIPTEN_VERSION}" >> "${GITHUB_OUTPUT}"
+
+      - name: Setup pinned Emscripten SDK
+        uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: ${{ env.EMSCRIPTEN_VERSION }}
+
+      - name: Verify compiler and build wasm32 plus memory64
+        env:
+          OUT_DIR: ${{ runner.temp }}/webgpu_bridge_dist
+          WEBGPU_BRIDGE_BUILD_MEM64: 1
+        run: |
+          python3 scripts/verify_emscripten_version.py --emit-github-env "$GITHUB_ENV"
+          ./scripts/build_bridge.sh
+
+      - name: Cache release smoke models
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/llama-web-bridge/state-smoke-models
+            ~/.cache/llama-web-bridge/multimodal-smoke-models
+          key: release-smoke-${{ env.LLAMA_WEBGPU_SMOKE_MODEL_SHA256 }}-${{ env.LLAMA_WEBGPU_MULTIMODAL_MODEL_SHA256 }}-${{ env.LLAMA_WEBGPU_MULTIMODAL_MMPROJ_SHA256 }}
+
+      - name: Install Playwright Chromium
+        run: |
+          python3 -m pip install --user playwright
+          python3 -m playwright install chromium
+
+      - name: Run durable state persistence gate
+        id: state_gate
+        env:
+          BRIDGE_DIST_DIR: ${{ runner.temp }}/webgpu_bridge_dist
+        run: python3 scripts/state_persistence_browser_smoke.py
+
+      - name: Run durable multimodal gate
+        id: multimodal_gate
+        env:
+          BRIDGE_DIST_DIR: ${{ runner.temp }}/webgpu_bridge_dist
+        run: python3 scripts/multimodal_browser_smoke.py
+
+      - name: Generate schema-v2 manifest and checksums
+        env:
+          OUT_DIR: ${{ runner.temp }}/webgpu_bridge_dist
+          NATIVE_COMMIT: ${{ steps.native.outputs.native_commit }}
+        run: |
+          set -euo pipefail
+          python3 scripts/generate_release_manifest.py \
+            --out-dir "${OUT_DIR}" --release-tag "${RELEASE_TAG}" --release-rebuild "${RELEASE_REBUILD}" \
+            --assets-repo "${ASSETS_REPO}" --bridge-repo "${BRIDGE_REPO}" --bridge-commit "${BRIDGE_SOURCE_SHA}" \
+            --upstream-tag "${UPSTREAM_TAG}" --upstream-commit "${UPSTREAM_COMMIT}" \
+            --native-repo "${NATIVE_REPO}" --native-release-tag "${NATIVE_RELEASE_TAG}" \
+            --native-manifest-sha256 "${NATIVE_MANIFEST_SHA256}" --native-commit "${NATIVE_COMMIT}" \
+            --emscripten-version "${EMSCRIPTEN_VERSION}" \
+            --orchestrator-correlation-id "${ORCHESTRATOR_CORRELATION_ID}" \
+            --github-run-id "${GITHUB_RUN_ID_STRING}" --github-run-url "${GITHUB_RUN_URL}"
+          (cd "${OUT_DIR}" && sha256sum --check sha256sums.txt)
+
+      - name: Record candidate fingerprint and prequalification state
+        id: candidate
+        env:
+          OUT_DIR: ${{ runner.temp }}/webgpu_bridge_dist
+          STATE_CONCLUSION: ${{ steps.state_gate.outcome }}
+          MULTIMODAL_CONCLUSION: ${{ steps.multimodal_gate.outcome }}
+          EMSCRIPTEN_VERSION_OUT: ${{ steps.emscripten.outputs.emscripten_version }}
+          NATIVE_COMMIT: ${{ steps.native.outputs.native_commit }}
+        run: |
+          set -euo pipefail
+          FINGERPRINT="$(python3 scripts/release_qualification.py candidate-fingerprint \
+            --candidate-dist "${OUT_DIR}")"
+          HARNESS_SHA256="$(python3 scripts/release_qualification.py harness-digest \
+            --harness-dir scripts)"
+          echo "candidate_fingerprint=${FINGERPRINT}" >> "${GITHUB_OUTPUT}"
+          jq -n --arg correlation "${ORCHESTRATOR_CORRELATION_ID}" \
+            --arg run_id "${GITHUB_RUN_ID_STRING}" --arg run_url "${GITHUB_RUN_URL}" \
+            --arg fingerprint "${FINGERPRINT}" --arg harness "${HARNESS_SHA256}" \
+            --arg bridge "${BRIDGE_SOURCE_SHA}" --arg release "${RELEASE_TAG}" \
+            --arg emscripten "${EMSCRIPTEN_VERSION_OUT}" --arg native "${NATIVE_COMMIT}" \
+            --arg state "${STATE_CONCLUSION}" --arg multimodal "${MULTIMODAL_CONCLUSION}" \
+            '{schema_version:1,candidate_fingerprint:$fingerprint,
+              harness_source_sha256:$harness,
+              orchestrator_correlation_id:$correlation,
+              github_run_id:$run_id,github_run_url:$run_url,
+              bridge_source_sha:$bridge,release_tag:$release,
+              emscripten_version:$emscripten,native_commit:$native,
+              hosted_gates:{state_persistence:$state,multimodal:$multimodal},
+              local_gates:{speech_to_text:"pending-local-qualification",
+                text_to_speech:"pending-local-qualification"},
+              unproven_capabilities:{real_device_intelligibility:"unproven",
+                real_device_playback:"unproven",
+                speaker_reference_fidelity:"unproven"}}' \
+            > "${RUNNER_TEMP}/candidate-prequalification.json"
+          cat "${RUNNER_TEMP}/candidate-prequalification.json"
+
+      - name: Upload exact candidate bridge assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: exact-webgpu-bridge-dist
+          if-no-files-found: error
+          path: |
+            ${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_bridge.js
+            ${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_bridge_worker.js
+            ${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_bridge.d.ts
+            ${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_core.js
+            ${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_core.wasm
+            ${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_core_mem64.js
+            ${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_core_mem64.wasm
+            ${{ runner.temp }}/webgpu_bridge_dist/manifest.json
+            ${{ runner.temp }}/webgpu_bridge_dist/sha256sums.txt
+
+      - name: Upload candidate prequalification record
+        uses: actions/upload-artifact@v4
+        with:
+          name: bridge-candidate-prequalification
+          if-no-files-found: error
+          path: ${{ runner.temp }}/candidate-prequalification.json
+
+      - name: Upload hosted smoke diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: exact-candidate-smoke-diagnostics
+          path: |
+            ${{ env.LLAMA_WEBGPU_SMOKE_ARTIFACTS_DIR }}
+            ${{ env.LLAMA_WEBGPU_MULTIMODAL_ARTIFACTS_DIR }}
+          if-no-files-found: ignore
