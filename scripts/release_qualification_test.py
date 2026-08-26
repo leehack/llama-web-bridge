@@ -2231,6 +2231,54 @@ class QualificationTest(unittest.TestCase):
         self.assertEqual(persisted["note"], payload["note"])
         self.assertEqual(persisted["modelUrl"], "https://example.com/m.gguf")
 
+    def test_successful_child_rejects_non_strict_json(self) -> None:
+        import sys as _sys
+
+        for label, raw, expected in (
+            ("duplicate", '{"ok":true,"ok":true}', "duplicate"),
+            ("nonstandard", '{"ok":true,"metric":NaN}', "non-standard"),
+        ):
+            with self.subTest(label=label):
+                diagnostics = self.tmp / f"{label}-diagnostics"
+                diagnostics.mkdir()
+                program = f"import sys; sys.stdout.write({raw!r})"
+                with self.assertRaises(ContractError) as ctx:
+                    rq._run_smoke(
+                        [_sys.executable, "-c", program],
+                        label,
+                        diagnostics,
+                        timeout_seconds=30,
+                    )
+                self.assertIn(expected, str(ctx.exception).lower())
+
+    def test_successful_child_duplicate_key_error_is_sanitized(self) -> None:
+        import sys as _sys
+        import traceback
+
+        diagnostics = self.tmp / "duplicate-key-diagnostics"
+        diagnostics.mkdir()
+        duplicate_key = (
+            "https://url-user:url-pass@example.com/m.gguf?token=child-secret#frag"
+        )
+        raw = json.dumps({"ok": True})[:-1] + (
+            f",{json.dumps(duplicate_key)}:1,{json.dumps(duplicate_key)}:2}}"
+        )
+        program = f"import sys; sys.stdout.write({raw!r})"
+        with self.assertRaises(ContractError) as ctx:
+            rq._run_smoke(
+                [_sys.executable, "-c", program],
+                "duplicate-key",
+                diagnostics,
+                timeout_seconds=30,
+            )
+        error = str(ctx.exception)
+        traceback_text = "".join(traceback.format_exception(ctx.exception))
+        self.assertIn("duplicate json key", error.lower())
+        self.assertIn("https://example.com/m.gguf", error)
+        for leaked in ("url-user", "url-pass", "child-secret", "token=", "#frag"):
+            self.assertNotIn(leaked, error)
+            self.assertNotIn(leaked, traceback_text)
+
     def test_max_rss_is_reported_in_bytes(self) -> None:
         import subprocess
         import sys as _sys

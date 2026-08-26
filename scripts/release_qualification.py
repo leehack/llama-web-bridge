@@ -1373,9 +1373,14 @@ def _run_smoke(
         sys.stderr.write(sanitized_stderr)
         raise ContractError(f"{label} gate failed with exit status {proc.returncode}")
     try:
-        payload = json.loads(stdout)
-    except json.JSONDecodeError as exc:
-        raise ContractError(f"{label} gate emitted unparsable JSON: {exc}") from exc
+        payload = json.loads(
+            stdout,
+            object_pairs_hook=_reject_duplicate_keys,
+            parse_constant=_reject_nonstandard_json_constant,
+        )
+    except (ContractError, json.JSONDecodeError) as exc:
+        detail = sanitize_diagnostic_text(str(exc))
+        raise ContractError(f"{label} gate emitted invalid JSON: {detail}") from None
     if not isinstance(payload, dict) or payload.get("ok") is not True:
         raise ContractError(f"{label} gate did not report ok=true")
     return payload
