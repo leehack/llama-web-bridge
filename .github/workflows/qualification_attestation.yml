@@ -56,6 +56,14 @@ jobs:
             echo "error: attestation ingestion is restricted to ${REPOSITORY_OWNER}"
             exit 1
           fi
+          if [ "${GITHUB_ACTOR}" != "${REPOSITORY_OWNER}" ]; then
+            echo "error: attestation ingestion actor is restricted to ${REPOSITORY_OWNER}"
+            exit 1
+          fi
+          if [ "${GITHUB_RUN_ATTEMPT}" != "1" ]; then
+            echo "error: attestation ingestion run_attempt must be 1"
+            exit 1
+          fi
           bridge_default="$(gh api "repos/${BRIDGE_REPO}" --jq '.default_branch')"
           if [ "${GITHUB_REF}" != "refs/heads/${bridge_default}" ]; then
             echo "error: attestation ingestion must run from ${BRIDGE_REPO}'s default branch"
@@ -117,7 +125,7 @@ jobs:
           from pathlib import Path
           sys.path.insert(0, "scripts")
           from release_qualification import _extract_flat_artifact_archive
-          _extract_flat_artifact_archive(Path(sys.argv[1]), Path(sys.argv[2]))
+          _extract_flat_artifact_archive(Path(sys.argv[1]), Path(sys.argv[2]), artifact_type="candidate")
           PY
 
       - name: Resolve and validate the exact candidate source identity
@@ -165,6 +173,8 @@ jobs:
             --attestation "${RUNNER_TEMP}/attestation/qualification-attestation.json" \
             --candidate-dist "${RUNNER_TEMP}/candidate" \
             --candidate-run-id "${CANDIDATE_RUN_ID}" \
+            --candidate-artifact-id "${CANDIDATE_ARTIFACT_ID}" \
+            --candidate-run-attempt 1 \
             --candidate-fingerprint "${CANDIDATE_FINGERPRINT}" \
             --bridge-commit "${CANDIDATE_BRIDGE_SOURCE_SHA}" \
             --harness-dir candidate-source/scripts

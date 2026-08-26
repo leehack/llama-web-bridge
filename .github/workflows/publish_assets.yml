@@ -121,6 +121,14 @@ jobs:
             echo "error: publication dispatch is restricted to ${REPOSITORY_OWNER}"
             exit 1
           fi
+          if [ "${GITHUB_ACTOR}" != "${REPOSITORY_OWNER}" ]; then
+            echo "error: publication actor is restricted to ${REPOSITORY_OWNER}"
+            exit 1
+          fi
+          if [ "${GITHUB_RUN_ATTEMPT}" != "1" ]; then
+            echo "error: publication run_attempt must be 1"
+            exit 1
+          fi
           if [[ ! "${ORCHESTRATOR_CORRELATION_ID}" =~ ^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$ ]]; then
             echo "error: invalid orchestrator_correlation_id"
             exit 1
@@ -165,6 +173,7 @@ jobs:
       native_commit: ${{ steps.native.outputs.native_commit }}
       emscripten_version: ${{ steps.emscripten.outputs.emscripten_version }}
       candidate_fingerprint: ${{ steps.attestation.outputs.candidate_fingerprint }}
+      candidate_artifact_id: ${{ steps.runs.outputs.candidate_artifact_id }}
     steps:
       - name: Checkout trusted candidate verification policy
         uses: actions/checkout@v4
@@ -305,6 +314,7 @@ jobs:
           echo "emscripten_version=${EMSCRIPTEN_VERSION}" >> "${GITHUB_OUTPUT}"
 
       - name: Prove the candidate and attestation run identities
+        id: runs
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -316,10 +326,7 @@ jobs:
             label="${pair%%:*}"; rest="${pair#*:}"
             run_id="${rest%%:*}"; rest="${rest#*:}"
             workflow_path="${rest%%:*}"; artifact_name="${rest#*:}"
-            run_attempt_args=()
-            if [ "${label}" = "candidate" ]; then
-              run_attempt_args=(--run-attempt 1)
-            fi
+            run_attempt_args=(--run-attempt 1)
             gh api "repos/${BRIDGE_REPO}/actions/runs/${run_id}" \
               > "${RUNNER_TEMP}/runs/${label}-run.json"
             gh api "repos/${BRIDGE_REPO}/actions/runs/${run_id}/artifacts?per_page=100" \
@@ -335,6 +342,7 @@ jobs:
             artifact_id="$(jq -er '.artifact_id' <<<"${verification}")"
             if [ "${label}" = "candidate" ]; then
               echo "CANDIDATE_ARTIFACT_ID=${artifact_id}" >> "${GITHUB_ENV}"
+              echo "candidate_artifact_id=${artifact_id}" >> "${GITHUB_OUTPUT}"
             else
               echo "ATTESTATION_ARTIFACT_ID=${artifact_id}" >> "${GITHUB_ENV}"
             fi
@@ -366,10 +374,12 @@ jobs:
           from pathlib import Path
           sys.path.insert(0, "scripts")
           from release_qualification import _extract_flat_artifact_archive
-          for index in (1, 3):
-              _extract_flat_artifact_archive(
-                  Path(sys.argv[index]), Path(sys.argv[index + 1])
-              )
+          _extract_flat_artifact_archive(
+              Path(sys.argv[1]), Path(sys.argv[2]), artifact_type="candidate"
+          )
+          _extract_flat_artifact_archive(
+              Path(sys.argv[3]), Path(sys.argv[4]), artifact_type="attestation"
+          )
           PY
           (cd "${RUNNER_TEMP}/candidate" && sha256sum --check sha256sums.txt)
 
@@ -383,6 +393,8 @@ jobs:
             --attestation "${RUNNER_TEMP}/attestation/qualification-attestation.json" \
             --candidate-dist "${RUNNER_TEMP}/candidate" \
             --candidate-run-id "${CANDIDATE_RUN_ID}" \
+            --candidate-artifact-id "${CANDIDATE_ARTIFACT_ID}" \
+            --candidate-run-attempt 1 \
             --harness-dir bridge-source/scripts \
             --bridge-commit "${BRIDGE_SOURCE_SHA}" \
             --upstream-tag "${UPSTREAM_TAG}" \
@@ -537,6 +549,7 @@ jobs:
         env:
           NATIVE_COMMIT: ${{ needs.verify-candidate-and-attestation.outputs.native_commit }}
           EMSCRIPTEN_VERSION: ${{ needs.verify-candidate-and-attestation.outputs.emscripten_version }}
+          CANDIDATE_ARTIFACT_ID: ${{ needs.verify-candidate-and-attestation.outputs.candidate_artifact_id }}
         run: |
           set -euo pipefail
           python3 publication-policy/scripts/release_qualification.py verify-attestation \
@@ -544,6 +557,8 @@ jobs:
             --candidate-dist bridge-dist \
             --candidate-fingerprint "${CANDIDATE_FINGERPRINT}" \
             --candidate-run-id "${CANDIDATE_RUN_ID}" \
+            --candidate-artifact-id "${CANDIDATE_ARTIFACT_ID}" \
+            --candidate-run-attempt 1 \
             --harness-dir bridge-source/scripts \
             --bridge-commit "${BRIDGE_SOURCE_SHA}" \
             --upstream-tag "${UPSTREAM_TAG}" \

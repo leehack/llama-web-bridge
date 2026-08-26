@@ -1397,6 +1397,145 @@ def main() -> int:
         errors,
     )
     require(
+        # A dispatching actor alone leaves the run's own actor and a re-run
+        # unproven, so both privileged workflows pin them too.
+        all(
+            '"${GITHUB_ACTOR}" != "${REPOSITORY_OWNER}"' in workflow
+            and '"${GITHUB_RUN_ATTEMPT}" != "1"' in workflow
+            for workflow in (qualification_attestation, publish)
+        )
+        and "workflow run actor must be" in release_qualification
+        and "workflow run triggering_actor must be" in release_qualification
+        and "test_wrong_workflow_run_actor_rejected" in release_qualification_test
+        and "test_wrong_workflow_run_triggering_actor_rejected"
+        in release_qualification_test,
+        "attestation ingestion and publication must pin the run actor and refuse replayed run attempts",
+        errors,
+    )
+    require(
+        # The attestation must bind the exact artifact it was produced from, and
+        # every verification site must re-assert that binding.
+        "candidate_artifact_id" in release_qualification
+        and "candidate_run_attempt" in release_qualification
+        and "attestation candidate_run_attempt must be 1" in release_qualification
+        and publish.count('--candidate-artifact-id "${CANDIDATE_ARTIFACT_ID}"') == 2
+        and publish.count("--candidate-run-attempt 1") == 2
+        and "candidate_artifact_id: ${{ steps.runs.outputs.candidate_artifact_id }}"
+        in publish
+        and "CANDIDATE_ARTIFACT_ID: ${{ needs.verify-candidate-and-attestation.outputs.candidate_artifact_id }}"
+        in publish
+        # Nothing consumes an attestation artifact id across jobs; exporting one
+        # would be unverified wiring that reads as a binding.
+        and "attestation_artifact_id" not in publish
+        and '--candidate-artifact-id "${CANDIDATE_ARTIFACT_ID}"'
+        in qualification_attestation
+        and "--candidate-run-attempt 1" in qualification_attestation
+        and "test_candidate_artifact_id_mismatch_rejected" in release_qualification_test
+        and "test_candidate_run_attempt_mismatch_rejected"
+        in release_qualification_test
+        and "test_attestation_receipt_contains_artifact_id_and_run_attempt"
+        in release_qualification_test,
+        "the attestation must bind the exact candidate artifact id and proven run attempt at every verification site",
+        errors,
+    )
+    require(
+        # Archive parsing must refuse a hostile archive from its metadata, before
+        # a single byte is decompressed into a trusted destination.
+        'artifact_type="candidate"' in publish
+        and 'artifact_type="attestation"' in publish
+        and 'artifact_type="candidate"' in qualification_attestation
+        and "ALLOWED_COMPRESS_TYPES" in release_qualification
+        and "MAX_COMPRESSION_RATIO" in release_qualification
+        and "MAX_CANDIDATE_MEMBER_BYTES" in release_qualification
+        and "MAX_CANDIDATE_TOTAL_BYTES" in release_qualification
+        and "CANDIDATE_ALLOWED_MEMBERS" in release_qualification
+        and "ATTESTATION_ALLOWED_MEMBERS" in release_qualification
+        and "_validate_local_header" in release_qualification
+        and "_stage_artifact_archive" in release_qualification
+        and "_preflight_zip_end_record" in release_qualification
+        and "_ZIP_ENCRYPTION_FLAGS" in release_qualification
+        and "_ZIP_DATA_DESCRIPTOR_FLAG" in release_qualification
+        and "dst_dir_fd=destination_fd" in release_qualification
+        and "_unlink_placed_members" in release_qualification
+        and "test_attestation_zip_bomb_rejected_on_compression_ratio"
+        in release_qualification_test
+        and "test_candidate_zip_bomb_rejected_on_compression_ratio"
+        in release_qualification_test
+        and "test_oversized_candidate_member_rejected_before_extraction"
+        in release_qualification_test
+        and "test_oversized_attestation_member_rejected_before_extraction"
+        in release_qualification_test
+        and "test_total_uncompressed_size_is_bounded_before_extraction"
+        in release_qualification_test
+        and "test_unsupported_compression_method_rejected"
+        in release_qualification_test
+        and "test_local_header_disagreeing_with_central_directory_rejected"
+        in release_qualification_test
+        and "test_local_header_name_disagreeing_with_central_directory_rejected"
+        in release_qualification_test
+        and "test_overlapping_members_rejected" in release_qualification_test
+        and "test_member_payload_cannot_overlap_the_central_directory"
+        in release_qualification_test
+        and "test_unclaimed_gap_before_central_directory_rejected"
+        in release_qualification_test
+        and "test_encrypted_zip_member_rejected" in release_qualification_test
+        and "test_data_descriptor_zip_member_rejected" in release_qualification_test
+        and "test_signed_github_style_data_descriptor_is_exactly_validated"
+        in release_qualification_test
+        and "test_local_and_central_flag_mismatch_rejected"
+        in release_qualification_test
+        and "test_nul_truncated_member_name_cannot_masquerade_as_allowlisted"
+        in release_qualification_test
+        and "test_member_extra_fields_and_comments_cannot_hide_metadata"
+        in release_qualification_test
+        and "test_local_only_extra_field_cannot_hide_metadata"
+        in release_qualification_test
+        and "test_unauthorized_artifact_member_rejected" in release_qualification_test
+        and "test_symlink_archive_member_rejected" in release_qualification_test
+        and "test_short_candidate_member_inventory_rejected"
+        in release_qualification_test
+        and "test_eocd_count_is_bounded_before_zipfile_parses_members"
+        in release_qualification_test
+        and "test_archive_preamble_cannot_hide_outside_the_member_inventory"
+        in release_qualification_test
+        and "test_failed_extraction_leaves_no_partial_trusted_output"
+        in release_qualification_test
+        and "test_interrupted_placement_leaves_no_partial_trusted_output"
+        in release_qualification_test
+        and "test_destination_swap_cannot_redirect_or_preserve_verified_output"
+        in release_qualification_test,
+        "artifact archives must be count- and byte-bounded, allow-listed, and local/central/descriptor consistent before extraction, and a rejected archive must leave no partial trusted output",
+        errors,
+    )
+    require(
+        # The transcript the heavy gate proves and the transcript qualification
+        # accepts must be one pinned value, not two copies that can drift.
+        "from speech_to_text_browser_smoke import DEFAULT_EXPECTED_TEXT"
+        in release_qualification
+        and "normalize_transcript(DEFAULT_EXPECTED_TEXT)" in release_qualification
+        and "Hmm. Oh, yeah, yeah." not in release_qualification
+        and "does not match expected transcript" in release_qualification
+        and "rejected but reported" in release_qualification
+        and "test_mutated_asr_cold_transcript_rejected" in release_qualification_test
+        and "test_mutated_asr_warm_transcript_rejected" in release_qualification_test
+        and "test_malformed_asr_cancellation_schema_rejected"
+        in release_qualification_test
+        and "test_rejected_cancellation_must_report_no_output"
+        in release_qualification_test
+        and "test_asr_silence_transcript_must_stay_empty" in release_qualification_test
+        and "test_tts_truncated_must_be_false" in release_qualification_test
+        and "test_tts_lifecycle_evidence_cancellation_tested_must_be_true"
+        in release_qualification_test
+        and "test_tts_lifecycle_evidence_pre_aborted_tested_must_be_true"
+        in release_qualification_test
+        and "test_tts_lifecycle_evidence_reuse_sample_count_must_be_positive"
+        in release_qualification_test
+        and "test_tts_lifecycle_evidence_unload_tested_must_be_true"
+        in release_qualification_test,
+        "attestation evidence must match the single pinned transcript and prove exact cancellation, silence, and TTS lifecycle semantics",
+        errors,
+    )
+    require(
         # Publication consumes the candidate; rebuilding it would change the
         # manifest and therefore the digest no attestation could then match.
         "scripts/build_bridge.sh" not in publish
@@ -1475,6 +1614,8 @@ def main() -> int:
         and "test_unrelated_or_unsuccessful_run_rejected" in release_qualification_test
         and "test_candidate_run_must_be_the_first_build_attempt"
         in release_qualification_test
+        and "test_run_attempt_one_is_mandatory_even_without_a_caller_override"
+        in release_qualification_test
         and "test_missing_duplicate_expired_or_foreign_artifact_rejected"
         in release_qualification_test
         and "test_truncated_artifact_inventory_rejected"
@@ -1493,6 +1634,10 @@ def main() -> int:
         in release_qualification_test
         and "test_noncanonical_transport_payload_rejected" in release_qualification_test
         and "test_duplicate_keys_in_transport_payload_rejected"
+        in release_qualification_test
+        and "test_nonstandard_json_constants_rejected_before_schema_validation"
+        in release_qualification_test
+        and "test_verify_run_cli_defaults_to_the_mandatory_first_attempt"
         in release_qualification_test
         and "test_candidate_manifest_must_not_claim_a_hosted_heavy_gate_pass"
         in release_qualification_test

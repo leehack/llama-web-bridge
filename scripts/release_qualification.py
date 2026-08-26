@@ -25,6 +25,7 @@ from pathlib import Path
 from pathlib import PurePosixPath
 import re
 import resource
+import shutil
 import signal
 import stat
 import struct
@@ -44,6 +45,7 @@ from release_contract import (
     require_sha256,
 )
 from generate_release_manifest import LOCAL_ATTESTATION_REQUIRED
+from speech_to_text_browser_smoke import DEFAULT_EXPECTED_TEXT
 from release_publication_state import (
     PUBLICATION_FILES,
     CandidateIdentity,
@@ -62,6 +64,80 @@ HARNESS_VERSION = "2.0.0"
 # remaining far above the canonical attestation's expected size.
 MAX_ATTESTATION_BYTES = 32768
 _BASE64_RE = re.compile(r"^[A-Za-z0-9+/]+={0,2}$")
+
+MAX_COMPRESSION_RATIO = 100.0
+# An exact-head candidate is roughly 17 MiB uncompressed with its two largest
+# wasm members near 8.4 MiB each, so these bounds leave real headroom while
+# still refusing an archive that could exhaust the machine extracting it.
+MAX_CANDIDATE_MEMBER_BYTES = 64 * 1024 * 1024
+MAX_CANDIDATE_TOTAL_BYTES = 256 * 1024 * 1024
+CANDIDATE_ALLOWED_MEMBERS = frozenset(PUBLICATION_FILES)
+
+MAX_ATTESTATION_MEMBER_BYTES = MAX_ATTESTATION_BYTES
+MAX_ATTESTATION_TOTAL_BYTES = MAX_ATTESTATION_BYTES
+ATTESTATION_ALLOWED_MEMBERS = frozenset(("qualification-attestation.json",))
+
+# Only the two methods GitHub artifact archives actually use. Any other method
+# would reach zipfile's optional codecs, which raise outside ContractError and
+# are not guaranteed to be compiled into the interpreter running qualification.
+ALLOWED_COMPRESS_TYPES = frozenset((zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED))
+_EXTRACT_CHUNK_BYTES = 64 * 1024
+_LOCAL_HEADER_SIGNATURE = b"PK\x03\x04"
+_LOCAL_HEADER_STRUCT = struct.Struct("<4s5H3L2H")
+_DATA_DESCRIPTOR_SIGNATURE = b"PK\x07\x08"
+_DATA_DESCRIPTOR_STRUCT = struct.Struct("<4s3L")
+_END_OF_CENTRAL_DIRECTORY_SIGNATURE = b"PK\x05\x06"
+_END_OF_CENTRAL_DIRECTORY_STRUCT = struct.Struct("<4s4H2LH")
+_MAX_CENTRAL_DIRECTORY_BYTES = 2 * 1024 * 1024
+_ZIP_ENCRYPTED_FLAG = 0x1
+_ZIP_STRONG_ENCRYPTION_FLAG = 0x40
+_ZIP_MASKED_HEADER_FLAG = 0x2000
+_ZIP_ENCRYPTION_FLAGS = (
+    _ZIP_ENCRYPTED_FLAG | _ZIP_STRONG_ENCRYPTION_FLAG | _ZIP_MASKED_HEADER_FLAG
+)
+_ZIP_DATA_DESCRIPTOR_FLAG = 0x8
+_ZIP_UTF8_NAME_FLAG = 0x800
+
+
+def normalize_transcript(value: str) -> str:
+    text = str(value or "")
+    text = re.sub(
+        r"^\s*language\s+[^<\r\n]+?\s*<asr_text>\s*", "", text, flags=re.IGNORECASE
+    )
+    text = re.sub(r"^\s*<asr_text>\s*", "", text, flags=re.IGNORECASE)
+    text = text.lower()
+    return re.sub(r"[^a-z0-9]+", " ", text).strip()
+
+
+# The fixture transcript belongs to the speech gate that produces it. A second
+# pinned copy here could drift into silently disagreeing with the gate about
+# what a passing transcript is.
+EXPECTED_SPEECH_TRANSCRIPT = normalize_transcript(DEFAULT_EXPECTED_TEXT)
+MAX_CANCELLATION_OUTPUT_CHARACTERS = 1_000_000
+_CANCELLATION_RESULT_RE = re.compile(
+    r"^cancel:(resolved|rejected):(0|[1-9][0-9]*)$"
+)
+
+
+def _parse_cancellation_result(value: Any, label: str) -> tuple[str, int]:
+    if not isinstance(value, str) or not value:
+        raise ContractError(f"{label} must be a non-empty string")
+    match = _CANCELLATION_RESULT_RE.fullmatch(value)
+    if match is None:
+        raise ContractError(
+            f"{label} must match 'cancel:<resolved|rejected>:<canonical-count>', "
+            f"got {value!r}"
+        )
+    count_text = match.group(2)
+    if len(count_text) > len(str(MAX_CANCELLATION_OUTPUT_CHARACTERS)):
+        raise ContractError(f"{label} output count exceeds the qualification bound")
+    count = int(count_text)
+    if count > MAX_CANCELLATION_OUTPUT_CHARACTERS:
+        raise ContractError(f"{label} output count exceeds the qualification bound")
+    state = match.group(1)
+    if state == "rejected" and count != 0:
+        raise ContractError(f"{label} rejected but reported {count} characters of output")
+    return state, count
 
 CANDIDATE_WORKFLOW_PATH = ".github/workflows/bridge_candidate.yml"
 CANDIDATE_ARTIFACT_NAME = "exact-webgpu-bridge-dist"
@@ -164,7 +240,9 @@ ATTESTATION_KEYS = (
     "attestation_type",
     "bridge_repository",
     "bridge_source_sha",
+    "candidate_artifact_id",
     "candidate_fingerprint",
+    "candidate_run_attempt",
     "candidate_run_id",
     "candidate_run_url",
     "emscripten_version",
@@ -198,9 +276,17 @@ def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return result
 
 
+def _reject_nonstandard_json_constant(value: str) -> Any:
+    raise ContractError(f"non-standard JSON numeric constant: {value}")
+
+
 def parse_attestation_json(raw_json: str) -> dict[str, Any]:
     try:
-        payload = json.loads(raw_json, object_pairs_hook=_reject_duplicate_keys)
+        payload = json.loads(
+            raw_json,
+            object_pairs_hook=_reject_duplicate_keys,
+            parse_constant=_reject_nonstandard_json_constant,
+        )
     except (json.JSONDecodeError, UnicodeDecodeError) as exc:
         raise ContractError(f"malformed attestation JSON: {exc}") from exc
     if not isinstance(payload, dict):
@@ -209,7 +295,10 @@ def parse_attestation_json(raw_json: str) -> dict[str, Any]:
 
 
 def canonical_json(payload: Mapping[str, Any]) -> str:
-    return json.dumps(payload, indent=2, sort_keys=True) + "\n"
+    try:
+        return json.dumps(payload, indent=2, sort_keys=True, allow_nan=False) + "\n"
+    except (TypeError, ValueError) as exc:
+        raise ContractError(f"attestation is not canonical JSON data: {exc}") from exc
 
 
 def encode_attestation(canonical_text: str) -> str:
@@ -448,7 +537,7 @@ def validate_workflow_run(
     expected_run_id: str,
     expected_workflow_path: str,
     expected_head_branch: str,
-    expected_run_attempt: int | None = None,
+    expected_run_attempt: int = 1,
 ) -> str:
     """Fail closed unless a run is the exact successful dispatch we require.
 
@@ -478,6 +567,16 @@ def validate_workflow_run(
             raise ContractError(
                 f"workflow run {field} must be exactly {BRIDGE_REPOSITORY}"
             )
+    expected_owner = BRIDGE_REPOSITORY.split("/")[0]
+    actor = run.get("actor")
+    if not isinstance(actor, Mapping) or actor.get("login") != expected_owner:
+        raise ContractError(f"workflow run actor must be {expected_owner}")
+    triggering_actor = run.get("triggering_actor")
+    if (
+        not isinstance(triggering_actor, Mapping)
+        or triggering_actor.get("login") != expected_owner
+    ):
+        raise ContractError(f"workflow run triggering_actor must be {expected_owner}")
     if run.get("path") != expected_workflow_path:
         raise ContractError(
             f"workflow run path mismatch: expected {expected_workflow_path}, "
@@ -495,23 +594,22 @@ def validate_workflow_run(
         raise ContractError(
             f"workflow run conclusion must be success, got {run.get('conclusion')!r}"
         )
-    if expected_run_attempt is not None:
-        if (
-            not isinstance(expected_run_attempt, int)
-            or isinstance(expected_run_attempt, bool)
-            or expected_run_attempt <= 0
-        ):
-            raise ContractError("expected run attempt must be a positive integer")
-        actual_run_attempt = run.get("run_attempt")
-        if (
-            not isinstance(actual_run_attempt, int)
-            or isinstance(actual_run_attempt, bool)
-            or actual_run_attempt != expected_run_attempt
-        ):
-            raise ContractError(
-                f"workflow run attempt must be {expected_run_attempt}, got "
-                f"{actual_run_attempt!r}"
-            )
+    if (
+        not isinstance(expected_run_attempt, int)
+        or isinstance(expected_run_attempt, bool)
+        or expected_run_attempt != 1
+    ):
+        raise ContractError("expected run attempt must be exactly 1")
+    actual_run_attempt = run.get("run_attempt")
+    if (
+        not isinstance(actual_run_attempt, int)
+        or isinstance(actual_run_attempt, bool)
+        or actual_run_attempt != expected_run_attempt
+    ):
+        raise ContractError(
+            f"workflow run attempt must be {expected_run_attempt}, got "
+            f"{actual_run_attempt!r}"
+        )
     if not expected_head_branch:
         raise ContractError("expected head branch is required")
     if run.get("head_branch") != expected_head_branch:
@@ -582,6 +680,8 @@ def build_attestation(
     manifest: Mapping[str, Any],
     candidate_fingerprint: str,
     candidate_run_id: str,
+    candidate_artifact_id: int,
+    candidate_run_attempt: int = 1,
     harness_digest: str,
     speech_phase: Mapping[str, Any],
     tts_phase: Mapping[str, Any],
@@ -590,6 +690,13 @@ def build_attestation(
     require_sha256(harness_digest, "harness_source_sha256")
     if _RUN_ID_RE.fullmatch(candidate_run_id) is None:
         raise ContractError("candidate_run_id must be a positive integer")
+    _require_positive_int(candidate_artifact_id, "candidate_artifact_id")
+    if (
+        not isinstance(candidate_run_attempt, int)
+        or isinstance(candidate_run_attempt, bool)
+        or candidate_run_attempt != 1
+    ):
+        raise ContractError("candidate_run_attempt must be 1")
     manifest_run_id = _require_str(manifest, "github_run_id", "candidate manifest")
     if manifest_run_id != candidate_run_id:
         raise ContractError(
@@ -605,6 +712,8 @@ def build_attestation(
         "attestation_type": ATTESTATION_TYPE,
         "candidate_fingerprint": candidate_fingerprint,
         "candidate_run_id": candidate_run_id,
+        "candidate_artifact_id": candidate_artifact_id,
+        "candidate_run_attempt": candidate_run_attempt,
         "candidate_run_url": _require_str(
             manifest, "github_run_url", "candidate manifest"
         ),
@@ -681,7 +790,19 @@ def _validate_phase(
         mode_label = f"{label}.modes[{index}]"
         keys = ["memory_mode", "phase_timings_ms", "runtime_mode", "total_ms"]
         if require_wav:
-            keys.extend(("frames_generated", "peak", "rms", "truncated", "wav"))
+            keys.extend(
+                (
+                    "cancellation_tested",
+                    "frames_generated",
+                    "peak",
+                    "pre_aborted_tested",
+                    "reuse_sample_count",
+                    "rms",
+                    "truncated",
+                    "unload_tested",
+                    "wav",
+                )
+            )
         else:
             keys.extend(
                 (
@@ -715,6 +836,17 @@ def _validate_phase(
                 f"{mode_label}.total_ms is shorter than its recorded phase timings"
             )
         if require_wav:
+            if mode["truncated"] is not False:
+                raise ContractError(f"{mode_label}.truncated must be false")
+            if mode["cancellation_tested"] is not True:
+                raise ContractError(f"{mode_label}.cancellation_tested must be true")
+            if mode["pre_aborted_tested"] is not True:
+                raise ContractError(f"{mode_label}.pre_aborted_tested must be true")
+            _require_positive_int(
+                mode["reuse_sample_count"], f"{mode_label}.reuse_sample_count"
+            )
+            if mode["unload_tested"] is not True:
+                raise ContractError(f"{mode_label}.unload_tested must be true")
             wav = _require_exact_mapping(
                 mode["wav"],
                 (
@@ -752,8 +884,6 @@ def _validate_phase(
             _require_positive_int(
                 mode["frames_generated"], f"{mode_label}.frames_generated"
             )
-            if not isinstance(mode["truncated"], bool):
-                raise ContractError(f"{mode_label}.truncated must be a boolean")
             for measurement in ("peak", "rms"):
                 value = mode[measurement]
                 if (
@@ -786,13 +916,19 @@ def _validate_phase(
             for transcript_field in (
                 "cold_transcript",
                 "warm_transcript",
-                "cancellation_result",
             ):
                 transcript = mode[transcript_field]
                 if not isinstance(transcript, str) or not transcript:
                     raise ContractError(
                         f"{mode_label}.{transcript_field} must be a non-empty string"
                     )
+                if normalize_transcript(transcript) != EXPECTED_SPEECH_TRANSCRIPT:
+                    raise ContractError(
+                        f"{mode_label}.{transcript_field} does not match expected transcript"
+                    )
+            _parse_cancellation_result(
+                mode["cancellation_result"], f"{mode_label}.cancellation_result"
+            )
             if mode["silence_transcript"] != "":
                 raise ContractError(
                     f"{mode_label}.silence_transcript must stay empty"
@@ -819,6 +955,8 @@ def verify_attestation(
     candidate_dir: Path | None = None,
     candidate_fingerprint: str | None = None,
     candidate_run_id: str | None = None,
+    candidate_artifact_id: int | None = None,
+    candidate_run_attempt: int | None = None,
     bridge_source_sha: str | None = None,
     upstream_tag: str | None = None,
     upstream_commit: str | None = None,
@@ -834,9 +972,14 @@ def verify_attestation(
     """Fail closed unless the attestation exactly binds the candidate and identities."""
     _require_exact_mapping(attestation, ATTESTATION_KEYS, "attestation")
 
-    if attestation["schema_version"] != QUALIFICATION_SCHEMA_VERSION:
+    schema_version = attestation["schema_version"]
+    if (
+        not isinstance(schema_version, int)
+        or isinstance(schema_version, bool)
+        or schema_version != QUALIFICATION_SCHEMA_VERSION
+    ):
         raise ContractError(
-            f"unsupported attestation schema_version: {attestation['schema_version']!r}"
+            f"unsupported attestation schema_version: {schema_version!r}"
         )
     if attestation["attestation_type"] != ATTESTATION_TYPE:
         raise ContractError(
@@ -877,9 +1020,17 @@ def verify_attestation(
     )
     if attestation["candidate_run_url"] != expected_run_url:
         raise ContractError(f"candidate_run_url must be exactly {expected_run_url}")
+    artifact_id = _require_positive_int(
+        attestation.get("candidate_artifact_id"), "attestation candidate_artifact_id"
+    )
+    attempt = attestation.get("candidate_run_attempt")
+    if not isinstance(attempt, int) or isinstance(attempt, bool) or attempt != 1:
+        raise ContractError("attestation candidate_run_attempt must be 1")
     _require_str(attestation, "emscripten_version", "attestation")
     _require_str(attestation, "release_tag", "attestation")
-    _require_int(attestation, "release_rebuild", "attestation")
+    _require_non_negative_int(
+        attestation.get("release_rebuild"), "attestation release_rebuild"
+    )
     require_correlation_id(
         _require_str(attestation, "orchestrator_correlation_id", "attestation")
     )
@@ -967,7 +1118,9 @@ def verify_attestation(
 
     expectations: dict[str, Any] = {
         "bridge_source_sha": bridge_source_sha,
+        "candidate_artifact_id": candidate_artifact_id,
         "candidate_fingerprint": candidate_fingerprint,
+        "candidate_run_attempt": candidate_run_attempt,
         "candidate_run_id": candidate_run_id,
         "emscripten_version": emscripten_version,
         "harness_source_sha256": harness_sha256,
@@ -993,6 +1146,8 @@ def verify_attestation(
         "verified": True,
         "candidate_fingerprint": fingerprint,
         "candidate_run_id": run_id,
+        "candidate_artifact_id": artifact_id,
+        "candidate_run_attempt": attempt,
         "release_tag": attestation["release_tag"],
         "bridge_source_sha": attestation["bridge_source_sha"],
         "harness_source_sha256": attestation["harness_source_sha256"],
@@ -1167,6 +1322,11 @@ def _speech_phase(payload: Mapping[str, Any], rss: int) -> dict[str, Any]:
         ):
             if not isinstance(value, str) or not value:
                 raise ContractError(f"{label} did not report {field} evidence")
+        if normalize_transcript(cold_transcript) != EXPECTED_SPEECH_TRANSCRIPT:
+            raise ContractError(f"{label} cold transcript does not match expected fixture transcript")
+        if normalize_transcript(warm_transcript) != EXPECTED_SPEECH_TRANSCRIPT:
+            raise ContractError(f"{label} warm transcript does not match expected fixture transcript")
+        _parse_cancellation_result(cancellation_result, f"{label} cancellation")
         if silence_transcript != "":
             raise ContractError(f"{label} silence transcript must be empty")
         modes.append(
@@ -1268,8 +1428,19 @@ def _tts_phase(
         ):
             raise ContractError(f"{label} framesGenerated must be a positive integer")
         truncated = entry.get("truncated")
-        if not isinstance(truncated, bool):
-            raise ContractError(f"{label} truncated must be a boolean")
+        if not isinstance(truncated, bool) or truncated is not False:
+            raise ContractError(f"{label} truncated must be false, got {truncated!r}")
+        cancellation_tested = entry.get("cancellationTested")
+        if not isinstance(cancellation_tested, bool) or cancellation_tested is not True:
+            raise ContractError(f"{label} cancellationTested must be true")
+        pre_aborted_tested = entry.get("preAbortedTested")
+        if not isinstance(pre_aborted_tested, bool) or pre_aborted_tested is not True:
+            raise ContractError(f"{label} preAbortedTested must be true")
+        reuse_sample_count = entry.get("reuseSampleCount")
+        _require_positive_int(reuse_sample_count, f"{label}.reuseSampleCount")
+        unload_tested = entry.get("unloadTested")
+        if not isinstance(unload_tested, bool) or unload_tested is not True:
+            raise ContractError(f"{label} unloadTested must be true")
         peak = entry.get("peak")
         rms = entry.get("rms")
         for field, value in (("peak", peak), ("rms", rms)):
@@ -1295,18 +1466,22 @@ def _tts_phase(
             raise ContractError(f"{label} generated WAV is effectively silent")
         modes.append(
             {
+                "cancellation_tested": True,
+                "frames_generated": frames_generated,
                 "memory_mode": memory_mode,
-                "runtime_mode": runtime_mode,
-                "total_ms": _timing(entry, "totalElapsedMs", label),
+                "peak": measured_peak,
                 "phase_timings_ms": {
                     "model_load": _timing(entry, "modelLoadMs", label),
                     "projector_load": _timing(entry, "projectorLoadMs", label),
                     "synthesis": _timing(entry, "synthesisMs", label),
                 },
-                "frames_generated": frames_generated,
-                "peak": measured_peak,
+                "pre_aborted_tested": True,
+                "reuse_sample_count": reuse_sample_count,
                 "rms": measured_rms,
-                "truncated": truncated,
+                "runtime_mode": runtime_mode,
+                "total_ms": _timing(entry, "totalElapsedMs", label),
+                "truncated": False,
+                "unload_tested": True,
                 "wav": wav_identity,
             }
         )
@@ -1335,46 +1510,488 @@ def _gh_json(args: list[str]) -> Any:
         raise ContractError(f"gh {' '.join(args)} emitted unparsable JSON: {exc}") from exc
 
 
-def _extract_flat_artifact_archive(archive_path: Path, destination: Path) -> None:
-    """Extract a GitHub artifact only when every member is a unique flat file."""
-    if destination.is_symlink():
-        raise ContractError(f"artifact destination must not be a symlink: {destination}")
-    destination.mkdir(parents=True, exist_ok=True)
-    if not destination.is_dir():
-        raise ContractError(f"artifact destination is not a directory: {destination}")
-    if any(destination.iterdir()):
-        raise ContractError(f"artifact destination is not empty: {destination}")
+def _artifact_archive_bounds(artifact_type: str) -> tuple[frozenset[str], int, int]:
+    if artifact_type == "candidate":
+        return (
+            CANDIDATE_ALLOWED_MEMBERS,
+            MAX_CANDIDATE_MEMBER_BYTES,
+            MAX_CANDIDATE_TOTAL_BYTES,
+        )
+    if artifact_type == "attestation":
+        return (
+            ATTESTATION_ALLOWED_MEMBERS,
+            MAX_ATTESTATION_MEMBER_BYTES,
+            MAX_ATTESTATION_TOTAL_BYTES,
+        )
+    raise ContractError(f"unknown artifact type: {artifact_type!r}")
+
+
+def _preflight_zip_end_record(
+    raw: Any, archive_size: int, expected_member_count: int
+) -> int:
+    """Bound member count before ZipFile allocates one ZipInfo per entry."""
+    fixed_size = _END_OF_CENTRAL_DIRECTORY_STRUCT.size
+    if archive_size < fixed_size:
+        raise ContractError("artifact archive has no complete end-of-central-directory record")
+    raw.seek(archive_size - fixed_size)
+    fixed = raw.read(fixed_size)
+    if len(fixed) != fixed_size:
+        raise ContractError("artifact archive has a truncated end-of-central-directory record")
+    (
+        signature,
+        disk_number,
+        central_directory_disk,
+        entries_on_disk,
+        total_entries,
+        central_directory_size,
+        central_directory_offset,
+        comment_length,
+    ) = _END_OF_CENTRAL_DIRECTORY_STRUCT.unpack(fixed)
+    if signature != _END_OF_CENTRAL_DIRECTORY_SIGNATURE or comment_length != 0:
+        raise ContractError(
+            "artifact archive must end with an uncommented end-of-central-directory record"
+        )
+    if (
+        disk_number != 0
+        or central_directory_disk != 0
+        or entries_on_disk != total_entries
+    ):
+        raise ContractError("multi-disk artifact archives are unsupported")
+    if total_entries != expected_member_count:
+        raise ContractError(
+            "artifact archive end-of-central-directory member count must be exactly "
+            f"{expected_member_count}, got {total_entries}"
+        )
+    if central_directory_size > _MAX_CENTRAL_DIRECTORY_BYTES:
+        raise ContractError(
+            "artifact archive central directory exceeds its metadata byte bound"
+        )
+    if (
+        central_directory_offset < 0
+        or central_directory_offset + central_directory_size != archive_size - fixed_size
+    ):
+        raise ContractError(
+            "artifact archive central directory location disagrees with its end record"
+        )
+    return central_directory_offset
+
+
+def _validate_local_header(
+    raw: Any,
+    member: zipfile.ZipInfo,
+    archive_size: int,
+    central_directory_offset: int,
+) -> int:
+    """Prove a member's local header agrees with the central directory.
+
+    infolist() reports only the central directory, so an archive whose local
+    headers disagree with it is ambiguous about what would actually be
+    decompressed. Ambiguity is refused rather than reconciled. Returns the end
+    of the member, including the one exact signed descriptor form emitted by
+    GitHub artifacts. The local payload offset is the only sound basis for the
+    overlap and boundary checks because the central directory's extra field
+    routinely differs in length from the local one.
+    """
+    if member.header_offset < 0 or member.header_offset >= archive_size:
+        raise ContractError(
+            f"artifact archive member {member.filename!r} has an out-of-range header offset"
+        )
+    raw.seek(member.header_offset)
+    fixed = raw.read(_LOCAL_HEADER_STRUCT.size)
+    if len(fixed) != _LOCAL_HEADER_STRUCT.size:
+        raise ContractError(
+            f"artifact archive member {member.filename!r} has a truncated local header"
+        )
+    (
+        signature,
+        _version,
+        flag_bits,
+        compress_type,
+        _modified_time,
+        _modified_date,
+        crc,
+        compress_size,
+        file_size,
+        name_length,
+        extra_length,
+    ) = _LOCAL_HEADER_STRUCT.unpack(fixed)
+    if signature != _LOCAL_HEADER_SIGNATURE:
+        raise ContractError(
+            f"artifact archive member {member.filename!r} has no local file header"
+        )
+    if flag_bits != member.flag_bits:
+        raise ContractError(
+            f"artifact archive member {member.filename!r} local flags {flag_bits:#x} "
+            f"disagree with central flags {member.flag_bits:#x}"
+        )
+    if flag_bits & _ZIP_ENCRYPTION_FLAGS:
+        raise ContractError(
+            f"artifact archive member is encrypted: {member.filename!r}"
+        )
+    if compress_type != member.compress_type:
+        raise ContractError(
+            f"artifact archive member {member.filename!r} local compression method "
+            f"{compress_type} disagrees with the central directory"
+        )
+    name = raw.read(name_length)
+    if len(name) != name_length:
+        raise ContractError(
+            f"artifact archive member {member.filename!r} has a truncated local name"
+        )
+    if extra_length != 0:
+        raise ContractError(
+            f"artifact archive member {member.filename!r} carries hidden local metadata"
+        )
+    encoding = "utf-8" if flag_bits & _ZIP_UTF8_NAME_FLAG else "cp437"
     try:
-        with zipfile.ZipFile(archive_path) as archive:
-            seen: set[str] = set()
+        local_name = name.decode(encoding)
+    except UnicodeDecodeError as exc:
+        raise ContractError(
+            f"artifact archive member {member.filename!r} has an undecodable local name"
+        ) from exc
+    if local_name != member.orig_filename:
+        raise ContractError(
+            f"artifact archive member {member.filename!r} local name {local_name!r} "
+            "disagrees with the central directory"
+        )
+    data_offset = (
+        member.header_offset + _LOCAL_HEADER_STRUCT.size + name_length + extra_length
+    )
+    payload_end = data_offset + member.compress_size
+    if flag_bits & _ZIP_DATA_DESCRIPTOR_FLAG:
+        if (crc, compress_size, file_size) != (0, 0, 0):
+            raise ContractError(
+                f"artifact archive member {member.filename!r} data descriptor mode "
+                "requires zero local CRC and sizes"
+            )
+        member_end = payload_end + _DATA_DESCRIPTOR_STRUCT.size
+        if member_end > archive_size or member_end > central_directory_offset:
+            raise ContractError(
+                f"artifact archive member {member.filename!r} data descriptor "
+                "overlaps the archive boundary or central directory"
+            )
+        raw.seek(payload_end)
+        descriptor = raw.read(_DATA_DESCRIPTOR_STRUCT.size)
+        if len(descriptor) != _DATA_DESCRIPTOR_STRUCT.size:
+            raise ContractError(
+                f"artifact archive member {member.filename!r} has a truncated "
+                "data descriptor"
+            )
+        descriptor_values = _DATA_DESCRIPTOR_STRUCT.unpack(descriptor)
+        if descriptor_values != (
+            _DATA_DESCRIPTOR_SIGNATURE,
+            member.CRC,
+            member.compress_size,
+            member.file_size,
+        ):
+            raise ContractError(
+                f"artifact archive member {member.filename!r} data descriptor "
+                "disagrees with the central directory"
+            )
+    else:
+        if (crc, compress_size, file_size) != (
+            member.CRC,
+            member.compress_size,
+            member.file_size,
+        ):
+            raise ContractError(
+                f"artifact archive member {member.filename!r} local header disagrees "
+                "with the central directory"
+            )
+        member_end = payload_end
+    if member_end > archive_size:
+        raise ContractError(
+            f"artifact archive member {member.filename!r} payload extends past the "
+            "archive boundary"
+        )
+    if member_end > central_directory_offset:
+        raise ContractError(
+            f"artifact archive member {member.filename!r} payload overlaps the "
+            "central directory"
+        )
+    return member_end
+
+
+def _stage_artifact_archive(
+    archive_path: Path,
+    staging: Path,
+    *,
+    allowed_members: frozenset[str],
+    per_member_cap: int,
+    total_cap: int,
+) -> list[str]:
+    """Prove the whole inventory, then stream each member under hard byte caps.
+
+    Nothing is decompressed until every member has been checked, so an archive
+    that lies about a member, hides a payload underneath another one, or would
+    expand past the caps is refused while it is still only metadata.
+    """
+    try:
+        archive_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        archive_flags |= getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(archive_path, archive_flags)
+        try:
+            archive_stat = os.fstat(descriptor)
+            if not stat.S_ISREG(archive_stat.st_mode):
+                raise ContractError(
+                    f"artifact archive must be a regular file: {archive_path}"
+                )
+            archive_size = archive_stat.st_size
+            if archive_size <= 0:
+                raise ContractError(f"artifact archive is empty: {archive_path}")
+        except BaseException:
+            os.close(descriptor)
+            raise
+        with os.fdopen(descriptor, "rb") as raw:
+            preflight_central_directory_offset = _preflight_zip_end_record(
+                raw, archive_size, len(allowed_members)
+            )
+            archive = zipfile.ZipFile(raw)
+            central_directory_offset = archive.start_dir
+            if (
+                not isinstance(central_directory_offset, int)
+                or central_directory_offset < 0
+                or central_directory_offset > archive_size
+                or central_directory_offset != preflight_central_directory_offset
+            ):
+                raise ContractError(
+                    "artifact archive central directory offset is out of range or ambiguous"
+                )
             members = archive.infolist()
-            if not members:
-                raise ContractError("artifact archive is empty")
+            if len(members) != len(allowed_members):
+                raise ContractError(
+                    "artifact archive must contain exactly the "
+                    f"{len(allowed_members)} expected members "
+                    f"{sorted(allowed_members)}, found {len(members)}"
+                )
+            if not members or min(member.header_offset for member in members) != 0:
+                raise ContractError(
+                    "artifact archive members must start at byte zero with no preamble"
+                )
+            seen: set[str] = set()
+            total_uncompressed = 0
             for member in members:
+                if member.extra or member.comment:
+                    raise ContractError(
+                        f"artifact archive member {member.filename!r} carries hidden metadata"
+                    )
+                if member.orig_filename != member.filename:
+                    raise ContractError(
+                        f"artifact archive member name is ambiguous: "
+                        f"{member.orig_filename!r}"
+                    )
+                if member.flag_bits & _ZIP_ENCRYPTION_FLAGS:
+                    raise ContractError(
+                        f"artifact archive member is encrypted: {member.filename!r}"
+                    )
                 relative = PurePosixPath(member.filename)
                 mode_type = stat.S_IFMT(member.external_attr >> 16)
                 if (
                     member.is_dir()
                     or len(relative.parts) != 1
                     or relative.name in ("", ".", "..")
-                    or "\\" in relative.name
+                    or "\\" in member.filename
+                    or "/" in member.filename
                     or mode_type not in (0, stat.S_IFREG)
                 ):
                     raise ContractError(
                         f"artifact archive member is not a flat regular file: "
                         f"{member.filename!r}"
                     )
+                if relative.name not in allowed_members:
+                    raise ContractError(
+                        f"artifact archive contains unauthorized member: {relative.name!r}"
+                    )
                 if relative.name in seen:
                     raise ContractError(
                         f"artifact archive repeats member: {relative.name!r}"
                     )
                 seen.add(relative.name)
-                (destination / relative.name).write_bytes(archive.read(member))
-    except (OSError, zipfile.BadZipFile) as exc:
+                if member.compress_type not in ALLOWED_COMPRESS_TYPES:
+                    raise ContractError(
+                        f"artifact archive member {member.filename!r} uses unsupported "
+                        f"compression method {member.compress_type}"
+                    )
+                if member.file_size < 0 or member.file_size > per_member_cap:
+                    raise ContractError(
+                        f"artifact archive member {member.filename!r} uncompressed size "
+                        f"{member.file_size} exceeds bound {per_member_cap}"
+                    )
+                if member.compress_size > 0:
+                    ratio = member.file_size / member.compress_size
+                    if ratio > MAX_COMPRESSION_RATIO:
+                        raise ContractError(
+                            f"artifact archive member {member.filename!r} compression ratio "
+                            f"{ratio:.1f} exceeds maximum allowed ratio {MAX_COMPRESSION_RATIO}"
+                        )
+                elif member.file_size > 0:
+                    raise ContractError(
+                        f"artifact archive member {member.filename!r} has zero compressed size "
+                        "for non-empty content"
+                    )
+                total_uncompressed += member.file_size
+
+            if total_uncompressed > total_cap:
+                raise ContractError(
+                    f"artifact archive total uncompressed size {total_uncompressed} exceeds "
+                    f"bound {total_cap}"
+                )
+
+            payload_end = 0
+            for member in sorted(members, key=lambda entry: entry.header_offset):
+                if member.header_offset < payload_end:
+                    raise ContractError(
+                        "overlapping members detected in artifact archive: "
+                        f"{member.filename!r}"
+                    )
+                if member.header_offset > payload_end:
+                    raise ContractError(
+                        "unclaimed gap detected between artifact archive members before "
+                        f"{member.filename!r}"
+                    )
+                payload_end = _validate_local_header(
+                    raw,
+                    member,
+                    archive_size,
+                    central_directory_offset,
+                )
+            if payload_end != central_directory_offset:
+                raise ContractError(
+                    "unclaimed gap detected before the artifact archive central directory"
+                )
+
+            total_written = 0
+            for member in members:
+                target = staging / member.filename
+                written = 0
+                with archive.open(member, "r") as src, target.open("wb") as dst:
+                    while True:
+                        chunk = src.read(_EXTRACT_CHUNK_BYTES)
+                        if not chunk:
+                            break
+                        written += len(chunk)
+                        total_written += len(chunk)
+                        if written > per_member_cap:
+                            raise ContractError(
+                                f"member {member.filename!r} exceeded per-member byte cap "
+                                "during extraction"
+                            )
+                        if total_written > total_cap:
+                            raise ContractError(
+                                "total decompressed bytes exceeded total byte cap during "
+                                "extraction"
+                            )
+                        dst.write(chunk)
+                if written != member.file_size:
+                    raise ContractError(
+                        f"member {member.filename!r} decompressed size mismatch: "
+                        f"{written} != {member.file_size}"
+                    )
+            archive.close()
+    except (OSError, struct.error, zipfile.BadZipFile) as exc:
         raise ContractError(f"could not read artifact archive: {exc}") from exc
+    return sorted(seen)
 
 
-def _download_artifact(artifact_id: int, destination: Path) -> None:
+def _extract_flat_artifact_archive(
+    archive_path: Path, destination: Path, *, artifact_type: str = "candidate"
+) -> None:
+    """Extract a GitHub artifact only when every member is a unique flat allowed file.
+
+    Members are staged outside the destination and moved in only once the whole
+    archive has passed. A rejected archive therefore never leaves partially
+    written files behind for a later step to mistake for verified content.
+    """
+    allowed_members, per_member_cap, total_cap = _artifact_archive_bounds(artifact_type)
+
+    try:
+        destination.mkdir(parents=True, exist_ok=True)
+        destination_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        destination_flags |= getattr(os, "O_DIRECTORY", 0)
+        destination_flags |= getattr(os, "O_NOFOLLOW", 0)
+        destination_fd = os.open(destination, destination_flags)
+    except OSError as exc:
+        raise ContractError(
+            f"artifact destination must be a real directory: {destination}: {exc}"
+        ) from exc
+    try:
+        destination_stat = os.fstat(destination_fd)
+        if not stat.S_ISDIR(destination_stat.st_mode):
+            raise ContractError(
+                f"artifact destination is not a directory: {destination}"
+            )
+        if os.listdir(destination_fd):
+            raise ContractError(f"artifact destination is not empty: {destination}")
+        destination_identity = (destination_stat.st_dev, destination_stat.st_ino)
+    except BaseException:
+        os.close(destination_fd)
+        raise
+
+    try:
+        staging = Path(
+            tempfile.mkdtemp(prefix=".artifact-extract-", dir=destination.parent)
+        )
+    except OSError as exc:
+        os.close(destination_fd)
+        raise ContractError(f"could not create artifact staging directory: {exc}") from exc
+    placed: list[str] = []
+    try:
+        names = _stage_artifact_archive(
+            archive_path,
+            staging,
+            allowed_members=allowed_members,
+            per_member_cap=per_member_cap,
+            total_cap=total_cap,
+        )
+        try:
+            for name in names:
+                os.replace(staging / name, name, dst_dir_fd=destination_fd)
+                placed.append(name)
+        except OSError as exc:
+            raise ContractError(
+                f"could not place verified artifact members: {exc}"
+            ) from exc
+        try:
+            current_stat = os.stat(destination, follow_symlinks=False)
+        except OSError as exc:
+            raise ContractError(
+                f"artifact destination changed during extraction: {exc}"
+            ) from exc
+        if (
+            not stat.S_ISDIR(current_stat.st_mode)
+            or (current_stat.st_dev, current_stat.st_ino) != destination_identity
+            or set(os.listdir(destination_fd)) != set(names)
+        ):
+            raise ContractError("artifact destination changed during extraction")
+    except BaseException:
+        cleanup_errors = _unlink_placed_members(destination_fd, placed)
+        if cleanup_errors:
+            raise ContractError(
+                "could not remove partially placed artifact members: "
+                + "; ".join(cleanup_errors)
+            )
+        raise
+    finally:
+        os.close(destination_fd)
+        shutil.rmtree(staging, ignore_errors=True)
+
+
+def _unlink_placed_members(directory_fd: int, names: Sequence[str]) -> list[str]:
+    """Remove only members this extraction placed, through its pinned directory FD."""
+    errors: list[str] = []
+    for name in names:
+        try:
+            os.unlink(name, dir_fd=directory_fd)
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            errors.append(f"{name}: {exc}")
+    return errors
+
+
+def _download_artifact(
+    artifact_id: int, destination: Path, *, artifact_type: str = "candidate"
+) -> None:
     if not isinstance(artifact_id, int) or isinstance(artifact_id, bool):
         raise ContractError("artifact id must be an integer")
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -1403,16 +2020,23 @@ def _download_artifact(artifact_id: int, destination: Path) -> None:
         if proc.returncode != 0:
             diagnostic = proc.stderr.decode("utf-8", errors="replace")
             raise ContractError(
-                "could not download exact candidate artifact: "
+                f"could not download exact {artifact_type} artifact: "
                 f"{sanitize_diagnostic_text(diagnostic.strip())}"
             )
-        _extract_flat_artifact_archive(archive_path, destination)
+        _extract_flat_artifact_archive(
+            archive_path, destination, artifact_type=artifact_type
+        )
     finally:
         archive_path.unlink(missing_ok=True)
 
 
-def fetch_candidate(run_id: str, destination: Path) -> None:
-    """Prove the candidate run's identity, then download its unique artifact."""
+def fetch_candidate(run_id: str, destination: Path) -> tuple[int, int]:
+    """Prove the candidate run's identity, then download its unique artifact.
+
+    Returns the artifact id and the run attempt that was just proven, so the
+    attestation binds the attempt the run actually reported rather than one the
+    caller assumed.
+    """
     if _RUN_ID_RE.fullmatch(run_id) is None:
         raise ContractError("candidate run id must be a positive integer")
     repository = _gh_json(["api", f"repos/{BRIDGE_REPOSITORY}"])
@@ -1426,6 +2050,9 @@ def fetch_candidate(run_id: str, destination: Path) -> None:
         expected_workflow_path=CANDIDATE_WORKFLOW_PATH,
         expected_head_branch=branch,
         expected_run_attempt=1,
+    )
+    run_attempt = _require_positive_int(
+        run.get("run_attempt"), "candidate run run_attempt"
     )
     comparison = _gh_json(
         ["api", f"repos/{BRIDGE_REPOSITORY}/compare/{head_sha}...{branch}"]
@@ -1444,7 +2071,8 @@ def fetch_candidate(run_id: str, destination: Path) -> None:
     artifact_id = validate_artifact_inventory(
         inventory, expected_run_id=run_id, expected_name=CANDIDATE_ARTIFACT_NAME
     )
-    _download_artifact(artifact_id, destination)
+    _download_artifact(artifact_id, destination, artifact_type="candidate")
+    return artifact_id, run_attempt
 
 
 def _require_input_file(path: Path, label: str) -> Path:
@@ -1487,7 +2115,9 @@ def qualify_cmd(args: argparse.Namespace) -> int:
             f"Downloading candidate artifact from run {args.candidate_run_id}",
             file=sys.stderr,
         )
-        fetch_candidate(args.candidate_run_id, candidate_dir)
+        candidate_artifact_id, candidate_run_attempt = fetch_candidate(
+            args.candidate_run_id, candidate_dir
+        )
         manifest, fingerprint = load_candidate(candidate_dir)
         harness_digest = require_harness_matches_bridge_source(
             scripts_dir,
@@ -1543,13 +2173,20 @@ def qualify_cmd(args: argparse.Namespace) -> int:
             manifest=manifest,
             candidate_fingerprint=fingerprint,
             candidate_run_id=args.candidate_run_id,
+            candidate_artifact_id=candidate_artifact_id,
+            candidate_run_attempt=candidate_run_attempt,
             harness_digest=harness_digest,
             speech_phase=speech_phase,
             tts_phase=tts_phase,
         )
         # Re-verify what was just built against the exact candidate so a harness
         # bug can never emit an attestation publication would later reject.
-        verify_attestation(attestation=attestation, candidate_dir=candidate_dir)
+        verify_attestation(
+            attestation=attestation,
+            candidate_dir=candidate_dir,
+            candidate_artifact_id=candidate_artifact_id,
+            candidate_run_attempt=candidate_run_attempt,
+        )
         canonical = canonical_json(attestation)
 
     args.output_attestation.write_text(canonical, encoding="utf-8")
@@ -1598,6 +2235,8 @@ def verify_attestation_cmd(args: argparse.Namespace) -> int:
         candidate_dir=args.candidate_dist.resolve() if args.candidate_dist else None,
         candidate_fingerprint=args.candidate_fingerprint,
         candidate_run_id=args.candidate_run_id,
+        candidate_artifact_id=args.candidate_artifact_id,
+        candidate_run_attempt=args.candidate_run_attempt,
         bridge_source_sha=args.bridge_commit,
         upstream_tag=args.upstream_tag,
         upstream_commit=args.upstream_commit,
@@ -1667,7 +2306,7 @@ def _build_parser() -> argparse.ArgumentParser:
     verify_run.add_argument("--workflow-path", required=True)
     verify_run.add_argument("--head-branch", required=True)
     verify_run.add_argument("--artifact-name", required=True)
-    verify_run.add_argument("--run-attempt", type=int)
+    verify_run.add_argument("--run-attempt", type=int, default=1)
 
     verify = subparsers.add_parser(
         "verify-attestation", help="Verify a canonical qualification attestation."
@@ -1676,6 +2315,8 @@ def _build_parser() -> argparse.ArgumentParser:
     verify.add_argument("--candidate-dist", type=Path)
     verify.add_argument("--candidate-fingerprint")
     verify.add_argument("--candidate-run-id")
+    verify.add_argument("--candidate-artifact-id", type=int)
+    verify.add_argument("--candidate-run-attempt", type=int)
     verify.add_argument("--bridge-commit")
     verify.add_argument("--upstream-tag")
     verify.add_argument("--upstream-commit")

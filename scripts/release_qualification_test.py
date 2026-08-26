@@ -14,6 +14,7 @@ import shutil
 import struct
 import tempfile
 import unittest
+from unittest import mock
 import wave
 import warnings
 import zipfile
@@ -22,6 +23,7 @@ from pathlib import Path
 import release_qualification as rq
 from generate_release_manifest import ARTIFACTS, generate
 from release_contract import BRIDGE_REPOSITORY, ContractError
+from speech_to_text_browser_smoke import DEFAULT_EXPECTED_TEXT
 
 
 BRIDGE_SHA = "565c8396597ea7c0fb4e8d5d966da8d884b156d8"
@@ -31,12 +33,26 @@ NATIVE_MANIFEST_SHA = (
 )
 NATIVE_COMMIT = "1" * 40
 CANDIDATE_RUN_ID = "32919086955"
+CANDIDATE_ARTIFACT_ID = 7
 CANDIDATE_RUN_URL = (
     f"https://github.com/{BRIDGE_REPOSITORY}/actions/runs/{CANDIDATE_RUN_ID}"
 )
 CORRELATION_ID = "llamadart-pin:run-123"
 DEFAULT_HEAD_BRANCH = "main"
 DEFAULT_HEAD_SHA = "a" * 40
+
+
+# Pinned by the speech gate that produces it, not restated here, so this suite
+# cannot pass against a transcript the real gate would reject.
+EXPECTED_SPEECH_TRANSCRIPT_RAW = DEFAULT_EXPECTED_TEXT
+
+
+def candidate_archive_members() -> dict[str, bytes]:
+    """Every member a legitimate candidate archive must carry, and nothing else."""
+    members = {name: b"data\n" for name in ARTIFACTS}
+    members["manifest.json"] = b"{}\n"
+    members["sha256sums.txt"] = b"sums\n"
+    return members
 
 
 def write_candidate(directory: Path, *, marker: bytes = b"candidate") -> None:
@@ -90,9 +106,9 @@ def speech_phase() -> dict[str, object]:
                     "silence": 4000,
                     "warm_transcript": 30000,
                 },
-                "cold_transcript": "fixture transcript",
-                "warm_transcript": "fixture transcript",
-                "cancellation_result": "cancel:AbortError:0",
+                "cold_transcript": EXPECTED_SPEECH_TRANSCRIPT_RAW,
+                "warm_transcript": EXPECTED_SPEECH_TRANSCRIPT_RAW,
+                "cancellation_result": "cancel:resolved:12",
                 "silence_transcript": "",
             }
             for memory_mode, runtime_mode in rq.REQUIRED_SPEECH_MODES
@@ -117,7 +133,11 @@ def tts_phase() -> dict[str, object]:
                 "frames_generated": 24,
                 "peak": 0.5,
                 "rms": 0.1,
-                "truncated": True,
+                "truncated": False,
+                "cancellation_tested": True,
+                "pre_aborted_tested": True,
+                "reuse_sample_count": 2400,
+                "unload_tested": True,
                 "wav": {
                     "sha256": hashlib.sha256(runtime_mode.encode()).hexdigest(),
                     "byte_length": 96044,
@@ -146,6 +166,8 @@ def workflow_run(**overrides: object) -> dict[str, object]:
         "run_attempt": 1,
         "repository": {"full_name": BRIDGE_REPOSITORY},
         "head_repository": {"full_name": BRIDGE_REPOSITORY},
+        "actor": {"login": "leehack"},
+        "triggering_actor": {"login": "leehack"},
     }
     run.update(overrides)
     return run
@@ -180,6 +202,8 @@ class QualificationTest(unittest.TestCase):
             manifest=self.manifest,
             candidate_fingerprint=self.fingerprint,
             candidate_run_id=CANDIDATE_RUN_ID,
+            candidate_artifact_id=7,
+            candidate_run_attempt=1,
             harness_digest=self.harness_digest,
             speech_phase=speech_phase(),
             tts_phase=tts_phase(),
@@ -223,6 +247,7 @@ class QualificationTest(unittest.TestCase):
             manifest=self.manifest,
             candidate_fingerprint=self.fingerprint,
             candidate_run_id=CANDIDATE_RUN_ID,
+            candidate_artifact_id=CANDIDATE_ARTIFACT_ID,
             harness_digest=self.harness_digest,
             speech_phase=speech_phase(),
             tts_phase=tts_phase(),
@@ -265,6 +290,7 @@ class QualificationTest(unittest.TestCase):
                 manifest=manifest,
                 candidate_fingerprint=self.fingerprint,
                 candidate_run_id=CANDIDATE_RUN_ID,
+                candidate_artifact_id=CANDIDATE_ARTIFACT_ID,
                 harness_digest=self.harness_digest,
                 speech_phase=speech_phase(),
                 tts_phase=tts_phase(),
@@ -416,6 +442,8 @@ class QualificationTest(unittest.TestCase):
     def test_wrong_attestation_type_or_schema_rejected(self) -> None:
         for key, value in (
             ("schema_version", 2),
+            ("schema_version", True),
+            ("schema_version", 1.0),
             ("attestation_type", "something-else"),
             ("harness_version", "0.0.1"),
             ("bridge_repository", "attacker/bridge"),
@@ -432,6 +460,8 @@ class QualificationTest(unittest.TestCase):
             ("candidate_fingerprint", 123),
             ("candidate_run_id", 32919086955),
             ("release_rebuild", "1"),
+            ("release_rebuild", -1),
+            ("release_rebuild", True),
             ("hosted_gates", ["state_persistence"]),
             ("model_pins", "none"),
             ("phases", []),
@@ -754,6 +784,10 @@ class QualificationTest(unittest.TestCase):
             "peak": measured["peak"],
             "rms": measured["rms"],
             "truncated": False,
+            "cancellationTested": True,
+            "preAbortedTested": True,
+            "reuseSampleCount": 1,
+            "unloadTested": True,
             "audioArtifact": wav_path.name,
         }
         phase = rq._tts_phase({"modeResults": [result]}, 1, artifacts)
@@ -809,6 +843,15 @@ class QualificationTest(unittest.TestCase):
         with self.assertRaises(ContractError) as ctx:
             rq.decode_attestation(blob)
         self.assertIn("duplicate", str(ctx.exception).lower())
+
+    def test_nonstandard_json_constants_rejected_before_schema_validation(self) -> None:
+        for constant in ("NaN", "Infinity", "-Infinity"):
+            with self.subTest(constant=constant):
+                with self.assertRaises(ContractError) as ctx:
+                    rq.parse_attestation_json(f'{{"value": {constant}}}')
+                self.assertIn("non-standard", str(ctx.exception))
+        with self.assertRaises(ContractError):
+            rq.canonical_json({"value": float("nan")})
 
     def test_non_object_transport_payload_rejected(self) -> None:
         for raw in (b"[1, 2, 3]\n", b'"text"\n', b"123\n", b"null\n", b"{ broken"):
@@ -898,6 +941,18 @@ class QualificationTest(unittest.TestCase):
                     expected_run_attempt=1,
                 )
 
+    def test_run_attempt_one_is_mandatory_even_without_a_caller_override(self) -> None:
+        for run_attempt in (2, 0, True, "1", None):
+            with self.subTest(run_attempt=run_attempt), self.assertRaises(
+                ContractError
+            ):
+                rq.validate_workflow_run(
+                    workflow_run(run_attempt=run_attempt),
+                    expected_run_id=CANDIDATE_RUN_ID,
+                    expected_workflow_path=rq.CANDIDATE_WORKFLOW_PATH,
+                    expected_head_branch=DEFAULT_HEAD_BRANCH,
+                )
+
     def test_attestation_run_must_be_the_ingestion_workflow(self) -> None:
         with self.assertRaises(ContractError) as ctx:
             rq.validate_workflow_run(
@@ -955,36 +1010,810 @@ class QualificationTest(unittest.TestCase):
             )
         self.assertIn("truncated", str(ctx.exception))
 
+    def write_candidate_archive(
+        self, name: str, *, replace: dict[str, str] | None = None
+    ) -> Path:
+        """Write a member-complete candidate archive so rejections are on merit.
+
+        A short archive would be refused on member count alone, which would let
+        a traversal or duplicate check regress without any test noticing.
+        """
+        members = candidate_archive_members()
+        if replace:
+            for original, _ in replace.items():
+                members.pop(original, None)
+            members.update({new: b"bad" for new in replace.values()})
+        archive = self.tmp / name
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            with zipfile.ZipFile(archive, "w") as handle:
+                for member, data in members.items():
+                    handle.writestr(member, data)
+        return archive
+
     def test_artifact_archive_rejects_path_escape_and_duplicate_members(self) -> None:
-        for name, members in (
-            ("escape.zip", (("../escape", b"bad"),)),
-            ("nested.zip", (("nested/file", b"bad"),)),
-            ("duplicate.zip", (("file", b"one"), ("file", b"two"))),
+        for name, swapped, expected in (
+            ("escape.zip", "../escape", "not a flat regular file"),
+            ("nested.zip", "nested/file", "not a flat regular file"),
+            ("unauthorized.zip", "evil.sh", "unauthorized member"),
         ):
-            archive = self.tmp / name
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore", UserWarning)
-                with zipfile.ZipFile(archive, "w") as handle:
-                    for member, data in members:
-                        handle.writestr(member, data)
+            archive = self.write_candidate_archive(
+                name, replace={"sha256sums.txt": swapped}
+            )
             destination = self.tmp / f"extract-{name}"
-            with self.subTest(name=name), self.assertRaises(ContractError):
-                rq._extract_flat_artifact_archive(archive, destination)
+            with self.subTest(name=name), self.assertRaises(ContractError) as ctx:
+                rq._extract_flat_artifact_archive(
+                    archive, destination, artifact_type="candidate"
+                )
+            self.assertIn(expected, str(ctx.exception))
+
+        duplicate = self.tmp / "duplicate.zip"
+        members = candidate_archive_members()
+        members.pop("sha256sums.txt")
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            with zipfile.ZipFile(duplicate, "w") as handle:
+                for member, data in members.items():
+                    handle.writestr(member, data)
+                handle.writestr("manifest.json", b"second\n")
+        with self.assertRaises(ContractError) as ctx:
+            rq._extract_flat_artifact_archive(
+                duplicate, self.tmp / "extract-duplicate", artifact_type="candidate"
+            )
+        self.assertIn("repeats member", str(ctx.exception))
 
     def test_artifact_archive_extracts_only_flat_regular_files(self) -> None:
-        archive = self.tmp / "valid.zip"
-        with zipfile.ZipFile(archive, "w") as handle:
-            handle.writestr("manifest.json", b"{}\n")
-        destination = self.tmp / "valid-extract"
-        rq._extract_flat_artifact_archive(archive, destination)
+        archive = self.write_candidate_archive("valid-candidate.zip")
+        destination = self.tmp / "valid-candidate-extract"
+        rq._extract_flat_artifact_archive(archive, destination, artifact_type="candidate")
         self.assertEqual((destination / "manifest.json").read_bytes(), b"{}\n")
+        self.assertEqual(
+            {entry.name for entry in destination.iterdir()},
+            set(candidate_archive_members()),
+        )
 
         real_destination = self.tmp / "real-artifact-destination"
         real_destination.mkdir()
         linked_destination = self.tmp / "linked-artifact-destination"
         linked_destination.symlink_to(real_destination, target_is_directory=True)
         with self.assertRaises(ContractError):
-            rq._extract_flat_artifact_archive(archive, linked_destination)
+            rq._extract_flat_artifact_archive(archive, linked_destination, artifact_type="candidate")
+
+    def test_attestation_zip_bomb_rejected_on_compression_ratio(self) -> None:
+        # Small enough to clear the per-member byte cap, so the ratio bound is
+        # the check that has to refuse it.
+        archive = self.tmp / "attestation-bomb.zip"
+        with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as handle:
+            handle.writestr("qualification-attestation.json", b"\0" * 32000)
+        self.assertLess(
+            archive.stat().st_size, rq.MAX_ATTESTATION_MEMBER_BYTES
+        )
+        destination = self.tmp / "attestation-bomb-extract"
+        with self.assertRaises(ContractError) as ctx:
+            rq._extract_flat_artifact_archive(
+                archive, destination, artifact_type="attestation"
+            )
+        self.assertIn("compression ratio", str(ctx.exception))
+        self.assertEqual(list(destination.iterdir()), [])
+
+    def test_candidate_zip_bomb_rejected_on_compression_ratio(self) -> None:
+        archive = self.tmp / "candidate-bomb.zip"
+        members = candidate_archive_members()
+        members["sha256sums.txt"] = b"\0" * (1024 * 1024)
+        with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as handle:
+            for member, data in members.items():
+                handle.writestr(member, data)
+        destination = self.tmp / "candidate-bomb-extract"
+        with self.assertRaises(ContractError) as ctx:
+            rq._extract_flat_artifact_archive(
+                archive, destination, artifact_type="candidate"
+            )
+        self.assertIn("compression ratio", str(ctx.exception))
+        self.assertEqual(list(destination.iterdir()), [])
+
+    def test_oversized_candidate_member_rejected_before_extraction(self) -> None:
+        archive = self.write_candidate_archive("oversize-candidate.zip")
+        data = bytearray(archive.read_bytes())
+        oversize = rq.MAX_CANDIDATE_MEMBER_BYTES + 1
+        cd_offset = data.find(b"PK\x01\x02")
+        while cd_offset != -1:
+            name_length = struct.unpack_from("<H", data, cd_offset + 28)[0]
+            if data[cd_offset + 46 : cd_offset + 46 + name_length] == b"sha256sums.txt":
+                local_offset = struct.unpack_from("<I", data, cd_offset + 42)[0]
+                struct.pack_into("<I", data, cd_offset + 20, oversize)
+                struct.pack_into("<I", data, cd_offset + 24, oversize)
+                struct.pack_into("<I", data, local_offset + 18, oversize)
+                struct.pack_into("<I", data, local_offset + 22, oversize)
+                break
+            cd_offset = data.find(b"PK\x01\x02", cd_offset + 4)
+        self.assertNotEqual(cd_offset, -1)
+        archive.write_bytes(data)
+        destination = self.tmp / "oversize-candidate-extract"
+        with self.assertRaises(ContractError) as ctx:
+            rq._extract_flat_artifact_archive(
+                archive, destination, artifact_type="candidate"
+            )
+        self.assertIn("exceeds bound", str(ctx.exception))
+        self.assertEqual(list(destination.iterdir()), [])
+
+    def test_oversized_attestation_member_rejected_before_extraction(self) -> None:
+        archive = self.tmp / "oversize-attestation.zip"
+        with zipfile.ZipFile(archive, "w") as handle:
+            handle.writestr(
+                "qualification-attestation.json",
+                b"x" * (rq.MAX_ATTESTATION_MEMBER_BYTES + 1),
+            )
+        destination = self.tmp / "oversize-attestation-extract"
+        with self.assertRaises(ContractError) as ctx:
+            rq._extract_flat_artifact_archive(
+                archive, destination, artifact_type="attestation"
+            )
+        self.assertIn("exceeds bound", str(ctx.exception))
+        self.assertEqual(list(destination.iterdir()), [])
+
+    def test_total_uncompressed_size_is_bounded_before_extraction(self) -> None:
+        archive = self.write_candidate_archive("oversize-total-candidate.zip")
+        data = bytearray(archive.read_bytes())
+        claimed_size = 32 * 1024 * 1024
+        cd_offset = data.find(b"PK\x01\x02")
+        rewritten = 0
+        while cd_offset != -1:
+            local_offset = struct.unpack_from("<I", data, cd_offset + 42)[0]
+            struct.pack_into("<I", data, cd_offset + 20, claimed_size)
+            struct.pack_into("<I", data, cd_offset + 24, claimed_size)
+            struct.pack_into("<I", data, local_offset + 18, claimed_size)
+            struct.pack_into("<I", data, local_offset + 22, claimed_size)
+            rewritten += 1
+            cd_offset = data.find(b"PK\x01\x02", cd_offset + 4)
+        self.assertEqual(rewritten, len(candidate_archive_members()))
+        archive.write_bytes(data)
+        destination = self.tmp / "oversize-total-extract"
+        with self.assertRaises(ContractError) as ctx:
+            rq._extract_flat_artifact_archive(
+                archive, destination, artifact_type="candidate"
+            )
+        self.assertIn("total uncompressed size", str(ctx.exception))
+        self.assertEqual(list(destination.iterdir()), [])
+
+    def test_symlink_archive_member_rejected(self) -> None:
+        archive = self.tmp / "symlink-attestation.zip"
+        member = zipfile.ZipInfo("qualification-attestation.json")
+        member.create_system = 3
+        member.external_attr = (rq.stat.S_IFLNK | 0o777) << 16
+        with zipfile.ZipFile(archive, "w") as handle:
+            handle.writestr(member, b"target.json")
+        destination = self.tmp / "symlink-attestation-extract"
+        with self.assertRaises(ContractError) as ctx:
+            rq._extract_flat_artifact_archive(
+                archive, destination, artifact_type="attestation"
+            )
+        self.assertIn("not a flat regular file", str(ctx.exception))
+        self.assertEqual(list(destination.iterdir()), [])
+
+    def test_unauthorized_artifact_member_rejected(self) -> None:
+        archive = self.tmp / "unauthorized-attestation.zip"
+        with zipfile.ZipFile(archive, "w") as handle:
+            handle.writestr("evil.sh", b"echo evil\n")
+        destination = self.tmp / "unauthorized-extract"
+        with self.assertRaises(ContractError) as ctx:
+            rq._extract_flat_artifact_archive(
+                archive, destination, artifact_type="attestation"
+            )
+        self.assertIn("unauthorized member", str(ctx.exception))
+
+    def test_short_candidate_member_inventory_rejected(self) -> None:
+        archive = self.tmp / "incomplete-candidate.zip"
+        with zipfile.ZipFile(archive, "w") as handle:
+            for name in ARTIFACTS:
+                handle.writestr(name, b"data\n")
+        destination = self.tmp / "incomplete-candidate-extract"
+        with self.assertRaises(ContractError) as ctx:
+            rq._extract_flat_artifact_archive(
+                archive, destination, artifact_type="candidate"
+            )
+        self.assertIn("member count must be exactly", str(ctx.exception))
+        self.assertIn(str(len(candidate_archive_members())), str(ctx.exception))
+
+    def test_eocd_count_is_bounded_before_zipfile_parses_members(self) -> None:
+        archive = self.tmp / "too-many-attestation-members.zip"
+        with zipfile.ZipFile(archive, "w") as handle:
+            handle.writestr("qualification-attestation.json", b"evidence\n")
+            handle.writestr("evil.txt", b"extra\n")
+        destination = self.tmp / "too-many-attestation-members-extract"
+        with mock.patch.object(
+            rq.zipfile,
+            "ZipFile",
+            side_effect=AssertionError("ZipFile must not parse an over-count archive"),
+        ):
+            with self.assertRaises(ContractError) as ctx:
+                rq._extract_flat_artifact_archive(
+                    archive, destination, artifact_type="attestation"
+                )
+        self.assertIn("end-of-central-directory member count", str(ctx.exception))
+        self.assertEqual(list(destination.iterdir()), [])
+
+    def test_archive_preamble_cannot_hide_outside_the_member_inventory(self) -> None:
+        archive = self.tmp / "prefixed-attestation.zip"
+        with zipfile.ZipFile(archive, "w") as handle:
+            handle.writestr("qualification-attestation.json", b"evidence\n")
+        original = bytearray(archive.read_bytes())
+        old_cd_offset = original.find(b"PK\x01\x02")
+        old_eocd_offset = original.find(b"PK\x05\x06")
+        self.assertNotEqual(old_cd_offset, -1)
+        self.assertNotEqual(old_eocd_offset, -1)
+        prefix = b"JUNK"
+        data = bytearray(prefix) + original
+        cd_offset = old_cd_offset + len(prefix)
+        eocd_offset = old_eocd_offset + len(prefix)
+        local_offset = struct.unpack_from("<I", data, cd_offset + 42)[0]
+        struct.pack_into("<I", data, cd_offset + 42, local_offset + len(prefix))
+        struct.pack_into("<I", data, eocd_offset + 16, cd_offset)
+        archive.write_bytes(data)
+        destination = self.tmp / "prefixed-attestation-extract"
+        with self.assertRaises(ContractError) as ctx:
+            rq._extract_flat_artifact_archive(
+                archive, destination, artifact_type="attestation"
+            )
+        self.assertIn("start at byte zero", str(ctx.exception))
+        self.assertEqual(list(destination.iterdir()), [])
+
+    def test_encrypted_zip_member_rejected(self) -> None:
+        for flag in (0x1, 0x40, 0x2000):
+            archive = self.tmp / f"encrypted-{flag:x}.zip"
+            with zipfile.ZipFile(archive, "w") as handle:
+                handle.writestr("qualification-attestation.json", b"secret")
+            data = bytearray(archive.read_bytes())
+            local_flags = struct.unpack_from("<H", data, 6)[0]
+            struct.pack_into("<H", data, 6, local_flags | flag)
+            cd_offset = data.find(b"PK\x01\x02")
+            self.assertNotEqual(cd_offset, -1)
+            central_flags = struct.unpack_from("<H", data, cd_offset + 8)[0]
+            struct.pack_into("<H", data, cd_offset + 8, central_flags | flag)
+            archive.write_bytes(data)
+            destination = self.tmp / f"encrypted-{flag:x}-extract"
+            with self.subTest(flag=flag):
+                with self.assertRaises(ContractError) as ctx:
+                    rq._extract_flat_artifact_archive(
+                        archive, destination, artifact_type="attestation"
+                    )
+                self.assertIn("encrypted", str(ctx.exception))
+
+    def test_data_descriptor_zip_member_rejected(self) -> None:
+        archive = self.tmp / "data-descriptor.zip"
+        with zipfile.ZipFile(archive, "w") as handle:
+            handle.writestr("qualification-attestation.json", b"evidence\n")
+        data = bytearray(archive.read_bytes())
+        local_flags = struct.unpack_from("<H", data, 6)[0]
+        struct.pack_into("<H", data, 6, local_flags | 0x8)
+        struct.pack_into("<III", data, 14, 0, 0, 0)
+        cd_offset = data.find(b"PK\x01\x02")
+        self.assertNotEqual(cd_offset, -1)
+        central_flags = struct.unpack_from("<H", data, cd_offset + 8)[0]
+        struct.pack_into("<H", data, cd_offset + 8, central_flags | 0x8)
+        archive.write_bytes(data)
+        destination = self.tmp / "data-descriptor-extract"
+        with self.assertRaises(ContractError) as ctx:
+            rq._extract_flat_artifact_archive(
+                archive, destination, artifact_type="attestation"
+            )
+        self.assertIn("data descriptor", str(ctx.exception))
+        self.assertEqual(list(destination.iterdir()), [])
+
+    def test_signed_github_style_data_descriptor_is_exactly_validated(self) -> None:
+        archive = self.tmp / "signed-data-descriptor.zip"
+        with zipfile.ZipFile(archive, "w") as handle:
+            handle.writestr("qualification-attestation.json", b"evidence\n")
+        data = bytearray(archive.read_bytes())
+        cd_offset = data.find(b"PK\x01\x02")
+        self.assertNotEqual(cd_offset, -1)
+        crc = struct.unpack_from("<I", data, cd_offset + 16)[0]
+        compressed_size = struct.unpack_from("<I", data, cd_offset + 20)[0]
+        file_size = struct.unpack_from("<I", data, cd_offset + 24)[0]
+        local_flags = struct.unpack_from("<H", data, 6)[0]
+        struct.pack_into("<H", data, 6, local_flags | 0x8)
+        struct.pack_into("<III", data, 14, 0, 0, 0)
+        central_flags = struct.unpack_from("<H", data, cd_offset + 8)[0]
+        struct.pack_into("<H", data, cd_offset + 8, central_flags | 0x8)
+        descriptor = struct.pack(
+            "<4sIII", b"PK\x07\x08", crc, compressed_size, file_size
+        )
+        data[cd_offset:cd_offset] = descriptor
+        eocd_offset = data.find(b"PK\x05\x06", cd_offset + len(descriptor))
+        self.assertNotEqual(eocd_offset, -1)
+        struct.pack_into("<I", data, eocd_offset + 16, cd_offset + len(descriptor))
+        archive.write_bytes(data)
+
+        destination = self.tmp / "signed-data-descriptor-extract"
+        rq._extract_flat_artifact_archive(
+            archive, destination, artifact_type="attestation"
+        )
+        self.assertEqual(
+            (destination / "qualification-attestation.json").read_bytes(),
+            b"evidence\n",
+        )
+
+        mismatched = bytearray(archive.read_bytes())
+        descriptor_offset = mismatched.find(b"PK\x07\x08")
+        self.assertNotEqual(descriptor_offset, -1)
+        struct.pack_into("<I", mismatched, descriptor_offset + 4, crc ^ 0xFFFFFFFF)
+        archive.write_bytes(mismatched)
+        destination = self.tmp / "mismatched-data-descriptor-extract"
+        with self.assertRaises(ContractError) as ctx:
+            rq._extract_flat_artifact_archive(
+                archive, destination, artifact_type="attestation"
+            )
+        self.assertIn("data descriptor", str(ctx.exception))
+        self.assertEqual(list(destination.iterdir()), [])
+
+    def test_local_and_central_flag_mismatch_rejected(self) -> None:
+        archive = self.tmp / "flag-mismatch.zip"
+        with zipfile.ZipFile(archive, "w") as handle:
+            handle.writestr("qualification-attestation.json", b"evidence\n")
+        data = bytearray(archive.read_bytes())
+        local_flags = struct.unpack_from("<H", data, 6)[0]
+        struct.pack_into("<H", data, 6, local_flags ^ 0x800)
+        archive.write_bytes(data)
+        destination = self.tmp / "flag-mismatch-extract"
+        with self.assertRaises(ContractError) as ctx:
+            rq._extract_flat_artifact_archive(
+                archive, destination, artifact_type="attestation"
+            )
+        self.assertIn("flags", str(ctx.exception))
+        self.assertEqual(list(destination.iterdir()), [])
+
+    def test_nul_truncated_member_name_cannot_masquerade_as_allowlisted(self) -> None:
+        archive = self.write_candidate_archive(
+            "nul-name-candidate.zip",
+            replace={"manifest.json": "manifest.jsonX"},
+        )
+        data = bytearray(archive.read_bytes())
+        cd_offset = data.find(b"PK\x01\x02")
+        while cd_offset != -1:
+            name_length = struct.unpack_from("<H", data, cd_offset + 28)[0]
+            name_start = cd_offset + 46
+            if data[name_start : name_start + name_length] == b"manifest.jsonX":
+                local_offset = struct.unpack_from("<I", data, cd_offset + 42)[0]
+                local_name_start = local_offset + 30
+                data[local_name_start + name_length - 1] = 0
+                data[name_start + name_length - 1] = 0
+                break
+            cd_offset = data.find(b"PK\x01\x02", cd_offset + 4)
+        self.assertNotEqual(cd_offset, -1)
+        archive.write_bytes(data)
+        destination = self.tmp / "nul-name-extract"
+        with self.assertRaises(ContractError) as ctx:
+            rq._extract_flat_artifact_archive(
+                archive, destination, artifact_type="candidate"
+            )
+        self.assertIn("ambiguous", str(ctx.exception))
+        self.assertEqual(list(destination.iterdir()), [])
+
+    def test_member_extra_fields_and_comments_cannot_hide_metadata(self) -> None:
+        for kind in ("extra", "comment"):
+            archive = self.tmp / f"hidden-{kind}-attestation.zip"
+            member = zipfile.ZipInfo("qualification-attestation.json")
+            if kind == "extra":
+                member.extra = struct.pack("<HH", 0xCAFE, 0)
+            else:
+                member.comment = b"hidden"
+            with zipfile.ZipFile(archive, "w") as handle:
+                handle.writestr(member, b"evidence\n")
+            destination = self.tmp / f"hidden-{kind}-extract"
+            with self.subTest(kind=kind):
+                with self.assertRaises(ContractError) as ctx:
+                    rq._extract_flat_artifact_archive(
+                        archive, destination, artifact_type="attestation"
+                    )
+                self.assertIn("metadata", str(ctx.exception))
+                self.assertEqual(list(destination.iterdir()), [])
+
+    def test_local_only_extra_field_cannot_hide_metadata(self) -> None:
+        archive = self.tmp / "local-extra-attestation.zip"
+        with zipfile.ZipFile(archive, "w") as handle:
+            handle.writestr("qualification-attestation.json", b"evidence\n")
+        data = bytearray(archive.read_bytes())
+        name_length = struct.unpack_from("<H", data, 26)[0]
+        payload_offset = 30 + name_length
+        local_extra = struct.pack("<HH", 0xCAFE, 0)
+        data[payload_offset:payload_offset] = local_extra
+        struct.pack_into("<H", data, 28, len(local_extra))
+        cd_offset = data.find(b"PK\x01\x02")
+        eocd_offset = data.find(b"PK\x05\x06")
+        self.assertNotEqual(cd_offset, -1)
+        self.assertNotEqual(eocd_offset, -1)
+        struct.pack_into("<I", data, eocd_offset + 16, cd_offset)
+        archive.write_bytes(data)
+        destination = self.tmp / "local-extra-extract"
+        with self.assertRaises(ContractError) as ctx:
+            rq._extract_flat_artifact_archive(
+                archive, destination, artifact_type="attestation"
+            )
+        self.assertIn("metadata", str(ctx.exception))
+        self.assertEqual(list(destination.iterdir()), [])
+
+    def test_unsupported_compression_method_rejected(self) -> None:
+        archive = self.write_candidate_archive("bzip2-candidate.zip")
+        data = bytearray(archive.read_bytes())
+        cd_offset = data.find(b"PK\x01\x02")
+        while cd_offset != -1:
+            name_length = struct.unpack_from("<H", data, cd_offset + 28)[0]
+            if data[cd_offset + 46 : cd_offset + 46 + name_length] == b"manifest.json":
+                local_offset = struct.unpack_from("<I", data, cd_offset + 42)[0]
+                struct.pack_into("<H", data, cd_offset + 10, zipfile.ZIP_BZIP2)
+                struct.pack_into("<H", data, local_offset + 8, zipfile.ZIP_BZIP2)
+                break
+            cd_offset = data.find(b"PK\x01\x02", cd_offset + 4)
+        self.assertNotEqual(cd_offset, -1)
+        archive.write_bytes(data)
+        destination = self.tmp / "bzip2-candidate-extract"
+        with self.assertRaises(ContractError) as ctx:
+            rq._extract_flat_artifact_archive(
+                archive, destination, artifact_type="candidate"
+            )
+        self.assertIn("unsupported compression method", str(ctx.exception))
+        self.assertEqual(list(destination.iterdir()), [])
+
+    def test_local_header_disagreeing_with_central_directory_rejected(self) -> None:
+        # Only the local header is rewritten, so the central directory still
+        # looks benign. The archive is ambiguous about what it would actually
+        # decompress and must be refused rather than reconciled.
+        archive = self.write_candidate_archive("local-mismatch-candidate.zip")
+        data = bytearray(archive.read_bytes())
+        cd_offset = data.find(b"PK\x01\x02")
+        local_offset = struct.unpack_from("<I", data, cd_offset + 42)[0]
+        struct.pack_into("<I", data, local_offset + 22, 4096)
+        archive.write_bytes(data)
+        destination = self.tmp / "local-mismatch-extract"
+        with self.assertRaises(ContractError) as ctx:
+            rq._extract_flat_artifact_archive(
+                archive, destination, artifact_type="candidate"
+            )
+        self.assertIn("disagrees with the central directory", str(ctx.exception))
+        self.assertEqual(list(destination.iterdir()), [])
+
+    def test_local_header_name_disagreeing_with_central_directory_rejected(self) -> None:
+        archive = self.write_candidate_archive("local-name-candidate.zip")
+        data = bytearray(archive.read_bytes())
+        cd_offset = data.find(b"PK\x01\x02")
+        name_length = struct.unpack_from("<H", data, cd_offset + 28)[0]
+        name = bytes(data[cd_offset + 46 : cd_offset + 46 + name_length])
+        local_offset = struct.unpack_from("<I", data, cd_offset + 42)[0]
+        start = local_offset + 30
+        self.assertEqual(bytes(data[start : start + name_length]), name)
+        data[start] = ord("Z")
+        archive.write_bytes(data)
+        destination = self.tmp / "local-name-extract"
+        with self.assertRaises(ContractError) as ctx:
+            rq._extract_flat_artifact_archive(
+                archive, destination, artifact_type="candidate"
+            )
+        self.assertIn("disagrees with the central directory", str(ctx.exception))
+        self.assertEqual(list(destination.iterdir()), [])
+
+    def test_overlapping_members_rejected(self) -> None:
+        archive = self.write_candidate_archive("overlapping-candidate.zip")
+        data = bytearray(archive.read_bytes())
+        offsets = []
+        cd_offset = data.find(b"PK\x01\x02")
+        while cd_offset != -1:
+            offsets.append(cd_offset + 42)
+            cd_offset = data.find(b"PK\x01\x02", cd_offset + 4)
+        self.assertGreater(len(offsets), 1)
+        first = struct.unpack_from("<I", data, offsets[0])[0]
+        # Point a second member's local header back inside the first member's
+        # payload so the two entries claim overlapping bytes.
+        struct.pack_into("<I", data, offsets[1], first)
+        archive.write_bytes(data)
+        destination = self.tmp / "overlapping-extract"
+        with self.assertRaises(ContractError) as ctx:
+            rq._extract_flat_artifact_archive(
+                archive, destination, artifact_type="candidate"
+            )
+        self.assertIn("overlapping members", str(ctx.exception))
+        self.assertEqual(list(destination.iterdir()), [])
+
+    def test_member_payload_cannot_overlap_the_central_directory(self) -> None:
+        archive = self.write_candidate_archive("central-overlap-candidate.zip")
+        data = bytearray(archive.read_bytes())
+        cd_offset = data.find(b"PK\x01\x02")
+        while cd_offset != -1:
+            name_length = struct.unpack_from("<H", data, cd_offset + 28)[0]
+            name = data[cd_offset + 46 : cd_offset + 46 + name_length]
+            if name == b"sha256sums.txt":
+                local_offset = struct.unpack_from("<I", data, cd_offset + 42)[0]
+                compressed_size = struct.unpack_from("<I", data, cd_offset + 20)[0]
+                file_size = struct.unpack_from("<I", data, cd_offset + 24)[0]
+                struct.pack_into("<I", data, cd_offset + 20, compressed_size + 1)
+                struct.pack_into("<I", data, cd_offset + 24, file_size + 1)
+                struct.pack_into("<I", data, local_offset + 18, compressed_size + 1)
+                struct.pack_into("<I", data, local_offset + 22, file_size + 1)
+                break
+            cd_offset = data.find(b"PK\x01\x02", cd_offset + 4)
+        self.assertNotEqual(cd_offset, -1)
+        archive.write_bytes(data)
+        destination = self.tmp / "central-overlap-extract"
+        with self.assertRaises(ContractError) as ctx:
+            rq._extract_flat_artifact_archive(
+                archive, destination, artifact_type="candidate"
+            )
+        self.assertIn("central directory", str(ctx.exception))
+        self.assertEqual(list(destination.iterdir()), [])
+
+    def test_unclaimed_gap_before_central_directory_rejected(self) -> None:
+        archive = self.tmp / "central-gap-attestation.zip"
+        with zipfile.ZipFile(archive, "w") as handle:
+            handle.writestr("qualification-attestation.json", b"evidence\n")
+        data = bytearray(archive.read_bytes())
+        cd_offset = data.find(b"PK\x01\x02")
+        eocd_offset = data.find(b"PK\x05\x06")
+        self.assertNotEqual(cd_offset, -1)
+        self.assertNotEqual(eocd_offset, -1)
+        gap = b"JUNK"
+        data[cd_offset:cd_offset] = gap
+        eocd_offset += len(gap)
+        struct.pack_into("<I", data, eocd_offset + 16, cd_offset + len(gap))
+        archive.write_bytes(data)
+        destination = self.tmp / "central-gap-extract"
+        with self.assertRaises(ContractError) as ctx:
+            rq._extract_flat_artifact_archive(
+                archive, destination, artifact_type="attestation"
+            )
+        self.assertIn("unclaimed gap", str(ctx.exception))
+        self.assertEqual(list(destination.iterdir()), [])
+
+    def test_failed_extraction_leaves_no_partial_trusted_output(self) -> None:
+        # The corrupted member sorts last, so earlier members extract cleanly
+        # before the failure and would survive without staged extraction.
+        archive = self.write_candidate_archive("corrupt-candidate.zip")
+        data = bytearray(archive.read_bytes())
+        cd_offset = data.find(b"PK\x01\x02")
+        while cd_offset != -1:
+            name_length = struct.unpack_from("<H", data, cd_offset + 28)[0]
+            if data[cd_offset + 46 : cd_offset + 46 + name_length] == b"sha256sums.txt":
+                local_offset = struct.unpack_from("<I", data, cd_offset + 42)[0]
+                payload = local_offset + 30 + name_length
+                data[payload] ^= 0xFF
+                break
+            cd_offset = data.find(b"PK\x01\x02", cd_offset + 4)
+        self.assertNotEqual(cd_offset, -1)
+        archive.write_bytes(data)
+        destination = self.tmp / "corrupt-candidate-extract"
+        with self.assertRaises(ContractError):
+            rq._extract_flat_artifact_archive(
+                archive, destination, artifact_type="candidate"
+            )
+        self.assertTrue(destination.is_dir())
+        self.assertEqual(list(destination.iterdir()), [])
+        self.assertEqual(
+            [entry for entry in destination.parent.iterdir() if entry.name.startswith(".artifact-extract-")],
+            [],
+        )
+
+    def test_interrupted_placement_leaves_no_partial_trusted_output(self) -> None:
+        # Every member has already passed, so the failure lands while verified
+        # files are being moved in. The destination must still come back empty
+        # rather than half populated.
+        archive = self.write_candidate_archive("interrupted-candidate.zip")
+        destination = self.tmp / "interrupted-extract"
+        real_replace = rq.os.replace
+        calls = {"count": 0}
+
+        def failing_replace(
+            source: object, target: object, *args: object, **kwargs: object
+        ) -> None:
+            calls["count"] += 1
+            if calls["count"] > 3:
+                raise OSError("simulated placement failure")
+            real_replace(source, target, *args, **kwargs)
+
+        with mock.patch.object(rq.os, "replace", failing_replace):
+            with self.assertRaises(ContractError) as ctx:
+                rq._extract_flat_artifact_archive(
+                    archive, destination, artifact_type="candidate"
+                )
+        self.assertIn("could not place verified artifact members", str(ctx.exception))
+        self.assertGreater(calls["count"], 3)
+        self.assertTrue(destination.is_dir())
+        self.assertEqual(list(destination.iterdir()), [])
+
+    def test_destination_swap_cannot_redirect_or_preserve_verified_output(self) -> None:
+        archive = self.write_candidate_archive("destination-swap-candidate.zip")
+        destination = self.tmp / "destination-swap-extract"
+        displaced = self.tmp / "displaced-destination"
+        attacker_target = self.tmp / "attacker-target"
+        attacker_target.mkdir()
+        real_replace = rq.os.replace
+        swapped = False
+
+        def swapping_replace(
+            source: object, target: object, *args: object, **kwargs: object
+        ) -> None:
+            nonlocal swapped
+            if not swapped:
+                destination.rename(displaced)
+                destination.symlink_to(attacker_target, target_is_directory=True)
+                swapped = True
+            real_replace(source, target, *args, **kwargs)
+
+        with mock.patch.object(rq.os, "replace", swapping_replace):
+            with self.assertRaises(ContractError) as ctx:
+                rq._extract_flat_artifact_archive(
+                    archive, destination, artifact_type="candidate"
+                )
+        self.assertIn("changed during extraction", str(ctx.exception))
+        self.assertEqual(list(attacker_target.iterdir()), [])
+        self.assertTrue(displaced.is_dir())
+        self.assertEqual(list(displaced.iterdir()), [])
+
+    def test_unknown_artifact_type_rejected(self) -> None:
+        archive = self.write_candidate_archive("unknown-type-candidate.zip")
+        destination = self.tmp / "unknown-extract"
+        with self.assertRaises(ContractError) as ctx:
+            rq._extract_flat_artifact_archive(
+                archive, destination, artifact_type="invalid-type"
+            )
+        self.assertIn("unknown artifact type", str(ctx.exception))
+
+    def test_mutated_asr_cold_transcript_rejected(self) -> None:
+        bad = copy.deepcopy(self.attestation)
+        bad["phases"]["speech_to_text"]["modes"][0]["cold_transcript"] = "completely wrong transcript"
+        with self.assertRaises(ContractError) as ctx:
+            self.verify(bad)
+        self.assertIn("transcript", str(ctx.exception).lower())
+
+    def test_mutated_asr_warm_transcript_rejected(self) -> None:
+        bad = copy.deepcopy(self.attestation)
+        bad["phases"]["speech_to_text"]["modes"][0]["warm_transcript"] = "completely wrong transcript"
+        with self.assertRaises(ContractError) as ctx:
+            self.verify(bad)
+        self.assertIn("transcript", str(ctx.exception).lower())
+
+    def test_malformed_asr_cancellation_schema_rejected(self) -> None:
+        for malformed in (
+            "cancelled",
+            "cancel:invalid:0",
+            "cancel:resolved:-1",
+            "cancel:resolved:abc",
+            "cancel:resolved:01",
+            "cancel:rejected:00",
+            "cancel:resolved:" + "9" * 10000,
+            "",
+            None,
+        ):
+            bad = copy.deepcopy(self.attestation)
+            bad["phases"]["speech_to_text"]["modes"][0]["cancellation_result"] = malformed
+            with self.subTest(malformed=malformed), self.assertRaises(ContractError):
+                self.verify(bad)
+
+    def test_rejected_cancellation_must_report_no_output(self) -> None:
+        # The gate only reaches the rejected state by throwing before it ever
+        # assigns output, so a rejected result carrying characters means the
+        # recorded state and the recorded output contradict each other.
+        bad = copy.deepcopy(self.attestation)
+        bad["phases"]["speech_to_text"]["modes"][0][
+            "cancellation_result"
+        ] = "cancel:rejected:37"
+        with self.assertRaises(ContractError) as ctx:
+            self.verify(bad)
+        self.assertIn("rejected but reported", str(ctx.exception))
+
+        good = copy.deepcopy(self.attestation)
+        good["phases"]["speech_to_text"]["modes"][0][
+            "cancellation_result"
+        ] = "cancel:rejected:0"
+        self.assertTrue(self.verify(good)["verified"])
+
+    def test_speech_phase_rejects_a_rejected_cancellation_with_output(self) -> None:
+        payload = {
+            "modeResults": [
+                {
+                    "memoryMode": "wasm32",
+                    "runtimeMode": "direct",
+                    "elapsedMs": 10,
+                    "phaseTimingsMs": {
+                        "cancellationMs": 1,
+                        "coldTranscriptMs": 1,
+                        "modelLoadMs": 1,
+                        "projectorLoadMs": 1,
+                        "silenceMs": 1,
+                        "warmTranscriptMs": 1,
+                    },
+                    "coldTranscript": DEFAULT_EXPECTED_TEXT,
+                    "warmTranscript": DEFAULT_EXPECTED_TEXT,
+                    "cancellation": "cancel:rejected:12",
+                    "silenceTranscript": "",
+                }
+            ]
+        }
+        with self.assertRaises(ContractError) as ctx:
+            rq._speech_phase(payload, 1)
+        self.assertIn("rejected but reported", str(ctx.exception))
+
+    def test_asr_silence_transcript_must_stay_empty(self) -> None:
+        bad = copy.deepcopy(self.attestation)
+        bad["phases"]["speech_to_text"]["modes"][0]["silence_transcript"] = "hallucinated speech"
+        with self.assertRaises(ContractError):
+            self.verify(bad)
+
+    def test_tts_truncated_must_be_false(self) -> None:
+        for val in (True, "false", None, 1):
+            bad = copy.deepcopy(self.attestation)
+            bad["phases"]["text_to_speech"]["modes"][0]["truncated"] = val
+            with self.subTest(val=val), self.assertRaises(ContractError):
+                self.verify(bad)
+
+    def test_tts_lifecycle_evidence_cancellation_tested_must_be_true(self) -> None:
+        for val in (False, "true", None, 0):
+            bad = copy.deepcopy(self.attestation)
+            bad["phases"]["text_to_speech"]["modes"][0]["cancellation_tested"] = val
+            with self.subTest(val=val), self.assertRaises(ContractError):
+                self.verify(bad)
+
+    def test_tts_lifecycle_evidence_pre_aborted_tested_must_be_true(self) -> None:
+        for val in (False, "true", None, 0):
+            bad = copy.deepcopy(self.attestation)
+            bad["phases"]["text_to_speech"]["modes"][0]["pre_aborted_tested"] = val
+            with self.subTest(val=val), self.assertRaises(ContractError):
+                self.verify(bad)
+
+    def test_tts_lifecycle_evidence_reuse_sample_count_must_be_positive(self) -> None:
+        for val in (0, -1, "2400", None, True):
+            bad = copy.deepcopy(self.attestation)
+            bad["phases"]["text_to_speech"]["modes"][0]["reuse_sample_count"] = val
+            with self.subTest(val=val), self.assertRaises(ContractError):
+                self.verify(bad)
+
+    def test_tts_lifecycle_evidence_unload_tested_must_be_true(self) -> None:
+        for val in (False, "true", None, 0):
+            bad = copy.deepcopy(self.attestation)
+            bad["phases"]["text_to_speech"]["modes"][0]["unload_tested"] = val
+            with self.subTest(val=val), self.assertRaises(ContractError):
+                self.verify(bad)
+
+    def test_wrong_workflow_run_actor_rejected(self) -> None:
+        for actor in ({"login": "attacker"}, {"login": "someone-else"}, None, {}):
+            with self.subTest(actor=actor), self.assertRaises(ContractError):
+                rq.validate_workflow_run(
+                    workflow_run(actor=actor),
+                    expected_run_id=CANDIDATE_RUN_ID,
+                    expected_workflow_path=rq.CANDIDATE_WORKFLOW_PATH,
+                    expected_head_branch=DEFAULT_HEAD_BRANCH,
+                    expected_run_attempt=1,
+                )
+
+    def test_wrong_workflow_run_triggering_actor_rejected(self) -> None:
+        for actor in ({"login": "attacker"}, {"login": "someone-else"}, None, {}):
+            with self.subTest(actor=actor), self.assertRaises(ContractError):
+                rq.validate_workflow_run(
+                    workflow_run(triggering_actor=actor),
+                    expected_run_id=CANDIDATE_RUN_ID,
+                    expected_workflow_path=rq.CANDIDATE_WORKFLOW_PATH,
+                    expected_head_branch=DEFAULT_HEAD_BRANCH,
+                    expected_run_attempt=1,
+                )
+
+    def test_candidate_artifact_id_and_run_attempt_bound_into_attestation(self) -> None:
+        self.assertEqual(self.attestation["candidate_artifact_id"], 7)
+        self.assertEqual(self.attestation["candidate_run_attempt"], 1)
+
+    def test_candidate_artifact_id_mismatch_rejected(self) -> None:
+        with self.assertRaises(ContractError) as ctx:
+            self.verify(self.attestation, candidate_artifact_id=999)
+        self.assertIn("candidate_artifact_id", str(ctx.exception))
+
+    def test_candidate_run_attempt_mismatch_rejected(self) -> None:
+        with self.assertRaises(ContractError) as ctx:
+            self.verify(self.attestation, candidate_run_attempt=2)
+        self.assertIn("candidate_run_attempt", str(ctx.exception))
+
+    def test_attestation_receipt_contains_artifact_id_and_run_attempt(self) -> None:
+        receipt = self.verify(
+            self.attestation,
+            candidate_artifact_id=7,
+            candidate_run_attempt=1,
+        )
+        self.assertEqual(receipt["candidate_artifact_id"], 7)
+        self.assertEqual(receipt["candidate_run_attempt"], 1)
 
     def test_artifact_name_alone_does_not_prove_provenance(self) -> None:
         inventory = artifact_inventory(
@@ -1141,6 +1970,26 @@ class QualificationTest(unittest.TestCase):
                         str(self.tmp / "a.json"),
                     ]
                 )
+
+    def test_verify_run_cli_defaults_to_the_mandatory_first_attempt(self) -> None:
+        args = rq._build_parser().parse_args(
+            [
+                "verify-run",
+                "--run-json",
+                str(self.tmp / "run.json"),
+                "--artifacts-json",
+                str(self.tmp / "artifacts.json"),
+                "--run-id",
+                CANDIDATE_RUN_ID,
+                "--workflow-path",
+                rq.CANDIDATE_WORKFLOW_PATH,
+                "--head-branch",
+                DEFAULT_HEAD_BRANCH,
+                "--artifact-name",
+                rq.CANDIDATE_ARTIFACT_NAME,
+            ]
+        )
+        self.assertEqual(args.run_attempt, 1)
 
 
 if __name__ == "__main__":
