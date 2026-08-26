@@ -245,10 +245,11 @@ independently and recovers exact partial states while rejecting any mismatch.
 Manifest and outcome records carry the candidate run ID/URL, because that is the
 identity the candidate manifest embeds; unavailable post-mutation re-queries
 produce retryable `mutation-unknown` records rather than guessed state.
-Retry partial publication by rerunning the same GitHub Actions run, or by
-redispatching against the same `candidate_run_id` and `attestation_run_id`: the
-fingerprinted identity comes from the candidate run, so it stays stable either
-way. Never redispatch a different candidate against an existing output tag.
+Publication run attempts are first-attempt-only: retry partial publication by
+redispatching a new publication run against the same `candidate_run_id` and
+`attestation_run_id`, never rerunning the old run. The fingerprinted identity
+comes from the candidate run, so it stays stable. A different candidate must
+never target an existing output tag.
 
 GitHub artifact tags are `vMAJOR.MINOR.PATCH`, `vMAJOR.MINOR.PATCH-N`, `bNNNN`,
 or `bNNNN-N`. Historical `bNNNN-llamadart.N` and prior wrapper forms are

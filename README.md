@@ -450,10 +450,10 @@ hosted gate conclusions alongside `pending-local-qualification` for the two
 heavy gates. Every publication run uploads `bridge-qualification-outcome` with
 the correlation ID, candidate and attestation run IDs, and candidate
 fingerprint. The candidate run ID is part of the immutable candidate
-fingerprint, so a partial publication is recovered either by GitHub's rerun
-operation or by redispatching against the same candidate and attestation runs. A
-different candidate must never overwrite an earlier one under the same output
-tag.
+fingerprint, so a partial publication is recovered by redispatching a new
+publication workflow run using the same `candidate_run_id` and
+`attestation_run_id`; never rerun the old run. A different candidate must never
+overwrite an earlier one under the same output tag.
 
 GitHub artifact tags follow the shared convention:
 
