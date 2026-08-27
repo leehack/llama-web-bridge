@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import subprocess
@@ -13,6 +14,8 @@ from pathlib import Path
 from release_contract import (
     Channel,
     ContractError,
+    IMMUTABLE_RELEASE_ATTESTATION_PREDICATE_TYPE,
+    IMMUTABLE_RELEASE_ATTESTATION_SIGNER,
     Transition,
     compare_releases,
     compare_upstream,
@@ -28,10 +31,103 @@ from release_contract import (
     validate_native_release,
     validate_native_request,
     validate_github_prerelease,
+    validate_candidate_prequalification,
+    validate_immutable_release_governance,
     validate_publication_environment,
     validate_native_identity,
+    validate_release_attestation,
     validate_release_identity,
+    validate_release_immutability,
 )
+
+
+ASSETS_REPO = "leehack/llama-web-bridge-assets"
+TAG_COMMIT = "a" * 40
+RUN_ID = "123456789"
+RUN_URL = f"https://github.com/leehack/llama-web-bridge/actions/runs/{RUN_ID}"
+
+
+def release_attestation(
+    *,
+    release_tag: str = "v0.1.39",
+    assets_repo: str = ASSETS_REPO,
+    tag_commit: str = TAG_COMMIT,
+    release_id: int = 1,
+    assets: dict[str, str] | None = None,
+    statement_overrides: dict[str, object] | None = None,
+    result_overrides: dict[str, object] | None = None,
+) -> dict[str, object]:
+    """Build a `gh release verify --format json` payload shaped like GitHub's."""
+    purl = f"pkg:github/{assets_repo}@{release_tag}"
+    subjects: list[dict[str, object]] = [
+        {"uri": purl, "digest": {"sha1": tag_commit}}
+    ]
+    for name, digest in (assets or {}).items():
+        subjects.append({"name": name, "digest": {"sha256": digest}})
+    statement: dict[str, object] = {
+        "_type": "https://in-toto.io/Statement/v1",
+        "subject": subjects,
+        "predicateType": IMMUTABLE_RELEASE_ATTESTATION_PREDICATE_TYPE,
+        "predicate": {
+            "databaseId": str(release_id),
+            "ownerId": "2",
+            "packageId": "3",
+            "purl": purl,
+            "repository": assets_repo,
+            "repositoryId": "3",
+            "tag": release_tag,
+        },
+    }
+    statement.update(statement_overrides or {})
+    result: dict[str, object] = {
+        "mediaType": "application/vnd.dev.sigstore.verificationresult+json;version=0.1",
+        "signature": {
+            "certificate": {
+                "certificateIssuer": "CN=Fulcio Intermediate l1,O=GitHub\\, Inc.",
+                "subjectAlternativeName": IMMUTABLE_RELEASE_ATTESTATION_SIGNER,
+            }
+        },
+        "verifiedTimestamps": [
+            {
+                "type": "TimestampAuthority",
+                "uri": "timestamp.githubapp.com",
+                "timestamp": "2026-08-20T22:15:59Z",
+            }
+        ],
+        "verifiedIdentity": {
+            "subjectAlternativeName": {
+                "subjectAlternativeName": "",
+                "regexp": r"^https://dotcom\.releases\.github\.com$",
+            },
+            "issuer": {"issuer": "", "regexp": ".*"},
+        },
+        "statement": statement,
+    }
+    result.update(result_overrides or {})
+    signed = result["statement"] if isinstance(result.get("statement"), dict) else statement
+    return {
+        "attestation": {
+            "bundle": {
+                "mediaType": "application/vnd.dev.sigstore.bundle.v0.3+json",
+                "verificationMaterial": {
+                    "certificate": {"rawBytes": "Zm9v"},
+                    "timestampVerificationData": {
+                        "rfc3161Timestamps": [{"signedTimestamp": "Zm9v"}]
+                    },
+                },
+                "dsseEnvelope": {
+                    "payloadType": "application/vnd.in-toto+json",
+                    "payload": base64.b64encode(
+                        json.dumps(signed).encode("utf-8")
+                    ).decode("ascii"),
+                    "signatures": [{"sig": "Zm9v"}],
+                },
+            },
+            "bundle_url": "",
+            "initiator": "",
+        },
+        "verificationResult": result,
+    }
 
 
 class ReleaseContractTest(unittest.TestCase):
@@ -685,6 +781,450 @@ class ReleaseContractTest(unittest.TestCase):
         for manifest, tag in invalid:
             with self.subTest(manifest=manifest), self.assertRaises(ContractError):
                 resolve_native_manifest(manifest, tag)
+
+    def test_immutable_release_governance_must_be_enabled(self) -> None:
+        self.assertEqual(
+            validate_immutable_release_governance(
+                {"enabled": True, "enforced_by_owner": False}, ASSETS_REPO
+            ),
+            {"repository": ASSETS_REPO, "enabled": True, "enforced_by_owner": False},
+        )
+        self.assertEqual(
+            validate_immutable_release_governance(
+                {"enabled": True, "enforced_by_owner": True}, ASSETS_REPO
+            )["enforced_by_owner"],
+            True,
+        )
+        invalid = {
+            "disabled": {"enabled": False, "enforced_by_owner": False},
+            "missing-enabled": {"enforced_by_owner": False},
+            "missing-enforced": {"enabled": True},
+            "extra-field": {
+                "enabled": True,
+                "enforced_by_owner": False,
+                "enforced_by_enterprise": False,
+            },
+            "string-true": {"enabled": "true", "enforced_by_owner": False},
+            "numeric-true": {"enabled": 1, "enforced_by_owner": False},
+            "null-enabled": {"enabled": None, "enforced_by_owner": False},
+            "string-enforced": {"enabled": True, "enforced_by_owner": "false"},
+            "empty": {},
+            "not-an-object": [{"enabled": True, "enforced_by_owner": False}],
+            "null-body": None,
+        }
+        for label, payload in invalid.items():
+            with self.subTest(label=label), self.assertRaises(ContractError):
+                validate_immutable_release_governance(payload, ASSETS_REPO)
+        with self.assertRaises(ContractError):
+            validate_immutable_release_governance(
+                {"enabled": True, "enforced_by_owner": False}, "not-a-repository"
+            )
+
+    def test_immutable_release_governance_cli_rejects_malformed_json(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            governance = Path(directory, "governance.json")
+            command = [
+                sys.executable,
+                str(Path(__file__).with_name("release_contract.py")),
+                "validate-immutable-release-governance",
+                "--governance-json",
+                str(governance),
+                "--repository",
+                ASSETS_REPO,
+            ]
+            governance.write_text(
+                json.dumps({"enabled": True, "enforced_by_owner": False}),
+                encoding="utf-8",
+            )
+            accepted = subprocess.run(command, capture_output=True, text=True)
+            self.assertEqual(accepted.returncode, 0, accepted.stderr)
+            self.assertTrue(json.loads(accepted.stdout)["enabled"])
+
+            for label, contents in {
+                "invalid-json": "{",
+                "duplicate-enabled": (
+                    '{"enabled":true,"enabled":false,"enforced_by_owner":false}'
+                ),
+                "wrong-root": "[]",
+            }.items():
+                with self.subTest(label=label):
+                    governance.write_text(contents, encoding="utf-8")
+                    rejected = subprocess.run(command, capture_output=True, text=True)
+                    self.assertNotEqual(rejected.returncode, 0)
+                    self.assertIn("error:", rejected.stderr)
+
+    def test_candidate_prequalification_binds_true_governance_assertion(self) -> None:
+        fingerprint = "b" * 64
+        harness = "c" * 64
+        correlation = "kanban:t_7f112b91:web-v0.1.39"
+        bridge = "d" * 40
+        native = "e" * 40
+        record: dict[str, object] = {
+            "schema_version": 1,
+            "candidate_fingerprint": fingerprint,
+            "harness_source_sha256": harness,
+            "assets_immutable_releases_enabled": True,
+            "orchestrator_correlation_id": correlation,
+            "github_run_id": RUN_ID,
+            "github_run_url": RUN_URL,
+            "bridge_source_sha": bridge,
+            "release_tag": "v0.1.39",
+            "emscripten_version": "6.0.8",
+            "native_commit": native,
+            "hosted_gates": {
+                "state_persistence": "success",
+                "multimodal": "success",
+            },
+            "local_gates": {
+                "speech_to_text": "pending-local-qualification",
+                "text_to_speech": "pending-local-qualification",
+            },
+            "unproven_capabilities": {
+                "real_device_intelligibility": "unproven",
+                "real_device_playback": "unproven",
+                "speaker_reference_fidelity": "unproven",
+            },
+        }
+        arguments = {
+            "candidate_fingerprint": fingerprint,
+            "harness_source_sha256": harness,
+            "orchestrator_correlation_id": correlation,
+            "github_run_id": RUN_ID,
+            "github_run_url": RUN_URL,
+            "bridge_source_sha": bridge,
+            "release_tag": "v0.1.39",
+            "emscripten_version": "6.0.8",
+            "native_commit": native,
+        }
+        self.assertTrue(
+            validate_candidate_prequalification(record, **arguments)[
+                "assets_immutable_releases_enabled"
+            ]
+        )
+        for label, broken in {
+            "governance-false": {
+                **record,
+                "assets_immutable_releases_enabled": False,
+            },
+            "governance-missing": {
+                key: value
+                for key, value in record.items()
+                if key != "assets_immutable_releases_enabled"
+            },
+            "governance-string": {
+                **record,
+                "assets_immutable_releases_enabled": "true",
+            },
+            "wrong-run": {**record, "github_run_id": "987654321"},
+            "wrong-fingerprint": {**record, "candidate_fingerprint": "f" * 64},
+            "boolean-schema-version": {**record, "schema_version": True},
+            "failed-hosted-gate": {
+                **record,
+                "hosted_gates": {
+                    "state_persistence": "success",
+                    "multimodal": "failure",
+                },
+            },
+        }.items():
+            with self.subTest(label=label), self.assertRaises(ContractError):
+                validate_candidate_prequalification(broken, **arguments)
+
+    def test_created_release_must_read_back_immutable(self) -> None:
+        release = {
+            "tag_name": "v0.1.39",
+            "id": 4242,
+            "draft": False,
+            "prerelease": False,
+            "target_commitish": TAG_COMMIT,
+            "published_at": "2026-08-20T22:15:59Z",
+            "immutable": True,
+        }
+        self.assertEqual(
+            validate_release_immutability(
+                release, release_tag="v0.1.39", tag_commit=TAG_COMMIT
+            ),
+            4242,
+        )
+        self.assertEqual(
+            validate_release_immutability(
+                release,
+                release_tag="v0.1.39",
+                tag_commit=TAG_COMMIT,
+                release_id=4242,
+            ),
+            4242,
+        )
+
+        invalid = {
+            "immutable-false": {**release, "immutable": False},
+            "immutable-missing": {
+                key: value for key, value in release.items() if key != "immutable"
+            },
+            "immutable-null": {**release, "immutable": None},
+            "immutable-string": {**release, "immutable": "true"},
+            "immutable-numeric": {**release, "immutable": 1},
+            "draft": {**release, "draft": True},
+            "draft-missing": {
+                key: value for key, value in release.items() if key != "draft"
+            },
+            "wrong-tag": {**release, "tag_name": "v0.1.38"},
+            "wrong-prerelease": {**release, "prerelease": True},
+            "wrong-target": {**release, "target_commitish": "f" * 40},
+            "missing-target": {
+                key: value for key, value in release.items() if key != "target_commitish"
+            },
+            "missing-published-at": {
+                key: value for key, value in release.items() if key != "published_at"
+            },
+            "malformed-published-at": {**release, "published_at": "yesterday"},
+            "missing-id": {key: value for key, value in release.items() if key != "id"},
+            "boolean-id": {**release, "id": True},
+            "zero-id": {**release, "id": 0},
+            "not-an-object": [release],
+        }
+        for label, payload in invalid.items():
+            with self.subTest(label=label), self.assertRaises(ContractError):
+                validate_release_immutability(
+                    payload, release_tag="v0.1.39", tag_commit=TAG_COMMIT
+                )
+        with self.assertRaises(ContractError):
+            validate_release_immutability(
+                release,
+                release_tag="v0.1.39",
+                tag_commit=TAG_COMMIT,
+                release_id=9999,
+            )
+
+    def test_release_attestation_binds_the_exact_published_release(self) -> None:
+        assets = {"manifest.json": "b" * 64, "sha256sums.txt": "c" * 64}
+        payload = release_attestation(assets=assets)
+        verified = validate_release_attestation(
+            payload,
+            assets_repo=ASSETS_REPO,
+            release_tag="v0.1.39",
+            tag_commit=TAG_COMMIT,
+            release_id=1,
+            expected_assets=assets,
+        )
+        self.assertEqual(verified["purl"], f"pkg:github/{ASSETS_REPO}@v0.1.39")
+        self.assertEqual(verified["assets"], assets)
+        self.assertEqual(
+            verified["predicate_type"], IMMUTABLE_RELEASE_ATTESTATION_PREDICATE_TYPE
+        )
+        self.assertEqual(
+            verified["verified_timestamps"],
+            [
+                {
+                    "type": "TimestampAuthority",
+                    "uri": "timestamp.githubapp.com",
+                    "timestamp": "2026-08-20T22:15:59Z",
+                }
+            ],
+        )
+
+        def statement_case(**overrides: object) -> dict[str, object]:
+            return release_attestation(assets=assets, statement_overrides=overrides)
+
+        statement = payload["verificationResult"]["statement"]
+        invalid: dict[str, dict[str, object]] = {
+            "wrong-predicate-type": statement_case(
+                predicateType="https://slsa.dev/provenance/v1"
+            ),
+            "missing-predicate-type": statement_case(predicateType=None),
+            "wrong-statement-type": statement_case(
+                _type="https://in-toto.io/Statement/v0.1"
+            ),
+            "predicate-names-other-repository": statement_case(
+                predicate={**statement["predicate"], "repository": "leehack/other"}
+            ),
+            "predicate-names-other-tag": statement_case(
+                predicate={**statement["predicate"], "tag": "v0.1.38"}
+            ),
+            "predicate-missing-release-id": statement_case(
+                predicate={
+                    key: value
+                    for key, value in statement["predicate"].items()
+                    if key != "databaseId"
+                }
+            ),
+            "predicate-malformed-release-id": statement_case(
+                predicate={**statement["predicate"], "databaseId": "01"}
+            ),
+            "predicate-not-an-object": statement_case(predicate="release"),
+            "no-release-subject": statement_case(
+                subject=[
+                    {"name": name, "digest": {"sha256": digest}}
+                    for name, digest in assets.items()
+                ]
+            ),
+            "two-release-subjects": statement_case(
+                subject=[*statement["subject"], statement["subject"][0]]
+            ),
+            "release-subject-wrong-commit": statement_case(
+                subject=[
+                    {
+                        "uri": f"pkg:github/{ASSETS_REPO}@v0.1.39",
+                        "digest": {"sha1": "d" * 40},
+                    },
+                    *statement["subject"][1:],
+                ]
+            ),
+            "duplicate-asset-subject": statement_case(
+                subject=[*statement["subject"], statement["subject"][1]]
+            ),
+            "asset-digest-mismatch": statement_case(
+                subject=[
+                    statement["subject"][0],
+                    {"name": "manifest.json", "digest": {"sha256": "e" * 64}},
+                    statement["subject"][2],
+                ]
+            ),
+            "asset-missing-from-attestation": statement_case(
+                subject=statement["subject"][:2]
+            ),
+            "unexpected-asset-in-attestation": statement_case(
+                subject=[
+                    *statement["subject"],
+                    {"name": "unexpected.bin", "digest": {"sha256": "f" * 64}},
+                ]
+            ),
+            "malformed-asset-digest": statement_case(
+                subject=[
+                    statement["subject"][0],
+                    {"name": "manifest.json", "digest": {"sha256": "not-a-digest"}},
+                    statement["subject"][2],
+                ]
+            ),
+            "subject-list-empty": statement_case(subject=[]),
+            "subject-not-a-list": statement_case(subject={"name": "manifest.json"}),
+            "asset-subject-with-null-uri": statement_case(
+                subject=[
+                    statement["subject"][0],
+                    {
+                        **statement["subject"][1],
+                        "uri": None,
+                    },
+                    statement["subject"][2],
+                ]
+            ),
+        }
+        invalid["untrusted-signer"] = release_attestation(
+            assets=assets,
+            result_overrides={
+                "signature": {
+                    "certificate": {
+                        "subjectAlternativeName": "https://evil.example/attester"
+                    }
+                }
+            },
+        )
+        invalid["no-verified-timestamp"] = release_attestation(
+            assets=assets, result_overrides={"verifiedTimestamps": []}
+        )
+        invalid["incomplete-verified-timestamp"] = release_attestation(
+            assets=assets,
+            result_overrides={"verifiedTimestamps": [{"uri": "", "timestamp": ""}]},
+        )
+        invalid["malformed-verified-timestamp"] = release_attestation(
+            assets=assets,
+            result_overrides={
+                "verifiedTimestamps": [
+                    {
+                        "type": "TimestampAuthority",
+                        "uri": "timestamp.githubapp.com",
+                        "timestamp": "not-a-timestamp",
+                    }
+                ]
+            },
+        )
+        invalid["wrong-verified-signer-policy"] = release_attestation(
+            assets=assets,
+            result_overrides={
+                "verifiedIdentity": {
+                    "subjectAlternativeName": {
+                        "subjectAlternativeName": "",
+                        "regexp": ".*",
+                    }
+                }
+            },
+        )
+        invalid["missing-verification-result"] = {
+            "attestation": payload["attestation"]
+        }
+        invalid["missing-attestation"] = {
+            "verificationResult": payload["verificationResult"]
+        }
+
+        tampered = json.loads(json.dumps(payload))
+        tampered["verificationResult"]["statement"]["predicate"]["tag"] = "v0.1.39"
+        tampered["attestation"]["bundle"]["dsseEnvelope"]["payload"] = base64.b64encode(
+            json.dumps({"_type": "https://in-toto.io/Statement/v1"}).encode("utf-8")
+        ).decode("ascii")
+        invalid["signed-payload-disagrees-with-verified-statement"] = tampered
+
+        unsigned = json.loads(json.dumps(payload))
+        unsigned["attestation"]["bundle"]["dsseEnvelope"]["payloadType"] = "text/plain"
+        invalid["wrong-dsse-payload-type"] = unsigned
+
+        no_signature = json.loads(json.dumps(payload))
+        no_signature["attestation"]["bundle"]["dsseEnvelope"]["signatures"] = []
+        invalid["missing-dsse-signature"] = no_signature
+
+        malformed_signature = json.loads(json.dumps(payload))
+        malformed_signature["attestation"]["bundle"]["dsseEnvelope"]["signatures"] = [
+            {"sig": "!!!"}
+        ]
+        invalid["malformed-dsse-signature"] = malformed_signature
+
+        undecodable = json.loads(json.dumps(payload))
+        undecodable["attestation"]["bundle"]["dsseEnvelope"]["payload"] = "!!!"
+        invalid["undecodable-dsse-payload"] = undecodable
+
+        not_a_bundle = json.loads(json.dumps(payload))
+        not_a_bundle["attestation"]["bundle"]["mediaType"] = "application/json"
+        invalid["not-a-sigstore-bundle"] = not_a_bundle
+
+        unsupported_bundle = json.loads(json.dumps(payload))
+        unsupported_bundle["attestation"]["bundle"]["mediaType"] = (
+            "application/vnd.dev.sigstore.bundle.attacker+json"
+        )
+        invalid["unsupported-sigstore-bundle-version"] = unsupported_bundle
+
+        missing_timestamp_material = json.loads(json.dumps(payload))
+        del missing_timestamp_material["attestation"]["bundle"][
+            "verificationMaterial"
+        ]["timestampVerificationData"]
+        invalid["missing-signed-timestamp-material"] = missing_timestamp_material
+
+        for label, candidate in invalid.items():
+            with self.subTest(label=label), self.assertRaises(ContractError):
+                validate_release_attestation(
+                    candidate,
+                    assets_repo=ASSETS_REPO,
+                    release_tag="v0.1.39",
+                    tag_commit=TAG_COMMIT,
+                    release_id=1,
+                    expected_assets=assets,
+                )
+
+        for label, kwargs in {
+            "attestation-for-another-repository": {"assets_repo": "leehack/other-repo"},
+            "attestation-for-another-tag": {"release_tag": "v0.1.38"},
+            "attestation-for-another-commit": {"tag_commit": "f" * 40},
+            "attestation-for-another-release-id": {"release_id": 9999},
+        }.items():
+            with self.subTest(label=label), self.assertRaises(ContractError):
+                validate_release_attestation(
+                    payload,
+                    **{
+                        "assets_repo": ASSETS_REPO,
+                        "release_tag": "v0.1.39",
+                        "tag_commit": TAG_COMMIT,
+                        "release_id": 1,
+                        "expected_assets": assets,
+                        **kwargs,
+                    },
+                )
 
     def test_reads_current_and_legacy_previous_manifest(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

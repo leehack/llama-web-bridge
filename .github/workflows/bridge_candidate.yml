@@ -41,6 +41,10 @@ on:
         description: Rebuild counter encoded by release_tag
         required: true
         type: number
+      assets_immutable_releases_enabled:
+        description: Dispatcher assertion, not live proof, that the assets repository already enables immutable releases
+        required: true
+        type: boolean
 
 permissions:
   contents: read
@@ -57,6 +61,7 @@ env:
   RELEASE_TAG: ${{ inputs.release_tag }}
   RELEASE_REBUILD: ${{ inputs.release_rebuild }}
   ASSETS_REPO: leehack/llama-web-bridge-assets
+  ASSETS_IMMUTABLE_RELEASES_ENABLED: ${{ inputs.assets_immutable_releases_enabled }}
   ORCHESTRATOR_CORRELATION_ID: ${{ inputs.orchestrator_correlation_id }}
   DISPATCHING_ACTOR: ${{ github.triggering_actor }}
   REPOSITORY_OWNER: ${{ github.repository_owner }}
@@ -112,6 +117,16 @@ jobs:
           fi
           if [ "${GITHUB_RUN_ATTEMPT_STRING}" != "1" ]; then
             echo "error: candidate builds are first-attempt-only; dispatch a new run instead of rebuilding"
+            exit 1
+          fi
+          # This unprivileged workflow deliberately holds no credential that can
+          # read another repository's administration settings, so it cannot call
+          # the immutable-release governance API itself. It fails closed unless
+          # the dispatcher asserts governance is already enabled, and
+          # publish_assets.yml independently proves the real state through
+          # GET /repos/{owner}/{repo}/immutable-releases before publishing.
+          if [ "${ASSETS_IMMUTABLE_RELEASES_ENABLED}" != "true" ]; then
+            echo "error: candidate builds require immutable releases to be enabled on ${ASSETS_REPO} before dispatch"
             exit 1
           fi
           if [[ ! "${ORCHESTRATOR_CORRELATION_ID}" =~ ^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$ ]]; then
@@ -341,8 +356,10 @@ jobs:
             --arg bridge "${BRIDGE_SOURCE_SHA}" --arg release "${RELEASE_TAG}" \
             --arg emscripten "${EMSCRIPTEN_VERSION_OUT}" --arg native "${NATIVE_COMMIT}" \
             --arg state "${STATE_CONCLUSION}" --arg multimodal "${MULTIMODAL_CONCLUSION}" \
+            --argjson immutable "${ASSETS_IMMUTABLE_RELEASES_ENABLED}" \
             '{schema_version:1,candidate_fingerprint:$fingerprint,
               harness_source_sha256:$harness,
+              assets_immutable_releases_enabled:$immutable,
               orchestrator_correlation_id:$correlation,
               github_run_id:$run_id,github_run_url:$run_url,
               bridge_source_sha:$bridge,release_tag:$release,

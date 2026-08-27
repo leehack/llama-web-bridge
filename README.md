@@ -378,6 +378,33 @@ Trigger modes:
 
 There is no push, tag, schedule, or ordinary-CI publication trigger.
 
+Immutable releases must already be enabled on `leehack/llama-web-bridge-assets`
+before a candidate is dispatched. `bridge_candidate.yml` requires
+`assets_immutable_releases_enabled=true` and records that assertion in its
+prequalification artifact. Publication downloads that exact run-owned record,
+binds its explicit boolean assertion to the candidate fingerprint, run, source,
+release, compiler, and native identities, and proves the real state itself through
+`GET /repos/{owner}/{repo}/immutable-releases`, requiring the exact
+`{enabled, enforced_by_owner}` shape with `enabled` explicitly boolean `true`,
+before it pushes anything. That endpoint returns 404 both when immutable
+releases are off and when it cannot be read, so every non-200, missing, false,
+or non-boolean answer fails closed.
+
+Every complete release state, including one found by a retry, is read back by
+tag and by release ID. Both reads must bind the exact tag, release ID, tag
+commit, and published state and must report `immutable` as explicit boolean
+`true`. Publication then requires
+`gh release verify <tag> --repo leehack/llama-web-bridge-assets --format json`
+to prove GitHub's signed release attestation: predicate type
+`https://in-toto.io/attestation/release/v0.2`, signer
+`https://dotcom.releases.github.com`, predicate database ID equal to the live
+readback release ID, the `pkg:github/<repo>@<tag>` subject bound to the resolved
+tag commit, and a SHA-256 subject for every published artifact matching the
+exact candidate bytes. A mismatch is reported as a
+non-retryable `immutable-publication-unverified` outcome and the release is left
+untouched. An incomplete published release is not repaired by uploading missing
+assets; publication never deletes, retags, overwrites, or repairs it.
+
 Required externally configured credentials:
 
 - `WEBGPU_BRIDGE_ASSETS_PAT` (read access to provenance repositories and write
@@ -437,10 +464,11 @@ recording real-device playback, intelligibility, and speaker-reference fidelity
 as `unproven`. Those two gate values state the requirement rather than a hosted
 pass that never happened; publication is what enforces it, refusing to publish
 the artifact without a verified attestation bound to its exact digest. The
-manifest is byte-deterministic for the same inputs and artifacts. Exact partial
-publication states are recovered only after branch, tag, release metadata,
-provenance, and asset-digest checks;
-mismatches fail closed with a machine-readable JSON outcome.
+manifest is byte-deterministic for the same inputs and artifacts. Exact ref-only
+partial states are recovered only after branch, tag, release metadata,
+provenance, and asset-digest checks. An incomplete published release is an
+immutable mismatch, not a repair path; mismatches fail closed with a
+machine-readable JSON outcome.
 If a credentialed ref or release mutation is followed by an unavailable or
 empty re-query, the workflow emits a durable, retryable `mutation-unknown`
 outcome with `mutated: null`; it never guesses that publication did or did not

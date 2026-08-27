@@ -219,6 +219,27 @@ upstream tag/commit, native release tag plus `assets.json` SHA-256,
 output release tag/rebuild, distinct required `candidate_run_id` and
 `attestation_run_id`, and assets repository.
 
+Immutable releases must already be enabled on the assets repository before the
+candidate is dispatched. Confirm it with
+`gh api repos/leehack/llama-web-bridge-assets/immutable-releases`, then dispatch
+`bridge_candidate.yml` with `assets_immutable_releases_enabled=true`; the
+candidate cannot read that setting itself and fails closed on the assertion.
+Publication downloads the exact run-owned prequalification record and binds its
+explicit boolean assertion to the candidate and run identities before it
+re-proves the real state through the same endpoint and before it pushes,
+requiring the exact `{enabled, enforced_by_owner}` shape with `enabled`
+explicitly boolean `true`, and treats every non-200, missing, false, or
+non-boolean answer as a failure. Every complete release state, including one
+found by a retry, is read back by tag and by release ID. Both reads must bind the
+exact tag, release ID, tag commit, and published state and report `immutable` as
+explicit boolean `true`. Publication verifies GitHub's signed release attestation with
+`gh release verify <tag> --repo leehack/llama-web-bridge-assets --format json`,
+requiring predicate type `https://in-toto.io/attestation/release/v0.2` signed by
+`https://dotcom.releases.github.com`, predicate database ID equal to the live
+readback release ID, and the exact published artifact digests. A failure is reported as
+`immutable-publication-unverified`. An incomplete published release is never
+filled in; the release is never deleted, retagged, overwritten, or repaired.
+
 The request must set `publish_approved=true`. Publication remains blocked until
 repository administrators separately create `bridge-assets-publication`, disable
 administrator bypass, restrict the custom deployment branch policy to `main`,
@@ -241,7 +262,8 @@ success, complete artifact inventory, and uniqueness of both the candidate run
 and the attestation ingestion run, downloads both by immutable artifact ID, and
 verifies the attestation against the candidate twice -- once before approval and
 again inside the privileged job. It then orders stable and development histories
-independently and recovers exact partial states while rejecting any mismatch.
+independently and recovers exact ref-only partial states while rejecting any
+published-release mismatch rather than trying to repair it.
 Manifest and outcome records carry the candidate run ID/URL, because that is the
 identity the candidate manifest embeds; unavailable post-mutation re-queries
 produce retryable `mutation-unknown` records rather than guessed state.

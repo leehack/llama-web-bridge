@@ -693,6 +693,10 @@ def main() -> int:
     contributing = read_required("CONTRIBUTING.md", errors)
     release_contract = read_required("scripts/release_contract.py", errors)
     release_contract_test = read_required("scripts/release_contract_test.py", errors)
+    publication_state = read_required("scripts/release_publication_state.py", errors)
+    publication_state_test = read_required(
+        "scripts/release_publication_state_test.py", errors
+    )
     workflow_input_transport = read_required(
         "scripts/workflow_input_transport_test.mjs", errors
     )
@@ -1332,8 +1336,9 @@ def main() -> int:
     require(
         "scripts/release_publication_state.py classify" in publish
         and "recoverable-partial" in publish
-        and "upload-release-assets" in publish
-        and "gh release upload" in publish
+        and "upload-release-assets" not in publish
+        and "gh release upload" not in publish
+        and "immutable-release-assets-missing" in publication_state
         and "publication_outcome" in publish
         and 'cp "${RUNNER_TEMP}/preflight.json" "${RUNNER_TEMP}/publication-outcome.json"' in publish
         and "state_changed()" in publish
@@ -1347,7 +1352,7 @@ def main() -> int:
         and publish.count(
             '.qualification_gates == {state_persistence:"passed",multimodal:"passed",'
         )
-        == 2
+        >= 3
         # Publication compares against the honest candidate manifest gates: the
         # heavy gates are proven by the verified attestation, never by a hosted
         # job, so a re-query that claims a hosted ASR/TTS pass fails closed.
@@ -1362,6 +1367,130 @@ def main() -> int:
         and "sha256sum --check sha256sums.txt" in publish
         and "git -C assets-repo push --atomic" in publish,
         "publication must classify exact retry states, reject failed classifier re-queries, emit outcomes, lock credentials, and recheck after mutation",
+        errors,
+    )
+    governance_check = publish_job.find(
+        "release_contract.py \\\n            validate-immutable-release-governance"
+    )
+    first_ref_mutation = publish_job.find("Apply only the classified ref mutation")
+    require(
+        # Governance is proven through the supported repository API, whose 404
+        # covers both "disabled" and "unreadable", so only an exact 200 body
+        # reaching the validator can pass -- and it must pass before publication
+        # pushes anything.
+        publish_job.count('"repos/${ASSETS_REPO}/immutable-releases"') >= 3
+        and "validate-immutable-release-governance" in publish_job
+        and "--repository \"${ASSETS_REPO}\"" in publish_job
+        and 0 <= governance_check < first_ref_mutation
+        and "validate_immutable_release_governance" in release_contract
+        and "immutable releases are not enabled for" in release_contract
+        and "must be an explicit JSON boolean" in release_contract
+        and "test_immutable_release_governance_must_be_enabled" in release_contract_test
+        and "ASSETS_IMMUTABLE_RELEASES_ENABLED: ${{ inputs.assets_immutable_releases_enabled }}"
+        in candidate
+        and '"${ASSETS_IMMUTABLE_RELEASES_ENABLED}" != "true"' in candidate
+        and "--argjson immutable \"${ASSETS_IMMUTABLE_RELEASES_ENABLED}\"" in candidate
+        and "assets_immutable_releases_enabled:$immutable" in candidate
+        and "CANDIDATE_PREQUALIFICATION_ARTIFACT_NAME: bridge-candidate-prequalification"
+        in publish
+        and "CANDIDATE_PREQUALIFICATION_ARTIFACT_ID" in publish
+        and "candidate-prequalification.zip" in publish
+        and "validate-candidate-prequalification" in publish
+        and "validate_candidate_prequalification" in release_contract
+        and "test_candidate_prequalification_binds_true_governance_assertion"
+        in release_contract_test
+        and "immutable-governance-unverified" in publish_job,
+        "candidate dispatch and publication must fail closed unless the assets repository already enables immutable releases, proven at publication through the supported repository API",
+        errors,
+    )
+    require(
+        # A created release is only trustworthy once GitHub itself reports it as
+        # immutable and has signed a release attestation over the exact bytes.
+        publish_job.count('"repos/${ASSETS_REPO}/releases/tags/${RELEASE_TAG}"') >= 1
+        and '"repos/${ASSETS_REPO}/releases/${published_release_id}"' in publish_job
+        and 'gh release verify "${RELEASE_TAG}" --repo "${ASSETS_REPO}"' in publish_job
+        and "--format json" in publish_job
+        # An unsupported runner CLI must fail before publication pushes, not
+        # after it has created a release nothing can verify.
+        and 0 <= publish_job.find("gh release verify --help | grep -F -- '--format'")
+        < first_ref_mutation
+        and "verify-immutable-publication" in publish_job
+        and '--release-by-id-json "${RUNNER_TEMP}/published-release-by-id.json"'
+        in publish_job
+        and "immutable-publication-unverified" in publish_job
+        and "verify_immutable_publication" in publication_state
+        and "candidate_publication_digests" in publication_state
+        and "validate_release_immutability" in release_contract
+        and "validate_release_attestation" in release_contract
+        and "predicate does not bind the exact release id" in release_contract
+        and "release_id=resolved_id" in publication_state
+        and "https://in-toto.io/attestation/release/v0.2" in release_contract
+        and "https://dotcom.releases.github.com" in release_contract
+        and "does not report immutability" in release_contract
+        and "target_commitish does not bind the exact tag commit" in release_contract
+        and '_require_utc_timestamp(release.get("published_at"), "published_at")'
+        in release_contract
+        and "DSSE envelope has no signature" in release_contract
+        and "verified_timestamps" in release_contract
+        and "test_created_release_must_read_back_immutable" in release_contract_test
+        and "test_release_attestation_binds_the_exact_published_release"
+        in release_contract_test
+        and "test_published_release_must_be_immutable_and_attested"
+        in publication_state_test
+        and "test_non_immutable_or_malformed_readback_fails_closed"
+        in publication_state_test
+        and "test_release_attestation_must_cover_the_published_candidate"
+        in publication_state_test
+        and "test_immutable_publication_cli_reports_exact_failures"
+        in publication_state_test
+        and "Every complete state is verified" in publish_job
+        and 'touch "${RUNNER_TEMP}/ref-push-attempted"' in publish_job
+        and 'touch "${RUNNER_TEMP}/release-mutation-attempted"' in publish_job
+        and "steps.mutate.outcome == 'failure'" in publish_job
+        and 'fallback_state="mutation-unknown"' in publish_job
+        and 'fallback_mutated=null' in publish_job
+        and publish_job.find('elif [ "${post_action}" = "none" ]')
+        < publish_job.find("Every complete state is verified"),
+        "publication must read the new release back by tag and by ID, require an explicit immutable:true, and verify GitHub's signed release attestation over the exact published assets",
+        errors,
+    )
+    require(
+        # An immutable release cannot be repaired, so a failed immutability or
+        # attestation check must never provoke a cleanup attempt.
+        all(
+            destructive not in publish
+            for destructive in (
+                "gh release delete",
+                "gh release edit",
+                "gh release upload",
+                "git push --delete",
+                "--force-with-lease",
+                "push --force",
+                "-X DELETE",
+            )
+        )
+        and "never deletes, retags, overwrites, or repairs" in publish,
+        "publication must never attempt cleanup, deletion, retagging, or mutation when an immutability or attestation check fails",
+        errors,
+    )
+    require(
+        all(
+            "immutable-releases" in document
+            and "https://in-toto.io/attestation/release/v0.2" in document
+            and "gh release verify" in document
+            and "immutable-publication-unverified" in document
+            for document in (agents_publication, readme_publication, contributing)
+        )
+        and "assets_immutable_releases_enabled" in agents
+        and "assets_immutable_releases_enabled" in readme_publication
+        and "assets_immutable_releases_enabled=true" in contributing
+        # The next release is a fresh identity; reusing the v0.1.38 candidate,
+        # attestation, approval, or manifest is never a rebuild path.
+        and "### Next Release Identity" in agents
+        and "kanban:t_7f112b91:web-v0.1.39" in agents
+        and "`release_tag`: `v0.1.39`" in agents
+        and "`release_rebuild`: `0`" in agents,
+        "AGENTS.md, README.md, and CONTRIBUTING.md must document the immutable-release governance gate, the post-publication readback and attestation verification, and the fresh next-release identity",
         errors,
     )
     require(
