@@ -1083,7 +1083,7 @@ def main() -> int:
     )
     require(
         auto_update.count(owner_manual_gate) == 2
-        and auto_update.find(owner_manual_gate) < auto_update.find("environment:"),
+        and auto_update.rfind(owner_manual_gate) < auto_update.find("environment:"),
         "both automatic-orchestration jobs must reject non-owner manual callers before the publication environment can expose its credential",
         errors,
     )
