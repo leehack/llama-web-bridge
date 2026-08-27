@@ -1,5 +1,9 @@
 name: Publish Exact Qualified Bridge Assets
 
+# Parsed by scripts/stable_release_orchestrator.py so a retry can prove whether
+# this exact candidate/attestation/output publication already ran.
+run-name: publish-assets ${{ inputs.orchestrator_correlation_id }} candidate:${{ inputs.candidate_run_id }} attestation:${{ inputs.attestation_run_id }} source:${{ inputs.bridge_source_sha }} tag:${{ inputs.release_tag }} rebuild:${{ inputs.release_rebuild }}
+
 on:
   # This workflow is intentionally bridge-owned and non-reusable. A central
   # orchestrator may dispatch it, but the environment gate must execute in this
@@ -97,7 +101,7 @@ concurrency:
 
 jobs:
   validate-request:
-    name: Require explicit publication approval
+    name: Require publication approval assertion
     runs-on: ubuntu-latest
     steps:
       - name: Validate approval boundary
@@ -107,7 +111,7 @@ jobs:
         run: |
           set -euo pipefail
           if [ "${PUBLISH_APPROVED}" != "true" ]; then
-            echo "error: publish_approved=true requires explicit maintainer approval"
+            echo "error: publish_approved=true is required before publication"
             exit 1
           fi
           if [ "${REQUESTED_ASSETS_REPO}" != "${APPROVED_ASSETS_REPO}" ]; then

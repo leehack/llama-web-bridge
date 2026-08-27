@@ -189,11 +189,58 @@ candidate digest it is about to publish.
     checks out the exact candidate source to recompute the harness digest,
     decodes and canonicality-checks the payload, re-verifies it, and uploads
     `qualification-attestation` using existing repository access and no PAT.
-- Native-aligned candidate scan: `.github/workflows/auto_llama_cpp_update.yml`
-  - Scheduled/manual runs download the selected native `assets.json`, validate
-    its exact upstream/native identities, and upload `release-candidate.json`.
-  - The scan only prepares and reports candidate inputs. It never changes
-    `llama_cpp.version`, opens a PR, dispatches publication, tags, or pushes.
+- Native-aligned candidate scan and publication orchestrator: `.github/workflows/auto_llama_cpp_update.yml`
+  - Scheduled runs select every stable native release published after the
+    immutable `v0.2.0-1` / Web-assets `v0.1.39` automation baseline. They
+    download each release's `assets.json` and `SHA256SUMS` by unique GitHub
+    Release asset ID, validate the exact release/tag/asset inventory, collect
+    exact provenance in `release-candidates.json`, and idempotently advance each
+    three-stage pipeline (Build Exact Bridge Candidate -> Ingest Qualification
+    Attestation -> Publish Exact Qualified Bridge Assets). Processing the whole
+    ordered backlog prevents an older qualification wait from hiding or
+    starving a newer stable native release; each exact pipeline advances by at
+    most one stage per scheduled/manual scan.
+  - Only the stable channel is orchestrated. Manual `development` scans still
+    resolve and report exact `bNNNN` provenance, but `require_stable_provenance`
+    refuses to advance them, so they never dispatch anything.
+  - Every dispatch sends exactly the target workflow's declared `workflow_dispatch`
+    inputs (`require_exact_dispatch_inputs`), at the exact default-branch `--ref`,
+    after a live `immutable-releases` governance read; a duplicate-run check runs
+    before dispatch and a run-name readback runs after it.
+  - Run recovery queries the exact workflow with server-side owner, event,
+    default-branch, and relevant-publication-time filters, then accepts only the
+    workflow's static `name` plus its exact deterministic `display_title`, owner
+    actor/triggering actor, first attempt, repository, path, and branch. A
+    multi-page query must retain a stable filtered count. A search at GitHub's
+    1,000-result cap is split into closed time windows until every relevant page
+    is complete; a saturated one-second window or ambiguous result fails closed
+    without depending on a repository-wide history count.
+  - The dispatch job reuses the existing `bridge-assets-publication` environment
+    and its environment-scoped `WEBGPU_BRIDGE_ASSETS_PAT`; there is no separate
+    orchestrator secret. Automatic dispatch requires that owner credential to
+    retain assets-governance read access and Actions write access on
+    `leehack/llama-web-bridge`. Missing capability is reported as blocked. The
+    planner supplies neither `publish_approved=true` nor
+    `assets_immutable_releases_enabled=true`; those values are added only after
+    the corresponding live environment/governance proofs.
+  - A manual orchestration run is admitted only when both `github.actor` and
+    `github.triggering_actor` are the repository owner. The gate applies to both
+    jobs before the publication environment can expose its PAT; trusted
+    default-branch schedule events remain automatic.
+  - A failed candidate run is terminal for that exact native provenance, so the
+    daily schedule cannot create unbounded duplicate candidates. After diagnosis,
+    a maintainer may explicitly dispatch one deliberate new first-attempt run
+    with the same exact binding. Publication retries may reuse only the exact
+    successful candidate and attestation runs.
+  - A successful candidate waits for maintainer-run local ASR/TTS qualification
+    and ingestion without blocking candidate creation for later backlog entries.
+    After that external ingestion succeeds, the next daily or manual stable scan
+    dispatches publication; no hosted run fabricates or weakens the attestation.
+  - An already-published noop independently resolves the assets tag commit,
+    validates release reads by tag and ID, downloads and hashes the exact asset
+    inventory, and validates `gh release verify --format json` with the same
+    immutable-release and release-attestation contracts as publication.
+  - It never changes `llama_cpp.version`, opens a PR, tags, or pushes directly.
 - CI reliability contract: `scripts/verify_ci_reliability.py`
   - Keep this script updated when changing browser smoke behavior, action
     versions, JS build/type-checking, or workflow diagnostics.
@@ -286,19 +333,19 @@ candidate digest it is about to publish.
     uses stable/nightly dist-tags; GitHub `vM.m.p-N` tags must not be reused as
     npm versions because npm orders them as prereleases.
 
-### Next Release Identity
+### Immutable Automation Baseline
 
-The next asset release is a fresh build, never a reuse of the `v0.1.38`
-candidate, attestation, approval, or manifest:
+The historical `v0.1.38` release is not repaired or reused. The verified
+immutable baseline is:
 
 - `release_tag`: `v0.1.39`
 - `release_rebuild`: `0`
 - `orchestrator_correlation_id`: `kanban:t_7f112b91:web-v0.1.39`
 - `assets_immutable_releases_enabled`: `true`
 
-Dispatch a new `bridge_candidate.yml` run, ingest a new local qualification
-attestation against that candidate run, and publish with the new
-`candidate_run_id`/`attestation_run_id` pair.
+Daily backlog selection starts after native `v0.2.0-1`, published at
+`2026-08-25T08:57:12Z`. Every later stable native release gets its own new
+candidate and exact `candidate_run_id`/`attestation_run_id` pair.
 
 ## Change Boundaries
 

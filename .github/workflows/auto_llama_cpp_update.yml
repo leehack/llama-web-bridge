@@ -2,8 +2,9 @@ name: Scan Native-Aligned llama.cpp Releases
 
 on:
   schedule:
-    # Daily UTC, aligned with llamadart-native discovery. This scan never
-    # publishes, dispatches another workflow, or changes a bridge pin.
+    # Daily UTC, aligned with llamadart-native discovery. Each run advances each
+    # post-baseline stable provenance by at most one provable transition: dispatch
+    # its exact candidate, report an honest qualification wait, or dispatch publish.
     - cron: '23 3 * * *'
   workflow_dispatch:
     inputs:
@@ -20,97 +21,239 @@ on:
         required: false
         default: ''
         type: string
+      dry_run:
+        description: Plan the next stable transition without dispatching it
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
+  actions: read
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
   NATIVE_REPO: leehack/llamadart-native
+  BRIDGE_REPO: leehack/llama-web-bridge
+  ASSETS_REPO: leehack/llama-web-bridge-assets
+  REQUESTED_CHANNEL: ${{ github.event_name == 'workflow_dispatch' && inputs.release_channel || 'stable' }}
+  REQUESTED_NATIVE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.native_release_tag || '' }}
+  DRY_RUN_REQUESTED: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || false }}
+
+concurrency:
+  group: auto-stable-web-bridge-publication
+  cancel-in-progress: false
 
 jobs:
-  prepare-release-candidate:
-    name: Prepare exact-input release candidate
+  prepare_release_candidate:
+    name: Resolve and verify exact native release provenance
+    if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.actor == github.repository_owner && github.triggering_actor == github.repository_owner) }}
     runs-on: ubuntu-latest
+    outputs:
+      release_channel: ${{ steps.candidate.outputs.release_channel }}
+      release_count: ${{ steps.candidate.outputs.release_count }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Resolve native-aligned candidate
+        id: candidate
         env:
           GH_TOKEN: ${{ github.token }}
-          REQUESTED_CHANNEL: ${{ github.event_name == 'workflow_dispatch' && inputs.release_channel || 'stable' }}
-          REQUESTED_NATIVE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.native_release_tag || '' }}
         run: |
           set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/native-candidates" release-candidates
+          gh api --paginate --slurp "repos/${NATIVE_REPO}/releases?per_page=100" \
+            > "${RUNNER_TEMP}/native-release-pages.json"
+          jq 'add // []' "${RUNNER_TEMP}/native-release-pages.json" \
+            > "${RUNNER_TEMP}/native-releases.json"
+
           if [ "${REQUESTED_CHANNEL}" = "development" ]; then
             if [ -z "${REQUESTED_NATIVE_TAG}" ]; then
               echo "error: development scans require an exact native_release_tag"
               exit 1
             fi
-            NATIVE_TAG="${REQUESTED_NATIVE_TAG}"
+            jq -n --arg tag "${REQUESTED_NATIVE_TAG}" '[$tag]' \
+              > "${RUNNER_TEMP}/native-tags.json"
           elif [ "${REQUESTED_CHANNEL}" = "stable" ]; then
             if [ -n "${REQUESTED_NATIVE_TAG}" ]; then
-              NATIVE_TAG="${REQUESTED_NATIVE_TAG}"
+              jq -n --arg tag "${REQUESTED_NATIVE_TAG}" '[$tag]' \
+                > "${RUNNER_TEMP}/native-tags.json"
             else
-              gh api --paginate --slurp "repos/${NATIVE_REPO}/releases?per_page=100" \
-                > "${RUNNER_TEMP}/native-release-pages.json"
-              jq 'add' "${RUNNER_TEMP}/native-release-pages.json" \
-                > "${RUNNER_TEMP}/native-releases.json"
-              NATIVE_TAG="$(python3 scripts/release_contract.py select-stable-native-release \
-                --releases-json "${RUNNER_TEMP}/native-releases.json")"
+              python3 scripts/stable_release_orchestrator.py \
+                select-stable-native-backlog \
+                --releases-json "${RUNNER_TEMP}/native-releases.json" \
+                --output-json "${RUNNER_TEMP}/native-tags.json"
             fi
           else
             echo "error: unsupported release channel ${REQUESTED_CHANNEL}"
             exit 1
           fi
+          jq -r '.[]' "${RUNNER_TEMP}/native-tags.json" \
+            > "${RUNNER_TEMP}/native-tags.txt"
+          bridge_source_sha="$(git rev-parse HEAD)"
+          while IFS= read -r NATIVE_TAG; do
+            if [ "${REQUESTED_CHANNEL}" = "stable" ]; then
+              if [[ ! "${NATIVE_TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[1-9][0-9]*)?$ ]]; then
+                echo "error: stable native release tag is not canonical"
+                exit 1
+              fi
+            elif [[ ! "${NATIVE_TAG}" =~ ^b[0-9]+(-[1-9][0-9]*)?$ ]]; then
+              echo "error: development native release tag is not canonical"
+              exit 1
+            fi
 
-          mkdir -p "${RUNNER_TEMP}/candidate"
-          gh release download "${NATIVE_TAG}" --repo "${NATIVE_REPO}" \
-            --pattern assets.json --dir "${RUNNER_TEMP}/candidate"
-          NATIVE_MANIFEST="${RUNNER_TEMP}/candidate/assets.json"
-          IDENTITY="$(python3 scripts/release_contract.py scan-native \
-            --manifest "${NATIVE_MANIFEST}" --native-release-tag "${NATIVE_TAG}")"
-          UPSTREAM_TAG="$(jq -r '.upstream_tag' <<<"${IDENTITY}")"
-          UPSTREAM_COMMIT="$(jq -r '.upstream_commit' <<<"${IDENTITY}")"
-          NATIVE_COMMIT="$(jq -r '.native_commit' <<<"${IDENTITY}")"
-          NATIVE_MANIFEST_SHA256="$(sha256sum "${NATIVE_MANIFEST}" | cut -d' ' -f1)"
-          BRIDGE_SOURCE_SHA="$(git rev-parse HEAD)"
+            candidate_dir="${RUNNER_TEMP}/native-candidates/${NATIVE_TAG}"
+            mkdir -p "${candidate_dir}"
+            jq --arg tag "${NATIVE_TAG}" '
+              [.[] | select(.tag_name == $tag)] as $matches
+              | if ($matches | length) == 1 then $matches[0]
+                else error("native release tag must resolve to exactly one release") end
+            ' "${RUNNER_TEMP}/native-releases.json" \
+              > "${candidate_dir}/native-release.json"
+            native_published_at="$(jq -er '
+              .published_at
+              | select(type == "string")
+              | select(test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"))
+            ' "${candidate_dir}/native-release.json")"
 
-          if [ "${REQUESTED_CHANNEL}" = "stable" ] && [[ ! "${UPSTREAM_TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "error: stable candidate did not resolve an exact stable upstream tag: ${UPSTREAM_TAG}"
-            exit 1
+            for name in assets.json SHA256SUMS; do
+              asset_id="$(jq -er --arg name "${name}" '
+                [.assets[]? | select(.name == $name)] as $matches
+                | if (($matches | length) == 1
+                      and ($matches[0].id | type) == "number"
+                      and $matches[0].id > 0
+                      and (($matches[0].id | tostring) | test("^[1-9][0-9]*$")))
+                  then $matches[0].id
+                  else error("native release asset must be unique with a positive id") end
+              ' "${candidate_dir}/native-release.json")"
+              gh api -H "Accept: application/octet-stream" \
+                "repos/${NATIVE_REPO}/releases/assets/${asset_id}" \
+                > "${candidate_dir}/${name}"
+            done
+
+            git ls-remote --tags "https://github.com/${NATIVE_REPO}.git" \
+              "refs/tags/${NATIVE_TAG}" "refs/tags/${NATIVE_TAG}^{}" \
+              > "${candidate_dir}/native-tag-refs.txt"
+            native_tag_commit="$(python3 scripts/release_contract.py resolve-tag-commit \
+              --ls-remote "${candidate_dir}/native-tag-refs.txt" \
+              --tag "${NATIVE_TAG}")"
+
+            provenance_json="release-candidates/${NATIVE_TAG}.json"
+            python3 scripts/stable_release_orchestrator.py scan-native \
+              --manifest "${candidate_dir}/assets.json" \
+              --native-release-tag "${NATIVE_TAG}" \
+              --native-release-published-at "${native_published_at}" \
+              --bridge-source-sha "${bridge_source_sha}" \
+              --channel "${REQUESTED_CHANNEL}" \
+              --output-json "${provenance_json}"
+
+            upstream_tag="$(jq -er '.upstream_tag' "${provenance_json}")"
+            upstream_commit="$(jq -er '.upstream_commit' "${provenance_json}")"
+            manifest_sha256="$(jq -er '.native_manifest_sha256' "${provenance_json}")"
+            python3 scripts/release_contract.py validate-native-release \
+              --manifest "${candidate_dir}/assets.json" \
+              --checksums "${candidate_dir}/SHA256SUMS" \
+              --release-json "${candidate_dir}/native-release.json" \
+              --manifest-sha256 "${manifest_sha256}" \
+              --native-release-tag "${NATIVE_TAG}" \
+              --upstream-tag "${upstream_tag}" \
+              --upstream-commit "${upstream_commit}" \
+              --native-tag-commit "${native_tag_commit}"
+          done < "${RUNNER_TEMP}/native-tags.txt"
+
+          release_count="$(wc -l < "${RUNNER_TEMP}/native-tags.txt" | tr -d ' ')"
+          if [ "${release_count}" -eq 0 ]; then
+            jq -n '[]' > release-candidates.json
+          else
+            jq -s 'sort_by(.native_release_published_at, .native_release_tag)' \
+              release-candidates/*.json > release-candidates.json
           fi
-          if [ "${REQUESTED_CHANNEL}" = "development" ] && [[ ! "${UPSTREAM_TAG}" =~ ^b[0-9]+$ ]]; then
-            echo "error: development candidate did not resolve an exact bNNNN upstream tag: ${UPSTREAM_TAG}"
-            exit 1
-          fi
+          echo "release_channel=${REQUESTED_CHANNEL}" >> "${GITHUB_OUTPUT}"
+          echo "release_count=${release_count}" >> "${GITHUB_OUTPUT}"
 
-          jq -n \
-            --arg bridge_source_sha "${BRIDGE_SOURCE_SHA}" \
-            --arg upstream_tag "${UPSTREAM_TAG}" \
-            --arg upstream_commit "${UPSTREAM_COMMIT}" \
-            --arg native_repo "${NATIVE_REPO}" \
-            --arg native_release_tag "${NATIVE_TAG}" \
-            --arg native_manifest_sha256 "${NATIVE_MANIFEST_SHA256}" \
-            --arg native_commit "${NATIVE_COMMIT}" \
-            '{bridge_source_sha:$bridge_source_sha,upstream_tag:$upstream_tag,upstream_commit:$upstream_commit,native_repo:$native_repo,native_release_tag:$native_release_tag,native_manifest_sha256:$native_manifest_sha256,native_commit:$native_commit}' \
-            > release-candidate.json
-
+      - name: Report development scan without orchestrating
+        if: ${{ env.REQUESTED_CHANNEL != 'stable' }}
+        run: |
+          set -euo pipefail
           {
-            echo "### Native-aligned Web release candidate"
+            echo "### Development native scan"
             echo
-            echo "This scheduled scan only prepared exact inputs. It did not change \`llama_cpp.version\`, open a PR, dispatch publication, create a tag, or update a downstream pin."
+            echo "Manual development scans only prepare exact candidate inputs. They never"
+            echo "dispatch a candidate build, an attestation ingestion, or a publication."
             echo
-            echo "- Bridge source: \`${BRIDGE_SOURCE_SHA}\`"
-            echo "- llama.cpp: \`${UPSTREAM_TAG}@${UPSTREAM_COMMIT}\`"
-            echo "- Native release: \`${NATIVE_REPO}@${NATIVE_TAG}\`"
-            echo "- Native manifest SHA-256: \`${NATIVE_MANIFEST_SHA256}\`"
-            echo
-            echo "After explicit approval, the central llamadart pin-upgrade orchestrator may dispatch the bridge-owned \`publish_assets.yml\` through GitHub's API with these inputs, a required correlation ID, and a collision-free output tag/rebuild."
+            echo '```json'
+            cat release-candidates.json
+            echo '```'
           } >> "${GITHUB_STEP_SUMMARY}"
 
-      - name: Upload prepared candidate
+      - name: Upload verified candidate provenance
         uses: actions/upload-artifact@v4
         with:
           name: bridge-release-candidate
-          path: release-candidate.json
+          if-no-files-found: error
+          path: release-candidates.json
+
+  advance_stable_release:
+    name: Advance each exact stable publication by one stage
+    needs: prepare_release_candidate
+    if: ${{ needs.prepare_release_candidate.outputs.release_channel == 'stable' && needs.prepare_release_candidate.outputs.release_count != '0' && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.actor == github.repository_owner && github.triggering_actor == github.repository_owner)) }}
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+    # Reuse the established main-only publication environment and its single
+    # owner credential. No repository-level or newly named secret is accepted.
+    environment:
+      name: bridge-assets-publication
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: bridge-release-candidate
+
+      - name: Prove the dispatcher environment before exposing its credential
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api "repos/${BRIDGE_REPO}/environments/bridge-assets-publication" \
+            > "${RUNNER_TEMP}/publication-environment.json"
+          gh api "repos/${BRIDGE_REPO}/environments/bridge-assets-publication/deployment-branch-policies" \
+            > "${RUNNER_TEMP}/publication-branch-policies.json"
+          python3 scripts/release_contract.py validate-environment \
+            --environment-json "${RUNNER_TEMP}/publication-environment.json" \
+            --branch-policies-json "${RUNNER_TEMP}/publication-branch-policies.json"
+
+      - name: Advance the stable publication pipeline
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # This existing environment-scoped PAT must identify the repository
+          # owner, read assets immutable-release governance, and have Actions
+          # write permission on the bridge repository. The orchestrator proves
+          # identity/governance live and fails closed if either capability is absent.
+          WEBGPU_BRIDGE_ASSETS_PAT: ${{ secrets.WEBGPU_BRIDGE_ASSETS_PAT }}
+        run: |
+          set -euo pipefail
+          dry_run_flag=()
+          if [ "${DRY_RUN_REQUESTED}" = "true" ]; then
+            dry_run_flag+=(--dry-run)
+          fi
+          python3 scripts/stable_release_orchestrator.py orchestrate-backlog \
+            --provenance-list-json release-candidates.json \
+            --workspace "${RUNNER_TEMP}/orchestrator" \
+            --output-plan-json orchestration-plan.json \
+            --step-summary-file "${GITHUB_STEP_SUMMARY}" \
+            "${dry_run_flag[@]}"
+
+      - name: Upload orchestration plan
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: stable-release-orchestration-plan
+          if-no-files-found: ignore
+          path: orchestration-plan.json

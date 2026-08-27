@@ -129,6 +129,24 @@ def require(condition: bool, message: str, errors: list[str]) -> None:
         errors.append(message)
 
 
+def run_required_python_contract(relative_path: str, errors: list[str]) -> None:
+    """Execute a fast contract suite so CI verifies behavior, not test-name text."""
+    try:
+        result = subprocess.run(
+            [sys.executable, relative_path],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError as exc:
+        errors.append(f"failed to execute {relative_path}: {exc}")
+        return
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()
+        errors.append(f"{relative_path} failed: {detail}")
+
+
 def resolve_workflow_steps(
     workflow: str,
 ) -> tuple[list[dict[str, object]], list[str], list[str]]:
@@ -697,6 +715,14 @@ def main() -> int:
     publication_state_test = read_required(
         "scripts/release_publication_state_test.py", errors
     )
+    orchestrator = read_required("scripts/stable_release_orchestrator.py", errors)
+    orchestrator_test = read_required(
+        "scripts/stable_release_orchestrator_test.py", errors
+    )
+    if orchestrator and orchestrator_test:
+        run_required_python_contract(
+            "scripts/stable_release_orchestrator_test.py", errors
+        )
     workflow_input_transport = read_required(
         "scripts/workflow_input_transport_test.mjs", errors
     )
@@ -1024,24 +1050,82 @@ def main() -> int:
     )
     require(
         "NATIVE_REPO: leehack/llamadart-native" in auto_update
-        and "release-candidate.json" in auto_update
-        and "select-stable-native-release" in auto_update
+        and "BRIDGE_REPO: leehack/llama-web-bridge" in auto_update
+        and "ASSETS_REPO: leehack/llama-web-bridge-assets" in auto_update
+        and "release-candidates.json" in auto_update
+        and "orchestration-plan.json" in auto_update
+        and "select-stable-native-backlog" in auto_update
         and "gh release view" not in auto_update
-        and "native_manifest_sha256" in auto_update
-        and "scripts/release_contract.py scan-native" in auto_update
+        and "gh release download" not in auto_update
+        and "releases/assets/${asset_id}" in auto_update
+        and "validate-native-release" in auto_update
+        and "resolve-tag-commit" in auto_update
+        and "scripts/stable_release_orchestrator.py scan-native" in auto_update
+        and "scripts/stable_release_orchestrator.py orchestrate-backlog" in auto_update
+        and '--channel "${REQUESTED_CHANNEL}"' in auto_update
+        and "ORCHESTRATOR_DISPATCH_TOKEN" not in auto_update
+        and "WEBGPU_BRIDGE_ASSETS_PAT: ${{ secrets.WEBGPU_BRIDGE_ASSETS_PAT }}"
+        in auto_update
+        and "name: bridge-assets-publication" in auto_update
+        and "validate-environment" in auto_update
         and "gh workflow run" not in auto_update
         and "create-pull-request" not in auto_update
         and "git push" not in auto_update
-        and "did not change" in auto_update,
-        "the scheduled native scan must only prepare exact candidate inputs and must not change pins, open PRs, dispatch publication, or push",
+        and "Manual development scans only prepare exact candidate inputs" in auto_update
+        and "env.REQUESTED_CHANNEL != 'stable'" in auto_update,
+        "the scheduled scan must download every post-baseline stable provenance by unique asset id, reuse only the existing environment-scoped publication credential, advance stable publication only through stable_release_orchestrator.py, and keep development scans scan-only",
+        errors,
+    )
+    owner_manual_gate = (
+        "github.event_name == 'workflow_dispatch' && "
+        "github.actor == github.repository_owner && "
+        "github.triggering_actor == github.repository_owner"
+    )
+    require(
+        auto_update.count(owner_manual_gate) == 2
+        and auto_update.find(owner_manual_gate) < auto_update.find("environment:"),
+        "both automatic-orchestration jobs must reject non-owner manual callers before the publication environment can expose its credential",
         errors,
     )
     require(
-        "may dispatch the bridge-owned" in auto_update
-        and "through GitHub's API" in auto_update
-        and "required correlation ID" in auto_update
-        and "may call `publish_assets.yml`" not in auto_update,
-        "the scheduled scan summary must describe the bridge-owned API dispatch contract",
+        "workflow_runs" in orchestrator
+        and "def parse_workflow_runs" in orchestrator
+        and "def plan_pipeline" in orchestrator
+        and "def compute_correlation_id" in orchestrator
+        and "def select_next_release_target" in orchestrator
+        and "def verify_published_release" in orchestrator
+        and "def verify_candidate_run" in orchestrator
+        and "def verify_attestation_run" in orchestrator
+        and "def require_immutable_release_governance" in orchestrator
+        and "def require_publication_environment" in orchestrator
+        and "def require_orchestration_caller" in orchestrator
+        and "def select_stable_native_backlog" in orchestrator
+        and "orchestrate-backlog" in orchestrator
+        and "validate_immutable_release_governance" in orchestrator
+        and "validate_release_immutability" in orchestrator
+        and "validate_release_attestation" in orchestrator
+        and "validate_publication_environment" in orchestrator
+        and "release_attestation" in orchestrator
+        and "rq.validate_workflow_run" in orchestrator
+        and "rq.validate_artifact_inventory" in orchestrator
+        and "rq.load_candidate" in orchestrator
+        and "rq.verify_attestation" in orchestrator
+        and "OrchestrationAction.BLOCKED" in orchestrator
+        and "OrchestrationAction.WAITING_FOR_ATTESTATION" in orchestrator
+        and '"--ref",' in orchestrator
+        and '"--json",' in orchestrator,
+        "stable_release_orchestrator must reuse the release, qualification, environment, and immutable-attestation validators for every live transition and published noop",
+        errors,
+    )
+    require(
+        "def require_exact_dispatch_inputs" in orchestrator
+        and "WORKFLOW_DISPATCH_INPUTS" in orchestrator
+        and "def require_stable_provenance" in orchestrator
+        and "def require_channel" in orchestrator
+        and '"assets_immutable_releases_enabled": "true"' not in orchestrator
+        and '"publish_approved": "true"' not in orchestrator
+        and "_candidate_fingerprint_marker" in orchestrator,
+        "the orchestrator must dispatch exactly each workflow's declared inputs, derive governance and approval booleans only from live proofs, orchestrate the stable channel only, and bind published bytes to their exact candidate fingerprint",
         errors,
     )
     require(
@@ -1122,7 +1206,7 @@ def main() -> int:
         errors,
     )
     require(
-        "publish_approved=true requires explicit maintainer approval" in publish
+        "publish_approved=true is required before publication" in publish
         and "Verify externally configured publication environment" in publish
         and "release_contract.py validate-environment" in publish
         and publish.count("deployment-branch-policies") == 2
@@ -1484,13 +1568,13 @@ def main() -> int:
         and "assets_immutable_releases_enabled" in agents
         and "assets_immutable_releases_enabled" in readme_publication
         and "assets_immutable_releases_enabled=true" in contributing
-        # The next release is a fresh identity; reusing the v0.1.38 candidate,
-        # attestation, approval, or manifest is never a rebuild path.
-        and "### Next Release Identity" in agents
+        # The immutable automation baseline is a fresh identity; v0.1.38 is
+        # historical and never a repair/rebuild path.
+        and "### Immutable Automation Baseline" in agents
         and "kanban:t_7f112b91:web-v0.1.39" in agents
         and "`release_tag`: `v0.1.39`" in agents
         and "`release_rebuild`: `0`" in agents,
-        "AGENTS.md, README.md, and CONTRIBUTING.md must document the immutable-release governance gate, the post-publication readback and attestation verification, and the fresh next-release identity",
+        "AGENTS.md, README.md, and CONTRIBUTING.md must document the immutable-release governance gate, the post-publication readback and attestation verification, and the verified immutable automation baseline",
         errors,
     )
     require(

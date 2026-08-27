@@ -1,5 +1,11 @@
 name: Build Exact Bridge Candidate
 
+# The runs API never echoes a dispatch's inputs, so this deterministic run name
+# is the only durable record of which exact pipeline attempt a run belongs to.
+# scripts/stable_release_orchestrator.py parses it byte-for-byte; changing the
+# format without changing the parser orphans in-flight candidates.
+run-name: bridge-candidate ${{ inputs.orchestrator_correlation_id }} source:${{ inputs.bridge_source_sha }} tag:${{ inputs.release_tag }} rebuild:${{ inputs.release_rebuild }}
+
 on:
   # The candidate is built exactly once, by this workflow, and is then consumed
   # unchanged by local qualification, attestation ingestion, and publication.
