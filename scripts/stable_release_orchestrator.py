@@ -443,22 +443,29 @@ def parse_candidate_run_name(
     claims this correlation but cannot be parsed exactly fails closed.
     """
     require_correlation_id(correlation_id)
+    if not isinstance(run_name, str):
+        return None
+    claims_correlation = run_name.split()[:2] == ["bridge-candidate", correlation_id]
     if (
-        not isinstance(run_name, str)
-        or len(run_name) > MAX_RUN_NAME_CHARACTERS
+        len(run_name) > MAX_RUN_NAME_CHARACTERS
         or _RUN_NAME_RE.fullmatch(run_name) is None
     ):
+        if claims_correlation:
+            raise ContractError(
+                f"candidate run name claiming correlation {correlation_id!r} exceeds "
+                "the length or character contract"
+            )
         return None
     match = _CANDIDATE_RUN_NAME_RE.fullmatch(run_name)
-    if match is None or match.group("correlation_id") != correlation_id:
-        return None
-    try:
+    if match is not None:
+        if match.group("correlation_id") != correlation_id:
+            return None
         return _parse_binding_fields(match, "candidate run name")
-    except ContractError:
-        # Only an exact, valid rendered identity is durable state. A failed or
-        # foreign manual dispatch with a lookalike title cannot orphan the
-        # deterministic automatic pipeline.
-        return None
+    if claims_correlation:
+        raise ContractError(
+            f"candidate run name claiming correlation {correlation_id!r} is malformed"
+        )
+    return None
 
 
 def parse_publish_run_name(

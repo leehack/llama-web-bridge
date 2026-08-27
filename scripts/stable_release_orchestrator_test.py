@@ -668,22 +668,50 @@ class CorrelationTest(unittest.TestCase):
 
     def test_foreign_candidate_run_name_is_not_adopted(self) -> None:
         correlation_id = sro.compute_correlation_id(make_provenance())
-        self.assertIsNone(
-            sro.parse_candidate_run_name(
-                f"bridge-candidate other-correlation source:{BRIDGE_SHA} "
-                "tag:v0.1.40 rebuild:0",
-                correlation_id,
-            )
+        foreign_names = (
+            f"bridge-candidate other-correlation source:{BRIDGE_SHA} "
+            "tag:v0.1.40 rebuild:0",
+            "bridge-candidate other-correlation source:not-a-sha "
+            "tag:v0.1.40 rebuild:0",
+            "bridge-candidate other-correlation malformed",
+            f"bridge-candidate {correlation_id}-foreign source:not-a-sha "
+            "tag:v0.1.40 rebuild:bad",
+            f"bridge-candidate-other {correlation_id} malformed",
+            "some-unrelated-workflow-run",
         )
+        for foreign_name in foreign_names:
+            with self.subTest(run_name=foreign_name):
+                self.assertIsNone(
+                    sro.parse_candidate_run_name(foreign_name, correlation_id)
+                )
 
-    def test_malformed_candidate_run_name_cannot_orphan_state(self) -> None:
+    def test_malformed_candidate_run_name_claiming_correlation_fails_closed(
+        self,
+    ) -> None:
         correlation_id = sro.compute_correlation_id(make_provenance())
-        self.assertIsNone(
-            sro.parse_candidate_run_name(
-                f"bridge-candidate {correlation_id} source:not-a-sha tag:v0.1.40 rebuild:0",
-                correlation_id,
-            )
+        malformed_names = (
+            f"bridge-candidate {correlation_id} source:not-a-sha "
+            "tag:v0.1.40 rebuild:0",
+            f"bridge-candidate {correlation_id} source:{BRIDGE_SHA} "
+            "tag:v0.1.40 rebuild:not-a-number",
+            f"bridge-candidate {correlation_id} source:{BRIDGE_SHA} "
+            "tag:v0.1.40 rebuild:-1",
+            f"bridge-candidate {correlation_id} source:{BRIDGE_SHA} "
+            "tag:v0.1.40 rebuild:01",
+            f"bridge-candidate {correlation_id} source:{BRIDGE_SHA} "
+            "tag:invalid_tag rebuild:0",
+            f"bridge-candidate {correlation_id}",
+            f"bridge-candidate {correlation_id} source:{BRIDGE_SHA}",
+            f"bridge-candidate {correlation_id} source:{BRIDGE_SHA} tag:v0.1.40",
+            f"bridge-candidate {correlation_id} malformed",
+            f"bridge-candidate {correlation_id} source:{BRIDGE_SHA} "
+            "tag:v0.1.40 rebuild:0\x00",
+            f"bridge-candidate {correlation_id} " + ("x" * 200),
         )
+        for malformed_name in malformed_names:
+            with self.subTest(run_name=malformed_name):
+                with self.assertRaises(ContractError):
+                    sro.parse_candidate_run_name(malformed_name, correlation_id)
 
     def test_generated_run_name_enforces_a_conservative_length_bound(self) -> None:
         with self.assertRaises(ContractError):
@@ -1169,6 +1197,59 @@ class RunSelectionTest(unittest.TestCase):
         )
         with self.assertRaises(ContractError):
             sro.select_pipeline_runs(runs, label="candidate", matcher=lambda name: name == "target")
+
+    def test_candidate_matcher_and_selection_fail_closed_on_correlated_malformed_run(
+        self,
+    ) -> None:
+        correlation_id = sro.compute_correlation_id(make_provenance())
+        matcher = sro._candidate_matcher(correlation_id)
+        malformed_names = (
+            f"bridge-candidate {correlation_id} source:not-a-sha "
+            "tag:v0.1.40 rebuild:0",
+            f"bridge-candidate {correlation_id} source:{BRIDGE_SHA} "
+            "tag:v0.1.40 rebuild:bad",
+            f"bridge-candidate {correlation_id} source:{BRIDGE_SHA} "
+            "tag:invalid_tag rebuild:0",
+            f"bridge-candidate {correlation_id} source:{BRIDGE_SHA} "
+            "tag:v0.1.40",
+            f"bridge-candidate {correlation_id} malformed",
+            f"bridge-candidate {correlation_id} source:{BRIDGE_SHA} "
+            "tag:v0.1.40 rebuild:0\x00",
+        )
+        for malformed_name in malformed_names:
+            with self.subTest(run_name=malformed_name):
+                with self.assertRaises(ContractError):
+                    matcher(malformed_name)
+                runs = self._runs(("501", malformed_name, "in_progress", None))
+                with self.assertRaises(ContractError):
+                    sro.select_pipeline_runs(runs, label="candidate", matcher=matcher)
+
+    def test_candidate_matcher_and_selection_ignore_foreign_candidate_run(
+        self,
+    ) -> None:
+        correlation_id = sro.compute_correlation_id(make_provenance())
+        matcher = sro._candidate_matcher(correlation_id)
+        foreign_names = (
+            f"bridge-candidate other-correlation source:{BRIDGE_SHA} "
+            "tag:v0.1.40 rebuild:0",
+            "bridge-candidate other-correlation source:not-a-sha "
+            "tag:v0.1.40 rebuild:0",
+            "bridge-candidate other-correlation malformed",
+            f"bridge-candidate {correlation_id}-foreign source:not-a-sha "
+            "tag:v0.1.40 rebuild:bad",
+            f"bridge-candidate-other {correlation_id} malformed",
+            "completely-unrelated-workflow-run",
+        )
+        for foreign_name in foreign_names:
+            with self.subTest(run_name=foreign_name):
+                self.assertFalse(matcher(foreign_name))
+                runs = self._runs(("501", foreign_name, "in_progress", None))
+                selection = sro.select_pipeline_runs(
+                    runs, label="candidate", matcher=matcher
+                )
+                self.assertEqual(len(selection.matched), 0)
+                self.assertIsNone(selection.in_flight_run_id)
+                self.assertIsNone(selection.succeeded_run_id)
 
 
 class ReleaseTargetTest(unittest.TestCase):
@@ -2614,6 +2695,27 @@ class AdvancePipelineTest(unittest.TestCase):
                 gateway, provenance=self.provenance, workspace=self.tmp
             )
         self.assertEqual(len(gateway.dispatches), 1)
+
+    def test_advance_pipeline_fails_closed_on_malformed_correlated_candidate_run(
+        self,
+    ) -> None:
+        malformed_run = run_payload(
+            run_id="501",
+            path=sro.CANDIDATE_WORKFLOW_PATH,
+            run_name=(
+                f"bridge-candidate {self.correlation_id} source:not-a-sha "
+                "tag:v0.1.40 rebuild:0"
+            ),
+            status="in_progress",
+            conclusion=None,
+        )
+        routes = self._routes(candidate_runs=[malformed_run])
+        gateway = FakeGateway(json_routes=routes)
+        with self.assertRaises(ContractError):
+            sro.advance_pipeline(
+                gateway, provenance=self.provenance, workspace=self.tmp
+            )
+        self.assertEqual(gateway.dispatches, [])
 
 
 if __name__ == "__main__":
