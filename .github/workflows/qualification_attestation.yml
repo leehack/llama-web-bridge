@@ -1,5 +1,9 @@
 name: Ingest Qualification Attestation
 
+# Parsed by scripts/stable_release_orchestrator.py to bind this ingestion to the
+# exact candidate run it attests; the runs API never echoes dispatch inputs.
+run-name: qualification-attestation candidate:${{ inputs.candidate_run_id }}
+
 on:
   # Maintainer-only ingestion of the digest-bound local qualification
   # attestation. It mutates nothing outside its own run: it proves the candidate

@@ -197,8 +197,26 @@ query strings, and fragments before printing the location.
 - Preserve `emsdk.version` as the single compiler source for CI and publish.
   Both workflows must verify the active `emcc` version, and published manifests
   must record that verified identity.
-- Main-branch and PR CI never dispatch publication. Scheduled discovery only
-  prepares `release-candidate.json` and a job summary.
+- Main-branch and PR CI never dispatch publication. Scheduled stable release
+  discovery prepares an ordered `release-candidates.json` backlog for every
+  stable native release after the immutable native `v0.2.0-1` / Web-assets
+  `v0.1.39` baseline and invokes `scripts/stable_release_orchestrator.py` to
+  idempotently advance candidate, qualification-attestation, and publication
+  stages. The scan downloads every selected `assets.json` and `SHA256SUMS` by
+  unique release-asset ID and runs the complete native release/tag/inventory
+  contract first. Each exact pipeline advances by at most one stage per scan,
+  so an older local-qualification wait does not starve a newer stable release.
+  Manual `development` scans stay scan-only: they resolve exact `bNNNN`
+  provenance and report it, and the orchestrator refuses non-stable provenance.
+  A failed candidate is never retried automatically each day; after diagnosis,
+  a maintainer may deliberately dispatch one new first-attempt run with the same
+  exact binding, and a later unique success supersedes the recorded failed run.
+  A successful candidate waits for maintainer-run local ASR/TTS qualification;
+  after its attestation is ingested, the next scheduled or manual stable scan
+  advances publication. Run recovery paginates each exact workflow's filtered
+  history with stable-count checks and splits searches at GitHub's 1,000-result
+  cap into closed time windows, so an older waiting pipeline is not lost as
+  later workflow history grows.
 - Bridge source changes still require ordinary PRs. A dependency-version release
   may reuse an already-merged exact bridge source SHA without changing
   `llama_cpp.version`.
@@ -211,9 +229,10 @@ query strings, and fragments before printing the location.
 
 ## Publish Process
 
-Use `.github/workflows/publish_assets.yml` only after explicit publication
-approval. The repository owner, either directly or through the central
-orchestrator using that existing authorized identity, dispatches this
+Use `.github/workflows/publish_assets.yml` only after the publication approval
+assertion is backed by the live `bridge-assets-publication` policy. The
+repository owner, either directly or through the scheduled orchestrator using
+that existing authorized identity, dispatches this
 bridge-owned, non-reusable workflow with a required correlation ID, exact bridge SHA,
 upstream tag/commit, native release tag plus `assets.json` SHA-256,
 output release tag/rebuild, distinct required `candidate_run_id` and
@@ -272,6 +291,23 @@ redispatching a new publication run against the same `candidate_run_id` and
 `attestation_run_id`, never rerunning the old run. The fingerprinted identity
 comes from the candidate run, so it stays stable. A different candidate must
 never target an existing output tag.
+
+The scheduled orchestrator reuses that same existing secret only from a
+`bridge-assets-publication` environment job; it does not require an
+`ORCHESTRATOR_DISPATCH_TOKEN`. For automatic progression, the owner-bound token
+must retain Actions write permission on `leehack/llama-web-bridge` in addition
+to the assets-repository permissions publication already requires. The job token
+validates the environment policy first; the orchestrator then proves the PAT's
+owner identity and live immutable-release governance before dispatch. It adds
+`assets_immutable_releases_enabled=true` only from that governance response and
+adds `publish_approved=true` only after the live publication-environment policy
+passes. An already-published noop still resolves the exact assets tag commit,
+validates independent release reads by tag and ID, and validates the signed
+`gh release verify --format json` attestation against every downloaded asset
+digest. Manual runs require both the initiating actor and triggering actor to be
+the repository owner before either workflow job starts, preventing a
+collaborator from using the environment PAT as a confused deputy. Trusted
+default-branch schedule events remain automatic.
 
 GitHub artifact tags are `vMAJOR.MINOR.PATCH`, `vMAJOR.MINOR.PATCH-N`, `bNNNN`,
 or `bNNNN-N`. Historical `bNNNN-llamadart.N` and prior wrapper forms are
