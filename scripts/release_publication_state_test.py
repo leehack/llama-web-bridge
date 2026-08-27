@@ -7,6 +7,7 @@ import hashlib
 import json
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -17,17 +18,20 @@ from generate_release_manifest import (
     generate,
 )
 from release_contract import ContractError
+from release_contract_test import release_attestation
 from release_publication_state import (
     APPROVED_ASSETS_REPOSITORY,
     CandidateIdentity,
     PUBLICATION_FILES,
     _fatal,
+    candidate_publication_digests,
     classify,
     mutation_unknown_from_requery,
     mutation_unknown_outcome,
     publication_state_changed,
     require_approved_assets_repo,
     validate_candidate,
+    verify_immutable_publication,
 )
 
 
@@ -102,6 +106,38 @@ class ReleasePublicationStateTest(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
+    def published_release(self, **overrides: object) -> dict[str, object]:
+        release = {
+            **self.release_data(self.head),
+            "immutable": True,
+        }
+        release.update(overrides)
+        return release
+
+    def published_attestation(self, **overrides: object) -> dict[str, object]:
+        return release_attestation(
+            release_tag="v0.2.0",
+            assets_repo=APPROVED_ASSETS_REPOSITORY,
+            tag_commit=self.head,
+            release_id=42,
+            assets=candidate_publication_digests(self.candidate),
+            **overrides,
+        )
+
+    def verify_published(self, **overrides: object) -> dict[str, object]:
+        arguments: dict[str, object] = {
+            "candidate": self.candidate,
+            "assets_repo": APPROVED_ASSETS_REPOSITORY,
+            "release_tag": "v0.2.0",
+            "tag_commit": self.head,
+            "release_id": 42,
+            "release_by_tag": self.published_release(),
+            "release_by_id": self.published_release(),
+            "attestation": self.published_attestation(),
+        }
+        arguments.update(overrides)
+        return verify_immutable_publication(**arguments)
+
     @property
     def head(self) -> str:
         return git(self.repository, "rev-parse", "HEAD")
@@ -124,6 +160,7 @@ class ReleasePublicationStateTest(unittest.TestCase):
             "draft": False,
             "prerelease": False,
             "target_commitish": commit,
+            "published_at": "2026-08-20T22:15:59Z",
             "body": (
                 f"Candidate fingerprint: `{fingerprint}`\n"
                 f"Orchestrator correlation: `{self.identity.orchestrator_correlation_id}`\n"
@@ -607,18 +644,18 @@ class ReleasePublicationStateTest(unittest.TestCase):
         self.assertEqual(after["reason_code"], "exact-tag-release-missing")
         self.assertTrue(after["retryable"])
 
-    def test_partial_release_asset_upload_is_safely_resumable(self) -> None:
+    def test_partial_published_release_is_not_repaired(self) -> None:
         candidate_commit = self.publish_branch_candidate()
         git(self.repository, "tag", "v0.2.0", candidate_commit)
         partial_release = self.release_data(candidate_commit)
         missing = partial_release["assets"].pop()
         partial = self.inspect(tag=candidate_commit, release=partial_release)
-        self.assertTrue(partial["allowed"])
+        self.assertFalse(partial["allowed"])
         self.assertEqual(partial["state"], "release-assets-partial")
-        self.assertEqual(partial["action"], "upload-release-assets")
+        self.assertEqual(partial["action"], "none")
+        self.assertEqual(partial["outcome"], "immutable-publication-unverified")
+        self.assertFalse(partial["retryable"])
         self.assertEqual(partial["missing_release_assets"], [missing["name"]])
-        complete = self.inspect(tag=candidate_commit, release=True)
-        self.assertEqual(complete["outcome"], "already-complete")
 
     def test_exact_complete_release_remains_idempotent_after_branch_advances(self) -> None:
         candidate_commit = self.publish_branch_candidate()
@@ -674,7 +711,12 @@ class ReleasePublicationStateTest(unittest.TestCase):
     def test_release_metadata_and_asset_digest_mismatch_fail_closed(self) -> None:
         candidate_commit = self.publish_branch_candidate()
         git(self.repository, "tag", "v0.2.0", candidate_commit)
-        for field, value in (("prerelease", True), ("target_commitish", "f" * 40)):
+        for field, value in (
+            ("prerelease", True),
+            ("target_commitish", "f" * 40),
+            ("id", True),
+            ("id", 0),
+        ):
             release = self.release_data(candidate_commit)
             release[field] = value
             with self.subTest(field=field):
@@ -731,6 +773,8 @@ class ReleasePublicationStateTest(unittest.TestCase):
         artifact.symlink_to(target)
         with self.assertRaises(ContractError):
             validate_candidate(self.candidate, self.identity)
+        with self.assertRaises(ContractError):
+            candidate_publication_digests(self.candidate)
 
     def test_candidate_run_and_gate_provenance_tampering_fails_closed(self) -> None:
         for field, value in (
@@ -814,6 +858,193 @@ class ReleasePublicationStateTest(unittest.TestCase):
         )
         self.assertEqual(state["outcome"], "rollback")
         self.assertEqual(state["reason_code"], "ordering-rollback")
+
+    def test_published_release_must_be_immutable_and_attested(self) -> None:
+        verified = self.verify_published()
+        self.assertEqual(verified["immutable"], True)
+        self.assertEqual(verified["release_id"], 42)
+        self.assertEqual(verified["tag_commit"], self.head)
+        self.assertEqual(verified["published_at"], "2026-08-20T22:15:59Z")
+        self.assertEqual(
+            verified["attested_purl"],
+            f"pkg:github/{APPROVED_ASSETS_REPOSITORY}@v0.2.0",
+        )
+        self.assertEqual(
+            verified["attested_assets"], candidate_publication_digests(self.candidate)
+        )
+
+    def test_non_immutable_or_malformed_readback_fails_closed(self) -> None:
+        release = self.published_release()
+        cases: dict[str, dict[str, object]] = {
+            "tag-readback-immutable-false": {
+                "release_by_tag": {**release, "immutable": False}
+            },
+            "tag-readback-immutable-missing": {
+                "release_by_tag": {
+                    key: value for key, value in release.items() if key != "immutable"
+                }
+            },
+            "tag-readback-immutable-string": {
+                "release_by_tag": {**release, "immutable": "true"}
+            },
+            "id-readback-immutable-false": {
+                "release_by_id": {**release, "immutable": False}
+            },
+            "id-readback-immutable-missing": {
+                "release_by_id": {
+                    key: value for key, value in release.items() if key != "immutable"
+                }
+            },
+            "id-readback-is-a-different-release": {
+                "release_by_id": {**release, "id": 43}
+            },
+            "readbacks-disagree-on-target": {
+                "release_by_id": {**release, "target_commitish": "f" * 40}
+            },
+            "readbacks-disagree-on-published-at": {
+                "release_by_id": {
+                    **release,
+                    "published_at": "2026-08-20T22:16:00Z",
+                }
+            },
+            "classified-release-id-mismatch": {"release_id": 4242},
+            "readback-is-a-draft": {"release_by_tag": {**release, "draft": True}},
+            "readback-is-unpublished": {
+                "release_by_tag": {**release, "published_at": None}
+            },
+            "readback-is-another-tag": {
+                "release_by_tag": {**release, "tag_name": "v0.1.38"}
+            },
+            "readback-not-an-object": {"release_by_tag": [release]},
+            "unapproved-assets-repository": {"assets_repo": "leehack/other-assets"},
+            "malformed-tag-commit": {"tag_commit": "not-a-commit"},
+        }
+        for label, overrides in cases.items():
+            with self.subTest(label=label), self.assertRaises(ContractError):
+                self.verify_published(**overrides)
+
+    def test_release_attestation_must_cover_the_published_candidate(self) -> None:
+        digests = candidate_publication_digests(self.candidate)
+        cases: dict[str, dict[str, object]] = {
+            "attestation-missing": {"attestation": {}},
+            "attestation-null": {"attestation": None},
+            "attestation-for-another-tag": {
+                "attestation": release_attestation(
+                    release_tag="v0.1.38",
+                    assets_repo=APPROVED_ASSETS_REPOSITORY,
+                    tag_commit=self.head,
+                    release_id=42,
+                    assets=digests,
+                )
+            },
+            "attestation-for-another-release-id": {
+                "attestation": release_attestation(
+                    release_tag="v0.2.0",
+                    assets_repo=APPROVED_ASSETS_REPOSITORY,
+                    tag_commit=self.head,
+                    release_id=43,
+                    assets=digests,
+                )
+            },
+            "attestation-for-another-commit": {
+                "attestation": release_attestation(
+                    release_tag="v0.2.0",
+                    assets_repo=APPROVED_ASSETS_REPOSITORY,
+                    tag_commit="d" * 40,
+                    release_id=42,
+                    assets=digests,
+                )
+            },
+            "attestation-omits-an-asset": {
+                "attestation": release_attestation(
+                    release_tag="v0.2.0",
+                    assets_repo=APPROVED_ASSETS_REPOSITORY,
+                    tag_commit=self.head,
+                    release_id=42,
+                    assets={
+                        name: digest
+                        for name, digest in digests.items()
+                        if name != "manifest.json"
+                    },
+                )
+            },
+            "attestation-digest-mismatch": {
+                "attestation": release_attestation(
+                    release_tag="v0.2.0",
+                    assets_repo=APPROVED_ASSETS_REPOSITORY,
+                    tag_commit=self.head,
+                    release_id=42,
+                    assets={**digests, "manifest.json": "b" * 64},
+                )
+            },
+            "attestation-signed-by-an-impostor": {
+                "attestation": self.published_attestation(
+                    result_overrides={
+                        "signature": {
+                            "certificate": {
+                                "subjectAlternativeName": "https://evil.example"
+                            }
+                        }
+                    }
+                )
+            },
+        }
+        for label, overrides in cases.items():
+            with self.subTest(label=label), self.assertRaises(ContractError):
+                self.verify_published(**overrides)
+
+    def test_immutable_publication_cli_reports_exact_failures(self) -> None:
+        root = Path(self.temporary.name)
+        digests = candidate_publication_digests(self.candidate)
+
+        def run(**payloads: object) -> subprocess.CompletedProcess[str]:
+            paths: dict[str, Path] = {}
+            for key, payload in payloads.items():
+                path = root / f"{key}.json"
+                path.write_text(json.dumps(payload), encoding="utf-8")
+                paths[key] = path
+            return subprocess.run(
+                [
+                    sys.executable,
+                    str(Path(__file__).resolve().parent / "release_publication_state.py"),
+                    "verify-immutable-publication",
+                    "--candidate", str(self.candidate),
+                    "--assets-repo", APPROVED_ASSETS_REPOSITORY,
+                    "--release-tag", "v0.2.0",
+                    "--tag-commit", self.head,
+                    "--release-id", "42",
+                    "--release-json", str(paths["release"]),
+                    "--release-by-id-json", str(paths["release_by_id"]),
+                    "--attestation-json", str(paths["attestation"]),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+        accepted = run(
+            release=self.published_release(),
+            release_by_id=self.published_release(),
+            attestation=self.published_attestation(),
+        )
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+        self.assertEqual(json.loads(accepted.stdout)["attested_assets"], digests)
+
+        rejected = run(
+            release=self.published_release(immutable=False),
+            release_by_id=self.published_release(),
+            attestation=self.published_attestation(),
+        )
+        self.assertEqual(rejected.returncode, 1)
+        self.assertIn("is not immutable", rejected.stderr)
+
+        unattested = run(
+            release=self.published_release(),
+            release_by_id=self.published_release(),
+            attestation={},
+        )
+        self.assertEqual(unattested.returncode, 1)
+        self.assertIn("error:", unattested.stderr)
 
 
 if __name__ == "__main__":

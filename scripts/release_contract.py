@@ -11,10 +11,13 @@ as an ordering boundary, but this module never emits them.
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 import hashlib
 import json
 import re
 from dataclasses import dataclass
+from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from typing import Any, Mapping
@@ -24,6 +27,23 @@ BRIDGE_REPOSITORY = "leehack/llama-web-bridge"
 ASSETS_REPOSITORY = "leehack/llama-web-bridge-assets"
 NATIVE_REPOSITORY = "leehack/llamadart-native"
 NATIVE_HOOK_CONTRACT_VERSION = 1
+# GitHub exposes exactly three supported signals that a published release can
+# never be moved: repository immutable-release governance
+# (`GET /repos/{owner}/{repo}/immutable-releases`), the release object's own
+# `immutable` boolean, and the release attestation GitHub signs for immutable
+# releases. Nothing else is invented here.
+IMMUTABLE_RELEASE_ATTESTATION_PREDICATE_TYPE = (
+    "https://in-toto.io/attestation/release/v0.2"
+)
+IMMUTABLE_RELEASE_ATTESTATION_SIGNER = "https://dotcom.releases.github.com"
+_IN_TOTO_STATEMENT_TYPE = "https://in-toto.io/Statement/v1"
+_DSSE_IN_TOTO_PAYLOAD_TYPE = "application/vnd.in-toto+json"
+_SIGSTORE_BUNDLE_MEDIA_TYPE = "application/vnd.dev.sigstore.bundle.v0.3+json"
+_SIGSTORE_VERIFICATION_RESULT_MEDIA_TYPE = (
+    "application/vnd.dev.sigstore.verificationresult+json;version=0.1"
+)
+_RELEASE_SIGNER_IDENTITY_REGEXP = r"^https://dotcom\.releases\.github\.com$"
+_ATTESTATION_ASSET_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
 
 
 class ContractError(ValueError):
@@ -693,6 +713,439 @@ def validate_publication_environment(
         )
 
 
+def _require_json_boolean(value: Any, field: str) -> bool:
+    if not isinstance(value, bool):
+        raise ContractError(f"{field} must be an explicit JSON boolean")
+    return value
+
+
+def _require_mapping(value: Any, field: str) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping):
+        raise ContractError(f"{field} must be a JSON object")
+    return value
+
+
+def _require_utc_timestamp(value: Any, field: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise ContractError(f"{field} must be a non-empty UTC timestamp")
+    try:
+        parsed = datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError as error:
+        raise ContractError(
+            f"{field} must use the exact YYYY-MM-DDTHH:MM:SSZ format"
+        ) from error
+    if parsed.strftime("%Y-%m-%dT%H:%M:%SZ") != value:
+        raise ContractError(f"{field} is not a canonical UTC timestamp")
+    return value
+
+
+def validate_immutable_release_governance(
+    payload: Any, repository: str
+) -> dict[str, Any]:
+    """Require enabled immutable-release governance on the assets repository.
+
+    ``GET /repos/{owner}/{repo}/immutable-releases`` answers 404 both when
+    governance is off and when the credential lacks administration read, so the
+    caller must fail on any non-200; only an exact 200 body reaches this
+    validator, and only ``enabled: true`` passes it.
+    """
+    require_repository(repository, "repository")
+    payload = _require_mapping(payload, "immutable-release governance response")
+    if set(payload) != {"enabled", "enforced_by_owner"}:
+        raise ContractError(
+            "immutable-release governance response has missing or unexpected fields"
+        )
+    enforced_by_owner = _require_json_boolean(
+        payload.get("enforced_by_owner"), "enforced_by_owner"
+    )
+    if _require_json_boolean(payload.get("enabled"), "enabled") is not True:
+        raise ContractError(f"immutable releases are not enabled for {repository}")
+    return {
+        "repository": repository,
+        "enabled": True,
+        "enforced_by_owner": enforced_by_owner,
+    }
+
+
+def validate_candidate_prequalification(
+    payload: Any,
+    *,
+    candidate_fingerprint: str,
+    harness_source_sha256: str,
+    orchestrator_correlation_id: str,
+    github_run_id: str,
+    github_run_url: str,
+    bridge_source_sha: str,
+    release_tag: str,
+    emscripten_version: str,
+    native_commit: str,
+) -> dict[str, Any]:
+    """Bind the candidate's pre-dispatch governance assertion to its identity."""
+    payload = _require_mapping(payload, "candidate prequalification record")
+    expected = {
+        "schema_version": 1,
+        "candidate_fingerprint": require_sha256(
+            candidate_fingerprint, "candidate_fingerprint"
+        ),
+        "harness_source_sha256": require_sha256(
+            harness_source_sha256, "harness_source_sha256"
+        ),
+        "assets_immutable_releases_enabled": True,
+        "orchestrator_correlation_id": require_correlation_id(
+            orchestrator_correlation_id
+        ),
+        "github_run_id": github_run_id,
+        "github_run_url": github_run_url,
+        "bridge_source_sha": _require_commit(bridge_source_sha, "bridge_source_sha"),
+        "release_tag": parse_release_tag(release_tag).tag,
+        "emscripten_version": emscripten_version,
+        "native_commit": _require_commit(native_commit, "native_commit"),
+        "hosted_gates": {
+            "state_persistence": "success",
+            "multimodal": "success",
+        },
+        "local_gates": {
+            "speech_to_text": "pending-local-qualification",
+            "text_to_speech": "pending-local-qualification",
+        },
+        "unproven_capabilities": {
+            "real_device_intelligibility": "unproven",
+            "real_device_playback": "unproven",
+            "speaker_reference_fidelity": "unproven",
+        },
+    }
+    if set(payload) != set(expected):
+        raise ContractError(
+            "candidate prequalification record has missing or unexpected fields"
+        )
+    if (
+        not isinstance(payload.get("schema_version"), int)
+        or isinstance(payload.get("schema_version"), bool)
+        or payload.get("schema_version") != 1
+    ):
+        raise ContractError("candidate prequalification schema_version must be integer 1")
+    if not isinstance(github_run_id, str) or re.fullmatch(r"[1-9][0-9]*", github_run_id) is None:
+        raise ContractError("github_run_id must be a positive decimal string")
+    expected_run_url = (
+        f"https://github.com/{BRIDGE_REPOSITORY}/actions/runs/{github_run_id}"
+    )
+    if github_run_url != expected_run_url:
+        raise ContractError(f"github_run_url must be exactly {expected_run_url}")
+    if not isinstance(emscripten_version, str) or not emscripten_version:
+        raise ContractError("emscripten_version must be a non-empty string")
+    for field, value in expected.items():
+        if field == "assets_immutable_releases_enabled":
+            if _require_json_boolean(
+                payload.get(field), "assets_immutable_releases_enabled"
+            ) is not True:
+                raise ContractError(
+                    "candidate did not assert immutable releases before dispatch"
+                )
+        elif payload.get(field) != value:
+            raise ContractError(f"candidate prequalification {field} mismatch")
+    return {
+        "candidate_fingerprint": candidate_fingerprint,
+        "github_run_id": github_run_id,
+        "assets_immutable_releases_enabled": True,
+    }
+
+
+def validate_release_immutability(
+    release: Any,
+    *,
+    release_tag: str,
+    tag_commit: str,
+    release_id: int | None = None,
+) -> int:
+    """Require an exact, published, immutable GitHub Release readback."""
+    parsed_release = parse_release_tag(release_tag)
+    _require_commit(tag_commit, "tag_commit")
+    release = _require_mapping(release, "GitHub Release response")
+    if release.get("tag_name") != release_tag:
+        raise ContractError(
+            f"GitHub Release tag {release.get('tag_name')!r} does not match {release_tag!r}"
+        )
+    actual_id = release.get("id")
+    if (
+        not isinstance(actual_id, int)
+        or isinstance(actual_id, bool)
+        or actual_id <= 0
+    ):
+        raise ContractError("GitHub Release id must be a positive integer")
+    if release_id is not None and actual_id != release_id:
+        raise ContractError("GitHub Release id does not match the classified release id")
+    if release.get("draft") is not False:
+        raise ContractError("GitHub Release must be published, not a draft")
+    if release.get("prerelease") is not parsed_release.github_prerelease:
+        raise ContractError("GitHub Release prerelease state does not match its tag")
+    if release.get("target_commitish") != tag_commit:
+        raise ContractError(
+            "GitHub Release target_commitish does not bind the exact tag commit"
+        )
+    _require_utc_timestamp(release.get("published_at"), "published_at")
+    if "immutable" not in release:
+        raise ContractError("GitHub Release response does not report immutability")
+    if _require_json_boolean(release.get("immutable"), "immutable") is not True:
+        raise ContractError(f"GitHub Release {release_tag!r} is not immutable")
+    return actual_id
+
+
+def validate_release_attestation(
+    payload: Any,
+    *,
+    assets_repo: str,
+    release_tag: str,
+    tag_commit: str,
+    release_id: int,
+    expected_assets: Mapping[str, str],
+) -> dict[str, Any]:
+    """Validate the release attestation `gh release verify --format json` proved.
+
+    The CLI performs the cryptographic verification; this validator refuses to
+    accept its report unless the verified signer, statement, predicate, tag
+    commit, and every per-asset digest bind the exact release being published,
+    and unless the signed DSSE payload still says the same thing.
+    """
+    require_repository(assets_repo, "assets_repo")
+    parse_release_tag(release_tag)
+    _require_commit(tag_commit, "tag_commit")
+    if (
+        not isinstance(release_id, int)
+        or isinstance(release_id, bool)
+        or release_id <= 0
+    ):
+        raise ContractError("release_id must be a positive integer")
+    if not isinstance(expected_assets, Mapping) or not expected_assets:
+        raise ContractError("expected release asset inventory must be a non-empty object")
+    canonical_expected_assets: dict[str, str] = {}
+    for name, digest in expected_assets.items():
+        if not isinstance(name, str) or _ATTESTATION_ASSET_NAME_RE.fullmatch(name) is None:
+            raise ContractError(f"invalid expected release asset name: {name!r}")
+        canonical_expected_assets[name] = require_sha256(
+            digest, f"expected release asset digest for {name}"
+        )
+    payload = _require_mapping(payload, "release attestation response")
+    attestation = _require_mapping(payload.get("attestation"), "release attestation")
+    result = _require_mapping(
+        payload.get("verificationResult"), "release attestation verification result"
+    )
+
+    bundle = _require_mapping(attestation.get("bundle"), "release attestation bundle")
+    if bundle.get("mediaType") != _SIGSTORE_BUNDLE_MEDIA_TYPE:
+        raise ContractError("release attestation is not a Sigstore bundle")
+    if result.get("mediaType") != _SIGSTORE_VERIFICATION_RESULT_MEDIA_TYPE:
+        raise ContractError("release attestation verification result is unsupported")
+    verification_material = _require_mapping(
+        bundle.get("verificationMaterial"),
+        "release attestation verification material",
+    )
+    bundle_certificate = _require_mapping(
+        verification_material.get("certificate"),
+        "release attestation bundle certificate",
+    )
+    encoded_certificate = bundle_certificate.get("rawBytes")
+    if not isinstance(encoded_certificate, str) or not encoded_certificate:
+        raise ContractError("release attestation bundle certificate is missing")
+    try:
+        decoded_certificate = base64.b64decode(encoded_certificate, validate=True)
+    except (binascii.Error, ValueError) as error:
+        raise ContractError(
+            f"could not decode release attestation bundle certificate: {error}"
+        ) from error
+    if not decoded_certificate:
+        raise ContractError("release attestation bundle certificate is empty")
+    timestamp_material = _require_mapping(
+        verification_material.get("timestampVerificationData"),
+        "release attestation timestamp verification material",
+    )
+    signed_timestamps = timestamp_material.get("rfc3161Timestamps")
+    if not isinstance(signed_timestamps, list) or not signed_timestamps:
+        raise ContractError("release attestation has no signed timestamp material")
+    for entry in signed_timestamps:
+        signed_timestamp = _require_mapping(
+            entry, "release attestation signed timestamp"
+        ).get("signedTimestamp")
+        if not isinstance(signed_timestamp, str) or not signed_timestamp:
+            raise ContractError("release attestation signed timestamp is missing")
+        try:
+            decoded_timestamp = base64.b64decode(signed_timestamp, validate=True)
+        except (binascii.Error, ValueError) as error:
+            raise ContractError(
+                f"could not decode release attestation signed timestamp: {error}"
+            ) from error
+        if not decoded_timestamp:
+            raise ContractError("release attestation signed timestamp is empty")
+
+    signature = _require_mapping(
+        result.get("signature"), "release attestation signature"
+    )
+    certificate = _require_mapping(
+        signature.get("certificate"), "release attestation certificate"
+    )
+    if certificate.get("subjectAlternativeName") != IMMUTABLE_RELEASE_ATTESTATION_SIGNER:
+        raise ContractError(
+            "release attestation was not signed by GitHub's release attester"
+        )
+    verified_identity = _require_mapping(
+        result.get("verifiedIdentity"), "release attestation verified identity"
+    )
+    signer_identity = _require_mapping(
+        verified_identity.get("subjectAlternativeName"),
+        "release attestation verified signer identity",
+    )
+    if signer_identity.get("regexp") != _RELEASE_SIGNER_IDENTITY_REGEXP:
+        raise ContractError(
+            "release attestation verification policy does not bind GitHub's release signer"
+        )
+    timestamps = result.get("verifiedTimestamps")
+    if not isinstance(timestamps, list) or not timestamps:
+        raise ContractError("release attestation has no verified timestamp")
+    verified_timestamps: list[dict[str, str]] = []
+    for entry in timestamps:
+        verified_at = _require_mapping(entry, "release attestation timestamp")
+        if (
+            verified_at.get("type") != "TimestampAuthority"
+            or not isinstance(verified_at.get("uri"), str)
+            or not verified_at["uri"]
+        ):
+            raise ContractError("release attestation timestamp is incomplete")
+        timestamp = _require_utc_timestamp(
+            verified_at.get("timestamp"), "release attestation verified timestamp"
+        )
+        verified_timestamps.append(
+            {
+                "type": "TimestampAuthority",
+                "uri": verified_at["uri"],
+                "timestamp": timestamp,
+            }
+        )
+
+    statement = _require_mapping(
+        result.get("statement"), "release attestation statement"
+    )
+    envelope = _require_mapping(
+        bundle.get("dsseEnvelope"), "release attestation DSSE envelope"
+    )
+    if envelope.get("payloadType") != _DSSE_IN_TOTO_PAYLOAD_TYPE:
+        raise ContractError("release attestation DSSE payload is not in-toto JSON")
+    signatures = envelope.get("signatures")
+    if not isinstance(signatures, list) or not signatures:
+        raise ContractError("release attestation DSSE envelope has no signature")
+    for entry in signatures:
+        signature_entry = _require_mapping(entry, "release attestation DSSE signature")
+        encoded_signature = signature_entry.get("sig")
+        if not isinstance(encoded_signature, str) or not encoded_signature:
+            raise ContractError("release attestation DSSE signature is missing")
+        try:
+            decoded_signature = base64.b64decode(encoded_signature, validate=True)
+        except (binascii.Error, ValueError) as error:
+            raise ContractError(
+                f"could not decode release attestation DSSE signature: {error}"
+            ) from error
+        if not decoded_signature:
+            raise ContractError("release attestation DSSE signature is empty")
+    encoded = envelope.get("payload")
+    if not isinstance(encoded, str) or not encoded:
+        raise ContractError("release attestation DSSE payload is missing")
+    try:
+        decoded = base64.b64decode(encoded, validate=True).decode("utf-8")
+    except (binascii.Error, ValueError, UnicodeDecodeError) as error:
+        raise ContractError(
+            f"could not decode release attestation DSSE payload: {error}"
+        ) from error
+    if _strict_json_loads(decoded, "release attestation DSSE payload") != statement:
+        raise ContractError(
+            "verified statement does not match the signed attestation payload"
+        )
+
+    if statement.get("_type") != _IN_TOTO_STATEMENT_TYPE:
+        raise ContractError("release attestation is not an in-toto statement")
+    if statement.get("predicateType") != IMMUTABLE_RELEASE_ATTESTATION_PREDICATE_TYPE:
+        raise ContractError(
+            "release attestation predicate type is not GitHub's release predicate"
+        )
+    purl = f"pkg:github/{assets_repo}@{release_tag}"
+    predicate = _require_mapping(
+        statement.get("predicate"), "release attestation predicate"
+    )
+    for field in ("databaseId", "ownerId", "packageId", "repositoryId"):
+        value = predicate.get(field)
+        if not isinstance(value, str) or re.fullmatch(r"[1-9][0-9]*", value) is None:
+            raise ContractError(
+                f"release attestation predicate {field} must be a positive decimal string"
+            )
+    if predicate["databaseId"] != str(release_id):
+        raise ContractError(
+            "release attestation predicate does not bind the exact release id"
+        )
+    if (
+        predicate.get("repository") != assets_repo
+        or predicate.get("tag") != release_tag
+        or predicate.get("purl") != purl
+    ):
+        raise ContractError(
+            "release attestation predicate does not name this exact release"
+        )
+
+    subjects = statement.get("subject")
+    if not isinstance(subjects, list) or not subjects:
+        raise ContractError("release attestation has no subject inventory")
+    release_subjects = 0
+    attested_assets: dict[str, str] = {}
+    for entry in subjects:
+        subject = _require_mapping(entry, "release attestation subject")
+        digest = _require_mapping(
+            subject.get("digest"), "release attestation subject digest"
+        )
+        if "uri" in subject:
+            if set(subject) != {"uri", "digest"}:
+                raise ContractError("release attestation release subject is malformed")
+            uri = subject.get("uri")
+            release_subjects += 1
+            if uri != purl:
+                raise ContractError(
+                    "release attestation release subject names a different release"
+                )
+            if set(digest) != {"sha1"} or digest.get("sha1") != tag_commit:
+                raise ContractError(
+                    "release attestation release subject does not bind the exact tag commit"
+                )
+            continue
+        if set(subject) != {"name", "digest"}:
+            raise ContractError("release attestation asset subject is malformed")
+        name = subject.get("name")
+        if (
+            not isinstance(name, str)
+            or _ATTESTATION_ASSET_NAME_RE.fullmatch(name) is None
+        ):
+            raise ContractError("release attestation asset subject has no name")
+        if name in attested_assets:
+            raise ContractError(f"release attestation has duplicate subject {name!r}")
+        asset_digest = digest.get("sha256")
+        if set(digest) != {"sha256"} or not isinstance(asset_digest, str):
+            raise ContractError(f"release attestation subject {name!r} has no SHA-256")
+        attested_assets[name] = require_sha256(
+            asset_digest, f"release attestation digest for {name}"
+        )
+    if release_subjects != 1:
+        raise ContractError(
+            "release attestation must carry exactly one release subject"
+        )
+    if attested_assets != canonical_expected_assets:
+        raise ContractError(
+            "release attestation asset digests do not match the published candidate"
+        )
+    return {
+        "purl": purl,
+        "release_id": release_id,
+        "tag_commit": tag_commit,
+        "predicate_type": IMMUTABLE_RELEASE_ATTESTATION_PREDICATE_TYPE,
+        "signer": IMMUTABLE_RELEASE_ATTESTATION_SIGNER,
+        "verified_timestamps": verified_timestamps,
+        "assets": attested_assets,
+    }
+
+
 def read_previous_manifest(path: Path) -> tuple[str, str, str]:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
@@ -772,6 +1225,22 @@ def _parser() -> argparse.ArgumentParser:
 
     select = subparsers.add_parser("select-stable-native-release")
     select.add_argument("--releases-json", required=True, type=Path)
+
+    governance = subparsers.add_parser("validate-immutable-release-governance")
+    governance.add_argument("--governance-json", required=True, type=Path)
+    governance.add_argument("--repository", required=True)
+
+    prequalification = subparsers.add_parser("validate-candidate-prequalification")
+    prequalification.add_argument("--prequalification-json", required=True, type=Path)
+    prequalification.add_argument("--candidate-fingerprint", required=True)
+    prequalification.add_argument("--harness-source-sha256", required=True)
+    prequalification.add_argument("--orchestrator-correlation-id", required=True)
+    prequalification.add_argument("--github-run-id", required=True)
+    prequalification.add_argument("--github-run-url", required=True)
+    prequalification.add_argument("--bridge-source-sha", required=True)
+    prequalification.add_argument("--release-tag", required=True)
+    prequalification.add_argument("--emscripten-version", required=True)
+    prequalification.add_argument("--native-commit", required=True)
 
     environment = subparsers.add_parser("validate-environment")
     environment.add_argument("--environment-json", required=True, type=Path)
@@ -875,6 +1344,41 @@ def main() -> int:
             if not isinstance(releases, list):
                 raise ContractError("native release listing must be a JSON array")
             print(select_stable_native_release(releases))
+        elif args.command == "validate-immutable-release-governance":
+            governance_payload = _strict_json_loads(
+                args.governance_json.read_text(encoding="utf-8"),
+                "immutable-release governance response",
+            )
+            print(
+                json.dumps(
+                    validate_immutable_release_governance(
+                        governance_payload, args.repository
+                    ),
+                    sort_keys=True,
+                )
+            )
+        elif args.command == "validate-candidate-prequalification":
+            prequalification_payload = _strict_json_loads(
+                args.prequalification_json.read_text(encoding="utf-8"),
+                "candidate prequalification record",
+            )
+            print(
+                json.dumps(
+                    validate_candidate_prequalification(
+                        prequalification_payload,
+                        candidate_fingerprint=args.candidate_fingerprint,
+                        harness_source_sha256=args.harness_source_sha256,
+                        orchestrator_correlation_id=args.orchestrator_correlation_id,
+                        github_run_id=args.github_run_id,
+                        github_run_url=args.github_run_url,
+                        bridge_source_sha=args.bridge_source_sha,
+                        release_tag=args.release_tag,
+                        emscripten_version=args.emscripten_version,
+                        native_commit=args.native_commit,
+                    ),
+                    sort_keys=True,
+                )
+            )
         else:
             environment_payload = json.loads(
                 args.environment_json.read_text(encoding="utf-8")
@@ -893,7 +1397,7 @@ def main() -> int:
             print(json.dumps({
                 "environment": "bridge-assets-publication",
             }, sort_keys=True))
-    except (ContractError, OSError, json.JSONDecodeError) as error:
+    except (ContractError, OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
         raise SystemExit(f"error: {error}") from error
     return 0
 

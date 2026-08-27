@@ -21,6 +21,8 @@ from generate_release_manifest import (
 from release_contract import (
     ASSETS_REPOSITORY,
     BRIDGE_REPOSITORY,
+    IMMUTABLE_RELEASE_ATTESTATION_PREDICATE_TYPE,
+    IMMUTABLE_RELEASE_ATTESTATION_SIGNER,
     NATIVE_REPOSITORY,
     ContractError,
     Transition,
@@ -31,6 +33,8 @@ from release_contract import (
     require_correlation_id,
     require_sha256,
     validate_native_identity,
+    validate_release_attestation,
+    validate_release_immutability,
 )
 
 
@@ -395,13 +399,16 @@ def _validate_release(
     fingerprint: str,
 ) -> list[str]:
     expected_prerelease = parse_release_tag(identity.release_tag).github_prerelease
+    release_id = release.get("id")
     if (
         release.get("tag_name") != identity.release_tag
         or release.get("name") != identity.release_tag
         or release.get("draft") is not False
         or release.get("prerelease") is not expected_prerelease
         or release.get("target_commitish") != tag_commit
-        or not isinstance(release.get("id"), int)
+        or not isinstance(release_id, int)
+        or isinstance(release_id, bool)
+        or release_id <= 0
         or f"Candidate fingerprint: `{fingerprint}`" not in str(release.get("body", ""))
         or f"Orchestrator correlation: `{identity.orchestrator_correlation_id}`"
         not in str(release.get("body", ""))
@@ -425,9 +432,12 @@ def _validate_release(
     for name in actual:
         data = (candidate / name).read_bytes()
         asset = actual[name]
+        asset_size = asset.get("size")
         if (
             asset.get("state") != "uploaded"
-            or asset.get("size") != len(data)
+            or not isinstance(asset_size, int)
+            or isinstance(asset_size, bool)
+            or asset_size != len(data)
             or asset.get("digest") != f"sha256:{hashlib.sha256(data).hexdigest()}"
         ):
             raise ContractError(f"GitHub Release asset digest/size mismatch for {name}")
@@ -587,12 +597,14 @@ def classify(
                 if missing_assets:
                     partial = result(
                         state="release-assets-partial",
-                        allowed=True,
-                        action="upload-release-assets",
-                        outcome="safely-resumed",
-                        reason_code="exact-release-assets-missing",
-                        reason="release metadata and present assets match; assets are missing",
-                        retryable=True,
+                        allowed=False,
+                        action="none",
+                        outcome="immutable-publication-unverified",
+                        reason_code="immutable-release-assets-missing",
+                        reason=(
+                            "published release asset inventory is incomplete; immutable "
+                            "releases must never be repaired or overwritten"
+                        ),
                     )
                     partial["missing_release_assets"] = missing_assets
                     return partial
@@ -648,6 +660,85 @@ def classify(
         )
 
 
+def candidate_publication_digests(candidate: Path) -> dict[str, str]:
+    if not candidate.is_dir() or candidate.is_symlink():
+        raise ContractError("candidate must be a real directory")
+    entries = list(candidate.iterdir())
+    if {entry.name for entry in entries} != set(PUBLICATION_FILES):
+        raise ContractError(
+            "candidate directory must contain exactly the governed publication files"
+        )
+    for entry in entries:
+        if entry.is_symlink() or not entry.is_file():
+            raise ContractError(
+                f"candidate entry must be an immutable regular file: {entry.name}"
+            )
+    return {
+        name: hashlib.sha256((candidate / name).read_bytes()).hexdigest()
+        for name in PUBLICATION_FILES
+    }
+
+
+def verify_immutable_publication(
+    *,
+    candidate: Path,
+    assets_repo: str,
+    release_tag: str,
+    tag_commit: str,
+    release_id: int | None,
+    release_by_tag: Mapping[str, Any],
+    release_by_id: Mapping[str, Any],
+    attestation: Mapping[str, Any],
+) -> dict[str, object]:
+    """Prove a just-published release is immutable and attested, or fail closed.
+
+    Both readbacks are independent reads of the same release -- by tag and by
+    ID -- so a tag that silently resolves elsewhere cannot satisfy the gate.
+    Nothing here mutates, deletes, retags, or repairs remote state: a mismatch
+    is reported and the release is left exactly as GitHub created it.
+    """
+    require_approved_assets_repo(assets_repo)
+    _require_commit(tag_commit, "tag_commit")
+    digests = candidate_publication_digests(candidate)
+    resolved_id = validate_release_immutability(
+        release_by_tag,
+        release_tag=release_tag,
+        tag_commit=tag_commit,
+        release_id=release_id,
+    )
+    if validate_release_immutability(
+        release_by_id,
+        release_tag=release_tag,
+        tag_commit=tag_commit,
+        release_id=resolved_id,
+    ) != resolved_id:
+        raise ContractError("release readbacks by tag and by ID identify different releases")
+    if release_by_tag.get("published_at") != release_by_id.get("published_at"):
+        raise ContractError("release readbacks disagree on published_at")
+    verified = validate_release_attestation(
+        attestation,
+        assets_repo=assets_repo,
+        release_tag=release_tag,
+        tag_commit=tag_commit,
+        release_id=resolved_id,
+        expected_assets=digests,
+    )
+    return {
+        "schema_version": 1,
+        "assets_repository": assets_repo,
+        "release_tag": release_tag,
+        "release_id": resolved_id,
+        "tag_commit": tag_commit,
+        "immutable": True,
+        "published_at": release_by_tag["published_at"],
+        "attestation_predicate_type": IMMUTABLE_RELEASE_ATTESTATION_PREDICATE_TYPE,
+        "attestation_signer": IMMUTABLE_RELEASE_ATTESTATION_SIGNER,
+        "attested_purl": verified["purl"],
+        "verified_timestamps": verified["verified_timestamps"],
+        "attested_assets": verified["assets"],
+    }
+
+
 def _identity(args: argparse.Namespace) -> CandidateIdentity:
     return CandidateIdentity(
         release_tag=args.release_tag,
@@ -671,6 +762,16 @@ def _parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
     target = subparsers.add_parser("validate-target")
     target.add_argument("--assets-repo", required=True)
+
+    immutable = subparsers.add_parser("verify-immutable-publication")
+    immutable.add_argument("--candidate", required=True, type=Path)
+    immutable.add_argument("--assets-repo", required=True)
+    immutable.add_argument("--release-tag", required=True)
+    immutable.add_argument("--tag-commit", required=True)
+    immutable.add_argument("--release-id", type=int)
+    immutable.add_argument("--release-json", required=True, type=Path)
+    immutable.add_argument("--release-by-id-json", required=True, type=Path)
+    immutable.add_argument("--attestation-json", required=True, type=Path)
 
     changed = subparsers.add_parser("state-changed")
     changed.add_argument("--before-json", required=True, type=Path)
@@ -750,6 +851,28 @@ def main() -> int:
         if args.command == "validate-target":
             require_approved_assets_repo(args.assets_repo)
             print(json.dumps({"allowed": True, "assets_repository": args.assets_repo}))
+            return 0
+        if args.command == "verify-immutable-publication":
+            # This gate reports immutability, never publication state, so it
+            # exits with a plain error instead of a classifier outcome.
+            try:
+                verified = verify_immutable_publication(
+                    candidate=args.candidate,
+                    assets_repo=args.assets_repo,
+                    release_tag=args.release_tag,
+                    tag_commit=args.tag_commit,
+                    release_id=args.release_id,
+                    release_by_tag=_read_json(args.release_json, "published GitHub Release"),
+                    release_by_id=_read_json(
+                        args.release_by_id_json, "published GitHub Release by ID"
+                    ),
+                    attestation=_read_json(
+                        args.attestation_json, "GitHub release attestation"
+                    ),
+                )
+            except (ContractError, OSError) as error:
+                raise SystemExit(f"error: {error}") from error
+            print(json.dumps(verified, sort_keys=True))
             return 0
         if args.command == "state-changed":
             before = _read_json(args.before_json, "before publication state")

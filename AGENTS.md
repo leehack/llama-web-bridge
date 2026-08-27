@@ -170,6 +170,15 @@ candidate digest it is about to publish.
     attestation could ever match what is published. The workflow refuses
     `github.run_attempt != 1`; dispatch a new candidate after failure rather than
     rerunning it.
+  - Requires `assets_immutable_releases_enabled=true`. The candidate holds no
+    credential that can read another repository's administration settings, so it
+    cannot call the governance API itself: it fails closed on the dispatcher's
+    assertion and records it in `bridge-candidate-prequalification`, while
+    `publish_assets.yml` downloads that exact run-owned record, binds its boolean
+    assertion to the candidate identity, and independently proves the real state
+    before publishing.
+    Confirm the assertion first with
+    `gh api repos/leehack/llama-web-bridge-assets/immutable-releases`.
 - Attestation ingestion: `.github/workflows/qualification_attestation.yml`
   - Maintainer-only. Takes the candidate run ID and a bounded single-line
     base64 attestation; a raw multiline JSON input is not accepted.
@@ -248,6 +257,26 @@ candidate digest it is about to publish.
   - Records the candidate run ID/URL as the publication identity, because that
     is what the candidate manifest embeds. Retry by redispatching against the
     same candidate and attestation runs.
+  - Proves immutable-release governance on the assets repository through
+    `GET /repos/{owner}/{repo}/immutable-releases` before any ref or release
+    mutation, and requires the exact `{enabled, enforced_by_owner}` shape with
+    `enabled` exactly boolean `true`. That endpoint answers 404 both when
+    governance is disabled and when the credential cannot read it, so every
+    non-200, missing, false, or non-boolean response fails closed.
+  - Reads every complete release state, including a retry that found an existing
+    exact release, back by tag and by release ID. Both reads must bind the exact
+    tag, release ID, tag commit, published state, and explicit boolean
+    `immutable: true`; publication then requires
+    `gh release verify <tag> --repo <assets repo> --format json` to prove
+    GitHub's signed release attestation: predicate type
+    `https://in-toto.io/attestation/release/v0.2`, signer
+    `https://dotcom.releases.github.com`, predicate database ID equal to the
+    live readback release ID, the exact `pkg:github/<repo>@<tag>` subject bound
+    to the resolved tag commit, and a SHA-256 subject for every published
+    artifact matching the candidate bytes. A mismatch is reported as
+    a non-retryable `immutable-publication-unverified` outcome. Publication
+    never uploads into an incomplete published release and never deletes,
+    retags, overwrites, or otherwise repairs the release.
   - Publishes schema-v2 provenance with release tag, capabilities, bridge,
     upstream, and native commits, exact run ID/URL, mandatory gate conclusions,
     correlation ID, and per-artifact SHA-256 values. An unreadable post-mutation
@@ -256,6 +285,20 @@ candidate digest it is about to publish.
   - Any future npm package version has an independent monotonic sequence and
     uses stable/nightly dist-tags; GitHub `vM.m.p-N` tags must not be reused as
     npm versions because npm orders them as prereleases.
+
+### Next Release Identity
+
+The next asset release is a fresh build, never a reuse of the `v0.1.38`
+candidate, attestation, approval, or manifest:
+
+- `release_tag`: `v0.1.39`
+- `release_rebuild`: `0`
+- `orchestrator_correlation_id`: `kanban:t_7f112b91:web-v0.1.39`
+- `assets_immutable_releases_enabled`: `true`
+
+Dispatch a new `bridge_candidate.yml` run, ingest a new local qualification
+attestation against that candidate run, and publish with the new
+`candidate_run_id`/`attestation_run_id` pair.
 
 ## Change Boundaries
 
