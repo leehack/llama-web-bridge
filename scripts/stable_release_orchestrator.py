@@ -67,12 +67,13 @@ PUBLISH_WORKFLOW_FILE = "publish_assets.yml"
 CANDIDATE_WORKFLOW_PATH = rq.CANDIDATE_WORKFLOW_PATH
 ATTESTATION_WORKFLOW_PATH = rq.ATTESTATION_WORKFLOW_PATH
 PUBLISH_WORKFLOW_PATH = f".github/workflows/{PUBLISH_WORKFLOW_FILE}"
-
-WORKFLOW_NAMES: Mapping[str, str] = {
-    CANDIDATE_WORKFLOW_PATH: "Build Exact Bridge Candidate",
-    ATTESTATION_WORKFLOW_PATH: "Ingest Qualification Attestation",
-    PUBLISH_WORKFLOW_PATH: "Publish Exact Qualified Bridge Assets",
-}
+SUPPORTED_PIPELINE_WORKFLOW_PATHS = frozenset(
+    {
+        CANDIDATE_WORKFLOW_PATH,
+        ATTESTATION_WORKFLOW_PATH,
+        PUBLISH_WORKFLOW_PATH,
+    }
+)
 
 REPOSITORY_OWNER = BRIDGE_REPOSITORY.split("/", 1)[0]
 
@@ -722,6 +723,8 @@ def _parse_workflow_runs_response(
 def _parse_run_record(run: Any, *, workflow_path: str) -> RunRecord:
     if not isinstance(run, Mapping):
         raise ContractError("workflow run record must be a JSON object")
+    if workflow_path not in SUPPORTED_PIPELINE_WORKFLOW_PATHS:
+        raise ContractError(f"unsupported workflow path {workflow_path!r}")
     run_id = str(_require_positive_int(run.get("id"), "workflow run id"))
     if run.get("path") != workflow_path:
         raise ContractError(
@@ -729,14 +732,10 @@ def _parse_run_record(run: Any, *, workflow_path: str) -> RunRecord:
         )
     if run.get("event") != "workflow_dispatch":
         raise ContractError(f"workflow run {run_id} was not a workflow_dispatch run")
-    expected_workflow_name = WORKFLOW_NAMES.get(workflow_path)
-    if expected_workflow_name is None:
-        raise ContractError(f"unsupported workflow path {workflow_path!r}")
-    if run.get("name") != expected_workflow_name:
-        raise ContractError(
-            f"workflow run {run_id} name is {run.get('name')!r}, expected "
-            f"{expected_workflow_name!r}"
-        )
+    # A workflow-level ``run-name`` replaces the static workflow label in the
+    # Actions API's ``name`` field.  Bind machine identity to the exact path
+    # returned by the workflow-scoped endpoint above; the deterministic
+    # ``display_title`` below carries the correlation and pipeline inputs.
     run_name = _require_str(
         run.get("display_title"), f"workflow run {run_id} display_title"
     )
