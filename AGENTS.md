@@ -208,9 +208,11 @@ candidate digest it is about to publish.
     after a live `immutable-releases` governance read; a duplicate-run check runs
     before dispatch and a run-name readback runs after it.
   - Run recovery queries the exact workflow with server-side owner, event,
-    default-branch, and relevant-publication-time filters, then accepts only the
-    workflow's static `name` plus its exact deterministic `display_title`, owner
-    actor/triggering actor, first attempt, repository, path, and branch. A
+    default-branch, and relevant-publication-time filters, then accepts only an
+    exact supported workflow path plus its deterministic `display_title`, owner
+    actor/triggering actor, first attempt, repository, and branch. GitHub exposes
+    a workflow's rendered `run-name` in the run record's `name` field, so that
+    field is not treated as the static workflow identity. A
     multi-page query must retain a stable filtered count. A search at GitHub's
     1,000-result cap is split into closed time windows until every relevant page
     is complete; a saturated one-second window or ambiguous result fails closed

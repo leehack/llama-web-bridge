@@ -197,15 +197,17 @@ def run_payload(
     head_sha: str = HEAD_SHA,
     run_attempt: int = 1,
     event: str = "workflow_dispatch",
-    workflow_name: str | None = None,
+    api_name: str | None = None,
     actor: str = OWNER,
     triggering_actor: str = OWNER,
 ) -> dict[str, Any]:
-    if workflow_name is None:
-        workflow_name = sro.WORKFLOW_NAMES[path]
+    if api_name is None:
+        api_name = run_name
     return {
         "id": int(run_id),
-        "name": workflow_name,
+        # Workflows with ``run-name`` expose the rendered correlation string in
+        # both fields.  Keep the fixture aligned with the live Actions API.
+        "name": api_name,
         "display_title": run_name,
         "path": path,
         "event": event,
@@ -905,11 +907,22 @@ class DispatchInputContractTest(unittest.TestCase):
 class WorkflowRunsResponseTest(unittest.TestCase):
     def setUp(self) -> None:
         self.path = sro.CANDIDATE_WORKFLOW_PATH
+        correlation_id = sro.compute_correlation_id(make_provenance())
+        self.run_name = sro.candidate_run_name(
+            correlation_id,
+            sro.PipelineBinding(
+                bridge_source_sha=BRIDGE_SHA,
+                release_tag="v0.1.40",
+                release_rebuild=0,
+            ),
+        )
         self.run = run_payload(
-            run_id=CANDIDATE_RUN_ID, path=self.path, run_name="bridge-candidate x"
+            run_id=CANDIDATE_RUN_ID, path=self.path, run_name=self.run_name
         )
 
-    def test_object_response_with_workflow_runs_is_parsed(self) -> None:
+    def test_dynamic_correlated_api_name_is_parsed(self) -> None:
+        self.assertEqual(self.run["name"], self.run_name)
+        self.assertNotEqual(self.run["name"], "Build Exact Bridge Candidate")
         runs = sro.parse_workflow_runs(
             runs_response([self.run]),
             workflow_path=self.path,
@@ -935,8 +948,8 @@ class WorkflowRunsResponseTest(unittest.TestCase):
         foreign = run_payload(
             run_id=CANDIDATE_RUN_ID,
             path=".github/workflows/ci.yml",
-            run_name="bridge-candidate x",
-            workflow_name="CI",
+            run_name=self.run_name,
+            api_name=self.run_name,
         )
         with self.assertRaises(ContractError):
             sro.parse_workflow_runs(
@@ -945,12 +958,13 @@ class WorkflowRunsResponseTest(unittest.TestCase):
                 default_branch=DEFAULT_BRANCH,
             )
 
-    def test_static_workflow_name_is_not_treated_as_the_run_name(self) -> None:
-        malformed = dict(self.run, name="bridge-candidate x")
+    def test_unsupported_workflow_path_fails_closed_even_when_record_matches(self) -> None:
+        unsupported_path = ".github/workflows/ci.yml"
+        unsupported = dict(self.run, path=unsupported_path)
         with self.assertRaises(ContractError):
             sro.parse_workflow_runs(
-                runs_response([malformed]),
-                workflow_path=self.path,
+                runs_response([unsupported]),
+                workflow_path=unsupported_path,
                 default_branch=DEFAULT_BRANCH,
             )
 
@@ -2465,15 +2479,18 @@ class AdvancePipelineTest(unittest.TestCase):
                 gateway, provenance=self.provenance, workspace=self.tmp
             )
 
-    def test_candidate_manifest_that_contradicts_the_run_name_fails_closed(self) -> None:
+    def _assert_candidate_manifest_binding_mismatch(
+        self, **candidate_overrides: Any
+    ) -> None:
         candidate_dir = self.tmp / "candidate-src"
-        write_bridge_candidate(
-            candidate_dir,
-            release_tag="v0.1.41",
-            release_rebuild=0,
-            correlation_id=self.correlation_id,
-            run_id=CANDIDATE_RUN_ID,
-        )
+        candidate_fields: dict[str, Any] = {
+            "release_tag": "v0.1.40",
+            "release_rebuild": 0,
+            "correlation_id": self.correlation_id,
+            "run_id": CANDIDATE_RUN_ID,
+        }
+        candidate_fields.update(candidate_overrides)
+        write_bridge_candidate(candidate_dir, **candidate_fields)
         members = directory_members(candidate_dir)
         succeeded = run_payload(
             run_id=CANDIDATE_RUN_ID,
@@ -2502,6 +2519,18 @@ class AdvancePipelineTest(unittest.TestCase):
             sro.advance_pipeline(
                 gateway, provenance=self.provenance, workspace=self.tmp
             )
+
+    def test_candidate_manifest_source_that_contradicts_run_name_fails_closed(
+        self,
+    ) -> None:
+        self._assert_candidate_manifest_binding_mismatch(
+            bridge_commit=ADVANCED_BRIDGE_SHA
+        )
+
+    def test_candidate_manifest_tag_that_contradicts_run_name_fails_closed(
+        self,
+    ) -> None:
+        self._assert_candidate_manifest_binding_mismatch(release_tag="v0.1.41")
 
     def test_full_pipeline_dispatches_publish_after_exact_attestation(self) -> None:
         candidate_dir = self.tmp / "candidate-src"
