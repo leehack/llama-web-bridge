@@ -882,6 +882,15 @@ def resolve_attestation_continuation(
     parsed_native = parse_release_tag(native_release_tag)
     if parsed_native.channel is not Channel.STABLE:
         raise ContractError("continuation attestation native_release_tag must be stable")
+    # Reject an incompatible schema, failed/missing gate, unexpected model pin,
+    # or malformed phase before the protected publication environment can be
+    # reached. Publication repeats this complete proof against the candidate
+    # artifact; this early pass intentionally validates payload semantics only.
+    rq.verify_attestation(
+        attestation=attestation,
+        candidate_run_id=candidate_run_id,
+        native_release_tag=native_release_tag,
+    )
     return {
         "attestation_artifact_id": artifact_id,
         "attestation_run_id": expected_run_id,

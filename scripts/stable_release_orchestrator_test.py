@@ -246,19 +246,27 @@ def artifact_inventory(
 def continuation_attestation(
     *, candidate_run_id: str = CANDIDATE_RUN_ID, native_release_tag: str = "v0.2.0"
 ) -> dict[str, Any]:
-    payload = {key: None for key in rq.ATTESTATION_KEYS}
-    payload.update(
-        {
-            "bridge_repository": BRIDGE_REPOSITORY,
-            "candidate_run_id": candidate_run_id,
-            "candidate_run_url": (
-                f"https://github.com/{BRIDGE_REPOSITORY}/actions/runs/"
-                f"{candidate_run_id}"
-            ),
-            "native_release_tag": native_release_tag,
-        }
-    )
-    return payload
+    with tempfile.TemporaryDirectory(prefix="sro-continuation-attestation-") as temp:
+        candidate_dir = Path(temp)
+        write_bridge_candidate(
+            candidate_dir,
+            release_tag="v0.1.40",
+            release_rebuild=0,
+            correlation_id=sro.compute_correlation_id(make_provenance()),
+            run_id=candidate_run_id,
+            native_release_tag=native_release_tag,
+        )
+        manifest, fingerprint = rq.load_candidate(candidate_dir)
+        return rq.build_attestation(
+            manifest=manifest,
+            candidate_fingerprint=fingerprint,
+            candidate_run_id=candidate_run_id,
+            candidate_artifact_id=CANDIDATE_ARTIFACT_ID,
+            candidate_run_attempt=1,
+            harness_digest=rq.harness_source_sha256(Path(__file__).resolve().parent),
+            speech_phase=speech_phase(),
+            tts_phase=tts_phase(),
+        )
 
 
 class FakeGateway:
@@ -755,6 +763,33 @@ class AttestationContinuationTest(unittest.TestCase):
                         artifact_id=ATTESTATION_ARTIFACT_ID,
                     ),
                     attestation=continuation_attestation(),
+                    expected_run_id=ATTESTATION_RUN_ID,
+                    default_branch=DEFAULT_BRANCH,
+                )
+
+    def test_invalid_attestation_semantics_are_rejected_before_continuation(
+        self,
+    ) -> None:
+        run = run_payload(
+            run_id=ATTESTATION_RUN_ID,
+            path=sro.ATTESTATION_WORKFLOW_PATH,
+            run_name=sro.attestation_run_name(CANDIDATE_RUN_ID),
+        )
+        for field, value in (
+            ("schema_version", 999),
+            ("hosted_gates", {"state_persistence": "failed"}),
+        ):
+            attestation = continuation_attestation()
+            attestation[field] = value
+            with self.subTest(field=field), self.assertRaises(ContractError):
+                sro.resolve_attestation_continuation(
+                    run=run,
+                    artifact_inventory=artifact_inventory(
+                        run_id=ATTESTATION_RUN_ID,
+                        name=rq.ATTESTATION_ARTIFACT_NAME,
+                        artifact_id=ATTESTATION_ARTIFACT_ID,
+                    ),
+                    attestation=attestation,
                     expected_run_id=ATTESTATION_RUN_ID,
                     default_branch=DEFAULT_BRANCH,
                 )
