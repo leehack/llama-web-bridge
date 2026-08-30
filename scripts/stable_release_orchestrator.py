@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Artifact-driven daily stable Web bridge release state machine.
+"""Artifact-driven stable Web bridge release state machine.
 
 The scheduled scan resolves every stable native release after the immutable
 automation baseline, then idempotently advances each three-stage pipeline:
@@ -17,6 +17,9 @@ unique artifact, and that artifact's contents before it advances anything.
 Stage 2 has no runner: no self-hosted machine exists and the heavy real-model
 gates cannot run hosted. The orchestrator therefore waits indefinitely and
 fail-closed for a maintainer-produced attestation; it never synthesizes one.
+After an owner-authorized ingestion succeeds, a ``workflow_run`` continuation
+targets that exact candidate and attestation through this same state machine;
+the daily schedule remains the fallback repair scan.
 """
 
 from __future__ import annotations
@@ -153,6 +156,9 @@ _PUBLISH_RUN_NAME_RE = re.compile(
     r" attestation:(?P<attestation_run_id>\S+) source:(?P<bridge_source_sha>\S+)"
     r" tag:(?P<release_tag>\S+) rebuild:(?P<release_rebuild>\S+)"
 )
+_ATTESTATION_RUN_NAME_RE = re.compile(
+    r"qualification-attestation candidate:(?P<candidate_run_id>[1-9][0-9]*)"
+)
 
 
 @dataclass(frozen=True)
@@ -211,7 +217,13 @@ def require_stable_provenance(provenance: NativeProvenance) -> NativeProvenance:
 
 
 def require_orchestration_caller(
-    event_name: str, actor: str, triggering_actor: str
+    event_name: str,
+    actor: str,
+    triggering_actor: str,
+    *,
+    continuation_native_release_tag: str | None = None,
+    continuation_candidate_run_id: str | None = None,
+    continuation_attestation_run_id: str | None = None,
 ) -> None:
     """Keep manual callers from turning the environment PAT into a deputy.
 
@@ -227,9 +239,30 @@ def require_orchestration_caller(
         and triggering_actor == REPOSITORY_OWNER
     ):
         return
+    continuation = (
+        continuation_native_release_tag,
+        continuation_candidate_run_id,
+        continuation_attestation_run_id,
+    )
+    if event_name == "workflow_run":
+        if any(value is None for value in continuation):
+            raise ContractError(
+                "attestation continuation requires exact native, candidate, and "
+                "attestation identities"
+            )
+        native_tag = parse_release_tag(str(continuation_native_release_tag))
+        if native_tag.channel is not Channel.STABLE:
+            raise ContractError("attestation continuation native tag must be stable")
+        for value, label in (
+            (continuation_candidate_run_id, "continuation candidate run id"),
+            (continuation_attestation_run_id, "continuation attestation run id"),
+        ):
+            if not isinstance(value, str) or _RUN_ID_RE.fullmatch(value) is None:
+                raise ContractError(f"{label} must be a positive integer")
+        return
     raise ContractError(
-        "stable orchestration requires a schedule event or an owner-initiated "
-        "workflow_dispatch with owner actor and triggering_actor"
+        "stable orchestration requires a schedule event, an owner-initiated "
+        "workflow_dispatch, or an exact validated attestation continuation"
     )
 
 
@@ -778,6 +811,83 @@ def _parse_run_record(run: Any, *, workflow_path: str) -> RunRecord:
             run.get("run_attempt"), f"workflow run {run_id} run_attempt"
         ),
     )
+
+
+def resolve_attestation_continuation(
+    *,
+    run: Any,
+    artifact_inventory: Any,
+    attestation: Any,
+    expected_run_id: str,
+    default_branch: str,
+) -> dict[str, Any]:
+    """Resolve one trusted ingestion completion to its exact stable pipeline.
+
+    This is deliberately a selection proof, not a substitute for publication's
+    full candidate and attestation verification. The orchestrator repeats those
+    byte-level proofs before dispatching publication. Here we prove that the
+    wakeup came from one successful, first-attempt, owner-authored ingestion run
+    on the default branch, that its sole live artifact belongs to that run, and
+    that the canonical payload names the same candidate as the run title.
+    """
+    if not isinstance(expected_run_id, str) or _RUN_ID_RE.fullmatch(
+        expected_run_id
+    ) is None:
+        raise ContractError("continuation attestation run id must be a positive integer")
+    record = _parse_run_record(run, workflow_path=ATTESTATION_WORKFLOW_PATH)
+    if record.run_id != expected_run_id:
+        raise ContractError(
+            f"continuation run id mismatch: expected {expected_run_id}, "
+            f"got {record.run_id}"
+        )
+    if record.head_branch != default_branch:
+        raise ContractError(
+            f"continuation attestation ran from {record.head_branch!r}, not the "
+            f"default branch {default_branch!r}"
+        )
+    if record.run_attempt != 1:
+        raise ContractError("continuation attestation run_attempt must be 1")
+    if not record.succeeded:
+        raise ContractError("continuation attestation run must be completed successfully")
+    title_match = _ATTESTATION_RUN_NAME_RE.fullmatch(record.run_name)
+    if title_match is None:
+        raise ContractError("continuation attestation run name is not canonical")
+    candidate_run_id = title_match.group("candidate_run_id")
+    artifact_id = rq.validate_artifact_inventory(
+        artifact_inventory,
+        expected_run_id=expected_run_id,
+        expected_name=rq.ATTESTATION_ARTIFACT_NAME,
+    )
+    if not isinstance(attestation, Mapping):
+        raise ContractError("continuation attestation must be a JSON object")
+    if set(attestation) != set(rq.ATTESTATION_KEYS):
+        raise ContractError("continuation attestation has missing or unexpected fields")
+    if attestation.get("bridge_repository") != BRIDGE_REPOSITORY:
+        raise ContractError(
+            f"continuation attestation bridge_repository must be {BRIDGE_REPOSITORY}"
+        )
+    if attestation.get("candidate_run_id") != candidate_run_id:
+        raise ContractError(
+            "continuation attestation candidate_run_id does not match its run name"
+        )
+    expected_candidate_url = (
+        f"https://github.com/{BRIDGE_REPOSITORY}/actions/runs/{candidate_run_id}"
+    )
+    if attestation.get("candidate_run_url") != expected_candidate_url:
+        raise ContractError("continuation attestation candidate_run_url is not exact")
+    native_release_tag = _require_str(
+        attestation.get("native_release_tag"),
+        "continuation attestation native_release_tag",
+    )
+    parsed_native = parse_release_tag(native_release_tag)
+    if parsed_native.channel is not Channel.STABLE:
+        raise ContractError("continuation attestation native_release_tag must be stable")
+    return {
+        "attestation_artifact_id": artifact_id,
+        "attestation_run_id": expected_run_id,
+        "candidate_run_id": candidate_run_id,
+        "native_release_tag": native_release_tag,
+    }
 
 
 @dataclass(frozen=True)
@@ -2098,8 +2208,20 @@ def advance_pipeline(
     reserved_release_tags: Sequence[str] | set[str] = (),
     publication_allowed: bool = True,
     publication_barrier_native_tag: str | None = None,
+    required_candidate_run_id: str | None = None,
+    required_attestation_run_id: str | None = None,
 ) -> OrchestrationPlan:
     require_stable_provenance(provenance)
+    if (required_candidate_run_id is None) != (required_attestation_run_id is None):
+        raise ContractError(
+            "exact continuation requires candidate and attestation run ids together"
+        )
+    for value, label in (
+        (required_candidate_run_id, "required candidate run id"),
+        (required_attestation_run_id, "required attestation run id"),
+    ):
+        if value is not None and _RUN_ID_RE.fullmatch(value) is None:
+            raise ContractError(f"{label} must be a positive integer")
     if not publication_allowed:
         if not isinstance(publication_barrier_native_tag, str):
             raise ContractError(
@@ -2175,6 +2297,14 @@ def advance_pipeline(
             bridge_source_sha=provenance.bridge_source_sha,
             release_tag=target.release_tag,
             release_rebuild=target.release_rebuild,
+        )
+
+    if required_candidate_run_id is not None and (
+        candidate_selection.succeeded_run_id != required_candidate_run_id
+    ):
+        raise ContractError(
+            f"continuation candidate run {required_candidate_run_id} is not the "
+            f"unique successful candidate for {provenance.native_release_tag}"
         )
 
     if candidate_selection.in_flight_run_id is not None:
@@ -2256,6 +2386,13 @@ def advance_pipeline(
         matcher=lambda name: name == expected_attestation_name,
         default_branch=default_branch,
     )
+    if required_attestation_run_id is not None and (
+        attestation_selection.succeeded_run_id != required_attestation_run_id
+    ):
+        raise ContractError(
+            f"continuation attestation run {required_attestation_run_id} is not the "
+            f"unique successful attestation for candidate {candidate.run_id}"
+        )
     if attestation_selection.in_flight_run_id is not None or (
         attestation_selection.succeeded_run_id is None
     ):
@@ -2565,6 +2702,17 @@ def _parser() -> argparse.ArgumentParser:
     select.add_argument("--releases-json", required=True, type=Path)
     select.add_argument("--output-json", type=Path)
 
+    continuation = subparsers.add_parser(
+        "resolve-attestation-continuation",
+        help="Resolve one successful ingestion run to its exact stable pipeline",
+    )
+    continuation.add_argument("--run-json", required=True, type=Path)
+    continuation.add_argument("--artifacts-json", required=True, type=Path)
+    continuation.add_argument("--attestation-json", required=True, type=Path)
+    continuation.add_argument("--attestation-run-id", required=True)
+    continuation.add_argument("--default-branch", required=True)
+    continuation.add_argument("--output-json", type=Path)
+
     orchestrate = subparsers.add_parser(
         "orchestrate", help="Advance the stable release pipeline by one exact step"
     )
@@ -2583,6 +2731,9 @@ def _parser() -> argparse.ArgumentParser:
     backlog.add_argument("--output-plan-json", type=Path)
     backlog.add_argument("--step-summary-file", type=Path)
     backlog.add_argument("--dry-run", action="store_true")
+    backlog.add_argument("--continuation-native-release-tag")
+    backlog.add_argument("--continuation-candidate-run-id")
+    backlog.add_argument("--continuation-attestation-run-id")
     return parser
 
 
@@ -2650,11 +2801,46 @@ def _load_provenance_backlog(path: Path) -> list[NativeProvenance]:
     return provenances
 
 
-def _require_cli_caller() -> None:
+def _continuation_cli_values(
+    args: argparse.Namespace,
+) -> tuple[str, str, str] | None:
+    values = (
+        getattr(args, "continuation_native_release_tag", None),
+        getattr(args, "continuation_candidate_run_id", None),
+        getattr(args, "continuation_attestation_run_id", None),
+    )
+    if all(value is None for value in values):
+        return None
+    if any(value is None for value in values):
+        raise ContractError(
+            "attestation continuation requires native release tag, candidate run id, "
+            "and attestation run id together"
+        )
+    native_tag, candidate_run_id, attestation_run_id = values
+    assert isinstance(native_tag, str)
+    assert isinstance(candidate_run_id, str)
+    assert isinstance(attestation_run_id, str)
+    parsed = parse_release_tag(native_tag)
+    if parsed.channel is not Channel.STABLE:
+        raise ContractError("attestation continuation native tag must be stable")
+    for value, label in (
+        (candidate_run_id, "continuation candidate run id"),
+        (attestation_run_id, "continuation attestation run id"),
+    ):
+        if _RUN_ID_RE.fullmatch(value) is None:
+            raise ContractError(f"{label} must be a positive integer")
+    return native_tag, candidate_run_id, attestation_run_id
+
+
+def _require_cli_caller(args: argparse.Namespace) -> None:
+    continuation = _continuation_cli_values(args)
     require_orchestration_caller(
         os.environ.get("GITHUB_EVENT_NAME", ""),
         os.environ.get("GITHUB_ACTOR", ""),
         os.environ.get("GITHUB_TRIGGERING_ACTOR", ""),
+        continuation_native_release_tag=(continuation[0] if continuation else None),
+        continuation_candidate_run_id=(continuation[1] if continuation else None),
+        continuation_attestation_run_id=(continuation[2] if continuation else None),
     )
 
 
@@ -2689,7 +2875,34 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(payload)
         return 0
 
-    _require_cli_caller()
+    if args.subcommand == "resolve-attestation-continuation":
+        run = _strict_json_loads(
+            args.run_json.read_text(encoding="utf-8"), "continuation run"
+        )
+        artifacts = _strict_json_loads(
+            args.artifacts_json.read_text(encoding="utf-8"),
+            "continuation artifact inventory",
+        )
+        raw_attestation = args.attestation_json.read_text(encoding="utf-8")
+        attestation = rq.parse_attestation_json(raw_attestation)
+        if raw_attestation != rq.canonical_json(attestation):
+            raise ContractError(
+                "continuation attestation artifact is not canonical JSON bytes"
+            )
+        result = resolve_attestation_continuation(
+            run=run,
+            artifact_inventory=artifacts,
+            attestation=attestation,
+            expected_run_id=args.attestation_run_id,
+            default_branch=args.default_branch,
+        )
+        payload = json.dumps(result, indent=2, sort_keys=True)
+        if args.output_json:
+            args.output_json.write_text(payload + "\n", encoding="utf-8")
+        print(payload)
+        return 0
+
+    _require_cli_caller(args)
     gateway = GhGateway(
         read_token=os.environ.get("GH_TOKEN", ""),
         dispatch_token=os.environ.get("WEBGPU_BRIDGE_ASSETS_PAT"),
@@ -2698,11 +2911,17 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.subcommand == "orchestrate-backlog":
         provenances = _load_provenance_backlog(args.provenance_list_json)
+        continuation = _continuation_cli_values(args)
         plans: list[dict[str, Any]] = []
         errors: list[dict[str, Any]] = []
         reserved_release_tags: set[str] = set()
         publication_barrier_native_tag: str | None = None
+        continuation_seen = False
         for provenance in provenances:
+            is_continuation_target = bool(
+                continuation
+                and provenance.native_release_tag == continuation[0]
+            )
             correlation_id = compute_correlation_id(provenance)
             pipeline_workspace = args.workspace / correlation_id
             pipeline_workspace.mkdir(parents=True, exist_ok=True)
@@ -2711,12 +2930,26 @@ def main(argv: Sequence[str] | None = None) -> int:
                     gateway,
                     provenance=provenance,
                     workspace=pipeline_workspace,
-                    dry_run=args.dry_run,
+                    # Earlier entries are classified without mutation so the
+                    # existing monotonic publication barrier remains binding.
+                    # Only the exact attested pipeline may perform one live step.
+                    dry_run=(
+                        args.dry_run
+                        or (continuation is not None and not is_continuation_target)
+                    ),
                     reserved_release_tags=reserved_release_tags,
                     publication_allowed=publication_barrier_native_tag is None,
                     publication_barrier_native_tag=publication_barrier_native_tag,
+                    required_candidate_run_id=(
+                        continuation[1] if is_continuation_target and continuation else None
+                    ),
+                    required_attestation_run_id=(
+                        continuation[2] if is_continuation_target and continuation else None
+                    ),
                 )
                 plans.append(plan.to_dict())
+                if is_continuation_target:
+                    continuation_seen = True
                 if plan.release_target is not None:
                     reserved_release_tags.add(plan.release_target.release_tag)
                 if (
@@ -2747,6 +2980,21 @@ def main(argv: Sequence[str] | None = None) -> int:
                 # its state is not yet observable. Stop before another backlog
                 # entry can claim a colliding output identity under uncertainty.
                 break
+            if is_continuation_target:
+                # A continuation intentionally advances only the attested
+                # pipeline. Later backlog entries remain for the daily fallback.
+                break
+        if continuation is not None and not continuation_seen and not errors:
+            errors.append(
+                {
+                    "correlation_id": None,
+                    "native_release_tag": continuation[0],
+                    "error": (
+                        "attestation continuation native release is absent from the "
+                        "verified stable backlog"
+                    ),
+                }
+            )
         result = {
             "schema_version": 1,
             "plans": plans,

@@ -211,12 +211,16 @@ query strings, and fragments before printing the location.
   A failed candidate is never retried automatically each day; after diagnosis,
   a maintainer may deliberately dispatch one new first-attempt run with the same
   exact binding, and a later unique success supersedes the recorded failed run.
-  A successful candidate waits for maintainer-run local ASR/TTS qualification;
-  after its attestation is ingested, the next scheduled or manual stable scan
-  advances publication. Run recovery paginates each exact workflow's filtered
-  history with stable-count checks and splits searches at GitHub's 1,000-result
-  cap into closed time windows, so an older waiting pipeline is not lost as
-  later workflow history grows.
+  A successful candidate waits for maintainer-run local ASR/TTS qualification.
+  After its owner-authorized attestation is ingested, a default-branch
+  `workflow_run` continuation re-proves that exact successful ingestion and
+  advances only its exact candidate through the same orchestrator. It classifies
+  earlier stable pipelines without mutation so the existing publication-order
+  barrier remains binding; the next scheduled or manual stable scan is the
+  fallback if the continuation is delayed or missed. Run recovery paginates
+  each exact workflow's filtered history with stable-count checks and splits
+  searches at GitHub's 1,000-result cap into closed time windows, so an older
+  waiting pipeline is not lost as later workflow history grows.
 - Bridge source changes still require ordinary PRs. A dependency-version release
   may reuse an already-merged exact bridge source SHA without changing
   `llama_cpp.version`.

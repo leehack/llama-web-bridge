@@ -1062,6 +1062,13 @@ def main() -> int:
         and "resolve-tag-commit" in auto_update
         and "scripts/stable_release_orchestrator.py scan-native" in auto_update
         and "scripts/stable_release_orchestrator.py orchestrate-backlog" in auto_update
+        and "workflows: [Ingest Qualification Attestation]" in auto_update
+        and "types: [completed]" in auto_update
+        and "branches: [main]" in auto_update
+        and "resolve-attestation-continuation" in auto_update
+        and "--continuation-native-release-tag" in auto_update
+        and "--continuation-candidate-run-id" in auto_update
+        and "--continuation-attestation-run-id" in auto_update
         and '--channel "${REQUESTED_CHANNEL}"' in auto_update
         and "ORCHESTRATOR_DISPATCH_TOKEN" not in auto_update
         and "WEBGPU_BRIDGE_ASSETS_PAT: ${{ secrets.WEBGPU_BRIDGE_ASSETS_PAT }}"
@@ -1073,7 +1080,7 @@ def main() -> int:
         and "git push" not in auto_update
         and "Manual development scans only prepare exact candidate inputs" in auto_update
         and "env.REQUESTED_CHANNEL != 'stable'" in auto_update,
-        "the scheduled scan must download every post-baseline stable provenance by unique asset id, reuse only the existing environment-scoped publication credential, advance stable publication only through stable_release_orchestrator.py, and keep development scans scan-only",
+        "the scheduled scan and exact successful-attestation continuation must download every post-baseline stable provenance by unique asset id, reuse only the existing environment-scoped publication credential, advance stable publication only through stable_release_orchestrator.py, and keep development scans scan-only",
         errors,
     )
     owner_manual_gate = (

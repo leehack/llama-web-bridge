@@ -200,6 +200,14 @@ candidate digest it is about to publish.
     ordered backlog prevents an older qualification wait from hiding or
     starving a newer stable native release; each exact pipeline advances by at
     most one stage per scheduled/manual scan.
+  - A successful owner-authorized `qualification_attestation.yml` run wakes the
+    same orchestrator through a default-branch `workflow_run` continuation. The
+    continuation re-fetches and proves the exact successful first-attempt
+    ingestion run, its unique live artifact, canonical attestation bytes,
+    candidate ID, and stable native tag before the publication environment is
+    reachable. It classifies every earlier stable pipeline without mutation to
+    preserve monotonic ordering, then permits only that exact candidate and
+    attestation to advance by one stage. The daily schedule remains the fallback.
   - Only the stable channel is orchestrated. Manual `development` scans still
     resolve and report exact `bNNNN` provenance, but `require_stable_provenance`
     refuses to advance them, so they never dispatch anything.
@@ -236,8 +244,9 @@ candidate digest it is about to publish.
     successful candidate and attestation runs.
   - A successful candidate waits for maintainer-run local ASR/TTS qualification
     and ingestion without blocking candidate creation for later backlog entries.
-    After that external ingestion succeeds, the next daily or manual stable scan
-    dispatches publication; no hosted run fabricates or weakens the attestation.
+    After that external ingestion succeeds, the event-driven continuation
+    normally dispatches publication; the next daily or manual stable scan repairs
+    a missed continuation. No hosted run fabricates or weakens the attestation.
   - An already-published noop independently resolves the assets tag commit,
     validates release reads by tag and ID, downloads and hashes the exact asset
     inventory, and validates `gh release verify --format json` with the same

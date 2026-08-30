@@ -6,6 +6,13 @@ on:
     # post-baseline stable provenance by at most one provable transition: dispatch
     # its exact candidate, report an honest qualification wait, or dispatch publish.
     - cron: '23 3 * * *'
+  workflow_run:
+    # A successful owner-authorized ingestion wakes the same stable orchestrator
+    # immediately. The live run and artifact are re-proven before the protected
+    # publication environment is reachable; the daily schedule remains fallback.
+    workflows: [Ingest Qualification Attestation]
+    types: [completed]
+    branches: [main]
   workflow_dispatch:
     inputs:
       release_channel:
@@ -47,15 +54,68 @@ concurrency:
 jobs:
   prepare_release_candidate:
     name: Resolve and verify exact native release provenance
-    if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.actor == github.repository_owner && github.triggering_actor == github.repository_owner) }}
+    if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.actor == github.repository_owner && github.triggering_actor == github.repository_owner) || (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success') }}
     runs-on: ubuntu-latest
     outputs:
       release_channel: ${{ steps.candidate.outputs.release_channel }}
       release_count: ${{ steps.candidate.outputs.release_count }}
+      continuation_native_release_tag: ${{ steps.continuation.outputs.native_release_tag }}
+      continuation_candidate_run_id: ${{ steps.continuation.outputs.candidate_run_id }}
+      continuation_attestation_run_id: ${{ steps.continuation.outputs.attestation_run_id }}
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+
+      - name: Resolve exact successful attestation continuation
+        id: continuation
+        if: ${{ github.event_name == 'workflow_run' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ATTESTATION_RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          set -euo pipefail
+          continuation_dir="${RUNNER_TEMP}/attestation-continuation"
+          mkdir -p "${continuation_dir}/artifact"
+          bridge_default="$(gh api "repos/${BRIDGE_REPO}" --jq '.default_branch')"
+          gh api "repos/${BRIDGE_REPO}/actions/runs/${ATTESTATION_RUN_ID}" \
+            > "${continuation_dir}/run.json"
+          gh api "repos/${BRIDGE_REPO}/actions/runs/${ATTESTATION_RUN_ID}/artifacts?per_page=100" \
+            > "${continuation_dir}/artifacts.json"
+          verification="$(python3 scripts/release_qualification.py verify-run \
+            --run-json "${continuation_dir}/run.json" \
+            --artifacts-json "${continuation_dir}/artifacts.json" \
+            --run-id "${ATTESTATION_RUN_ID}" \
+            --workflow-path .github/workflows/qualification_attestation.yml \
+            --head-branch "${bridge_default}" \
+            --artifact-name qualification-attestation \
+            --run-attempt 1)"
+          artifact_id="$(jq -er '.artifact_id' <<<"${verification}")"
+          gh api -H "Accept: application/vnd.github+json" \
+            "repos/${BRIDGE_REPO}/actions/artifacts/${artifact_id}/zip" \
+            > "${continuation_dir}/artifact.zip"
+          python3 - "${continuation_dir}/artifact.zip" "${continuation_dir}/artifact" <<'PY'
+          import sys
+          from pathlib import Path
+          sys.path.insert(0, "scripts")
+          from release_qualification import _extract_flat_artifact_archive
+          _extract_flat_artifact_archive(
+              Path(sys.argv[1]), Path(sys.argv[2]), artifact_type="attestation"
+          )
+          PY
+          python3 scripts/stable_release_orchestrator.py \
+            resolve-attestation-continuation \
+            --run-json "${continuation_dir}/run.json" \
+            --artifacts-json "${continuation_dir}/artifacts.json" \
+            --attestation-json "${continuation_dir}/artifact/qualification-attestation.json" \
+            --attestation-run-id "${ATTESTATION_RUN_ID}" \
+            --default-branch "${bridge_default}" \
+            --output-json "${continuation_dir}/resolved.json"
+          {
+            echo "native_release_tag=$(jq -er '.native_release_tag' "${continuation_dir}/resolved.json")"
+            echo "candidate_run_id=$(jq -er '.candidate_run_id' "${continuation_dir}/resolved.json")"
+            echo "attestation_run_id=$(jq -er '.attestation_run_id' "${continuation_dir}/resolved.json")"
+          } >> "${GITHUB_OUTPUT}"
 
       - name: Resolve native-aligned candidate
         id: candidate
@@ -198,7 +258,7 @@ jobs:
   advance_stable_release:
     name: Advance each exact stable publication by one stage
     needs: prepare_release_candidate
-    if: ${{ needs.prepare_release_candidate.outputs.release_channel == 'stable' && needs.prepare_release_candidate.outputs.release_count != '0' && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.actor == github.repository_owner && github.triggering_actor == github.repository_owner)) }}
+    if: ${{ needs.prepare_release_candidate.outputs.release_channel == 'stable' && needs.prepare_release_candidate.outputs.release_count != '0' && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.actor == github.repository_owner && github.triggering_actor == github.repository_owner) || (github.event_name == 'workflow_run' && needs.prepare_release_candidate.outputs.continuation_native_release_tag != '' && needs.prepare_release_candidate.outputs.continuation_candidate_run_id != '' && needs.prepare_release_candidate.outputs.continuation_attestation_run_id != '')) }}
     runs-on: ubuntu-latest
     permissions:
       actions: read
@@ -232,6 +292,9 @@ jobs:
       - name: Advance the stable publication pipeline
         env:
           GH_TOKEN: ${{ github.token }}
+          CONTINUATION_NATIVE_RELEASE_TAG: ${{ needs.prepare_release_candidate.outputs.continuation_native_release_tag }}
+          CONTINUATION_CANDIDATE_RUN_ID: ${{ needs.prepare_release_candidate.outputs.continuation_candidate_run_id }}
+          CONTINUATION_ATTESTATION_RUN_ID: ${{ needs.prepare_release_candidate.outputs.continuation_attestation_run_id }}
           # This existing environment-scoped PAT must identify the repository
           # owner, read assets immutable-release governance, and have Actions
           # write permission on the bridge repository. The orchestrator proves
@@ -243,11 +306,20 @@ jobs:
           if [ "${DRY_RUN_REQUESTED}" = "true" ]; then
             dry_run_flag+=(--dry-run)
           fi
+          continuation_flags=()
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_run" ]; then
+            continuation_flags+=(
+              --continuation-native-release-tag "${CONTINUATION_NATIVE_RELEASE_TAG}"
+              --continuation-candidate-run-id "${CONTINUATION_CANDIDATE_RUN_ID}"
+              --continuation-attestation-run-id "${CONTINUATION_ATTESTATION_RUN_ID}"
+            )
+          fi
           python3 scripts/stable_release_orchestrator.py orchestrate-backlog \
             --provenance-list-json release-candidates.json \
             --workspace "${RUNNER_TEMP}/orchestrator" \
             --output-plan-json orchestration-plan.json \
             --step-summary-file "${GITHUB_STEP_SUMMARY}" \
+            "${continuation_flags[@]}" \
             "${dry_run_flag[@]}"
 
       - name: Upload orchestration plan

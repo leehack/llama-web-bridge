@@ -243,6 +243,24 @@ def artifact_inventory(
     return {"total_count": len(artifacts), "artifacts": artifacts}
 
 
+def continuation_attestation(
+    *, candidate_run_id: str = CANDIDATE_RUN_ID, native_release_tag: str = "v0.2.0"
+) -> dict[str, Any]:
+    payload = {key: None for key in rq.ATTESTATION_KEYS}
+    payload.update(
+        {
+            "bridge_repository": BRIDGE_REPOSITORY,
+            "candidate_run_id": candidate_run_id,
+            "candidate_run_url": (
+                f"https://github.com/{BRIDGE_REPOSITORY}/actions/runs/"
+                f"{candidate_run_id}"
+            ),
+            "native_release_tag": native_release_tag,
+        }
+    )
+    return payload
+
+
 class FakeGateway:
     """Deterministic stand-in for the live gh transport."""
 
@@ -619,6 +637,14 @@ class OrchestrationCallerAuthorizationTest(unittest.TestCase):
     def test_schedule_and_owner_manual_dispatch_are_authorized(self) -> None:
         sro.require_orchestration_caller("schedule", "github-actions", "github-actions")
         sro.require_orchestration_caller("workflow_dispatch", OWNER, OWNER)
+        sro.require_orchestration_caller(
+            "workflow_run",
+            "github-actions",
+            "github-actions",
+            continuation_native_release_tag="v0.3.0",
+            continuation_candidate_run_id=CANDIDATE_RUN_ID,
+            continuation_attestation_run_id=ATTESTATION_RUN_ID,
+        )
 
     def test_non_owner_manual_dispatch_is_rejected(self) -> None:
         for actor, triggering_actor in (("collaborator", OWNER), (OWNER, "collaborator")):
@@ -636,6 +662,102 @@ class OrchestrationCallerAuthorizationTest(unittest.TestCase):
         )
         self.assertEqual(workflow.count(owner_gate), 2)
         self.assertLess(workflow.find(owner_gate), workflow.find("environment:"))
+
+    def test_workflow_run_continuation_is_exact_and_schedule_remains(self) -> None:
+        workflow = self.WORKFLOW.read_text(encoding="utf-8")
+        self.assertIn("- cron: '23 3 * * *'", workflow)
+        self.assertIn("workflows: [Ingest Qualification Attestation]", workflow)
+        self.assertIn("types: [completed]", workflow)
+        self.assertIn("branches: [main]", workflow)
+        self.assertIn("resolve-attestation-continuation", workflow)
+        self.assertIn("--continuation-native-release-tag", workflow)
+        self.assertIn("--continuation-candidate-run-id", workflow)
+        self.assertIn("--continuation-attestation-run-id", workflow)
+        self.assertLess(
+            workflow.find("resolve-attestation-continuation"),
+            workflow.find("environment:"),
+        )
+
+    def test_workflow_run_requires_all_exact_identities(self) -> None:
+        with self.assertRaises(ContractError):
+            sro.require_orchestration_caller(
+                "workflow_run",
+                OWNER,
+                OWNER,
+                continuation_native_release_tag="v0.3.0",
+                continuation_candidate_run_id=CANDIDATE_RUN_ID,
+            )
+
+
+class AttestationContinuationTest(unittest.TestCase):
+    def test_exact_successful_ingestion_resolves_stable_pipeline(self) -> None:
+        run = run_payload(
+            run_id=ATTESTATION_RUN_ID,
+            path=sro.ATTESTATION_WORKFLOW_PATH,
+            run_name=sro.attestation_run_name(CANDIDATE_RUN_ID),
+        )
+        result = sro.resolve_attestation_continuation(
+            run=run,
+            artifact_inventory=artifact_inventory(
+                run_id=ATTESTATION_RUN_ID,
+                name=rq.ATTESTATION_ARTIFACT_NAME,
+                artifact_id=ATTESTATION_ARTIFACT_ID,
+            ),
+            attestation=continuation_attestation(),
+            expected_run_id=ATTESTATION_RUN_ID,
+            default_branch=DEFAULT_BRANCH,
+        )
+        self.assertEqual(result["candidate_run_id"], CANDIDATE_RUN_ID)
+        self.assertEqual(result["attestation_run_id"], ATTESTATION_RUN_ID)
+        self.assertEqual(result["native_release_tag"], "v0.2.0")
+        self.assertEqual(result["attestation_artifact_id"], ATTESTATION_ARTIFACT_ID)
+
+    def test_ingestion_title_and_attestation_candidate_must_match(self) -> None:
+        run = run_payload(
+            run_id=ATTESTATION_RUN_ID,
+            path=sro.ATTESTATION_WORKFLOW_PATH,
+            run_name=sro.attestation_run_name(CANDIDATE_RUN_ID),
+        )
+        with self.assertRaises(ContractError):
+            sro.resolve_attestation_continuation(
+                run=run,
+                artifact_inventory=artifact_inventory(
+                    run_id=ATTESTATION_RUN_ID,
+                    name=rq.ATTESTATION_ARTIFACT_NAME,
+                    artifact_id=ATTESTATION_ARTIFACT_ID,
+                ),
+                attestation=continuation_attestation(candidate_run_id="999"),
+                expected_run_id=ATTESTATION_RUN_ID,
+                default_branch=DEFAULT_BRANCH,
+            )
+
+    def test_non_owner_or_non_successful_ingestion_is_rejected(self) -> None:
+        for run in (
+            run_payload(
+                run_id=ATTESTATION_RUN_ID,
+                path=sro.ATTESTATION_WORKFLOW_PATH,
+                run_name=sro.attestation_run_name(CANDIDATE_RUN_ID),
+                actor="collaborator",
+            ),
+            run_payload(
+                run_id=ATTESTATION_RUN_ID,
+                path=sro.ATTESTATION_WORKFLOW_PATH,
+                run_name=sro.attestation_run_name(CANDIDATE_RUN_ID),
+                conclusion="failure",
+            ),
+        ):
+            with self.assertRaises(ContractError):
+                sro.resolve_attestation_continuation(
+                    run=run,
+                    artifact_inventory=artifact_inventory(
+                        run_id=ATTESTATION_RUN_ID,
+                        name=rq.ATTESTATION_ARTIFACT_NAME,
+                        artifact_id=ATTESTATION_ARTIFACT_ID,
+                    ),
+                    attestation=continuation_attestation(),
+                    expected_run_id=ATTESTATION_RUN_ID,
+                    default_branch=DEFAULT_BRANCH,
+                )
 
 
 class CorrelationTest(unittest.TestCase):
@@ -2151,6 +2273,49 @@ class AdvancePipelineTest(unittest.TestCase):
             )
             self.assertEqual(gateway.dispatches, [])
 
+            continuation_plan = root / "continuation-plan.json"
+            continuation_environment = {
+                "GITHUB_EVENT_NAME": "workflow_run",
+                "GITHUB_ACTOR": OWNER,
+                "GITHUB_TRIGGERING_ACTOR": OWNER,
+            }
+            with (
+                mock.patch.object(sro, "GhGateway", return_value=gateway),
+                mock.patch.dict(
+                    os.environ, continuation_environment, clear=False
+                ),
+                mock.patch("sys.stdout", io.StringIO()),
+            ):
+                continuation_result = sro.main(
+                    [
+                        "orchestrate-backlog",
+                        "--provenance-list-json",
+                        str(provenance_list),
+                        "--workspace",
+                        str(root / "continuation-workspace"),
+                        "--output-plan-json",
+                        str(continuation_plan),
+                        "--continuation-native-release-tag",
+                        second.native_release_tag,
+                        "--continuation-candidate-run-id",
+                        second_run_id,
+                        "--continuation-attestation-run-id",
+                        second_attestation_run_id,
+                    ]
+                )
+            self.assertEqual(continuation_result, 0)
+            continuation_payload = json.loads(
+                continuation_plan.read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                [item["action"] for item in continuation_payload["plans"]],
+                [
+                    sro.OrchestrationAction.WAITING_FOR_ATTESTATION.value,
+                    sro.OrchestrationAction.WAITING_FOR_PRIOR_PUBLICATION.value,
+                ],
+            )
+            self.assertEqual(gateway.dispatches, [])
+
     def test_in_flight_candidate_produces_no_second_dispatch(self) -> None:
         in_flight = run_payload(
             run_id="501",
@@ -2623,7 +2788,11 @@ class AdvancePipelineTest(unittest.TestCase):
         gateway.dispatch_workflow = dispatch  # type: ignore[assignment]
 
         plan = sro.advance_pipeline(
-            gateway, provenance=self.provenance, workspace=self.tmp
+            gateway,
+            provenance=self.provenance,
+            workspace=self.tmp,
+            required_candidate_run_id=CANDIDATE_RUN_ID,
+            required_attestation_run_id=ATTESTATION_RUN_ID,
         )
         self.assertEqual(plan.action, sro.OrchestrationAction.DISPATCH_PUBLISH)
         self.assertEqual(len(gateway.dispatches), 1)
@@ -2635,6 +2804,20 @@ class AdvancePipelineTest(unittest.TestCase):
         self.assertEqual(inputs["publish_approved"], "true")
         self.assertEqual(gateway.dispatches[0]["ref"], DEFAULT_BRANCH)
         self.assertEqual(plan.dispatched_run_id, "701")
+
+        for candidate_run_id, attestation_run_id in (
+            ("999", ATTESTATION_RUN_ID),
+            (CANDIDATE_RUN_ID, "999"),
+        ):
+            with self.assertRaises(ContractError):
+                sro.advance_pipeline(
+                    gateway,
+                    provenance=self.provenance,
+                    workspace=self.tmp,
+                    required_candidate_run_id=candidate_run_id,
+                    required_attestation_run_id=attestation_run_id,
+                )
+        self.assertEqual(len(gateway.dispatches), 1)
 
     def test_attestation_bound_to_another_candidate_fails_closed(self) -> None:
         candidate_dir = self.tmp / "candidate-src"
