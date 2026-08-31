@@ -100,31 +100,10 @@ python3 scripts/multimodal_browser_smoke.py \
 ```
 
 Heavy Qwen3-ASR and Qwen3-TTS gates run in the hosted automated qualification
-workflow, not in ordinary CI or the candidate build. For local reproduction
-against the exact artifact produced by `.github/workflows/bridge_candidate.yml`:
-
-```bash
-python3 scripts/release_qualification.py qualify \
-  --candidate-run-id <CANDIDATE_RUN_ID> \
-  --speech-model-path /path/to/Qwen3-ASR-0.6B-Q8_0.gguf \
-  --speech-mmproj-path /path/to/mmproj-Qwen3-ASR-0.6B-Q8_0.gguf \
-  --speech-audio-path /path/to/asr_en.wav \
-  --tts-model-path /path/to/Qwen3-TTS-12Hz-1.7B-Base-Q4_K_M.gguf \
-  --tts-mmproj-path /path/to/mmproj-Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf \
-  --output-attestation /private/tmp/qualification-attestation.json \
-  --output-base64 /private/tmp/qualification-attestation.b64
-```
-
-Every model, projector, and fixture path is required. Smoke children receive a
-narrow non-secret environment allowlist, each gate has a bounded timeout, and
-the full process group is terminated on timeout or cancellation. The command
-never accepts an unprovenanced local dist and rejects local harness bytes that
-do not match the exact candidate bridge commit. The release path does
-not accept this local payload: the orchestrator dispatches
-`.github/workflows/bridge_qualification.yml`, and publication accepts only its
-exact successful first-attempt run and artifact.
-
-Run individual smokes when testing isolated changes:
+workflow, not in ordinary CI or the candidate build. The combined
+`release_qualification.py qualify` command is workflow-only because it requires
+GitHub Actions and `github-hosted` runner identity. For local reproduction, run
+the individual smokes directly:
 
 ```bash
 python3 scripts/speech_to_text_browser_smoke.py \

@@ -1582,6 +1582,12 @@ def verify_qualification_run(
         expected_head_branch=default_branch,
         expected_run_attempt=1,
     )
+    _require_reachable_from_main(
+        gateway,
+        commit=qualification_source_sha,
+        default_branch=default_branch,
+        label="qualification workflow source",
+    )
     _, directory = _download_run_artifact(
         gateway,
         run_id=run_id,

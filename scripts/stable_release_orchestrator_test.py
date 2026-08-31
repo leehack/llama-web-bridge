@@ -268,6 +268,7 @@ class FakeGateway:
         self.now = now
         self.dispatches: list[dict[str, Any]] = []
         self.slept: list[float] = []
+        self.api_paths: list[str] = []
         self.json_routes.setdefault(
             f"repos/{BRIDGE_REPOSITORY}", {"default_branch": DEFAULT_BRANCH}
         )
@@ -303,6 +304,7 @@ class FakeGateway:
         )
 
     def api_json(self, path: str, *, paginate: bool = False, privileged: bool = False) -> Any:
+        self.api_paths.append(path)
         if path not in self.json_routes:
             raise ContractError(f"unmapped API path in test gateway: {path}")
         return self.json_routes[path]
@@ -2860,6 +2862,10 @@ class AdvancePipelineTest(unittest.TestCase):
         self.assertEqual(inputs["publish_approved"], "true")
         self.assertEqual(gateway.dispatches[0]["ref"], DEFAULT_BRANCH)
         self.assertEqual(plan.dispatched_run_id, "701")
+        qualification_reachability_path = (
+            f"repos/{BRIDGE_REPOSITORY}/compare/{HEAD_SHA}...{DEFAULT_BRANCH}"
+        )
+        self.assertEqual(gateway.api_paths.count(qualification_reachability_path), 2)
 
     def test_attestation_bound_to_another_candidate_fails_closed(self) -> None:
         candidate_dir = self.tmp / "candidate-src"
