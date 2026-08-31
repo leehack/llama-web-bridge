@@ -875,14 +875,16 @@ class ReleaseContractTest(unittest.TestCase):
                 "state_persistence": "success",
                 "multimodal": "success",
             },
-            "local_gates": {
-                "speech_to_text": "pending-local-qualification",
-                "text_to_speech": "pending-local-qualification",
+            "heavy_gates": {
+                "speech_to_text": "pending-automated-qualification",
+                "text_to_speech": "pending-automated-qualification",
             },
             "unproven_capabilities": {
+                "hardware_gpu_acceleration": "unavailable-on-hosted-runners",
                 "real_device_intelligibility": "unproven",
                 "real_device_playback": "unproven",
                 "speaker_reference_fidelity": "unproven",
+                "wasm32_text_to_speech": "unsupported",
             },
         }
         arguments = {

@@ -11,9 +11,11 @@ import re
 
 from release_contract import (
     ASSETS_REPOSITORY,
+    AUTOMATED_QUALIFICATION_REQUIRED,
     BRIDGE_REPOSITORY,
     ContractError,
     NATIVE_REPOSITORY,
+    UNPROVEN_CAPABILITIES,
     require_correlation_id,
     require_repository,
     require_sha256,
@@ -52,25 +54,15 @@ CAPABILITIES: dict[str, object] = {
     },
 }
 
-# Heavy real-model ASR/TTS gates exhaust hosted runners, so they are proven by a
-# digest-bound local qualification attestation instead. The manifest records that
-# requirement rather than a hosted pass that never happened; publication refuses
-# to publish this artifact unless a verified attestation binds its exact digest.
-LOCAL_ATTESTATION_REQUIRED = "required-local-attestation"
-
+# The candidate build never runs the heavy real-model ASR/TTS gates, so its
+# manifest records the requirement its own run did not satisfy. Publication
+# refuses to publish this artifact unless a verified attestation from the hosted
+# qualification run binds its exact digest.
 QUALIFICATION_GATES: dict[str, str] = {
     "state_persistence": "passed",
     "multimodal": "passed",
-    "speech_to_text": LOCAL_ATTESTATION_REQUIRED,
-    "text_to_speech": LOCAL_ATTESTATION_REQUIRED,
-}
-
-# Local qualification proves transcript, lifecycle, and WAV container
-# correctness. Nothing in any gate listens to generated audio on a real device.
-UNPROVEN_CAPABILITIES: dict[str, str] = {
-    "real_device_intelligibility": "unproven",
-    "real_device_playback": "unproven",
-    "speaker_reference_fidelity": "unproven",
+    "speech_to_text": AUTOMATED_QUALIFICATION_REQUIRED,
+    "text_to_speech": AUTOMATED_QUALIFICATION_REQUIRED,
 }
 
 _RUN_ID_RE = re.compile(r"^[1-9][0-9]*$")

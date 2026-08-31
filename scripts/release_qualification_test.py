@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""Fail-closed tests for digest-bound local qualification and attestation checks."""
+"""Fail-closed tests for digest-bound automated qualification and attestation checks."""
 
 from __future__ import annotations
 
 import argparse
-import base64
 import contextlib
 import copy
 import hashlib
@@ -34,6 +33,7 @@ NATIVE_MANIFEST_SHA = (
 NATIVE_COMMIT = "1" * 40
 CANDIDATE_RUN_ID = "32919086955"
 CANDIDATE_ARTIFACT_ID = 7
+QUALIFICATION_RUN_ID = "32919086977"
 CANDIDATE_RUN_URL = (
     f"https://github.com/{BRIDGE_REPOSITORY}/actions/runs/{CANDIDATE_RUN_ID}"
 )
@@ -154,6 +154,30 @@ def tts_phase() -> dict[str, object]:
     }
 
 
+def qualification_environment(**overrides: object) -> dict[str, object]:
+    environment = {
+        "execution": "hosted-github-actions",
+        "runner_os": "Linux",
+        "runner_arch": "X64",
+        "cpu_count": 4,
+        "total_memory_bytes": 16766181376,
+    }
+    environment.update(overrides)
+    return environment
+
+
+def qualification_identity(
+    *,
+    qualification_run_id: str = QUALIFICATION_RUN_ID,
+    qualification_source_sha: str = DEFAULT_HEAD_SHA,
+) -> dict[str, object]:
+    return {
+        "qualification_run_id": qualification_run_id,
+        "qualification_run_attempt": 1,
+        "qualification_source_sha": qualification_source_sha,
+    }
+
+
 def workflow_run(**overrides: object) -> dict[str, object]:
     run = {
         "id": int(CANDIDATE_RUN_ID),
@@ -204,7 +228,9 @@ class QualificationTest(unittest.TestCase):
             candidate_run_id=CANDIDATE_RUN_ID,
             candidate_artifact_id=7,
             candidate_run_attempt=1,
+            **qualification_identity(),
             harness_digest=self.harness_digest,
+            environment=qualification_environment(),
             speech_phase=speech_phase(),
             tts_phase=tts_phase(),
         )
@@ -237,10 +263,13 @@ class QualificationTest(unittest.TestCase):
             release_rebuild=1,
             orchestrator_correlation_id=CORRELATION_ID,
             harness_sha256=self.harness_digest,
+            **qualification_identity(),
         )
         self.assertTrue(result["verified"])
         self.assertEqual(result["candidate_fingerprint"], self.fingerprint)
         self.assertEqual(result["candidate_run_id"], CANDIDATE_RUN_ID)
+        self.assertEqual(result["qualification_run_id"], QUALIFICATION_RUN_ID)
+        self.assertEqual(result["qualification_source_sha"], DEFAULT_HEAD_SHA)
 
     def test_attestation_is_deterministic_and_canonical(self) -> None:
         again = rq.build_attestation(
@@ -248,7 +277,9 @@ class QualificationTest(unittest.TestCase):
             candidate_fingerprint=self.fingerprint,
             candidate_run_id=CANDIDATE_RUN_ID,
             candidate_artifact_id=CANDIDATE_ARTIFACT_ID,
+            **qualification_identity(),
             harness_digest=self.harness_digest,
+            environment=qualification_environment(),
             speech_phase=speech_phase(),
             tts_phase=tts_phase(),
         )
@@ -256,23 +287,35 @@ class QualificationTest(unittest.TestCase):
         self.assertEqual(text, rq.canonical_json(again))
         self.assertEqual(text, rq.canonical_json(json.loads(text)))
 
-    def test_attestation_leaves_playback_capabilities_unproven(self) -> None:
+    def test_attestation_states_every_uncovered_lane_explicitly(self) -> None:
         self.assertEqual(
             self.attestation["unproven_capabilities"],
             {
+                "hardware_gpu_acceleration": "unavailable-on-hosted-runners",
                 "real_device_intelligibility": "unproven",
                 "real_device_playback": "unproven",
                 "speaker_reference_fidelity": "unproven",
+                "wasm32_text_to_speech": "unsupported",
             },
         )
 
-    def test_attestation_records_hosted_and_local_gates_separately(self) -> None:
+    def test_attestation_records_the_hosted_environment_it_ran_in(self) -> None:
         self.assertEqual(
-            self.attestation["hosted_gates"],
+            self.attestation["qualification_environment"],
+            qualification_environment(),
+        )
+        self.assertEqual(
+            self.attestation["qualification_environment"]["execution"],
+            "hosted-github-actions",
+        )
+
+    def test_attestation_records_candidate_and_heavy_gates_separately(self) -> None:
+        self.assertEqual(
+            self.attestation["candidate_gates"],
             {"state_persistence": "passed", "multimodal": "passed"},
         )
         self.assertEqual(
-            self.attestation["local_gates"],
+            self.attestation["heavy_gates"],
             {"speech_to_text": "passed", "text_to_speech": "passed"},
         )
 
@@ -291,11 +334,13 @@ class QualificationTest(unittest.TestCase):
                 candidate_fingerprint=self.fingerprint,
                 candidate_run_id=CANDIDATE_RUN_ID,
                 candidate_artifact_id=CANDIDATE_ARTIFACT_ID,
+                **qualification_identity(),
                 harness_digest=self.harness_digest,
+                environment=qualification_environment(),
                 speech_phase=speech_phase(),
                 tts_phase=tts_phase(),
             )
-        self.assertIn("hosted pass it never ran", str(ctx.exception))
+        self.assertIn("a pass its own run never executed", str(ctx.exception))
 
     def test_candidate_directory_with_unexpected_file_rejected(self) -> None:
         (self.candidate / "extra.txt").write_text("stow", encoding="utf-8")
@@ -420,8 +465,8 @@ class QualificationTest(unittest.TestCase):
 
     def test_unexpected_nested_field_rejected(self) -> None:
         for path in (
-            ("hosted_gates", "extra_gate"),
-            ("local_gates", "extra_gate"),
+            ("candidate_gates", "extra_gate"),
+            ("heavy_gates", "extra_gate"),
             ("model_pins", "extra_pin"),
             ("unproven_capabilities", "extra_claim"),
             ("phases", "extra_phase"),
@@ -441,9 +486,12 @@ class QualificationTest(unittest.TestCase):
 
     def test_wrong_attestation_type_or_schema_rejected(self) -> None:
         for key, value in (
-            ("schema_version", 2),
+            # Schema 1 is the retired manual-attestation shape and must not be
+            # replayable against the automated pipeline.
+            ("schema_version", 1),
+            ("schema_version", 3),
             ("schema_version", True),
-            ("schema_version", 1.0),
+            ("schema_version", 2.0),
             ("attestation_type", "something-else"),
             ("harness_version", "0.0.1"),
             ("bridge_repository", "attacker/bridge"),
@@ -462,7 +510,7 @@ class QualificationTest(unittest.TestCase):
             ("release_rebuild", "1"),
             ("release_rebuild", -1),
             ("release_rebuild", True),
-            ("hosted_gates", ["state_persistence"]),
+            ("candidate_gates", ["state_persistence"]),
             ("model_pins", "none"),
             ("phases", []),
             ("unproven_capabilities", None),
@@ -474,10 +522,10 @@ class QualificationTest(unittest.TestCase):
 
     def test_non_passed_gate_rejected(self) -> None:
         for group, gate in (
-            ("hosted_gates", "state_persistence"),
-            ("hosted_gates", "multimodal"),
-            ("local_gates", "speech_to_text"),
-            ("local_gates", "text_to_speech"),
+            ("candidate_gates", "state_persistence"),
+            ("candidate_gates", "multimodal"),
+            ("heavy_gates", "speech_to_text"),
+            ("heavy_gates", "text_to_speech"),
         ):
             for status in ("failed", "skipped", "pending", "success"):
                 bad = copy.deepcopy(self.attestation)
@@ -488,8 +536,8 @@ class QualificationTest(unittest.TestCase):
 
     def test_missing_gate_rejected(self) -> None:
         for group, gate in (
-            ("hosted_gates", "multimodal"),
-            ("local_gates", "text_to_speech"),
+            ("candidate_gates", "multimodal"),
+            ("heavy_gates", "text_to_speech"),
         ):
             bad = copy.deepcopy(self.attestation)
             del bad[group][gate]
@@ -526,6 +574,21 @@ class QualificationTest(unittest.TestCase):
         with self.assertRaises(ContractError) as ctx:
             self.verify(bad)
         self.assertIn("candidate_run_url", str(ctx.exception))
+
+    def test_qualification_workflow_and_run_identity_are_bound(self) -> None:
+        cases = (
+            ("candidate_workflow_path", ".github/workflows/ci.yml"),
+            ("qualification_workflow_path", ".github/workflows/ci.yml"),
+            ("qualification_run_id", "1"),
+            ("qualification_run_attempt", 2),
+            ("qualification_run_url", f"https://github.com/{BRIDGE_REPOSITORY}/actions/runs/1"),
+            ("qualification_source_sha", "b" * 40),
+        )
+        for field, value in cases:
+            bad = copy.deepcopy(self.attestation)
+            bad[field] = value
+            with self.subTest(field=field), self.assertRaises(ContractError):
+                self.verify(bad, **qualification_identity())
 
     def test_identity_expectation_mismatch_rejected(self) -> None:
         for field, value in (
@@ -597,7 +660,7 @@ class QualificationTest(unittest.TestCase):
             self.assertIn("max_rss_bytes", str(ctx.exception))
 
     def test_phase_total_must_equal_the_sum_of_mode_totals(self) -> None:
-        for gate in rq.LOCAL_GATES:
+        for gate in rq.HEAVY_GATES:
             bad = copy.deepcopy(self.attestation)
             bad["phases"][gate]["total_ms"] += 1
             with self.subTest(gate=gate):
@@ -796,52 +859,119 @@ class QualificationTest(unittest.TestCase):
         with self.assertRaises(ContractError):
             rq._tts_phase({"modeResults": [result]}, 1, artifacts)
 
-    # --- transport --------------------------------------------------------
+    # --- hosted qualification environment ---------------------------------
 
-    def test_base64_transport_round_trip(self) -> None:
-        canonical = rq.canonical_json(self.attestation)
-        payload, decoded = rq.decode_attestation(rq.encode_attestation(canonical))
-        self.assertEqual(decoded, canonical)
-        self.assertEqual(payload, self.attestation)
+    def test_non_hosted_execution_claim_rejected(self) -> None:
+        for execution in ("local", "self-hosted", "", None):
+            with self.subTest(execution=execution):
+                bad = copy.deepcopy(self.attestation)
+                bad["qualification_environment"]["execution"] = execution
+                with self.assertRaises(ContractError) as ctx:
+                    self.verify(bad)
+                self.assertIn("execution", str(ctx.exception))
 
-    def test_transport_allows_one_terminal_newline_but_rejects_line_folding(self) -> None:
-        blob = rq.encode_attestation(rq.canonical_json(self.attestation))
-        folded = "\n".join(blob[index : index + 76] for index in range(0, len(blob), 76))
-        self.assertEqual(
-            rq.decode_attestation(blob + "\n")[1], rq.canonical_json(self.attestation)
+    def test_qualification_environment_must_be_exact_and_plausible(self) -> None:
+        cases = (
+            {"cpu_count": 0},
+            {"cpu_count": rq.MAX_QUALIFICATION_CPU_COUNT + 1},
+            {"cpu_count": "4"},
+            {"cpu_count": True},
+            {"total_memory_bytes": 0},
+            {"total_memory_bytes": rq.MAX_QUALIFICATION_MEMORY_BYTES + 1},
+            {"runner_os": ""},
+            {"runner_os": "Linux runner"},
+            {"runner_arch": 64},
         )
+        for override in cases:
+            with self.subTest(override=override):
+                bad = copy.deepcopy(self.attestation)
+                bad["qualification_environment"].update(override)
+                with self.assertRaises(ContractError):
+                    self.verify(bad)
+        for mutate in (
+            lambda env: env.pop("runner_os"),
+            lambda env: env.update({"extra": "field"}),
+        ):
+            bad = copy.deepcopy(self.attestation)
+            mutate(bad["qualification_environment"])
+            with self.assertRaises(ContractError):
+                self.verify(bad)
+        bad = copy.deepcopy(self.attestation)
+        bad["qualification_environment"] = "hosted"
         with self.assertRaises(ContractError):
-            rq.decode_attestation(folded)
-        with self.assertRaises(ContractError):
-            rq.decode_attestation(blob[:-8] + "!!!!!!!!")
+            self.verify(bad)
 
-    def test_noncanonical_transport_payload_rejected(self) -> None:
-        compact = json.dumps(self.attestation, sort_keys=True)
-        blob = base64.b64encode(compact.encode("utf-8")).decode("ascii")
+    def test_environment_probe_requires_github_hosted_runner_markers(self) -> None:
+        hosted = {
+            "GITHUB_ACTIONS": "true",
+            "RUNNER_ENVIRONMENT": "github-hosted",
+            "RUNNER_OS": "Linux",
+            "RUNNER_ARCH": "X64",
+        }
+        with mock.patch.dict(rq.os.environ, hosted, clear=True):
+            probed = rq.qualification_environment()
+        self.assertEqual(probed["execution"], "hosted-github-actions")
+        self.assertEqual(probed["runner_os"], "Linux")
+        self.assertEqual(probed["runner_arch"], "X64")
+        for missing in hosted:
+            env = {key: value for key, value in hosted.items() if key != missing}
+            with self.subTest(env=sorted(env)):
+                with mock.patch.dict(rq.os.environ, env, clear=True):
+                    with self.assertRaises(ContractError) as ctx:
+                        rq.qualification_environment()
+                self.assertIn("hosted GitHub Actions", str(ctx.exception))
+
+    def test_qualification_run_identity_comes_from_actions_environment(self) -> None:
+        environment = {
+            "GITHUB_RUN_ID": QUALIFICATION_RUN_ID,
+            "GITHUB_RUN_ATTEMPT": "1",
+            "GITHUB_SHA": DEFAULT_HEAD_SHA,
+            "GITHUB_REPOSITORY": BRIDGE_REPOSITORY,
+        }
+        with mock.patch.dict(rq.os.environ, environment, clear=True):
+            identity = rq.qualification_run_identity()
+        self.assertEqual(identity["qualification_run_id"], QUALIFICATION_RUN_ID)
+        self.assertEqual(identity["qualification_run_attempt"], 1)
+        self.assertEqual(identity["qualification_source_sha"], DEFAULT_HEAD_SHA)
+        for missing in environment:
+            incomplete = {
+                key: value for key, value in environment.items() if key != missing
+            }
+            with self.subTest(missing=missing), mock.patch.dict(
+                rq.os.environ, incomplete, clear=True
+            ), self.assertRaises(ContractError):
+                rq.qualification_run_identity()
+
+    # --- attestation artifact payload -------------------------------------
+
+    def test_canonical_attestation_artifact_round_trip(self) -> None:
+        path = self.tmp / "qualification-attestation.json"
+        path.write_text(rq.canonical_json(self.attestation), encoding="utf-8")
+        self.assertEqual(rq.load_attestation_file(path), self.attestation)
+
+    def test_noncanonical_attestation_artifact_rejected(self) -> None:
+        path = self.tmp / "qualification-attestation.json"
+        path.write_text(
+            json.dumps(self.attestation, sort_keys=True), encoding="utf-8"
+        )
         with self.assertRaises(ContractError) as ctx:
-            rq.decode_attestation(blob)
+            rq.load_attestation_file(path)
         self.assertIn("canonical", str(ctx.exception))
 
-    def test_noncanonical_base64_padding_bits_rejected(self) -> None:
-        canonical = rq.canonical_json({"a": 1})
-        blob = rq.encode_attestation(canonical)
-        self.assertTrue(blob.endswith("g=="))
-        with self.assertRaises(ContractError) as ctx:
-            rq.decode_attestation(blob[:-3] + "h==")
-        self.assertIn("base64", str(ctx.exception))
-
-    def test_reordered_transport_payload_rejected(self) -> None:
-        reordered = json.dumps(self.attestation, indent=2, sort_keys=False) + "\n"
-        blob = base64.b64encode(reordered.encode("utf-8")).decode("ascii")
+    def test_reordered_attestation_artifact_rejected(self) -> None:
+        path = self.tmp / "qualification-attestation.json"
+        path.write_text(
+            json.dumps(self.attestation, indent=2, sort_keys=False) + "\n",
+            encoding="utf-8",
+        )
         with self.assertRaises(ContractError):
-            rq.decode_attestation(blob)
+            rq.load_attestation_file(path)
 
-    def test_duplicate_keys_in_transport_payload_rejected(self) -> None:
-        blob = base64.b64encode(
-            b'{\n  "schema_version": 1,\n  "schema_version": 1\n}\n'
-        ).decode("ascii")
+    def test_duplicate_keys_in_attestation_artifact_rejected(self) -> None:
+        path = self.tmp / "qualification-attestation.json"
+        path.write_bytes(b'{\n  "schema_version": 2,\n  "schema_version": 2\n}\n')
         with self.assertRaises(ContractError) as ctx:
-            rq.decode_attestation(blob)
+            rq.load_attestation_file(path)
         self.assertIn("duplicate", str(ctx.exception).lower())
 
     def test_nonstandard_json_constants_rejected_before_schema_validation(self) -> None:
@@ -853,33 +983,26 @@ class QualificationTest(unittest.TestCase):
         with self.assertRaises(ContractError):
             rq.canonical_json({"value": float("nan")})
 
-    def test_non_object_transport_payload_rejected(self) -> None:
+    def test_non_object_attestation_artifact_rejected(self) -> None:
+        path = self.tmp / "qualification-attestation.json"
         for raw in (b"[1, 2, 3]\n", b'"text"\n', b"123\n", b"null\n", b"{ broken"):
-            blob = base64.b64encode(raw).decode("ascii")
+            path.write_bytes(raw)
             with self.assertRaises(ContractError):
-                rq.decode_attestation(blob)
+                rq.load_attestation_file(path)
 
-    def test_empty_transport_payload_rejected(self) -> None:
-        for blob in ("", "   \n  "):
-            with self.assertRaises(ContractError):
-                rq.decode_attestation(blob)
-
-    def test_oversized_transport_payload_rejected(self) -> None:
-        oversized = base64.b64encode(b"x" * (rq.MAX_ATTESTATION_BYTES + 1)).decode(
-            "ascii"
-        )
+    def test_oversized_attestation_artifact_rejected(self) -> None:
+        path = self.tmp / "qualification-attestation.json"
+        path.write_bytes(b"x" * (rq.MAX_ATTESTATION_BYTES + 1))
         with self.assertRaises(ContractError) as ctx:
-            rq.decode_attestation(oversized)
+            rq.load_attestation_file(path)
         self.assertIn("bound", str(ctx.exception))
-        with self.assertRaises(ContractError):
-            rq.encode_attestation("y" * (rq.MAX_ATTESTATION_BYTES + 1))
 
-    def test_shell_metacharacter_payload_is_never_valid(self) -> None:
-        blob = base64.b64encode(b'"; rm -rf / #').decode("ascii")
-        with self.assertRaises(ContractError):
-            rq.decode_attestation(blob)
-        with self.assertRaises(ContractError):
-            rq.decode_attestation('$(whoami)')
+    def test_non_utf8_attestation_artifact_rejected(self) -> None:
+        path = self.tmp / "qualification-attestation.json"
+        path.write_bytes(b"\xff\xfe{}")
+        with self.assertRaises(ContractError) as ctx:
+            rq.load_attestation_file(path)
+        self.assertIn("UTF-8", str(ctx.exception))
 
     # --- workflow run provenance ------------------------------------------
 
@@ -953,15 +1076,15 @@ class QualificationTest(unittest.TestCase):
                     expected_head_branch=DEFAULT_HEAD_BRANCH,
                 )
 
-    def test_attestation_run_must_be_the_ingestion_workflow(self) -> None:
+    def test_qualification_run_must_be_the_qualification_workflow(self) -> None:
         with self.assertRaises(ContractError) as ctx:
             rq.validate_workflow_run(
                 workflow_run(path=rq.CANDIDATE_WORKFLOW_PATH),
                 expected_run_id=CANDIDATE_RUN_ID,
-                expected_workflow_path=rq.ATTESTATION_WORKFLOW_PATH,
+                expected_workflow_path=rq.QUALIFICATION_WORKFLOW_PATH,
                 expected_head_branch=DEFAULT_HEAD_BRANCH,
             )
-        self.assertIn(rq.ATTESTATION_WORKFLOW_PATH, str(ctx.exception))
+        self.assertIn(rq.QUALIFICATION_WORKFLOW_PATH, str(ctx.exception))
 
     def test_run_id_and_head_sha_must_be_well_formed(self) -> None:
         for run_id in ("0", "-1", "01", "abc", ""):
@@ -1796,6 +1919,11 @@ class QualificationTest(unittest.TestCase):
         self.assertEqual(self.attestation["candidate_artifact_id"], 7)
         self.assertEqual(self.attestation["candidate_run_attempt"], 1)
 
+    def test_qualification_run_identity_bound_into_attestation(self) -> None:
+        self.assertEqual(self.attestation["qualification_run_id"], QUALIFICATION_RUN_ID)
+        self.assertEqual(self.attestation["qualification_run_attempt"], 1)
+        self.assertEqual(self.attestation["qualification_source_sha"], DEFAULT_HEAD_SHA)
+
     def test_candidate_artifact_id_mismatch_rejected(self) -> None:
         with self.assertRaises(ContractError) as ctx:
             self.verify(self.attestation, candidate_artifact_id=999)
@@ -2364,6 +2492,8 @@ class QualificationTest(unittest.TestCase):
 
     def test_harness_digest_covers_every_heavy_gate_source(self) -> None:
         scripts_dir = Path(__file__).resolve().parent
+        self.assertIn("release_contract.py", rq.HARNESS_SOURCES)
+        self.assertIn("release_publication_state.py", rq.HARNESS_SOURCES)
         baseline = rq.harness_source_sha256(scripts_dir)
         for name in rq.HARNESS_SOURCES:
             mirror = self.tmp / f"mirror-{name}"

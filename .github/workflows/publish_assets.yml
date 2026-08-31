@@ -1,8 +1,8 @@
 name: Publish Exact Qualified Bridge Assets
 
 # Parsed by scripts/stable_release_orchestrator.py so a retry can prove whether
-# this exact candidate/attestation/output publication already ran.
-run-name: publish-assets ${{ inputs.orchestrator_correlation_id }} candidate:${{ inputs.candidate_run_id }} attestation:${{ inputs.attestation_run_id }} source:${{ inputs.bridge_source_sha }} tag:${{ inputs.release_tag }} rebuild:${{ inputs.release_rebuild }}
+# this exact candidate/qualification/output publication already ran.
+run-name: publish-assets ${{ inputs.orchestrator_correlation_id }} candidate:${{ inputs.candidate_run_id }} qualification:${{ inputs.qualification_run_id }} source:${{ inputs.bridge_source_sha }} tag:${{ inputs.release_tag }} rebuild:${{ inputs.release_rebuild }}
 
 on:
   # This workflow is intentionally bridge-owned and non-reusable. A central
@@ -55,8 +55,8 @@ on:
         description: Required Build Exact Bridge Candidate run ID that produced the candidate to publish
         required: true
         type: string
-      attestation_run_id:
-        description: Required workflow run ID that ingested the maintainer qualification attestation
+      qualification_run_id:
+        description: Required Qualify Exact Bridge Candidate run ID that attested this candidate
         required: true
         type: string
 
@@ -81,12 +81,12 @@ env:
   DISPATCHING_ACTOR: ${{ github.triggering_actor }}
   REPOSITORY_OWNER: ${{ github.repository_owner }}
   CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
-  ATTESTATION_RUN_ID: ${{ inputs.attestation_run_id }}
+  QUALIFICATION_RUN_ID: ${{ inputs.qualification_run_id }}
   CANDIDATE_WORKFLOW_PATH: .github/workflows/bridge_candidate.yml
-  ATTESTATION_WORKFLOW_PATH: .github/workflows/qualification_attestation.yml
+  QUALIFICATION_WORKFLOW_PATH: .github/workflows/bridge_qualification.yml
   CANDIDATE_ARTIFACT_NAME: exact-webgpu-bridge-dist
   CANDIDATE_PREQUALIFICATION_ARTIFACT_NAME: bridge-candidate-prequalification
-  ATTESTATION_ARTIFACT_NAME: qualification-attestation
+  QUALIFICATION_ARTIFACT_NAME: qualification-attestation
   # The candidate run is the artifact's provenance of record. Its ID and URL are
   # what the candidate manifest embeds, so they -- not this publication run --
   # are the identity every publication-state comparison is made against.
@@ -142,12 +142,12 @@ jobs:
             echo "error: candidate_run_id must be a positive integer"
             exit 1
           fi
-          if [[ ! "${ATTESTATION_RUN_ID}" =~ ^[1-9][0-9]*$ ]]; then
-            echo "error: attestation_run_id must be a positive integer"
+          if [[ ! "${QUALIFICATION_RUN_ID}" =~ ^[1-9][0-9]*$ ]]; then
+            echo "error: qualification_run_id must be a positive integer"
             exit 1
           fi
-          if [ "${CANDIDATE_RUN_ID}" = "${ATTESTATION_RUN_ID}" ]; then
-            echo "error: candidate and attestation runs must be distinct runs"
+          if [ "${CANDIDATE_RUN_ID}" = "${QUALIFICATION_RUN_ID}" ]; then
+            echo "error: candidate and qualification runs must be distinct runs"
             exit 1
           fi
           if [[ ! "${BRIDGE_SOURCE_SHA}" =~ ^[0-9a-f]{40}$ ]]; then
@@ -167,8 +167,8 @@ jobs:
             exit 1
           fi
 
-  verify-candidate-and-attestation:
-    name: Verify the exact candidate and its maintainer qualification attestation
+  verify-candidate-and-qualification:
+    name: Verify the exact candidate and its automated qualification attestation
     needs: verify-publication-environment
     runs-on: ubuntu-latest
     permissions:
@@ -177,8 +177,9 @@ jobs:
     outputs:
       native_commit: ${{ steps.native.outputs.native_commit }}
       emscripten_version: ${{ steps.emscripten.outputs.emscripten_version }}
-      candidate_fingerprint: ${{ steps.attestation.outputs.candidate_fingerprint }}
+      candidate_fingerprint: ${{ steps.qualification.outputs.candidate_fingerprint }}
       candidate_artifact_id: ${{ steps.runs.outputs.candidate_artifact_id }}
+      qualification_source_sha: ${{ steps.runs.outputs.qualification_source_sha }}
     steps:
       - name: Checkout trusted candidate verification policy
         uses: actions/checkout@v4
@@ -318,7 +319,7 @@ jobs:
           echo "EMSCRIPTEN_VERSION=${EMSCRIPTEN_VERSION}" >> "${GITHUB_ENV}"
           echo "emscripten_version=${EMSCRIPTEN_VERSION}" >> "${GITHUB_OUTPUT}"
 
-      - name: Prove the candidate and attestation run identities
+      - name: Prove the candidate and qualification run identities
         id: runs
         env:
           GH_TOKEN: ${{ github.token }}
@@ -327,7 +328,7 @@ jobs:
           mkdir -p "${RUNNER_TEMP}/runs"
           bridge_default="$(gh api "repos/${BRIDGE_REPO}" --jq '.default_branch')"
           for pair in "candidate:${CANDIDATE_RUN_ID}:${CANDIDATE_WORKFLOW_PATH}:${CANDIDATE_ARTIFACT_NAME}" \
-                      "attestation:${ATTESTATION_RUN_ID}:${ATTESTATION_WORKFLOW_PATH}:${ATTESTATION_ARTIFACT_NAME}"; do
+                      "qualification:${QUALIFICATION_RUN_ID}:${QUALIFICATION_WORKFLOW_PATH}:${QUALIFICATION_ARTIFACT_NAME}"; do
             label="${pair%%:*}"; rest="${pair#*:}"
             run_id="${rest%%:*}"; rest="${rest#*:}"
             workflow_path="${rest%%:*}"; artifact_name="${rest#*:}"
@@ -362,7 +363,9 @@ jobs:
               echo "CANDIDATE_PREQUALIFICATION_ARTIFACT_ID=${prequalification_artifact_id}" >> "${GITHUB_ENV}"
               echo "candidate_artifact_id=${artifact_id}" >> "${GITHUB_OUTPUT}"
             else
-              echo "ATTESTATION_ARTIFACT_ID=${artifact_id}" >> "${GITHUB_ENV}"
+              echo "QUALIFICATION_ARTIFACT_ID=${artifact_id}" >> "${GITHUB_ENV}"
+              echo "QUALIFICATION_SOURCE_SHA=${head_sha}" >> "${GITHUB_ENV}"
+              echo "qualification_source_sha=${head_sha}" >> "${GITHUB_OUTPUT}"
             fi
             run_status="$(gh api \
               "repos/${BRIDGE_REPO}/compare/${head_sha}...${bridge_default}" \
@@ -373,7 +376,7 @@ jobs:
             fi
           done
 
-      - name: Download the exact candidate artifact and its attestation
+      - name: Download the exact candidate artifact and its qualification attestation
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -384,7 +387,7 @@ jobs:
             "repos/${BRIDGE_REPO}/actions/artifacts/${CANDIDATE_ARTIFACT_ID}/zip" \
             > "${RUNNER_TEMP}/candidate.zip"
           gh api -H "Accept: application/vnd.github+json" \
-            "repos/${BRIDGE_REPO}/actions/artifacts/${ATTESTATION_ARTIFACT_ID}/zip" \
+            "repos/${BRIDGE_REPO}/actions/artifacts/${QUALIFICATION_ARTIFACT_ID}/zip" \
             > "${RUNNER_TEMP}/attestation.zip"
           gh api -H "Accept: application/vnd.github+json" \
             "repos/${BRIDGE_REPO}/actions/artifacts/${CANDIDATE_PREQUALIFICATION_ARTIFACT_ID}/zip" \
@@ -444,7 +447,7 @@ jobs:
           (cd "${RUNNER_TEMP}/candidate" && sha256sum --check sha256sums.txt)
 
       - name: Verify the attestation binds this exact candidate and every identity
-        id: attestation
+        id: qualification
         env:
           NATIVE_COMMIT: ${{ steps.native.outputs.native_commit }}
         run: |
@@ -455,6 +458,9 @@ jobs:
             --candidate-run-id "${CANDIDATE_RUN_ID}" \
             --candidate-artifact-id "${CANDIDATE_ARTIFACT_ID}" \
             --candidate-run-attempt 1 \
+            --qualification-run-id "${QUALIFICATION_RUN_ID}" \
+            --qualification-run-attempt 1 \
+            --qualification-source-sha "${QUALIFICATION_SOURCE_SHA}" \
             --harness-dir bridge-source/scripts \
             --bridge-commit "${BRIDGE_SOURCE_SHA}" \
             --upstream-tag "${UPSTREAM_TAG}" \
@@ -509,20 +515,20 @@ jobs:
       - name: Record exact qualification conclusions
         if: always()
         env:
-          CANDIDATE_FINGERPRINT: ${{ steps.attestation.outputs.candidate_fingerprint }}
+          CANDIDATE_FINGERPRINT: ${{ steps.qualification.outputs.candidate_fingerprint }}
         run: |
           jq -n --arg correlation "${ORCHESTRATOR_CORRELATION_ID}" \
             --arg run_id "${GITHUB_RUN_ID_STRING}" --arg run_url "${GITHUB_RUN_URL}" \
             --arg candidate_run "${CANDIDATE_RUN_ID}" \
-            --arg attestation_run "${ATTESTATION_RUN_ID}" \
+            --arg qualification_run "${QUALIFICATION_RUN_ID}" \
             --arg fingerprint "${CANDIDATE_FINGERPRINT}" \
             '{schema_version:1,orchestrator_correlation_id:$correlation,
               github_run_id:$run_id,github_run_url:$run_url,
-              candidate_run_id:$candidate_run,attestation_run_id:$attestation_run,
+              candidate_run_id:$candidate_run,qualification_run_id:$qualification_run,
               candidate_fingerprint:$fingerprint,
               qualification_gates:{state_persistence:"passed",multimodal:"passed",
-                speech_to_text:"required-local-attestation",
-                text_to_speech:"required-local-attestation"}}' \
+                speech_to_text:"required-automated-qualification",
+                text_to_speech:"required-automated-qualification"}}' \
             > "${RUNNER_TEMP}/qualification-outcome.json"
 
       - name: Upload exact qualification conclusions
@@ -565,7 +571,7 @@ jobs:
 
   publish-assets:
     name: Publish or recover exact approved assets
-    needs: [verify-publication-environment, verify-candidate-and-attestation]
+    needs: [verify-publication-environment, verify-candidate-and-qualification]
     runs-on: ubuntu-latest
     permissions:
       actions: read
@@ -577,7 +583,7 @@ jobs:
     environment:
       name: ${{ needs.verify-publication-environment.outputs.environment_name }}
     env:
-      CANDIDATE_FINGERPRINT: ${{ needs.verify-candidate-and-attestation.outputs.candidate_fingerprint }}
+      CANDIDATE_FINGERPRINT: ${{ needs.verify-candidate-and-qualification.outputs.candidate_fingerprint }}
     outputs:
       publication_outcome: ${{ steps.final.outputs.publication_outcome }}
     steps:
@@ -620,9 +626,10 @@ jobs:
 
       - name: Re-verify the attestation against the candidate about to be published
         env:
-          NATIVE_COMMIT: ${{ needs.verify-candidate-and-attestation.outputs.native_commit }}
-          EMSCRIPTEN_VERSION: ${{ needs.verify-candidate-and-attestation.outputs.emscripten_version }}
-          CANDIDATE_ARTIFACT_ID: ${{ needs.verify-candidate-and-attestation.outputs.candidate_artifact_id }}
+          NATIVE_COMMIT: ${{ needs.verify-candidate-and-qualification.outputs.native_commit }}
+          EMSCRIPTEN_VERSION: ${{ needs.verify-candidate-and-qualification.outputs.emscripten_version }}
+          CANDIDATE_ARTIFACT_ID: ${{ needs.verify-candidate-and-qualification.outputs.candidate_artifact_id }}
+          QUALIFICATION_SOURCE_SHA: ${{ needs.verify-candidate-and-qualification.outputs.qualification_source_sha }}
         run: |
           set -euo pipefail
           python3 publication-policy/scripts/release_qualification.py verify-attestation \
@@ -632,6 +639,9 @@ jobs:
             --candidate-run-id "${CANDIDATE_RUN_ID}" \
             --candidate-artifact-id "${CANDIDATE_ARTIFACT_ID}" \
             --candidate-run-attempt 1 \
+            --qualification-run-id "${QUALIFICATION_RUN_ID}" \
+            --qualification-run-attempt 1 \
+            --qualification-source-sha "${QUALIFICATION_SOURCE_SHA}" \
             --harness-dir bridge-source/scripts \
             --bridge-commit "${BRIDGE_SOURCE_SHA}" \
             --upstream-tag "${UPSTREAM_TAG}" \
@@ -661,8 +671,8 @@ jobs:
         id: preflight
         env:
           GH_TOKEN: ${{ secrets.WEBGPU_BRIDGE_ASSETS_PAT }}
-          NATIVE_COMMIT: ${{ needs.verify-candidate-and-attestation.outputs.native_commit }}
-          EMSCRIPTEN_VERSION: ${{ needs.verify-candidate-and-attestation.outputs.emscripten_version }}
+          NATIVE_COMMIT: ${{ needs.verify-candidate-and-qualification.outputs.native_commit }}
+          EMSCRIPTEN_VERSION: ${{ needs.verify-candidate-and-qualification.outputs.emscripten_version }}
         run: |
           set -euo pipefail
           if [ -z "${GH_TOKEN}" ]; then
@@ -779,14 +789,14 @@ jobs:
             echo "llama.cpp: \`${UPSTREAM_TAG}@${UPSTREAM_COMMIT}\`"
             echo "Native: \`${NATIVE_REPO}@${NATIVE_RELEASE_TAG}\`"
             echo "Native manifest SHA-256: \`${NATIVE_MANIFEST_SHA256}\`"
-            echo "Emscripten: \`${{ needs.verify-candidate-and-attestation.outputs.emscripten_version }}\`"
+            echo "Emscripten: \`${{ needs.verify-candidate-and-qualification.outputs.emscripten_version }}\`"
             echo "Orchestrator correlation: \`${ORCHESTRATOR_CORRELATION_ID}\`"
             echo "Candidate build run: \`${CANDIDATE_RUN_ID_STRING}\` (${CANDIDATE_RUN_URL})"
-            echo "Attestation ingestion run: \`${ATTESTATION_RUN_ID}\`"
+            echo "Qualification run: \`${QUALIFICATION_RUN_ID}\`"
             echo "Publication run: \`${GITHUB_RUN_ID_STRING}\` (${GITHUB_RUN_URL})"
             echo "Hosted gates: state=passed, multimodal=passed"
-            echo "Local qualification attestation: ASR=passed, TTS=passed"
-            echo "Unproven: real-device playback, intelligibility, speaker-reference fidelity"
+            echo "Hosted qualification attestation: ASR=passed, TTS=passed (hosted-github-actions, CPU-only)"
+            echo "Unavailable/unproven: hardware GPU acceleration, wasm32 TTS, real-device playback, intelligibility, speaker-reference fidelity"
           } > "${RUNNER_TEMP}/asset-release-notes.md"
 
       - name: Apply only the classified ref mutation
@@ -869,8 +879,8 @@ jobs:
           GH_TOKEN: ${{ secrets.WEBGPU_BRIDGE_ASSETS_PAT }}
           ASSETS_BRANCH: ${{ steps.preflight.outputs.assets_branch }}
           INITIAL_OUTCOME: ${{ steps.preflight.outputs.initial_outcome }}
-          NATIVE_COMMIT: ${{ needs.verify-candidate-and-attestation.outputs.native_commit }}
-          EMSCRIPTEN_VERSION: ${{ needs.verify-candidate-and-attestation.outputs.emscripten_version }}
+          NATIVE_COMMIT: ${{ needs.verify-candidate-and-qualification.outputs.native_commit }}
+          EMSCRIPTEN_VERSION: ${{ needs.verify-candidate-and-qualification.outputs.emscripten_version }}
         run: |
           set -euo pipefail
           if [ -z "${GH_TOKEN}" ]; then
@@ -970,8 +980,8 @@ jobs:
               .github_run_url == env.CANDIDATE_RUN_URL and
               .candidate_fingerprint == env.CANDIDATE_FINGERPRINT and
               .qualification_gates == {state_persistence:"passed",multimodal:"passed",
-                speech_to_text:"required-local-attestation",
-                text_to_speech:"required-local-attestation"}' \
+                speech_to_text:"required-automated-qualification",
+                text_to_speech:"required-automated-qualification"}' \
             "${RUNNER_TEMP}/post-refs.json" >/dev/null 2>&1; then
             cat "${RUNNER_TEMP}/post-refs.err" >&2
             if [ "${REF_PUSH_ATTEMPTED}" = "true" ]; then
@@ -1050,8 +1060,8 @@ jobs:
                 .github_run_url == env.CANDIDATE_RUN_URL and
                 .candidate_fingerprint == env.CANDIDATE_FINGERPRINT and
                 .qualification_gates == {state_persistence:"passed",multimodal:"passed",
-                  speech_to_text:"required-local-attestation",
-                  text_to_speech:"required-local-attestation"}' \
+                  speech_to_text:"required-automated-qualification",
+                  text_to_speech:"required-automated-qualification"}' \
               "${RUNNER_TEMP}/post-release.json" >/dev/null 2>&1; then
               cat "${RUNNER_TEMP}/post-release.err" >&2
               if [ "${release_mutation_attempted}" = "true" ]; then
@@ -1157,8 +1167,8 @@ jobs:
               .github_run_url == env.CANDIDATE_RUN_URL and
               .candidate_fingerprint == env.CANDIDATE_FINGERPRINT and
               .qualification_gates == {state_persistence:"passed",multimodal:"passed",
-                speech_to_text:"required-local-attestation",
-                text_to_speech:"required-local-attestation"}' \
+                speech_to_text:"required-automated-qualification",
+                text_to_speech:"required-automated-qualification"}' \
               "${RUNNER_TEMP}/publication-outcome.json" >/dev/null 2>&1; then
             recorded_outcome=true
           fi
@@ -1191,8 +1201,8 @@ jobs:
                 orchestrator_correlation_id:$correlation,github_run_id:$run_id,
                 github_run_url:$run_url,
                 qualification_gates:{state_persistence:"passed",multimodal:"passed",
-                  speech_to_text:"required-local-attestation",
-                  text_to_speech:"required-local-attestation"}} |
+                  speech_to_text:"required-automated-qualification",
+                  text_to_speech:"required-automated-qualification"}} |
                if $mutated == null then .mutation_status="unknown" else . end' \
               > "${RUNNER_TEMP}/publication-outcome.json"
           fi

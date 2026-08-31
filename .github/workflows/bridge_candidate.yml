@@ -8,7 +8,7 @@ run-name: bridge-candidate ${{ inputs.orchestrator_correlation_id }} source:${{ 
 
 on:
   # The candidate is built exactly once, by this workflow, and is then consumed
-  # unchanged by local qualification, attestation ingestion, and publication.
+  # unchanged by automated qualification and publication.
   # Rebuilding at publication time would produce a different manifest and a
   # different digest, so no attestation could ever match the artifact published.
   # This workflow holds no publication environment, no deployment branch policy,
@@ -95,10 +95,11 @@ jobs:
       LLAMA_WEBGPU_MULTIMODAL_MODEL_CACHE: ~/.cache/llama-web-bridge/multimodal-smoke-models
       LLAMA_WEBGPU_MULTIMODAL_ARTIFACTS_DIR: /tmp/multimodal-smoke-artifacts
       LLAMA_WEBGPU_MULTIMODAL_TIMEOUT_MS: 420000
-      # Qwen3-ASR and Qwen3-TTS pins live here as the single hosted source of
-      # truth for the pinned model set even though this workflow never runs
-      # them: the heavy gates exhausted the hosted 4-vCPU/16 GB runner and are
-      # proven by digest-bound local qualification instead.
+      # Qwen3-ASR and Qwen3-TTS pins live here as the single source of truth for
+      # the pinned model set even though this workflow never runs them: the
+      # heavy gates run in bridge_qualification.yml against this exact
+      # candidate, so a build failure and a gate failure stay attributable and
+      # separately retryable.
       LLAMA_WEBGPU_SPEECH_MODEL_URL: https://huggingface.co/ggml-org/Qwen3-ASR-0.6B-GGUF/resolve/928ab958557df9aa2ef1c93e0e83c7ad0933fae2/Qwen3-ASR-0.6B-Q8_0.gguf?download=true
       LLAMA_WEBGPU_SPEECH_MODEL_SHA256: bca259818b50ca7c4c05e9bdb35a5dc04fa039653a6d6f3f0f331f96f6aa1971
       LLAMA_WEBGPU_SPEECH_MMPROJ_URL: https://huggingface.co/ggml-org/Qwen3-ASR-0.6B-GGUF/resolve/928ab958557df9aa2ef1c93e0e83c7ad0933fae2/mmproj-Qwen3-ASR-0.6B-Q8_0.gguf?download=true
@@ -371,11 +372,14 @@ jobs:
               bridge_source_sha:$bridge,release_tag:$release,
               emscripten_version:$emscripten,native_commit:$native,
               hosted_gates:{state_persistence:$state,multimodal:$multimodal},
-              local_gates:{speech_to_text:"pending-local-qualification",
-                text_to_speech:"pending-local-qualification"},
-              unproven_capabilities:{real_device_intelligibility:"unproven",
+              heavy_gates:{speech_to_text:"pending-automated-qualification",
+                text_to_speech:"pending-automated-qualification"},
+              unproven_capabilities:{
+                hardware_gpu_acceleration:"unavailable-on-hosted-runners",
+                real_device_intelligibility:"unproven",
                 real_device_playback:"unproven",
-                speaker_reference_fidelity:"unproven"}}' \
+                speaker_reference_fidelity:"unproven",
+                wasm32_text_to_speech:"unsupported"}}' \
             > "${RUNNER_TEMP}/candidate-prequalification.json"
           cat "${RUNNER_TEMP}/candidate-prequalification.json"
 

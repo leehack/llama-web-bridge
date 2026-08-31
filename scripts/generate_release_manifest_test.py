@@ -56,24 +56,26 @@ class GenerateReleaseManifestTest(unittest.TestCase):
                 manifest["github_run_url"],
                 "https://github.com/leehack/llama-web-bridge/actions/runs/123456789",
             )
-            # Heavy real-model gates never run on a hosted runner, so the
-            # manifest must state the local-attestation requirement instead of
-            # claiming a pass that no hosted job produced.
+            # Heavy real-model gates never run in the candidate workflow, so
+            # the manifest states the automated-qualification requirement
+            # instead of claiming a pass this candidate run never produced.
             self.assertEqual(
                 manifest["qualification_gates"],
                 {
                     "state_persistence": "passed",
                     "multimodal": "passed",
-                    "speech_to_text": "required-local-attestation",
-                    "text_to_speech": "required-local-attestation",
+                    "speech_to_text": "required-automated-qualification",
+                    "text_to_speech": "required-automated-qualification",
                 },
             )
             self.assertEqual(
                 manifest["unproven_capabilities"],
                 {
+                    "hardware_gpu_acceleration": "unavailable-on-hosted-runners",
                     "real_device_intelligibility": "unproven",
                     "real_device_playback": "unproven",
                     "speaker_reference_fidelity": "unproven",
+                    "wasm32_text_to_speech": "unsupported",
                 },
             )
             self.assertTrue(manifest["capabilities"]["speech_to_text"]["advertised"])

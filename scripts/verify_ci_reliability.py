@@ -662,8 +662,8 @@ def main() -> int:
     release_qualification_test = read_required(
         "scripts/release_qualification_test.py", errors
     )
-    qualification_attestation = read_required(
-        ".github/workflows/qualification_attestation.yml", errors
+    bridge_qualification = read_required(
+        ".github/workflows/bridge_qualification.yml", errors
     )
     candidate = read_required(".github/workflows/bridge_candidate.yml", errors)
     embedding_contract = read_required("scripts/embedding_json_contract_test.mjs", errors)
@@ -764,7 +764,7 @@ def main() -> int:
         ("ci.yml", ci),
         ("publish_assets.yml", publish),
         ("auto_llama_cpp_update.yml", auto_update),
-        ("qualification_attestation.yml", qualification_attestation),
+        ("bridge_qualification.yml", bridge_qualification),
         ("bridge_candidate.yml", candidate),
     ):
         require(
@@ -1073,7 +1073,7 @@ def main() -> int:
         and "git push" not in auto_update
         and "Manual development scans only prepare exact candidate inputs" in auto_update
         and "env.REQUESTED_CHANNEL != 'stable'" in auto_update,
-        "the scheduled scan must download every post-baseline stable provenance by unique asset id, reuse only the existing environment-scoped publication credential, advance stable publication only through stable_release_orchestrator.py, and keep development scans scan-only",
+        "automatic scans must download every post-baseline stable provenance by unique asset id, reuse only the existing environment-scoped publication credential, advance stable publication only through stable_release_orchestrator.py, and keep development scans scan-only",
         errors,
     )
     owner_manual_gate = (
@@ -1087,6 +1087,54 @@ def main() -> int:
         "both automatic-orchestration jobs must reject non-owner manual callers before the publication environment can expose its credential",
         errors,
     )
+    owner_workflow_run_gate = (
+        "github.event_name == 'workflow_run' && "
+        "github.event.workflow_run.conclusion == 'success' && "
+        "github.event.workflow_run.head_branch == github.event.repository.default_branch && "
+        "github.event.workflow_run.actor.login == github.repository_owner && "
+        "github.event.workflow_run.triggering_actor.login == github.repository_owner"
+    )
+    continuation_proof_name = (
+        "Prove the exact workflow continuation before environment use"
+    )
+    continuation_proof = ""
+    continuation_marker = f"      - name: {continuation_proof_name}\n"
+    if continuation_marker in auto_update:
+        continuation_proof = auto_update.split(continuation_marker, 1)[1].split(
+            "\n      - name:", 1
+        )[0]
+    require(
+        "workflow_run:" in auto_update
+        and "- Build Exact Bridge Candidate" in auto_update
+        and "- Qualify Exact Bridge Candidate" in auto_update
+        and "- Publish Exact Qualified Bridge Assets" in auto_update
+        and "types: [completed]" in auto_update
+        and auto_update.count(owner_workflow_run_gate) == 2
+        and auto_update.rfind(owner_workflow_run_gate)
+        < auto_update.find("environment:")
+        and continuation_proof
+        and "scripts/release_qualification.py verify-run" in continuation_proof
+        and "--run-attempt 1" in continuation_proof
+        and (
+            ".github/workflows/bridge_candidate.yml)\n"
+            "              artifact_name=exact-webgpu-bridge-dist"
+        )
+        in continuation_proof
+        and (
+            ".github/workflows/bridge_qualification.yml)\n"
+            "              artifact_name=qualification-attestation"
+        )
+        in continuation_proof
+        and (
+            ".github/workflows/publish_assets.yml)\n"
+            "              artifact_name=bridge-qualification-outcome"
+        )
+        in continuation_proof
+        and auto_update.find(continuation_proof_name)
+        < auto_update.find("environment:"),
+        "event-driven continuation must listen only to the three exact stage workflows and reject unsuccessful, non-default-branch, or non-owner runs before environment use",
+        errors,
+    )
     require(
         "workflow_runs" in orchestrator
         and "def parse_workflow_runs" in orchestrator
@@ -1095,7 +1143,7 @@ def main() -> int:
         and "def select_next_release_target" in orchestrator
         and "def verify_published_release" in orchestrator
         and "def verify_candidate_run" in orchestrator
-        and "def verify_attestation_run" in orchestrator
+        and "def verify_qualification_run" in orchestrator
         and "def require_immutable_release_governance" in orchestrator
         and "def require_publication_environment" in orchestrator
         and "def require_orchestration_caller" in orchestrator
@@ -1111,7 +1159,12 @@ def main() -> int:
         and "rq.load_candidate" in orchestrator
         and "rq.verify_attestation" in orchestrator
         and "OrchestrationAction.BLOCKED" in orchestrator
-        and "OrchestrationAction.WAITING_FOR_ATTESTATION" in orchestrator
+        # The routine path must dispatch qualification itself; no state may wait
+        # for a maintainer-supplied attestation.
+        and "OrchestrationAction.DISPATCH_QUALIFICATION" in orchestrator
+        and "WAITING_FOR_ATTESTATION" not in orchestrator
+        and "def qualification_run_name" in orchestrator
+        and "QUALIFICATION_DISPATCH_INPUTS" in orchestrator
         and '"--ref",' in orchestrator
         and '"--json",' in orchestrator,
         "stable_release_orchestrator must reuse the release, qualification, environment, and immutable-attestation validators for every live transition and published noop",
@@ -1185,14 +1238,14 @@ def main() -> int:
         and "release_tag:" in publish
         and "release_rebuild:" in publish
         and "assets_repo:" in publish
-        and "attestation_run_id:" in publish
+        and "qualification_run_id:" in publish
         and "REQUESTED_ASSETS_REPO: ${{ inputs.assets_repo }}" in publish
         and 'if [ "${REQUESTED_ASSETS_REPO}" != "${APPROVED_ASSETS_REPO}" ]'
         in publish
         and "release_capabilities:" not in publish
         and "publish_approved:" in publish
         and "llama_cpp.version" not in publish,
-        "bridge-owned publish_assets.yml must expose exact orchestrator/bridge/upstream/native/attestation/output inputs without a bridge pin",
+        "bridge-owned publish_assets.yml must expose exact orchestrator/bridge/upstream/native/qualification/output inputs without a bridge pin",
         errors,
     )
     require(
@@ -1282,7 +1335,8 @@ def main() -> int:
             "configured publication credential."
         )
         and "`github.token`" in readme_publication_text
-        and "after explicit dispatch approval is validated" in readme_publication_text
+        and "before entering the privileged job and again immediately before"
+        in readme_publication_text
         and "immediately before the first publication-PAT-bearing step"
         in readme_publication_text
         and "trusted workflow commit on `main`" in readme_publication_text
@@ -1343,7 +1397,7 @@ def main() -> int:
             post_approval_environment_check:first_pat_reference
         ].count("\n      - name:")
         == 1,
-        "the privileged job must revalidate environment identity, bypass, and main-branch policy with github.token after approval and immediately before its first PAT-bearing step",
+        "the privileged job must revalidate environment identity, bypass, and main-branch policy with github.token after the approval assertion and immediately before its first PAT-bearing step",
         errors,
     )
     errors.extend(
@@ -1438,10 +1492,11 @@ def main() -> int:
         )
         >= 3
         # Publication compares against the honest candidate manifest gates: the
-        # heavy gates are proven by the verified attestation, never by a hosted
-        # job, so a re-query that claims a hosted ASR/TTS pass fails closed.
+        # heavy gates are proven by the separate qualification run, never by the
+        # candidate build, so a re-query claiming a candidate-run ASR/TTS pass
+        # fails closed.
         and publish.count(
-            'speech_to_text:"required-local-attestation",'
+            'speech_to_text:"required-automated-qualification",'
         )
         >= 3
         and 'speech_to_text:"passed"' not in publish
@@ -1588,7 +1643,7 @@ def main() -> int:
         and "MULTIMODAL_CONCLUSION:" in candidate
         and "exact-webgpu-bridge-dist" in candidate
         and "bridge-candidate-prequalification" in candidate
-        and "pending-local-qualification" in candidate
+        and "pending-automated-qualification" in candidate
         and "contains(inputs.release_capabilities" not in candidate
         # The candidate workflow is the only place assets are built, and it is
         # deliberately unprivileged: no publication environment, no PAT.
@@ -1604,9 +1659,9 @@ def main() -> int:
             "DISPATCHING_ACTOR: ${{ github.triggering_actor }}" in workflow
             and "REPOSITORY_OWNER: ${{ github.repository_owner }}" in workflow
             and '"${DISPATCHING_ACTOR}" != "${REPOSITORY_OWNER}"' in workflow
-            for workflow in (candidate, qualification_attestation, publish)
+            for workflow in (candidate, bridge_qualification, publish)
         ),
-        "candidate, attestation ingestion, and publication dispatches must be restricted to the repository owner identity",
+        "candidate, qualification, and publication dispatches must be restricted to the repository owner identity",
         errors,
     )
     require(
@@ -1615,14 +1670,14 @@ def main() -> int:
         all(
             '"${GITHUB_ACTOR}" != "${REPOSITORY_OWNER}"' in workflow
             and '"${GITHUB_RUN_ATTEMPT}" != "1"' in workflow
-            for workflow in (qualification_attestation, publish)
+            for workflow in (bridge_qualification, publish)
         )
         and "workflow run actor must be" in release_qualification
         and "workflow run triggering_actor must be" in release_qualification
         and "test_wrong_workflow_run_actor_rejected" in release_qualification_test
         and "test_wrong_workflow_run_triggering_actor_rejected"
         in release_qualification_test,
-        "attestation ingestion and publication must pin the run actor and refuse replayed run attempts",
+        "qualification and publication must pin the run actor and refuse replayed run attempts",
         errors,
     )
     require(
@@ -1631,24 +1686,42 @@ def main() -> int:
         "candidate_artifact_id" in release_qualification
         and "candidate_run_attempt" in release_qualification
         and "attestation candidate_run_attempt must be 1" in release_qualification
+        and "candidate_workflow_path" in release_qualification
+        and "qualification_workflow_path" in release_qualification
+        and "qualification_run_id" in release_qualification
+        and "qualification_run_attempt" in release_qualification
+        and "qualification_source_sha" in release_qualification
         and publish.count('--candidate-artifact-id "${CANDIDATE_ARTIFACT_ID}"') == 2
         and publish.count("--candidate-run-attempt 1") == 2
+        and publish.count('--qualification-run-id "${QUALIFICATION_RUN_ID}"') == 2
+        and publish.count("--qualification-run-attempt 1") == 2
+        and publish.count(
+            '--qualification-source-sha "${QUALIFICATION_SOURCE_SHA}"'
+        )
+        == 2
         and "candidate_artifact_id: ${{ steps.runs.outputs.candidate_artifact_id }}"
         in publish
-        and "CANDIDATE_ARTIFACT_ID: ${{ needs.verify-candidate-and-attestation.outputs.candidate_artifact_id }}"
+        and "CANDIDATE_ARTIFACT_ID: ${{ needs.verify-candidate-and-qualification.outputs.candidate_artifact_id }}"
         in publish
-        # Nothing consumes an attestation artifact id across jobs; exporting one
-        # would be unverified wiring that reads as a binding.
-        and "attestation_artifact_id" not in publish
+        # Nothing exports a qualification artifact id across jobs; publication
+        # verifies and consumes it within the same job.
+        and "qualification_artifact_id:" not in publish
         and '--candidate-artifact-id "${CANDIDATE_ARTIFACT_ID}"'
-        in qualification_attestation
-        and "--candidate-run-attempt 1" in qualification_attestation
+        in bridge_qualification
+        and "--candidate-run-attempt 1" in bridge_qualification
+        and '--qualification-run-id "${GITHUB_RUN_ID}"' in bridge_qualification
+        and "--qualification-run-attempt 1" in bridge_qualification
+        and '--qualification-source-sha "${GITHUB_SHA}"' in bridge_qualification
         and "test_candidate_artifact_id_mismatch_rejected" in release_qualification_test
         and "test_candidate_run_attempt_mismatch_rejected"
         in release_qualification_test
+        and "test_qualification_workflow_and_run_identity_are_bound"
+        in release_qualification_test
+        and "test_qualification_run_identity_comes_from_actions_environment"
+        in release_qualification_test
         and "test_attestation_receipt_contains_artifact_id_and_run_attempt"
         in release_qualification_test,
-        "the attestation must bind the exact candidate artifact id and proven run attempt at every verification site",
+        "the attestation must bind the exact candidate artifact and qualification producer identities at every verification site",
         errors,
     )
     require(
@@ -1656,7 +1729,7 @@ def main() -> int:
         # a single byte is decompressed into a trusted destination.
         'artifact_type="candidate"' in publish
         and 'artifact_type="attestation"' in publish
-        and 'artifact_type="candidate"' in qualification_attestation
+        and 'artifact_type="candidate"' in bridge_qualification
         and "ALLOWED_COMPRESS_TYPES" in release_qualification
         and "MAX_COMPRESSION_RATIO" in release_qualification
         and "MAX_CANDIDATE_MEMBER_BYTES" in release_qualification
@@ -1757,7 +1830,7 @@ def main() -> int:
         and "Run durable state persistence gate" not in publish
         and "Run durable multimodal gate" not in publish
         and "scripts/generate_release_manifest.py" not in publish
-        and "Prove the candidate and attestation run identities" in publish
+        and "Prove the candidate and qualification run identities" in publish
         and "scripts/release_qualification.py verify-run" in publish
         and publish.count("scripts/release_qualification.py verify-attestation") == 2
         and "--workflow-path \"${workflow_path}\"" in publish
@@ -1766,12 +1839,12 @@ def main() -> int:
         # not pinned to a moving head that an unrelated push would invalidate.
         and 'repos/${BRIDGE_REPO}/compare/${head_sha}...${bridge_default}' in publish
         and 'repos/${BRIDGE_REPO}/compare/${head_sha}...${bridge_default}'
-        in qualification_attestation
+        in bridge_qualification
         and "CANDIDATE_WORKFLOW_PATH: .github/workflows/bridge_candidate.yml" in publish
-        and "ATTESTATION_WORKFLOW_PATH: .github/workflows/qualification_attestation.yml"
+        and "QUALIFICATION_WORKFLOW_PATH: .github/workflows/bridge_qualification.yml"
         in publish
         and 'actions/artifacts/${CANDIDATE_ARTIFACT_ID}/zip' in publish
-        and 'actions/artifacts/${ATTESTATION_ARTIFACT_ID}/zip' in publish
+        and 'actions/artifacts/${QUALIFICATION_ARTIFACT_ID}/zip' in publish
         and "?per_page=100" in publish
         and "run_attempt_args=(--run-attempt 1)" in publish
         and "_extract_flat_artifact_archive" in publish
@@ -1802,9 +1875,24 @@ def main() -> int:
         and "harness_source_sha256" in release_qualification
         and "require_harness_matches_bridge_source" in release_qualification
         and "REQUIRED_UNPROVEN_CAPABILITIES" in release_qualification
-        and "real_device_intelligibility" in release_qualification
-        and "real_device_playback" in release_qualification
-        and "speaker_reference_fidelity" in release_qualification
+        and "qualification_environment" in release_qualification
+        and "hosted-github-actions" in release_qualification
+        and 'os.environ.get("GITHUB_ACTIONS") != "true"'
+        in release_qualification
+        and 'os.environ.get("RUNNER_ENVIRONMENT") != "github-hosted"'
+        in release_qualification
+        and '"release_contract.py"' in release_qualification
+        and '"release_publication_state.py"' in release_qualification
+        and all(
+            lane in release_contract
+            for lane in (
+                "hardware_gpu_acceleration",
+                "real_device_intelligibility",
+                "real_device_playback",
+                "speaker_reference_fidelity",
+                "wasm32_text_to_speech",
+            )
+        )
         # The heavy gates must prove every required memory/runtime mode and
         # must never silently reach the network for a model or fixture.
         and '("wasm32", "direct")' in release_qualification
@@ -1845,8 +1933,16 @@ def main() -> int:
         in release_qualification_test
         and "test_local_harness_must_match_the_exact_bridge_source"
         in release_qualification_test
-        and "test_noncanonical_transport_payload_rejected" in release_qualification_test
-        and "test_duplicate_keys_in_transport_payload_rejected"
+        and "test_noncanonical_attestation_artifact_rejected"
+        in release_qualification_test
+        and "test_duplicate_keys_in_attestation_artifact_rejected"
+        in release_qualification_test
+        # Automatic publication must be unable to accept an attestation that was
+        # not produced on hosted infrastructure.
+        and "test_non_hosted_execution_claim_rejected" in release_qualification_test
+        and "test_environment_probe_requires_github_hosted_runner_markers"
+        in release_qualification_test
+        and "test_harness_digest_covers_every_heavy_gate_source"
         in release_qualification_test
         and "test_nonstandard_json_constants_rejected_before_schema_validation"
         in release_qualification_test
@@ -1854,27 +1950,32 @@ def main() -> int:
         in release_qualification_test
         and "test_candidate_manifest_must_not_claim_a_hosted_heavy_gate_pass"
         in release_qualification_test
-        and "attestation_base64:" in qualification_attestation
-        and "attestation_json:" not in qualification_attestation
-        and "Validate maintainer and repository boundary" in qualification_attestation
+        # The routine path takes no hand-produced attestation: the workflow runs
+        # the gates itself and never accepts a transported payload.
+        and "attestation_base64:" not in bridge_qualification
+        and "attestation_json:" not in bridge_qualification
+        and "decode-attestation" not in bridge_qualification
+        and "Validate dispatcher and repository boundary" in bridge_qualification
         and '"${DISPATCHING_ACTOR}" != "${REPOSITORY_OWNER}"'
-        in qualification_attestation
+        in bridge_qualification
         and "Prove the candidate run identity and artifact uniqueness"
-        in qualification_attestation
-        and "scripts/release_qualification.py verify-run" in qualification_attestation
-        and "scripts/release_qualification.py decode-attestation"
-        in qualification_attestation
+        in bridge_qualification
+        and "scripts/release_qualification.py verify-run" in bridge_qualification
+        and "release_qualification.py qualify" in bridge_qualification
         and "scripts/release_qualification.py verify-attestation"
-        in qualification_attestation
-        and "Checkout exact candidate harness source" in qualification_attestation
-        and "--harness-dir candidate-source/scripts" in qualification_attestation
-        and "?per_page=100" in qualification_attestation
-        and "--run-attempt 1" in qualification_attestation
+        in bridge_qualification
+        and "Checkout exact candidate harness source" in bridge_qualification
+        and "--harness-dir candidate-source/scripts" in bridge_qualification
+        and 'candidate_correlation_id="$(jq -er' in bridge_qualification
+        and '"${candidate_correlation_id}" != "${ORCHESTRATOR_CORRELATION_ID}"'
+        in bridge_qualification
+        and "?per_page=100" in bridge_qualification
+        and "--run-attempt 1" in bridge_qualification
         and 'actions/artifacts/${CANDIDATE_ARTIFACT_ID}/zip'
-        in qualification_attestation
-        and "Upload verified qualification attestation" in qualification_attestation
-        and "WEBGPU_BRIDGE_ASSETS_PAT" not in qualification_attestation,
-        "CI, candidate, ingestion, and publication must enforce the digest-bound qualification contract with regression coverage for replay and malformed payloads",
+        in bridge_qualification
+        and "Upload verified qualification attestation" in bridge_qualification
+        and "WEBGPU_BRIDGE_ASSETS_PAT" not in bridge_qualification,
+        "CI, candidate, qualification, and publication must enforce the digest-bound qualification contract with regression coverage for replay and malformed payloads",
         errors,
     )
     require(
@@ -1906,12 +2007,12 @@ def main() -> int:
         and '"qualification_gates": QUALIFICATION_GATES' in read_required(
             "scripts/generate_release_manifest.py", errors
         )
-        # The manifest must state the local-attestation requirement rather than
-        # claim a hosted heavy-gate pass that no hosted job ever produced.
-        and '"speech_to_text": LOCAL_ATTESTATION_REQUIRED' in read_required(
+        # The manifest must state the automated-qualification requirement rather
+        # than claim a heavy-gate pass the candidate build never executed.
+        and '"speech_to_text": AUTOMATED_QUALIFICATION_REQUIRED' in read_required(
             "scripts/generate_release_manifest.py", errors
         )
-        and '"text_to_speech": LOCAL_ATTESTATION_REQUIRED' in read_required(
+        and '"text_to_speech": AUTOMATED_QUALIFICATION_REQUIRED' in read_required(
             "scripts/generate_release_manifest.py", errors
         )
         and '"unproven_capabilities": UNPROVEN_CAPABILITIES' in read_required(

@@ -14,7 +14,7 @@ from pathlib import Path
 
 from generate_release_manifest import (
     ARTIFACTS,
-    LOCAL_ATTESTATION_REQUIRED,
+    AUTOMATED_QUALIFICATION_REQUIRED,
     generate,
 )
 from release_contract import ContractError
@@ -561,7 +561,7 @@ class ReleasePublicationStateTest(unittest.TestCase):
         self.assertEqual(outcome["github_run_id"], "123456789")
         self.assertEqual(
             outcome["qualification_gates"]["text_to_speech"],
-            LOCAL_ATTESTATION_REQUIRED,
+            AUTOMATED_QUALIFICATION_REQUIRED,
         )
         with self.assertRaises(ContractError):
             mutation_unknown_outcome(self.candidate, self.identity, "attacker-value")
@@ -615,11 +615,11 @@ class ReleasePublicationStateTest(unittest.TestCase):
         self.assertEqual(outcome["qualification_gates"]["multimodal"], "passed")
         self.assertEqual(
             outcome["qualification_gates"]["speech_to_text"],
-            LOCAL_ATTESTATION_REQUIRED,
+            AUTOMATED_QUALIFICATION_REQUIRED,
         )
         self.assertEqual(
             outcome["qualification_gates"]["text_to_speech"],
-            LOCAL_ATTESTATION_REQUIRED,
+            AUTOMATED_QUALIFICATION_REQUIRED,
         )
 
     def test_ambiguous_release_create_failure_is_recovered_after_exact_requery(self) -> None:

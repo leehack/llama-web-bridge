@@ -27,6 +27,24 @@ BRIDGE_REPOSITORY = "leehack/llama-web-bridge"
 ASSETS_REPOSITORY = "leehack/llama-web-bridge-assets"
 NATIVE_REPOSITORY = "leehack/llamadart-native"
 NATIVE_HOOK_CONTRACT_VERSION = 1
+
+# The heavy real-model ASR/TTS gates run in their own hosted qualification run
+# rather than inside the candidate build, so a candidate declares the pending
+# requirement and a published manifest declares the satisfied requirement.
+AUTOMATED_QUALIFICATION_REQUIRED = "required-automated-qualification"
+AUTOMATED_QUALIFICATION_PENDING = "pending-automated-qualification"
+
+# Qualification proves transcript, lifecycle, and WAV container correctness on a
+# hosted runner. Nothing listens to generated audio on a real device, hosted
+# runners expose no real GPU, and the pinned Qwen3-TTS pair is memory64-only.
+UNPROVEN_CAPABILITIES: dict[str, str] = {
+    "hardware_gpu_acceleration": "unavailable-on-hosted-runners",
+    "real_device_intelligibility": "unproven",
+    "real_device_playback": "unproven",
+    "speaker_reference_fidelity": "unproven",
+    "wasm32_text_to_speech": "unsupported",
+}
+
 # GitHub exposes exactly three supported signals that a published release can
 # never be moved: repository immutable-release governance
 # (`GET /repos/{owner}/{repo}/immutable-releases`), the release object's own
@@ -804,15 +822,11 @@ def validate_candidate_prequalification(
             "state_persistence": "success",
             "multimodal": "success",
         },
-        "local_gates": {
-            "speech_to_text": "pending-local-qualification",
-            "text_to_speech": "pending-local-qualification",
+        "heavy_gates": {
+            "speech_to_text": AUTOMATED_QUALIFICATION_PENDING,
+            "text_to_speech": AUTOMATED_QUALIFICATION_PENDING,
         },
-        "unproven_capabilities": {
-            "real_device_intelligibility": "unproven",
-            "real_device_playback": "unproven",
-            "speaker_reference_fidelity": "unproven",
-        },
+        "unproven_capabilities": dict(UNPROVEN_CAPABILITIES),
     }
     if set(payload) != set(expected):
         raise ContractError(

@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Artifact-driven daily stable Web bridge release state machine.
+"""Artifact-driven automatic stable Web bridge release state machine.
 
-The scheduled scan resolves every stable native release after the immutable
-automation baseline, then idempotently advances each three-stage pipeline:
+Each event-driven scan resolves every stable native release after the immutable
+automation baseline, then idempotently advances each three-stage pipeline. A
+daily scheduled scan provides repair fallback:
 
 1. Build Exact Bridge Candidate      (.github/workflows/bridge_candidate.yml)
-2. Ingest Qualification Attestation  (.github/workflows/qualification_attestation.yml)
+2. Qualify Exact Bridge Candidate    (.github/workflows/bridge_qualification.yml)
 3. Publish Exact Qualified Assets    (.github/workflows/publish_assets.yml)
 
 Every transition is proven from downloaded artifact and release bytes. The live
@@ -14,9 +15,11 @@ carried by a deterministic ``run-name`` that each workflow renders from its own
 exact inputs, and every named run is then re-proven against its run record, its
 unique artifact, and that artifact's contents before it advances anything.
 
-Stage 2 has no runner: no self-hosted machine exists and the heavy real-model
-gates cannot run hosted. The orchestrator therefore waits indefinitely and
-fail-closed for a maintainer-produced attestation; it never synthesizes one.
+Every stage is dispatched by this orchestrator, so a discovered eligible native
+release reaches a verified immutable Web asset release with no manual step.
+Progression after discovery is event-driven: each stage's completion wakes the
+next scan. The daily schedule also discovers releases and provides idempotent
+repair fallback.
 """
 
 from __future__ import annotations
@@ -62,15 +65,15 @@ import release_qualification as rq
 
 
 CANDIDATE_WORKFLOW_FILE = "bridge_candidate.yml"
-ATTESTATION_WORKFLOW_FILE = "qualification_attestation.yml"
+QUALIFICATION_WORKFLOW_FILE = "bridge_qualification.yml"
 PUBLISH_WORKFLOW_FILE = "publish_assets.yml"
 CANDIDATE_WORKFLOW_PATH = rq.CANDIDATE_WORKFLOW_PATH
-ATTESTATION_WORKFLOW_PATH = rq.ATTESTATION_WORKFLOW_PATH
+QUALIFICATION_WORKFLOW_PATH = rq.QUALIFICATION_WORKFLOW_PATH
 PUBLISH_WORKFLOW_PATH = f".github/workflows/{PUBLISH_WORKFLOW_FILE}"
 SUPPORTED_PIPELINE_WORKFLOW_PATHS = frozenset(
     {
         CANDIDATE_WORKFLOW_PATH,
-        ATTESTATION_WORKFLOW_PATH,
+        QUALIFICATION_WORKFLOW_PATH,
         PUBLISH_WORKFLOW_PATH,
     }
 )
@@ -93,6 +96,11 @@ CANDIDATE_DISPATCH_INPUTS = (
     "assets_immutable_releases_enabled",
 )
 
+QUALIFICATION_DISPATCH_INPUTS = (
+    "orchestrator_correlation_id",
+    "candidate_run_id",
+)
+
 PUBLISH_DISPATCH_INPUTS = (
     "orchestrator_correlation_id",
     "bridge_source_sha",
@@ -105,7 +113,7 @@ PUBLISH_DISPATCH_INPUTS = (
     "assets_repo",
     "publish_approved",
     "candidate_run_id",
-    "attestation_run_id",
+    "qualification_run_id",
 )
 
 # Every dispatch is checked against these before it leaves the process. GitHub
@@ -114,6 +122,7 @@ PUBLISH_DISPATCH_INPUTS = (
 # tuples are byte-for-byte the workflows' declared inputs.
 WORKFLOW_DISPATCH_INPUTS: Mapping[str, tuple[str, ...]] = {
     CANDIDATE_WORKFLOW_FILE: CANDIDATE_DISPATCH_INPUTS,
+    QUALIFICATION_WORKFLOW_FILE: QUALIFICATION_DISPATCH_INPUTS,
     PUBLISH_WORKFLOW_FILE: PUBLISH_DISPATCH_INPUTS,
 }
 
@@ -130,7 +139,7 @@ DISPATCH_READBACK_DELAY_SECONDS = 5.0
 
 # v0.2.0-1 was published as the first verified immutable automatic-publication
 # baseline (Web assets v0.1.39). Older native releases belong to the historical
-# pre-automation series and must not be silently rebuilt by the daily backlog.
+# pre-automation series and must not be silently rebuilt by backlog scans.
 STABLE_AUTOMATION_BASELINE_NATIVE_TAG = "v0.2.0-1"
 STABLE_AUTOMATION_BASELINE_PUBLISHED_AT = "2026-08-25T08:57:12Z"
 
@@ -150,7 +159,7 @@ _CANDIDATE_RUN_NAME_RE = re.compile(
 )
 _PUBLISH_RUN_NAME_RE = re.compile(
     r"publish-assets (?P<correlation_id>\S+) candidate:(?P<candidate_run_id>\S+)"
-    r" attestation:(?P<attestation_run_id>\S+) source:(?P<bridge_source_sha>\S+)"
+    r" qualification:(?P<qualification_run_id>\S+) source:(?P<bridge_source_sha>\S+)"
     r" tag:(?P<release_tag>\S+) rebuild:(?P<release_rebuild>\S+)"
 )
 
@@ -213,23 +222,27 @@ def require_stable_provenance(provenance: NativeProvenance) -> NativeProvenance:
 def require_orchestration_caller(
     event_name: str, actor: str, triggering_actor: str
 ) -> None:
-    """Keep manual callers from turning the environment PAT into a deputy.
+    """Keep untrusted callers from turning the environment PAT into a deputy.
 
     Scheduled executions are authorized by the trusted default-branch workflow.
-    A manual dispatch additionally requires both GitHub actor identities to be
-    the repository owner before any environment-scoped credential is used.
+    A workflow_run continuation and a manual dispatch additionally require both
+    GitHub actor identities to be the repository owner before any
+    environment-scoped credential is used. A workflow_run event always executes
+    the default-branch workflow definition, so the continuation cannot be
+    redefined from a pull request or a fork.
     """
     if event_name == "schedule":
         return
     if (
-        event_name == "workflow_dispatch"
+        event_name in ("workflow_dispatch", "workflow_run")
         and actor == REPOSITORY_OWNER
         and triggering_actor == REPOSITORY_OWNER
     ):
         return
     raise ContractError(
-        "stable orchestration requires a schedule event or an owner-initiated "
-        "workflow_dispatch with owner actor and triggering_actor"
+        "stable orchestration requires a schedule event, or an owner-initiated "
+        "workflow_dispatch or workflow_run continuation with owner actor and "
+        "triggering_actor"
     )
 
 
@@ -272,9 +285,9 @@ class PublishedRelease:
 class OrchestrationAction(str, Enum):
     NOOP = "noop"
     IN_FLIGHT = "in_flight"
-    WAITING_FOR_ATTESTATION = "waiting_for_attestation"
     WAITING_FOR_PRIOR_PUBLICATION = "waiting_for_prior_publication"
     DISPATCH_CANDIDATE = "dispatch_candidate"
+    DISPATCH_QUALIFICATION = "dispatch_qualification"
     DISPATCH_PUBLISH = "dispatch_publish"
     BLOCKED = "blocked"
 
@@ -287,7 +300,7 @@ class OrchestrationPlan:
     correlation_id: str
     release_target: ReleaseTarget | None = None
     candidate_run_id: str | None = None
-    attestation_run_id: str | None = None
+    qualification_run_id: str | None = None
     in_flight_workflow: str | None = None
     in_flight_run_id: str | None = None
     dispatch_workflow: str | None = None
@@ -318,7 +331,7 @@ class OrchestrationPlan:
             "release_tag": target.release_tag if target else None,
             "release_rebuild": target.release_rebuild if target else None,
             "candidate_run_id": self.candidate_run_id,
-            "attestation_run_id": self.attestation_run_id,
+            "qualification_run_id": self.qualification_run_id,
             "in_flight_workflow": self.in_flight_workflow,
             "in_flight_run_id": self.in_flight_run_id,
             "dispatch_workflow": self.dispatch_workflow,
@@ -338,8 +351,8 @@ class PipelineObservation:
     fresh_binding: PipelineBinding | None = None
     candidate_in_flight_run_id: str | None = None
     candidate_run_id: str | None = None
-    attestation_in_flight_run_id: str | None = None
-    attestation_run_id: str | None = None
+    qualification_in_flight_run_id: str | None = None
+    qualification_run_id: str | None = None
     publish_in_flight_run_id: str | None = None
     publish_succeeded_run_id: str | None = None
     publish_retry: bool = False
@@ -353,9 +366,9 @@ class PipelineObservation:
 def compute_correlation_id(provenance: NativeProvenance) -> str:
     """Derive one stable pipeline identity from the native release alone.
 
-    Deliberately independent of the bridge source commit: main advances daily,
-    and a correlation that moved with it would orphan an in-flight candidate and
-    dispatch a duplicate every night.
+    Deliberately independent of the bridge source commit: main advances while a
+    pipeline is in flight, and a correlation that moved with it would orphan the
+    candidate and let a later event or repair scan dispatch a duplicate.
     """
     raw = (
         f"auto-stable-{provenance.native_release_tag}"
@@ -374,31 +387,32 @@ def candidate_run_name(correlation_id: str, binding: PipelineBinding) -> str:
     )
 
 
-def attestation_run_name(candidate_run_id: str) -> str:
+def qualification_run_name(correlation_id: str, candidate_run_id: str) -> str:
+    require_correlation_id(correlation_id)
     if _RUN_ID_RE.fullmatch(candidate_run_id) is None:
         raise ContractError("candidate_run_id must be a positive integer")
     return _require_run_name(
-        f"qualification-attestation candidate:{candidate_run_id}"
+        f"bridge-qualification {correlation_id} candidate:{candidate_run_id}"
     )
 
 
 def publish_run_name(
     correlation_id: str,
     candidate_run_id: str,
-    attestation_run_id: str,
+    qualification_run_id: str,
     binding: PipelineBinding,
 ) -> str:
     require_correlation_id(correlation_id)
     for label, value in (
         ("candidate_run_id", candidate_run_id),
-        ("attestation_run_id", attestation_run_id),
+        ("qualification_run_id", qualification_run_id),
     ):
         if _RUN_ID_RE.fullmatch(value) is None:
             raise ContractError(f"{label} must be a positive integer")
     return _require_run_name(
         f"publish-assets {correlation_id}"
         f" candidate:{candidate_run_id}"
-        f" attestation:{attestation_run_id}"
+        f" qualification:{qualification_run_id}"
         f" source:{binding.bridge_source_sha}"
         f" tag:{binding.release_tag}"
         f" rebuild:{binding.release_rebuild}"
@@ -482,12 +496,12 @@ def parse_publish_run_name(
     match = _PUBLISH_RUN_NAME_RE.fullmatch(run_name)
     if match is None or match.group("correlation_id") != correlation_id:
         return None
-    for label in ("candidate_run_id", "attestation_run_id"):
+    for label in ("candidate_run_id", "qualification_run_id"):
         if _RUN_ID_RE.fullmatch(match.group(label)) is None:
             raise ContractError(f"publish run name has a malformed {label}")
     return (
         match.group("candidate_run_id"),
-        match.group("attestation_run_id"),
+        match.group("qualification_run_id"),
         _parse_binding_fields(match, "publish run name"),
     )
 
@@ -565,8 +579,8 @@ def select_stable_native_backlog(
     The publication timestamp defines which releases belong to automatic
     orchestration; the tag ordering independently rejects a post-baseline
     rollback. This lets a later release receive its candidate while an earlier
-    release honestly waits for local qualification, without backfilling the
-    mutable historical release series.
+    release advances through qualification, without backfilling the mutable
+    historical release series.
     """
     if _UTC_TIMESTAMP_RE.fullmatch(baseline_published_at) is None:
         raise ContractError("stable automation baseline timestamp is not canonical")
@@ -1550,7 +1564,7 @@ def verify_candidate_run(
     )
 
 
-def verify_attestation_run(
+def verify_qualification_run(
     gateway: Gateway,
     *,
     run_id: str,
@@ -1561,10 +1575,10 @@ def verify_attestation_run(
     workspace: Path,
 ) -> dict[str, Any]:
     run = gateway.api_json(f"repos/{BRIDGE_REPOSITORY}/actions/runs/{run_id}")
-    rq.validate_workflow_run(
+    qualification_source_sha = rq.validate_workflow_run(
         run,
         expected_run_id=run_id,
-        expected_workflow_path=ATTESTATION_WORKFLOW_PATH,
+        expected_workflow_path=QUALIFICATION_WORKFLOW_PATH,
         expected_head_branch=default_branch,
         expected_run_attempt=1,
     )
@@ -1578,9 +1592,7 @@ def verify_attestation_run(
     attestation_path = directory / "qualification-attestation.json"
     if not attestation_path.is_file():
         raise ContractError("attestation artifact does not contain the canonical payload")
-    attestation = rq.parse_attestation_json(
-        attestation_path.read_text(encoding="utf-8")
-    )
+    attestation = rq.load_attestation_file(attestation_path)
     return rq.verify_attestation(
         attestation=attestation,
         candidate_dir=candidate.directory,
@@ -1588,6 +1600,9 @@ def verify_attestation_run(
         candidate_run_id=candidate.run_id,
         candidate_artifact_id=candidate.artifact_id,
         candidate_run_attempt=1,
+        qualification_run_id=run_id,
+        qualification_run_attempt=1,
+        qualification_source_sha=qualification_source_sha,
         bridge_source_sha=candidate.binding.bridge_source_sha,
         upstream_tag=provenance.upstream_tag,
         upstream_commit=provenance.upstream_commit,
@@ -1658,12 +1673,21 @@ def _dispatch_inputs_for_candidate(
     }
 
 
+def _dispatch_inputs_for_qualification(
+    correlation_id: str, candidate_run_id: str
+) -> dict[str, str]:
+    return {
+        "orchestrator_correlation_id": correlation_id,
+        "candidate_run_id": candidate_run_id,
+    }
+
+
 def _dispatch_inputs_for_publish(
     provenance: NativeProvenance,
     correlation_id: str,
     binding: PipelineBinding,
     candidate_run_id: str,
-    attestation_run_id: str,
+    qualification_run_id: str,
 ) -> dict[str, str]:
     return {
         "orchestrator_correlation_id": correlation_id,
@@ -1676,7 +1700,7 @@ def _dispatch_inputs_for_publish(
         "release_rebuild": str(binding.release_rebuild),
         "assets_repo": ASSETS_REPOSITORY,
         "candidate_run_id": candidate_run_id,
-        "attestation_run_id": attestation_run_id,
+        "qualification_run_id": qualification_run_id,
     }
 
 
@@ -1745,33 +1769,40 @@ def plan_pipeline(
             "a successful candidate run must carry its proven pipeline binding"
         )
 
-    if observation.attestation_in_flight_run_id is not None:
+    if observation.qualification_in_flight_run_id is not None:
         return OrchestrationPlan(
             action=OrchestrationAction.IN_FLIGHT,
             reason=(
-                f"attestation ingestion run {observation.attestation_in_flight_run_id} "
+                f"qualification run {observation.qualification_in_flight_run_id} "
                 "is still running"
             ),
             provenance=provenance,
             correlation_id=correlation_id,
             release_target=binding.release_target,
             candidate_run_id=observation.candidate_run_id,
-            in_flight_workflow=ATTESTATION_WORKFLOW_FILE,
-            in_flight_run_id=observation.attestation_in_flight_run_id,
+            in_flight_workflow=QUALIFICATION_WORKFLOW_FILE,
+            in_flight_run_id=observation.qualification_in_flight_run_id,
         )
 
-    if observation.attestation_run_id is None:
+    if observation.qualification_run_id is None:
         return OrchestrationPlan(
-            action=OrchestrationAction.WAITING_FOR_ATTESTATION,
+            action=OrchestrationAction.DISPATCH_QUALIFICATION,
             reason=(
                 f"candidate run {observation.candidate_run_id} is built and proven; "
-                "no runner can produce the real-model qualification, so publication "
-                "waits for the maintainer to ingest an exact attestation"
+                "dispatching exactly one hosted qualification run for the heavy "
+                "real-model gates"
             ),
             provenance=provenance,
             correlation_id=correlation_id,
             release_target=binding.release_target,
             candidate_run_id=observation.candidate_run_id,
+            dispatch_workflow=QUALIFICATION_WORKFLOW_FILE,
+            dispatch_run_name=qualification_run_name(
+                correlation_id, observation.candidate_run_id
+            ),
+            dispatch_inputs=_dispatch_inputs_for_qualification(
+                correlation_id, observation.candidate_run_id
+            ),
         )
 
     if observation.publish_in_flight_run_id is not None:
@@ -1784,7 +1815,7 @@ def plan_pipeline(
             correlation_id=correlation_id,
             release_target=binding.release_target,
             candidate_run_id=observation.candidate_run_id,
-            attestation_run_id=observation.attestation_run_id,
+            qualification_run_id=observation.qualification_run_id,
             in_flight_workflow=PUBLISH_WORKFLOW_FILE,
             in_flight_run_id=observation.publish_in_flight_run_id,
         )
@@ -1800,19 +1831,19 @@ def plan_pipeline(
         reason=(
             f"{'retrying publication of' if observation.publish_retry else 'publishing'}"
             f" {binding.release_tag} from the proven candidate "
-            f"{observation.candidate_run_id} and attestation "
-            f"{observation.attestation_run_id}"
+            f"{observation.candidate_run_id} and qualification "
+            f"{observation.qualification_run_id}"
         ),
         provenance=provenance,
         correlation_id=correlation_id,
         release_target=binding.release_target,
         candidate_run_id=observation.candidate_run_id,
-        attestation_run_id=observation.attestation_run_id,
+        qualification_run_id=observation.qualification_run_id,
         dispatch_workflow=PUBLISH_WORKFLOW_FILE,
         dispatch_run_name=publish_run_name(
             correlation_id,
             observation.candidate_run_id,
-            observation.attestation_run_id,
+            observation.qualification_run_id,
             binding,
         ),
         dispatch_inputs=_dispatch_inputs_for_publish(
@@ -1820,7 +1851,7 @@ def plan_pipeline(
             correlation_id,
             binding,
             observation.candidate_run_id,
-            observation.attestation_run_id,
+            observation.qualification_run_id,
         ),
     )
 
@@ -2242,36 +2273,67 @@ def advance_pipeline(
         workspace=workspace,
     )
 
-    attestation_runs = _fetch_runs(
+    qualification_runs = _fetch_runs(
         gateway,
-        workflow_file=ATTESTATION_WORKFLOW_FILE,
-        workflow_path=ATTESTATION_WORKFLOW_PATH,
+        workflow_file=QUALIFICATION_WORKFLOW_FILE,
+        workflow_path=QUALIFICATION_WORKFLOW_PATH,
         default_branch=default_branch,
         created_since=run_history_since,
     )
-    expected_attestation_name = attestation_run_name(candidate.run_id)
-    attestation_selection = select_pipeline_runs(
-        attestation_runs,
-        label="attestation",
-        matcher=lambda name: name == expected_attestation_name,
+    expected_qualification_name = qualification_run_name(
+        correlation_id, candidate.run_id
+    )
+    qualification_selection = select_pipeline_runs(
+        qualification_runs,
+        label="qualification",
+        matcher=lambda name: name == expected_qualification_name,
         default_branch=default_branch,
     )
-    if attestation_selection.in_flight_run_id is not None or (
-        attestation_selection.succeeded_run_id is None
+    if (
+        qualification_selection.succeeded_run_id is None
+        and qualification_selection.in_flight_run_id is None
+        and qualification_selection.unsuccessful
     ):
-        return plan_pipeline(
+        failed_ids = ", ".join(
+            record.run_id for record in qualification_selection.unsuccessful
+        )
+        return OrchestrationPlan(
+            action=OrchestrationAction.BLOCKED,
+            reason=(
+                f"qualification run(s) {failed_ids} failed for candidate "
+                f"{candidate.run_id}; automatic qualification retries are disabled "
+                "to prevent unbounded duplicates, so a maintainer must diagnose the "
+                "heavy-gate failure before this candidate can advance"
+            ),
+            provenance=provenance,
+            correlation_id=correlation_id,
+            release_target=candidate.binding.release_target,
+            candidate_run_id=candidate.run_id,
+        )
+
+    if qualification_selection.succeeded_run_id is None:
+        plan = plan_pipeline(
             provenance=provenance,
             correlation_id=correlation_id,
             observation=PipelineObservation(
                 binding=candidate.binding,
                 candidate_run_id=candidate.run_id,
-                attestation_in_flight_run_id=attestation_selection.in_flight_run_id,
+                qualification_in_flight_run_id=(
+                    qualification_selection.in_flight_run_id
+                ),
             ),
         )
+        return _execute_dispatch(
+            gateway,
+            plan,
+            default_branch=default_branch,
+            workflow_path=QUALIFICATION_WORKFLOW_PATH,
+            dry_run=dry_run,
+        )
 
-    verify_attestation_run(
+    verify_qualification_run(
         gateway,
-        run_id=attestation_selection.succeeded_run_id,
+        run_id=qualification_selection.succeeded_run_id,
         candidate=candidate,
         provenance=provenance,
         correlation_id=correlation_id,
@@ -2289,7 +2351,7 @@ def advance_pipeline(
     expected_publish_name = publish_run_name(
         correlation_id,
         candidate.run_id,
-        attestation_selection.succeeded_run_id,
+        qualification_selection.succeeded_run_id,
         candidate.binding,
     )
     publish_selection = select_pipeline_runs(
@@ -2314,7 +2376,7 @@ def advance_pipeline(
                 correlation_id=correlation_id,
                 release_target=candidate.binding.release_target,
                 candidate_run_id=candidate.run_id,
-                attestation_run_id=attestation_selection.succeeded_run_id,
+                qualification_run_id=qualification_selection.succeeded_run_id,
                 in_flight_workflow=(
                     PUBLISH_WORKFLOW_FILE
                     if publish_selection.in_flight_run_id is not None
@@ -2325,8 +2387,8 @@ def advance_pipeline(
         return OrchestrationPlan(
             action=OrchestrationAction.WAITING_FOR_PRIOR_PUBLICATION,
             reason=(
-                f"candidate {candidate.run_id} and attestation "
-                f"{attestation_selection.succeeded_run_id} are proven, but "
+                f"candidate {candidate.run_id} and qualification "
+                f"{qualification_selection.succeeded_run_id} are proven, but "
                 f"earlier native release {publication_barrier_native_tag} must be "
                 "immutably published first to preserve monotonic output ordering"
             ),
@@ -2334,7 +2396,7 @@ def advance_pipeline(
             correlation_id=correlation_id,
             release_target=candidate.binding.release_target,
             candidate_run_id=candidate.run_id,
-            attestation_run_id=attestation_selection.succeeded_run_id,
+            qualification_run_id=qualification_selection.succeeded_run_id,
         )
     plan = plan_pipeline(
         provenance=provenance,
@@ -2342,7 +2404,7 @@ def advance_pipeline(
         observation=PipelineObservation(
             binding=candidate.binding,
             candidate_run_id=candidate.run_id,
-            attestation_run_id=attestation_selection.succeeded_run_id,
+            qualification_run_id=qualification_selection.succeeded_run_id,
             publish_in_flight_run_id=publish_selection.in_flight_run_id,
             publish_succeeded_run_id=publish_selection.succeeded_run_id,
             publish_retry=bool(publish_selection.unsuccessful),
@@ -2384,7 +2446,7 @@ def _execute_dispatch(
             correlation_id=plan.correlation_id,
             release_target=plan.release_target,
             candidate_run_id=plan.candidate_run_id,
-            attestation_run_id=plan.attestation_run_id,
+            qualification_run_id=plan.qualification_run_id,
         )
 
     workflow_file = plan.dispatch_workflow
@@ -2463,7 +2525,7 @@ def _with_dispatch_record(
         correlation_id=plan.correlation_id,
         release_target=plan.release_target,
         candidate_run_id=plan.candidate_run_id,
-        attestation_run_id=plan.attestation_run_id,
+        qualification_run_id=plan.qualification_run_id,
         dispatch_workflow=plan.dispatch_workflow,
         dispatch_ref=ref,
         dispatch_run_name=plan.dispatch_run_name,
@@ -2521,8 +2583,8 @@ def render_step_summary(plan: OrchestrationPlan) -> str:
         )
     if plan.candidate_run_id:
         lines.append(f"- Candidate run: `{plan.candidate_run_id}`")
-    if plan.attestation_run_id:
-        lines.append(f"- Attestation run: `{plan.attestation_run_id}`")
+    if plan.qualification_run_id:
+        lines.append(f"- Qualification run: `{plan.qualification_run_id}`")
     if plan.in_flight_workflow:
         lines.append(
             f"- In flight: `{plan.in_flight_workflow}` run `{plan.in_flight_run_id}`"

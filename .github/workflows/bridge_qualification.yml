@@ -1,0 +1,300 @@
+name: Qualify Exact Bridge Candidate
+
+# Parsed by scripts/stable_release_orchestrator.py to bind this qualification to
+# the exact candidate run it proves; the runs API never echoes dispatch inputs.
+run-name: bridge-qualification ${{ inputs.orchestrator_correlation_id }} candidate:${{ inputs.candidate_run_id }}
+
+on:
+  # Automatic hosted qualification of the exact candidate artifact. It mutates
+  # nothing outside its own run: it proves the candidate run's identity, runs the
+  # heavy real-model Qwen3-ASR and Qwen3-TTS gates against that exact artifact,
+  # and uploads the canonical attestation as this run's single artifact so
+  # publication can require an exact successful qualification run.
+  #
+  # The orchestrator dispatches this with the same owner credential it uses for
+  # the candidate build. No maintainer ever produces or transports an
+  # attestation by hand, and this workflow holds no publication credential.
+  workflow_dispatch:
+    inputs:
+      orchestrator_correlation_id:
+        description: Required central-orchestrator correlation identifier
+        required: true
+        type: string
+      candidate_run_id:
+        description: Run ID of the Build Exact Bridge Candidate run that produced the candidate
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  BRIDGE_REPO: leehack/llama-web-bridge
+  CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
+  ORCHESTRATOR_CORRELATION_ID: ${{ inputs.orchestrator_correlation_id }}
+  CANDIDATE_WORKFLOW_PATH: .github/workflows/bridge_candidate.yml
+  CANDIDATE_ARTIFACT_NAME: exact-webgpu-bridge-dist
+  DISPATCHING_ACTOR: ${{ github.triggering_actor }}
+  REPOSITORY_OWNER: ${{ github.repository_owner }}
+
+concurrency:
+  group: bridge-qualification-${{ inputs.candidate_run_id }}
+  cancel-in-progress: false
+
+jobs:
+  qualify:
+    name: Run the heavy real-model gates against the exact candidate
+    runs-on: ubuntu-latest
+    # The heavy gates decode and synthesize real audio on CPU. This ceiling stays
+    # under the hosted six-hour job limit so an overrun fails as a gate timeout
+    # with diagnostics rather than as an opaque cancellation.
+    timeout-minutes: 330
+    env:
+      LLAMA_WEBGPU_SPEECH_MODEL_URL: https://huggingface.co/ggml-org/Qwen3-ASR-0.6B-GGUF/resolve/928ab958557df9aa2ef1c93e0e83c7ad0933fae2/Qwen3-ASR-0.6B-Q8_0.gguf?download=true
+      LLAMA_WEBGPU_SPEECH_MODEL_SHA256: bca259818b50ca7c4c05e9bdb35a5dc04fa039653a6d6f3f0f331f96f6aa1971
+      LLAMA_WEBGPU_SPEECH_MMPROJ_URL: https://huggingface.co/ggml-org/Qwen3-ASR-0.6B-GGUF/resolve/928ab958557df9aa2ef1c93e0e83c7ad0933fae2/mmproj-Qwen3-ASR-0.6B-Q8_0.gguf?download=true
+      LLAMA_WEBGPU_SPEECH_MMPROJ_SHA256: 41a342b5e4c514e968cb756de6cd1b7be39eff43c44c57a2ef5fc6522e36603d
+      LLAMA_WEBGPU_SPEECH_AUDIO_URL: https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen3-ASR-Repo/asr_en.wav
+      LLAMA_WEBGPU_SPEECH_AUDIO_SHA256: f9b4440ac8393e47c14a6240e9739dea09b645bb1592b8f2dd48feb9666cea7f
+      LLAMA_WEBGPU_TTS_MODEL_URL: https://huggingface.co/ggml-org/Qwen3-TTS-12Hz-1.7B-Base-GGUF/resolve/ca27d74bc954b73dadab5b71ca265d87fc861a7c/Qwen3-TTS-12Hz-1.7B-Base-Q4_K_M.gguf?download=true
+      LLAMA_WEBGPU_TTS_MODEL_SHA256: 8d18c94acb2addd042f97da63c98be144eafa76d0d9495177eab65130cf85129
+      LLAMA_WEBGPU_TTS_MMPROJ_URL: https://huggingface.co/ggml-org/Qwen3-TTS-12Hz-1.7B-Base-GGUF/resolve/ca27d74bc954b73dadab5b71ca265d87fc861a7c/mmproj-Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf?download=true
+      LLAMA_WEBGPU_TTS_MMPROJ_SHA256: 6fd65188839bcd6ecc91b277ad471e22a0edfada4699a0fe82f1165c18cfcce2
+      QUALIFICATION_MODEL_CACHE: ~/.cache/llama-web-bridge/qualification-models
+      QUALIFICATION_DIAGNOSTICS_DIR: /tmp/bridge-qualification-diagnostics
+    steps:
+      - name: Validate dispatcher and repository boundary
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_REPOSITORY}" != "${BRIDGE_REPO}" ]; then
+            echo "error: qualification must execute in ${BRIDGE_REPO}"
+            exit 1
+          fi
+          if [ "${DISPATCHING_ACTOR}" != "${REPOSITORY_OWNER}" ]; then
+            echo "error: qualification dispatch is restricted to ${REPOSITORY_OWNER}"
+            exit 1
+          fi
+          if [ "${GITHUB_ACTOR}" != "${REPOSITORY_OWNER}" ]; then
+            echo "error: qualification actor is restricted to ${REPOSITORY_OWNER}"
+            exit 1
+          fi
+          if [ "${GITHUB_RUN_ATTEMPT}" != "1" ]; then
+            echo "error: qualification run_attempt must be 1"
+            exit 1
+          fi
+          bridge_default="$(gh api "repos/${BRIDGE_REPO}" --jq '.default_branch')"
+          if [ "${GITHUB_REF}" != "refs/heads/${bridge_default}" ]; then
+            echo "error: qualification must run from ${BRIDGE_REPO}'s default branch"
+            exit 1
+          fi
+          if [[ ! "${CANDIDATE_RUN_ID}" =~ ^[1-9][0-9]*$ ]]; then
+            echo "error: candidate_run_id must be a positive integer"
+            exit 1
+          fi
+          if [[ ! "${ORCHESTRATOR_CORRELATION_ID}" =~ ^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$ ]]; then
+            echo "error: invalid orchestrator_correlation_id"
+            exit 1
+          fi
+
+      - name: Checkout trusted bridge qualification contract
+        uses: actions/checkout@v4
+        with:
+          repository: leehack/llama-web-bridge
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Prove the candidate run identity and artifact uniqueness
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/candidate-run"
+          bridge_default="$(gh api "repos/${BRIDGE_REPO}" --jq '.default_branch')"
+          gh api "repos/${BRIDGE_REPO}/actions/runs/${CANDIDATE_RUN_ID}" \
+            > "${RUNNER_TEMP}/candidate-run/run.json"
+          gh api "repos/${BRIDGE_REPO}/actions/runs/${CANDIDATE_RUN_ID}/artifacts?per_page=100" \
+            > "${RUNNER_TEMP}/candidate-run/artifacts.json"
+          verification="$(python3 scripts/release_qualification.py verify-run \
+            --run-json "${RUNNER_TEMP}/candidate-run/run.json" \
+            --artifacts-json "${RUNNER_TEMP}/candidate-run/artifacts.json" \
+            --run-id "${CANDIDATE_RUN_ID}" \
+            --workflow-path "${CANDIDATE_WORKFLOW_PATH}" \
+            --head-branch "${bridge_default}" \
+            --artifact-name "${CANDIDATE_ARTIFACT_NAME}" \
+            --run-attempt 1)"
+          head_sha="$(jq -er '.head_sha' <<<"${verification}")"
+          artifact_id="$(jq -er '.artifact_id' <<<"${verification}")"
+          echo "CANDIDATE_ARTIFACT_ID=${artifact_id}" >> "${GITHUB_ENV}"
+          run_status="$(gh api \
+            "repos/${BRIDGE_REPO}/compare/${head_sha}...${bridge_default}" \
+            --jq '.status')"
+          if [ "${run_status}" != "ahead" ] && [ "${run_status}" != "identical" ]; then
+            echo "error: candidate run head ${head_sha} is not reachable from ${bridge_default}"
+            exit 1
+          fi
+
+      - name: Download the exact candidate artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/candidate"
+          gh api -H "Accept: application/vnd.github+json" \
+            "repos/${BRIDGE_REPO}/actions/artifacts/${CANDIDATE_ARTIFACT_ID}/zip" \
+            > "${RUNNER_TEMP}/candidate.zip"
+          python3 - "${RUNNER_TEMP}/candidate.zip" "${RUNNER_TEMP}/candidate" <<'PY'
+          import sys
+          from pathlib import Path
+          sys.path.insert(0, "scripts")
+          from release_qualification import _extract_flat_artifact_archive
+          _extract_flat_artifact_archive(Path(sys.argv[1]), Path(sys.argv[2]), artifact_type="candidate")
+          PY
+
+      - name: Resolve and validate the exact candidate source identity
+        id: candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          fingerprint="$(python3 scripts/release_qualification.py candidate-fingerprint \
+            --candidate-dist "${RUNNER_TEMP}/candidate")"
+          bridge_source_sha="$(jq -er '.bridge_commit | select(test("^[0-9a-f]{40}$"))' \
+            "${RUNNER_TEMP}/candidate/manifest.json")"
+          candidate_correlation_id="$(jq -er \
+            '.orchestrator_correlation_id | select(type == "string")' \
+            "${RUNNER_TEMP}/candidate/manifest.json")"
+          if [ "${candidate_correlation_id}" != "${ORCHESTRATOR_CORRELATION_ID}" ]; then
+            echo "error: qualification correlation does not match candidate manifest"
+            exit 1
+          fi
+          bridge_default="$(gh api "repos/${BRIDGE_REPO}" --jq '.default_branch')"
+          source_status="$(gh api \
+            "repos/${BRIDGE_REPO}/compare/${bridge_source_sha}...${bridge_default}" \
+            --jq '.status')"
+          if [ "${source_status}" != "ahead" ] && [ "${source_status}" != "identical" ]; then
+            echo "error: candidate bridge source is not reachable from ${bridge_default}"
+            exit 1
+          fi
+          echo "fingerprint=${fingerprint}" >> "${GITHUB_OUTPUT}"
+          echo "bridge_source_sha=${bridge_source_sha}" >> "${GITHUB_OUTPUT}"
+
+      - name: Checkout exact candidate harness source
+        uses: actions/checkout@v4
+        with:
+          repository: leehack/llama-web-bridge
+          ref: ${{ steps.candidate.outputs.bridge_source_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+          path: candidate-source
+
+      - name: Cache pinned qualification models
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/llama-web-bridge/qualification-models
+          key: qualification-models-${{ env.LLAMA_WEBGPU_SPEECH_MODEL_SHA256 }}-${{ env.LLAMA_WEBGPU_SPEECH_MMPROJ_SHA256 }}-${{ env.LLAMA_WEBGPU_TTS_MODEL_SHA256 }}-${{ env.LLAMA_WEBGPU_TTS_MMPROJ_SHA256 }}-${{ env.LLAMA_WEBGPU_SPEECH_AUDIO_SHA256 }}
+
+      - name: Download and verify the pinned qualification models
+        id: models
+        run: |
+          set -euo pipefail
+          cache_dir="${QUALIFICATION_MODEL_CACHE/#\~/$HOME}"
+          mkdir -p "${cache_dir}"
+
+          # A restored cache is untrusted input: every file is re-checked against
+          # its pinned digest and re-downloaded on any mismatch before a gate can
+          # load it.
+          download_verified() {
+            local url="$1"
+            local expected_sha="$2"
+            local output_path="$3"
+            if [ -f "${output_path}" ] && echo "${expected_sha}  ${output_path}" | sha256sum --check --status; then
+              return
+            fi
+            rm -f "${output_path}" "${output_path}.download"
+            curl --fail --location --retry 5 --retry-all-errors \
+              --output "${output_path}.download" "${url}"
+            echo "${expected_sha}  ${output_path}.download" | sha256sum --check --status
+            mv "${output_path}.download" "${output_path}"
+          }
+
+          speech_model="${cache_dir}/Qwen3-ASR-0.6B-Q8_0.gguf"
+          speech_mmproj="${cache_dir}/mmproj-Qwen3-ASR-0.6B-Q8_0.gguf"
+          speech_audio="${cache_dir}/asr_en.wav"
+          tts_model="${cache_dir}/Qwen3-TTS-12Hz-1.7B-Base-Q4_K_M.gguf"
+          tts_mmproj="${cache_dir}/mmproj-Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf"
+
+          download_verified "${LLAMA_WEBGPU_SPEECH_MODEL_URL}" "${LLAMA_WEBGPU_SPEECH_MODEL_SHA256}" "${speech_model}"
+          download_verified "${LLAMA_WEBGPU_SPEECH_MMPROJ_URL}" "${LLAMA_WEBGPU_SPEECH_MMPROJ_SHA256}" "${speech_mmproj}"
+          download_verified "${LLAMA_WEBGPU_SPEECH_AUDIO_URL}" "${LLAMA_WEBGPU_SPEECH_AUDIO_SHA256}" "${speech_audio}"
+          download_verified "${LLAMA_WEBGPU_TTS_MODEL_URL}" "${LLAMA_WEBGPU_TTS_MODEL_SHA256}" "${tts_model}"
+          download_verified "${LLAMA_WEBGPU_TTS_MMPROJ_URL}" "${LLAMA_WEBGPU_TTS_MMPROJ_SHA256}" "${tts_mmproj}"
+
+          {
+            echo "speech_model=${speech_model}"
+            echo "speech_mmproj=${speech_mmproj}"
+            echo "speech_audio=${speech_audio}"
+            echo "tts_model=${tts_model}"
+            echo "tts_mmproj=${tts_mmproj}"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Install Playwright Chromium
+        run: |
+          python3 -m pip install --user playwright
+          python3 -m playwright install chromium
+
+      - name: Run the heavy Qwen3-ASR and Qwen3-TTS gates
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/attestation"
+          python3 candidate-source/scripts/release_qualification.py qualify \
+            --candidate-run-id "${CANDIDATE_RUN_ID}" \
+            --speech-model-path "${{ steps.models.outputs.speech_model }}" \
+            --speech-mmproj-path "${{ steps.models.outputs.speech_mmproj }}" \
+            --speech-audio-path "${{ steps.models.outputs.speech_audio }}" \
+            --tts-model-path "${{ steps.models.outputs.tts_model }}" \
+            --tts-mmproj-path "${{ steps.models.outputs.tts_mmproj }}" \
+            --tts-max-frames 24 \
+            --speech-timeout-seconds 5400 \
+            --tts-timeout-seconds 5400 \
+            --diagnostics-dir "${QUALIFICATION_DIAGNOSTICS_DIR}" \
+            --output-attestation "${RUNNER_TEMP}/attestation/qualification-attestation.json"
+
+      - name: Re-verify the attestation with the trusted default-branch contract
+        env:
+          CANDIDATE_FINGERPRINT: ${{ steps.candidate.outputs.fingerprint }}
+          CANDIDATE_BRIDGE_SOURCE_SHA: ${{ steps.candidate.outputs.bridge_source_sha }}
+        run: |
+          set -euo pipefail
+          python3 scripts/release_qualification.py verify-attestation \
+            --attestation "${RUNNER_TEMP}/attestation/qualification-attestation.json" \
+            --candidate-dist "${RUNNER_TEMP}/candidate" \
+            --candidate-run-id "${CANDIDATE_RUN_ID}" \
+            --candidate-artifact-id "${CANDIDATE_ARTIFACT_ID}" \
+            --candidate-run-attempt 1 \
+            --qualification-run-id "${GITHUB_RUN_ID}" \
+            --qualification-run-attempt 1 \
+            --qualification-source-sha "${GITHUB_SHA}" \
+            --candidate-fingerprint "${CANDIDATE_FINGERPRINT}" \
+            --bridge-commit "${CANDIDATE_BRIDGE_SOURCE_SHA}" \
+            --harness-dir candidate-source/scripts
+
+      - name: Upload verified qualification attestation
+        uses: actions/upload-artifact@v4
+        with:
+          name: qualification-attestation
+          if-no-files-found: error
+          path: ${{ runner.temp }}/attestation/qualification-attestation.json
+
+      - name: Upload sanitized qualification diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bridge-qualification-diagnostics
+          path: ${{ env.QUALIFICATION_DIAGNOSTICS_DIR }}
+          if-no-files-found: ignore

@@ -30,7 +30,12 @@ from release_contract_test import release_attestation
 # The heavy attestation fixtures are pinned by the qualification suite that
 # produces them. Restating them here would let this suite pass against an
 # attestation the real gate would reject.
-from release_qualification_test import speech_phase, tts_phase
+from release_qualification_test import (
+    qualification_environment,
+    qualification_identity,
+    speech_phase,
+    tts_phase,
+)
 import release_qualification as rq
 
 
@@ -42,9 +47,9 @@ NATIVE_MANIFEST_SHA = (
     "2e5d29d7f98f0d71e75d3fa63b7c55f3b2a7933247cc34ea2b1c5e053d142452"
 )
 CANDIDATE_RUN_ID = "32919086955"
-ATTESTATION_RUN_ID = "32919086977"
+QUALIFICATION_RUN_ID = "32919086977"
 CANDIDATE_ARTIFACT_ID = 7
-ATTESTATION_ARTIFACT_ID = 9
+QUALIFICATION_ARTIFACT_ID = 9
 DEFAULT_BRANCH = "main"
 HEAD_SHA = "a" * 40
 ASSETS_TAG_COMMIT = "c" * 40
@@ -616,26 +621,66 @@ class OrchestrationCallerAuthorizationTest(unittest.TestCase):
         / "auto_llama_cpp_update.yml"
     )
 
-    def test_schedule_and_owner_manual_dispatch_are_authorized(self) -> None:
+    def test_schedule_owner_manual_and_owner_continuation_are_authorized(self) -> None:
         sro.require_orchestration_caller("schedule", "github-actions", "github-actions")
         sro.require_orchestration_caller("workflow_dispatch", OWNER, OWNER)
+        sro.require_orchestration_caller("workflow_run", OWNER, OWNER)
 
-    def test_non_owner_manual_dispatch_is_rejected(self) -> None:
-        for actor, triggering_actor in (("collaborator", OWNER), (OWNER, "collaborator")):
-            with self.assertRaises(ContractError):
-                sro.require_orchestration_caller(
-                    "workflow_dispatch", actor, triggering_actor
-                )
+    def test_non_owner_manual_or_continuation_is_rejected(self) -> None:
+        for event in ("workflow_dispatch", "workflow_run"):
+            for actor, triggering_actor in (
+                ("collaborator", OWNER),
+                (OWNER, "collaborator"),
+            ):
+                with self.subTest(event=event, actor=actor), self.assertRaises(
+                    ContractError
+                ):
+                    sro.require_orchestration_caller(event, actor, triggering_actor)
 
-    def test_both_workflow_jobs_gate_manual_callers_before_environment_use(self) -> None:
+    def test_workflow_run_trigger_and_both_job_gates_are_exact(self) -> None:
         workflow = self.WORKFLOW.read_text(encoding="utf-8")
-        owner_gate = (
+        manual_gate = (
             "github.event_name == 'workflow_dispatch' && "
             "github.actor == github.repository_owner && "
             "github.triggering_actor == github.repository_owner"
         )
-        self.assertEqual(workflow.count(owner_gate), 2)
-        self.assertLess(workflow.find(owner_gate), workflow.find("environment:"))
+        continuation_gate = (
+            "github.event_name == 'workflow_run' && "
+            "github.event.workflow_run.conclusion == 'success' && "
+            "github.event.workflow_run.head_branch == "
+            "github.event.repository.default_branch && "
+            "github.event.workflow_run.actor.login == github.repository_owner && "
+            "github.event.workflow_run.triggering_actor.login == "
+            "github.repository_owner"
+        )
+        for trigger in (
+            "- Build Exact Bridge Candidate",
+            "- Qualify Exact Bridge Candidate",
+            "- Publish Exact Qualified Bridge Assets",
+            "types: [completed]",
+        ):
+            self.assertIn(trigger, workflow)
+        self.assertEqual(workflow.count(manual_gate), 2)
+        self.assertEqual(workflow.count(continuation_gate), 2)
+        self.assertLess(workflow.rfind(manual_gate), workflow.find("environment:"))
+        self.assertLess(workflow.rfind(continuation_gate), workflow.find("environment:"))
+        proof = "Prove the exact workflow continuation before environment use"
+        self.assertIn(proof, workflow)
+        proof_block = workflow.split(f"      - name: {proof}\n", 1)[1].split(
+            "\n      - name:", 1
+        )[0]
+        self.assertIn("scripts/release_qualification.py verify-run", proof_block)
+        self.assertIn("--run-attempt 1", proof_block)
+        for exact_mapping in (
+            ".github/workflows/bridge_candidate.yml)\n"
+            "              artifact_name=exact-webgpu-bridge-dist",
+            ".github/workflows/bridge_qualification.yml)\n"
+            "              artifact_name=qualification-attestation",
+            ".github/workflows/publish_assets.yml)\n"
+            "              artifact_name=bridge-qualification-outcome",
+        ):
+            self.assertIn(exact_mapping, proof_block)
+        self.assertLess(workflow.find(proof), workflow.find("environment:"))
 
 
 class CorrelationTest(unittest.TestCase):
@@ -753,11 +798,18 @@ class WorkflowRunNameContractTest(unittest.TestCase):
         self.assertEqual(rendered, sro.candidate_run_name(correlation_id, binding))
         self.assertEqual(sro.parse_candidate_run_name(rendered, correlation_id), binding)
 
-    def test_attestation_workflow_renders_the_parsed_run_name(self) -> None:
+    def test_qualification_workflow_renders_the_parsed_run_name(self) -> None:
+        correlation_id = sro.compute_correlation_id(make_provenance())
         rendered = self.render(
-            sro.ATTESTATION_WORKFLOW_FILE, {"candidate_run_id": CANDIDATE_RUN_ID}
+            sro.QUALIFICATION_WORKFLOW_FILE,
+            {
+                "orchestrator_correlation_id": correlation_id,
+                "candidate_run_id": CANDIDATE_RUN_ID,
+            },
         )
-        self.assertEqual(rendered, sro.attestation_run_name(CANDIDATE_RUN_ID))
+        self.assertEqual(
+            rendered, sro.qualification_run_name(correlation_id, CANDIDATE_RUN_ID)
+        )
 
     def test_publish_workflow_renders_the_parsed_run_name(self) -> None:
         correlation_id = sro.compute_correlation_id(make_provenance())
@@ -769,7 +821,7 @@ class WorkflowRunNameContractTest(unittest.TestCase):
             {
                 "orchestrator_correlation_id": correlation_id,
                 "candidate_run_id": CANDIDATE_RUN_ID,
-                "attestation_run_id": ATTESTATION_RUN_ID,
+                "qualification_run_id": QUALIFICATION_RUN_ID,
                 "bridge_source_sha": BRIDGE_SHA,
                 "release_tag": "v0.1.40",
                 "release_rebuild": "0",
@@ -778,12 +830,12 @@ class WorkflowRunNameContractTest(unittest.TestCase):
         self.assertEqual(
             rendered,
             sro.publish_run_name(
-                correlation_id, CANDIDATE_RUN_ID, ATTESTATION_RUN_ID, binding
+                correlation_id, CANDIDATE_RUN_ID, QUALIFICATION_RUN_ID, binding
             ),
         )
         self.assertEqual(
             sro.parse_publish_run_name(rendered, correlation_id),
-            (CANDIDATE_RUN_ID, ATTESTATION_RUN_ID, binding),
+            (CANDIDATE_RUN_ID, QUALIFICATION_RUN_ID, binding),
         )
 
 
@@ -857,16 +909,20 @@ class DispatchInputContractTest(unittest.TestCase):
             self.correlation_id,
             self.binding,
             CANDIDATE_RUN_ID,
-            ATTESTATION_RUN_ID,
+            QUALIFICATION_RUN_ID,
         )
         # The live environment-policy proof supplies this approval assertion.
         self.assertEqual(set(inputs), set(declared) - {"publish_approved"})
 
-    def test_attestation_workflow_declares_the_candidate_run_id_input(self) -> None:
+    def test_qualification_dispatch_inputs_are_exactly_the_declared_inputs(self) -> None:
         declared = declared_workflow_inputs(
-            self.WORKFLOWS / sro.ATTESTATION_WORKFLOW_FILE
+            self.WORKFLOWS / sro.QUALIFICATION_WORKFLOW_FILE
         )
-        self.assertIn("candidate_run_id", declared)
+        self.assertEqual(set(declared), set(sro.QUALIFICATION_DISPATCH_INPUTS))
+        inputs = sro._dispatch_inputs_for_qualification(
+            self.correlation_id, CANDIDATE_RUN_ID
+        )
+        self.assertEqual(set(inputs), set(declared))
 
     def test_missing_dispatch_input_fails_closed(self) -> None:
         inputs = sro._dispatch_inputs_for_publish(
@@ -874,7 +930,7 @@ class DispatchInputContractTest(unittest.TestCase):
             self.correlation_id,
             self.binding,
             CANDIDATE_RUN_ID,
-            ATTESTATION_RUN_ID,
+            QUALIFICATION_RUN_ID,
         )
         with self.assertRaises(ContractError):
             sro.require_exact_dispatch_inputs(sro.PUBLISH_WORKFLOW_FILE, inputs)
@@ -891,7 +947,7 @@ class DispatchInputContractTest(unittest.TestCase):
     def test_undispatchable_workflow_fails_closed(self) -> None:
         with self.assertRaises(ContractError):
             sro.require_exact_dispatch_inputs(
-                sro.ATTESTATION_WORKFLOW_FILE, {"candidate_run_id": CANDIDATE_RUN_ID}
+                "ci.yml", {"candidate_run_id": CANDIDATE_RUN_ID}
             )
 
     def test_non_string_dispatch_input_fails_closed(self) -> None:
@@ -1631,7 +1687,7 @@ class PlanTest(unittest.TestCase):
         self.assertEqual(plan.in_flight_run_id, "501")
         self.assertIsNone(plan.dispatch_workflow)
 
-    def test_candidate_ready_waits_fail_closed_for_the_attestation(self) -> None:
+    def test_candidate_ready_plans_exactly_one_hosted_qualification(self) -> None:
         plan = sro.plan_pipeline(
             provenance=self.provenance,
             correlation_id=self.correlation_id,
@@ -1639,40 +1695,56 @@ class PlanTest(unittest.TestCase):
                 binding=self.binding, candidate_run_id=CANDIDATE_RUN_ID
             ),
         )
-        self.assertEqual(plan.action, sro.OrchestrationAction.WAITING_FOR_ATTESTATION)
+        self.assertEqual(
+            plan.action, sro.OrchestrationAction.DISPATCH_QUALIFICATION
+        )
         self.assertEqual(plan.candidate_run_id, CANDIDATE_RUN_ID)
-        self.assertIsNone(plan.dispatch_workflow)
-        self.assertIsNone(plan.attestation_run_id)
-        self.assertIn("maintainer", plan.reason.lower())
+        self.assertEqual(plan.dispatch_workflow, sro.QUALIFICATION_WORKFLOW_FILE)
+        self.assertEqual(
+            plan.dispatch_run_name,
+            sro.qualification_run_name(self.correlation_id, CANDIDATE_RUN_ID),
+        )
+        self.assertEqual(
+            plan.dispatch_inputs,
+            {
+                "orchestrator_correlation_id": self.correlation_id,
+                "candidate_run_id": CANDIDATE_RUN_ID,
+            },
+        )
+        self.assertIsNone(plan.qualification_run_id)
+        # No routine state may require a maintainer-supplied payload or an owner
+        # workflow_dispatch continuation to advance.
+        self.assertNotIn("maintainer", plan.reason.lower())
+        self.assertNotIn("attestation", plan.reason.lower())
 
-    def test_in_flight_attestation_blocks_duplicate_publish(self) -> None:
+    def test_in_flight_qualification_blocks_duplicate_publish(self) -> None:
         plan = sro.plan_pipeline(
             provenance=self.provenance,
             correlation_id=self.correlation_id,
             observation=sro.PipelineObservation(
                 binding=self.binding,
                 candidate_run_id=CANDIDATE_RUN_ID,
-                attestation_in_flight_run_id=ATTESTATION_RUN_ID,
+                qualification_in_flight_run_id=QUALIFICATION_RUN_ID,
             ),
         )
         self.assertEqual(plan.action, sro.OrchestrationAction.IN_FLIGHT)
-        self.assertEqual(plan.in_flight_workflow, sro.ATTESTATION_WORKFLOW_FILE)
+        self.assertEqual(plan.in_flight_workflow, sro.QUALIFICATION_WORKFLOW_FILE)
 
-    def test_candidate_and_attestation_ready_plan_publish(self) -> None:
+    def test_candidate_and_qualification_ready_plan_publish(self) -> None:
         plan = sro.plan_pipeline(
             provenance=self.provenance,
             correlation_id=self.correlation_id,
             observation=sro.PipelineObservation(
                 binding=self.binding,
                 candidate_run_id=CANDIDATE_RUN_ID,
-                attestation_run_id=ATTESTATION_RUN_ID,
+                qualification_run_id=QUALIFICATION_RUN_ID,
             ),
         )
         self.assertEqual(plan.action, sro.OrchestrationAction.DISPATCH_PUBLISH)
         self.assertEqual(plan.dispatch_workflow, sro.PUBLISH_WORKFLOW_FILE)
         inputs = plan.dispatch_inputs or {}
         self.assertEqual(inputs["candidate_run_id"], CANDIDATE_RUN_ID)
-        self.assertEqual(inputs["attestation_run_id"], ATTESTATION_RUN_ID)
+        self.assertEqual(inputs["qualification_run_id"], QUALIFICATION_RUN_ID)
         self.assertEqual(inputs["release_tag"], "v0.1.40")
         self.assertEqual(inputs["release_rebuild"], "0")
         self.assertNotIn("publish_approved", inputs)
@@ -1689,7 +1761,7 @@ class PlanTest(unittest.TestCase):
             observation=sro.PipelineObservation(
                 binding=self.binding,
                 candidate_run_id=CANDIDATE_RUN_ID,
-                attestation_run_id=ATTESTATION_RUN_ID,
+                qualification_run_id=QUALIFICATION_RUN_ID,
                 publish_in_flight_run_id="701",
             ),
         )
@@ -1705,7 +1777,7 @@ class PlanTest(unittest.TestCase):
                 observation=sro.PipelineObservation(
                     binding=self.binding,
                     candidate_run_id=CANDIDATE_RUN_ID,
-                    attestation_run_id=ATTESTATION_RUN_ID,
+                    qualification_run_id=QUALIFICATION_RUN_ID,
                     publish_succeeded_run_id="701",
                 ),
             )
@@ -1717,13 +1789,13 @@ class PlanTest(unittest.TestCase):
             observation=sro.PipelineObservation(
                 binding=self.binding,
                 candidate_run_id=CANDIDATE_RUN_ID,
-                attestation_run_id=ATTESTATION_RUN_ID,
+                qualification_run_id=QUALIFICATION_RUN_ID,
                 publish_retry=True,
             ),
         )
         self.assertEqual(plan.action, sro.OrchestrationAction.DISPATCH_PUBLISH)
         self.assertEqual(plan.candidate_run_id, CANDIDATE_RUN_ID)
-        self.assertEqual(plan.attestation_run_id, ATTESTATION_RUN_ID)
+        self.assertEqual(plan.qualification_run_id, QUALIFICATION_RUN_ID)
         # A retry must be visible as a retry, not reported as a first attempt.
         self.assertIn("retry", plan.reason)
 
@@ -1743,7 +1815,7 @@ class PlanTest(unittest.TestCase):
             observation=sro.PipelineObservation(
                 binding=self.binding,
                 candidate_run_id=CANDIDATE_RUN_ID,
-                attestation_run_id=ATTESTATION_RUN_ID,
+                qualification_run_id=QUALIFICATION_RUN_ID,
             ),
         )
         self.assertNotIn("publish_approved", plan.dispatch_inputs)
@@ -1837,7 +1909,7 @@ class GovernanceAndDispatchIdentityTest(unittest.TestCase):
             observation=sro.PipelineObservation(
                 binding=binding,
                 candidate_run_id=CANDIDATE_RUN_ID,
-                attestation_run_id=ATTESTATION_RUN_ID,
+                qualification_run_id=QUALIFICATION_RUN_ID,
             ),
         )
         gateway = self._gateway()
@@ -1881,7 +1953,7 @@ class AdvancePipelineTest(unittest.TestCase):
         *,
         releases: list[dict[str, Any]] | None = None,
         candidate_runs: list[dict[str, Any]] | None = None,
-        attestation_runs: list[dict[str, Any]] | None = None,
+        qualification_runs: list[dict[str, Any]] | None = None,
         publish_runs: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         return {
@@ -1900,11 +1972,11 @@ class AdvancePipelineTest(unittest.TestCase):
                 candidate_runs or []
             ),
             sro._workflow_runs_path(
-                workflow_file=sro.ATTESTATION_WORKFLOW_FILE,
+                workflow_file=sro.QUALIFICATION_WORKFLOW_FILE,
                 default_branch=DEFAULT_BRANCH,
                 created_since=NATIVE_PUBLISHED_AT,
             ): runs_response(
-                attestation_runs or []
+                qualification_runs or []
             ),
             sro._workflow_runs_path(
                 workflow_file=sro.PUBLISH_WORKFLOW_FILE,
@@ -1983,10 +2055,10 @@ class AdvancePipelineTest(unittest.TestCase):
             second_binding = sro.PipelineBinding(BRIDGE_SHA, "v0.1.40-1", 1)
             first_run_id = "4101"
             second_run_id = "4201"
-            second_attestation_run_id = "4202"
+            second_qualification_run_id = "4202"
             first_artifact_id = 31
             second_artifact_id = 32
-            second_attestation_artifact_id = 33
+            second_qualification_artifact_id = 33
 
             first_candidate = root / "first-candidate"
             second_candidate = root / "second-candidate"
@@ -2010,13 +2082,18 @@ class AdvancePipelineTest(unittest.TestCase):
                 native_commit=second.native_commit,
             )
             second_manifest, second_fingerprint = rq.load_candidate(second_candidate)
-            second_attestation = rq.build_attestation(
+            second_qualification = rq.build_attestation(
                 manifest=second_manifest,
                 candidate_fingerprint=second_fingerprint,
                 candidate_run_id=second_run_id,
                 candidate_artifact_id=second_artifact_id,
                 candidate_run_attempt=1,
+                **qualification_identity(
+                    qualification_run_id=second_qualification_run_id,
+                    qualification_source_sha=HEAD_SHA,
+                ),
                 harness_digest=rq.harness_source_sha256(Path(__file__).resolve().parent),
+                environment=qualification_environment(),
                 speech_phase=speech_phase(),
                 tts_phase=tts_phase(),
             )
@@ -2031,10 +2108,12 @@ class AdvancePipelineTest(unittest.TestCase):
                 path=sro.CANDIDATE_WORKFLOW_PATH,
                 run_name=sro.candidate_run_name(second_correlation, second_binding),
             )
-            attestation_run = run_payload(
-                run_id=second_attestation_run_id,
-                path=sro.ATTESTATION_WORKFLOW_PATH,
-                run_name=sro.attestation_run_name(second_run_id),
+            qualification_run = run_payload(
+                run_id=second_qualification_run_id,
+                path=sro.QUALIFICATION_WORKFLOW_PATH,
+                run_name=sro.qualification_run_name(
+                    second_correlation, second_run_id
+                ),
             )
             releases = [asset_release_stub()]
             routes: dict[str, Any] = {
@@ -2047,7 +2126,7 @@ class AdvancePipelineTest(unittest.TestCase):
                 },
                 f"repos/{BRIDGE_REPOSITORY}/actions/runs/{first_run_id}": first_run,
                 f"repos/{BRIDGE_REPOSITORY}/actions/runs/{second_run_id}": second_run,
-                f"repos/{BRIDGE_REPOSITORY}/actions/runs/{second_attestation_run_id}": attestation_run,
+                f"repos/{BRIDGE_REPOSITORY}/actions/runs/{second_qualification_run_id}": qualification_run,
                 f"repos/{BRIDGE_REPOSITORY}/actions/runs/{first_run_id}/artifacts?per_page=100": artifact_inventory(
                     run_id=first_run_id,
                     name=rq.CANDIDATE_ARTIFACT_NAME,
@@ -2058,14 +2137,14 @@ class AdvancePipelineTest(unittest.TestCase):
                     name=rq.CANDIDATE_ARTIFACT_NAME,
                     artifact_id=second_artifact_id,
                 ),
-                f"repos/{BRIDGE_REPOSITORY}/actions/runs/{second_attestation_run_id}/artifacts?per_page=100": artifact_inventory(
-                    run_id=second_attestation_run_id,
+                f"repos/{BRIDGE_REPOSITORY}/actions/runs/{second_qualification_run_id}/artifacts?per_page=100": artifact_inventory(
+                    run_id=second_qualification_run_id,
                     name=rq.ATTESTATION_ARTIFACT_NAME,
-                    artifact_id=second_attestation_artifact_id,
+                    artifact_id=second_qualification_artifact_id,
                 ),
             }
             candidate_runs = runs_response([first_run, second_run])
-            attestation_runs = runs_response([attestation_run])
+            qualification_runs = runs_response([qualification_run])
             publish_runs = runs_response([])
             for provenance in (first, second):
                 since = sro.workflow_history_since(releases, provenance)
@@ -2078,11 +2157,11 @@ class AdvancePipelineTest(unittest.TestCase):
                 ] = candidate_runs
                 routes[
                     sro._workflow_runs_path(
-                        workflow_file=sro.ATTESTATION_WORKFLOW_FILE,
+                        workflow_file=sro.QUALIFICATION_WORKFLOW_FILE,
                         default_branch=DEFAULT_BRANCH,
                         created_since=since,
                     )
-                ] = attestation_runs
+                ] = qualification_runs
                 routes[
                     sro._workflow_runs_path(
                         workflow_file=sro.PUBLISH_WORKFLOW_FILE,
@@ -2099,15 +2178,41 @@ class AdvancePipelineTest(unittest.TestCase):
                     f"repos/{BRIDGE_REPOSITORY}/actions/artifacts/{second_artifact_id}/zip": flat_zip(
                         directory_members(second_candidate)
                     ),
-                    f"repos/{BRIDGE_REPOSITORY}/actions/artifacts/{second_attestation_artifact_id}/zip": flat_zip(
+                    f"repos/{BRIDGE_REPOSITORY}/actions/artifacts/{second_qualification_artifact_id}/zip": flat_zip(
                         {
                             "qualification-attestation.json": rq.canonical_json(
-                                second_attestation
+                                second_qualification
                             ).encode("utf-8")
                         }
                     ),
                 },
             )
+            first_qualification_run = run_payload(
+                run_id="4201",
+                path=sro.QUALIFICATION_WORKFLOW_PATH,
+                run_name=sro.qualification_run_name(first_correlation, first_run_id),
+                status="in_progress",
+                conclusion=None,
+            )
+            qualification_route_keys = [
+                sro._workflow_runs_path(
+                    workflow_file=sro.QUALIFICATION_WORKFLOW_FILE,
+                    default_branch=DEFAULT_BRANCH,
+                    created_since=sro.workflow_history_since(releases, provenance),
+                )
+                for provenance in (first, second)
+            ]
+            original_dispatch = gateway.dispatch_workflow
+
+            def dispatch(**kwargs: Any) -> None:
+                original_dispatch(**kwargs)
+                for key in qualification_route_keys:
+                    gateway.json_routes[key] = runs_response(
+                        [qualification_run, first_qualification_run]
+                    )
+
+            gateway.dispatch_workflow = dispatch  # type: ignore[assignment]
+
             provenance_list = root / "release-candidates.json"
             provenance_list.write_text(
                 json.dumps(
@@ -2145,11 +2250,17 @@ class AdvancePipelineTest(unittest.TestCase):
             self.assertEqual(
                 [item["action"] for item in plan["plans"]],
                 [
-                    sro.OrchestrationAction.WAITING_FOR_ATTESTATION.value,
+                    sro.OrchestrationAction.DISPATCH_QUALIFICATION.value,
                     sro.OrchestrationAction.WAITING_FOR_PRIOR_PUBLICATION.value,
                 ],
             )
-            self.assertEqual(gateway.dispatches, [])
+            # The later provenance is fully qualified but must not publish before
+            # the earlier one, so exactly one qualification dispatch happens and
+            # no publication is dispatched.
+            self.assertEqual(
+                [record["workflow_file"] for record in gateway.dispatches],
+                [sro.QUALIFICATION_WORKFLOW_FILE],
+            )
 
     def test_in_flight_candidate_produces_no_second_dispatch(self) -> None:
         in_flight = run_payload(
@@ -2230,12 +2341,38 @@ class AdvancePipelineTest(unittest.TestCase):
                 )
             },
         )
+        dispatched = run_payload(
+            run_id="4201",
+            path=sro.QUALIFICATION_WORKFLOW_PATH,
+            run_name=sro.qualification_run_name(self.correlation_id, CANDIDATE_RUN_ID),
+            status="in_progress",
+            conclusion=None,
+        )
+        readback_key = sro._workflow_runs_path(
+            workflow_file=sro.QUALIFICATION_WORKFLOW_FILE,
+            default_branch=DEFAULT_BRANCH,
+            created_since=NATIVE_PUBLISHED_AT,
+        )
+        original_dispatch = gateway.dispatch_workflow
+
+        def dispatch(**kwargs: Any) -> None:
+            original_dispatch(**kwargs)
+            gateway.json_routes[readback_key] = runs_response([dispatched])
+
+        gateway.dispatch_workflow = dispatch  # type: ignore[assignment]
+
         plan = sro.advance_pipeline(
             gateway, provenance=self.provenance, workspace=self.tmp
         )
-        self.assertEqual(plan.action, sro.OrchestrationAction.WAITING_FOR_ATTESTATION)
+        self.assertEqual(
+            plan.action, sro.OrchestrationAction.DISPATCH_QUALIFICATION
+        )
         self.assertEqual(plan.candidate_run_id, CANDIDATE_RUN_ID)
-        self.assertEqual(gateway.dispatches, [])
+        self.assertEqual(plan.dispatched_run_id, "4201")
+        self.assertEqual(
+            [record["workflow_file"] for record in gateway.dispatches],
+            [sro.QUALIFICATION_WORKFLOW_FILE],
+        )
 
     def test_dry_run_plans_without_dispatching(self) -> None:
         routes = self._routes(
@@ -2389,7 +2526,7 @@ class AdvancePipelineTest(unittest.TestCase):
                 gateway, provenance=self.provenance, workspace=self.tmp
             )
 
-    def test_candidate_success_waits_for_the_maintainer_attestation(self) -> None:
+    def test_candidate_success_dispatches_hosted_qualification(self) -> None:
         candidate_dir = self.tmp / "candidate-src"
         write_bridge_candidate(
             candidate_dir,
@@ -2425,13 +2562,94 @@ class AdvancePipelineTest(unittest.TestCase):
             )
         }
         gateway = FakeGateway(json_routes=routes, blob_routes=blobs)
+        dispatched = run_payload(
+            run_id="4201",
+            path=sro.QUALIFICATION_WORKFLOW_PATH,
+            run_name=sro.qualification_run_name(self.correlation_id, CANDIDATE_RUN_ID),
+            status="in_progress",
+            conclusion=None,
+        )
+        readback_key = sro._workflow_runs_path(
+            workflow_file=sro.QUALIFICATION_WORKFLOW_FILE,
+            default_branch=DEFAULT_BRANCH,
+            created_since=NATIVE_PUBLISHED_AT,
+        )
+        original_dispatch = gateway.dispatch_workflow
+
+        def dispatch(**kwargs: Any) -> None:
+            original_dispatch(**kwargs)
+            gateway.json_routes[readback_key] = runs_response([dispatched])
+
+        gateway.dispatch_workflow = dispatch  # type: ignore[assignment]
         plan = sro.advance_pipeline(
             gateway, provenance=self.provenance, workspace=self.tmp
         )
-        self.assertEqual(plan.action, sro.OrchestrationAction.WAITING_FOR_ATTESTATION)
+        self.assertEqual(
+            plan.action, sro.OrchestrationAction.DISPATCH_QUALIFICATION
+        )
         self.assertEqual(plan.candidate_run_id, CANDIDATE_RUN_ID)
         self.assertEqual(plan.release_target.release_tag, "v0.1.40")
+        self.assertEqual(len(gateway.dispatches), 1)
+        record = gateway.dispatches[0]
+        self.assertEqual(record["workflow_file"], sro.QUALIFICATION_WORKFLOW_FILE)
+        self.assertEqual(record["ref"], DEFAULT_BRANCH)
+        self.assertEqual(
+            record["inputs"],
+            {
+                "orchestrator_correlation_id": self.correlation_id,
+                "candidate_run_id": CANDIDATE_RUN_ID,
+            },
+        )
+
+    def test_failed_qualification_blocks_instead_of_retrying_forever(self) -> None:
+        candidate_dir = self.tmp / "candidate-failed-qualification"
+        write_bridge_candidate(
+            candidate_dir,
+            release_tag="v0.1.40",
+            release_rebuild=0,
+            correlation_id=self.correlation_id,
+            run_id=CANDIDATE_RUN_ID,
+        )
+        succeeded = run_payload(
+            run_id=CANDIDATE_RUN_ID,
+            path=sro.CANDIDATE_WORKFLOW_PATH,
+            run_name=self.candidate_name,
+        )
+        failed_qualification = run_payload(
+            run_id="4201",
+            path=sro.QUALIFICATION_WORKFLOW_PATH,
+            run_name=sro.qualification_run_name(self.correlation_id, CANDIDATE_RUN_ID),
+            status="completed",
+            conclusion="failure",
+        )
+        routes = self._routes(
+            candidate_runs=[succeeded], qualification_runs=[failed_qualification]
+        )
+        routes[f"repos/{BRIDGE_REPOSITORY}/actions/runs/{CANDIDATE_RUN_ID}"] = succeeded
+        routes[
+            f"repos/{BRIDGE_REPOSITORY}/actions/runs/{CANDIDATE_RUN_ID}/artifacts?per_page=100"
+        ] = artifact_inventory(
+            run_id=CANDIDATE_RUN_ID,
+            name=rq.CANDIDATE_ARTIFACT_NAME,
+            artifact_id=CANDIDATE_ARTIFACT_ID,
+        )
+        routes[f"repos/{BRIDGE_REPOSITORY}/compare/{HEAD_SHA}...{DEFAULT_BRANCH}"] = {
+            "status": "identical"
+        }
+        gateway = FakeGateway(
+            json_routes=routes,
+            blob_routes={
+                f"repos/{BRIDGE_REPOSITORY}/actions/artifacts/{CANDIDATE_ARTIFACT_ID}/zip": flat_zip(
+                    directory_members(candidate_dir)
+                )
+            },
+        )
+        plan = sro.advance_pipeline(
+            gateway, provenance=self.provenance, workspace=self.tmp
+        )
+        self.assertEqual(plan.action, sro.OrchestrationAction.BLOCKED)
         self.assertEqual(gateway.dispatches, [])
+        self.assertIn("automatic qualification retries are disabled", plan.reason)
 
     def test_duplicate_candidate_artifacts_fail_closed(self) -> None:
         candidate_dir = self.tmp / "candidate-src"
@@ -2549,7 +2767,12 @@ class AdvancePipelineTest(unittest.TestCase):
             candidate_run_id=CANDIDATE_RUN_ID,
             candidate_artifact_id=CANDIDATE_ARTIFACT_ID,
             candidate_run_attempt=1,
+            **qualification_identity(
+                qualification_run_id=QUALIFICATION_RUN_ID,
+                qualification_source_sha=HEAD_SHA,
+            ),
             harness_digest=rq.harness_source_sha256(Path(__file__).resolve().parent),
+            environment=qualification_environment(),
             speech_phase=speech_phase(),
             tts_phase=tts_phase(),
         )
@@ -2560,16 +2783,18 @@ class AdvancePipelineTest(unittest.TestCase):
             path=sro.CANDIDATE_WORKFLOW_PATH,
             run_name=self.candidate_name,
         )
-        attestation_run = run_payload(
-            run_id=ATTESTATION_RUN_ID,
-            path=sro.ATTESTATION_WORKFLOW_PATH,
-            run_name=sro.attestation_run_name(CANDIDATE_RUN_ID),
+        qualification_run = run_payload(
+            run_id=QUALIFICATION_RUN_ID,
+            path=sro.QUALIFICATION_WORKFLOW_PATH,
+            run_name=sro.qualification_run_name(
+                self.correlation_id, CANDIDATE_RUN_ID
+            ),
         )
         routes = self._routes(
-            candidate_runs=[candidate_run], attestation_runs=[attestation_run]
+            candidate_runs=[candidate_run], qualification_runs=[qualification_run]
         )
         routes[f"repos/{BRIDGE_REPOSITORY}/actions/runs/{CANDIDATE_RUN_ID}"] = candidate_run
-        routes[f"repos/{BRIDGE_REPOSITORY}/actions/runs/{ATTESTATION_RUN_ID}"] = attestation_run
+        routes[f"repos/{BRIDGE_REPOSITORY}/actions/runs/{QUALIFICATION_RUN_ID}"] = qualification_run
         routes[
             f"repos/{BRIDGE_REPOSITORY}/actions/runs/{CANDIDATE_RUN_ID}/artifacts?per_page=100"
         ] = artifact_inventory(
@@ -2578,11 +2803,11 @@ class AdvancePipelineTest(unittest.TestCase):
             artifact_id=CANDIDATE_ARTIFACT_ID,
         )
         routes[
-            f"repos/{BRIDGE_REPOSITORY}/actions/runs/{ATTESTATION_RUN_ID}/artifacts?per_page=100"
+            f"repos/{BRIDGE_REPOSITORY}/actions/runs/{QUALIFICATION_RUN_ID}/artifacts?per_page=100"
         ] = artifact_inventory(
-            run_id=ATTESTATION_RUN_ID,
+            run_id=QUALIFICATION_RUN_ID,
             name=rq.ATTESTATION_ARTIFACT_NAME,
-            artifact_id=ATTESTATION_ARTIFACT_ID,
+            artifact_id=QUALIFICATION_ARTIFACT_ID,
         )
         routes[f"repos/{BRIDGE_REPOSITORY}/compare/{HEAD_SHA}...{DEFAULT_BRANCH}"] = {
             "status": "identical"
@@ -2591,7 +2816,7 @@ class AdvancePipelineTest(unittest.TestCase):
             f"repos/{BRIDGE_REPOSITORY}/actions/artifacts/{CANDIDATE_ARTIFACT_ID}/zip": flat_zip(
                 members
             ),
-            f"repos/{BRIDGE_REPOSITORY}/actions/artifacts/{ATTESTATION_ARTIFACT_ID}/zip": flat_zip(
+            f"repos/{BRIDGE_REPOSITORY}/actions/artifacts/{QUALIFICATION_ARTIFACT_ID}/zip": flat_zip(
                 {"qualification-attestation.json": attestation_bytes}
             ),
         }
@@ -2599,7 +2824,7 @@ class AdvancePipelineTest(unittest.TestCase):
         publish_name = sro.publish_run_name(
             self.correlation_id,
             CANDIDATE_RUN_ID,
-            ATTESTATION_RUN_ID,
+            QUALIFICATION_RUN_ID,
             self.binding,
         )
         publish_run = run_payload(
@@ -2629,7 +2854,7 @@ class AdvancePipelineTest(unittest.TestCase):
         self.assertEqual(len(gateway.dispatches), 1)
         inputs = gateway.dispatches[0]["inputs"]
         self.assertEqual(inputs["candidate_run_id"], CANDIDATE_RUN_ID)
-        self.assertEqual(inputs["attestation_run_id"], ATTESTATION_RUN_ID)
+        self.assertEqual(inputs["qualification_run_id"], QUALIFICATION_RUN_ID)
         self.assertEqual(inputs["release_tag"], "v0.1.40")
         self.assertEqual(inputs["bridge_source_sha"], BRIDGE_SHA)
         self.assertEqual(inputs["publish_approved"], "true")
@@ -2662,7 +2887,12 @@ class AdvancePipelineTest(unittest.TestCase):
             candidate_run_id=CANDIDATE_RUN_ID,
             candidate_artifact_id=CANDIDATE_ARTIFACT_ID,
             candidate_run_attempt=1,
+            **qualification_identity(
+                qualification_run_id=QUALIFICATION_RUN_ID,
+                qualification_source_sha=HEAD_SHA,
+            ),
             harness_digest=rq.harness_source_sha256(Path(__file__).resolve().parent),
+            environment=qualification_environment(),
             speech_phase=speech_phase(),
             tts_phase=tts_phase(),
         )
@@ -2672,16 +2902,18 @@ class AdvancePipelineTest(unittest.TestCase):
             path=sro.CANDIDATE_WORKFLOW_PATH,
             run_name=self.candidate_name,
         )
-        attestation_run = run_payload(
-            run_id=ATTESTATION_RUN_ID,
-            path=sro.ATTESTATION_WORKFLOW_PATH,
-            run_name=sro.attestation_run_name(CANDIDATE_RUN_ID),
+        qualification_run = run_payload(
+            run_id=QUALIFICATION_RUN_ID,
+            path=sro.QUALIFICATION_WORKFLOW_PATH,
+            run_name=sro.qualification_run_name(
+                self.correlation_id, CANDIDATE_RUN_ID
+            ),
         )
         routes = self._routes(
-            candidate_runs=[candidate_run], attestation_runs=[attestation_run]
+            candidate_runs=[candidate_run], qualification_runs=[qualification_run]
         )
         routes[f"repos/{BRIDGE_REPOSITORY}/actions/runs/{CANDIDATE_RUN_ID}"] = candidate_run
-        routes[f"repos/{BRIDGE_REPOSITORY}/actions/runs/{ATTESTATION_RUN_ID}"] = attestation_run
+        routes[f"repos/{BRIDGE_REPOSITORY}/actions/runs/{QUALIFICATION_RUN_ID}"] = qualification_run
         routes[
             f"repos/{BRIDGE_REPOSITORY}/actions/runs/{CANDIDATE_RUN_ID}/artifacts?per_page=100"
         ] = artifact_inventory(
@@ -2690,11 +2922,11 @@ class AdvancePipelineTest(unittest.TestCase):
             artifact_id=CANDIDATE_ARTIFACT_ID,
         )
         routes[
-            f"repos/{BRIDGE_REPOSITORY}/actions/runs/{ATTESTATION_RUN_ID}/artifacts?per_page=100"
+            f"repos/{BRIDGE_REPOSITORY}/actions/runs/{QUALIFICATION_RUN_ID}/artifacts?per_page=100"
         ] = artifact_inventory(
-            run_id=ATTESTATION_RUN_ID,
+            run_id=QUALIFICATION_RUN_ID,
             name=rq.ATTESTATION_ARTIFACT_NAME,
-            artifact_id=ATTESTATION_ARTIFACT_ID,
+            artifact_id=QUALIFICATION_ARTIFACT_ID,
         )
         routes[f"repos/{BRIDGE_REPOSITORY}/compare/{HEAD_SHA}...{DEFAULT_BRANCH}"] = {
             "status": "identical"
@@ -2703,7 +2935,7 @@ class AdvancePipelineTest(unittest.TestCase):
             f"repos/{BRIDGE_REPOSITORY}/actions/artifacts/{CANDIDATE_ARTIFACT_ID}/zip": flat_zip(
                 members
             ),
-            f"repos/{BRIDGE_REPOSITORY}/actions/artifacts/{ATTESTATION_ARTIFACT_ID}/zip": flat_zip(
+            f"repos/{BRIDGE_REPOSITORY}/actions/artifacts/{QUALIFICATION_ARTIFACT_ID}/zip": flat_zip(
                 {"qualification-attestation.json": attestation_bytes}
             ),
         }
