@@ -96,36 +96,18 @@ python3 scripts/multimodal_browser_smoke.py \
   --artifacts-dir /tmp/llama-web-bridge-multimodal-smoke
 ```
 
-Heavy Qwen3-ASR and Qwen3-TTS gates never run on hosted runners. Before
-publishing, run the one required local qualification command against the exact
-candidate artifact built by `.github/workflows/bridge_candidate.yml`:
+Heavy Qwen3-ASR and Qwen3-TTS gates run in the hosted automated
+qualification workflow, not in ordinary CI or the candidate build. Before
+publishing, `.github/workflows/bridge_qualification.yml` runs them against the
+exact candidate artifact built by `.github/workflows/bridge_candidate.yml`.
+The workflow proves the candidate's workflow/run/source identity and unique
+artifact ID, verifies every downloaded input checksum, requires GitHub Actions
+`github-hosted` runner identity, and emits one canonical attestation. That
+attestation binds the candidate artifact ID/run/attempt/workflow/digest and the
+producing qualification run ID/attempt/workflow/source SHA. The combined
+`release_qualification.py qualify` command is therefore workflow-only.
 
-```bash
-python3 scripts/release_qualification.py qualify \
-  --candidate-run-id <CANDIDATE_RUN_ID> \
-  --speech-model-path /path/to/Qwen3-ASR-0.6B-Q8_0.gguf \
-  --speech-mmproj-path /path/to/mmproj-Qwen3-ASR-0.6B-Q8_0.gguf \
-  --speech-audio-path /path/to/asr_en.wav \
-  --tts-model-path /path/to/Qwen3-TTS-12Hz-1.7B-Base-Q4_K_M.gguf \
-  --tts-mmproj-path /path/to/mmproj-Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf \
-  --output-attestation /tmp/qualification-attestation.json \
-  --output-base64 /tmp/qualification-attestation.b64
-```
-
-The command downloads the candidate by immutable artifact ID only after proving
-the named run is a successful `bridge_candidate.yml` dispatch on the
-default-branch line whose complete inventory contains exactly one live
-`exact-webgpu-bridge-dist` artifact. It refuses an unprovenanced local dist,
-requires every model/projector/fixture path, gives smoke children only a narrow
-non-secret environment allowlist, bounds both gate timeouts, and terminates the
-full smoke process group on timeout or cancellation. It also compares the local
-harness bytes with the exact candidate bridge commit before running a model
-gate, so run it from a checkout that contains that commit. Dispatch the `.b64`
-payload and the same candidate run ID to
-`.github/workflows/qualification_attestation.yml`, then pass that ingestion run
-ID to publication as `attestation_run_id`.
-
-Direct individual smokes can also be run locally:
+For local reproduction, run the individual smokes directly:
 
 ```bash
 python3 scripts/speech_to_text_browser_smoke.py \
@@ -159,7 +141,7 @@ query strings, and fragments before printing the location.
   changing `.github/workflows/ci.yml`, `.github/workflows/bridge_candidate.yml`,
   `.github/workflows/publish_assets.yml`,
   `.github/workflows/auto_llama_cpp_update.yml`,
-  `.github/workflows/qualification_attestation.yml`, JS build pipeline files,
+  `.github/workflows/bridge_qualification.yml`, JS build pipeline files,
   `scripts/release_qualification.py`, or
   `scripts/state_persistence_browser_smoke.py`.
 - Rotate all 7 model/projector SHA-256 pins in the five files that hard-code
@@ -179,10 +161,11 @@ query strings, and fragments before printing the location.
   the model or projector the pin belongs to.
 - Keep `scripts/multimodal_browser_smoke.py` in normal CI for every llama.cpp
   pin update; build-only validation does not cover mtmd prompt ingestion.
-- Heavy real-model ASR and TTS gates run only through
-  `scripts/release_qualification.py` during local qualification. Keep the
+- Heavy real-model ASR and TTS gates run through
+  `scripts/release_qualification.py` in automated qualification. Keep the
   candidate manifest honest: `generate_release_manifest.py` must record those
-  two gates as `required-local-attestation`, never as a hosted pass, and must
+  two gates as `required-automated-qualification`, never as a candidate-build
+  pass, and must
   keep real-device playback, intelligibility, and speaker-reference fidelity in
   `unproven_capabilities`.
 - Nothing may rebuild the candidate after it is built. The manifest embeds the
@@ -197,23 +180,27 @@ query strings, and fragments before printing the location.
 - Preserve `emsdk.version` as the single compiler source for CI and publish.
   Both workflows must verify the active `emcc` version, and published manifests
   must record that verified identity.
-- Main-branch and PR CI never dispatch publication. Scheduled stable release
-  discovery prepares an ordered `release-candidates.json` backlog for every
+- Main-branch and PR CI never dispatch publication. Stable release discovery
+  prepares an ordered `release-candidates.json` backlog for every
   stable native release after the immutable native `v0.2.0-1` / Web-assets
   `v0.1.39` baseline and invokes `scripts/stable_release_orchestrator.py` to
-  idempotently advance candidate, qualification-attestation, and publication
-  stages. The scan downloads every selected `assets.json` and `SHA256SUMS` by
+  idempotently advance candidate, automated qualification, and publication
+  stages. Each successful stage wakes an immediate `workflow_run` continuation;
+  the daily schedule discovers new native releases and is the idempotent repair
+  fallback. The scan downloads
+  every selected `assets.json` and `SHA256SUMS` by
   unique release-asset ID and runs the complete native release/tag/inventory
   contract first. Each exact pipeline advances by at most one stage per scan,
-  so an older local-qualification wait does not starve a newer stable release.
+  and the complete backlog is visited so an older in-flight gate does not starve
+  a newer candidate. Publication remains ordered by native release time.
   Manual `development` scans stay scan-only: they resolve exact `bNNNN`
   provenance and report it, and the orchestrator refuses non-stable provenance.
-  A failed candidate is never retried automatically each day; after diagnosis,
+  A failed candidate or qualification is never retried automatically; after diagnosis,
   a maintainer may deliberately dispatch one new first-attempt run with the same
   exact binding, and a later unique success supersedes the recorded failed run.
-  A successful candidate waits for maintainer-run local ASR/TTS qualification;
-  after its attestation is ingested, the next scheduled or manual stable scan
-  advances publication. Run recovery paginates each exact workflow's filtered
+  On the normal path, a successful candidate is immediately followed by hosted
+  ASR/TTS qualification, then by publication after the exact attestation is
+  verified. Run recovery paginates each exact workflow's filtered
   history with stable-count checks and splits searches at GitHub's 1,000-result
   cap into closed time windows, so an older waiting pipeline is not lost as
   later workflow history grows.
@@ -231,12 +218,11 @@ query strings, and fragments before printing the location.
 
 Use `.github/workflows/publish_assets.yml` only after the publication approval
 assertion is backed by the live `bridge-assets-publication` policy. The
-repository owner, either directly or through the scheduled orchestrator using
-that existing authorized identity, dispatches this
+bridge-owned orchestrator dispatches this
 bridge-owned, non-reusable workflow with a required correlation ID, exact bridge SHA,
 upstream tag/commit, native release tag plus `assets.json` SHA-256,
 output release tag/rebuild, distinct required `candidate_run_id` and
-`attestation_run_id`, and assets repository.
+`qualification_run_id`, and assets repository.
 
 Immutable releases must already be enabled on the assets repository before the
 candidate is dispatched. Confirm it with
@@ -259,15 +245,17 @@ readback release ID, and the exact published artifact digests. A failure is repo
 `immutable-publication-unverified`. An incomplete published release is never
 filled in; the release is never deleted, retagged, overwritten, or repaired.
 
-The request must set `publish_approved=true`. Publication remains blocked until
+The orchestrator must set `publish_approved=true` only after live policy
+verification. Publication remains blocked until
 repository administrators separately create `bridge-assets-publication`, disable
 administrator bypass, restrict the custom deployment branch policy to `main`,
 and store the assets PAT as an environment-scoped secret. The solo-maintainer
 publication contract does not require a reviewer rule, `prevent_self_review`, or
 a two-person approval quorum. The workflow uses the default job token to verify
 the environment identity, disabled administrator bypass, and exact `main`
-deployment branch policy before approval. It repeats those checks after approval
-immediately before the first publication-PAT-bearing step, using the trusted
+deployment branch policy before entering the privileged job. It repeats those
+checks inside that job immediately before the first publication-PAT-bearing
+step, using the trusted
 workflow commit's validator so an older requested build-source SHA remains
 compatible. The trusted commit also supplies attestation, provenance, and
 publication-state policy; the historical source supplies only the exact harness
@@ -277,10 +265,10 @@ external credential; each step that can use it fails closed unless the injected
 value is non-empty and never prints the value. The workflow also verifies all
 identities plus native GitHub asset digests/inventory. It never builds: it
 proves the repository, workflow file, dispatch event, default-branch-line head,
-success, complete artifact inventory, and uniqueness of both the candidate run
-and the attestation ingestion run, downloads both by immutable artifact ID, and
-verifies the attestation against the candidate twice -- once before approval and
-again inside the privileged job. It then orders stable and development histories
+success, complete artifact inventory, and uniqueness of both the candidate and
+qualification runs, downloads both by immutable artifact ID, and verifies the
+attestation against the candidate and its producing qualification run twice --
+once before entering the privileged job and again inside it. It then orders stable and development histories
 independently and recovers exact ref-only partial states while rejecting any
 published-release mismatch rather than trying to repair it.
 Manifest and outcome records carry the candidate run ID/URL, because that is the
@@ -288,11 +276,11 @@ identity the candidate manifest embeds; unavailable post-mutation re-queries
 produce retryable `mutation-unknown` records rather than guessed state.
 Publication run attempts are first-attempt-only: retry partial publication by
 redispatching a new publication run against the same `candidate_run_id` and
-`attestation_run_id`, never rerunning the old run. The fingerprinted identity
+`qualification_run_id`, never rerunning the old run. The fingerprinted identity
 comes from the candidate run, so it stays stable. A different candidate must
 never target an existing output tag.
 
-The scheduled orchestrator reuses that same existing secret only from a
+The event-driven orchestrator and its scheduled repair fallback reuse that same existing secret only from a
 `bridge-assets-publication` environment job; it does not require an
 `ORCHESTRATOR_DISPATCH_TOKEN`. For automatic progression, the owner-bound token
 must retain Actions write permission on `leehack/llama-web-bridge` in addition
@@ -307,7 +295,9 @@ validates independent release reads by tag and ID, and validates the signed
 digest. Manual runs require both the initiating actor and triggering actor to be
 the repository owner before either workflow job starts, preventing a
 collaborator from using the environment PAT as a confused deputy. Trusted
-default-branch schedule events remain automatic.
+default-branch schedule events remain automatic; `workflow_run` continuations
+also require a successful stage run on the default branch with owner actor and
+triggering actor before either job starts.
 
 GitHub artifact tags are `vMAJOR.MINOR.PATCH`, `vMAJOR.MINOR.PATCH-N`, `bNNNN`,
 or `bNNNN-N`. Historical `bNNNN-llamadart.N` and prior wrapper forms are

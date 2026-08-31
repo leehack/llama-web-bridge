@@ -1,21 +1,22 @@
 #!/usr/bin/env python3
-"""Digest-bound local release qualification and attestation validation.
+"""Digest-bound automated release qualification and attestation validation.
 
-Heavy real-model Qwen3-ASR and Qwen3-TTS gates cannot run on hosted CI runners,
-so they are split into one required local command. That command consumes the
-exact hosted candidate artifact -- it never rebuilds it -- runs the heavy gates,
-and emits a canonical attestation bound to the candidate digest and to every
-provenance identity recorded in the candidate manifest. A maintainer-only
-ingestion workflow validates the attestation against the same candidate, and
-publication refuses to publish unless an exact successful ingestion run attested
-the exact candidate it is about to publish.
+The heavy real-model Qwen3-ASR and Qwen3-TTS gates run in their own hosted
+qualification workflow rather than inside the candidate build. That run consumes
+the exact hosted candidate artifact -- it never rebuilds it -- runs the heavy
+gates, and emits a canonical attestation bound to the candidate digest and to
+every provenance identity recorded in the candidate manifest. Publication
+refuses to publish unless an exact successful qualification run attested the
+exact candidate it is about to publish.
+
+The attestation records the environment the gates actually ran in and the lanes
+that stay unproven or unavailable there, so an automatic publication never
+claims coverage nothing executed.
 """
 
 from __future__ import annotations
 
 import argparse
-import base64
-import binascii
 import copy
 import hashlib
 import json
@@ -38,13 +39,14 @@ from typing import Any, Mapping, Sequence
 from urllib.parse import urlsplit, urlunsplit
 
 from release_contract import (
+    AUTOMATED_QUALIFICATION_REQUIRED,
     BRIDGE_REPOSITORY,
     NATIVE_REPOSITORY,
+    UNPROVEN_CAPABILITIES,
     ContractError,
     require_correlation_id,
     require_sha256,
 )
-from generate_release_manifest import LOCAL_ATTESTATION_REQUIRED
 from speech_to_text_browser_smoke import DEFAULT_EXPECTED_TEXT
 from release_publication_state import (
     PUBLICATION_FILES,
@@ -53,17 +55,14 @@ from release_publication_state import (
 )
 
 
-QUALIFICATION_SCHEMA_VERSION = 1
-ATTESTATION_TYPE = "llama-web-bridge-local-qualification"
-HARNESS_VERSION = "2.0.0"
+QUALIFICATION_SCHEMA_VERSION = 2
+ATTESTATION_TYPE = "llama-web-bridge-automated-qualification"
+HARNESS_VERSION = "3.0.0"
 
-# The attestation is transported into the maintainer ingestion workflow as a
-# single-line base64 blob so multiline dispatch inputs cannot be truncated,
-# re-quoted, or line-folded in transit. A 32 KiB decoded ceiling leaves ample
-# room for base64 expansion and the rest of the workflow-dispatch payload while
-# remaining far above the canonical attestation's expected size.
+# The attestation only ever travels as a workflow artifact, so this ceiling is a
+# bound on the archived member rather than a transport limit. It stays far above
+# the canonical attestation's expected size.
 MAX_ATTESTATION_BYTES = 32768
-_BASE64_RE = re.compile(r"^[A-Za-z0-9+/]+={0,2}$")
 
 MAX_COMPRESSION_RATIO = 100.0
 # An exact-head candidate is roughly 17 MiB uncompressed with its two largest
@@ -141,23 +140,35 @@ def _parse_cancellation_result(value: Any, label: str) -> tuple[str, int]:
 
 CANDIDATE_WORKFLOW_PATH = ".github/workflows/bridge_candidate.yml"
 CANDIDATE_ARTIFACT_NAME = "exact-webgpu-bridge-dist"
-ATTESTATION_WORKFLOW_PATH = ".github/workflows/qualification_attestation.yml"
+QUALIFICATION_WORKFLOW_PATH = ".github/workflows/bridge_qualification.yml"
 ATTESTATION_ARTIFACT_NAME = "qualification-attestation"
 
-# Gates the hosted candidate run proves. They are copied from the candidate
-# manifest and re-checked, never asserted by the local harness itself.
-HOSTED_GATES = ("state_persistence", "multimodal")
-# Gates this local harness proves against the exact candidate artifact.
-LOCAL_GATES = ("speech_to_text", "text_to_speech")
+# Gates the candidate build run proves. They are copied from the candidate
+# manifest and re-checked, never asserted by the qualification harness itself.
+CANDIDATE_GATES = ("state_persistence", "multimodal")
+# Heavy real-model gates this harness proves against the exact candidate
+# artifact in its own hosted qualification run.
+HEAVY_GATES = ("speech_to_text", "text_to_speech")
 
-# Local qualification proves programmatic transcript, lifecycle, and WAV
-# container correctness only. Nothing here listens to the generated audio, so
-# these three capabilities stay explicitly unproven in every attestation.
-REQUIRED_UNPROVEN_CAPABILITIES = {
-    "real_device_intelligibility": "unproven",
-    "real_device_playback": "unproven",
-    "speaker_reference_fidelity": "unproven",
-}
+# Qualification proves programmatic transcript, lifecycle, and WAV container
+# correctness on a hosted runner. Nothing listens to generated audio, and no
+# hosted runner exposes a real GPU, so those lanes stay explicitly uncovered.
+REQUIRED_UNPROVEN_CAPABILITIES = copy.deepcopy(UNPROVEN_CAPABILITIES)
+
+# The gates must execute on hosted GitHub Actions infrastructure. Pinning the
+# recorded execution mode is what stops a machine-produced attestation from
+# claiming coverage the automatic pipeline never observed.
+QUALIFICATION_EXECUTION = "hosted-github-actions"
+QUALIFICATION_ENVIRONMENT_KEYS = (
+    "cpu_count",
+    "execution",
+    "runner_arch",
+    "runner_os",
+    "total_memory_bytes",
+)
+MAX_QUALIFICATION_CPU_COUNT = 1024
+MAX_QUALIFICATION_MEMORY_BYTES = 1 << 44
+_RUNNER_LABEL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,31}")
 
 REQUIRED_SPEECH_MODES = (
     ("wasm32", "direct"),
@@ -224,9 +235,11 @@ EXPECTED_MODEL_PINS = {
 
 # Every source file whose behaviour the heavy gates depend on. The digest binds
 # an attestation to the exact harness that produced it, so publication can prove
-# the maintainer ran the harness from the exact bridge source being published.
+# the harness that ran is the exact bridge source being published.
 HARNESS_SOURCES = (
     "multimodal_browser_smoke.py",
+    "release_contract.py",
+    "release_publication_state.py",
     "release_qualification.py",
     "speech_to_text_browser_smoke.py",
     "state_persistence_browser_smoke.py",
@@ -242,14 +255,15 @@ ATTESTATION_KEYS = (
     "bridge_source_sha",
     "candidate_artifact_id",
     "candidate_fingerprint",
+    "candidate_gates",
     "candidate_run_attempt",
     "candidate_run_id",
     "candidate_run_url",
+    "candidate_workflow_path",
     "emscripten_version",
     "harness_source_sha256",
     "harness_version",
-    "hosted_gates",
-    "local_gates",
+    "heavy_gates",
     "model_pins",
     "native_commit",
     "native_manifest_sha256",
@@ -257,6 +271,12 @@ ATTESTATION_KEYS = (
     "native_repository",
     "orchestrator_correlation_id",
     "phases",
+    "qualification_environment",
+    "qualification_run_attempt",
+    "qualification_run_id",
+    "qualification_run_url",
+    "qualification_source_sha",
+    "qualification_workflow_path",
     "release_rebuild",
     "release_tag",
     "schema_version",
@@ -301,65 +321,33 @@ def canonical_json(payload: Mapping[str, Any]) -> str:
         raise ContractError(f"attestation is not canonical JSON data: {exc}") from exc
 
 
-def encode_attestation(canonical_text: str) -> str:
-    """Encode canonical attestation text as one bounded single-line base64 blob."""
-    encoded = canonical_text.encode("utf-8")
-    if len(encoded) > MAX_ATTESTATION_BYTES:
-        raise ContractError(
-            f"attestation is {len(encoded)} bytes; the transport bound is "
-            f"{MAX_ATTESTATION_BYTES}"
-        )
-    return base64.b64encode(encoded).decode("ascii")
+def load_attestation_file(path: Path) -> dict[str, Any]:
+    """Read an attestation artifact, refusing anything but its canonical form.
 
-
-def decode_attestation(blob: str) -> tuple[dict[str, Any], str]:
-    """Decode a transported attestation, rejecting oversized or noncanonical input.
-
-    Returns the parsed payload and its canonical text. The decoded bytes must be
-    byte-for-byte the canonical serialization of the payload, so a re-ordered,
-    re-indented, or padded variant of an otherwise valid attestation is refused
-    instead of being silently normalized.
+    A re-ordered, re-indented, or padded variant of an otherwise valid
+    attestation is refused rather than silently normalized, so the bytes a
+    qualification run uploaded are the exact bytes publication verifies.
     """
-    # The local output file ends with one conventional newline. The dispatch
-    # value itself must otherwise be one uninterrupted base64 line; silently
-    # folding arbitrary whitespace would contradict the transport boundary.
-    if blob.endswith("\r\n"):
-        encoded = blob[:-2]
-    elif blob.endswith("\n"):
-        encoded = blob[:-1]
-    else:
-        encoded = blob
-    if not encoded:
-        raise ContractError("attestation payload is empty")
-    if any(character.isspace() for character in encoded):
-        raise ContractError("attestation payload must be exactly one base64 line")
-    maximum_encoded_length = ((MAX_ATTESTATION_BYTES + 2) // 3) * 4
-    if len(encoded) > maximum_encoded_length:
-        raise ContractError("encoded attestation exceeds the transport bound")
-    if _BASE64_RE.fullmatch(encoded) is None:
-        raise ContractError("attestation payload is not single-line base64")
     try:
-        raw = base64.b64decode(encoded, validate=True)
-    except (binascii.Error, ValueError) as exc:
-        raise ContractError(f"attestation payload is not valid base64: {exc}") from exc
-    if base64.b64encode(raw).decode("ascii") != encoded:
-        raise ContractError("attestation payload is not canonical base64")
+        raw = path.read_bytes()
+    except OSError as exc:
+        raise ContractError(f"could not read attestation artifact: {exc}") from exc
     if len(raw) > MAX_ATTESTATION_BYTES:
         raise ContractError(
-            f"decoded attestation is {len(raw)} bytes; the bound is "
+            f"attestation artifact is {len(raw)} bytes; the bound is "
             f"{MAX_ATTESTATION_BYTES}"
         )
     try:
         text = raw.decode("utf-8")
     except UnicodeDecodeError as exc:
-        raise ContractError(f"attestation payload is not UTF-8: {exc}") from exc
+        raise ContractError(f"attestation artifact is not UTF-8: {exc}") from exc
     payload = parse_attestation_json(text)
-    canonical = canonical_json(payload)
-    if text != canonical:
+    if text != canonical_json(payload):
         raise ContractError(
-            "attestation payload is not the canonical serialization of its own content"
+            "attestation artifact is not the canonical serialization of its own "
+            "content"
         )
-    return payload, canonical
+    return payload
 
 
 REDACTED_CREDENTIAL = "<redacted-credential>"
@@ -527,7 +515,7 @@ def require_harness_matches_bridge_source(
     source_digest = _harness_source_sha256_at_commit(scripts_dir.parent, bridge_sha)
     if local_digest != source_digest:
         raise ContractError(
-            "local qualification harness does not match the exact candidate "
+            "qualification harness does not match the exact candidate "
             f"bridge source {bridge_sha}: local={local_digest}, source={source_digest}"
         )
     return local_digest
@@ -605,27 +593,125 @@ def load_candidate(directory: Path) -> tuple[dict[str, Any], str]:
     return manifest, fingerprint
 
 
-def _manifest_hosted_gates(manifest: Mapping[str, Any]) -> dict[str, str]:
+def _manifest_candidate_gates(manifest: Mapping[str, Any]) -> dict[str, str]:
     gates = manifest.get("qualification_gates")
     if not isinstance(gates, Mapping):
         raise ContractError("candidate manifest qualification_gates must be an object")
-    hosted: dict[str, str] = {}
-    for name in HOSTED_GATES:
+    proven: dict[str, str] = {}
+    for name in CANDIDATE_GATES:
         value = gates.get(name)
         if value != "passed":
             raise ContractError(
-                f"candidate manifest hosted gate {name!r} is {value!r}; must be 'passed'"
+                f"candidate manifest gate {name!r} is {value!r}; must be 'passed'"
             )
-        hosted[name] = value
-    for name in LOCAL_GATES:
+        proven[name] = value
+    for name in HEAVY_GATES:
         value = gates.get(name)
-        if value != LOCAL_ATTESTATION_REQUIRED:
+        if value != AUTOMATED_QUALIFICATION_REQUIRED:
             raise ContractError(
                 f"candidate manifest gate {name!r} is {value!r}; a candidate must "
-                f"declare {LOCAL_ATTESTATION_REQUIRED!r} rather than claim a "
-                "hosted pass it never ran"
+                f"declare {AUTOMATED_QUALIFICATION_REQUIRED!r} rather than claim a "
+                "pass its own run never executed"
             )
-    return hosted
+    return proven
+
+
+def qualification_environment() -> dict[str, Any]:
+    """Record the hosted runner the heavy gates actually executed on.
+
+    The values come from the runner itself rather than from a caller-supplied
+    claim. GitHub's hosted-runner marker and Actions marker are both required;
+    OS/architecture labels alone are locally forgeable and are not a hosted
+    execution proof.
+    """
+    if os.environ.get("GITHUB_ACTIONS") != "true":
+        raise ContractError(
+            "GITHUB_ACTIONS must identify a GitHub Actions run; qualification "
+            "only runs on hosted GitHub Actions infrastructure"
+        )
+    if os.environ.get("RUNNER_ENVIRONMENT") != "github-hosted":
+        raise ContractError(
+            "RUNNER_ENVIRONMENT must be 'github-hosted'; qualification only runs "
+            "on hosted GitHub Actions infrastructure"
+        )
+    labels: dict[str, str] = {}
+    for key, field in (("RUNNER_OS", "runner_os"), ("RUNNER_ARCH", "runner_arch")):
+        value = os.environ.get(key, "")
+        if _RUNNER_LABEL_RE.fullmatch(value) is None:
+            raise ContractError(
+                f"{key} must identify the hosted runner; qualification only runs "
+                "on hosted GitHub Actions infrastructure"
+            )
+        labels[field] = value
+    cpu_count = os.cpu_count() or 0
+    try:
+        total_memory_bytes = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+    except (OSError, ValueError, AttributeError) as exc:
+        raise ContractError(f"could not measure runner memory: {exc}") from exc
+    return {
+        "execution": QUALIFICATION_EXECUTION,
+        "cpu_count": _require_positive_int(cpu_count, "runner cpu_count"),
+        "total_memory_bytes": _require_positive_int(
+            total_memory_bytes, "runner total_memory_bytes"
+        ),
+        **labels,
+    }
+
+
+def qualification_run_identity() -> dict[str, Any]:
+    """Bind the attestation to the exact trusted workflow run that produced it."""
+    run_id = os.environ.get("GITHUB_RUN_ID", "")
+    if _RUN_ID_RE.fullmatch(run_id) is None:
+        raise ContractError("GITHUB_RUN_ID must identify the qualification run")
+    run_attempt_text = os.environ.get("GITHUB_RUN_ATTEMPT", "")
+    if run_attempt_text != "1":
+        raise ContractError("qualification GITHUB_RUN_ATTEMPT must be 1")
+    source_sha = os.environ.get("GITHUB_SHA", "")
+    if _COMMIT_RE.fullmatch(source_sha) is None:
+        raise ContractError("GITHUB_SHA must identify the qualification workflow source")
+    if os.environ.get("GITHUB_REPOSITORY") != BRIDGE_REPOSITORY:
+        raise ContractError(
+            f"GITHUB_REPOSITORY must be exactly {BRIDGE_REPOSITORY}"
+        )
+    return {
+        "qualification_run_id": run_id,
+        "qualification_run_attempt": 1,
+        "qualification_run_url": (
+            f"https://github.com/{BRIDGE_REPOSITORY}/actions/runs/{run_id}"
+        ),
+        "qualification_source_sha": source_sha,
+        "qualification_workflow_path": QUALIFICATION_WORKFLOW_PATH,
+    }
+
+
+def _validate_qualification_environment(value: Any) -> None:
+    environment = _require_exact_mapping(
+        value, QUALIFICATION_ENVIRONMENT_KEYS, "qualification_environment"
+    )
+    if environment["execution"] != QUALIFICATION_EXECUTION:
+        raise ContractError(
+            "qualification_environment execution must be "
+            f"{QUALIFICATION_EXECUTION!r}, got {environment['execution']!r}"
+        )
+    for field in ("runner_os", "runner_arch"):
+        label = environment[field]
+        if not isinstance(label, str) or _RUNNER_LABEL_RE.fullmatch(label) is None:
+            raise ContractError(
+                f"qualification_environment {field} must be a short runner label"
+            )
+    cpu_count = _require_positive_int(
+        environment["cpu_count"], "qualification_environment cpu_count"
+    )
+    if cpu_count > MAX_QUALIFICATION_CPU_COUNT:
+        raise ContractError("qualification_environment cpu_count is implausible")
+    memory = _require_positive_int(
+        environment["total_memory_bytes"],
+        "qualification_environment total_memory_bytes",
+    )
+    if memory > MAX_QUALIFICATION_MEMORY_BYTES:
+        raise ContractError(
+            "qualification_environment total_memory_bytes is implausible"
+        )
 
 
 def validate_workflow_run(
@@ -779,7 +865,11 @@ def build_attestation(
     candidate_run_id: str,
     candidate_artifact_id: int,
     candidate_run_attempt: int = 1,
+    qualification_run_id: str,
+    qualification_run_attempt: int,
+    qualification_source_sha: str,
     harness_digest: str,
+    environment: Mapping[str, Any],
     speech_phase: Mapping[str, Any],
     tts_phase: Mapping[str, Any],
 ) -> dict[str, Any]:
@@ -794,6 +884,20 @@ def build_attestation(
         or candidate_run_attempt != 1
     ):
         raise ContractError("candidate_run_attempt must be 1")
+    if _RUN_ID_RE.fullmatch(qualification_run_id) is None:
+        raise ContractError("qualification_run_id must be a positive integer")
+    if qualification_run_id == candidate_run_id:
+        raise ContractError("candidate and qualification runs must be distinct")
+    if (
+        not isinstance(qualification_run_attempt, int)
+        or isinstance(qualification_run_attempt, bool)
+        or qualification_run_attempt != 1
+    ):
+        raise ContractError("qualification_run_attempt must be 1")
+    if _COMMIT_RE.fullmatch(qualification_source_sha) is None:
+        raise ContractError(
+            "qualification_source_sha must be a lowercase 40-hex commit SHA"
+        )
     manifest_run_id = _require_str(manifest, "github_run_id", "candidate manifest")
     if manifest_run_id != candidate_run_id:
         raise ContractError(
@@ -803,6 +907,7 @@ def build_attestation(
     require_correlation_id(
         _require_str(manifest, "orchestrator_correlation_id", "candidate manifest")
     )
+    _validate_qualification_environment(environment)
 
     return {
         "schema_version": QUALIFICATION_SCHEMA_VERSION,
@@ -814,6 +919,15 @@ def build_attestation(
         "candidate_run_url": _require_str(
             manifest, "github_run_url", "candidate manifest"
         ),
+        "candidate_workflow_path": CANDIDATE_WORKFLOW_PATH,
+        "qualification_run_id": qualification_run_id,
+        "qualification_run_attempt": qualification_run_attempt,
+        "qualification_run_url": (
+            f"https://github.com/{BRIDGE_REPOSITORY}/actions/runs/"
+            f"{qualification_run_id}"
+        ),
+        "qualification_source_sha": qualification_source_sha,
+        "qualification_workflow_path": QUALIFICATION_WORKFLOW_PATH,
         "bridge_repository": BRIDGE_REPOSITORY,
         "bridge_source_sha": manifest["bridge_commit"],
         "upstream_repository": "ggml-org/llama.cpp",
@@ -830,9 +944,10 @@ def build_attestation(
         "harness_version": HARNESS_VERSION,
         "harness_source_sha256": harness_digest,
         "model_pins": copy.deepcopy(EXPECTED_MODEL_PINS),
-        "hosted_gates": _manifest_hosted_gates(manifest),
-        "local_gates": {gate: "passed" for gate in LOCAL_GATES},
+        "candidate_gates": _manifest_candidate_gates(manifest),
+        "heavy_gates": {gate: "passed" for gate in HEAVY_GATES},
         "unproven_capabilities": copy.deepcopy(REQUIRED_UNPROVEN_CAPABILITIES),
+        "qualification_environment": copy.deepcopy(dict(environment)),
         "phases": {
             "speech_to_text": copy.deepcopy(dict(speech_phase)),
             "text_to_speech": copy.deepcopy(dict(tts_phase)),
@@ -1054,6 +1169,9 @@ def verify_attestation(
     candidate_run_id: str | None = None,
     candidate_artifact_id: int | None = None,
     candidate_run_attempt: int | None = None,
+    qualification_run_id: str | None = None,
+    qualification_run_attempt: int | None = None,
+    qualification_source_sha: str | None = None,
     bridge_source_sha: str | None = None,
     upstream_tag: str | None = None,
     upstream_commit: str | None = None,
@@ -1094,6 +1212,15 @@ def verify_attestation(
         raise ContractError(f"native_repository must be exactly {NATIVE_REPOSITORY!r}")
     if attestation["upstream_repository"] != "ggml-org/llama.cpp":
         raise ContractError("upstream_repository must be exactly 'ggml-org/llama.cpp'")
+    if attestation["candidate_workflow_path"] != CANDIDATE_WORKFLOW_PATH:
+        raise ContractError(
+            f"candidate_workflow_path must be exactly {CANDIDATE_WORKFLOW_PATH!r}"
+        )
+    if attestation["qualification_workflow_path"] != QUALIFICATION_WORKFLOW_PATH:
+        raise ContractError(
+            "qualification_workflow_path must be exactly "
+            f"{QUALIFICATION_WORKFLOW_PATH!r}"
+        )
 
     fingerprint = _require_str(attestation, "candidate_fingerprint", "attestation")
     require_sha256(fingerprint, "candidate_fingerprint")
@@ -1123,6 +1250,35 @@ def verify_attestation(
     attempt = attestation.get("candidate_run_attempt")
     if not isinstance(attempt, int) or isinstance(attempt, bool) or attempt != 1:
         raise ContractError("attestation candidate_run_attempt must be 1")
+    qualification_id = _require_str(
+        attestation, "qualification_run_id", "attestation"
+    )
+    if _RUN_ID_RE.fullmatch(qualification_id) is None:
+        raise ContractError("qualification_run_id must be a positive integer")
+    if qualification_id == run_id:
+        raise ContractError("candidate and qualification runs must be distinct")
+    expected_qualification_url = (
+        f"https://github.com/{BRIDGE_REPOSITORY}/actions/runs/{qualification_id}"
+    )
+    if attestation["qualification_run_url"] != expected_qualification_url:
+        raise ContractError(
+            "qualification_run_url must be exactly "
+            f"{expected_qualification_url}"
+        )
+    qualification_attempt = attestation.get("qualification_run_attempt")
+    if (
+        not isinstance(qualification_attempt, int)
+        or isinstance(qualification_attempt, bool)
+        or qualification_attempt != 1
+    ):
+        raise ContractError("attestation qualification_run_attempt must be 1")
+    qualification_sha = _require_str(
+        attestation, "qualification_source_sha", "attestation"
+    )
+    if _COMMIT_RE.fullmatch(qualification_sha) is None:
+        raise ContractError(
+            "qualification_source_sha must be a lowercase 40-hex commit SHA"
+        )
     _require_str(attestation, "emscripten_version", "attestation")
     _require_str(attestation, "release_tag", "attestation")
     _require_non_negative_int(
@@ -1132,17 +1288,19 @@ def verify_attestation(
         _require_str(attestation, "orchestrator_correlation_id", "attestation")
     )
 
-    hosted = _require_exact_mapping(
-        attestation["hosted_gates"], HOSTED_GATES, "hosted_gates"
+    candidate_gates = _require_exact_mapping(
+        attestation["candidate_gates"], CANDIDATE_GATES, "candidate_gates"
     )
-    local = _require_exact_mapping(
-        attestation["local_gates"], LOCAL_GATES, "local_gates"
+    heavy = _require_exact_mapping(
+        attestation["heavy_gates"], HEAVY_GATES, "heavy_gates"
     )
-    for name, conclusion in (*hosted.items(), *local.items()):
+    for name, conclusion in (*candidate_gates.items(), *heavy.items()):
         if conclusion != "passed":
             raise ContractError(
                 f"qualification gate {name!r} is {conclusion!r}; must be 'passed'"
             )
+
+    _validate_qualification_environment(attestation["qualification_environment"])
 
     unproven = _require_exact_mapping(
         attestation["unproven_capabilities"],
@@ -1165,7 +1323,7 @@ def verify_attestation(
                 f"model pin {name!r} mismatch: expected {expected}, got {pins[name]!r}"
             )
 
-    phases = _require_exact_mapping(attestation["phases"], LOCAL_GATES, "phases")
+    phases = _require_exact_mapping(attestation["phases"], HEAVY_GATES, "phases")
     _validate_phase(
         phases["speech_to_text"],
         label="phases.speech_to_text",
@@ -1208,9 +1366,9 @@ def verify_attestation(
                     f"attestation {field} does not match the candidate manifest: "
                     f"{attestation[field]!r} != {expected!r}"
                 )
-        if hosted != _manifest_hosted_gates(manifest):
+        if candidate_gates != _manifest_candidate_gates(manifest):
             raise ContractError(
-                "attestation hosted_gates do not match the candidate manifest"
+                "attestation candidate_gates do not match the candidate manifest"
             )
 
     expectations: dict[str, Any] = {
@@ -1219,6 +1377,9 @@ def verify_attestation(
         "candidate_fingerprint": candidate_fingerprint,
         "candidate_run_attempt": candidate_run_attempt,
         "candidate_run_id": candidate_run_id,
+        "qualification_run_attempt": qualification_run_attempt,
+        "qualification_run_id": qualification_run_id,
+        "qualification_source_sha": qualification_source_sha,
         "emscripten_version": emscripten_version,
         "harness_source_sha256": harness_sha256,
         "native_commit": native_commit,
@@ -1245,6 +1406,9 @@ def verify_attestation(
         "candidate_run_id": run_id,
         "candidate_artifact_id": artifact_id,
         "candidate_run_attempt": attempt,
+        "qualification_run_id": qualification_id,
+        "qualification_run_attempt": qualification_attempt,
+        "qualification_source_sha": qualification_sha,
         "release_tag": attestation["release_tag"],
         "bridge_source_sha": attestation["bridge_source_sha"],
         "harness_source_sha256": attestation["harness_source_sha256"],
@@ -1304,7 +1468,7 @@ def _stop_smoke_process(
         try:
             if os.name == "posix":
                 os.killpg(proc.pid, signal.SIGTERM)
-            else:  # pragma: no cover - local qualification targets POSIX today
+            else:  # pragma: no cover - qualification targets POSIX today
                 proc.terminate()
         except ProcessLookupError:
             pass
@@ -1314,7 +1478,7 @@ def _stop_smoke_process(
         try:
             if os.name == "posix":
                 os.killpg(proc.pid, signal.SIGKILL)
-            else:  # pragma: no cover - local qualification targets POSIX today
+            else:  # pragma: no cover - qualification targets POSIX today
                 proc.kill()
         except ProcessLookupError:
             pass
@@ -2187,6 +2351,8 @@ def _require_input_file(path: Path, label: str) -> Path:
 
 def qualify_cmd(args: argparse.Namespace) -> int:
     scripts_dir = Path(__file__).resolve().parent
+    environment = qualification_environment()
+    qualification_identity = qualification_run_identity()
     if args.tts_max_frames <= 0:
         raise ContractError("tts_max_frames must be positive")
     if args.speech_timeout_seconds <= 0 or args.tts_timeout_seconds <= 0:
@@ -2278,7 +2444,15 @@ def qualify_cmd(args: argparse.Namespace) -> int:
             candidate_run_id=args.candidate_run_id,
             candidate_artifact_id=candidate_artifact_id,
             candidate_run_attempt=candidate_run_attempt,
+            qualification_run_id=qualification_identity["qualification_run_id"],
+            qualification_run_attempt=qualification_identity[
+                "qualification_run_attempt"
+            ],
+            qualification_source_sha=qualification_identity[
+                "qualification_source_sha"
+            ],
             harness_digest=harness_digest,
+            environment=environment,
             speech_phase=speech_phase,
             tts_phase=tts_phase,
         )
@@ -2289,23 +2463,26 @@ def qualify_cmd(args: argparse.Namespace) -> int:
             candidate_dir=candidate_dir,
             candidate_artifact_id=candidate_artifact_id,
             candidate_run_attempt=candidate_run_attempt,
+            qualification_run_id=qualification_identity["qualification_run_id"],
+            qualification_run_attempt=qualification_identity[
+                "qualification_run_attempt"
+            ],
+            qualification_source_sha=qualification_identity[
+                "qualification_source_sha"
+            ],
         )
         canonical = canonical_json(attestation)
 
+    if len(canonical.encode("utf-8")) > MAX_ATTESTATION_BYTES:
+        raise ContractError(
+            f"attestation exceeds the {MAX_ATTESTATION_BYTES}-byte artifact bound"
+        )
     args.output_attestation.write_text(canonical, encoding="utf-8")
-    args.output_base64.write_text(encode_attestation(canonical) + "\n", encoding="utf-8")
     sys.stdout.write(canonical)
     print(
-        f"Canonical attestation written to {args.output_attestation}\n"
-        f"Dispatch payload written to {args.output_base64}",
+        f"Canonical attestation written to {args.output_attestation}",
         file=sys.stderr,
     )
-    return 0
-
-
-def decode_attestation_cmd(args: argparse.Namespace) -> int:
-    _, canonical = decode_attestation(args.input.read_text(encoding="utf-8"))
-    args.output.write_text(canonical, encoding="utf-8")
     return 0
 
 
@@ -2332,7 +2509,7 @@ def verify_run_cmd(args: argparse.Namespace) -> int:
 
 
 def verify_attestation_cmd(args: argparse.Namespace) -> int:
-    attestation = parse_attestation_json(args.attestation.read_text(encoding="utf-8"))
+    attestation = load_attestation_file(args.attestation)
     result = verify_attestation(
         attestation=attestation,
         candidate_dir=args.candidate_dist.resolve() if args.candidate_dist else None,
@@ -2340,6 +2517,9 @@ def verify_attestation_cmd(args: argparse.Namespace) -> int:
         candidate_run_id=args.candidate_run_id,
         candidate_artifact_id=args.candidate_artifact_id,
         candidate_run_attempt=args.candidate_run_attempt,
+        qualification_run_id=args.qualification_run_id,
+        qualification_run_attempt=args.qualification_run_attempt,
+        qualification_source_sha=args.qualification_source_sha,
         bridge_source_sha=args.bridge_commit,
         upstream_tag=args.upstream_tag,
         upstream_commit=args.upstream_commit,
@@ -2377,7 +2557,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     qualify = subparsers.add_parser(
         "qualify",
-        help="Run the heavy local gates against an exact hosted candidate run.",
+        help="Run the heavy hosted gates against an exact hosted candidate run.",
     )
     qualify.add_argument("--candidate-run-id", required=True)
     qualify.add_argument("--speech-model-path", required=True, type=Path)
@@ -2390,14 +2570,6 @@ def _build_parser() -> argparse.ArgumentParser:
     qualify.add_argument("--tts-timeout-seconds", type=int, default=1800)
     qualify.add_argument("--diagnostics-dir", type=Path)
     qualify.add_argument("--output-attestation", required=True, type=Path)
-    qualify.add_argument("--output-base64", required=True, type=Path)
-
-    decode = subparsers.add_parser(
-        "decode-attestation",
-        help="Decode and canonicality-check a transported base64 attestation.",
-    )
-    decode.add_argument("--input", required=True, type=Path)
-    decode.add_argument("--output", required=True, type=Path)
 
     verify_run = subparsers.add_parser(
         "verify-run",
@@ -2420,6 +2592,9 @@ def _build_parser() -> argparse.ArgumentParser:
     verify.add_argument("--candidate-run-id")
     verify.add_argument("--candidate-artifact-id", type=int)
     verify.add_argument("--candidate-run-attempt", type=int)
+    verify.add_argument("--qualification-run-id")
+    verify.add_argument("--qualification-run-attempt", type=int)
+    verify.add_argument("--qualification-source-sha")
     verify.add_argument("--bridge-commit")
     verify.add_argument("--upstream-tag")
     verify.add_argument("--upstream-commit")
@@ -2447,7 +2622,6 @@ def _build_parser() -> argparse.ArgumentParser:
 
 COMMANDS = {
     "qualify": qualify_cmd,
-    "decode-attestation": decode_attestation_cmd,
     "verify-run": verify_run_cmd,
     "verify-attestation": verify_attestation_cmd,
     "candidate-fingerprint": candidate_fingerprint_cmd,

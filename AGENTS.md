@@ -99,31 +99,11 @@ python3 scripts/multimodal_browser_smoke.py \
   --artifacts-dir /private/tmp/llama_web_bridge_multimodal_smoke_artifacts
 ```
 
-Heavy Qwen3-ASR and Qwen3-TTS gates never run on hosted runners. Before
-publishing, run the one required local qualification command against the exact
-candidate artifact produced by `.github/workflows/bridge_candidate.yml`:
-
-```bash
-python3 scripts/release_qualification.py qualify \
-  --candidate-run-id <CANDIDATE_RUN_ID> \
-  --speech-model-path /path/to/Qwen3-ASR-0.6B-Q8_0.gguf \
-  --speech-mmproj-path /path/to/mmproj-Qwen3-ASR-0.6B-Q8_0.gguf \
-  --speech-audio-path /path/to/asr_en.wav \
-  --tts-model-path /path/to/Qwen3-TTS-12Hz-1.7B-Base-Q4_K_M.gguf \
-  --tts-mmproj-path /path/to/mmproj-Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf \
-  --output-attestation /private/tmp/qualification-attestation.json \
-  --output-base64 /private/tmp/qualification-attestation.b64
-```
-
-Every model, projector, and fixture path is required. Smoke children receive a
-narrow non-secret environment allowlist, each gate has a bounded timeout, and
-the full process group is terminated on timeout or cancellation. The command
-never accepts an unprovenanced local dist and rejects local harness bytes that
-do not match the exact candidate bridge commit. Dispatch the resulting base64
-payload to `.github/workflows/qualification_attestation.yml` with the same
-candidate run ID.
-
-Run individual smokes when testing isolated changes:
+Heavy Qwen3-ASR and Qwen3-TTS gates run in the hosted automated qualification
+workflow, not in ordinary CI or the candidate build. The combined
+`release_qualification.py qualify` command is workflow-only because it requires
+GitHub Actions and `github-hosted` runner identity. For local reproduction, run
+the individual smokes directly:
 
 ```bash
 python3 scripts/speech_to_text_browser_smoke.py \
@@ -147,9 +127,9 @@ python3 scripts/text_to_speech_browser_smoke.py \
 ```
 
 The candidate manifest records `speech_to_text` and `text_to_speech` as
-`required-local-attestation`, never as a hosted pass. Publication fails closed
-unless a verified attestation from an exact successful ingestion run binds the
-candidate digest it is about to publish.
+`required-automated-qualification`, never as a candidate-build pass.
+Publication fails closed unless a verified attestation from an exact successful
+automated qualification run binds the candidate digest it is about to publish.
 
 ## CI / Release
 
@@ -179,24 +159,24 @@ candidate digest it is about to publish.
     before publishing.
     Confirm the assertion first with
     `gh api repos/leehack/llama-web-bridge-assets/immutable-releases`.
-- Attestation ingestion: `.github/workflows/qualification_attestation.yml`
-  - Maintainer-only. Takes the candidate run ID and a bounded single-line
-    base64 attestation; a raw multiline JSON input is not accepted.
+- Automated qualification: `.github/workflows/bridge_qualification.yml`
+  - Owner-dispatched by the orchestrator with the exact candidate run ID and
+    correlation ID; no maintainer-supplied attestation input exists.
   - Proves the candidate run is a successful `bridge_candidate.yml`
     `workflow_dispatch` in this repository whose head is on the default-branch
     line whose complete inventory has exactly one live
     `exact-webgpu-bridge-dist` artifact, downloads it by immutable artifact ID,
-    checks out the exact candidate source to recompute the harness digest,
-    decodes and canonicality-checks the payload, re-verifies it, and uploads
-    `qualification-attestation` using existing repository access and no PAT.
+    checks out the exact candidate source, verifies pinned model inputs, runs
+    the hosted real-model gates, canonicality-checks the result, and uploads one
+    `qualification-attestation` artifact using repository access and no PAT.
 - Native-aligned candidate scan and publication orchestrator: `.github/workflows/auto_llama_cpp_update.yml`
   - Scheduled runs select every stable native release published after the
     immutable `v0.2.0-1` / Web-assets `v0.1.39` automation baseline. They
     download each release's `assets.json` and `SHA256SUMS` by unique GitHub
     Release asset ID, validate the exact release/tag/asset inventory, collect
     exact provenance in `release-candidates.json`, and idempotently advance each
-    three-stage pipeline (Build Exact Bridge Candidate -> Ingest Qualification
-    Attestation -> Publish Exact Qualified Bridge Assets). Processing the whole
+    three-stage pipeline (Build Exact Bridge Candidate -> Qualify Exact Bridge
+    Candidate -> Publish Exact Qualified Bridge Assets). Processing the whole
     ordered backlog prevents an older qualification wait from hiding or
     starving a newer stable native release; each exact pipeline advances by at
     most one stage per scheduled/manual scan.
