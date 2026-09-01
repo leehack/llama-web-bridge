@@ -214,10 +214,10 @@ automated qualification run binds the candidate digest it is about to publish.
     a maintainer may explicitly dispatch one deliberate new first-attempt run
     with the same exact binding. Publication retries may reuse only the exact
     successful candidate and attestation runs.
-  - A successful candidate waits for maintainer-run local ASR/TTS qualification
-    and ingestion without blocking candidate creation for later backlog entries.
-    After that external ingestion succeeds, the next daily or manual stable scan
-    dispatches publication; no hosted run fabricates or weakens the attestation.
+  - A successful candidate advances to hosted automated ASR/TTS qualification
+    without blocking candidate creation for later backlog entries. A successful
+    qualification workflow event wakes the orchestrator to dispatch publication;
+    the daily schedule remains the idempotent repair fallback.
   - An already-published noop independently resolves the assets tag commit,
     validates release reads by tag and ID, downloads and hashes the exact asset
     inventory, and validates `gh release verify --format json` with the same

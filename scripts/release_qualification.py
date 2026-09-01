@@ -535,12 +535,19 @@ def _require_int(payload: Mapping[str, Any], key: str, label: str) -> int:
     return value
 
 
-def load_candidate(directory: Path) -> tuple[dict[str, Any], str]:
+def load_candidate(
+    directory: Path,
+    *,
+    expected_qualification_gates: Mapping[str, str] | None = None,
+    expected_unproven_capabilities: Mapping[str, str] | None = None,
+) -> tuple[dict[str, Any], str]:
     """Validate an exact candidate directory and return its manifest and digest.
 
     The candidate is validated with the same routine publication uses, so the
     fingerprint an attestation binds is the identical fingerprint publication
     recomputes; a divergent second definition could never be kept in step.
+    Historical expectations are only for immutable published-release readback;
+    ordinary candidate and qualification callers must omit them.
     """
     if not directory.is_dir() or directory.is_symlink():
         raise ContractError(f"candidate directory does not exist: {directory}")
@@ -589,7 +596,12 @@ def load_candidate(directory: Path) -> tuple[dict[str, Any], str]:
         github_run_id=_require_str(manifest, "github_run_id", "candidate manifest"),
         github_run_url=_require_str(manifest, "github_run_url", "candidate manifest"),
     )
-    fingerprint = validate_candidate(directory, identity)
+    fingerprint = validate_candidate(
+        directory,
+        identity,
+        expected_qualification_gates=expected_qualification_gates,
+        expected_unproven_capabilities=expected_unproven_capabilities,
+    )
     return manifest, fingerprint
 
 

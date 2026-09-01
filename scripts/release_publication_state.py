@@ -102,7 +102,19 @@ def _read_json(path: Path, label: str) -> Mapping[str, Any]:
     return payload
 
 
-def validate_candidate(directory: Path, identity: CandidateIdentity) -> str:
+def validate_candidate(
+    directory: Path,
+    identity: CandidateIdentity,
+    *,
+    expected_qualification_gates: Mapping[str, str] | None = None,
+    expected_unproven_capabilities: Mapping[str, str] | None = None,
+) -> str:
+    """Validate candidate bytes against the current or an explicit historical contract.
+
+    Historical expectations are only for immutable published-release readback.
+    Candidate generation, qualification, and publication must omit them.
+    """
+
     if not directory.is_dir() or directory.is_symlink():
         raise ContractError("candidate must be a real directory")
     entries = list(directory.iterdir())
@@ -150,6 +162,16 @@ def validate_candidate(directory: Path, identity: CandidateIdentity) -> str:
         raise ContractError(f"github_run_url must be exactly {expected_run_url}")
 
     manifest = _read_json(directory / "manifest.json", "candidate manifest")
+    qualification_gates = (
+        QUALIFICATION_GATES
+        if expected_qualification_gates is None
+        else dict(expected_qualification_gates)
+    )
+    unproven_capabilities = (
+        UNPROVEN_CAPABILITIES
+        if expected_unproven_capabilities is None
+        else dict(expected_unproven_capabilities)
+    )
     expected_fields: dict[str, object] = {
         "schema_version": 2,
         "release_tag": identity.release_tag,
@@ -169,8 +191,8 @@ def validate_candidate(directory: Path, identity: CandidateIdentity) -> str:
         "orchestrator_correlation_id": identity.orchestrator_correlation_id,
         "github_run_id": identity.github_run_id,
         "github_run_url": identity.github_run_url,
-        "qualification_gates": QUALIFICATION_GATES,
-        "unproven_capabilities": UNPROVEN_CAPABILITIES,
+        "qualification_gates": qualification_gates,
+        "unproven_capabilities": unproven_capabilities,
         "capabilities": CAPABILITIES,
         "bridge_assets_tag": identity.release_tag,
         "source_repository": BRIDGE_REPOSITORY,
