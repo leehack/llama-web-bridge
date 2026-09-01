@@ -56,6 +56,27 @@ export interface LoadModelOptions {
 
 export type TokenEventEncoding = 'bytes' | 'text' | (string & {});
 
+export type CompletionMediaData = ArrayBuffer | ArrayBufferView | readonly number[];
+
+export type CompletionImagePart = {
+  type: 'image';
+  width?: number;
+  height?: number;
+} & (
+  | { bytes: CompletionMediaData; url?: string }
+  | { bytes?: CompletionMediaData; url: string }
+);
+
+export type CompletionAudioPart = {
+  type: 'audio';
+} & (
+  | { samples: CompletionMediaData; bytes?: CompletionMediaData; url?: string }
+  | { samples?: CompletionMediaData; bytes: CompletionMediaData; url?: string }
+  | { samples?: CompletionMediaData; bytes?: CompletionMediaData; url: string }
+);
+
+export type CompletionMediaPart = CompletionImagePart | CompletionAudioPart;
+
 export interface CompletionOptions {
   onToken?: (piece: string | Uint8Array, currentText: string | null) => void;
   signal?: AbortSignal;
@@ -64,11 +85,19 @@ export interface CompletionOptions {
   tokenEventEncoding?: TokenEventEncoding;
   tokenEventFlushMs?: number;
   tokenEventFlushChars?: number;
-  [key: string]: unknown;
+  nPredict?: number;
+  mediaMaxPredict?: number;
+  parts?: readonly CompletionMediaPart[];
+  temp?: number;
+  topK?: number;
+  topP?: number;
+  penalty?: number;
+  grammar?: string;
+  seed?: number;
 }
 
 export interface EmbedOptions {
-  [key: string]: unknown;
+  normalize?: boolean;
 }
 
 export interface TextToSpeechCapabilities {

@@ -267,7 +267,7 @@ Common `options` keys:
 | `tokenEventEncoding` | `'bytes'` (default) sends `Uint8Array` pieces; `'text'` sends string pieces. Worker events may already provide text pieces. |
 | `tokenEventFlushMs` | Worker mode coalesces token events for up to this many milliseconds, for both byte and text encoding. `0` (default) disables coalescing. Values are clamped to `0..200`. |
 | `tokenEventFlushChars` | When worker coalescing is enabled, flush once the buffered decoded text reaches this many JavaScript characters. `0` (default) disables the size threshold. Values are clamped to `1..1024` when positive. |
-| `parts` | Optional multimodal parts for image/audio prompts after a projector is loaded. |
+| `parts` | Optional multimodal parts after a projector is loaded. Image parts require `{ type: 'image', bytes }` or `{ type: 'image', url }`; audio parts require `{ type: 'audio', samples }`, `{ type: 'audio', bytes }`, or `{ type: 'audio', url }`. `bytes` and `samples` accept an `ArrayBuffer`, any `ArrayBuffer` view, or a number array. Image `width` and `height` identify raw RGB bytes when their dimensions match the byte length. |
 | `mediaMaxPredict` | Cap for multimodal generation token count. |
 
 Call `cancel()` or abort the supplied signal to request a best-effort stop.
@@ -447,16 +447,29 @@ Returns the versioned capability record for the loaded model/projector. Check
 synthesizeSpeech(options: TextToSpeechOptions): Promise<TextToSpeechResult>
 ```
 
-When a worker-mode WebGPU synthesis request fails with an eligible
-infrastructure error — a WebGPU dispatch workgroup-limit failure or a worker
-request timeout, and only when the model was not already loaded CPU-only — the
-bridge disposes that worker and retries the request once in a CPU-backed
-main-thread runtime. The retry reloads the cached model and projector, so it is
-slower than the normal WebGPU path but avoids leaving a capable browser with an
-unrecoverable speech control after transient GPU memory or device loss.
+A failed worker-mode synthesis request gets at most one main-thread retry, and
+only when the model was not already loaded CPU-only and the error text matches
+one of these existing recovery classifiers:
 
-User cancellation is never retried: aborting `signal` or calling `cancel()`
-rejects with an `AbortError` `DOMException` and runs no CPU fallback.
+- WebGPU failure: `dispatch workgroup count`, `max compute workgroups per
+  dimension`, `invalid commandbuffer`, `ggml_webgpu: device error`,
+  `RuntimeError: Aborted`, or `Aborted()`.
+- Worker timeout: `worker request timeout`, `worker init timeout`, or `worker
+  timed out`.
+
+The bridge disposes the worker, reloads the cached model and projector in the
+main-thread runtime, and reruns the request there. WebGPU-classified failures
+reload CPU-only and emit a CPU-fallback warning. The generic `worker timed out`
+form also selects that CPU-only path. The exact `worker request timeout` and
+`worker init timeout` forms preserve the original GPU offload settings and emit
+no CPU-fallback warning. The retry itself is never recovered a second time.
+
+Every other worker failure is rejected as-is. A timeout-classified failure
+disposes the worker even when the model was already CPU-only and no retry runs.
+
+Cancellation is classified before recovery. An aborted `signal`, `cancel()`, an
+`AbortError`, or a worker error containing `cancel` rejects with an `AbortError`
+`DOMException` and runs no main-thread retry.
 
 Synthesizes speech and returns mono `Float32Array` PCM plus its sample rate,
 sample count, generated-frame count, and truncation flag. The bridge does not
@@ -475,8 +488,9 @@ from the returned PCM.
 | `onProgress` | Receives task state, remaining prompt tokens, generated frames, and truncation state. |
 
 Direct and worker modes use the same API, and worker mode transfers the output
-PCM buffer to the caller. Apart from the single eligible CPU retry described
-above, a failed request is surfaced to the caller, who may retry explicitly.
+PCM buffer to the caller. Apart from the single eligible main-thread retry
+described above, a failed request is surfaced to the caller, who may retry
+explicitly.
 
 A second synthesis is not rejected. It — and any other shared-runtime operation
 issued while synthesis is running — waits in the FIFO queue and runs in call
