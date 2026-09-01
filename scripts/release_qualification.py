@@ -52,6 +52,7 @@ from release_publication_state import (
     PUBLICATION_FILES,
     CandidateIdentity,
     validate_candidate,
+    validate_published_candidate,
 )
 
 
@@ -71,6 +72,7 @@ MAX_COMPRESSION_RATIO = 100.0
 MAX_CANDIDATE_MEMBER_BYTES = 64 * 1024 * 1024
 MAX_CANDIDATE_TOTAL_BYTES = 256 * 1024 * 1024
 CANDIDATE_ALLOWED_MEMBERS = frozenset(PUBLICATION_FILES)
+_PublishedManifestContract = tuple[Mapping[str, str], Mapping[str, str]]
 
 MAX_ATTESTATION_MEMBER_BYTES = MAX_ATTESTATION_BYTES
 MAX_ATTESTATION_TOTAL_BYTES = MAX_ATTESTATION_BYTES
@@ -536,6 +538,33 @@ def _require_int(payload: Mapping[str, Any], key: str, label: str) -> int:
 
 
 def load_candidate(directory: Path) -> tuple[dict[str, Any], str]:
+    """Validate a candidate directory against the current strict contract."""
+
+    return _load_candidate(directory)
+
+
+def load_published_candidate(
+    directory: Path,
+    *,
+    expected_qualification_gates: Mapping[str, str],
+    expected_unproven_capabilities: Mapping[str, str],
+) -> tuple[dict[str, Any], str]:
+    """Validate immutable published bytes against an explicit historical contract."""
+
+    return _load_candidate(
+        directory,
+        published_manifest_contract=(
+            expected_qualification_gates,
+            expected_unproven_capabilities,
+        ),
+    )
+
+
+def _load_candidate(
+    directory: Path,
+    *,
+    published_manifest_contract: _PublishedManifestContract | None = None,
+) -> tuple[dict[str, Any], str]:
     """Validate an exact candidate directory and return its manifest and digest.
 
     The candidate is validated with the same routine publication uses, so the
@@ -589,7 +618,15 @@ def load_candidate(directory: Path) -> tuple[dict[str, Any], str]:
         github_run_id=_require_str(manifest, "github_run_id", "candidate manifest"),
         github_run_url=_require_str(manifest, "github_run_url", "candidate manifest"),
     )
-    fingerprint = validate_candidate(directory, identity)
+    if published_manifest_contract is None:
+        fingerprint = validate_candidate(directory, identity)
+    else:
+        fingerprint = validate_published_candidate(
+            directory,
+            identity,
+            expected_qualification_gates=published_manifest_contract[0],
+            expected_unproven_capabilities=published_manifest_contract[1],
+        )
     return manifest, fingerprint
 
 

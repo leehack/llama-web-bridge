@@ -143,6 +143,38 @@ DISPATCH_READBACK_DELAY_SECONDS = 5.0
 STABLE_AUTOMATION_BASELINE_NATIVE_TAG = "v0.2.0-1"
 STABLE_AUTOMATION_BASELINE_PUBLISHED_AT = "2026-08-25T08:57:12Z"
 
+# v0.1.40 was immutably published for native/upstream v0.3.0 immediately
+# before hosted automatic qualification replaced maintainer-run attestation.
+# Its exact published bytes retain the historical gate vocabulary. This
+# compatibility identity is deliberately narrower than the general candidate
+# validator: every new candidate must still require hosted qualification.
+LEGACY_MANUAL_QUALIFICATION_RELEASE_TAG = "v0.1.40"
+LEGACY_MANUAL_QUALIFICATION_BRIDGE_COMMIT = (
+    "0bdc8286fd52b70da27f5b039e1b4278361da0be"
+)
+LEGACY_MANUAL_QUALIFICATION_NATIVE_TAG = "v0.3.0"
+LEGACY_MANUAL_QUALIFICATION_NATIVE_COMMIT = (
+    "28fca14873d4b4c531bef4425b261e2b911bdcce"
+)
+LEGACY_MANUAL_QUALIFICATION_UPSTREAM_TAG = "v0.3.0"
+LEGACY_MANUAL_QUALIFICATION_UPSTREAM_COMMIT = (
+    "c1d0e7a004015f23bc0233470b747b596f29b264"
+)
+LEGACY_MANUAL_QUALIFICATION_NATIVE_MANIFEST_SHA256 = (
+    "811fda999e70c3ad2716d1c196688dd38db62cf11a78044855ca94f71fabed45"
+)
+LEGACY_MANUAL_QUALIFICATION_GATES = {
+    "state_persistence": "passed",
+    "multimodal": "passed",
+    "speech_to_text": "required-local-attestation",
+    "text_to_speech": "required-local-attestation",
+}
+LEGACY_MANUAL_UNPROVEN_CAPABILITIES = {
+    "real_device_intelligibility": "unproven",
+    "real_device_playback": "unproven",
+    "speaker_reference_fidelity": "unproven",
+}
+
 _COMMIT_RE = re.compile(r"[0-9a-f]{40}")
 _RUN_ID_RE = re.compile(r"[1-9][0-9]*")
 _RUN_NAME_RE = re.compile(r"[A-Za-z0-9 ._:/-]+")
@@ -206,6 +238,30 @@ class NativeProvenance:
     @property
     def channel(self) -> Channel:
         return parse_upstream_tag(self.upstream_tag).channel
+
+
+def _published_manifest_compatibility(
+    *, tag: str, provenance: NativeProvenance
+) -> tuple[Mapping[str, str], Mapping[str, str]] | None:
+    """Return the one immutable pre-automation manifest contract, if applicable."""
+
+    if (
+        tag == LEGACY_MANUAL_QUALIFICATION_RELEASE_TAG
+        and provenance.bridge_source_sha
+        == LEGACY_MANUAL_QUALIFICATION_BRIDGE_COMMIT
+        and provenance.native_release_tag == LEGACY_MANUAL_QUALIFICATION_NATIVE_TAG
+        and provenance.native_commit == LEGACY_MANUAL_QUALIFICATION_NATIVE_COMMIT
+        and provenance.upstream_tag == LEGACY_MANUAL_QUALIFICATION_UPSTREAM_TAG
+        and provenance.upstream_commit
+        == LEGACY_MANUAL_QUALIFICATION_UPSTREAM_COMMIT
+        and provenance.native_manifest_sha256
+        == LEGACY_MANUAL_QUALIFICATION_NATIVE_MANIFEST_SHA256
+    ):
+        return (
+            LEGACY_MANUAL_QUALIFICATION_GATES,
+            LEGACY_MANUAL_UNPROVEN_CAPABILITIES,
+        )
+    return None
 
 
 def require_stable_provenance(provenance: NativeProvenance) -> NativeProvenance:
@@ -1357,7 +1413,18 @@ def verify_published_release(
         expected_asset_digests[name] = actual
         (directory / name).write_bytes(data)
 
-    manifest, fingerprint = rq.load_candidate(directory)
+    compatibility = _published_manifest_compatibility(
+        tag=tag,
+        provenance=provenance,
+    )
+    if compatibility is None:
+        manifest, fingerprint = rq.load_candidate(directory)
+    else:
+        manifest, fingerprint = rq.load_published_candidate(
+            directory,
+            expected_qualification_gates=compatibility[0],
+            expected_unproven_capabilities=compatibility[1],
+        )
     if _candidate_fingerprint_marker(fingerprint) not in body:
         raise ContractError(
             f"release {tag!r} does not record the fingerprint of the bytes it "

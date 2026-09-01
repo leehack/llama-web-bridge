@@ -56,6 +56,24 @@ ASSETS_TAG_COMMIT = "c" * 40
 OWNER = BRIDGE_REPOSITORY.split("/")[0]
 EMSCRIPTEN_VERSION = "6.0.8"
 NATIVE_PUBLISHED_AT = "2026-08-19T12:34:56Z"
+LEGACY_BRIDGE_SHA = "0bdc8286fd52b70da27f5b039e1b4278361da0be"
+LEGACY_UPSTREAM_COMMIT = "c1d0e7a004015f23bc0233470b747b596f29b264"
+LEGACY_NATIVE_COMMIT = "28fca14873d4b4c531bef4425b261e2b911bdcce"
+LEGACY_NATIVE_MANIFEST_SHA = (
+    "811fda999e70c3ad2716d1c196688dd38db62cf11a78044855ca94f71fabed45"
+)
+LEGACY_CANDIDATE_RUN_ID = "33225744070"
+LEGACY_MANUAL_QUALIFICATION_GATES = {
+    "state_persistence": "passed",
+    "multimodal": "passed",
+    "speech_to_text": "required-local-attestation",
+    "text_to_speech": "required-local-attestation",
+}
+LEGACY_MANUAL_UNPROVEN_CAPABILITIES = {
+    "real_device_intelligibility": "unproven",
+    "real_device_playback": "unproven",
+    "speaker_reference_fidelity": "unproven",
+}
 
 
 def make_provenance(**overrides: Any) -> sro.NativeProvenance:
@@ -68,6 +86,21 @@ def make_provenance(**overrides: Any) -> sro.NativeProvenance:
         "native_commit": NATIVE_COMMIT,
         "native_manifest_sha256": NATIVE_MANIFEST_SHA,
         "native_release_published_at": NATIVE_PUBLISHED_AT,
+    }
+    fields.update(overrides)
+    return sro.NativeProvenance(**fields)
+
+
+def make_legacy_v0140_provenance(**overrides: Any) -> sro.NativeProvenance:
+    fields: dict[str, Any] = {
+        "bridge_source_sha": LEGACY_BRIDGE_SHA,
+        "upstream_tag": "v0.3.0",
+        "upstream_commit": LEGACY_UPSTREAM_COMMIT,
+        "native_repo": NATIVE_REPOSITORY,
+        "native_release_tag": "v0.3.0",
+        "native_commit": LEGACY_NATIVE_COMMIT,
+        "native_manifest_sha256": LEGACY_NATIVE_MANIFEST_SHA,
+        "native_release_published_at": "2026-08-28T12:34:56Z",
     }
     fields.update(overrides)
     return sro.NativeProvenance(**fields)
@@ -125,6 +158,17 @@ def write_bridge_candidate(
                 f"https://github.com/{BRIDGE_REPOSITORY}/actions/runs/{run_id}"
             ),
         )
+    )
+
+
+def rewrite_legacy_candidate_manifest(directory: Path) -> None:
+    manifest_path = directory / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["qualification_gates"] = LEGACY_MANUAL_QUALIFICATION_GATES
+    manifest["unproven_capabilities"] = LEGACY_MANUAL_UNPROVEN_CAPABILITIES
+    manifest_path.write_text(
+        json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
     )
 
 
@@ -1460,6 +1504,54 @@ class PublishedReleaseVerificationTest(unittest.TestCase):
         self.assertEqual(verified.release_target.release_rebuild, 0)
         self.assertEqual(verified.binding.bridge_source_sha, BRIDGE_SHA)
 
+    def test_only_exact_v0140_identity_selects_legacy_manifest_contract(self) -> None:
+        exact = make_legacy_v0140_provenance()
+        self.assertEqual(
+            sro._published_manifest_compatibility(
+                tag="v0.1.40",
+                provenance=exact,
+            ),
+            (
+                LEGACY_MANUAL_QUALIFICATION_GATES,
+                LEGACY_MANUAL_UNPROVEN_CAPABILITIES,
+            ),
+        )
+        near_misses = {
+            "release tag": ("v0.1.40-1", exact),
+            "native tag": (
+                "v0.1.40",
+                make_legacy_v0140_provenance(native_release_tag="v0.3.0-1"),
+            ),
+            "native commit": (
+                "v0.1.40",
+                make_legacy_v0140_provenance(native_commit="1" * 40),
+            ),
+            "upstream tag": (
+                "v0.1.40",
+                make_legacy_v0140_provenance(upstream_tag="v0.3.1"),
+            ),
+            "upstream commit": (
+                "v0.1.40",
+                make_legacy_v0140_provenance(upstream_commit="2" * 40),
+            ),
+            "bridge commit": (
+                "v0.1.40",
+                make_legacy_v0140_provenance(bridge_source_sha="3" * 40),
+            ),
+            "native manifest": (
+                "v0.1.40",
+                make_legacy_v0140_provenance(native_manifest_sha256="0" * 64),
+            ),
+        }
+        for label, (tag, provenance) in near_misses.items():
+            with self.subTest(label=label):
+                self.assertIsNone(
+                    sro._published_manifest_compatibility(
+                        tag=tag,
+                        provenance=provenance,
+                    )
+                )
+
     def test_native_manifest_marker_prevents_duplicate_when_correlation_is_damaged(
         self,
     ) -> None:
@@ -1989,6 +2081,69 @@ class AdvancePipelineTest(unittest.TestCase):
             ),
         }
 
+    def _published_candidate_gateway(
+        self,
+        candidate_dir: Path,
+        *,
+        provenance: sro.NativeProvenance,
+        correlation_id: str,
+        published_manifest_compatibility: tuple[
+            dict[str, str], dict[str, str]
+        ]
+        | None = None,
+    ) -> FakeGateway:
+        members = directory_members(candidate_dir)
+        if published_manifest_compatibility is None:
+            fingerprint = rq.load_candidate(candidate_dir)[1]
+        else:
+            fingerprint = rq.load_published_candidate(
+                candidate_dir,
+                expected_qualification_gates=published_manifest_compatibility[0],
+                expected_unproven_capabilities=published_manifest_compatibility[1],
+            )[1]
+        body = (
+            f"Candidate fingerprint: `{fingerprint}`\n"
+            f"Orchestrator correlation: `{correlation_id}`\n"
+        )
+        release = release_payload(tag="v0.1.40", body=body, members=members)
+        routes = self._routes(releases=[release])
+        routes.update(
+            {
+                f"repos/{BRIDGE_REPOSITORY}/compare/"
+                f"{provenance.bridge_source_sha}...{DEFAULT_BRANCH}": {
+                    "status": "ahead"
+                },
+                f"repos/{ASSETS_REPOSITORY}/git/ref/tags/v0.1.40": {
+                    "ref": "refs/tags/v0.1.40",
+                    "object": {"type": "commit", "sha": ASSETS_TAG_COMMIT},
+                },
+                f"repos/{ASSETS_REPOSITORY}/releases/tags/v0.1.40": release,
+                f"repos/{ASSETS_REPOSITORY}/releases/{release['id']}": release,
+            }
+        )
+        blobs = {
+            f"repos/{ASSETS_REPOSITORY}/releases/assets/{asset['id']}": members[
+                asset["name"]
+            ]
+            for asset in release["assets"]
+        }
+        digests = {
+            name: hashlib.sha256(data).hexdigest() for name, data in members.items()
+        }
+        return FakeGateway(
+            json_routes=routes,
+            blob_routes=blobs,
+            release_attestations={
+                (ASSETS_REPOSITORY, "v0.1.40"): release_attestation(
+                    release_tag="v0.1.40",
+                    assets_repo=ASSETS_REPOSITORY,
+                    tag_commit=ASSETS_TAG_COMMIT,
+                    release_id=release["id"],
+                    assets=digests,
+                )
+            },
+        )
+
     def test_first_run_dispatches_exactly_one_candidate_with_structured_inputs(self) -> None:
         dispatched = run_payload(
             run_id="501",
@@ -2469,48 +2624,54 @@ class AdvancePipelineTest(unittest.TestCase):
             release_rebuild=0,
             correlation_id=self.correlation_id,
         )
-        members = directory_members(candidate_dir)
-        fingerprint = rq.load_candidate(candidate_dir)[1]
-        body = (
-            f"Candidate fingerprint: `{fingerprint}`\n"
-            f"Orchestrator correlation: `{self.correlation_id}`\n"
-        )
-        release = release_payload(tag="v0.1.40", body=body, members=members)
-        blobs = {
-            f"repos/{ASSETS_REPOSITORY}/releases/assets/{asset['id']}": members[
-                asset["name"]
-            ]
-            for asset in release["assets"]
-        }
-        routes = self._routes(releases=[release])
-        routes.update(
-            {
-                f"repos/{ASSETS_REPOSITORY}/git/ref/tags/v0.1.40": {
-                    "ref": "refs/tags/v0.1.40",
-                    "object": {"type": "commit", "sha": ASSETS_TAG_COMMIT},
-                },
-                f"repos/{ASSETS_REPOSITORY}/releases/tags/v0.1.40": release,
-                f"repos/{ASSETS_REPOSITORY}/releases/{release['id']}": release,
-            }
-        )
-        digests = {
-            name: hashlib.sha256(data).hexdigest() for name, data in members.items()
-        }
-        gateway = FakeGateway(
-            json_routes=routes,
-            blob_routes=blobs,
-            release_attestations={
-                (ASSETS_REPOSITORY, "v0.1.40"): release_attestation(
-                    release_tag="v0.1.40",
-                    assets_repo=ASSETS_REPOSITORY,
-                    tag_commit=ASSETS_TAG_COMMIT,
-                    release_id=release["id"],
-                    assets=digests,
-                )
-            },
+        gateway = self._published_candidate_gateway(
+            candidate_dir,
+            provenance=self.provenance,
+            correlation_id=self.correlation_id,
         )
         plan = sro.advance_pipeline(
             gateway, provenance=self.provenance, workspace=self.tmp
+        )
+        self.assertEqual(plan.action, sro.OrchestrationAction.NOOP)
+        self.assertEqual(gateway.dispatches, [])
+        self.assertEqual(plan.release_target.release_tag, "v0.1.40")
+
+    def test_legacy_v0140_publication_is_a_terminal_noop(self) -> None:
+        provenance = make_legacy_v0140_provenance()
+        correlation_id = sro.compute_correlation_id(provenance)
+        candidate_dir = self.tmp / "legacy-v0140-candidate"
+        write_bridge_candidate(
+            candidate_dir,
+            release_tag="v0.1.40",
+            release_rebuild=0,
+            correlation_id=correlation_id,
+            bridge_commit=LEGACY_BRIDGE_SHA,
+            run_id=LEGACY_CANDIDATE_RUN_ID,
+            upstream_tag="v0.3.0",
+            upstream_commit=LEGACY_UPSTREAM_COMMIT,
+            native_release_tag="v0.3.0",
+            native_manifest_sha256=LEGACY_NATIVE_MANIFEST_SHA,
+            native_commit=LEGACY_NATIVE_COMMIT,
+        )
+        rewrite_legacy_candidate_manifest(candidate_dir)
+
+        # The ordinary candidate path remains strict. Compatibility is selected
+        # only after the immutable published-release identity is proven.
+        with self.assertRaises(ContractError):
+            rq.load_candidate(candidate_dir)
+        gateway = self._published_candidate_gateway(
+            candidate_dir,
+            provenance=provenance,
+            correlation_id=correlation_id,
+            published_manifest_compatibility=(
+                LEGACY_MANUAL_QUALIFICATION_GATES,
+                LEGACY_MANUAL_UNPROVEN_CAPABILITIES,
+            ),
+        )
+        plan = sro.advance_pipeline(
+            gateway,
+            provenance=provenance,
+            workspace=self.tmp,
         )
         self.assertEqual(plan.action, sro.OrchestrationAction.NOOP)
         self.assertEqual(gateway.dispatches, [])
