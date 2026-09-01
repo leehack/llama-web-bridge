@@ -105,14 +105,45 @@ def _read_json(path: Path, label: str) -> Mapping[str, Any]:
 def validate_candidate(
     directory: Path,
     identity: CandidateIdentity,
-    *,
-    expected_qualification_gates: Mapping[str, str] | None = None,
-    expected_unproven_capabilities: Mapping[str, str] | None = None,
 ) -> str:
-    """Validate candidate bytes against the current or an explicit historical contract.
+    """Validate candidate bytes against the current manifest contract."""
 
-    Historical expectations are only for immutable published-release readback.
-    Candidate generation, qualification, and publication must omit them.
+    return _validate_candidate(
+        directory,
+        identity,
+        expected_qualification_gates=QUALIFICATION_GATES,
+        expected_unproven_capabilities=UNPROVEN_CAPABILITIES,
+    )
+
+
+def validate_published_candidate(
+    directory: Path,
+    identity: CandidateIdentity,
+    *,
+    expected_qualification_gates: Mapping[str, str],
+    expected_unproven_capabilities: Mapping[str, str],
+) -> str:
+    """Validate immutable published bytes against an explicit historical contract."""
+
+    return _validate_candidate(
+        directory,
+        identity,
+        expected_qualification_gates=expected_qualification_gates,
+        expected_unproven_capabilities=expected_unproven_capabilities,
+    )
+
+
+def _validate_candidate(
+    directory: Path,
+    identity: CandidateIdentity,
+    *,
+    expected_qualification_gates: Mapping[str, str],
+    expected_unproven_capabilities: Mapping[str, str],
+) -> str:
+    """Validate candidate bytes against an already selected manifest contract.
+
+    The public strict and published-readback entry points select the contract;
+    ordinary candidate callers cannot supply historical expectations.
     """
 
     if not directory.is_dir() or directory.is_symlink():
@@ -162,16 +193,8 @@ def validate_candidate(
         raise ContractError(f"github_run_url must be exactly {expected_run_url}")
 
     manifest = _read_json(directory / "manifest.json", "candidate manifest")
-    qualification_gates = (
-        QUALIFICATION_GATES
-        if expected_qualification_gates is None
-        else dict(expected_qualification_gates)
-    )
-    unproven_capabilities = (
-        UNPROVEN_CAPABILITIES
-        if expected_unproven_capabilities is None
-        else dict(expected_unproven_capabilities)
-    )
+    qualification_gates = dict(expected_qualification_gates)
+    unproven_capabilities = dict(expected_unproven_capabilities)
     expected_fields: dict[str, object] = {
         "schema_version": 2,
         "release_tag": identity.release_tag,

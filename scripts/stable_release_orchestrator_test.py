@@ -2087,15 +2087,20 @@ class AdvancePipelineTest(unittest.TestCase):
         *,
         provenance: sro.NativeProvenance,
         correlation_id: str,
-        expected_qualification_gates: dict[str, str] | None = None,
-        expected_unproven_capabilities: dict[str, str] | None = None,
+        published_manifest_compatibility: tuple[
+            dict[str, str], dict[str, str]
+        ]
+        | None = None,
     ) -> FakeGateway:
         members = directory_members(candidate_dir)
-        fingerprint = rq.load_candidate(
-            candidate_dir,
-            expected_qualification_gates=expected_qualification_gates,
-            expected_unproven_capabilities=expected_unproven_capabilities,
-        )[1]
+        if published_manifest_compatibility is None:
+            fingerprint = rq.load_candidate(candidate_dir)[1]
+        else:
+            fingerprint = rq.load_published_candidate(
+                candidate_dir,
+                expected_qualification_gates=published_manifest_compatibility[0],
+                expected_unproven_capabilities=published_manifest_compatibility[1],
+            )[1]
         body = (
             f"Candidate fingerprint: `{fingerprint}`\n"
             f"Orchestrator correlation: `{correlation_id}`\n"
@@ -2658,8 +2663,10 @@ class AdvancePipelineTest(unittest.TestCase):
             candidate_dir,
             provenance=provenance,
             correlation_id=correlation_id,
-            expected_qualification_gates=LEGACY_MANUAL_QUALIFICATION_GATES,
-            expected_unproven_capabilities=LEGACY_MANUAL_UNPROVEN_CAPABILITIES,
+            published_manifest_compatibility=(
+                LEGACY_MANUAL_QUALIFICATION_GATES,
+                LEGACY_MANUAL_UNPROVEN_CAPABILITIES,
+            ),
         )
         plan = sro.advance_pipeline(
             gateway,

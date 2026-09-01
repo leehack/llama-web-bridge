@@ -1417,13 +1417,14 @@ def verify_published_release(
         tag=tag,
         provenance=provenance,
     )
-    manifest, fingerprint = rq.load_candidate(
-        directory,
-        expected_qualification_gates=(compatibility[0] if compatibility else None),
-        expected_unproven_capabilities=(
-            compatibility[1] if compatibility else None
-        ),
-    )
+    if compatibility is None:
+        manifest, fingerprint = rq.load_candidate(directory)
+    else:
+        manifest, fingerprint = rq.load_published_candidate(
+            directory,
+            expected_qualification_gates=compatibility[0],
+            expected_unproven_capabilities=compatibility[1],
+        )
     if _candidate_fingerprint_marker(fingerprint) not in body:
         raise ContractError(
             f"release {tag!r} does not record the fingerprint of the bytes it "
