@@ -827,6 +827,12 @@ def main() -> int:
         errors,
     )
     require(
+        '"test:type-declarations"' in package_json
+        and "npm run test:type-declarations" in package_json,
+        "check:js must define and run the bridge type declaration contract",
+        errors,
+    )
+    require(
         "_runExclusive(" in js_source and "_runExclusive(" in js_output,
         "the single-writer operation queue must be present in bridge source and in the "
         "generated bridge output",

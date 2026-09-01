@@ -16,6 +16,7 @@ DTS = (ROOT / "js" / "src" / "llama_webgpu_bridge.d.ts").read_text(encoding="utf
 CMAKE = (ROOT / "CMakeLists.txt").read_text(encoding="utf-8")
 README = (ROOT / "README.md").read_text(encoding="utf-8")
 API_DOCS = (ROOT / "docs" / "api.md").read_text(encoding="utf-8")
+API_DOCS_FLAT = " ".join(API_DOCS.split())
 SMOKE = (ROOT / "scripts" / "text_to_speech_browser_smoke.py").read_text(
     encoding="utf-8"
 )
@@ -112,8 +113,25 @@ def main() -> int:
         "nGpuLayers, 0" in RECOVERY_TEST
         and "worker_fallback_cpu_text_to_speech" in RECOVERY_TEST
         and "gpuLayers: 0" in RECOVERY_TEST
-        and "AbortError" in RECOVERY_TEST,
-        "TTS recovery tests must cover GPU failure, CPU no-retry, and cancellation",
+        and "AbortError" in RECOVERY_TEST
+        and "Worker request timeout" in RECOVERY_TEST
+        and "worker timed out" in RECOVERY_TEST
+        and "beforeWorkerError: () => controller.abort()" in RECOVERY_TEST
+        and "beforeWorkerError: () => bridge.cancel()" in RECOVERY_TEST
+        and "CPU recovery must run at most once" in RECOVERY_TEST,
+        "TTS recovery tests must cover GPU failure, worker request timeout, the "
+        "single-retry limit, CPU no-retry, and cancellation",
+        errors,
+    )
+    require(
+        "at most one main-thread retry" in API_DOCS_FLAT
+        and "dispatch workgroup count" in API_DOCS_FLAT
+        and "worker request timeout" in API_DOCS_FLAT
+        and "not already loaded CPU-only" in API_DOCS_FLAT
+        and "preserve the original GPU offload settings" in API_DOCS_FLAT
+        and "Cancellation is classified before recovery" in API_DOCS_FLAT,
+        "public API docs must state the worker TTS retry triggers, its single-retry "
+        "limit, and that cancellation is never retried",
         errors,
     )
     require(
