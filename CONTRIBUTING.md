@@ -204,9 +204,15 @@ query strings, and fragments before printing the location.
   history with stable-count checks and splits searches at GitHub's 1,000-result
   cap into closed time windows, so an older waiting pipeline is not lost as
   later workflow history grows.
-- Bridge source changes still require ordinary PRs. A dependency-version release
-  may reuse an already-merged exact bridge source SHA without changing
-  `llama_cpp.version`.
+- The full-history scheduled resolver records both the exact default-branch
+  source SHA that will execute a new candidate and the newest first-parent
+  commit that changed governed runtime/build inputs. Correlation uses the latter:
+  non-build orchestration/qualification/publication/CI workflow, verification,
+  test, and documentation-only commits preserve a verified terminal release.
+  The candidate workflow, manifest/release-contract/compiler inputs, and every
+  other new path are governed by default and require a new candidate plus
+  automated qualification. Bridge source changes still
+  require ordinary PRs; release orchestration never changes `llama_cpp.version`.
 - Preserve `FORCE_JAVASCRIPT_ACTIONS_TO_NODE24` in CI and publish workflows so
   GitHub Action runtime changes are detected before they become mandatory.
 - Upload state-persistence smoke diagnostics only on failure; successful CI runs

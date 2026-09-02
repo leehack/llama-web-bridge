@@ -180,6 +180,15 @@ automated qualification run binds the candidate digest it is about to publish.
     ordered backlog prevents an older qualification wait from hiding or
     starving a newer stable native release; each exact pipeline advances by at
     most one stage per scheduled/manual scan.
+  - The resolver uses full default-branch history to keep the exact source SHA
+    that executes a new candidate separate from the newest first-parent commit
+    that changed governed runtime/build inputs. Pipeline correlation uses the
+    governed build SHA, so non-build orchestration/qualification/publication/CI
+    workflow, verification, test, and docs-only commits do not orphan terminal
+    or in-flight state. The candidate workflow, manifest/release-contract/compiler
+    inputs, and every unclassified new path are governed by default; a build
+    change requires a new strict candidate and automated qualification even for
+    the same native release.
   - Only the stable channel is orchestrated. Manual `development` scans still
     resolve and report exact `bNNNN` provenance, but `require_stable_provenance`
     refuses to advance them, so they never dispatch anything.
@@ -218,7 +227,8 @@ automated qualification run binds the candidate digest it is about to publish.
     without blocking candidate creation for later backlog entries. A successful
     qualification workflow event wakes the orchestrator to dispatch publication;
     the daily schedule remains the idempotent repair fallback.
-  - An already-published noop independently resolves the assets tag commit,
+  - An already-published noop requires the same governed build identity and
+    independently resolves the assets tag commit,
     validates release reads by tag and ID, downloads and hashes the exact asset
     inventory, and validates `gh release verify --format json` with the same
     immutable-release and release-attestation contracts as publication.

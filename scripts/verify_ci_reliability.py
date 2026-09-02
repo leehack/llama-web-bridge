@@ -1066,6 +1066,10 @@ def main() -> int:
         and "releases/assets/${asset_id}" in auto_update
         and "validate-native-release" in auto_update
         and "resolve-tag-commit" in auto_update
+        and "fetch-depth: 0" in auto_update
+        and "scripts/stable_release_orchestrator.py resolve-bridge-source"
+        in auto_update
+        and '--bridge-build-sha "${bridge_build_sha}"' in auto_update
         and "scripts/stable_release_orchestrator.py scan-native" in auto_update
         and "scripts/stable_release_orchestrator.py orchestrate-backlog" in auto_update
         and '--channel "${REQUESTED_CHANNEL}"' in auto_update
@@ -1079,7 +1083,7 @@ def main() -> int:
         and "git push" not in auto_update
         and "Manual development scans only prepare exact candidate inputs" in auto_update
         and "env.REQUESTED_CHANNEL != 'stable'" in auto_update,
-        "automatic scans must download every post-baseline stable provenance by unique asset id, reuse only the existing environment-scoped publication credential, advance stable publication only through stable_release_orchestrator.py, and keep development scans scan-only",
+        "automatic scans must resolve full-history governed bridge identity, download every post-baseline stable provenance by unique asset id, reuse only the existing environment-scoped publication credential, advance stable publication only through stable_release_orchestrator.py, and keep development scans scan-only",
         errors,
     )
     owner_manual_gate = (

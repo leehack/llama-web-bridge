@@ -175,6 +175,36 @@ LEGACY_MANUAL_UNPROVEN_CAPABILITIES = {
     "speaker_reference_fidelity": "unproven",
 }
 
+# These files can change how a release is discovered, qualified, or published,
+# but they do not change the runtime/build inputs placed in the bridge artifact.
+# Everything not explicitly classified here is governed by default so a newly
+# added build input cannot silently inherit an older release identity.
+_ORCHESTRATION_ONLY_PATHS = frozenset(
+    {
+        ".gitignore",
+        ".github/workflows/auto_llama_cpp_update.yml",
+        ".github/workflows/bridge_qualification.yml",
+        ".github/workflows/ci.yml",
+        ".github/workflows/publish_assets.yml",
+        "AGENTS.md",
+        "CONTRIBUTING.md",
+        "LICENSE",
+        "README.md",
+        "scripts/release_publication_state.py",
+        "scripts/release_qualification.py",
+        "scripts/stable_release_orchestrator.py",
+        "scripts/verify_ci_reliability.py",
+        "scripts/verify_state_persistence_api.py",
+        "scripts/verify_text_to_speech_api.py",
+    }
+)
+_ORCHESTRATION_ONLY_PREFIXES = ("docs/",)
+_ORCHESTRATION_ONLY_SCRIPT_SUFFIXES = (
+    "_browser_smoke.py",
+    "_test.mjs",
+    "_test.py",
+)
+
 _COMMIT_RE = re.compile(r"[0-9a-f]{40}")
 _RUN_ID_RE = re.compile(r"[1-9][0-9]*")
 _RUN_NAME_RE = re.compile(r"[A-Za-z0-9 ._:/-]+")
@@ -197,10 +227,105 @@ _PUBLISH_RUN_NAME_RE = re.compile(
 
 
 @dataclass(frozen=True)
+class BridgeSourceIdentity:
+    """Current executable source plus its governed runtime/build identity."""
+
+    bridge_source_sha: str
+    bridge_build_sha: str
+
+
+def is_governed_bridge_path(path: str) -> bool:
+    """Return whether a repository path can change published bridge artifacts.
+
+    The default is deliberately governed. Only known workflow, validation,
+    test, and documentation surfaces are exempt, so deleting this classifier or
+    adding a new build input makes the identity advance rather than silently
+    reusing an older immutable release.
+    """
+    if (
+        not isinstance(path, str)
+        or not path
+        or path.startswith("/")
+        or "\\" in path
+        or any(part in ("", ".", "..") for part in path.split("/"))
+    ):
+        raise ContractError(f"git reported an invalid repository path: {path!r}")
+    if path in _ORCHESTRATION_ONLY_PATHS:
+        return False
+    if path.startswith(_ORCHESTRATION_ONLY_PREFIXES):
+        return False
+    if path.startswith("scripts/") and path.endswith(
+        _ORCHESTRATION_ONLY_SCRIPT_SUFFIXES
+    ):
+        return False
+    return True
+
+
+def _git_output(repository: Path, *args: str) -> str:
+    try:
+        completed = subprocess.run(
+            ("git", "-C", str(repository), *args),
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError) as error:
+        detail = ""
+        if isinstance(error, subprocess.CalledProcessError):
+            detail = error.stderr.strip()
+        raise ContractError(
+            f"could not resolve governed bridge source with git: {detail or error}"
+        ) from error
+    return completed.stdout
+
+
+def resolve_bridge_source_identity(
+    repository: Path, head: str = "HEAD"
+) -> BridgeSourceIdentity:
+    """Resolve HEAD and the newest first-parent governed build change.
+
+    The scheduled checkout must have complete history. Walking first-parent
+    makes the selected build identity a commit on the exact default-branch line,
+    including merge commits that introduce governed files.
+    """
+    if not repository.is_dir() or repository.is_symlink():
+        raise ContractError(f"bridge repository is not a directory: {repository}")
+    source_sha = _git_output(repository, "rev-parse", "--verify", f"{head}^{{commit}}")
+    source_sha = source_sha.strip()
+    if _COMMIT_RE.fullmatch(source_sha) is None:
+        raise ContractError("resolved bridge source is not a full lowercase commit SHA")
+    history = _git_output(
+        repository,
+        "log",
+        "--first-parent",
+        "--format=%x00%H%x00",
+        "--name-only",
+        "--no-renames",
+        source_sha,
+    )
+    fields = history.split("\0")
+    if not fields or fields[0] != "" or len(fields) < 3 or len(fields) % 2 == 0:
+        raise ContractError("git returned malformed bridge first-parent history")
+    for index in range(1, len(fields), 2):
+        commit = fields[index]
+        if _COMMIT_RE.fullmatch(commit) is None:
+            raise ContractError("git returned a malformed first-parent commit")
+        changed_paths = [path for path in fields[index + 1].splitlines() if path]
+        if any(is_governed_bridge_path(path) for path in changed_paths):
+            return BridgeSourceIdentity(
+                bridge_source_sha=source_sha,
+                bridge_build_sha=commit,
+            )
+    raise ContractError("bridge history contains no governed runtime/build source")
+
+
+@dataclass(frozen=True)
 class NativeProvenance:
     """Exact identity of the native release this pipeline is aligned to."""
 
     bridge_source_sha: str
+    bridge_build_sha: str
     upstream_tag: str
     upstream_commit: str
     native_repo: str
@@ -210,7 +335,12 @@ class NativeProvenance:
     native_release_published_at: str
 
     def __post_init__(self) -> None:
-        for field_name in ("bridge_source_sha", "upstream_commit", "native_commit"):
+        for field_name in (
+            "bridge_source_sha",
+            "bridge_build_sha",
+            "upstream_commit",
+            "native_commit",
+        ):
             value = getattr(self, field_name)
             if not isinstance(value, str) or _COMMIT_RE.fullmatch(value) is None:
                 raise ContractError(
@@ -247,7 +377,7 @@ def _published_manifest_compatibility(
 
     if (
         tag == LEGACY_MANUAL_QUALIFICATION_RELEASE_TAG
-        and provenance.bridge_source_sha
+        and provenance.bridge_build_sha
         == LEGACY_MANUAL_QUALIFICATION_BRIDGE_COMMIT
         and provenance.native_release_tag == LEGACY_MANUAL_QUALIFICATION_NATIVE_TAG
         and provenance.native_commit == LEGACY_MANUAL_QUALIFICATION_NATIVE_COMMIT
@@ -374,6 +504,7 @@ class OrchestrationPlan:
             "correlation_id": self.correlation_id,
             "provenance": {
                 "bridge_source_sha": self.provenance.bridge_source_sha,
+                "bridge_build_sha": self.provenance.bridge_build_sha,
                 "upstream_tag": self.provenance.upstream_tag,
                 "upstream_commit": self.provenance.upstream_commit,
                 "native_repo": self.provenance.native_repo,
@@ -420,15 +551,36 @@ class PipelineObservation:
 
 
 def compute_correlation_id(provenance: NativeProvenance) -> str:
-    """Derive one stable pipeline identity from the native release alone.
+    """Derive one stable pipeline identity from native and governed build inputs.
 
-    Deliberately independent of the bridge source commit: main advances while a
-    pipeline is in flight, and a correlation that moved with it would orphan the
-    candidate and let a later event or repair scan dispatch a duplicate.
+    The checkout source may advance while a pipeline is in flight because
+    workflows, tests, or docs changed. The governed build identity does not, so
+    those changes cannot orphan a candidate. A runtime/build change deliberately
+    creates a new correlation and therefore requires a new qualified candidate.
+
+    The one immutable pre-automation publication keeps its historical
+    correlation only while the governed build identity is still its exact
+    bridge commit.
     """
+    if (
+        provenance.bridge_build_sha
+        == LEGACY_MANUAL_QUALIFICATION_BRIDGE_COMMIT
+        and provenance.native_release_tag == LEGACY_MANUAL_QUALIFICATION_NATIVE_TAG
+        and provenance.native_commit == LEGACY_MANUAL_QUALIFICATION_NATIVE_COMMIT
+        and provenance.upstream_tag == LEGACY_MANUAL_QUALIFICATION_UPSTREAM_TAG
+        and provenance.upstream_commit
+        == LEGACY_MANUAL_QUALIFICATION_UPSTREAM_COMMIT
+        and provenance.native_manifest_sha256
+        == LEGACY_MANUAL_QUALIFICATION_NATIVE_MANIFEST_SHA256
+    ):
+        return require_correlation_id(
+            f"auto-stable-{provenance.native_release_tag}"
+            f"-{provenance.native_manifest_sha256[:16]}"
+        )
     raw = (
         f"auto-stable-{provenance.native_release_tag}"
         f"-{provenance.native_manifest_sha256[:16]}"
+        f"-build-{provenance.bridge_build_sha[:16]}"
     )
     return require_correlation_id(raw)
 
@@ -585,6 +737,7 @@ def scan_native_provenance(
     manifest_path: Path,
     native_release_tag: str,
     bridge_source_sha: str,
+    bridge_build_sha: str,
     channel: str,
     native_release_published_at: str,
 ) -> NativeProvenance:
@@ -608,6 +761,7 @@ def scan_native_provenance(
     identity = resolve_native_manifest(manifest, native_release_tag)
     provenance = NativeProvenance(
         bridge_source_sha=bridge_source_sha,
+        bridge_build_sha=bridge_build_sha,
         upstream_tag=identity.upstream_tag,
         upstream_commit=identity.upstream_commit,
         native_repo=NATIVE_REPOSITORY,
@@ -1223,18 +1377,33 @@ def find_correlated_release(
     native_release_marker = (
         f"Native: `{provenance.native_repo}@{provenance.native_release_tag}`"
     )
-    matches = [
-        release
-        for release in releases
-        if isinstance(release.get("body"), str)
-        and (
-            marker in release["body"]
-            or (
-                native_manifest_marker in release["body"]
-                and native_release_marker in release["body"]
-            )
+    matches: list[Mapping[str, Any]] = []
+    for release in releases:
+        body = release.get("body")
+        if not isinstance(body, str):
+            continue
+        if marker in body:
+            matches.append(release)
+            continue
+        if native_manifest_marker not in body or native_release_marker not in body:
+            continue
+        claimed_correlations = re.findall(
+            r"(?m)^Orchestrator correlation: `([^`\r\n]+)`$", body
         )
-    ]
+        valid_claims: list[str] = []
+        for claim in claimed_correlations:
+            try:
+                valid_claims.append(require_correlation_id(claim))
+            except ContractError:
+                pass
+        if valid_claims:
+            # The same native release may intentionally have multiple bridge
+            # publications after governed runtime/build changes. A different
+            # well-formed correlation is another pipeline, not damaged state.
+            continue
+        # With no valid correlation marker, the native identity is still close
+        # enough to block a duplicate until immutable readback diagnoses it.
+        matches.append(release)
     if len(matches) > 1:
         raise ContractError(
             f"{len(matches)} asset releases claim correlation {correlation_id!r}: "
@@ -1435,6 +1604,11 @@ def verify_published_release(
         provenance=provenance,
         correlation_id=correlation_id,
         expected_release_tag=tag,
+        expected_bridge_source_sha=(
+            LEGACY_MANUAL_QUALIFICATION_BRIDGE_COMMIT
+            if compatibility is not None
+            else None
+        ),
     )
     for name in ARTIFACTS:
         recorded = manifest["artifacts"][name]
@@ -2646,6 +2820,7 @@ def render_step_summary(plan: OrchestrationPlan) -> str:
         f"- Reason: {plan.reason}",
         f"- Correlation: `{plan.correlation_id}`",
         f"- Bridge source: `{plan.provenance.bridge_source_sha}`",
+        f"- Governed bridge build: `{plan.provenance.bridge_build_sha}`",
         f"- llama.cpp: `{plan.provenance.upstream_tag}@{plan.provenance.upstream_commit}`",
         f"- Native release: `{plan.provenance.native_repo}@{plan.provenance.native_release_tag}`",
         f"- Native manifest SHA-256: `{plan.provenance.native_manifest_sha256}`",
@@ -2684,6 +2859,7 @@ def _parser() -> argparse.ArgumentParser:
     scan.add_argument("--manifest", required=True, type=Path)
     scan.add_argument("--native-release-tag", required=True)
     scan.add_argument("--bridge-source-sha", required=True)
+    scan.add_argument("--bridge-build-sha", required=True)
     scan.add_argument("--native-release-published-at", required=True)
     scan.add_argument(
         "--channel",
@@ -2692,6 +2868,14 @@ def _parser() -> argparse.ArgumentParser:
         help="Channel the caller asked for; a mismatch fails closed",
     )
     scan.add_argument("--output-json", type=Path)
+
+    source = subparsers.add_parser(
+        "resolve-bridge-source",
+        help="Resolve current source and governed runtime/build identity",
+    )
+    source.add_argument("--repository", required=True, type=Path)
+    source.add_argument("--head", default="HEAD")
+    source.add_argument("--output-json", type=Path)
 
     select = subparsers.add_parser(
         "select-stable-native-backlog",
@@ -2724,6 +2908,7 @@ def _parser() -> argparse.ArgumentParser:
 def _provenance_to_dict(provenance: NativeProvenance) -> dict[str, str]:
     return {
         "bridge_source_sha": provenance.bridge_source_sha,
+        "bridge_build_sha": provenance.bridge_build_sha,
         "upstream_tag": provenance.upstream_tag,
         "upstream_commit": provenance.upstream_commit,
         "native_repo": provenance.native_repo,
@@ -2739,6 +2924,7 @@ def _load_provenance_payload(payload: Any, label: str) -> NativeProvenance:
         raise ContractError(f"{label} must be a JSON object")
     expected = {
         "bridge_source_sha",
+        "bridge_build_sha",
         "upstream_tag",
         "upstream_commit",
         "native_repo",
@@ -2801,10 +2987,26 @@ def main(argv: Sequence[str] | None = None) -> int:
             manifest_path=args.manifest,
             native_release_tag=args.native_release_tag,
             bridge_source_sha=args.bridge_source_sha,
+            bridge_build_sha=args.bridge_build_sha,
             channel=args.channel,
             native_release_published_at=args.native_release_published_at,
         )
         payload = json.dumps(_provenance_to_dict(provenance), indent=2, sort_keys=True)
+        if args.output_json:
+            args.output_json.write_text(payload + "\n", encoding="utf-8")
+        print(payload)
+        return 0
+
+    if args.subcommand == "resolve-bridge-source":
+        identity = resolve_bridge_source_identity(args.repository, args.head)
+        payload = json.dumps(
+            {
+                "bridge_source_sha": identity.bridge_source_sha,
+                "bridge_build_sha": identity.bridge_build_sha,
+            },
+            indent=2,
+            sort_keys=True,
+        )
         if args.output_json:
             args.output_json.write_text(payload + "\n", encoding="utf-8")
         print(payload)

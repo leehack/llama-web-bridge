@@ -9,6 +9,7 @@ import io
 import json
 import os
 import shutil
+import subprocess
 import tempfile
 import unittest
 import zipfile
@@ -79,6 +80,7 @@ LEGACY_MANUAL_UNPROVEN_CAPABILITIES = {
 def make_provenance(**overrides: Any) -> sro.NativeProvenance:
     fields: dict[str, Any] = {
         "bridge_source_sha": BRIDGE_SHA,
+        "bridge_build_sha": BRIDGE_SHA,
         "upstream_tag": "v0.2.0",
         "upstream_commit": UPSTREAM_COMMIT,
         "native_repo": NATIVE_REPOSITORY,
@@ -94,6 +96,7 @@ def make_provenance(**overrides: Any) -> sro.NativeProvenance:
 def make_legacy_v0140_provenance(**overrides: Any) -> sro.NativeProvenance:
     fields: dict[str, Any] = {
         "bridge_source_sha": LEGACY_BRIDGE_SHA,
+        "bridge_build_sha": LEGACY_BRIDGE_SHA,
         "upstream_tag": "v0.3.0",
         "upstream_commit": LEGACY_UPSTREAM_COMMIT,
         "native_repo": NATIVE_REPOSITORY,
@@ -482,6 +485,115 @@ raise SystemExit(int(os.environ.get("GH_FAKE_EXIT", "0")))
         self.assertEqual(observed["gh_token"], "read-token")
 
 
+class BridgeSourceIdentityTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.repository = Path(self.temp.name) / "bridge"
+        self.repository.mkdir()
+        self._git("init", "--initial-branch=main")
+        self._git("config", "user.name", "Bridge Test")
+        self._git("config", "user.email", "bridge-test@example.com")
+
+    def tearDown(self) -> None:
+        self.temp.cleanup()
+
+    def _git(self, *args: str) -> str:
+        return subprocess.run(
+            ("git", "-C", str(self.repository), *args),
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        ).stdout.strip()
+
+    def _commit(self, message: str) -> str:
+        self._git("add", ".")
+        self._git("commit", "-m", message)
+        return self._git("rev-parse", "HEAD")
+
+    def test_actual_resolver_separates_orchestration_from_governed_changes(
+        self,
+    ) -> None:
+        source = self.repository / "src" / "bridge.cpp"
+        source.parent.mkdir()
+        source.write_text("runtime-v1\n", encoding="utf-8")
+        governed = self._commit("initial runtime")
+
+        workflow = (
+            self.repository
+            / ".github"
+            / "workflows"
+            / "auto_llama_cpp_update.yml"
+        )
+        workflow.parent.mkdir(parents=True)
+        workflow.write_text("name: scan\n", encoding="utf-8")
+        docs = self.repository / "docs" / "release.md"
+        docs.parent.mkdir()
+        docs.write_text("release docs\n", encoding="utf-8")
+        test = self.repository / "scripts" / "resolver_test.py"
+        test.parent.mkdir()
+        test.write_text("# regression\n", encoding="utf-8")
+        orchestration_head = self._commit("workflow tests and docs")
+
+        output = self.repository / "identity.json"
+        self.assertEqual(
+            sro.main(
+                [
+                    "resolve-bridge-source",
+                    "--repository",
+                    str(self.repository),
+                    "--head",
+                    "HEAD",
+                    "--output-json",
+                    str(output),
+                ]
+            ),
+            0,
+        )
+        identity = json.loads(output.read_text(encoding="utf-8"))
+        self.assertEqual(identity["bridge_source_sha"], orchestration_head)
+        self.assertEqual(identity["bridge_build_sha"], governed)
+
+        # An unclassified new file is governed by default. This protects the
+        # identity if a future build input is added without updating the list.
+        (self.repository / "new-build-input.cfg").write_text(
+            "runtime-v2\n", encoding="utf-8"
+        )
+        governed_head = self._commit("new governed build input")
+        advanced = sro.resolve_bridge_source_identity(self.repository)
+        self.assertEqual(advanced.bridge_source_sha, governed_head)
+        self.assertEqual(advanced.bridge_build_sha, governed_head)
+
+    def test_malformed_git_path_is_rejected(self) -> None:
+        with self.assertRaises(ContractError):
+            sro.is_governed_bridge_path("../outside")
+
+    def test_path_contract_is_fail_closed_for_runtime_and_new_inputs(self) -> None:
+        for path in (
+            ".github/workflows/auto_llama_cpp_update.yml",
+            "README.md",
+            "docs/api.md",
+            "scripts/release_qualification.py",
+            "scripts/stable_release_orchestrator_test.py",
+        ):
+            with self.subTest(path=path):
+                self.assertFalse(sro.is_governed_bridge_path(path))
+        for path in (
+            "CMakeLists.txt",
+            ".github/workflows/bridge_candidate.yml",
+            "package.json",
+            "js/llama_webgpu_bridge.d.ts",
+            "scripts/build_bridge.sh",
+            "scripts/generate_release_manifest.py",
+            "scripts/release_contract.py",
+            "scripts/verify_emscripten_version.py",
+            "src/llama_webgpu_core.cpp",
+            "unknown/new-build-input.cfg",
+        ):
+            with self.subTest(path=path):
+                self.assertTrue(sro.is_governed_bridge_path(path))
+
+
 class ProvenanceTest(unittest.TestCase):
     def test_scan_native_binds_exact_manifest_bytes(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -492,6 +604,7 @@ class ProvenanceTest(unittest.TestCase):
                 manifest_path=path,
                 native_release_tag="v0.2.0",
                 bridge_source_sha=BRIDGE_SHA,
+                bridge_build_sha=BRIDGE_SHA,
                 channel="stable",
                 native_release_published_at=NATIVE_PUBLISHED_AT,
             )
@@ -510,6 +623,7 @@ class ProvenanceTest(unittest.TestCase):
                     manifest_path=path,
                     native_release_tag="v0.2.0",
                     bridge_source_sha=BRIDGE_SHA,
+                    bridge_build_sha=BRIDGE_SHA,
                     channel="stable",
                     native_release_published_at=NATIVE_PUBLISHED_AT,
                 )
@@ -543,6 +657,7 @@ class DevelopmentScanTest(unittest.TestCase):
                 manifest_path=path,
                 native_release_tag="b9165",
                 bridge_source_sha=BRIDGE_SHA,
+                bridge_build_sha=BRIDGE_SHA,
                 channel=channel,
                 native_release_published_at=NATIVE_PUBLISHED_AT,
             )
@@ -566,6 +681,7 @@ class DevelopmentScanTest(unittest.TestCase):
                     manifest_path=path,
                     native_release_tag="v0.2.0",
                     bridge_source_sha=BRIDGE_SHA,
+                    bridge_build_sha=BRIDGE_SHA,
                     channel="development",
                     native_release_published_at=NATIVE_PUBLISHED_AT,
                 )
@@ -573,6 +689,7 @@ class DevelopmentScanTest(unittest.TestCase):
     def test_orchestration_refuses_a_development_provenance(self) -> None:
         development = sro.NativeProvenance(
             bridge_source_sha=BRIDGE_SHA,
+            bridge_build_sha=BRIDGE_SHA,
             upstream_tag="b9165",
             upstream_commit=UPSTREAM_COMMIT,
             native_repo=NATIVE_REPOSITORY,
@@ -589,6 +706,7 @@ class DevelopmentScanTest(unittest.TestCase):
                 json.dumps(
                     {
                         "bridge_source_sha": BRIDGE_SHA,
+                        "bridge_build_sha": BRIDGE_SHA,
                         "upstream_tag": "b9165",
                         "upstream_commit": UPSTREAM_COMMIT,
                         "native_repo": NATIVE_REPOSITORY,
@@ -685,6 +803,12 @@ class OrchestrationCallerAuthorizationTest(unittest.TestCase):
 
     def test_workflow_run_trigger_and_both_job_gates_are_exact(self) -> None:
         workflow = self.WORKFLOW.read_text(encoding="utf-8")
+        self.assertIn("fetch-depth: 0", workflow)
+        self.assertIn(
+            "scripts/stable_release_orchestrator.py resolve-bridge-source",
+            workflow,
+        )
+        self.assertIn('--bridge-build-sha "${bridge_build_sha}"', workflow)
         manual_gate = (
             "github.event_name == 'workflow_dispatch' && "
             "github.actor == github.repository_owner && "
@@ -730,15 +854,25 @@ class OrchestrationCallerAuthorizationTest(unittest.TestCase):
 
 
 class CorrelationTest(unittest.TestCase):
-    def test_deterministic_correlation_id_ignores_advancing_main(self) -> None:
+    def test_deterministic_correlation_id_ignores_orchestration_only_main(self) -> None:
         first = sro.compute_correlation_id(make_provenance())
         second = sro.compute_correlation_id(
             make_provenance(bridge_source_sha=ADVANCED_BRIDGE_SHA)
         )
         self.assertEqual(first, second)
         self.assertEqual(
-            first, f"auto-stable-v0.2.0-{NATIVE_MANIFEST_SHA[:16]}"
+            first,
+            f"auto-stable-v0.2.0-{NATIVE_MANIFEST_SHA[:16]}-build-{BRIDGE_SHA[:16]}",
         )
+
+    def test_correlation_id_changes_with_governed_build_source(self) -> None:
+        other = sro.compute_correlation_id(
+            make_provenance(
+                bridge_source_sha=ADVANCED_BRIDGE_SHA,
+                bridge_build_sha=ADVANCED_BRIDGE_SHA,
+            )
+        )
+        self.assertNotEqual(sro.compute_correlation_id(make_provenance()), other)
 
     def test_correlation_id_changes_with_native_manifest(self) -> None:
         other = sro.compute_correlation_id(
@@ -1534,9 +1668,9 @@ class PublishedReleaseVerificationTest(unittest.TestCase):
                 "v0.1.40",
                 make_legacy_v0140_provenance(upstream_commit="2" * 40),
             ),
-            "bridge commit": (
+            "governed bridge build": (
                 "v0.1.40",
-                make_legacy_v0140_provenance(bridge_source_sha="3" * 40),
+                make_legacy_v0140_provenance(bridge_build_sha="3" * 40),
             ),
             "native manifest": (
                 "v0.1.40",
@@ -2093,6 +2227,9 @@ class AdvancePipelineTest(unittest.TestCase):
         | None = None,
     ) -> FakeGateway:
         members = directory_members(candidate_dir)
+        manifest = json.loads(
+            (candidate_dir / "manifest.json").read_text(encoding="utf-8")
+        )
         if published_manifest_compatibility is None:
             fingerprint = rq.load_candidate(candidate_dir)[1]
         else:
@@ -2111,6 +2248,10 @@ class AdvancePipelineTest(unittest.TestCase):
             {
                 f"repos/{BRIDGE_REPOSITORY}/compare/"
                 f"{provenance.bridge_source_sha}...{DEFAULT_BRANCH}": {
+                    "status": "ahead"
+                },
+                f"repos/{BRIDGE_REPOSITORY}/compare/"
+                f"{manifest['bridge_commit']}...{DEFAULT_BRANCH}": {
                     "status": "ahead"
                 },
                 f"repos/{ASSETS_REPOSITORY}/git/ref/tags/v0.1.40": {
@@ -2637,7 +2778,9 @@ class AdvancePipelineTest(unittest.TestCase):
         self.assertEqual(plan.release_target.release_tag, "v0.1.40")
 
     def test_legacy_v0140_publication_is_a_terminal_noop(self) -> None:
-        provenance = make_legacy_v0140_provenance()
+        provenance = make_legacy_v0140_provenance(
+            bridge_source_sha=ADVANCED_BRIDGE_SHA
+        )
         correlation_id = sro.compute_correlation_id(provenance)
         candidate_dir = self.tmp / "legacy-v0140-candidate"
         write_bridge_candidate(
@@ -2676,6 +2819,57 @@ class AdvancePipelineTest(unittest.TestCase):
         self.assertEqual(plan.action, sro.OrchestrationAction.NOOP)
         self.assertEqual(gateway.dispatches, [])
         self.assertEqual(plan.release_target.release_tag, "v0.1.40")
+
+    def test_governed_source_change_does_not_reuse_legacy_v0140(self) -> None:
+        legacy = make_legacy_v0140_provenance(
+            bridge_source_sha=ADVANCED_BRIDGE_SHA
+        )
+        legacy_correlation = sro.compute_correlation_id(legacy)
+        candidate_dir = self.tmp / "legacy-v0140-before-governed-change"
+        write_bridge_candidate(
+            candidate_dir,
+            release_tag="v0.1.40",
+            release_rebuild=0,
+            correlation_id=legacy_correlation,
+            bridge_commit=LEGACY_BRIDGE_SHA,
+            run_id=LEGACY_CANDIDATE_RUN_ID,
+            upstream_tag="v0.3.0",
+            upstream_commit=LEGACY_UPSTREAM_COMMIT,
+            native_release_tag="v0.3.0",
+            native_manifest_sha256=LEGACY_NATIVE_MANIFEST_SHA,
+            native_commit=LEGACY_NATIVE_COMMIT,
+        )
+        rewrite_legacy_candidate_manifest(candidate_dir)
+        gateway = self._published_candidate_gateway(
+            candidate_dir,
+            provenance=legacy,
+            correlation_id=legacy_correlation,
+            published_manifest_compatibility=(
+                LEGACY_MANUAL_QUALIFICATION_GATES,
+                LEGACY_MANUAL_UNPROVEN_CAPABILITIES,
+            ),
+        )
+        governed = make_legacy_v0140_provenance(
+            bridge_source_sha=ADVANCED_BRIDGE_SHA,
+            bridge_build_sha=ADVANCED_BRIDGE_SHA,
+        )
+        gateway.json_routes[
+            sro._workflow_runs_path(
+                workflow_file=sro.CANDIDATE_WORKFLOW_FILE,
+                default_branch=DEFAULT_BRANCH,
+                created_since="2026-08-20T03:24:11Z",
+            )
+        ] = runs_response([])
+        plan = sro.advance_pipeline(
+            gateway,
+            provenance=governed,
+            workspace=self.tmp / "governed-change",
+            dry_run=True,
+        )
+        self.assertEqual(plan.action, sro.OrchestrationAction.DISPATCH_CANDIDATE)
+        self.assertEqual(plan.release_target.release_tag, "v0.1.41")
+        self.assertEqual(plan.dispatch_inputs["bridge_source_sha"], ADVANCED_BRIDGE_SHA)
+        self.assertEqual(gateway.dispatches, [])
 
     def test_two_releases_claiming_one_correlation_fail_closed(self) -> None:
         body = f"Orchestrator correlation: `{self.correlation_id}`"
