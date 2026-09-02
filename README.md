@@ -363,6 +363,13 @@ Trigger modes:
   stage workflows are deliberately not reusable
   because reusable job environments execute in the caller repository's context.
 
+The scheduled resolver keeps the current default-branch source SHA separate
+from the newest main-line commit that changed governed runtime/build inputs.
+Non-build orchestration/qualification/publication/CI workflow, verification,
+test, and documentation-only commits therefore preserve verified pipeline
+state. The candidate workflow and any runtime/build input change create a new
+correlation and must produce a new automatically qualified candidate.
+
 There is no push, tag, or ordinary-CI publication trigger. The schedule and
 `workflow_run` events wake the orchestrator; only its exact `workflow_dispatch`
 calls start a build, qualification, or publication stage.

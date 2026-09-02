@@ -66,6 +66,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          fetch-depth: 0
           persist-credentials: false
 
       - name: Prove the exact workflow continuation before environment use
@@ -154,7 +155,13 @@ jobs:
           fi
           jq -r '.[]' "${RUNNER_TEMP}/native-tags.json" \
             > "${RUNNER_TEMP}/native-tags.txt"
-          bridge_source_sha="$(git rev-parse HEAD)"
+          python3 scripts/stable_release_orchestrator.py resolve-bridge-source \
+            --repository . --head HEAD \
+            --output-json "${RUNNER_TEMP}/bridge-source-identity.json"
+          bridge_source_sha="$(jq -er '.bridge_source_sha' \
+            "${RUNNER_TEMP}/bridge-source-identity.json")"
+          bridge_build_sha="$(jq -er '.bridge_build_sha' \
+            "${RUNNER_TEMP}/bridge-source-identity.json")"
           while IFS= read -r NATIVE_TAG; do
             if [ "${REQUESTED_CHANNEL}" = "stable" ]; then
               if [[ ! "${NATIVE_TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[1-9][0-9]*)?$ ]]; then
@@ -208,6 +215,7 @@ jobs:
               --native-release-tag "${NATIVE_TAG}" \
               --native-release-published-at "${native_published_at}" \
               --bridge-source-sha "${bridge_source_sha}" \
+              --bridge-build-sha "${bridge_build_sha}" \
               --channel "${REQUESTED_CHANNEL}" \
               --output-json "${provenance_json}"
 
