@@ -24,6 +24,7 @@
 #include "mtmd.h"
 
 #include "llama_webgpu_embedding_json.h"
+#include "llama_webgpu_mtmd_compat.h"
 #include "llama_webgpu_tts.h"
 
 namespace {
@@ -1461,7 +1462,7 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_media_add_file(
   }
 
   mtmd_helper_bitmap_wrapper media =
-      mtmd_helper_bitmap_init_from_file(g_state.mm_ctx, media_path, false);
+      llama_webgpu_bitmap_from_file(g_state.mm_ctx, media_path);
   if (media.bitmap == nullptr) {
     set_error("Failed to decode media file content");
     return -4;
@@ -1490,11 +1491,10 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_media_add_encoded(
     return -3;
   }
 
-  mtmd_helper_bitmap_wrapper media = mtmd_helper_bitmap_init_from_buf(
+  mtmd_helper_bitmap_wrapper media = llama_webgpu_bitmap_from_buffer(
       g_state.mm_ctx,
       bytes,
-      static_cast<size_t>(length),
-      false);
+      static_cast<size_t>(length));
   if (media.bitmap == nullptr) {
     set_error("Failed to decode encoded media bytes");
     return -4;

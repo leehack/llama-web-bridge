@@ -1224,6 +1224,28 @@ def main() -> int:
         errors,
     )
     require(
+        "upstream: [pinned, v0.4.0]" in ci
+        and "5266f24da75dc449bd56cbed7addb9c8e4a6a73e" in ci
+        and "'Build WebGPU Bridge (WASM)'" in ci
+        and "'webgpu-bridge-dist-v0.4.0'" in ci
+        and "state-persistence-smoke-artifacts-${{ matrix.upstream }}" in ci
+        and "multimodal-smoke-artifacts-${{ matrix.upstream }}" in ci
+        and "python3 scripts/mtmd_compat_contract_test.py" in ci,
+        "CI must retain the pinned check and artifact identities, test exact v0.4.0 media compatibility, and isolate matrix artifacts",
+        errors,
+    )
+    require(
+        "bridge._runtime?._core" in multimodal_smoke
+        and "llamadart_webgpu_media_add_file" in multimodal_smoke
+        and "llamadart_webgpu_media_add_encoded" in multimodal_smoke
+        and "[imageBytes, 0]) === -3" in multimodal_smoke
+        and "[imageBytes.subarray(0, 8), 8]) === -4" in multimodal_smoke
+        and "['/mtmd-compat-missing.png']) === -4" in multimodal_smoke
+        and "core.FS.unlink(path)" in multimodal_smoke,
+        "multimodal smoke must exercise direct file/encoded PNG helpers, reject empty input, and clean its runtime-owned fixture",
+        errors,
+    )
+    require(
         "python3 -m playwright install chromium" in ci
         and "playwright install --with-deps chromium" not in ci,
         "ci.yml must use the pre-provisioned runner dependencies instead of rerunning the OS package installer for Playwright",

@@ -62,6 +62,22 @@ set(GGML_BLAS OFF CACHE BOOL "" FORCE)
 
 add_subdirectory("${LLAMA_CPP_DIR}" "${CMAKE_BINARY_DIR}/llama_cpp")
 
+include(CheckCXXSourceCompiles)
+include(CMakePushCheckState)
+cmake_push_check_state(RESET)
+set(CMAKE_REQUIRED_INCLUDES
+    "${LLAMA_CPP_DIR}/include"
+    "${LLAMA_CPP_DIR}/ggml/include"
+    "${LLAMA_CPP_DIR}/tools/mtmd")
+# Recheck when a build directory is reused with a different upstream checkout.
+unset(LLAMADART_MTMD_HELPER_HAS_OPTIONS CACHE)
+# Inspect declarations without calling upstream symbols or running target code.
+check_cxx_source_compiles("
+#include <mtmd-helper.h>
+int main() { return sizeof(decltype(mtmd_helper_init_opt_default())) == 0; }
+" LLAMADART_MTMD_HELPER_HAS_OPTIONS)
+cmake_pop_check_state()
+
 find_package(Threads REQUIRED)
 
 set(MTMD_AUDIO_SRC "${LLAMA_CPP_DIR}/tools/mtmd/mtmd-audio.cpp")
@@ -113,6 +129,7 @@ add_executable(llama_webgpu_core
 target_compile_features(llama_webgpu_core PRIVATE cxx_std_17)
 
 target_compile_definitions(llama_webgpu_core PRIVATE
+    LLAMADART_MTMD_HELPER_HAS_OPTIONS=$<BOOL:${LLAMADART_MTMD_HELPER_HAS_OPTIONS}>
     LLAMADART_WEBGPU_PTHREAD_POOL_SIZE=${LLAMADART_WEBGPU_PTHREAD_POOL_SIZE}
 )
 

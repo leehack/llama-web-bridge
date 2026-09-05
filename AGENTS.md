@@ -68,6 +68,7 @@ npm run check:js
 python3 -m py_compile scripts/verify_state_persistence_api.py scripts/verify_text_to_speech_api.py scripts/verify_ci_reliability.py scripts/state_persistence_browser_smoke.py scripts/multimodal_browser_smoke.py scripts/speech_to_text_browser_smoke.py scripts/text_to_speech_browser_smoke.py
 python3 scripts/verify_state_persistence_api.py
 python3 scripts/verify_text_to_speech_api.py
+python3 scripts/mtmd_compat_contract_test.py
 python3 scripts/verify_ci_reliability.py
 ```
 
@@ -135,6 +136,10 @@ automated qualification run binds the candidate digest it is about to publish.
 
 - CI build gate: `.github/workflows/ci.yml`
   - Resolves the default llama.cpp checkout from `llama_cpp.version`.
+  - Builds wasm32/memory64 against that pin and exact v0.4.0 in separate matrix
+    lanes, with media-helper API contracts plus real state and image smokes.
+    Preserve the original pinned check/artifact identities and isolate each
+    lane's artifact uploads. Neither lane publishes or changes the source pin.
   - Resolves `emsdk.version`, installs that exact compiler, verifies the active
     `emcc` identity, and contract-tests all five required wasm64 WASMFS patches.
   - Never dispatches asset publication. Bridge source changes, including changes
@@ -373,6 +378,7 @@ After publishing assets tag:
 - Every llama.cpp pin update must pass checksum-pinned real multimodal inference
   in both direct and worker runtimes; a successful WASM build alone is not
   sufficient.
-- Speech-capable asset releases must pass the required local qualification in
-  wasm32 and memory64; never run the large Qwen3-ASR/Qwen3-TTS pairs on hosted
-  runners.
+- Speech-capable asset releases must pass the hosted automated qualification
+  workflow's exact required memory/runtime matrix before publication. Keep
+  these heavy gates outside ordinary CI; reproduce locally with the individual
+  smoke scripts above, not the workflow-only combined qualifier.

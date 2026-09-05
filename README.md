@@ -181,11 +181,15 @@ This repo includes a wasm build gate in:
 
 - `.github/workflows/ci.yml`
 
-It builds against the pinned `llama.cpp` tag in `llama_cpp.version`, runs the JS
-bridge build/type-check gate, uploads build artifacts, and runs the static CI
-reliability contract:
+It builds wasm32 and memory64 against both the pinned `llama.cpp` tag in
+`llama_cpp.version` and the exact v0.4.0 compatibility revision. Both lanes run
+the JS/compatibility contracts and real state-persistence and multimodal browser
+smokes. The pinned lane retains `webgpu-bridge-dist`; the compatibility lane
+uploads `webgpu-bridge-dist-v0.4.0`. Neither changes a pin or publishes assets.
+To run the media-helper and static CI contracts locally:
 
 ```bash
+python3 scripts/mtmd_compat_contract_test.py
 python3 scripts/verify_ci_reliability.py
 ```
 
