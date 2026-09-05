@@ -1,4 +1,5 @@
 #include "llama_webgpu_tts.h"
+#include "llama_webgpu_mtmd_compat.h"
 
 #include <atomic>
 #include <cmath>
@@ -290,11 +291,10 @@ llama_webgpu_tts_status llama_webgpu_tts_start(
   tts->owns_embedding_mode = true;
 
   if (request.speaker_audio_length > 0) {
-    mtmd_helper_bitmap_wrapper wrapper = mtmd_helper_bitmap_init_from_buf(
+    mtmd_helper_bitmap_wrapper wrapper = llama_webgpu_bitmap_from_buffer(
         tts->mtmd,
         request.speaker_audio,
-        request.speaker_audio_length,
-        false);
+        request.speaker_audio_length);
     if (wrapper.bitmap == nullptr || !mtmd_bitmap_is_audio(wrapper.bitmap)) {
       if (wrapper.bitmap != nullptr) {
         mtmd_bitmap_free(wrapper.bitmap);

@@ -118,6 +118,49 @@ def write_harness(web_root: Path) -> None:
         await bridge.loadMultimodalProjector('/multimodal-mmproj.gguf');
         assert(bridge.supportsVision(), `${mode} did not report vision support`);
 
+        // Normal image ingestion resizes through RGB. Also exercise the native
+        // file/encoded entry points so helper API compatibility cannot hide
+        // behind that independent path. The direct runtime owns this FS.
+        if (disableWorker) {
+          const core = bridge._runtime?._core;
+          assert(core?.FS && typeof core.ccall === 'function',
+            'direct runtime core is unavailable for media compatibility checks');
+          const path = '/mtmd-compat.png';
+          core.FS.writeFile(path, imageBytes);
+          try {
+            assert(
+              core.ccall('llamadart_webgpu_media_add_file', 'number',
+                ['string'], [path]) === 0,
+              'native file helper failed to decode the real PNG',
+            );
+            core.ccall('llamadart_webgpu_media_clear_pending', null, [], []);
+            assert(
+              core.ccall('llamadart_webgpu_media_add_encoded', 'number',
+                ['array', 'number'], [imageBytes, imageBytes.length]) === 0,
+              'native buffer helper failed to decode the real PNG',
+            );
+            core.ccall('llamadart_webgpu_media_clear_pending', null, [], []);
+            assert(
+              core.ccall('llamadart_webgpu_media_add_encoded', 'number',
+                ['array', 'number'], [imageBytes, 0]) === -3,
+              'native buffer helper must reject empty input',
+            );
+            assert(
+              core.ccall('llamadart_webgpu_media_add_encoded', 'number',
+                ['array', 'number'], [imageBytes.subarray(0, 8), 8]) === -4,
+              'native buffer helper must reject a truncated PNG',
+            );
+            assert(
+              core.ccall('llamadart_webgpu_media_add_file', 'number',
+                ['string'], ['/mtmd-compat-missing.png']) === -4,
+              'native file helper must reject a missing file',
+            );
+          } finally {
+            core.ccall('llamadart_webgpu_media_clear_pending', null, [], []);
+            core.FS.unlink(path);
+          }
+        }
+
         const output = await bridge.createCompletion('what do you see?', {
           nPredict: 64,
           temp: 0,
