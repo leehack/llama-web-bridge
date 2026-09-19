@@ -319,3 +319,21 @@ Transport dispatch inputs through `env` and use quoted shell expansions.
 - Bridge runtime source/build belongs here.
 - Versioned static artifacts belong in `llama-web-bridge-assets`.
 - Consumer integration (loading/fallback behavior) belongs in `llamadart`.
+
+## CI change selection and compiler cache
+
+CI always runs the shared JS and workflow contracts. An explicit allowlist in
+`scripts/ci_scope.py` lets known documentation and tooling-only changes avoid the
+WASM builds. Runtime JS, C++, browser harnesses, build inputs, workflows, pins,
+and unknown paths retain both the pinned and v0.4.0 build/smoke lanes. Rename and
+deletion comparisons include both paths. The `CI validation` result always
+reports and rejects failed, cancelled, missing, or unexpectedly skipped work.
+Only superseded PR runs are cancelled; main/manual runs remain independent.
+
+The CI compiler cache stores objects outside the checkout, separated by runner
+OS/architecture, exact Emscripten version, resolved llama.cpp commit, and build
+script/CMake/patch inputs. ccache also checks compiler contents, source inputs,
+and compile flags. Every selected build still links fresh artifacts and runs
+both existing browser smokes. Candidate and publication workflows do not consume
+this cache or this change selector. Track follow-up work in
+[llamadart issue #532](https://github.com/leehack/llamadart/issues/532).
