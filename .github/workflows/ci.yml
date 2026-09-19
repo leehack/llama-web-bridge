@@ -7,6 +7,10 @@ on:
   pull_request:
     branches: [main]
 
+concurrency:
+  group: ci-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 permissions:
   contents: read
 
@@ -14,7 +18,81 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 jobs:
+  changes:
+    name: Select CI validation
+    runs-on: ubuntu-latest
+    outputs:
+      native: ${{ steps.scope.outputs.native }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - id: scope
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: python3 scripts/ci_scope.py
+
+  checks:
+    name: JS and workflow contracts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - name: Validate JS bridge build
+        run: |
+          npm run check:js
+          git ls-files --error-unmatch js/llama_webgpu_bridge.js js/llama_webgpu_bridge_worker.js js/llama_webgpu_bridge.d.ts
+          git diff --exit-code -- js/llama_webgpu_bridge.js js/llama_webgpu_bridge_worker.js js/llama_webgpu_bridge.d.ts
+
+      - name: Validate state persistence API contract
+        run: python3 scripts/verify_state_persistence_api.py
+
+      - name: Validate text-to-speech API contract
+        run: python3 scripts/verify_text_to_speech_api.py
+
+      - name: Validate media helper compatibility
+        run: python3 scripts/mtmd_compat_contract_test.py
+
+      - name: Validate wasm64 runtime patch contract
+        run: python3 scripts/wasm64_runtime_patch_contract_test.py
+
+      - name: Validate release qualification contract
+        run: python3 scripts/release_qualification_test.py
+
+      - name: Validate Python smoke syntax
+        run: |
+          python3 -m py_compile \
+            scripts/verify_state_persistence_api.py \
+            scripts/verify_text_to_speech_api.py \
+            scripts/verify_emscripten_version.py \
+            scripts/verify_ci_reliability.py \
+            scripts/patch_wasm64_runtime.py \
+            scripts/wasm64_runtime_patch_contract_test.py \
+            scripts/release_qualification.py \
+            scripts/release_qualification_test.py \
+            scripts/state_persistence_browser_smoke.py \
+            scripts/multimodal_browser_smoke.py \
+            scripts/speech_to_text_browser_smoke.py \
+            scripts/text_to_speech_browser_smoke.py
+
+      - name: Verify CI reliability contract
+        run: python3 scripts/verify_ci_reliability.py
+
+      - name: Validate release orchestration and CI selection
+        run: |
+          python3 -m unittest discover -s scripts -p '*_test.py'
+          node scripts/workflow_input_transport_test.mjs
+
   build-webgpu-bridge:
+    needs: [changes, checks]
+    if: needs.changes.outputs.native == 'true'
     name: ${{ matrix.upstream == 'pinned' && 'Build WebGPU Bridge (WASM)' || 'Build WebGPU Bridge (WASM, v0.4.0)' }}
     runs-on: ubuntu-latest
     strategy:
@@ -55,12 +133,6 @@ jobs:
       - name: Install JS dependencies
         run: npm ci --ignore-scripts
 
-      - name: Validate JS bridge build
-        run: |
-          npm run check:js
-          git ls-files --error-unmatch js/llama_webgpu_bridge.js js/llama_webgpu_bridge_worker.js js/llama_webgpu_bridge.d.ts
-          git diff --exit-code -- js/llama_webgpu_bridge.js js/llama_webgpu_bridge_worker.js js/llama_webgpu_bridge.d.ts
-
       - name: Resolve llama.cpp pin
         run: |
           LLAMA_CPP_TAG="$(tr -d '[:space:]' < llama_cpp.version)"
@@ -76,40 +148,6 @@ jobs:
           EMSCRIPTEN_VERSION="$(python3 scripts/verify_emscripten_version.py --print-pin)"
           echo "EMSCRIPTEN_VERSION=${EMSCRIPTEN_VERSION}" >> "$GITHUB_ENV"
           echo "Using Emscripten ${EMSCRIPTEN_VERSION}"
-
-      - name: Validate state persistence API contract
-        run: python3 scripts/verify_state_persistence_api.py
-
-      - name: Validate text-to-speech API contract
-        run: python3 scripts/verify_text_to_speech_api.py
-
-      - name: Validate media helper compatibility
-        run: python3 scripts/mtmd_compat_contract_test.py
-
-      - name: Validate wasm64 runtime patch contract
-        run: python3 scripts/wasm64_runtime_patch_contract_test.py
-
-      - name: Validate release qualification contract
-        run: python3 scripts/release_qualification_test.py
-
-      - name: Validate Python smoke syntax
-        run: |
-          python3 -m py_compile \
-            scripts/verify_state_persistence_api.py \
-            scripts/verify_text_to_speech_api.py \
-            scripts/verify_emscripten_version.py \
-            scripts/verify_ci_reliability.py \
-            scripts/patch_wasm64_runtime.py \
-            scripts/wasm64_runtime_patch_contract_test.py \
-            scripts/release_qualification.py \
-            scripts/release_qualification_test.py \
-            scripts/state_persistence_browser_smoke.py \
-            scripts/multimodal_browser_smoke.py \
-            scripts/speech_to_text_browser_smoke.py \
-            scripts/text_to_speech_browser_smoke.py
-
-      - name: Verify CI reliability contract
-        run: python3 scripts/verify_ci_reliability.py
 
       - name: Cache state smoke model
         uses: actions/cache@v4
@@ -141,8 +179,29 @@ jobs:
       - name: Verify resolved Emscripten compiler
         run: python3 scripts/verify_emscripten_version.py --emit-github-env "$GITHUB_ENV"
 
+      - name: Resolve compiler cache identity
+        id: compiler-cache
+        run: echo "upstream=$(git -C third_party/llama_cpp rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Install compiler cache
+        run: sudo apt-get update && sudo apt-get install -y ccache
+
+      - name: Cache compiler objects
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/webgpu-ccache
+          key: webgpu-ccache-v1-${{ runner.os }}-${{ runner.arch }}-${{ env.EMSCRIPTEN_VERSION }}-${{ steps.compiler-cache.outputs.upstream }}-${{ hashFiles('CMakeLists.txt', 'scripts/build_bridge.sh', 'scripts/patch_*.py') }}-${{ github.sha }}
+          restore-keys: |
+            webgpu-ccache-v1-${{ runner.os }}-${{ runner.arch }}-${{ env.EMSCRIPTEN_VERSION }}-${{ steps.compiler-cache.outputs.upstream }}-${{ hashFiles('CMakeLists.txt', 'scripts/build_bridge.sh', 'scripts/patch_*.py') }}-
+
       - name: Build bridge artifacts
         env:
+          BUILD_DIR: ${{ runner.temp }}/webgpu-build
+          MEM64_BUILD_DIR: ${{ runner.temp }}/webgpu-build-mem64
+          CCACHE_DIR: ${{ runner.temp }}/webgpu-ccache
+          CCACHE_MAXSIZE: 2G
+          CCACHE_COMPILERCHECK: content
+          EM_COMPILER_WRAPPER: ccache
           OUT_DIR: ${{ runner.temp }}/webgpu_bridge_dist
           WEBGPU_BRIDGE_BUILD_MEM64: 1
         run: ./scripts/build_bridge.sh
@@ -200,3 +259,17 @@ jobs:
             ${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_core.wasm
             ${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_core_mem64.js
             ${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_core_mem64.wasm
+
+  ci-result:
+    name: CI validation
+    if: always()
+    needs: [changes, checks, build-webgpu-bridge]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Validate selected job results
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: python3 scripts/ci_scope.py --check-results
