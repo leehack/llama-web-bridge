@@ -798,7 +798,7 @@ def main() -> int:
         and '"test:embedding-json"' in package_json
         and '"test:worker-token-coalescing"' in package_json
         and '"test:worker-state"' in package_json
-        and '"yaml": "2.8.1"' in package_json
+        and '"yaml": "2.8.4"' in package_json
         and '"esbuild"' in package_json
         and '"typescript"' in package_json,
         "package.json must define JS build/typecheck/syntax/runtime-state scripts and pin esbuild + TypeScript dev dependencies",
