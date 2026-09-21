@@ -186,13 +186,16 @@ automated qualification run binds the candidate digest it is about to publish.
     starving a newer stable native release; each exact pipeline advances by at
     most one stage per scheduled/manual scan.
   - A provenance without its own exact publication is reported `superseded`, and
-    gets no candidate, once a published stable asset release records (`Native:`
-    release-note marker) a newer native release: the publication ordering guard
-    would reject it, and as the oldest unpublished entry it would hold the
-    publication barrier forever. A native release at or ahead of that alignment
-    stays eligible, so a governed build change republishes only the newest. The
-    newest scanned native release is never skipped; if assets claim a newer
-    alignment than the scan found, it is reported blocked.
+    is not advanced, once a published stable asset release records (`Native:`
+    release-note marker) a newer native release, by version then rebuild. The
+    publication ordering guard rejects an older upstream line, and as the oldest
+    unpublished entry it would hold the publication barrier forever; an older
+    rebuild of the same line is skipped too, stricter than the guard. A native
+    release at or ahead of that alignment stays eligible, so a governed build
+    change republishes only the newest. The newest scanned native release is
+    never skipped; if assets record a newer alignment than any release in the
+    scan, including a manual exact-tag scan of an older release, it is reported
+    blocked.
   - The resolver uses full default-branch history to keep the exact source SHA
     that executes a new candidate separate from the newest first-parent commit
     that changed governed runtime/build inputs. Pipeline correlation uses the

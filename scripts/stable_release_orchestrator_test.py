@@ -836,6 +836,7 @@ class PublishedNativeAlignmentTest(unittest.TestCase):
             self.release("v0.1.45", "v0.5.0", draft=True),
             self.release("v0.1.46", "v0.5.0", draft=None),
             self.release("b9165", "b9165", prerelease=True),
+            self.release("b9170", "v0.5.0", prerelease=True),
             self.release("v0.1.48", "b9165"),
             self.release("not-a-release", "v0.5.0"),
             foreign,
@@ -2759,6 +2760,32 @@ class AdvancePipelineTest(unittest.TestCase):
             gateway, provenance=rebuilt, workspace=self.tmp, dry_run=True
         )
         self.assertEqual(plan.action, sro.OrchestrationAction.DISPATCH_CANDIDATE)
+
+    def test_native_rebuild_behind_the_alignment_is_not_republished(self) -> None:
+        # Same upstream line, so the ordering guard would accept it; the filter
+        # alone keeps the base native release from following its rebuild.
+        rebuilt = make_provenance(
+            native_release_tag="v0.2.0-1", bridge_build_sha=ADVANCED_BRIDGE_SHA
+        )
+        for newer_native_scanned, action in (
+            (True, sro.OrchestrationAction.SUPERSEDED),
+            (False, sro.OrchestrationAction.BLOCKED),
+        ):
+            with self.subTest(newer_native_scanned=newer_native_scanned):
+                gateway = FakeGateway(
+                    json_routes=self._routes(
+                        releases=[aligned_release_stub("v0.1.40", rebuilt)]
+                    )
+                )
+                plan = sro.advance_pipeline(
+                    gateway,
+                    provenance=self.provenance,
+                    workspace=self.tmp,
+                    newer_native_scanned=newer_native_scanned,
+                )
+                self.assertEqual(plan.action, action)
+                self.assertIn("v0.2.0-1", plan.reason)
+                self.assertEqual(gateway.dispatches, [])
 
     def test_first_publication_into_an_empty_assets_history(self) -> None:
         gateway = FakeGateway(json_routes=self._routes(releases=[]))

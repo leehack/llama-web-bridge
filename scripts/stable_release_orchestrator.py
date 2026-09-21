@@ -1419,7 +1419,7 @@ def latest_published_native_alignment(
             ) from error
         if native_version.channel is not Channel.STABLE:
             continue
-        order = (*native_version.version_parts, native_version.rebuild)
+        order = _native_release_order(native_tag)
         if latest is None or order > latest[0]:
             latest = (order, native_tag, asset_tag)
     return None if latest is None else latest[1:]
@@ -2488,10 +2488,12 @@ def advance_pipeline(
             observation=PipelineObservation(published=published),
         )
 
-    # The publication ordering guard rejects a native release behind the one
-    # assets already align to, so building it would only stall every later
-    # pipeline behind an unpublishable candidate. The skip needs a newer scanned
-    # native release; without one the filter itself is suspect and blocks.
+    # Only a native release at or ahead of the one assets already align to
+    # (version, then rebuild) is advanced. The publication ordering guard rejects
+    # an older upstream line, which would stall every later pipeline behind an
+    # unpublishable candidate; an older rebuild of the same line is skipped too,
+    # stricter than the guard. The skip needs a newer native release in the same
+    # scan; without one the pipeline blocks.
     alignment = latest_published_native_alignment(releases)
     if alignment is not None and _native_release_order(
         provenance.native_release_tag
@@ -2503,8 +2505,8 @@ def advance_pipeline(
                 reason=(
                     f"asset release {aligned_asset_tag} records native release "
                     f"{aligned_native_tag}, newer than {provenance.native_release_tag}, "
-                    "but this scan found no newer stable native release; refusing "
-                    "to skip the newest scanned native release"
+                    "but no newer stable native release is part of this scan; "
+                    "refusing to skip the newest scanned native release"
                 ),
                 provenance=provenance,
                 correlation_id=correlation_id,
@@ -2514,8 +2516,8 @@ def advance_pipeline(
             reason=(
                 f"{provenance.native_release_tag} is behind native release "
                 f"{aligned_native_tag}, already published as {aligned_asset_tag}; "
-                "the publication ordering guard would reject it, so no candidate "
-                "is built for this governed build identity"
+                "only native releases at or ahead of the published alignment "
+                "are advanced for a new build identity"
             ),
             provenance=provenance,
             correlation_id=correlation_id,
