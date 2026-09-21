@@ -843,7 +843,10 @@ def main() -> int:
     )
     require(
         "Native load option arity tests passed" in native_load_arity_contract
-        and "return this._nativeLoadOptionValues().map(() => 'number');" in js_source,
+        and re.search(
+            r"_nativeLoadOptionTypes\(\)\s*\{[^}]*_nativeLoadOptionValues\(\)", js_source
+        )
+        is not None,
         "native load option types must be derived from the option values and covered by the arity contract",
         errors,
     )
