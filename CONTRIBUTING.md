@@ -193,6 +193,11 @@ query strings, and fragments before printing the location.
   contract first. Each exact pipeline advances by at most one stage per scan,
   and the complete backlog is visited so an older in-flight gate does not starve
   a newer candidate. Publication remains ordered by native release time.
+  An entry without its own exact publication is `superseded`, and builds no
+  candidate, once a published stable asset release records a newer native
+  release in its `Native:` note marker: the ordering guard would reject it and it
+  would block every later publication. Entries at or ahead of that alignment stay
+  eligible, and the newest scanned native release blocks rather than skips.
   Manual `development` scans stay scan-only: they resolve exact `bNNNN`
   provenance and report it, and the orchestrator refuses non-stable provenance.
   A failed candidate or qualification is never retried automatically; after diagnosis,
