@@ -190,6 +190,9 @@ automated qualification run binds the candidate digest it is about to publish.
     asset release's `Native:` marker names a newer native release, compared by
     version then rebuild. If that provenance is the newest native release in
     the scan, it is `blocked` instead.
+  - A candidate run reserves its output tag for other pipelines unless its
+    correlation names another governed build identity and none of that
+    correlation's candidate, qualification or publication runs is in flight.
   - The resolver uses full default-branch history to keep the exact source SHA
     that executes a new candidate separate from the newest first-parent commit
     that changed governed runtime/build inputs. Pipeline correlation uses the

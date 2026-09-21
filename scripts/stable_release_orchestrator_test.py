@@ -1633,6 +1633,131 @@ class ReleaseTargetTest(unittest.TestCase):
         )
 
 
+class ClaimedReleaseTagsTest(unittest.TestCase):
+    OTHER_BUILD_SHA = "b" * 40
+
+    def setUp(self) -> None:
+        self.other = sro.compute_correlation_id(
+            make_provenance(bridge_build_sha=self.OTHER_BUILD_SHA)
+        )
+        self.current = sro.compute_correlation_id(make_provenance())
+
+    def _candidate_name(self, correlation_id: str, tag: str, rebuild: int) -> str:
+        return sro.candidate_run_name(
+            correlation_id,
+            sro.PipelineBinding(
+                bridge_source_sha=BRIDGE_SHA, release_tag=tag, release_rebuild=rebuild
+            ),
+        )
+
+    def _records(
+        self, path: str, *runs: tuple[str, str, str, str | None]
+    ) -> list[Any]:
+        return sro.parse_workflow_runs(
+            runs_response(
+                [
+                    run_payload(
+                        run_id=run_id, path=path, run_name=name,
+                        status=status, conclusion=conclusion,
+                    )
+                    for run_id, name, status, conclusion in runs
+                ]
+            ),
+            workflow_path=path,
+            default_branch=DEFAULT_BRANCH,
+        )
+
+    def test_finished_claim_of_another_build_is_dropped(self) -> None:
+        for conclusion in ("success", "failure"):
+            with self.subTest(conclusion=conclusion):
+                runs = self._records(
+                    sro.CANDIDATE_WORKFLOW_PATH,
+                    ("501", self._candidate_name(self.other, "v0.1.40", 0),
+                     "completed", conclusion),
+                )
+                self.assertTrue(
+                    sro.has_other_build_claim(runs, bridge_build_sha=BRIDGE_SHA)
+                )
+                self.assertEqual(
+                    sro.claimed_release_tags(runs, bridge_build_sha=BRIDGE_SHA),
+                    set(),
+                )
+
+    def test_current_build_claim_is_kept(self) -> None:
+        runs = self._records(
+            sro.CANDIDATE_WORKFLOW_PATH,
+            ("501", self._candidate_name(self.current, "v0.1.40", 0),
+             "completed", "failure"),
+        )
+        self.assertFalse(sro.has_other_build_claim(runs, bridge_build_sha=BRIDGE_SHA))
+        self.assertEqual(
+            sro.claimed_release_tags(runs, bridge_build_sha=BRIDGE_SHA),
+            {"v0.1.40"},
+        )
+
+    def test_claim_without_a_build_identity_is_kept(self) -> None:
+        legacy = sro.compute_correlation_id(make_legacy_v0140_provenance())
+        self.assertNotIn("-build-", legacy)
+        runs = self._records(
+            sro.CANDIDATE_WORKFLOW_PATH,
+            ("501", self._candidate_name(legacy, "v0.1.40", 0),
+             "completed", "success"),
+        )
+        self.assertEqual(
+            sro.claimed_release_tags(runs, bridge_build_sha=BRIDGE_SHA),
+            {"v0.1.40"},
+        )
+
+    def test_in_flight_candidate_of_another_build_keeps_its_claim(self) -> None:
+        runs = self._records(
+            sro.CANDIDATE_WORKFLOW_PATH,
+            ("501", self._candidate_name(self.other, "v0.1.40", 0),
+             "in_progress", None),
+        )
+        self.assertEqual(
+            sro.claimed_release_tags(runs, bridge_build_sha=BRIDGE_SHA),
+            {"v0.1.40"},
+        )
+
+    def test_in_flight_downstream_run_of_another_build_keeps_its_claim(self) -> None:
+        candidates = self._records(
+            sro.CANDIDATE_WORKFLOW_PATH,
+            ("501", self._candidate_name(self.other, "v0.1.40", 0),
+             "completed", "success"),
+        )
+        binding = sro.PipelineBinding(
+            bridge_source_sha=BRIDGE_SHA, release_tag="v0.1.40", release_rebuild=0
+        )
+        downstream = {
+            sro.QUALIFICATION_WORKFLOW_PATH: sro.qualification_run_name(
+                self.other, "501"
+            ),
+            sro.PUBLISH_WORKFLOW_PATH: sro.publish_run_name(
+                self.other, "501", "601", binding
+            ),
+        }
+        for path, name in downstream.items():
+            with self.subTest(path=path):
+                in_flight = self._records(path, ("701", name, "queued", None))
+                self.assertEqual(
+                    sro.claimed_release_tags(
+                        candidates,
+                        bridge_build_sha=BRIDGE_SHA,
+                        downstream_runs=in_flight,
+                    ),
+                    {"v0.1.40"},
+                )
+                finished = self._records(path, ("701", name, "completed", "failure"))
+                self.assertEqual(
+                    sro.claimed_release_tags(
+                        candidates,
+                        bridge_build_sha=BRIDGE_SHA,
+                        downstream_runs=finished,
+                    ),
+                    set(),
+                )
+
+
 class PublishedReleaseVerificationTest(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = Path(tempfile.mkdtemp(prefix="sro-published-"))
@@ -2415,6 +2540,78 @@ class AdvancePipelineTest(unittest.TestCase):
             self.candidate_name,
         )
 
+
+    def _dispatch_with_other_build_claim(
+        self, *, qualification_status: str
+    ) -> FakeGateway:
+        other = sro.compute_correlation_id(make_provenance(bridge_build_sha="b" * 40))
+        orphan = run_payload(
+            run_id="401",
+            path=sro.CANDIDATE_WORKFLOW_PATH,
+            run_name=sro.candidate_run_name(other, self.binding),
+        )
+        qualification = run_payload(
+            run_id="402",
+            path=sro.QUALIFICATION_WORKFLOW_PATH,
+            run_name=sro.qualification_run_name(other, "401"),
+            status=qualification_status,
+            conclusion=None if qualification_status != "completed" else "failure",
+        )
+        gateway = FakeGateway(
+            json_routes=self._routes(
+                releases=[asset_release_stub()],
+                candidate_runs=[orphan],
+                qualification_runs=[qualification],
+            )
+        )
+        readback_key = sro._workflow_runs_path(
+            workflow_file=sro.CANDIDATE_WORKFLOW_FILE,
+            default_branch=DEFAULT_BRANCH,
+            created_since=NATIVE_PUBLISHED_AT,
+        )
+        original_dispatch = gateway.dispatch_workflow
+
+        def dispatch(**kwargs: Any) -> None:
+            original_dispatch(**kwargs)
+            gateway.json_routes[readback_key] = runs_response(
+                [
+                    orphan,
+                    run_payload(
+                        run_id="501",
+                        path=sro.CANDIDATE_WORKFLOW_PATH,
+                        run_name=(
+                            f"bridge-candidate {self.correlation_id}"
+                            f" source:{BRIDGE_SHA}"
+                            f" tag:{kwargs['inputs']['release_tag']}"
+                            f" rebuild:{kwargs['inputs']['release_rebuild']}"
+                        ),
+                        status="in_progress",
+                        conclusion=None,
+                    ),
+                ]
+            )
+
+        gateway.dispatch_workflow = dispatch  # type: ignore[assignment]
+        sro.advance_pipeline(gateway, provenance=self.provenance, workspace=self.tmp)
+        return gateway
+
+    def test_finished_pipeline_of_another_build_does_not_force_a_rebuild_tag(
+        self,
+    ) -> None:
+        gateway = self._dispatch_with_other_build_claim(
+            qualification_status="completed"
+        )
+        inputs = gateway.dispatches[0]["inputs"]
+        self.assertEqual(inputs["release_tag"], "v0.1.40")
+        self.assertEqual(inputs["release_rebuild"], "0")
+
+    def test_in_flight_pipeline_of_another_build_still_reserves_its_tag(self) -> None:
+        gateway = self._dispatch_with_other_build_claim(
+            qualification_status="in_progress"
+        )
+        inputs = gateway.dispatches[0]["inputs"]
+        self.assertEqual(inputs["release_tag"], "v0.1.40-1")
+        self.assertEqual(inputs["release_rebuild"], "1")
 
     def test_later_qualified_provenance_waits_for_earlier_immutable_publication(
         self,
