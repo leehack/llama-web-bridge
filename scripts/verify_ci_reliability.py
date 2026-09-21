@@ -679,6 +679,9 @@ def main() -> int:
     operation_lifecycle_contract = read_required(
         "scripts/bridge_operation_lifecycle_test.mjs", errors
     )
+    worker_error_classification_contract = read_required(
+        "scripts/bridge_worker_error_classification_test.mjs", errors
+    )
     ci = read_required(".github/workflows/ci.yml", errors)
     publish = read_required(".github/workflows/publish_assets.yml", errors)
     auto_update = read_required(".github/workflows/auto_llama_cpp_update.yml", errors)
@@ -830,6 +833,23 @@ def main() -> int:
         '"test:type-declarations"' in package_json
         and "npm run test:type-declarations" in package_json,
         "check:js must define and run the bridge type declaration contract",
+        errors,
+    )
+    require(
+        '"test:worker-error-classification"' in package_json
+        and "npm run test:worker-error-classification" in package_json,
+        "check:js must define and run the bridge worker error classification contract",
+        errors,
+    )
+    require(
+        "Bridge worker error classification tests passed" in worker_error_classification_contract
+        and "_shouldFallbackToMainThread" in worker_error_classification_contract
+        and "_isWorkerRequestTimeoutError" in worker_error_classification_contract
+        and "_ensureRuntimeReadyAfterWorkerFallback" in worker_error_classification_contract
+        and "_shouldEmitBridgeLevel" in worker_error_classification_contract,
+        "the worker error classification contract must cover main-thread fallback, "
+        "request-timeout classification, multimodal recovery selection, and the shared "
+        "log-level table",
         errors,
     )
     require(
