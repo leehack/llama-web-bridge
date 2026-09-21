@@ -589,6 +589,11 @@ class BridgeSourceIdentityTest(unittest.TestCase):
             ".github/workflows/auto_llama_cpp_update.yml",
             "README.md",
             "docs/api.md",
+            # Imported only by bridge_operation_queue_test.mjs.
+            "scripts/bridge_operation_queue_direct_cases.mjs",
+            "scripts/bridge_operation_queue_fixtures.mjs",
+            "scripts/bridge_operation_queue_lifecycle_contract_cases.mjs",
+            "scripts/bridge_operation_queue_worker_proxy_cases.mjs",
             "scripts/ci_scope.py",
             "scripts/ci_scope_test.py",
             "scripts/release_qualification.py",
