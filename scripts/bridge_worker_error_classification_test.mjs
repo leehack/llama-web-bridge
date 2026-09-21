@@ -206,34 +206,29 @@ const CASES = [
   }],
 
   ['fallback reason is always the serialized error, including for flagged errors', () => {
-    const previousGlobalReason = globalThis.__llamadartBridgeWorkerFallbackReason;
-    try {
-      const flagged = Object.assign(new Error('Bridge worker crashed'), {
-        llamadartForceCpuMultimodal: true,
+    const flagged = Object.assign(new Error('Bridge worker crashed'), {
+      llamadartForceCpuMultimodal: true,
+    });
+    for (const error of [new Error('Bridge worker crashed'), flagged, 'plain string failure']) {
+      const proxy = createProxy('fallback', async () => ({ value: undefined }));
+      const runtime = createRuntime();
+      const { bridge, warnings } = createBridge({
+        _workerProxy: proxy,
+        _createRuntime: () => runtime,
       });
-      for (const error of [new Error('Bridge worker crashed'), flagged, 'plain string failure']) {
-        const proxy = createProxy('fallback', async () => ({ value: undefined }));
-        const runtime = createRuntime();
-        const { bridge, warnings } = createBridge({
-          _workerProxy: proxy,
-          _createRuntime: () => runtime,
-        });
 
-        bridge._disableWorkerFallback(error);
+      bridge._disableWorkerFallback(error);
 
-        const expected = typeof error === 'string' ? error : error.message;
-        assert.equal(bridge._workerFallbackReason, expected);
-        assert.equal(globalThis.__llamadartBridgeWorkerFallbackReason, expected);
-        assert.equal(bridge._workerProxy, null);
-        assert.equal(proxy.disposeCalls, 1);
-        assert.equal(bridge._runtime, runtime);
-        assert.deepEqual(runtime._runtimeNotes, [`worker_fallback:${expected}`]);
-        assert.deepEqual(warnings, [
-          `llamadart: bridge worker unavailable, falling back to main thread (${expected})`,
-        ]);
-      }
-    } finally {
-      globalThis.__llamadartBridgeWorkerFallbackReason = previousGlobalReason;
+      const expected = typeof error === 'string' ? error : error.message;
+      assert.equal(bridge._workerFallbackReason, expected);
+      assert.equal(globalThis.__llamadartBridgeWorkerFallbackReason, expected);
+      assert.equal(bridge._workerProxy, null);
+      assert.equal(proxy.disposeCalls, 1);
+      assert.equal(bridge._runtime, runtime);
+      assert.deepEqual(runtime._runtimeNotes, [`worker_fallback:${expected}`]);
+      assert.deepEqual(warnings, [
+        `llamadart: bridge worker unavailable, falling back to main thread (${expected})`,
+      ]);
     }
   }],
 
@@ -337,12 +332,17 @@ const CASES = [
 ];
 
 const failures = [];
-for (const [name, run] of CASES) {
-  try {
-    await run();
-  } catch (error) {
-    failures.push(`${name}: ${error?.message || error}`);
+const previousGlobalReason = globalThis.__llamadartBridgeWorkerFallbackReason;
+try {
+  for (const [name, run] of CASES) {
+    try {
+      await run();
+    } catch (error) {
+      failures.push(`${name}: ${error?.message || error}`);
+    }
   }
+} finally {
+  globalThis.__llamadartBridgeWorkerFallbackReason = previousGlobalReason;
 }
 
 if (failures.length > 0) {
