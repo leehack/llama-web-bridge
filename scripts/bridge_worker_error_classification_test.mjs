@@ -1,0 +1,356 @@
+import assert from 'node:assert/strict';
+
+import { LlamaWebGpuBridge } from '../js/src/llama_webgpu_bridge.js';
+
+function createProxy(name, callImpl) {
+  const proxy = {
+    name,
+    calls: [],
+    disposeCalls: 0,
+    async call(method, args, onEvent) {
+      proxy.calls.push({ method, args });
+      if (method === 'cancel' || method === 'setLogLevel') {
+        return { value: undefined };
+      }
+      return callImpl(method, args, onEvent, proxy);
+    },
+    async dispose() {
+      proxy.disposeCalls += 1;
+    },
+  };
+  return proxy;
+}
+
+function createRuntime(overrides = {}) {
+  const runtime = {
+    _modelBytes: 0,
+    _runtimeNotes: [],
+    loadCalls: [],
+    projectorCalls: [],
+    async loadModelFromUrl(url, options) {
+      runtime.loadCalls.push({ url, options: { ...options } });
+      runtime._modelBytes = 1;
+    },
+    async loadMultimodalProjector(url) {
+      runtime.projectorCalls.push(url);
+    },
+    async dispose() {},
+    getModelMetadata: () => ({}),
+    getContextSize: () => 128,
+    isGpuActive: () => false,
+    getBackendName: () => 'WASM (Prototype bridge)',
+    supportsVision: () => false,
+    supportsAudio: () => false,
+    ...overrides,
+  };
+  return runtime;
+}
+
+function createBridge(overrides = {}) {
+  const warnings = [];
+  const bridge = Object.create(LlamaWebGpuBridge.prototype);
+  Object.assign(bridge, {
+    _config: {},
+    _runtime: null,
+    _workerProxy: null,
+    _workerGeneration: 1,
+    _workerDisposePromise: null,
+    _retiringWorkerDisposals: new Set(),
+    _retiredWorkerProxies: new WeakSet(),
+    _workerFallbackReason: null,
+    _metadata: {},
+    _contextSize: 0,
+    _gpuActive: false,
+    _backendName: 'WASM (Prototype bridge)',
+    _supportsVision: false,
+    _supportsAudio: false,
+    _loadedModelUrl: null,
+    _loadedModelOptions: null,
+    _loadedMmProjUrl: null,
+    _multimodalWorkerCpuMode: false,
+    _bridgeWarnRecent: new Map(),
+    _operationQueueTail: null,
+    _activeOperation: null,
+    _nextOperationId: 0,
+    _lifecycleState: 'open',
+    _shadowStateTransactionDepth: 0,
+    _deferredShadowState: null,
+    _disposed: false,
+    _disposePromise: null,
+    _disposalWaiters: new Set(),
+    _emitBridgeWarn: (message) => warnings.push(message),
+    _createRuntime: () => createRuntime(),
+    ...overrides,
+  });
+  return { bridge, warnings };
+}
+
+const CASES = [
+  ['main-thread fallback classification is decided by the serialized error text', () => {
+    const { bridge } = createBridge();
+    const fallsBack = (error) => bridge._shouldFallbackToMainThread(error);
+
+    assert.equal(fallsBack(new Error('Worker request timeout')), true);
+    assert.equal(fallsBack(new Error('Worker init timeout')), true);
+    assert.equal(fallsBack(new Error('Bridge worker crashed')), true);
+    assert.equal(fallsBack(new Error('response drain read timed out')), true);
+    assert.equal(fallsBack('Worker proxy is not available'), true);
+    assert.equal(fallsBack(new Error('Aborted(native code called abort())')), false);
+    assert.equal(fallsBack(new Error('std::bad_alloc')), false);
+    assert.equal(fallsBack(new Error('Out of memory')), false);
+    assert.equal(fallsBack(new Error('unrelated model failure')), false);
+  }],
+
+  ['request-timeout and recoverable-FS classifiers agree on the exact timeout text', () => {
+    const { bridge } = createBridge();
+
+    for (const text of ['Worker request timeout', 'Worker init timeout', 'worker timed out']) {
+      assert.equal(bridge._isWorkerRequestTimeoutError(new Error(text)), true, text);
+    }
+    assert.equal(bridge._isWorkerRequestTimeoutError(new Error('FS error: not found')), false);
+
+    for (const text of ['FS error', 'No such file', 'not found', 'Invalid argument', 'read timed out']) {
+      assert.equal(bridge._isRecoverableWorkerFsError(new Error(text)), true, text);
+    }
+    assert.equal(bridge._isRecoverableWorkerFsError(new Error('Bridge worker crashed')), false);
+
+    const timeout = new Error('Worker request timeout');
+    assert.equal(
+      bridge._isRecoverableWorkerFsError(timeout) && !bridge._isWorkerRequestTimeoutError(timeout),
+      false,
+      'a request timeout never selects the FS restart-and-retry path',
+    );
+  }],
+
+  ['worker model-load FS error restarts the worker once and retries there', async () => {
+    let attempts = 0;
+    const failing = createProxy('fs-failing', async (method) => {
+      if (method !== 'loadModelFromUrl') {
+        return { value: undefined };
+      }
+      attempts += 1;
+      throw new Error('FS error: no such file or directory');
+    });
+    const replacement = createProxy('fs-replacement', async (method) => {
+      if (method !== 'loadModelFromUrl') {
+        return { value: undefined };
+      }
+      attempts += 1;
+      return { value: 'loaded-on-replacement' };
+    });
+    const replaceCalls = [];
+    const { bridge, warnings } = createBridge({ _workerProxy: failing });
+    bridge._replaceWorkerProxyForMultimodalCpuMode = async () => {
+      replaceCalls.push(bridge._workerProxy?.name);
+      bridge._workerProxy = replacement;
+    };
+
+    const result = await bridge.loadModelFromUrl('model.gguf', { nGpuLayers: 99 });
+
+    assert.equal(result, 'loaded-on-replacement');
+    assert.equal(attempts, 2);
+    assert.deepEqual(replaceCalls, ['fs-failing']);
+    assert.equal(bridge._workerProxy, replacement);
+    assert.equal(bridge._runtime, null, 'no main-thread runtime is created');
+    assert.equal(bridge._workerFallbackReason, null);
+    assert.ok(warnings.some((message) => message.includes('worker model-load FS error detected')));
+  }],
+
+  ['worker model-load request timeout skips the worker restart and falls back to main thread', async () => {
+    let attempts = 0;
+    const proxy = createProxy('timeout', async (method) => {
+      if (method !== 'loadModelFromUrl') {
+        return { value: undefined };
+      }
+      attempts += 1;
+      throw new Error('Worker request timeout');
+    });
+    const runtime = createRuntime();
+    const { bridge, warnings } = createBridge({
+      _workerProxy: proxy,
+      _createRuntime: () => runtime,
+    });
+    bridge._replaceWorkerProxyForMultimodalCpuMode = async () => {
+      throw new Error('the worker must not be restarted for a request timeout');
+    };
+
+    await bridge.loadModelFromUrl('model.gguf', { nGpuLayers: 99 });
+
+    assert.equal(attempts, 1);
+    assert.equal(bridge._workerProxy, null);
+    assert.equal(proxy.disposeCalls, 1);
+    assert.equal(bridge._runtime, runtime);
+    assert.equal(runtime.loadCalls.length, 1);
+    assert.equal(bridge._workerFallbackReason, 'Worker request timeout');
+    assert.ok(runtime._runtimeNotes.includes('worker_fallback:Worker request timeout'));
+    assert.ok(!warnings.some((message) => message.includes('FS error detected')));
+  }],
+
+  ['worker model-load non-recoverable error is rethrown without fallback', async () => {
+    const proxy = createProxy('oom', async (method) => {
+      if (method !== 'loadModelFromUrl') {
+        return { value: undefined };
+      }
+      throw new Error('Array buffer allocation failed');
+    });
+    const { bridge } = createBridge({ _workerProxy: proxy });
+
+    await assert.rejects(
+      bridge.loadModelFromUrl('model.gguf', {}),
+      /Array buffer allocation failed/,
+    );
+    assert.equal(bridge._workerProxy, proxy);
+    assert.equal(proxy.disposeCalls, 0);
+    assert.equal(bridge._runtime, null);
+    assert.equal(bridge._workerFallbackReason, null);
+  }],
+
+  ['fallback reason is always the serialized error, including for flagged errors', () => {
+    const previousGlobalReason = globalThis.__llamadartBridgeWorkerFallbackReason;
+    try {
+      const flagged = Object.assign(new Error('Bridge worker crashed'), {
+        llamadartForceCpuMultimodal: true,
+      });
+      for (const error of [new Error('Bridge worker crashed'), flagged, 'plain string failure']) {
+        const proxy = createProxy('fallback', async () => ({ value: undefined }));
+        const runtime = createRuntime();
+        const { bridge, warnings } = createBridge({
+          _workerProxy: proxy,
+          _createRuntime: () => runtime,
+        });
+
+        bridge._disableWorkerFallback(error);
+
+        const expected = typeof error === 'string' ? error : error.message;
+        assert.equal(bridge._workerFallbackReason, expected);
+        assert.equal(globalThis.__llamadartBridgeWorkerFallbackReason, expected);
+        assert.equal(bridge._workerProxy, null);
+        assert.equal(proxy.disposeCalls, 1);
+        assert.equal(bridge._runtime, runtime);
+        assert.deepEqual(runtime._runtimeNotes, [`worker_fallback:${expected}`]);
+        assert.deepEqual(warnings, [
+          `llamadart: bridge worker unavailable, falling back to main thread (${expected})`,
+        ]);
+      }
+    } finally {
+      globalThis.__llamadartBridgeWorkerFallbackReason = previousGlobalReason;
+    }
+  }],
+
+  ['multimodal recovery selects CPU-safe reload only for timeout and WebGPU classifications', async () => {
+    const run = async (error) => {
+      const runtime = createRuntime();
+      const { bridge, warnings } = createBridge({
+        _runtime: runtime,
+        _loadedModelUrl: 'model.gguf',
+        _loadedModelOptions: { nGpuLayers: 99, nCtx: 8192, nThreads: 8 },
+        _loadedMmProjUrl: 'mmproj.gguf',
+      });
+      await bridge._ensureRuntimeReadyAfterWorkerFallback(
+        { parts: [{ type: 'image', bytes: new Uint8Array(1) }] },
+        error,
+      );
+      assert.equal(runtime.loadCalls.length, 1);
+      assert.deepEqual(runtime.projectorCalls, ['mmproj.gguf']);
+      return { options: runtime.loadCalls[0].options, notes: runtime._runtimeNotes, warnings };
+    };
+
+    const stalled = await run(new Error('worker timed out'));
+    assert.equal(stalled.options.nGpuLayers, 0);
+    assert.equal(stalled.options.nCtx, 4096);
+    assert.ok(stalled.notes.includes('worker_fallback_timeout'));
+    assert.ok(stalled.notes.includes('worker_fallback_cpu_multimodal'));
+    assert.ok(stalled.warnings.some((message) => message.includes('after worker timeout')));
+
+    const flaggedTimeout = Object.assign(new Error('stalled'), { llamadartWorkerTimeout: true });
+    const flagged = await run(flaggedTimeout);
+    assert.equal(flagged.options.nGpuLayers, 0);
+    assert.ok(flagged.notes.includes('worker_fallback_timeout'));
+
+    const webgpu = await run(new Error('Aborted()'));
+    assert.equal(webgpu.options.nGpuLayers, 0);
+    assert.ok(webgpu.notes.includes('worker_fallback_cpu_multimodal'));
+    assert.ok(!webgpu.notes.includes('worker_fallback_timeout'));
+    assert.ok(webgpu.warnings.some((message) => message.includes('workgroup limit failure')));
+
+    const requestTimeout = await run(new Error('Worker request timeout'));
+    assert.equal(requestTimeout.options.nGpuLayers, 99);
+    assert.equal(requestTimeout.options.nCtx, 8192);
+    assert.ok(!requestTimeout.notes.includes('worker_fallback_cpu_multimodal'));
+    assert.ok(!requestTimeout.notes.includes('worker_fallback_timeout'));
+    assert.ok(!requestTimeout.warnings.some((message) => message.includes('CPU fallback')));
+
+    const crash = await run(new Error('Bridge worker crashed'));
+    assert.equal(crash.options.nGpuLayers, 99);
+    assert.ok(!crash.notes.includes('worker_fallback_cpu_multimodal'));
+    assert.ok(!crash.warnings.some((message) => message.includes('CPU fallback')));
+
+    const flaggedCrash = await run(Object.assign(new Error('Bridge worker crashed'), {
+      llamadartForceCpuMultimodal: true,
+    }));
+    assert.equal(flaggedCrash.options.nGpuLayers, 99);
+    assert.ok(!flaggedCrash.notes.includes('worker_fallback_cpu_multimodal'));
+    assert.ok(!flaggedCrash.warnings.some((message) => message.includes('CPU fallback')));
+  }],
+
+  ['bridge and runtime log gates share one level table', () => {
+    const levels = ['debug', 'log', 'info', 'warn', 'error', 'trace'];
+    const expected = {
+      0: { debug: false, log: false, info: false, warn: false, error: false, trace: false },
+      1: { debug: true, log: true, info: true, warn: true, error: true, trace: true },
+      2: { debug: false, log: true, info: true, warn: true, error: true, trace: true },
+      3: { debug: false, log: false, info: false, warn: true, error: true, trace: false },
+      4: { debug: false, log: false, info: false, warn: false, error: true, trace: false },
+    };
+
+    const realRuntime = (bridge) => LlamaWebGpuBridge.prototype._createRuntime.call(bridge);
+
+    for (const configured of [0, 1, 2, 3, 4]) {
+      const { bridge } = createBridge({ _config: { logLevel: configured } });
+      const runtime = realRuntime(bridge);
+      runtime._logLevel = configured;
+      for (const level of levels) {
+        assert.equal(
+          bridge._shouldEmitBridgeLevel(level),
+          expected[configured][level],
+          `bridge logLevel=${configured} ${level}`,
+        );
+        assert.equal(
+          runtime._shouldEmitLoggerLevel(level),
+          expected[configured][level],
+          `runtime logLevel=${configured} ${level}`,
+        );
+      }
+    }
+
+    const { bridge: unconfigured } = createBridge({ _config: {}, _runtime: null });
+    assert.equal(unconfigured._shouldEmitBridgeLevel('debug'), false);
+    assert.equal(unconfigured._shouldEmitBridgeLevel('info'), true);
+
+    const runtime = realRuntime(unconfigured);
+    runtime._logLevel = -1;
+    assert.equal(runtime._shouldEmitLoggerLevel('debug'), true);
+    runtime._logLevel = 9;
+    assert.equal(runtime._shouldEmitLoggerLevel('debug'), false);
+    assert.equal(runtime._shouldEmitLoggerLevel('error'), true);
+  }],
+];
+
+const failures = [];
+for (const [name, run] of CASES) {
+  try {
+    await run();
+  } catch (error) {
+    failures.push(`${name}: ${error?.message || error}`);
+  }
+}
+
+if (failures.length > 0) {
+  console.error(`${failures.length}/${CASES.length} bridge worker error classification cases failed:`);
+  for (const failure of failures) {
+    console.error(`  - ${failure}`);
+  }
+  process.exitCode = 1;
+} else {
+  console.log(`Bridge worker error classification tests passed (${CASES.length} cases)`);
+}
