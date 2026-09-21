@@ -2217,19 +2217,7 @@ class LlamaWebGpuBridgeRuntime {
   }
 
   _nativeLoadOptionTypes() {
-    return [
-      'number',
-      'number',
-      'number',
-      'number',
-      'number',
-      'number',
-      'number',
-      'number',
-      'number',
-      'number',
-      'number',
-    ];
+    return this._nativeLoadOptionValues().map(() => 'number');
   }
 
   async _tryLoadModelFromRemoteFetchBackend(core, url, options = {}) {

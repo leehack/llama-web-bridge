@@ -676,6 +676,9 @@ def main() -> int:
     operation_lifecycle_contract = read_required(
         "scripts/bridge_operation_lifecycle_test.mjs", errors
     )
+    native_load_arity_contract = read_required(
+        "scripts/native_load_option_arity_test.mjs", errors
+    )
     worker_error_classification_contract = read_required(
         "scripts/bridge_worker_error_classification_test.mjs", errors
     )
@@ -830,6 +833,21 @@ def main() -> int:
         '"test:type-declarations"' in package_json
         and "npm run test:type-declarations" in package_json,
         "check:js must define and run the bridge type declaration contract",
+        errors,
+    )
+    require(
+        '"test:native-load-arity"' in package_json
+        and "npm run test:native-load-arity" in package_json,
+        "check:js must define and run the native load option arity contract",
+        errors,
+    )
+    require(
+        "Native load option arity tests passed" in native_load_arity_contract
+        and re.search(
+            r"_nativeLoadOptionTypes\(\)\s*\{[^}]*_nativeLoadOptionValues\(\)", js_source
+        )
+        is not None,
+        "native load option types must be derived from the option values and covered by the arity contract",
         errors,
     )
     require(
