@@ -30,9 +30,9 @@ Common maintainer sibling layout:
 ```
 
 `./scripts/build_bridge.sh --help` lists every environment variable the build
-reads, with defaults. CI clones the `llama_cpp.version` tag into
-`LLAMA_CPP_DIR` and installs the exact `emsdk.version` compiler; a local
-Emscripten SDK must match that release.
+reads, with defaults. CI clones the `llama_cpp.version` tag into the script's
+default `third_party/llama_cpp` and installs the exact `emsdk.version`
+compiler; a local Emscripten SDK must match that release.
 
 ## Agent PR Workflow
 
@@ -54,8 +54,9 @@ For non-trivial runtime, workflow, or API changes, keep the PR path explicit:
 The external-path build recipe (`CCACHE_DIR`, `EM_CACHE`, `BUILD_DIR`,
 `MEM64_BUILD_DIR`, `OUT_DIR`), the lightweight contract list starting with
 `npm run check:js`, and every browser smoke invocation live in
-`CONTRIBUTING.md` under Local Build and Validate Outputs. Run them from there;
-do not copy them here. Which smoke applies:
+[CONTRIBUTING.md](CONTRIBUTING.md#validate-outputs) under Local Build and
+Validate Outputs. Run them from there; do not copy them here. Which smoke
+applies:
 
 - state-persistence or workflow changes:
   `scripts/state_persistence_browser_smoke.py` against a built `OUT_DIR`;
@@ -83,9 +84,10 @@ GGUFs or smoke artifacts.
     `docs/*.md` changes skip the build lanes; `AGENTS.md` is not in that
     allowlist, so editing it still runs them.
 - Candidate build: `.github/workflows/bridge_candidate.yml`
-  - The only workflow that builds publishable assets. It refuses
-    `github.run_attempt != 1`; dispatch a new candidate after failure rather
-    than rerunning it.
+  - The only workflow that builds publishable assets. It uploads the bundle as
+    `exact-webgpu-bridge-dist`, which qualification and publication download by
+    immutable artifact ID. It refuses `github.run_attempt != 1`; dispatch a new
+    candidate after failure rather than rerunning it.
   - Holds no credential that can read another repository's administration
     settings, so it fails closed on the dispatcher's
     `assets_immutable_releases_enabled` assertion and records it in
@@ -126,9 +128,11 @@ GGUFs or smoke artifacts.
     the governance read live and fails closed if either is absent.
 - CI reliability contract: `scripts/verify_ci_reliability.py`
   - Asserts specific sentences in `README.md`, `AGENTS.md`, and
-    `CONTRIBUTING.md` (publication contract, baseline, smoke script names) and
-    the 7-pin set in `CONTRIBUTING.md` and both build workflows. Update it in
-    the same change as any doc restructure.
+    `CONTRIBUTING.md` (publication contract, baseline, smoke script names), the
+    7-pin set in `CONTRIBUTING.md` and both build workflows, and that
+    `README.md` and `AGENTS.md` hold no pins and link to
+    `CONTRIBUTING.md#validate-outputs`. Update it in the same change as any doc
+    restructure.
 - Publish workflow: `.github/workflows/publish_assets.yml`
   - Never builds. It downloads the exact candidate artifact and attestation by
     immutable artifact ID and verifies the candidate manifest's

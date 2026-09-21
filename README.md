@@ -165,12 +165,11 @@ This repo includes a wasm build gate in:
 It builds wasm32 and memory64 against both the pinned `llama.cpp` tag in
 `llama_cpp.version` and the exact v0.4.0 compatibility revision. Both lanes run
 the JS/compatibility contracts and real state-persistence and multimodal browser
-smokes. Each lane uploads its seven built files as `webgpu-bridge-dist`
-(pinned lane) or `webgpu-bridge-dist-v0.4.0`; on failure it also uploads
-`state-persistence-smoke-artifacts-<lane>` and
-`multimodal-smoke-artifacts-<lane>` (`<lane>` is `pinned` or `v0.4.0`), so a
-run that selects both lanes produces two to six artifacts. Neither lane changes
-a pin or publishes assets.
+smokes. A lane that succeeds uploads its seven built files as
+`webgpu-bridge-dist` (pinned lane) or `webgpu-bridge-dist-v0.4.0`; a lane that
+fails uploads no dist and instead `state-persistence-smoke-artifacts-<lane>`
+and `multimodal-smoke-artifacts-<lane>` (`<lane>` is `pinned` or `v0.4.0`)
+when those directories exist. Neither lane changes a pin or publishes assets.
 To run the media-helper and static CI contracts locally:
 
 ```bash

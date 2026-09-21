@@ -17,8 +17,6 @@ ROOT = Path(__file__).resolve().parents[1]
 # one leaves CI green while a contributor hits an opaque checksum failure -- or,
 # for bridge_candidate.yml, while the candidate job that consumes the pins fails.
 # publish_assets.yml no longer builds or smokes anything, so it holds no pins.
-# CONTRIBUTING.md is the only markdown file that carries the smoke invocations;
-# README.md and AGENTS.md link to it and hold no pins.
 MODEL_SHA_PIN_FILES = (
     "CONTRIBUTING.md",
     ".github/workflows/ci.yml",
@@ -2276,6 +2274,13 @@ def main() -> int:
         "CONTRIBUTING.md must document JS build/type-checking, maintainer/agent workflow guardrails, checksum-pinned smoke usage, and toolchain pin handling",
         errors,
     )
+    for relative_path, content in (("README.md", readme), ("AGENTS.md", agents)):
+        require(
+            SHA256_HEX_PATTERN.search(content) is None
+            and "CONTRIBUTING.md#validate-outputs" in content,
+            f"{relative_path} must hold no SHA-256 pins and link to CONTRIBUTING.md#validate-outputs for the smoke invocations",
+            errors,
+        )
     pin_file_contents = {
         "CONTRIBUTING.md": contributing,
         ".github/workflows/ci.yml": ci,

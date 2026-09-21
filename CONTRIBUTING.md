@@ -33,7 +33,8 @@ LLAMA_CPP_DIR=../llama.cpp OUT_DIR=dist ./scripts/build_bridge.sh
 ```
 
 `./scripts/build_bridge.sh --help` is the complete list of environment
-variables the build reads, with their defaults; the docs do not restate it.
+variables the build reads, with their defaults; the docs do not repeat the
+list.
 
 Bridge wrapper source lives under `js/src/`; `npm run build:js` regenerates the
 checked-in browser ESM outputs and declarations under `js/`. `npm run check:js`
@@ -76,6 +77,7 @@ npm run check:js
 python3 -m py_compile scripts/verify_state_persistence_api.py scripts/verify_text_to_speech_api.py scripts/verify_ci_reliability.py scripts/state_persistence_browser_smoke.py scripts/multimodal_browser_smoke.py scripts/speech_to_text_browser_smoke.py scripts/text_to_speech_browser_smoke.py
 python3 scripts/verify_state_persistence_api.py
 python3 scripts/verify_text_to_speech_api.py
+python3 scripts/mtmd_compat_contract_test.py
 python3 scripts/verify_ci_reliability.py
 ```
 
