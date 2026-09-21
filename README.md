@@ -43,21 +43,12 @@ assets, but running `npm run check:js` explicitly is useful before PRs because i
 performs TypeScript `checkJs`, regenerates the checked-in browser ESM wrapper and
 declaration files with esbuild, and syntax-checks the generated bridge files.
 
-Useful environment variables:
-
-- `LLAMA_CPP_DIR` (path to llama.cpp source)
-- `BUILD_DIR` (cmake build dir)
-- `OUT_DIR` (output directory; defaults to `dist/`)
-- `WEBGPU_BRIDGE_BUILD_MEM64` (`1` to also build optional wasm64 core assets)
-- `WEBGPU_BRIDGE_MEM64_MAX_MEMORY` (optional wasm64 max linear memory bytes)
-- `WEBGPU_BRIDGE_STACK_SIZE` (Wasm stack bytes; defaults to `1048576`)
-- `WEBGPU_BRIDGE_PTHREADS` (`1`/`0`, defaults to `1`)
-- `WEBGPU_BRIDGE_PTHREAD_POOL_SIZE` (defaults to `4`)
-- `WEBGPU_BRIDGE_PTHREAD_POOL_SIZE_STRICT` (defaults to `0`)
+`./scripts/build_bridge.sh --help` lists every environment variable the build
+reads (source, build, and output directories, wasm64, stack, memory, and
+pthread settings) with its default.
 
 Notes:
 
-- wasm64 builds default to `WEBGPU_BRIDGE_MEM64_MAX_MEMORY=12884901888` (12 GiB).
 - Keep `WEBGPU_BRIDGE_STACK_SIZE` at or above its 1 MiB default unless both
   wasm32 and memory64 real-model smokes prove a lower value safe. Current
   llama.cpp graph parameters can overflow Emscripten's 64 KiB default stack.
@@ -161,19 +152,9 @@ WebGPU-selected model/projector path, while the CPU/WASM fallback remains
 functional but substantially slower. This generated-audio support is
 experimental upstream and stays out of default CI.
 
-Run the checksum-pinned real-model gate before publishing TTS-capable assets:
-
-```bash
-python3 scripts/text_to_speech_browser_smoke.py \
-  --dist-dir /path/to/webgpu_bridge_dist \
-  --model-path /path/to/Qwen3-TTS-12Hz-1.7B-Base-Q4_K_M.gguf \
-  --model-sha256 8d18c94acb2addd042f97da63c98be144eafa76d0d9495177eab65130cf85129 \
-  --mmproj-path /path/to/mmproj-Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf \
-  --mmproj-sha256 6fd65188839bcd6ecc91b277ad471e22a0edfada4699a0fe82f1165c18cfcce2 \
-  --memory-mode wasm64 \
-  --runtime-mode all \
-  --gpu-layers 99
-```
+Run the checksum-pinned real-model gate,
+`scripts/text_to_speech_browser_smoke.py`, before publishing TTS-capable
+assets; the invocation and pins are in [CONTRIBUTING.md](CONTRIBUTING.md#validate-outputs).
 
 ## CI
 
@@ -184,8 +165,12 @@ This repo includes a wasm build gate in:
 It builds wasm32 and memory64 against both the pinned `llama.cpp` tag in
 `llama_cpp.version` and the exact v0.4.0 compatibility revision. Both lanes run
 the JS/compatibility contracts and real state-persistence and multimodal browser
-smokes. The pinned lane retains `webgpu-bridge-dist`; the compatibility lane
-uploads `webgpu-bridge-dist-v0.4.0`. Neither changes a pin or publishes assets.
+smokes. Each lane uploads its seven built files as `webgpu-bridge-dist`
+(pinned lane) or `webgpu-bridge-dist-v0.4.0`; on failure it also uploads
+`state-persistence-smoke-artifacts-<lane>` and
+`multimodal-smoke-artifacts-<lane>` (`<lane>` is `pinned` or `v0.4.0`), so a
+run that selects both lanes produces two to six artifacts. Neither lane changes
+a pin or publishes assets.
 To run the media-helper and static CI contracts locally:
 
 ```bash
@@ -232,33 +217,15 @@ are easy to regress during agent-driven maintenance:
   cancellation, immediate reuse, and PCM/WAV validation;
 - the CI model cache path expands `~` before resolving so it matches the
   `actions/cache` directory;
-- browser smoke failures upload `state-persistence-smoke-artifacts` with console
-  logs, result JSON, and screenshots when available, plus
-  `multimodal-smoke-artifacts` for vision failures.
+- browser smoke failures upload `state-persistence-smoke-artifacts-<lane>` with
+  console logs, result JSON, and screenshots when available, plus
+  `multimodal-smoke-artifacts-<lane>` for vision failures.
 
-Run the model-backed smoke locally after building the bridge if a change touches
-state persistence, workers, browser smoke, or workflow diagnostics:
-
-```bash
-python3 scripts/state_persistence_browser_smoke.py \
-  --dist-dir /path/to/webgpu_bridge_dist \
-  --model-url https://huggingface.co/aladar/llama-2-tiny-random-GGUF/resolve/main/llama-2-tiny-random.gguf \
-  --model-sha256 81f226c62d28ed4a1a9b9fa080fcd9f0cc40e0f9d5680036583ff98fbcd035cb \
-  --model-cache-dir ~/.cache/llama-web-bridge/state-smoke-models \
-  --artifacts-dir /tmp/llama-web-bridge-state-smoke
-```
-
-For llama.cpp pin or multimodal changes, run the real-model vision gate:
-
-```bash
-python3 scripts/multimodal_browser_smoke.py \
-  --dist-dir /path/to/webgpu_bridge_dist \
-  --model-path /path/to/Qwen3.5-0.8B-Q4_K_M.gguf \
-  --model-sha256 bd258782e35f7f458f8aced1adc053e6e92e89bc735ba3be89d38a06121dc517 \
-  --mmproj-path /path/to/mmproj-F16.gguf \
-  --mmproj-sha256 56e4c6cfe73b0c82e3e82bc518d7591997e61d81f723fc41a586f4fa69ea2453 \
-  --artifacts-dir /tmp/llama-web-bridge-multimodal-smoke
-```
+Run `scripts/state_persistence_browser_smoke.py` locally after building the
+bridge if a change touches state persistence, workers, browser smoke, or
+workflow diagnostics, and `scripts/multimodal_browser_smoke.py` for llama.cpp
+pin or multimodal changes. Both invocations, with their pinned models, are in
+[CONTRIBUTING.md](CONTRIBUTING.md#validate-outputs).
 
 ## Automated Qualification and Attestation
 
@@ -315,18 +282,8 @@ submits an attestation, and the qualification workflow holds no publication PAT.
 `scripts/text_to_speech_browser_smoke.py` remain runnable on their own while
 iterating locally. The combined `release_qualification.py qualify` command is
 reserved for the hosted workflow because it requires GitHub Actions and
-`github-hosted` runner identity. The Qwen3-TTS invocation is in the Qwen3-TTS
-section above; the Qwen3-ASR one is:
-
-```bash
-python3 scripts/speech_to_text_browser_smoke.py \
-  --dist-dir /path/to/webgpu_bridge_dist \
-  --model-path /path/to/Qwen3-ASR-0.6B-Q8_0.gguf \
-  --model-sha256 bca259818b50ca7c4c05e9bdb35a5dc04fa039653a6d6f3f0f331f96f6aa1971 \
-  --mmproj-path /path/to/mmproj-Qwen3-ASR-0.6B-Q8_0.gguf \
-  --mmproj-sha256 41a342b5e4c514e968cb756de6cd1b7be39eff43c44c57a2ef5fc6522e36603d \
-  --artifacts-dir /tmp/llama-web-bridge-speech-smoke
-```
+`github-hosted` runner identity. Both invocations are in
+[CONTRIBUTING.md](CONTRIBUTING.md#validate-outputs).
 
 The default audio is Qwen's official English example fixture. The script pins
 its SHA-256 and the exact normalized transcript observed through the Web
@@ -516,5 +473,8 @@ Note: CDN pinning fundamentally relies on git tags in the assets repo.
 
 ## Maintainer Docs
 
-- `AGENTS.md`: agent workflow and cross-repo handoff
-- `CONTRIBUTING.md`: contributor setup/build/publish steps
+- `CONTRIBUTING.md`: setup, build, the runnable smoke invocations and their
+  pins, workflow guardrails, and the publish process
+- `AGENTS.md`: agent PR workflow, orchestrator invariants stated nowhere else,
+  the `js/src/`-source-vs-`js/`-generated rule, cross-repo handoff, and
+  regression smoke guidance

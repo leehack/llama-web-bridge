@@ -1,6 +1,10 @@
 # AGENTS.md
 
-Guidance for coding agents working in `llama-web-bridge`.
+Guidance for coding agents working in `llama-web-bridge`. `README.md` owns the
+integration surface, CI/qualification/publication narrative, and CDN list;
+`CONTRIBUTING.md` owns the runnable build recipes, smoke invocations and their
+pins, workflow guardrails, and publish process. This file keeps only what
+neither states.
 
 ## Scope and Ownership
 
@@ -25,14 +29,10 @@ Common maintainer sibling layout:
 ./scripts/build_bridge.sh
 ```
 
-Useful environment overrides:
-
-- `LLAMA_CPP_DIR` (defaults to `third_party/llama_cpp`; CI clones the tag from
-  `llama_cpp.version`)
-- The local Emscripten SDK must match the exact release in `emsdk.version`.
-- `BUILD_DIR`
-- `OUT_DIR`
-- `CMAKE_BUILD_TYPE`
+`./scripts/build_bridge.sh --help` lists every environment variable the build
+reads, with defaults. CI clones the `llama_cpp.version` tag into
+`LLAMA_CPP_DIR` and installs the exact `emsdk.version` compiler; a local
+Emscripten SDK must match that release.
 
 ## Agent PR Workflow
 
@@ -43,243 +43,97 @@ For non-trivial runtime, workflow, or API changes, keep the PR path explicit:
    practical. Static contract scripts are acceptable for workflow invariants.
 3. Keep Emscripten build directories, ccache, model caches, and Playwright
    artifacts outside the repository unless they are intentionally versioned.
-4. Run the targeted checks in this file and the full browser smoke when the
-   change touches `js/`, `src/`, `scripts/`, or GitHub workflows.
+4. Run the targeted checks below and the full browser smoke when the change
+   touches `js/`, `src/`, `scripts/`, or GitHub workflows.
 5. Use an independent review before committing PR-bound changes. Fix blocking
    findings, rerun the targeted checks, then commit locally; do not push or open
    a PR unless the maintainer asks.
 
 ### Local Verification Notes
 
-When validating bridge runtime changes locally, keep build/cache output outside
-the repo so generated wasm artifacts and toolchain caches do not dirty the
-checkout or hit sandboxed Homebrew/cache paths:
+The external-path build recipe (`CCACHE_DIR`, `EM_CACHE`, `BUILD_DIR`,
+`MEM64_BUILD_DIR`, `OUT_DIR`), the lightweight contract list starting with
+`npm run check:js`, and every browser smoke invocation live in
+`CONTRIBUTING.md` under Local Build and Validate Outputs. Run them from there;
+do not copy them here. Which smoke applies:
 
-```bash
-export CCACHE_DIR=/private/tmp/llama_web_bridge_ccache
-export EM_CACHE=/private/tmp/llama_web_bridge_emcache
-BUILD_DIR=/private/tmp/llama_web_bridge_build MEM64_BUILD_DIR=/private/tmp/llama_web_bridge_build_mem64 OUT_DIR=/private/tmp/llama_web_bridge_dist WEBGPU_BRIDGE_BUILD_MEM64=1 ./scripts/build_bridge.sh
-```
+- state-persistence or workflow changes:
+  `scripts/state_persistence_browser_smoke.py` against a built `OUT_DIR`;
+- llama.cpp pin or multimodal changes: `scripts/multimodal_browser_smoke.py`
+  through both direct and worker runtimes;
+- speech changes: `scripts/speech_to_text_browser_smoke.py` and
+  `scripts/text_to_speech_browser_smoke.py` individually. The combined
+  `release_qualification.py qualify` command is workflow-only because it
+  requires GitHub Actions and `github-hosted` runner identity.
 
-Minimum local checks before handing off a PR-ready branch:
-
-```bash
-npm run check:js
-python3 -m py_compile scripts/verify_state_persistence_api.py scripts/verify_text_to_speech_api.py scripts/verify_ci_reliability.py scripts/state_persistence_browser_smoke.py scripts/multimodal_browser_smoke.py scripts/speech_to_text_browser_smoke.py scripts/text_to_speech_browser_smoke.py
-python3 scripts/verify_state_persistence_api.py
-python3 scripts/verify_text_to_speech_api.py
-python3 scripts/mtmd_compat_contract_test.py
-python3 scripts/verify_ci_reliability.py
-```
-
-For state-persistence or workflow changes, also run the browser smoke against a
-built `OUT_DIR`. Keep the tiny model in a user cache or `/private/tmp`; do not
-commit downloaded GGUFs or smoke artifacts:
-
-```bash
-python3 -m pip install --user playwright
-python3 -m playwright install chromium
-python3 scripts/state_persistence_browser_smoke.py \
-  --dist-dir /private/tmp/llama_web_bridge_dist \
-  --model-url https://huggingface.co/aladar/llama-2-tiny-random-GGUF/resolve/main/llama-2-tiny-random.gguf \
-  --model-sha256 81f226c62d28ed4a1a9b9fa080fcd9f0cc40e0f9d5680036583ff98fbcd035cb \
-  --model-cache-dir ~/.cache/llama-web-bridge/state-smoke-models \
-  --artifacts-dir /private/tmp/llama_web_bridge_state_smoke_artifacts
-```
-
-For llama.cpp pin or multimodal changes, also run real image inference through
-both direct and worker runtimes:
-
-```bash
-python3 scripts/multimodal_browser_smoke.py \
-  --dist-dir /private/tmp/llama_web_bridge_dist \
-  --model-path /path/to/Qwen3.5-0.8B-Q4_K_M.gguf \
-  --model-sha256 bd258782e35f7f458f8aced1adc053e6e92e89bc735ba3be89d38a06121dc517 \
-  --mmproj-path /path/to/mmproj-F16.gguf \
-  --mmproj-sha256 56e4c6cfe73b0c82e3e82bc518d7591997e61d81f723fc41a586f4fa69ea2453 \
-  --artifacts-dir /private/tmp/llama_web_bridge_multimodal_smoke_artifacts
-```
-
-Heavy Qwen3-ASR and Qwen3-TTS gates run in the hosted automated qualification
-workflow, not in ordinary CI or the candidate build. The combined
-`release_qualification.py qualify` command is workflow-only because it requires
-GitHub Actions and `github-hosted` runner identity. For local reproduction, run
-the individual smokes directly:
-
-```bash
-python3 scripts/speech_to_text_browser_smoke.py \
-  --dist-dir /private/tmp/llama_web_bridge_dist \
-  --model-path /path/to/Qwen3-ASR-0.6B-Q8_0.gguf \
-  --model-sha256 bca259818b50ca7c4c05e9bdb35a5dc04fa039653a6d6f3f0f331f96f6aa1971 \
-  --mmproj-path /path/to/mmproj-Qwen3-ASR-0.6B-Q8_0.gguf \
-  --mmproj-sha256 41a342b5e4c514e968cb756de6cd1b7be39eff43c44c57a2ef5fc6522e36603d
-```
-
-```bash
-python3 scripts/text_to_speech_browser_smoke.py \
-  --dist-dir /private/tmp/llama_web_bridge_dist \
-  --model-path /path/to/Qwen3-TTS-12Hz-1.7B-Base-Q4_K_M.gguf \
-  --model-sha256 8d18c94acb2addd042f97da63c98be144eafa76d0d9495177eab65130cf85129 \
-  --mmproj-path /path/to/mmproj-Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf \
-  --mmproj-sha256 6fd65188839bcd6ecc91b277ad471e22a0edfada4699a0fe82f1165c18cfcce2 \
-  --memory-mode wasm64 \
-  --runtime-mode all \
-  --gpu-layers 99
-```
-
-The candidate manifest records `speech_to_text` and `text_to_speech` as
-`required-automated-qualification`, never as a candidate-build pass.
-Publication fails closed unless a verified attestation from an exact successful
-automated qualification run binds the candidate digest it is about to publish.
+Keep the tiny model in a user cache or `/private/tmp`; do not commit downloaded
+GGUFs or smoke artifacts.
 
 ## CI / Release
 
 - CI build gate: `.github/workflows/ci.yml`
-  - Resolves the default llama.cpp checkout from `llama_cpp.version`.
-  - Builds wasm32/memory64 against that pin and exact v0.4.0 in separate matrix
-    lanes, with media-helper API contracts plus real state and image smokes.
-    Preserve the original pinned check/artifact identities and isolate each
-    lane's artifact uploads. Neither lane publishes or changes the source pin.
-  - Resolves `emsdk.version`, installs that exact compiler, verifies the active
-    `emcc` identity, and contract-tests all five required wasm64 WASMFS patches.
-  - Never dispatches asset publication. Bridge source changes, including changes
-    to the default development pin, use ordinary PRs and ordinary CI.
+  - Builds wasm32/memory64 against the `llama_cpp.version` pin and exact v0.4.0
+    in separate matrix lanes (`upstream: pinned` / `v0.4.0`). Preserve the
+    original pinned check/artifact identities (`Build WebGPU Bridge (WASM)`,
+    `webgpu-bridge-dist`) and keep each lane's diagnostics uploads suffixed by
+    lane. Neither lane publishes or changes the source pin.
+  - Verifies the active `emcc` identity against `emsdk.version` and
+    contract-tests all five required wasm64 WASMFS patches.
+  - `scripts/ci_scope.py` lets `README.md`, `CONTRIBUTING.md`, `LICENSE`, and
+    `docs/*.md` changes skip the build lanes; `AGENTS.md` is not in that
+    allowlist, so editing it still runs them.
 - Candidate build: `.github/workflows/bridge_candidate.yml`
-  - The only workflow that builds publishable assets. It builds wasm32 and
-    memory64 once, runs the compiler, contract, state-persistence, and
-    multimodal gates it can afford, generates the schema-v2 manifest against its
-    own run ID/URL, and uploads `exact-webgpu-bridge-dist` plus an honest
-    `bridge-candidate-prequalification` record.
-  - Holds no publication environment and no PAT. Nothing rebuilds its artifact:
-    a rebuild would change the manifest, and therefore the digest, so no
-    attestation could ever match what is published. The workflow refuses
-    `github.run_attempt != 1`; dispatch a new candidate after failure rather than
-    rerunning it.
-  - Requires `assets_immutable_releases_enabled=true`. The candidate holds no
-    credential that can read another repository's administration settings, so it
-    cannot call the governance API itself: it fails closed on the dispatcher's
-    assertion and records it in `bridge-candidate-prequalification`, while
-    `publish_assets.yml` downloads that exact run-owned record, binds its boolean
-    assertion to the candidate identity, and independently proves the real state
-    before publishing.
-    Confirm the assertion first with
+  - The only workflow that builds publishable assets. It refuses
+    `github.run_attempt != 1`; dispatch a new candidate after failure rather
+    than rerunning it.
+  - Holds no credential that can read another repository's administration
+    settings, so it fails closed on the dispatcher's
+    `assets_immutable_releases_enabled` assertion and records it in
+    `bridge-candidate-prequalification`. Confirm the assertion first with
     `gh api repos/leehack/llama-web-bridge-assets/immutable-releases`.
 - Automated qualification: `.github/workflows/bridge_qualification.yml`
   - Owner-dispatched by the orchestrator with the exact candidate run ID and
-    correlation ID; no maintainer-supplied attestation input exists.
-  - Proves the candidate run is a successful `bridge_candidate.yml`
-    `workflow_dispatch` in this repository whose head is on the default-branch
-    line whose complete inventory has exactly one live
-    `exact-webgpu-bridge-dist` artifact, downloads it by immutable artifact ID,
-    checks out the exact candidate source, verifies pinned model inputs, runs
-    the hosted real-model gates, canonicality-checks the result, and uploads one
-    `qualification-attestation` artifact using repository access and no PAT.
-- Native-aligned candidate scan and publication orchestrator: `.github/workflows/auto_llama_cpp_update.yml`
-  - Scheduled runs select every stable native release published after the
-    immutable `v0.2.0-1` / Web-assets `v0.1.39` automation baseline. They
-    download each release's `assets.json` and `SHA256SUMS` by unique GitHub
-    Release asset ID, validate the exact release/tag/asset inventory, collect
-    exact provenance in `release-candidates.json`, and idempotently advance each
-    three-stage pipeline (Build Exact Bridge Candidate -> Qualify Exact Bridge
-    Candidate -> Publish Exact Qualified Bridge Assets). Processing the whole
-    ordered backlog prevents an older qualification wait from hiding or
-    starving a newer stable native release; each exact pipeline advances by at
-    most one stage per scheduled/manual scan.
-  - A provenance without its own exact publication is `superseded` (not
-    advanced, no tag claimed, no publication barrier) when a non-draft stable
-    asset release's `Native:` marker names a newer native release, compared by
-    version then rebuild. If that provenance is the newest native release in
-    the scan, it is `blocked` instead.
+    correlation ID; no maintainer-supplied attestation input exists. It uploads
+    one `qualification-attestation` artifact using repository access and no
+    PAT.
+- Orchestrator: `.github/workflows/auto_llama_cpp_update.yml`
   - A candidate run reserves its output tag for other pipelines unless its
     correlation names another governed build identity and none of that
     correlation's candidate, qualification or publication runs is in flight.
   - The resolver uses full default-branch history to keep the exact source SHA
     that executes a new candidate separate from the newest first-parent commit
-    that changed governed runtime/build inputs. Pipeline correlation uses the
-    governed build SHA, so non-build orchestration/qualification/publication/CI
-    workflow, verification, test, and docs-only commits do not orphan terminal
-    or in-flight state. The candidate workflow, manifest/release-contract/compiler
-    inputs, and every unclassified new path are governed by default; a build
-    change requires a new strict candidate and automated qualification even for
-    the same native release.
-  - Only the stable channel is orchestrated. Manual `development` scans still
-    resolve and report exact `bNNNN` provenance, but `require_stable_provenance`
-    refuses to advance them, so they never dispatch anything.
-  - Every dispatch sends exactly the target workflow's declared `workflow_dispatch`
-    inputs (`require_exact_dispatch_inputs`), at the exact default-branch `--ref`,
-    after a live `immutable-releases` governance read; a duplicate-run check runs
-    before dispatch and a run-name readback runs after it.
-  - Run recovery queries the exact workflow with server-side owner, event,
-    default-branch, and relevant-publication-time filters, then accepts only an
-    exact supported workflow path plus its deterministic `display_title`, owner
-    actor/triggering actor, first attempt, repository, and branch. GitHub exposes
-    a workflow's rendered `run-name` in the run record's `name` field, so that
-    field is not treated as the static workflow identity. A
-    multi-page query must retain a stable filtered count. A search at GitHub's
-    1,000-result cap is split into closed time windows until every relevant page
-    is complete; a saturated one-second window or ambiguous result fails closed
-    without depending on a repository-wide history count.
-  - The dispatch job reuses the existing `bridge-assets-publication` environment
-    and its environment-scoped `WEBGPU_BRIDGE_ASSETS_PAT`; there is no separate
-    orchestrator secret. Automatic dispatch requires that owner credential to
-    retain assets-governance read access and Actions write access on
-    `leehack/llama-web-bridge`. Missing capability is reported as blocked. The
-    planner supplies neither `publish_approved=true` nor
-    `assets_immutable_releases_enabled=true`; those values are added only after
-    the corresponding live environment/governance proofs.
-  - A manual orchestration run is admitted only when both `github.actor` and
-    `github.triggering_actor` are the repository owner. The gate applies to both
-    jobs before the publication environment can expose its PAT; trusted
-    default-branch schedule events remain automatic.
-  - A failed candidate run is terminal for that exact native provenance, so the
-    daily schedule cannot create unbounded duplicate candidates. After diagnosis,
-    a maintainer may explicitly dispatch one deliberate new first-attempt run
-    with the same exact binding. Publication retries may reuse only the exact
-    successful candidate and attestation runs.
-  - A successful candidate advances to hosted automated ASR/TTS qualification
-    without blocking candidate creation for later backlog entries. A successful
-    qualification workflow event wakes the orchestrator to dispatch publication;
-    the daily schedule remains the idempotent repair fallback.
-  - An already-published noop requires the same governed build identity and
-    independently resolves the assets tag commit,
-    validates release reads by tag and ID, downloads and hashes the exact asset
-    inventory, and validates `gh release verify --format json` with the same
-    immutable-release and release-attestation contracts as publication.
-  - It never changes `llama_cpp.version`, opens a PR, tags, or pushes directly.
+    that changed governed runtime/build inputs. `AGENTS.md`, `README.md`, and
+    `CONTRIBUTING.md` are in `_ORCHESTRATION_ONLY_PATHS` and `docs/` in
+    `_ORCHESTRATION_ONLY_PREFIXES` in `scripts/stable_release_orchestrator.py`,
+    so docs-only commits never advance the build identity; every unclassified
+    new path is governed by default.
+  - Every dispatch sends exactly the target workflow's declared
+    `workflow_dispatch` inputs (`require_exact_dispatch_inputs`) at the exact
+    default-branch `--ref` after a live `immutable-releases` governance read;
+    duplicate in-flight or successful runs for one stage fail closed, and a
+    run-name readback follows each dispatch.
+  - Run recovery accepts only an exact supported workflow path plus its
+    deterministic `display_title`, owner actor/triggering actor, first attempt,
+    repository, and branch. GitHub exposes a workflow's rendered `run-name` in
+    the run record's `name` field, so that field is not treated as the static
+    workflow identity. A search at GitHub's 1,000-result cap is split into
+    closed time windows; a saturated one-second window or ambiguous result
+    fails closed.
+  - The dispatch job reuses the `bridge-assets-publication` environment and its
+    `WEBGPU_BRIDGE_ASSETS_PAT`, which must identify the repository owner, read
+    assets immutable-release governance, and hold Actions write permission on
+    `leehack/llama-web-bridge`. The orchestrator proves the owner identity and
+    the governance read live and fails closed if either is absent.
 - CI reliability contract: `scripts/verify_ci_reliability.py`
-  - Keep this script updated when changing browser smoke behavior, action
-    versions, JS build/type-checking, or workflow diagnostics.
-  - Requires the 7 model/projector SHA-256 pins to be one identical set across
-    the five files that hard-code them -- `README.md`, `AGENTS.md`,
-    `CONTRIBUTING.md`, `ci.yml`, and `bridge_candidate.yml` -- and
-    role-consistent between the two workflows. CONTRIBUTING.md owns the rotation
-    rules and the residual gaps.
-  - CI, candidate, and publish must run `npm run check:js`, which regenerates the checked-in
-    generated bridge wrapper outputs and declarations, and then fail with
-    `git diff --exit-code` if those generated outputs are stale.
-  - The CI smoke must use a pinned tiny GGUF URL plus SHA-256, cache the model in
-    the same expanded `~/.cache/llama-web-bridge/state-smoke-models` directory
-    used by `actions/cache`, and upload `state-persistence-smoke-artifacts` on
-    failure.
-  - CI, candidate, ingestion, and publish workflows intentionally set
-    `FORCE_JAVASCRIPT_ACTIONS_TO_NODE24` so action-runtime regressions are caught
-    before Node 20 deprecation becomes a hard failure.
+  - Asserts specific sentences in `README.md`, `AGENTS.md`, and
+    `CONTRIBUTING.md` (publication contract, baseline, smoke script names) and
+    the 7-pin set in `CONTRIBUTING.md` and both build workflows. Update it in
+    the same change as any doc restructure.
 - Publish workflow: `.github/workflows/publish_assets.yml`
-  - Is a bridge-owned, non-reusable manual workflow that the central orchestrator
-    may dispatch through GitHub's API using the repository owner's existing
-    authorized identity; other dispatch actors are rejected. This keeps the
-    environment gate in the bridge repository rather than the caller context. It requires an orchestrator
-    correlation ID, exact bridge source SHA, upstream tag/commit, native tag plus
-    manifest SHA-256, output tag/rebuild, required distinct `candidate_run_id`
-    and `attestation_run_id`, and assets repository inputs. It does not read
-    `llama_cpp.version`.
-  - Never builds. It downloads the exact candidate artifact from
-    `candidate_run_id` and the attestation from `attestation_run_id` by immutable
-    artifact ID after proving both runs' repository, workflow file, dispatch
-    event, default-branch-line head, success, complete inventory, and artifact
-    uniqueness.
-  - Compares the candidate manifest's `emscripten_version` against the
-    `emsdk.version` pin at the exact bridge source SHA.
+  - Never builds. It downloads the exact candidate artifact and attestation by
+    immutable artifact ID and verifies the candidate manifest's
+    `emscripten_version` against the `emsdk.version` pin at the exact bridge
+    source SHA.
   - Requires `publish_approved=true`. Publication remains blocked until an
     administrator externally creates `bridge-assets-publication`, disables
     administrator bypass, restricts custom deployment branches to `main`, and
@@ -288,55 +142,19 @@ automated qualification run binds the candidate digest it is about to publish.
     not describe that environment as protected without current live evidence.
     Use the default job token to validate the environment identity,
     administrator-bypass setting, and exact `main` branch policy before approval
-    and again after approval. Use the trusted workflow commit's validator rather
-    than the requested historical bridge build source. Immediately before any
-    network use of the environment-scoped publication PAT, fail closed unless
-    the injected credential is non-empty, without printing its value.
-  - Emits only stable `vMAJOR.MINOR.PATCH[-N]` or development `bNNNN[-N]` tags.
-    Historical `*-llamadart.N` forms are accepted only when reading old
-    manifests and are never emitted.
-  - Orders stable and development histories independently, while rejecting
-    rollback or collisions within each channel, diverged bridge source, output
-    identity/checksum mismatches, and unmerged bridge source commits.
-  - Transports dispatch inputs through workflow environment variables; never
-    embed `${{ inputs.* }}` directly in a shell `run` block.
-  - Verifies the digest-bound attestation twice: once before approval and again
-    inside the privileged job against the artifact it is about to publish. The
-    attestation must match the candidate fingerprint, bridge/upstream/native
-    identities, compiler, release tag/rebuild, correlation ID, candidate run ID,
-    harness source digest, every required gate, and every required ASR/TTS
-    memory and runtime mode.
-  - Records the candidate run ID/URL as the publication identity, because that
-    is what the candidate manifest embeds. Retry by redispatching against the
-    same candidate and attestation runs.
+    and again after approval, with the trusted workflow commit's validator.
+    Immediately before any network use of the environment-scoped publication
+    PAT, fail closed unless the injected credential is non-empty,
+    without printing its value.
   - Proves immutable-release governance on the assets repository through
     `GET /repos/{owner}/{repo}/immutable-releases` before any ref or release
-    mutation, and requires the exact `{enabled, enforced_by_owner}` shape with
-    `enabled` exactly boolean `true`. That endpoint answers 404 both when
-    governance is disabled and when the credential cannot read it, so every
-    non-200, missing, false, or non-boolean response fails closed.
-  - Reads every complete release state, including a retry that found an existing
-    exact release, back by tag and by release ID. Both reads must bind the exact
-    tag, release ID, tag commit, published state, and explicit boolean
-    `immutable: true`; publication then requires
-    `gh release verify <tag> --repo <assets repo> --format json` to prove
-    GitHub's signed release attestation: predicate type
-    `https://in-toto.io/attestation/release/v0.2`, signer
-    `https://dotcom.releases.github.com`, predicate database ID equal to the
-    live readback release ID, the exact `pkg:github/<repo>@<tag>` subject bound
-    to the resolved tag commit, and a SHA-256 subject for every published
-    artifact matching the candidate bytes. A mismatch is reported as
-    a non-retryable `immutable-publication-unverified` outcome. Publication
-    never uploads into an incomplete published release and never deletes,
+    mutation, reads every complete release back by tag and by release ID with
+    explicit boolean `immutable: true`, and requires
+    `gh release verify <tag> --repo <assets repo> --format json` to prove the
+    `https://in-toto.io/attestation/release/v0.2` attestation over the exact
+    published bytes. A mismatch is a non-retryable
+    `immutable-publication-unverified` outcome; publication never deletes,
     retags, overwrites, or otherwise repairs the release.
-  - Publishes schema-v2 provenance with release tag, capabilities, bridge,
-    upstream, and native commits, exact run ID/URL, mandatory gate conclusions,
-    correlation ID, and per-artifact SHA-256 values. An unreadable post-mutation
-    remote state must emit retryable `mutation-unknown`, never guessed mutation
-    state.
-  - Any future npm package version has an independent monotonic sequence and
-    uses stable/nightly dist-tags; GitHub `vM.m.p-N` tags must not be reused as
-    npm versions because npm orders them as prereleases.
 
 ### Immutable Automation Baseline
 
@@ -354,8 +172,11 @@ candidate and exact `candidate_run_id`/`attestation_run_id` pair.
 
 ## Change Boundaries
 
-- Keep runtime bridge source code in `js/src/` and `src/`; generated browser
-  wrapper/declaration outputs live in `js/`.
+- Keep runtime bridge source code in `js/src/` and `src/`. The
+  generated bridge wrapper outputs and declaration (`js/llama_webgpu_bridge.js`,
+  `js/llama_webgpu_bridge_worker.js`, `js/llama_webgpu_bridge.d.ts`) are
+  regenerated by `npm run check:js`; CI, candidate, and publish fail on a stale
+  copy with `git diff --exit-code`, so never hand-edit them.
 - Keep publishing logic in workflow only.
 - Do not edit assets repository files from here outside publish flow.
 
@@ -389,4 +210,4 @@ After publishing assets tag:
 - Speech-capable asset releases must pass the hosted automated qualification
   workflow's exact required memory/runtime matrix before publication. Keep
   these heavy gates outside ordinary CI; reproduce locally with the individual
-  smoke scripts above, not the workflow-only combined qualifier.
+  smoke scripts, not the workflow-only combined qualifier.

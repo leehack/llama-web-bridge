@@ -17,9 +17,9 @@ ROOT = Path(__file__).resolve().parents[1]
 # one leaves CI green while a contributor hits an opaque checksum failure -- or,
 # for bridge_candidate.yml, while the candidate job that consumes the pins fails.
 # publish_assets.yml no longer builds or smokes anything, so it holds no pins.
+# CONTRIBUTING.md is the only markdown file that carries the smoke invocations;
+# README.md and AGENTS.md link to it and hold no pins.
 MODEL_SHA_PIN_FILES = (
-    "README.md",
-    "AGENTS.md",
     "CONTRIBUTING.md",
     ".github/workflows/ci.yml",
     ".github/workflows/bridge_candidate.yml",
@@ -39,12 +39,11 @@ MODEL_SHA_PIN_MARKER = re.compile(
 # a role-specific URL and fail checksum verification at release time. Both
 # workflows name the role in the env key, so comparing key-to-hex between them
 # catches a swap made in one of them. Not caught: a swap applied identically to
-# both workflows, or one confined to README.md, AGENTS.md, and CONTRIBUTING.md,
-# whose bare `--model-sha256` / `--mmproj-sha256` flags carry no role and whose
-# pin order differs between README.md and the other two -- there the role lives
-# only in the `--model-url` / `--model-path` / `--mmproj-path` value beside each
-# flag: a URL for the state-persistence pin, a `/path/to/<file>` placeholder for
-# the other six, each naming a distinct model or projector file.
+# both workflows, or one confined to CONTRIBUTING.md, whose bare
+# `--model-sha256` / `--mmproj-sha256` flags carry no role -- there the role
+# lives only in the `--model-url` / `--model-path` / `--mmproj-path` value
+# beside each flag: a URL for the state-persistence pin, a `/path/to/<file>`
+# placeholder for the other six, each naming a distinct model or projector file.
 WORKFLOW_MODEL_SHA_PIN_FILES = (
     ".github/workflows/ci.yml",
     ".github/workflows/bridge_candidate.yml",
@@ -2278,8 +2277,6 @@ def main() -> int:
         errors,
     )
     pin_file_contents = {
-        "README.md": readme,
-        "AGENTS.md": agents,
         "CONTRIBUTING.md": contributing,
         ".github/workflows/ci.yml": ci,
         ".github/workflows/bridge_candidate.yml": candidate,
