@@ -2421,13 +2421,61 @@ def _resolve_candidate_binding(
     return next(iter(bindings)) if bindings else None
 
 
-def claimed_release_tags(runs: Sequence[RunRecord]) -> set[str]:
-    """Output tags any candidate run has already claimed, across correlations."""
-    claimed: set[str] = set()
-    for record in runs:
+_CORRELATION_BUILD_RE = re.compile(r"-build-(?P<build>[0-9a-f]{16})$")
+
+
+def _run_correlation_id(record: RunRecord) -> str | None:
+    fields = record.run_name.split()
+    return fields[1] if len(fields) > 1 else None
+
+
+def _names_other_build(correlation_id: str, bridge_build_sha: str) -> bool:
+    build = _CORRELATION_BUILD_RE.search(correlation_id)
+    return build is not None and build.group("build") != bridge_build_sha[:16]
+
+
+def has_other_build_claim(
+    candidate_runs: Sequence[RunRecord], *, bridge_build_sha: str
+) -> bool:
+    for record in candidate_runs:
         match = _CANDIDATE_RUN_NAME_RE.fullmatch(record.run_name)
-        if match is not None:
-            claimed.add(match.group("release_tag"))
+        if match is not None and _names_other_build(
+            match.group("correlation_id"), bridge_build_sha
+        ):
+            return True
+    return False
+
+
+def claimed_release_tags(
+    candidate_runs: Sequence[RunRecord],
+    *,
+    bridge_build_sha: str,
+    downstream_runs: Sequence[RunRecord] = (),
+) -> set[str]:
+    """Output tags still claimed by candidate runs, across correlations.
+
+    A claim is dropped only when its correlation names a build identity other
+    than ``bridge_build_sha`` and no candidate, qualification or publication
+    run of that correlation is in flight. Scans advance only the current build
+    identity, so nothing dispatches for such a correlation again.
+    """
+    in_flight = {
+        _run_correlation_id(record)
+        for record in (*candidate_runs, *downstream_runs)
+        if record.in_flight
+    }
+    claimed: set[str] = set()
+    for record in candidate_runs:
+        match = _CANDIDATE_RUN_NAME_RE.fullmatch(record.run_name)
+        if match is None:
+            continue
+        correlation_id = match.group("correlation_id")
+        if (
+            _names_other_build(correlation_id, bridge_build_sha)
+            and correlation_id not in in_flight
+        ):
+            continue
+        claimed.add(match.group("release_tag"))
     return claimed
 
 
@@ -2534,12 +2582,37 @@ def advance_pipeline(
     persisted = _resolve_candidate_binding(candidate_selection, correlation_id)
     fresh_binding = None
     if persisted is None:
+        downstream_workflows = (
+            (
+                (QUALIFICATION_WORKFLOW_FILE, QUALIFICATION_WORKFLOW_PATH),
+                (PUBLISH_WORKFLOW_FILE, PUBLISH_WORKFLOW_PATH),
+            )
+            if has_other_build_claim(
+                candidate_runs, bridge_build_sha=provenance.bridge_build_sha
+            )
+            else ()
+        )
+        downstream_runs = [
+            record
+            for workflow_file, workflow_path in downstream_workflows
+            for record in _fetch_runs(
+                gateway,
+                workflow_file=workflow_file,
+                workflow_path=workflow_path,
+                default_branch=default_branch,
+                created_since=run_history_since,
+            )
+        ]
         target = select_next_release_target(
             [str(release.get("tag_name")) for release in releases],
             upstream_tag=provenance.upstream_tag,
             taken=(
                 asset_tag_names
-                | claimed_release_tags(candidate_runs)
+                | claimed_release_tags(
+                    candidate_runs,
+                    bridge_build_sha=provenance.bridge_build_sha,
+                    downstream_runs=downstream_runs,
+                )
                 | set(reserved_release_tags)
             ),
         )
