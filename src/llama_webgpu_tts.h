@@ -97,8 +97,6 @@ llama_webgpu_tts_status llama_webgpu_tts_write_pcm(
     const llama_webgpu_tts * tts,
     const char * output_path);
 
-int32_t llama_webgpu_tts_sample_rate(const llama_webgpu_tts * tts);
-int64_t llama_webgpu_tts_sample_count(const llama_webgpu_tts * tts);
 const char * llama_webgpu_tts_last_error(const llama_webgpu_tts * tts);
 
 #endif
