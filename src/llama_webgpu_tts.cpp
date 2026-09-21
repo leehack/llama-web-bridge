@@ -490,14 +490,6 @@ llama_webgpu_tts_status llama_webgpu_tts_write_pcm(
   return LLAMADART_WEBGPU_TTS_STATUS_OK;
 }
 
-int32_t llama_webgpu_tts_sample_rate(const llama_webgpu_tts * tts) {
-  return tts != nullptr ? tts->sample_rate : 0;
-}
-
-int64_t llama_webgpu_tts_sample_count(const llama_webgpu_tts * tts) {
-  return tts != nullptr ? tts->sample_count : 0;
-}
-
 const char * llama_webgpu_tts_last_error(const llama_webgpu_tts * tts) {
   return tts != nullptr ? tts->error.c_str() : "TTS task is unavailable";
 }

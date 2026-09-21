@@ -332,8 +332,7 @@ async function writeResponseToFsFileWithProgress(response, fs, filePath, progres
   const useBigIntPosition = writeOptions.useBigIntPosition === true;
   const startOffset = parsePositiveInteger(writeOptions.startOffset);
   const preservePartialOnError = writeOptions.preservePartialOnError === true;
-  const allowAppend = writeOptions.allowAppend === true || startOffset > 0;
-  const appendMode = allowAppend && startOffset > 0;
+  const appendMode = startOffset > 0;
   const chunkTimeoutMs = parsePositiveInteger(writeOptions.chunkTimeoutMs);
   const signal = writeOptions.signal || null;
   const abortMessage = writeOptions.abortMessage || "Model transfer was cancelled.";
@@ -600,6 +599,37 @@ async function decodeImageBytesToRgb(bytes, options = {}) {
       bitmap?.close?.();
     } catch (_) {
     }
+  }
+}
+function logLevelForName(level) {
+  switch (level) {
+    case "debug":
+      return 0;
+    case "log":
+    case "info":
+      return 1;
+    case "warn":
+      return 2;
+    case "error":
+      return 3;
+    default:
+      return 1;
+  }
+}
+function logThresholdForConfiguredLevel(level) {
+  switch (level) {
+    case 0:
+      return 99;
+    case 1:
+      return 0;
+    case 2:
+      return 1;
+    case 3:
+      return 2;
+    case 4:
+      return 3;
+    default:
+      return 1;
   }
 }
 function serializeWorkerError(error) {
@@ -1485,49 +1515,18 @@ var LlamaWebGpuBridgeRuntime = class {
     return () => {
     };
   }
-  _logLevelForName(level) {
-    switch (level) {
-      case "debug":
-        return 0;
-      case "log":
-      case "info":
-        return 1;
-      case "warn":
-        return 2;
-      case "error":
-        return 3;
-      default:
-        return 1;
-    }
-  }
-  _logThresholdForConfiguredLevel(level) {
-    switch (level) {
-      case 0:
-        return 99;
-      case 1:
-        return 0;
-      case 2:
-        return 1;
-      case 3:
-        return 2;
-      case 4:
-        return 3;
-      default:
-        return 1;
-    }
-  }
   _shouldEmitLoggerLevel(level) {
     const current = Number(this._logLevel);
     if (!Number.isFinite(current) || current < 0) {
       return true;
     }
-    const threshold = this._logThresholdForConfiguredLevel(
+    const threshold = logThresholdForConfiguredLevel(
       Math.max(0, Math.min(4, Math.trunc(current)))
     );
     if (threshold > 3) {
       return false;
     }
-    return this._logLevelForName(level) >= threshold;
+    return logLevelForName(level) >= threshold;
   }
   _emitLogger(level, message) {
     if (!this._shouldEmitLoggerLevel(level)) {
@@ -2692,7 +2691,6 @@ var LlamaWebGpuBridgeRuntime = class {
                 {
                   useBigIntPosition: this._coreVariant === "wasm64",
                   startOffset: resumeOffset,
-                  allowAppend: resumeOffset > 0,
                   preservePartialOnError: true,
                   totalBytes: knownTotalBytes,
                   chunkTimeoutMs: streamChunkTimeoutMs,
@@ -4514,7 +4512,7 @@ var LlamaWebGpuBridge = class {
   }
   _isRecoverableWorkerFsError(error) {
     const text = serializeWorkerError(error).toLowerCase();
-    return text.includes("fs error") || text.includes("no such file") || text.includes("not found") || text.includes("invalid argument") || text.includes("worker request timeout") || text.includes("timed out");
+    return text.includes("fs error") || text.includes("no such file") || text.includes("not found") || text.includes("invalid argument") || text.includes("timed out");
   }
   _isWorkerRequestTimeoutError(error) {
     const text = serializeWorkerError(error).toLowerCase();
@@ -4598,9 +4596,6 @@ var LlamaWebGpuBridge = class {
     const text = serializeWorkerError(error).toLowerCase();
     return text.includes("worker completion stalled") || text.includes("worker createcompletion stalled") || text.includes("worker timed out") || text.includes("worker timeout");
   }
-  _isForcedCpuMultimodalFallbackError(error) {
-    return error && typeof error === "object" && error.llamadartForceCpuMultimodal === true;
-  }
   _isCpuModelMode() {
     const requestedLayers = Number(this._loadedModelOptions?.nGpuLayers);
     if (Number.isFinite(requestedLayers)) {
@@ -4643,12 +4638,11 @@ var LlamaWebGpuBridge = class {
     const multimodalRuntimeRequired = mediaPartsRequested || textToSpeechRequested;
     const shouldEnsureMultimodalInRuntime = multimodalRuntimeRequired && typeof this._loadedMmProjUrl === "string" && this._loadedMmProjUrl.length > 0;
     const workerTimedOut = this._isWorkerTimeoutError(fallbackError);
-    const forcedCpuFallback = this._isForcedCpuMultimodalFallbackError(fallbackError);
     const dispatchWorkgroupFallback = this._isDispatchWorkgroupLimitError(fallbackError);
     const loadedGpuLayers = Number(this._loadedModelOptions?.nGpuLayers);
     const metadataGpuLayers = Number(this._metadata?.["llamadart.webgpu.n_gpu_layers"]);
     const modelLoadedWithGpu = Number.isFinite(loadedGpuLayers) ? loadedGpuLayers !== 0 : Number.isFinite(metadataGpuLayers) ? metadataGpuLayers !== 0 : true;
-    const shouldUseCpuMultimodalFallback = multimodalRuntimeRequired && modelLoadedWithGpu && (dispatchWorkgroupFallback || forcedCpuFallback || workerTimedOut);
+    const shouldUseCpuMultimodalFallback = multimodalRuntimeRequired && modelLoadedWithGpu && (dispatchWorkgroupFallback || workerTimedOut);
     try {
       if (Number(this._runtime?._modelBytes) > 0 && !forceReloadRequested && !shouldUseCpuMultimodalFallback) {
         if (shouldEnsureMultimodalInRuntime) {
@@ -4676,10 +4670,6 @@ var LlamaWebGpuBridge = class {
         if (textToSpeechRequested) {
           this._emitBridgeWarn(
             "llamadart: retrying text-to-speech once with CPU fallback after WebGPU failure."
-          );
-        } else if (forcedCpuFallback) {
-          this._emitBridgeWarn(
-            "llamadart: using CPU fallback for multimodal generation stability."
           );
         } else if (workerTimedOut) {
           this._emitBridgeWarn(
@@ -4872,44 +4862,13 @@ var LlamaWebGpuBridge = class {
     }
     return 2;
   }
-  _bridgeLogLevelForName(level) {
-    switch (level) {
-      case "debug":
-        return 0;
-      case "log":
-      case "info":
-        return 1;
-      case "warn":
-        return 2;
-      case "error":
-        return 3;
-      default:
-        return 1;
-    }
-  }
-  _bridgeLogThresholdForConfiguredLevel(level) {
-    switch (level) {
-      case 0:
-        return 99;
-      case 1:
-        return 0;
-      case 2:
-        return 1;
-      case 3:
-        return 2;
-      case 4:
-        return 3;
-      default:
-        return 1;
-    }
-  }
   _shouldEmitBridgeLevel(level) {
     const configured = this._resolvedBridgeLogLevel();
-    const threshold = this._bridgeLogThresholdForConfiguredLevel(configured);
+    const threshold = logThresholdForConfiguredLevel(configured);
     if (threshold > 3) {
       return false;
     }
-    return this._bridgeLogLevelForName(level) >= threshold;
+    return logLevelForName(level) >= threshold;
   }
   _shouldSuppressBridgeWarn(message) {
     const text = String(message || "").trim();
@@ -4947,21 +4906,14 @@ var LlamaWebGpuBridge = class {
     }
   }
   _disableWorkerFallback(error) {
-    const forcedCpuMultimodal = this._isForcedCpuMultimodalFallbackError(error);
-    const reason = forcedCpuMultimodal ? "multimodal_stability_mode" : serializeWorkerError(error);
+    const reason = serializeWorkerError(error);
     this._workerFallbackReason = reason;
     if (typeof globalThis !== "undefined") {
       globalThis.__llamadartBridgeWorkerFallbackReason = reason;
     }
-    if (forcedCpuMultimodal) {
-      this._emitBridgeWarn(
-        "llamadart: switching multimodal pipeline to main-thread runtime for stability."
-      );
-    } else {
-      this._emitBridgeWarn(
-        `llamadart: bridge worker unavailable, falling back to main thread (${reason})`
-      );
-    }
+    this._emitBridgeWarn(
+      `llamadart: bridge worker unavailable, falling back to main thread (${reason})`
+    );
     if (this._workerProxy) {
       const workerProxy = this._workerProxy;
       this._advanceWorkerGeneration();
@@ -4979,9 +4931,6 @@ var LlamaWebGpuBridge = class {
     }
     if (this._runtime && Array.isArray(this._runtime._runtimeNotes) && typeof reason === "string" && reason.length > 0) {
       this._runtime._runtimeNotes.push(`worker_fallback:${reason}`);
-      if (forcedCpuMultimodal) {
-        this._runtime._runtimeNotes.push("worker_fallback_forced_multimodal");
-      }
     }
   }
   async _callWorker(method, args, onEvent, transferList = []) {
