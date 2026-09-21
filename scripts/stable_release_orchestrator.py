@@ -190,6 +190,7 @@ _ORCHESTRATION_ONLY_PATHS = frozenset(
         "CONTRIBUTING.md",
         "LICENSE",
         "README.md",
+        "scripts/ci_scope.py",
         "scripts/release_publication_state.py",
         "scripts/release_qualification.py",
         "scripts/stable_release_orchestrator.py",

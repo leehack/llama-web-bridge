@@ -533,6 +533,8 @@ class BridgeSourceIdentityTest(unittest.TestCase):
         test = self.repository / "scripts" / "resolver_test.py"
         test.parent.mkdir()
         test.write_text("# regression\n", encoding="utf-8")
+        # The CI change selector never reaches the candidate or publication.
+        (test.parent / "ci_scope.py").write_text("# selector\n", encoding="utf-8")
         orchestration_head = self._commit("workflow tests and docs")
 
         output = self.repository / "identity.json"
@@ -573,6 +575,8 @@ class BridgeSourceIdentityTest(unittest.TestCase):
             ".github/workflows/auto_llama_cpp_update.yml",
             "README.md",
             "docs/api.md",
+            "scripts/ci_scope.py",
+            "scripts/ci_scope_test.py",
             "scripts/release_qualification.py",
             "scripts/stable_release_orchestrator_test.py",
         ):
