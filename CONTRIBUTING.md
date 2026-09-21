@@ -32,6 +32,10 @@ npm run check:js
 LLAMA_CPP_DIR=../llama.cpp OUT_DIR=dist ./scripts/build_bridge.sh
 ```
 
+`./scripts/build_bridge.sh --help` is the complete list of environment
+variables the build reads, with their defaults; the docs do not repeat the
+list.
+
 Bridge wrapper source lives under `js/src/`; `npm run build:js` regenerates the
 checked-in browser ESM outputs and declarations under `js/`. `npm run check:js`
 runs the same generator plus TypeScript and syntax checks, so commit any updated
@@ -52,13 +56,19 @@ WEBGPU_BRIDGE_BUILD_MEM64=1 \
 
 ## Validate Outputs
 
-Expected files:
+Expected files in `OUT_DIR`:
 
-- `dist/llama_webgpu_bridge.js`
-- `dist/llama_webgpu_bridge_worker.js`
-- `dist/llama_webgpu_bridge.d.ts`
-- `dist/llama_webgpu_core.js`
-- `dist/llama_webgpu_core.wasm`
+- `llama_webgpu_bridge.js`
+- `llama_webgpu_bridge_worker.js`
+- `llama_webgpu_bridge.d.ts`
+- `llama_webgpu_core.js`
+- `llama_webgpu_core.wasm`
+- `llama_webgpu_core_mem64.js` (only with `WEBGPU_BRIDGE_BUILD_MEM64=1`, as
+  above and in CI)
+- `llama_webgpu_core_mem64.wasm` (same condition)
+
+This file owns the runnable smoke invocations and the model/projector pins
+they carry; `README.md` and `AGENTS.md` link here instead of repeating them.
 
 Before opening or updating a PR, run the lightweight contracts:
 
@@ -67,6 +77,7 @@ npm run check:js
 python3 -m py_compile scripts/verify_state_persistence_api.py scripts/verify_text_to_speech_api.py scripts/verify_ci_reliability.py scripts/state_persistence_browser_smoke.py scripts/multimodal_browser_smoke.py scripts/speech_to_text_browser_smoke.py scripts/text_to_speech_browser_smoke.py
 python3 scripts/verify_state_persistence_api.py
 python3 scripts/verify_text_to_speech_api.py
+python3 scripts/mtmd_compat_contract_test.py
 python3 scripts/verify_ci_reliability.py
 ```
 
@@ -144,19 +155,20 @@ query strings, and fragments before printing the location.
   `.github/workflows/bridge_qualification.yml`, JS build pipeline files,
   `scripts/release_qualification.py`, or
   `scripts/state_persistence_browser_smoke.py`.
-- Rotate all 7 model/projector SHA-256 pins in the five files that hard-code
-  them together: `README.md`, `AGENTS.md`, `CONTRIBUTING.md`,
-  `.github/workflows/ci.yml`, `.github/workflows/bridge_candidate.yml`.
-  `scripts/verify_ci_reliability.py` requires the five sets to be identical with
+- Rotate all 7 model/projector SHA-256 pins in the three files that hard-code
+  them together: `CONTRIBUTING.md`, `.github/workflows/ci.yml`,
+  `.github/workflows/bridge_candidate.yml`.
+  `scripts/verify_ci_reliability.py` requires the three sets to be identical with
   exactly 7 pins each; a stale `bridge_candidate.yml` breaks the candidate job,
-  not just CI. `publish_assets.yml` holds no pins because it neither builds nor
+  not just CI. `README.md` and `AGENTS.md` hold no pins and link here.
+  `publish_assets.yml` holds no pins because it neither builds nor
   smokes. `scripts/release_qualification.py` carries the same 7 plus the pinned
   ASR audio fixture, and every attestation must match them exactly.
 - The script also compares pins role by role across the two workflows, whose env
   keys name the role, so a swap between roles in one workflow fails the gate. A
-  swap applied identically to both passes, as does one confined to the three
-  markdown files, whose bare `--model-sha256` / `--mmproj-sha256` flags carry no
-  role -- check each markdown pin by hand against the `--model-url` /
+  swap applied identically to both passes, as does one confined to this file,
+  whose bare `--model-sha256` / `--mmproj-sha256` flags carry no
+  role -- check each pin here by hand against the `--model-url` /
   `--model-path` / `--mmproj-path` value directly above it, whose filename names
   the model or projector the pin belongs to.
 - Keep `scripts/multimodal_browser_smoke.py` in normal CI for every llama.cpp
@@ -199,8 +211,10 @@ query strings, and fragments before printing the location.
   A proven candidate whose publication files other than `manifest.json` are
   byte-identical to the newest published release for the same native release
   and native manifest digest is `satisfied_by_identical_release`: nothing
-  further is dispatched and its
-  output tag is released to later pipelines in the same scan.
+  further is dispatched and its output tag is released to later pipelines in
+  the same scan. The comparison runs only where a qualification or publication
+  would otherwise be dispatched, never while one of the correlation's runs is
+  in flight, and never across native alignments.
   Manual `development` scans stay scan-only: they resolve exact `bNNNN`
   provenance and report it, and the orchestrator refuses non-stable provenance.
   A failed candidate or qualification is never retried automatically; after diagnosis,

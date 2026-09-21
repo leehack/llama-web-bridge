@@ -18,8 +18,6 @@ ROOT = Path(__file__).resolve().parents[1]
 # for bridge_candidate.yml, while the candidate job that consumes the pins fails.
 # publish_assets.yml no longer builds or smokes anything, so it holds no pins.
 MODEL_SHA_PIN_FILES = (
-    "README.md",
-    "AGENTS.md",
     "CONTRIBUTING.md",
     ".github/workflows/ci.yml",
     ".github/workflows/bridge_candidate.yml",
@@ -39,12 +37,11 @@ MODEL_SHA_PIN_MARKER = re.compile(
 # a role-specific URL and fail checksum verification at release time. Both
 # workflows name the role in the env key, so comparing key-to-hex between them
 # catches a swap made in one of them. Not caught: a swap applied identically to
-# both workflows, or one confined to README.md, AGENTS.md, and CONTRIBUTING.md,
-# whose bare `--model-sha256` / `--mmproj-sha256` flags carry no role and whose
-# pin order differs between README.md and the other two -- there the role lives
-# only in the `--model-url` / `--model-path` / `--mmproj-path` value beside each
-# flag: a URL for the state-persistence pin, a `/path/to/<file>` placeholder for
-# the other six, each naming a distinct model or projector file.
+# both workflows, or one confined to CONTRIBUTING.md, whose bare
+# `--model-sha256` / `--mmproj-sha256` flags carry no role -- there the role
+# lives only in the `--model-url` / `--model-path` / `--mmproj-path` value
+# beside each flag: a URL for the state-persistence pin, a `/path/to/<file>`
+# placeholder for the other six, each naming a distinct model or projector file.
 WORKFLOW_MODEL_SHA_PIN_FILES = (
     ".github/workflows/ci.yml",
     ".github/workflows/bridge_candidate.yml",
@@ -679,6 +676,9 @@ def main() -> int:
     operation_lifecycle_contract = read_required(
         "scripts/bridge_operation_lifecycle_test.mjs", errors
     )
+    worker_error_classification_contract = read_required(
+        "scripts/bridge_worker_error_classification_test.mjs", errors
+    )
     ci = read_required(".github/workflows/ci.yml", errors)
     publish = read_required(".github/workflows/publish_assets.yml", errors)
     auto_update = read_required(".github/workflows/auto_llama_cpp_update.yml", errors)
@@ -830,6 +830,23 @@ def main() -> int:
         '"test:type-declarations"' in package_json
         and "npm run test:type-declarations" in package_json,
         "check:js must define and run the bridge type declaration contract",
+        errors,
+    )
+    require(
+        '"test:worker-error-classification"' in package_json
+        and "npm run test:worker-error-classification" in package_json,
+        "check:js must define and run the bridge worker error classification contract",
+        errors,
+    )
+    require(
+        "Bridge worker error classification tests passed" in worker_error_classification_contract
+        and "_shouldFallbackToMainThread" in worker_error_classification_contract
+        and "_isWorkerRequestTimeoutError" in worker_error_classification_contract
+        and "_ensureRuntimeReadyAfterWorkerFallback" in worker_error_classification_contract
+        and "_shouldEmitBridgeLevel" in worker_error_classification_contract,
+        "the worker error classification contract must cover main-thread fallback, "
+        "request-timeout classification, multimodal recovery selection, and the shared "
+        "log-level table",
         errors,
     )
     require(
@@ -2277,9 +2294,14 @@ def main() -> int:
         "CONTRIBUTING.md must document JS build/type-checking, maintainer/agent workflow guardrails, checksum-pinned smoke usage, and toolchain pin handling",
         errors,
     )
+    for relative_path, content in (("README.md", readme), ("AGENTS.md", agents)):
+        require(
+            SHA256_HEX_PATTERN.search(content) is None
+            and "CONTRIBUTING.md#validate-outputs" in content,
+            f"{relative_path} must hold no SHA-256 pins and link to CONTRIBUTING.md#validate-outputs for the smoke invocations",
+            errors,
+        )
     pin_file_contents = {
-        "README.md": readme,
-        "AGENTS.md": agents,
         "CONTRIBUTING.md": contributing,
         ".github/workflows/ci.yml": ci,
         ".github/workflows/bridge_candidate.yml": candidate,

@@ -43,9 +43,10 @@ Requirements:
   llama.cpp         Source checkout via LLAMA_CPP_DIR or ../llama.cpp
 
 Environment variables:
-  LLAMA_CPP_DIR      Path to llama.cpp source checkout
-  BUILD_DIR          CMake build directory
-  OUT_DIR            Output directory for built assets
+  LLAMA_CPP_DIR      Path to llama.cpp source checkout (default: third_party/llama_cpp, then ../llama.cpp)
+  BUILD_DIR          CMake build directory (default: .build/webgpu_bridge)
+  MEM64_BUILD_DIR    CMake build directory for the optional wasm64 build (default: .build/webgpu_bridge_mem64)
+  OUT_DIR            Output directory for built assets (default: dist)
   CMAKE_BUILD_TYPE   CMake build type (default: Release)
   WEBGPU_BRIDGE_BUILD_MEM64  Build optional wasm64 artifacts (1/0)
   WEBGPU_BRIDGE_MEM64_MAX_MEMORY  wasm64 max linear memory bytes (default: 12884901888)
