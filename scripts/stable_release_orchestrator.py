@@ -3,7 +3,8 @@
 
 Each event-driven scan resolves every stable native release after the immutable
 automation baseline, then idempotently advances each three-stage pipeline. A
-daily scheduled scan provides repair fallback:
+native release older than one a published asset release already records is
+superseded, not rebuilt. A daily scheduled scan provides repair fallback:
 
 1. Build Exact Bridge Candidate      (.github/workflows/bridge_candidate.yml)
 2. Qualify Exact Bridge Candidate    (.github/workflows/bridge_qualification.yml)
@@ -190,6 +191,11 @@ _ORCHESTRATION_ONLY_PATHS = frozenset(
         "CONTRIBUTING.md",
         "LICENSE",
         "README.md",
+        "scripts/bridge_operation_queue_direct_cases.mjs",
+        "scripts/bridge_operation_queue_fixtures.mjs",
+        "scripts/bridge_operation_queue_lifecycle_contract_cases.mjs",
+        "scripts/bridge_operation_queue_worker_proxy_cases.mjs",
+        "scripts/ci_scope.py",
         "scripts/release_publication_state.py",
         "scripts/release_qualification.py",
         "scripts/stable_release_orchestrator.py",
@@ -470,6 +476,7 @@ class PublishedRelease:
 
 class OrchestrationAction(str, Enum):
     NOOP = "noop"
+    SUPERSEDED = "superseded"
     IN_FLIGHT = "in_flight"
     WAITING_FOR_PRIOR_PUBLICATION = "waiting_for_prior_publication"
     DISPATCH_CANDIDATE = "dispatch_candidate"
@@ -1358,6 +1365,63 @@ def fetch_asset_tag_names(gateway: Gateway) -> set[str]:
 
 def _correlation_marker(correlation_id: str) -> str:
     return f"Orchestrator correlation: `{correlation_id}`"
+
+
+_NATIVE_ALIGNMENT_RE = re.compile(
+    r"(?m)^Native: `" + re.escape(NATIVE_REPOSITORY) + r"@([^`\r\n]+)`\r?$"
+)
+
+
+def _native_release_order(native_release_tag: str) -> tuple[int, ...]:
+    version = parse_release_tag(native_release_tag)
+    return (*version.version_parts, version.rebuild)
+
+
+def latest_published_native_alignment(
+    releases: Sequence[Mapping[str, Any]],
+) -> tuple[str, str] | None:
+    """Return ``(native_tag, asset_tag)`` for the newest stable native release
+    named by a non-draft stable asset release's ``Native:`` marker, else None.
+
+    Raises ContractError if one release names several native releases or a
+    malformed tag.
+    """
+    latest: tuple[tuple[int, ...], str, str] | None = None
+    for release in releases:
+        asset_tag = release.get("tag_name")
+        body = release.get("body")
+        if not isinstance(asset_tag, str) or not isinstance(body, str):
+            continue
+        try:
+            asset_version = parse_release_tag(asset_tag, allow_legacy=True)
+        except ContractError:
+            continue
+        if (
+            asset_version.channel is not Channel.STABLE
+            or release.get("draft") is not False
+        ):
+            continue
+        claims = set(_NATIVE_ALIGNMENT_RE.findall(body))
+        if not claims:
+            continue
+        if len(claims) != 1:
+            raise ContractError(
+                f"asset release {asset_tag!r} records {len(claims)} native alignments"
+            )
+        native_tag = claims.pop()
+        try:
+            native_version = parse_release_tag(native_tag)
+        except ContractError as error:
+            raise ContractError(
+                f"asset release {asset_tag!r} records a malformed native "
+                f"alignment: {error}"
+            ) from error
+        if native_version.channel is not Channel.STABLE:
+            continue
+        order = _native_release_order(native_tag)
+        if latest is None or order > latest[0]:
+            latest = (order, native_tag, asset_tag)
+    return None if latest is None else latest[1:]
 
 
 def find_correlated_release(
@@ -2376,6 +2440,7 @@ def advance_pipeline(
     reserved_release_tags: Sequence[str] | set[str] = (),
     publication_allowed: bool = True,
     publication_barrier_native_tag: str | None = None,
+    newer_native_scanned: bool = False,
 ) -> OrchestrationPlan:
     require_stable_provenance(provenance)
     if not publication_allowed:
@@ -2420,6 +2485,35 @@ def advance_pipeline(
             provenance=provenance,
             correlation_id=correlation_id,
             observation=PipelineObservation(published=published),
+        )
+
+    alignment = latest_published_native_alignment(releases)
+    if alignment is not None and _native_release_order(
+        provenance.native_release_tag
+    ) < _native_release_order(alignment[0]):
+        aligned_native_tag, aligned_asset_tag = alignment
+        if not newer_native_scanned:
+            return OrchestrationPlan(
+                action=OrchestrationAction.BLOCKED,
+                reason=(
+                    f"asset release {aligned_asset_tag} records native release "
+                    f"{aligned_native_tag}, newer than {provenance.native_release_tag}, "
+                    "but no newer stable native release is part of this scan; "
+                    "refusing to skip the newest scanned native release"
+                ),
+                provenance=provenance,
+                correlation_id=correlation_id,
+            )
+        return OrchestrationPlan(
+            action=OrchestrationAction.SUPERSEDED,
+            reason=(
+                f"{provenance.native_release_tag} is behind native release "
+                f"{aligned_native_tag}, already published as {aligned_asset_tag}; "
+                "only native releases at or ahead of the published alignment "
+                "are advanced for a new build identity"
+            ),
+            provenance=provenance,
+            correlation_id=correlation_id,
         )
 
     run_history_since = workflow_history_since(releases, provenance)
@@ -2964,8 +3058,7 @@ def _load_provenance_backlog(path: Path) -> list[NativeProvenance]:
     provenances.sort(
         key=lambda value: (
             value.native_release_published_at,
-            (*parse_release_tag(value.native_release_tag).version_parts,
-             parse_release_tag(value.native_release_tag).rebuild),
+            _native_release_order(value.native_release_tag),
         )
     )
     return provenances
@@ -3039,6 +3132,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         errors: list[dict[str, Any]] = []
         reserved_release_tags: set[str] = set()
         publication_barrier_native_tag: str | None = None
+        newest_native_order = max(
+            (_native_release_order(value.native_release_tag) for value in provenances),
+            default=(),
+        )
         for provenance in provenances:
             correlation_id = compute_correlation_id(provenance)
             pipeline_workspace = args.workspace / correlation_id
@@ -3052,13 +3149,17 @@ def main(argv: Sequence[str] | None = None) -> int:
                     reserved_release_tags=reserved_release_tags,
                     publication_allowed=publication_barrier_native_tag is None,
                     publication_barrier_native_tag=publication_barrier_native_tag,
+                    newer_native_scanned=(
+                        _native_release_order(provenance.native_release_tag)
+                        < newest_native_order
+                    ),
                 )
                 plans.append(plan.to_dict())
                 if plan.release_target is not None:
                     reserved_release_tags.add(plan.release_target.release_tag)
-                if (
-                    publication_barrier_native_tag is None
-                    and plan.action is not OrchestrationAction.NOOP
+                if publication_barrier_native_tag is None and plan.action not in (
+                    OrchestrationAction.NOOP,
+                    OrchestrationAction.SUPERSEDED,
                 ):
                     publication_barrier_native_tag = provenance.native_release_tag
                 if args.step_summary_file:

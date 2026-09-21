@@ -185,6 +185,11 @@ automated qualification run binds the candidate digest it is about to publish.
     ordered backlog prevents an older qualification wait from hiding or
     starving a newer stable native release; each exact pipeline advances by at
     most one stage per scheduled/manual scan.
+  - A provenance without its own exact publication is `superseded` (not
+    advanced, no tag claimed, no publication barrier) when a non-draft stable
+    asset release's `Native:` marker names a newer native release, compared by
+    version then rebuild. If that provenance is the newest native release in
+    the scan, it is `blocked` instead.
   - The resolver uses full default-branch history to keep the exact source SHA
     that executes a new candidate separate from the newest first-parent commit
     that changed governed runtime/build inputs. Pipeline correlation uses the
