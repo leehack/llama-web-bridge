@@ -60,7 +60,10 @@ from release_contract import (
     validate_release_identity,
     validate_release_immutability,
 )
-from release_publication_state import PUBLICATION_FILES
+from release_publication_state import (
+    PUBLICATION_FILES,
+    candidate_publication_digests,
+)
 from generate_release_manifest import ARTIFACTS
 import release_qualification as rq
 
@@ -472,11 +475,13 @@ class PublishedRelease:
     release_target: ReleaseTarget
     binding: PipelineBinding
     published_at: str
+    directory: Path | None = None
 
 
 class OrchestrationAction(str, Enum):
     NOOP = "noop"
     SUPERSEDED = "superseded"
+    SATISFIED_BY_IDENTICAL_RELEASE = "satisfied_by_identical_release"
     IN_FLIGHT = "in_flight"
     WAITING_FOR_PRIOR_PUBLICATION = "waiting_for_prior_publication"
     DISPATCH_CANDIDATE = "dispatch_candidate"
@@ -545,6 +550,7 @@ class PipelineObservation:
     fresh_binding: PipelineBinding | None = None
     candidate_in_flight_run_id: str | None = None
     candidate_run_id: str | None = None
+    satisfied_by: PublishedRelease | None = None
     qualification_in_flight_run_id: str | None = None
     qualification_run_id: str | None = None
     publish_in_flight_run_id: str | None = None
@@ -1476,6 +1482,95 @@ def find_correlated_release(
     return matches[0] if matches else None
 
 
+def latest_aligned_release(
+    releases: Sequence[Mapping[str, Any]], provenance: NativeProvenance
+) -> tuple[Mapping[str, Any], str] | None:
+    """Return the newest non-draft stable asset release whose notes record this
+    provenance's exact native release and native manifest digest, with the one
+    correlation it claims, else None.
+
+    A release with the same native markers but not exactly one well-formed
+    correlation marker is skipped. The pre-automation ``v0.1.40`` manifest
+    follows a different contract and is only comparable by its own provenance.
+    """
+    native_release_marker = (
+        f"Native: `{provenance.native_repo}@{provenance.native_release_tag}`"
+    )
+    native_manifest_marker = (
+        f"Native manifest SHA-256: `{provenance.native_manifest_sha256}`"
+    )
+    latest: tuple[tuple[int, ...], Mapping[str, Any], str] | None = None
+    for release in releases:
+        tag = release.get("tag_name")
+        body = release.get("body")
+        if not isinstance(tag, str) or not isinstance(body, str):
+            continue
+        try:
+            version = parse_release_tag(tag, allow_legacy=True)
+        except ContractError:
+            continue
+        if version.channel is not Channel.STABLE or release.get("draft") is not False:
+            continue
+        if native_release_marker not in body or native_manifest_marker not in body:
+            continue
+        if (
+            tag == LEGACY_MANUAL_QUALIFICATION_RELEASE_TAG
+            and _published_manifest_compatibility(tag=tag, provenance=provenance)
+            is None
+        ):
+            continue
+        claims: list[str] = []
+        for claim in re.findall(
+            r"(?m)^Orchestrator correlation: `([^`\r\n]+)`$", body
+        ):
+            try:
+                claims.append(require_correlation_id(claim))
+            except ContractError:
+                pass
+        if len(claims) != 1:
+            continue
+        order = (*version.version_parts, version.rebuild)
+        if latest is None or order > latest[0]:
+            latest = (order, release, claims[0])
+    return None if latest is None else latest[1:]
+
+
+def publication_bytes_identical(
+    candidate_digests: Mapping[str, str], published_digests: Mapping[str, str]
+) -> bool:
+    """True when every publication file except ``manifest.json`` has the same
+    SHA-256 in both complete inventories.
+
+    ``manifest.json`` embeds the candidate run ID/URL, output tag, correlation
+    and bridge commit, so it differs between any two builds; ``sha256sums.txt``
+    lists only the artifact digests and is compared.
+    """
+    expected = set(PUBLICATION_FILES)
+    if set(candidate_digests) != expected or set(published_digests) != expected:
+        raise ContractError("publication digest inventories must be complete")
+    return all(
+        candidate_digests[name] == published_digests[name]
+        for name in PUBLICATION_FILES
+        if name != "manifest.json"
+    )
+
+
+def _claimed_rebuilds_of(binding: PipelineBinding, claimed: set[str]) -> list[str]:
+    """Claimed tags that can publish only after ``binding`` publishes rebuild 0."""
+    if binding.release_rebuild != 0:
+        return []
+    version = parse_release_tag(binding.release_tag)
+    dependents: list[str] = []
+    for tag in claimed:
+        try:
+            claim = parse_release_tag(tag)
+        except ContractError:
+            continue
+        if claim.version_parts == version.version_parts and claim.rebuild > 0:
+            dependents.append(tag)
+    return sorted(dependents)
+
+
 def workflow_history_since(
     releases: Sequence[Mapping[str, Any]], provenance: NativeProvenance
 ) -> str:
@@ -1693,6 +1788,7 @@ def verify_published_release(
         release_target=binding.release_target,
         binding=binding,
         published_at=published_at,
+        directory=directory,
     )
 
 
@@ -2080,6 +2176,26 @@ def plan_pipeline(
             "a successful candidate run must carry its proven pipeline binding"
         )
 
+    if observation.satisfied_by is not None:
+        satisfied_by = observation.satisfied_by
+        return OrchestrationPlan(
+            action=OrchestrationAction.SATISFIED_BY_IDENTICAL_RELEASE,
+            reason=(
+                f"candidate run {observation.candidate_run_id} bound to "
+                f"{binding.release_tag} (rebuild {binding.release_rebuild}) has "
+                "publication files other than manifest.json byte-identical to the "
+                f"immutable release {satisfied_by.release_target.release_tag} (id "
+                f"{satisfied_by.release_id}, published {satisfied_by.published_at}) "
+                f"for native {provenance.native_release_tag}; nothing further is "
+                "dispatched"
+            ),
+            provenance=provenance,
+            correlation_id=correlation_id,
+            release_target=satisfied_by.release_target,
+            candidate_run_id=observation.candidate_run_id,
+            qualification_run_id=observation.qualification_run_id,
+        )
+
     if observation.qualification_in_flight_run_id is not None:
         return OrchestrationPlan(
             action=OrchestrationAction.IN_FLIGHT,
@@ -2451,26 +2567,30 @@ def claimed_release_tags(
     *,
     bridge_build_sha: str,
     downstream_runs: Sequence[RunRecord] = (),
+    satisfied_correlation_ids: Sequence[str] | set[str] = (),
 ) -> set[str]:
     """Output tags still claimed by candidate runs, across correlations.
 
-    A claim is dropped only when its correlation names a build identity other
-    than ``bridge_build_sha`` and no candidate, qualification or publication
-    run of that correlation is in flight. Scans advance only the current build
-    identity, so nothing dispatches for such a correlation again.
+    A claim is dropped when its correlation names a build identity other than
+    ``bridge_build_sha`` and no candidate, qualification or publication run of
+    that correlation is in flight, or when this scan already found that
+    correlation satisfied by an identical release. Scans advance only the
+    current build identity and a satisfied correlation publishes nothing, so
+    nothing dispatches for such a correlation again.
     """
     in_flight = {
         _run_correlation_id(record)
         for record in (*candidate_runs, *downstream_runs)
         if record.in_flight
     }
+    satisfied = set(satisfied_correlation_ids)
     claimed: set[str] = set()
     for record in candidate_runs:
         match = _CANDIDATE_RUN_NAME_RE.fullmatch(record.run_name)
         if match is None:
             continue
         correlation_id = match.group("correlation_id")
-        if (
+        if correlation_id in satisfied or (
             _names_other_build(correlation_id, bridge_build_sha)
             and correlation_id not in in_flight
         ):
@@ -2486,6 +2606,7 @@ def advance_pipeline(
     workspace: Path,
     dry_run: bool = False,
     reserved_release_tags: Sequence[str] | set[str] = (),
+    satisfied_correlation_ids: Sequence[str] | set[str] = (),
     publication_allowed: bool = True,
     publication_barrier_native_tag: str | None = None,
     newer_native_scanned: bool = False,
@@ -2580,8 +2701,8 @@ def advance_pipeline(
         default_branch=default_branch,
     )
     persisted = _resolve_candidate_binding(candidate_selection, correlation_id)
-    fresh_binding = None
-    if persisted is None:
+
+    def still_claimed_tags() -> set[str]:
         downstream_workflows = (
             (
                 (QUALIFICATION_WORKFLOW_FILE, QUALIFICATION_WORKFLOW_PATH),
@@ -2603,17 +2724,20 @@ def advance_pipeline(
                 created_since=run_history_since,
             )
         ]
+        return claimed_release_tags(
+            candidate_runs,
+            bridge_build_sha=provenance.bridge_build_sha,
+            downstream_runs=downstream_runs,
+            satisfied_correlation_ids=satisfied_correlation_ids,
+        )
+
+    fresh_binding = None
+    if persisted is None:
         target = select_next_release_target(
             [str(release.get("tag_name")) for release in releases],
             upstream_tag=provenance.upstream_tag,
             taken=(
-                asset_tag_names
-                | claimed_release_tags(
-                    candidate_runs,
-                    bridge_build_sha=provenance.bridge_build_sha,
-                    downstream_runs=downstream_runs,
-                )
-                | set(reserved_release_tags)
+                asset_tag_names | still_claimed_tags() | set(reserved_release_tags)
             ),
         )
         fresh_binding = PipelineBinding(
@@ -2687,6 +2811,38 @@ def advance_pipeline(
         workspace=workspace,
     )
 
+    def satisfied_plan(qualification_run_id: str | None) -> OrchestrationPlan | None:
+        aligned = latest_aligned_release(releases, provenance)
+        if aligned is None or _claimed_rebuilds_of(
+            candidate.binding, still_claimed_tags()
+        ):
+            return None
+        aligned_release, aligned_correlation_id = aligned
+        published = verify_published_release(
+            gateway,
+            release=aligned_release,
+            provenance=provenance,
+            correlation_id=aligned_correlation_id,
+            workspace=workspace,
+        )
+        if published.directory is None:
+            raise ContractError("verified release did not retain its downloaded bytes")
+        if not publication_bytes_identical(
+            candidate_publication_digests(candidate.directory),
+            candidate_publication_digests(published.directory),
+        ):
+            return None
+        return plan_pipeline(
+            provenance=provenance,
+            correlation_id=correlation_id,
+            observation=PipelineObservation(
+                binding=candidate.binding,
+                candidate_run_id=candidate.run_id,
+                qualification_run_id=qualification_run_id,
+                satisfied_by=published,
+            ),
+        )
+
     qualification_runs = _fetch_runs(
         gateway,
         workflow_file=QUALIFICATION_WORKFLOW_FILE,
@@ -2726,6 +2882,10 @@ def advance_pipeline(
         )
 
     if qualification_selection.succeeded_run_id is None:
+        if qualification_selection.in_flight_run_id is None:
+            satisfied = satisfied_plan(None)
+            if satisfied is not None:
+                return satisfied
         plan = plan_pipeline(
             provenance=provenance,
             correlation_id=correlation_id,
@@ -2812,6 +2972,13 @@ def advance_pipeline(
             candidate_run_id=candidate.run_id,
             qualification_run_id=qualification_selection.succeeded_run_id,
         )
+    if (
+        publish_selection.in_flight_run_id is None
+        and publish_selection.succeeded_run_id is None
+    ):
+        satisfied = satisfied_plan(qualification_selection.succeeded_run_id)
+        if satisfied is not None:
+            return satisfied
     plan = plan_pipeline(
         provenance=provenance,
         correlation_id=correlation_id,
@@ -3204,6 +3371,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         plans: list[dict[str, Any]] = []
         errors: list[dict[str, Any]] = []
         reserved_release_tags: set[str] = set()
+        satisfied_correlation_ids: set[str] = set()
         publication_barrier_native_tag: str | None = None
         newest_native_order = max(
             (_native_release_order(value.native_release_tag) for value in provenances),
@@ -3220,6 +3388,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     workspace=pipeline_workspace,
                     dry_run=args.dry_run,
                     reserved_release_tags=reserved_release_tags,
+                    satisfied_correlation_ids=satisfied_correlation_ids,
                     publication_allowed=publication_barrier_native_tag is None,
                     publication_barrier_native_tag=publication_barrier_native_tag,
                     newer_native_scanned=(
@@ -3228,11 +3397,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                     ),
                 )
                 plans.append(plan.to_dict())
-                if plan.release_target is not None:
+                if plan.action is OrchestrationAction.SATISFIED_BY_IDENTICAL_RELEASE:
+                    satisfied_correlation_ids.add(correlation_id)
+                elif plan.release_target is not None:
                     reserved_release_tags.add(plan.release_target.release_tag)
                 if publication_barrier_native_tag is None and plan.action not in (
                     OrchestrationAction.NOOP,
                     OrchestrationAction.SUPERSEDED,
+                    OrchestrationAction.SATISFIED_BY_IDENTICAL_RELEASE,
                 ):
                     publication_barrier_native_tag = provenance.native_release_tag
                 if args.step_summary_file:

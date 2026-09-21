@@ -26,7 +26,10 @@ from release_contract import (
     ContractError,
     NATIVE_REPOSITORY,
 )
-from release_publication_state import PUBLICATION_FILES
+from release_publication_state import (
+    PUBLICATION_FILES,
+    candidate_publication_digests,
+)
 from release_contract_test import release_attestation
 
 # The heavy attestation fixtures are pinned by the qualification suite that
@@ -1756,6 +1759,127 @@ class ClaimedReleaseTagsTest(unittest.TestCase):
                     ),
                     set(),
                 )
+
+    def test_satisfied_correlation_releases_its_claim(self) -> None:
+        sibling = sro.compute_correlation_id(
+            make_provenance(native_release_tag="v0.2.1", native_manifest_sha256="f" * 64)
+        )
+        runs = self._records(
+            sro.CANDIDATE_WORKFLOW_PATH,
+            ("501", self._candidate_name(self.current, "v0.1.40", 0),
+             "completed", "success"),
+            ("502", self._candidate_name(sibling, "v0.1.40-1", 1),
+             "completed", "success"),
+        )
+        self.assertEqual(
+            sro.claimed_release_tags(runs, bridge_build_sha=BRIDGE_SHA),
+            {"v0.1.40", "v0.1.40-1"},
+        )
+        self.assertEqual(
+            sro.claimed_release_tags(
+                runs,
+                bridge_build_sha=BRIDGE_SHA,
+                satisfied_correlation_ids={self.current},
+            ),
+            {"v0.1.40-1"},
+        )
+
+
+class IdenticalPublicationTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="sro-identical-"))
+        self.provenance = make_provenance()
+        self.prior = dataclasses.replace(
+            self.provenance,
+            bridge_source_sha=ADVANCED_BRIDGE_SHA,
+            bridge_build_sha=ADVANCED_BRIDGE_SHA,
+        )
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _digests(self, name: str, *, marker: bytes, tag: str, provenance: Any) -> dict[str, str]:
+        directory = self.tmp / name
+        write_bridge_candidate(
+            directory,
+            release_tag=tag,
+            release_rebuild=0,
+            correlation_id=sro.compute_correlation_id(provenance),
+            bridge_commit=provenance.bridge_source_sha,
+            run_id=str(700 + len(name)),
+            marker=marker,
+        )
+        return candidate_publication_digests(directory)
+
+    def test_manifest_is_the_only_file_that_differs_between_identical_builds(self) -> None:
+        published = self._digests("published", marker=b"same", tag="v0.1.41", provenance=self.prior)
+        candidate = self._digests("candidate", marker=b"same", tag="v0.1.42", provenance=self.provenance)
+        self.assertEqual(
+            {name for name in PUBLICATION_FILES if published[name] != candidate[name]},
+            {"manifest.json"},
+        )
+        self.assertTrue(sro.publication_bytes_identical(candidate, published))
+
+    def test_one_differing_artifact_is_not_identical(self) -> None:
+        published = self._digests("published", marker=b"same", tag="v0.1.41", provenance=self.prior)
+        candidate = self._digests("candidate", marker=b"changed", tag="v0.1.42", provenance=self.provenance)
+        self.assertFalse(sro.publication_bytes_identical(candidate, published))
+
+    def test_incomplete_inventory_fails_closed(self) -> None:
+        published = self._digests("published", marker=b"same", tag="v0.1.41", provenance=self.prior)
+        candidate = self._digests("candidate", marker=b"same", tag="v0.1.42", provenance=self.provenance)
+        for side in ("candidate", "published"):
+            with self.subTest(side=side):
+                partial = dict(candidate if side == "candidate" else published)
+                partial.pop(ARTIFACTS[0])
+                with self.assertRaises(ContractError):
+                    sro.publication_bytes_identical(
+                        partial if side == "candidate" else candidate,
+                        published if side == "candidate" else partial,
+                    )
+
+    def test_latest_aligned_release_is_the_newest_tag_for_this_native(self) -> None:
+        other_native = make_provenance(
+            native_release_tag="v0.2.1", native_manifest_sha256="f" * 64
+        )
+        releases = [
+            aligned_release_stub("v0.1.41", self.prior),
+            aligned_release_stub("v0.1.41-2", self.prior),
+            aligned_release_stub("v0.1.42", other_native),
+            aligned_release_stub("v0.1.41-1", self.prior),
+        ]
+        selected = sro.latest_aligned_release(releases, self.provenance)
+        self.assertIsNotNone(selected)
+        self.assertEqual(selected[0]["tag_name"], "v0.1.41-2")
+        self.assertEqual(selected[1], sro.compute_correlation_id(self.prior))
+        self.assertIsNone(sro.latest_aligned_release(releases[2:3], self.provenance))
+
+    def test_latest_aligned_release_skips_drafts_and_ambiguous_correlations(self) -> None:
+        draft = aligned_release_stub("v0.1.41", self.prior)
+        draft["draft"] = True
+        self.assertIsNone(sro.latest_aligned_release([draft], self.provenance))
+        ambiguous = aligned_release_stub("v0.1.41", self.prior)
+        ambiguous["body"] += (
+            f"Orchestrator correlation: `{sro.compute_correlation_id(self.provenance)}`\n"
+        )
+        malformed = aligned_release_stub("v0.1.41-1", self.prior)
+        malformed["body"] = malformed["body"].replace(
+            sro.compute_correlation_id(self.prior), "not a correlation"
+        )
+        older = aligned_release_stub("v0.1.41", self.prior)
+        for releases in ([ambiguous], [malformed]):
+            self.assertIsNone(sro.latest_aligned_release(releases, self.provenance))
+        selected = sro.latest_aligned_release(
+            [older, ambiguous, malformed], self.provenance
+        )
+        self.assertIs(selected[0], older)
+
+    def test_legacy_v0140_is_comparable_only_by_its_own_provenance(self) -> None:
+        legacy = make_legacy_v0140_provenance()
+        release = aligned_release_stub("v0.1.40", legacy)
+        self.assertIsNotNone(sro.latest_aligned_release([release], legacy))
+        governed = make_legacy_v0140_provenance(bridge_build_sha=ADVANCED_BRIDGE_SHA)
+        self.assertIsNone(sro.latest_aligned_release([release], governed))
 
 
 class PublishedReleaseVerificationTest(unittest.TestCase):
@@ -3810,6 +3934,510 @@ class AdvancePipelineTest(unittest.TestCase):
             f"repos/{BRIDGE_REPOSITORY}/compare/{HEAD_SHA}...{DEFAULT_BRANCH}"
         )
         self.assertEqual(gateway.api_paths.count(qualification_reachability_path), 2)
+
+    def _aligned_release(
+        self,
+        published_dir: Path,
+        *,
+        tag: str,
+        provenance: sro.NativeProvenance,
+        correlation_id: str,
+        release_id: int = 4343,
+    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, bytes], dict[tuple[str, str], Any]]:
+        """A verifiable immutable release carrying the deterministic notes."""
+        members = directory_members(published_dir)
+        fingerprint = rq.load_candidate(published_dir)[1]
+        body = (
+            f"Candidate fingerprint: `{fingerprint}`\n"
+            f"Native: `{provenance.native_repo}@{provenance.native_release_tag}`\n"
+            f"Native manifest SHA-256: `{provenance.native_manifest_sha256}`\n"
+            f"Orchestrator correlation: `{correlation_id}`\n"
+        )
+        release = release_payload(
+            tag=tag, body=body, members=members, release_id=release_id
+        )
+        routes = {
+            f"repos/{ASSETS_REPOSITORY}/git/ref/tags/{tag}": {
+                "ref": f"refs/tags/{tag}",
+                "object": {"type": "commit", "sha": ASSETS_TAG_COMMIT},
+            },
+            f"repos/{ASSETS_REPOSITORY}/releases/tags/{tag}": release,
+            f"repos/{ASSETS_REPOSITORY}/releases/{release_id}": release,
+        }
+        blobs = {
+            f"repos/{ASSETS_REPOSITORY}/releases/assets/{asset['id']}": members[
+                asset["name"]
+            ]
+            for asset in release["assets"]
+        }
+        attestations = {
+            (ASSETS_REPOSITORY, tag): release_attestation(
+                release_tag=tag,
+                assets_repo=ASSETS_REPOSITORY,
+                tag_commit=ASSETS_TAG_COMMIT,
+                release_id=release_id,
+                assets={
+                    name: hashlib.sha256(data).hexdigest()
+                    for name, data in members.items()
+                },
+            )
+        }
+        return release, routes, blobs, attestations
+
+    def _proven_candidate(
+        self,
+        candidate_dir: Path,
+        *,
+        marker: bytes,
+        release_tag: str,
+        provenance: sro.NativeProvenance,
+    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, bytes]]:
+        """A succeeded candidate run whose artifact is downloadable and proven."""
+        correlation_id = sro.compute_correlation_id(provenance)
+        write_bridge_candidate(
+            candidate_dir,
+            release_tag=release_tag,
+            release_rebuild=0,
+            correlation_id=correlation_id,
+            run_id=CANDIDATE_RUN_ID,
+            marker=marker,
+            upstream_tag=provenance.upstream_tag,
+            upstream_commit=provenance.upstream_commit,
+            native_release_tag=provenance.native_release_tag,
+            native_manifest_sha256=provenance.native_manifest_sha256,
+            native_commit=provenance.native_commit,
+        )
+        run = run_payload(
+            run_id=CANDIDATE_RUN_ID,
+            path=sro.CANDIDATE_WORKFLOW_PATH,
+            run_name=sro.candidate_run_name(
+                correlation_id, sro.PipelineBinding(BRIDGE_SHA, release_tag, 0)
+            ),
+        )
+        runs = f"repos/{BRIDGE_REPOSITORY}/actions/runs"
+        routes = {
+            f"{runs}/{CANDIDATE_RUN_ID}": run,
+            f"{runs}/{CANDIDATE_RUN_ID}/artifacts?per_page=100": artifact_inventory(
+                run_id=CANDIDATE_RUN_ID,
+                name=rq.CANDIDATE_ARTIFACT_NAME,
+                artifact_id=CANDIDATE_ARTIFACT_ID,
+            ),
+        }
+        blobs = {
+            f"repos/{BRIDGE_REPOSITORY}/actions/artifacts/{CANDIDATE_ARTIFACT_ID}/zip": (
+                flat_zip(directory_members(candidate_dir))
+            )
+        }
+        return run, routes, blobs
+
+    def _aligned_candidate_gateway(
+        self,
+        *,
+        candidate_marker: bytes,
+        provenance: sro.NativeProvenance | None = None,
+        sibling_runs: list[dict[str, Any]] | None = None,
+    ) -> tuple[FakeGateway, dict[str, Any], dict[str, Any]]:
+        """``v0.1.41`` publishes ``b"same"`` bytes for native ``v0.2.0`` under an
+        earlier build identity; the scanned provenance has a proven candidate
+        bound to ``v0.1.42``."""
+        provenance = provenance or self.provenance
+        prior = dataclasses.replace(
+            self.provenance,
+            bridge_source_sha=ADVANCED_BRIDGE_SHA,
+            bridge_build_sha=ADVANCED_BRIDGE_SHA,
+        )
+        prior_correlation = sro.compute_correlation_id(prior)
+        published_dir = self.tmp / "published-src"
+        write_bridge_candidate(
+            published_dir,
+            release_tag="v0.1.41",
+            release_rebuild=0,
+            correlation_id=prior_correlation,
+            bridge_commit=ADVANCED_BRIDGE_SHA,
+            run_id="777",
+            marker=b"same",
+        )
+        release, release_routes, release_blobs, attestations = self._aligned_release(
+            published_dir,
+            tag="v0.1.41",
+            provenance=prior,
+            correlation_id=prior_correlation,
+        )
+        run, run_routes, run_blobs = self._proven_candidate(
+            self.tmp / "candidate-src",
+            marker=candidate_marker,
+            release_tag="v0.1.42",
+            provenance=provenance,
+        )
+        routes = self._routes(
+            releases=[release], candidate_runs=[run, *(sibling_runs or [])]
+        )
+        routes.update(release_routes)
+        routes.update(run_routes)
+        gateway = FakeGateway(
+            json_routes=routes,
+            blob_routes={**release_blobs, **run_blobs},
+            release_attestations=attestations,
+        )
+        return gateway, release, run
+
+    def _expect_qualification_dispatch(
+        self, gateway: FakeGateway, provenance: sro.NativeProvenance
+    ) -> None:
+        correlation_id = sro.compute_correlation_id(provenance)
+        readback_key = sro._workflow_runs_path(
+            workflow_file=sro.QUALIFICATION_WORKFLOW_FILE,
+            default_branch=DEFAULT_BRANCH,
+            created_since=NATIVE_PUBLISHED_AT,
+        )
+        dispatched = run_payload(
+            run_id="4201",
+            path=sro.QUALIFICATION_WORKFLOW_PATH,
+            run_name=sro.qualification_run_name(correlation_id, CANDIDATE_RUN_ID),
+            status="in_progress",
+            conclusion=None,
+        )
+        original_dispatch = gateway.dispatch_workflow
+
+        def dispatch(**kwargs: Any) -> None:
+            original_dispatch(**kwargs)
+            gateway.json_routes[readback_key] = runs_response([dispatched])
+
+        gateway.dispatch_workflow = dispatch  # type: ignore[assignment]
+
+    def test_identical_candidate_is_satisfied_by_the_aligned_release(self) -> None:
+        gateway, release, _ = self._aligned_candidate_gateway(candidate_marker=b"same")
+        plan = sro.advance_pipeline(
+            gateway, provenance=self.provenance, workspace=self.tmp
+        )
+        self.assertEqual(
+            plan.action, sro.OrchestrationAction.SATISFIED_BY_IDENTICAL_RELEASE
+        )
+        self.assertEqual(plan.release_target.release_tag, "v0.1.41")
+        self.assertEqual(plan.candidate_run_id, CANDIDATE_RUN_ID)
+        self.assertIsNone(plan.dispatch_workflow)
+        self.assertIn("v0.1.42", plan.reason)
+        self.assertEqual(gateway.dispatches, [])
+        self.assertIn(
+            f"repos/{ASSETS_REPOSITORY}/releases/{release['id']}", gateway.api_paths
+        )
+        self.assertIsNone(plan.qualification_run_id)
+        self.assertIn("other than manifest.json", plan.reason)
+        self.assertEqual(plan.to_dict()["action"], "satisfied_by_identical_release")
+
+    def _qualify_candidate(
+        self, gateway: FakeGateway, *, publish_runs: tuple[dict[str, Any], ...] = ()
+    ) -> None:
+        """Record a succeeded, attested qualification of the aligned fixture's
+        candidate and the given publication runs."""
+        manifest, fingerprint = rq.load_candidate(self.tmp / "candidate-src")
+        attestation = rq.build_attestation(
+            manifest=manifest,
+            candidate_fingerprint=fingerprint,
+            candidate_run_id=CANDIDATE_RUN_ID,
+            candidate_artifact_id=CANDIDATE_ARTIFACT_ID,
+            candidate_run_attempt=1,
+            **qualification_identity(
+                qualification_run_id=QUALIFICATION_RUN_ID,
+                qualification_source_sha=HEAD_SHA,
+            ),
+            harness_digest=rq.harness_source_sha256(Path(__file__).resolve().parent),
+            environment=qualification_environment(),
+            speech_phase=speech_phase(),
+            tts_phase=tts_phase(),
+        )
+        qualification_run = run_payload(
+            run_id=QUALIFICATION_RUN_ID,
+            path=sro.QUALIFICATION_WORKFLOW_PATH,
+            run_name=sro.qualification_run_name(self.correlation_id, CANDIDATE_RUN_ID),
+        )
+        runs = f"repos/{BRIDGE_REPOSITORY}/actions/runs"
+        gateway.json_routes[f"{runs}/{QUALIFICATION_RUN_ID}"] = qualification_run
+        gateway.json_routes[
+            f"{runs}/{QUALIFICATION_RUN_ID}/artifacts?per_page=100"
+        ] = artifact_inventory(
+            run_id=QUALIFICATION_RUN_ID,
+            name=rq.ATTESTATION_ARTIFACT_NAME,
+            artifact_id=QUALIFICATION_ARTIFACT_ID,
+        )
+        for workflow_file, listed in (
+            (sro.QUALIFICATION_WORKFLOW_FILE, [qualification_run]),
+            (sro.PUBLISH_WORKFLOW_FILE, list(publish_runs)),
+        ):
+            gateway.json_routes[
+                sro._workflow_runs_path(
+                    workflow_file=workflow_file,
+                    default_branch=DEFAULT_BRANCH,
+                    created_since=NATIVE_PUBLISHED_AT,
+                )
+            ] = runs_response(listed)
+        gateway.blob_routes[
+            f"repos/{BRIDGE_REPOSITORY}/actions/artifacts/{QUALIFICATION_ARTIFACT_ID}/zip"
+        ] = flat_zip(
+            {"qualification-attestation.json": rq.canonical_json(attestation).encode("utf-8")}
+        )
+
+    def _publish_run(self, *, status: str, conclusion: str | None) -> dict[str, Any]:
+        return run_payload(
+            run_id="701",
+            path=sro.PUBLISH_WORKFLOW_PATH,
+            run_name=sro.publish_run_name(
+                self.correlation_id,
+                CANDIDATE_RUN_ID,
+                QUALIFICATION_RUN_ID,
+                sro.PipelineBinding(BRIDGE_SHA, "v0.1.42", 0),
+            ),
+            status=status,
+            conclusion=conclusion,
+        )
+
+    def test_qualified_identical_candidate_is_satisfied_before_publication(self) -> None:
+        gateway, release, _ = self._aligned_candidate_gateway(candidate_marker=b"same")
+        self._qualify_candidate(gateway)
+        plan = sro.advance_pipeline(
+            gateway, provenance=self.provenance, workspace=self.tmp
+        )
+        self.assertEqual(
+            plan.action, sro.OrchestrationAction.SATISFIED_BY_IDENTICAL_RELEASE
+        )
+        self.assertEqual(plan.release_target.release_tag, "v0.1.41")
+        self.assertEqual(plan.qualification_run_id, QUALIFICATION_RUN_ID)
+        self.assertEqual(gateway.dispatches, [])
+        self.assertIn(
+            f"repos/{ASSETS_REPOSITORY}/releases/{release['id']}", gateway.api_paths
+        )
+
+    def test_failed_publication_of_an_identical_candidate_is_satisfied_not_retried(
+        self,
+    ) -> None:
+        gateway, _, _ = self._aligned_candidate_gateway(candidate_marker=b"same")
+        self._qualify_candidate(
+            gateway, publish_runs=(self._publish_run(status="completed", conclusion="failure"),)
+        )
+        plan = sro.advance_pipeline(
+            gateway, provenance=self.provenance, workspace=self.tmp
+        )
+        self.assertEqual(
+            plan.action, sro.OrchestrationAction.SATISFIED_BY_IDENTICAL_RELEASE
+        )
+        self.assertEqual(gateway.dispatches, [])
+
+    def test_identical_candidate_with_qualification_in_flight_is_not_compared(
+        self,
+    ) -> None:
+        gateway, release, _ = self._aligned_candidate_gateway(candidate_marker=b"same")
+        gateway.json_routes[
+            sro._workflow_runs_path(
+                workflow_file=sro.QUALIFICATION_WORKFLOW_FILE,
+                default_branch=DEFAULT_BRANCH,
+                created_since=NATIVE_PUBLISHED_AT,
+            )
+        ] = runs_response(
+            [
+                run_payload(
+                    run_id="4201",
+                    path=sro.QUALIFICATION_WORKFLOW_PATH,
+                    run_name=sro.qualification_run_name(
+                        self.correlation_id, CANDIDATE_RUN_ID
+                    ),
+                    status="in_progress",
+                    conclusion=None,
+                )
+            ]
+        )
+        plan = sro.advance_pipeline(
+            gateway, provenance=self.provenance, workspace=self.tmp
+        )
+        self.assertEqual(plan.action, sro.OrchestrationAction.IN_FLIGHT)
+        self.assertEqual(plan.in_flight_workflow, sro.QUALIFICATION_WORKFLOW_FILE)
+        self.assertEqual(plan.release_target.release_tag, "v0.1.42")
+        self.assertFalse(
+            any(f"/releases/{release['id']}" in path for path in gateway.api_paths)
+        )
+
+    def test_identical_candidate_with_publication_in_flight_keeps_its_tag(
+        self,
+    ) -> None:
+        gateway, release, run = self._aligned_candidate_gateway(candidate_marker=b"same")
+        self._qualify_candidate(
+            gateway, publish_runs=(self._publish_run(status="in_progress", conclusion=None),)
+        )
+        plan = sro.advance_pipeline(
+            gateway, provenance=self.provenance, workspace=self.tmp
+        )
+        self.assertEqual(plan.action, sro.OrchestrationAction.IN_FLIGHT)
+        self.assertEqual(plan.in_flight_workflow, sro.PUBLISH_WORKFLOW_FILE)
+        self.assertEqual(plan.release_target.release_tag, "v0.1.42")
+        self.assertFalse(
+            any(f"/releases/{release['id']}" in path for path in gateway.api_paths)
+        )
+
+        newer = self._route_newer_native(gateway, release, run)
+        result, backlog = self._run_backlog(gateway, [self.provenance, newer])
+        self.assertEqual(backlog["errors"], [])
+        self.assertEqual(result, 0)
+        self.assertEqual(
+            [
+                (item["provenance"]["native_release_tag"], item["action"], item["release_tag"])
+                for item in backlog["plans"]
+            ],
+            [
+                ("v0.2.0", "in_flight", "v0.1.42"),
+                ("v0.2.1", "dispatch_candidate", "v0.1.42-1"),
+            ],
+        )
+        self.assertEqual(
+            [
+                (record["workflow_file"], record["inputs"]["release_tag"], record["inputs"]["release_rebuild"])
+                for record in gateway.dispatches
+            ],
+            [(sro.CANDIDATE_WORKFLOW_FILE, "v0.1.42-1", "1")],
+        )
+
+    def test_differing_candidate_is_qualified_not_skipped(self) -> None:
+        gateway, _, _ = self._aligned_candidate_gateway(candidate_marker=b"changed")
+        self._expect_qualification_dispatch(gateway, self.provenance)
+        plan = sro.advance_pipeline(
+            gateway, provenance=self.provenance, workspace=self.tmp
+        )
+        self.assertEqual(plan.action, sro.OrchestrationAction.DISPATCH_QUALIFICATION)
+        self.assertEqual(plan.release_target.release_tag, "v0.1.42")
+        self.assertEqual(
+            [record["workflow_file"] for record in gateway.dispatches],
+            [sro.QUALIFICATION_WORKFLOW_FILE],
+        )
+
+    def test_identical_bytes_under_another_native_alignment_are_not_compared(self) -> None:
+        rebuilt = make_provenance(native_release_tag="v0.2.0-1")
+        gateway, release, _ = self._aligned_candidate_gateway(
+            candidate_marker=b"same", provenance=rebuilt
+        )
+        self._expect_qualification_dispatch(gateway, rebuilt)
+        plan = sro.advance_pipeline(gateway, provenance=rebuilt, workspace=self.tmp)
+        self.assertEqual(plan.action, sro.OrchestrationAction.DISPATCH_QUALIFICATION)
+        self.assertFalse(
+            any(f"/releases/{release['id']}" in path for path in gateway.api_paths)
+        )
+        self.assertEqual(
+            [record["workflow_file"] for record in gateway.dispatches],
+            [sro.QUALIFICATION_WORKFLOW_FILE],
+        )
+
+    def _route_newer_native(
+        self, gateway: FakeGateway, release: dict[str, Any], run: dict[str, Any]
+    ) -> sro.NativeProvenance:
+        """Route a backlog scan of native ``v0.2.1`` that sees ``run`` as the only
+        candidate and lists the candidate it dispatches on readback."""
+        newer = self._newer_native()
+        newer_since = sro.workflow_history_since([release], newer)
+        self.assertNotEqual(newer_since, NATIVE_PUBLISHED_AT)
+        for workflow_file in (
+            sro.CANDIDATE_WORKFLOW_FILE,
+            sro.QUALIFICATION_WORKFLOW_FILE,
+            sro.PUBLISH_WORKFLOW_FILE,
+        ):
+            gateway.json_routes[
+                sro._workflow_runs_path(
+                    workflow_file=workflow_file,
+                    default_branch=DEFAULT_BRANCH,
+                    created_since=newer_since,
+                )
+            ] = runs_response([run] if workflow_file == sro.CANDIDATE_WORKFLOW_FILE else [])
+        readback_key = sro._workflow_runs_path(
+            workflow_file=sro.CANDIDATE_WORKFLOW_FILE,
+            default_branch=DEFAULT_BRANCH,
+            created_since=newer.native_release_published_at,
+        )
+        gateway.json_routes[readback_key] = runs_response([run])
+        original_dispatch = gateway.dispatch_workflow
+
+        def dispatch(**kwargs: Any) -> None:
+            original_dispatch(**kwargs)
+            gateway.json_routes[readback_key] = runs_response(
+                [
+                    run,
+                    run_payload(
+                        run_id="501",
+                        path=sro.CANDIDATE_WORKFLOW_PATH,
+                        run_name=(
+                            f"bridge-candidate {sro.compute_correlation_id(newer)}"
+                            f" source:{BRIDGE_SHA}"
+                            f" tag:{kwargs['inputs']['release_tag']}"
+                            f" rebuild:{kwargs['inputs']['release_rebuild']}"
+                        ),
+                        status="in_progress",
+                        conclusion=None,
+                    ),
+                ]
+            )
+
+        gateway.dispatch_workflow = dispatch  # type: ignore[assignment]
+        return newer
+
+    def test_satisfied_correlation_stays_satisfied_and_frees_its_tag_on_later_scans(
+        self,
+    ) -> None:
+        gateway, release, run = self._aligned_candidate_gateway(candidate_marker=b"same")
+        for scan in (1, 2):
+            with self.subTest(scan=scan):
+                workspace = self.tmp / f"scan-{scan}"
+                workspace.mkdir()
+                plan = sro.advance_pipeline(
+                    gateway, provenance=self.provenance, workspace=workspace
+                )
+                self.assertEqual(
+                    plan.action,
+                    sro.OrchestrationAction.SATISFIED_BY_IDENTICAL_RELEASE,
+                )
+        self.assertEqual(gateway.dispatches, [])
+        self.assertFalse(
+            any(sro.PUBLISH_WORKFLOW_FILE in path for path in gateway.api_paths)
+        )
+
+        newer = self._route_newer_native(gateway, release, run)
+        result, backlog = self._run_backlog(gateway, [self.provenance, newer])
+        self.assertEqual(backlog["errors"], [])
+        self.assertEqual(result, 0)
+        self.assertEqual(
+            [
+                (item["provenance"]["native_release_tag"], item["action"], item["release_tag"])
+                for item in backlog["plans"]
+            ],
+            [
+                ("v0.2.0", "satisfied_by_identical_release", "v0.1.41"),
+                ("v0.2.1", "dispatch_candidate", "v0.1.42"),
+            ],
+        )
+        self.assertEqual(
+            [
+                (record["workflow_file"], record["inputs"]["release_tag"], record["inputs"]["release_rebuild"])
+                for record in gateway.dispatches
+            ],
+            [(sro.CANDIDATE_WORKFLOW_FILE, "v0.1.42", "0")],
+        )
+
+    def test_identical_candidate_still_publishes_when_a_sibling_claims_its_rebuild(
+        self,
+    ) -> None:
+        sibling = run_payload(
+            run_id="502",
+            path=sro.CANDIDATE_WORKFLOW_PATH,
+            run_name=sro.candidate_run_name(
+                sro.compute_correlation_id(self._newer_native()),
+                sro.PipelineBinding(BRIDGE_SHA, "v0.1.42-1", 1),
+            ),
+        )
+        gateway, release, _ = self._aligned_candidate_gateway(
+            candidate_marker=b"same", sibling_runs=[sibling]
+        )
+        self._expect_qualification_dispatch(gateway, self.provenance)
+        plan = sro.advance_pipeline(
+            gateway, provenance=self.provenance, workspace=self.tmp
+        )
+        self.assertEqual(plan.action, sro.OrchestrationAction.DISPATCH_QUALIFICATION)
+        self.assertFalse(
+            any(f"/releases/{release['id']}" in path for path in gateway.api_paths)
+        )
 
     def test_attestation_bound_to_another_candidate_fails_closed(self) -> None:
         candidate_dir = self.tmp / "candidate-src"

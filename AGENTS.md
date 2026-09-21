@@ -240,6 +240,21 @@ automated qualification run binds the candidate digest it is about to publish.
     without blocking candidate creation for later backlog entries. A successful
     qualification workflow event wakes the orchestrator to dispatch publication;
     the daily schedule remains the idempotent repair fallback.
+  - A proven candidate whose publication files other than `manifest.json` are
+    byte-identical to the newest non-draft stable asset release recording the
+    same native release and native manifest digest is
+    `satisfied_by_identical_release`: that release is re-verified with the
+    already-published noop validators, no qualification or publication is
+    dispatched, later scans reach the same result while that alignment remains
+    the newest published one (otherwise the entry is superseded as usual), and
+    the candidate's output tag claim is released to later pipelines in the same
+    scan. `manifest.json` embeds the candidate run identity and output tag, so
+    it never matches. The comparison runs only where a qualification or
+    publication would otherwise be dispatched, never while one of the
+    correlation's runs is in flight. No comparison happens across native
+    alignments, against the pre-automation `v0.1.40` manifest for another build
+    identity, or while another pipeline still claims a rebuild of the
+    candidate's unpublished version.
   - An already-published noop requires the same governed build identity and
     independently resolves the assets tag commit,
     validates release reads by tag and ID, downloads and hashes the exact asset
