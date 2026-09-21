@@ -208,6 +208,13 @@ query strings, and fragments before printing the location.
   An entry without its own exact publication is `superseded` when a published
   stable asset release's `Native:` marker names a newer native release (version,
   then rebuild); the newest native release in a scan is `blocked` instead.
+  A proven candidate whose publication files other than `manifest.json` are
+  byte-identical to the newest published release for the same native release
+  and native manifest digest is `satisfied_by_identical_release`: nothing
+  further is dispatched and its output tag is released to later pipelines in
+  the same scan. The comparison runs only where a qualification or publication
+  would otherwise be dispatched, never while one of the correlation's runs is
+  in flight, and never across native alignments.
   Manual `development` scans stay scan-only: they resolve exact `bNNNN`
   provenance and report it, and the orchestrator refuses non-stable provenance.
   A failed candidate or qualification is never retried automatically; after diagnosis,
