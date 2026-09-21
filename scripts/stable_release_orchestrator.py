@@ -3,8 +3,8 @@
 
 Each event-driven scan resolves every stable native release after the immutable
 automation baseline, then idempotently advances each three-stage pipeline. A
-release behind the native alignment assets already publish is superseded, not
-rebuilt. A daily scheduled scan provides repair fallback:
+native release older than one a published asset release already records is
+superseded, not rebuilt. A daily scheduled scan provides repair fallback:
 
 1. Build Exact Bridge Candidate      (.github/workflows/bridge_candidate.yml)
 2. Qualify Exact Bridge Candidate    (.github/workflows/bridge_qualification.yml)
@@ -1380,12 +1380,11 @@ def _native_release_order(native_release_tag: str) -> tuple[int, ...]:
 def latest_published_native_alignment(
     releases: Sequence[Mapping[str, Any]],
 ) -> tuple[str, str] | None:
-    """Return the newest stable native tag a stable asset release records.
+    """Return ``(native_tag, asset_tag)`` for the newest stable native release
+    named by a non-draft stable asset release's ``Native:`` marker, else None.
 
-    The result is ``(native_release_tag, asset_release_tag)``. Only a published
-    stable asset release with exactly one well-formed marker is evidence, so
-    missing or foreign state keeps a provenance eligible and leaves rejection
-    to the publication ordering guard; contradictory state fails closed.
+    Raises ContractError if one release names several native releases or a
+    malformed tag.
     """
     latest: tuple[tuple[int, ...], str, str] | None = None
     for release in releases:
@@ -2488,12 +2487,6 @@ def advance_pipeline(
             observation=PipelineObservation(published=published),
         )
 
-    # Only a native release at or ahead of the one assets already align to
-    # (version, then rebuild) is advanced. The publication ordering guard rejects
-    # an older upstream line, which would stall every later pipeline behind an
-    # unpublishable candidate; an older rebuild of the same line is skipped too,
-    # stricter than the guard. The skip needs a newer native release in the same
-    # scan; without one the pipeline blocks.
     alignment = latest_published_native_alignment(releases)
     if alignment is not None and _native_release_order(
         provenance.native_release_tag
@@ -3164,7 +3157,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                 plans.append(plan.to_dict())
                 if plan.release_target is not None:
                     reserved_release_tags.add(plan.release_target.release_tag)
-                # A superseded pipeline never publishes, so it is no barrier.
                 if publication_barrier_native_tag is None and plan.action not in (
                     OrchestrationAction.NOOP,
                     OrchestrationAction.SUPERSEDED,

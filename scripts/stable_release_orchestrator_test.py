@@ -547,7 +547,6 @@ class BridgeSourceIdentityTest(unittest.TestCase):
         test = self.repository / "scripts" / "resolver_test.py"
         test.parent.mkdir()
         test.write_text("# regression\n", encoding="utf-8")
-        # The CI change selector never reaches the candidate or publication.
         (test.parent / "ci_scope.py").write_text("# selector\n", encoding="utf-8")
         orchestration_head = self._commit("workflow tests and docs")
 
@@ -589,7 +588,6 @@ class BridgeSourceIdentityTest(unittest.TestCase):
             ".github/workflows/auto_llama_cpp_update.yml",
             "README.md",
             "docs/api.md",
-            # Imported only by bridge_operation_queue_test.mjs.
             "scripts/bridge_operation_queue_direct_cases.mjs",
             "scripts/bridge_operation_queue_fixtures.mjs",
             "scripts/bridge_operation_queue_lifecycle_contract_cases.mjs",
@@ -854,7 +852,6 @@ class PublishedNativeAlignmentTest(unittest.TestCase):
             with self.subTest(body=release["body"]):
                 with self.assertRaises(ContractError):
                     sro.latest_published_native_alignment([release])
-        # A repeated identical marker is still one unambiguous alignment.
         self.assertEqual(
             sro.latest_published_native_alignment(
                 [self.release("v0.1.44", "v0.4.1", "v0.4.1")]
@@ -2692,8 +2689,6 @@ class AdvancePipelineTest(unittest.TestCase):
         return result, json.loads(output_plan.read_text(encoding="utf-8"))
 
     def test_native_behind_the_published_alignment_is_superseded(self) -> None:
-        # Assets already ship v0.2.1 from an earlier governed build; v0.2.0 under
-        # the current build could only be rejected by the ordering guard.
         prior_build = self._newer_native(bridge_build_sha=ADVANCED_BRIDGE_SHA)
         gateway = FakeGateway(
             json_routes=self._routes(
@@ -2711,7 +2706,6 @@ class AdvancePipelineTest(unittest.TestCase):
         self.assertIn("v0.1.40", plan.reason)
         self.assertIsNone(plan.release_target)
         self.assertEqual(gateway.dispatches, [])
-        # No run history is read and no output tag is claimed for it.
         self.assertFalse(any("/actions/" in path for path in gateway.api_paths))
 
     def test_newest_scanned_native_is_never_skipped_as_superseded(self) -> None:
@@ -2734,7 +2728,6 @@ class AdvancePipelineTest(unittest.TestCase):
         )
 
     def test_newest_native_stays_eligible_after_a_governed_bridge_change(self) -> None:
-        # The same native release may get another bridge publication.
         prior_build = dataclasses.replace(
             self.provenance, bridge_build_sha=ADVANCED_BRIDGE_SHA
         )
@@ -2762,8 +2755,6 @@ class AdvancePipelineTest(unittest.TestCase):
         self.assertEqual(plan.action, sro.OrchestrationAction.DISPATCH_CANDIDATE)
 
     def test_native_rebuild_behind_the_alignment_is_not_republished(self) -> None:
-        # Same upstream line, so the ordering guard would accept it; the filter
-        # alone keeps the base native release from following its rebuild.
         rebuilt = make_provenance(
             native_release_tag="v0.2.0-1", bridge_build_sha=ADVANCED_BRIDGE_SHA
         )
@@ -2798,8 +2789,6 @@ class AdvancePipelineTest(unittest.TestCase):
         )
 
     def test_published_older_native_stays_a_verified_noop(self) -> None:
-        # CI-only path: the build identity is unchanged, so an older native
-        # release keeps its verified noop instead of being skipped.
         candidate_dir = self.tmp / "candidate"
         write_bridge_candidate(
             candidate_dir,
@@ -2825,8 +2814,6 @@ class AdvancePipelineTest(unittest.TestCase):
         self.assertEqual(plan.release_target.release_tag, "v0.1.40")
 
     def test_backlog_skips_superseded_native_and_publishes_the_newest(self) -> None:
-        # Issue #96: after a governed change the oldest backlog entry could never
-        # publish and, as the publication barrier, starved the newest forever.
         older = self.provenance
         newest = self._newer_native()
         correlation = sro.compute_correlation_id(newest)
@@ -2898,7 +2885,6 @@ class AdvancePipelineTest(unittest.TestCase):
                     created_since=sro.workflow_history_since(releases, newest),
                 )
             ] = runs_response(recorded)
-        # Dispatch readback is bounded by the native release, not asset history.
         publish_readback_key = sro._workflow_runs_path(
             workflow_file=sro.PUBLISH_WORKFLOW_FILE,
             default_branch=DEFAULT_BRANCH,
@@ -2945,7 +2931,6 @@ class AdvancePipelineTest(unittest.TestCase):
 
         gateway.dispatch_workflow = dispatch  # type: ignore[assignment]
 
-        # The loader orders the backlog oldest-first whatever the input order.
         result, backlog = self._run_backlog(gateway, [newest, older])
         self.assertEqual(result, 0)
         self.assertEqual(backlog["errors"], [])

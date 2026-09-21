@@ -185,17 +185,11 @@ automated qualification run binds the candidate digest it is about to publish.
     ordered backlog prevents an older qualification wait from hiding or
     starving a newer stable native release; each exact pipeline advances by at
     most one stage per scheduled/manual scan.
-  - A provenance without its own exact publication is reported `superseded`, and
-    is not advanced, once a published stable asset release records (`Native:`
-    release-note marker) a newer native release, by version then rebuild. The
-    publication ordering guard rejects an older upstream line, and as the oldest
-    unpublished entry it would hold the publication barrier forever; an older
-    rebuild of the same line is skipped too, stricter than the guard. A native
-    release at or ahead of that alignment stays eligible, so a governed build
-    change republishes only the newest. The newest scanned native release is
-    never skipped; if assets record a newer alignment than any release in the
-    scan, including a manual exact-tag scan of an older release, it is reported
-    blocked.
+  - A provenance without its own exact publication is `superseded` (not
+    advanced, no tag claimed, no publication barrier) when a non-draft stable
+    asset release's `Native:` marker names a newer native release, compared by
+    version then rebuild. If that provenance is the newest native release in
+    the scan, it is `blocked` instead.
   - The resolver uses full default-branch history to keep the exact source SHA
     that executes a new candidate separate from the newest first-parent commit
     that changed governed runtime/build inputs. Pipeline correlation uses the
