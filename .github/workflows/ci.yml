@@ -73,6 +73,7 @@ jobs:
             scripts/verify_text_to_speech_api.py \
             scripts/verify_emscripten_version.py \
             scripts/verify_ci_reliability.py \
+            scripts/verify_ci_reliability_pin_test.py \
             scripts/patch_wasm64_runtime.py \
             scripts/wasm64_runtime_patch_contract_test.py \
             scripts/release_qualification.py \

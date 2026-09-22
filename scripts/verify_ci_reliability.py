@@ -10,6 +10,7 @@ import sys
 from pathlib import Path
 
 from release_contract import ContractError, parse_upstream_tag
+from release_qualification import EXPECTED_MODEL_PINS
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -36,12 +37,17 @@ MODEL_SHA_PIN_MARKER = re.compile(
 # file keeps every value present and passes, yet the workflows pair each SHA with
 # a role-specific URL and fail checksum verification at release time. Both
 # workflows name the role in the env key, so comparing key-to-hex between them
-# catches a swap made in one of them. Not caught: a swap applied identically to
-# both workflows, or one confined to CONTRIBUTING.md, whose bare
-# `--model-sha256` / `--mmproj-sha256` flags carry no role -- there the role
-# lives only in the `--model-url` / `--model-path` / `--mmproj-path` value
-# beside each flag: a URL for the state-persistence pin, a `/path/to/<file>`
-# placeholder for the other six, each naming a distinct model or projector file.
+# catches a swap made in one of them, but not one applied identically to both.
+# The role checks below close that by comparing every workflow pin against
+# release_qualification.EXPECTED_MODEL_PINS, which verify_attestation requires
+# every attestation's model_pins to equal and which lives in a HARNESS_SOURCES
+# file, so the digest publication binds to changes with it. CONTRIBUTING.md
+# has no role-bearing env keys -- its bare `--model-sha256` / `--mmproj-sha256`
+# flags carry no role, which lives only in the `--model-url` / `--model-path` /
+# `--mmproj-path` value beside each flag: a URL for the state-persistence pin, a
+# `/path/to/<file>` placeholder for the other six, each naming a distinct model
+# or projector file. Pairing each flag with the following pin and resolving the
+# file name against the workflow URLs gives those pins a role too.
 WORKFLOW_MODEL_SHA_PIN_FILES = (
     ".github/workflows/ci.yml",
     ".github/workflows/bridge_candidate.yml",
@@ -49,6 +55,66 @@ WORKFLOW_MODEL_SHA_PIN_FILES = (
 WORKFLOW_MODEL_SHA_PIN_ASSIGNMENT = re.compile(
     r"""^[ \t]*([A-Z][A-Z0-9_]*_SHA256):[ \t]*["']?([0-9a-fA-F]{64})["']?[ \t]*$""",
     re.MULTILINE,
+)
+# bridge_qualification.yml hand-copies its own pin set -- the speech, TTS and
+# audio inputs the heavy gates download -- and is absent from
+# MODEL_SHA_PIN_FILES above, which requires all seven pins in every file it
+# lists. Its five roles are a subset of the canonical eight, so its values are
+# checked against the canonical map and its roster against the list below.
+# Without that roster a dropped `<ROLE>_URL` + `<ROLE>_SHA256` pair would pass:
+# the canonical role is still bound by ci.yml, and the pairing check is
+# per-file, so a role absent from both sides of one file goes unnoticed. Its
+# speech audio pin is the eighth role, documented in no command block, which is
+# why the canonical map holds eight names against EXPECTED_MODEL_SHA_PIN_COUNT.
+MODEL_PIN_ROLE_FILES = (
+    ".github/workflows/ci.yml",
+    ".github/workflows/bridge_candidate.yml",
+    ".github/workflows/bridge_qualification.yml",
+)
+QUALIFICATION_MODEL_PIN_FILE = ".github/workflows/bridge_qualification.yml"
+QUALIFICATION_MODEL_PIN_ROLES = (
+    "LLAMA_WEBGPU_SPEECH_AUDIO_SHA256",
+    "LLAMA_WEBGPU_SPEECH_MMPROJ_SHA256",
+    "LLAMA_WEBGPU_SPEECH_MODEL_SHA256",
+    "LLAMA_WEBGPU_TTS_MMPROJ_SHA256",
+    "LLAMA_WEBGPU_TTS_MODEL_SHA256",
+)
+# The canonical name of a role does not follow mechanically from its env key:
+# LLAMA_WEBGPU_SMOKE_MODEL_SHA256 is state_smoke_model_sha256.
+CANONICAL_MODEL_PIN_NAMES = {
+    "LLAMA_WEBGPU_MULTIMODAL_MMPROJ_SHA256": "multimodal_mmproj_sha256",
+    "LLAMA_WEBGPU_MULTIMODAL_MODEL_SHA256": "multimodal_model_sha256",
+    "LLAMA_WEBGPU_SMOKE_MODEL_SHA256": "state_smoke_model_sha256",
+    "LLAMA_WEBGPU_SPEECH_AUDIO_SHA256": "speech_audio_sha256",
+    "LLAMA_WEBGPU_SPEECH_MMPROJ_SHA256": "speech_mmproj_sha256",
+    "LLAMA_WEBGPU_SPEECH_MODEL_SHA256": "speech_model_sha256",
+    "LLAMA_WEBGPU_TTS_MMPROJ_SHA256": "tts_mmproj_sha256",
+    "LLAMA_WEBGPU_TTS_MODEL_SHA256": "tts_model_sha256",
+}
+MODEL_URL_ASSIGNMENT = re.compile(
+    r"""^[ \t]*(LLAMA_WEBGPU_[A-Z0-9_]*)_URL:[ \t]*["']?(\S+?)["']?"""
+    r"""(?:[ \t]+\#[^\n]*)?[ \t]*$""",
+    re.MULTILINE,
+)
+HUGGING_FACE_REVISION_SEGMENT = re.compile(r"/resolve/([^/]+)/")
+IMMUTABLE_REVISION = re.compile(r"[0-9a-f]{40}")
+# These three roles resolve through the mutable `main` branch of a third-party
+# repository, so the pinned SHA gates the bytes but names no retrievable
+# revision once upstream moves. Listing them keeps a newly introduced mutable
+# URL from joining them unnoticed.
+MUTABLE_REVISION_MODEL_URL_ROLES = (
+    "LLAMA_WEBGPU_MULTIMODAL_MMPROJ",
+    "LLAMA_WEBGPU_MULTIMODAL_MODEL",
+    "LLAMA_WEBGPU_SMOKE_MODEL",
+)
+# The speech audio sample is not a Hugging Face object and carries no revision
+# segment at all.
+UNVERSIONED_MODEL_URL_ROLES = ("LLAMA_WEBGPU_SPEECH_AUDIO",)
+MARKDOWN_MODEL_ROLE_FLAG = re.compile(
+    r"--(?:model-url|model-path|mmproj-path)[ \t]+(\S+)"
+)
+MARKDOWN_MODEL_PIN_FLAG = re.compile(
+    r"--[A-Za-z0-9][A-Za-z0-9-]*-sha256[ \t]+([0-9a-fA-F]{64})"
 )
 PUBLICATION_PAT_NAME = "WEBGPU_BRIDGE_ASSETS_PAT"
 PUBLICATION_PAT_REFERENCE = re.compile(
@@ -602,7 +668,7 @@ def require_identical_model_sha_pins(
         )
 
 
-def extract_workflow_model_sha_pin_roles(
+def extract_model_sha_pin_roles(
     relative_path: str, content: str, errors: list[str]
 ) -> dict[str, str]:
     roles: dict[str, str] = {}
@@ -616,6 +682,12 @@ def extract_workflow_model_sha_pin_roles(
             errors,
         )
         roles[key] = pin
+    return roles
+
+
+def require_complete_workflow_model_sha_pin_roles(
+    relative_path: str, roles: dict[str, str], errors: list[str]
+) -> None:
     require(
         len(roles) == EXPECTED_MODEL_SHA_PIN_COUNT,
         f"{relative_path} declares {len(roles)} role-bearing model SHA-256 env "
@@ -624,7 +696,22 @@ def extract_workflow_model_sha_pin_roles(
         "can compare it across workflows",
         errors,
     )
-    return roles
+
+
+def require_qualification_model_sha_pin_roles(
+    roles: dict[str, str], errors: list[str]
+) -> None:
+    declared = tuple(sorted(roles))
+    require(
+        declared == tuple(sorted(QUALIFICATION_MODEL_PIN_ROLES)),
+        f"{QUALIFICATION_MODEL_PIN_FILE} declares model SHA-256 env keys "
+        + (", ".join(declared) or "none")
+        + ", expected "
+        + ", ".join(sorted(QUALIFICATION_MODEL_PIN_ROLES))
+        + "; the heavy gates download every one of them, so a dropped role would "
+        "run them against an unpinned file",
+        errors,
+    )
 
 
 def require_identical_workflow_model_sha_pin_roles(
@@ -646,6 +733,232 @@ def require_identical_workflow_model_sha_pin_roles(
                 "with a role-specific model URL",
                 errors,
             )
+
+
+def model_file_name(url_or_path: str) -> str:
+    return url_or_path.split("?", 1)[0].split("#", 1)[0].rstrip("/").rsplit("/", 1)[-1]
+
+
+def extract_model_urls(
+    relative_path: str, content: str, errors: list[str]
+) -> dict[str, str]:
+    urls: dict[str, str] = {}
+    for match in MODEL_URL_ASSIGNMENT.finditer(content):
+        role, url = match.group(1), match.group(2)
+        line_number = content.count("\n", 0, match.start()) + 1
+        require(
+            role not in urls,
+            f"{relative_path}:{line_number} redefines model URL env key "
+            f"{role}_URL (was {urls.get(role)}, now {url}); each role must be "
+            "declared once",
+            errors,
+        )
+        urls[role] = url
+    return urls
+
+
+def require_canonical_model_sha_pins(
+    roles_by_file: dict[str, dict[str, str]], errors: list[str]
+) -> None:
+    unmapped = sorted(set(CANONICAL_MODEL_PIN_NAMES.values()) - set(EXPECTED_MODEL_PINS))
+    require(
+        not unmapped,
+        "CANONICAL_MODEL_PIN_NAMES maps to canonical pin name(s) "
+        + ", ".join(unmapped)
+        + " that release_qualification.EXPECTED_MODEL_PINS does not declare",
+        errors,
+    )
+    covered: set[str] = set()
+    for relative_path, roles in sorted(roles_by_file.items()):
+        for key in sorted(roles):
+            name = CANONICAL_MODEL_PIN_NAMES.get(key)
+            if name is None:
+                errors.append(
+                    f"{relative_path} binds model SHA-256 env key {key} that "
+                    "CANONICAL_MODEL_PIN_NAMES does not name; add the role there "
+                    "and to release_qualification.EXPECTED_MODEL_PINS so the pin "
+                    "is compared against a canonical value"
+                )
+                continue
+            covered.add(name)
+            expected = EXPECTED_MODEL_PINS.get(name, "absent")
+            require(
+                roles[key] == expected,
+                f"{relative_path} binds {key} to {roles[key]} but canonical "
+                f"{name} is {expected}; every workflow copy must equal the pin "
+                "release_qualification.py checks the attestation against, so a "
+                "role swap repeated across workflows still fails here",
+                errors,
+            )
+    missing = sorted(set(EXPECTED_MODEL_PINS) - covered)
+    require(
+        not missing,
+        "canonical model pin(s) "
+        + ", ".join(missing)
+        + " are declared in release_qualification.EXPECTED_MODEL_PINS but bound "
+        "by no <ROLE>_SHA256 env key in " + ", ".join(MODEL_PIN_ROLE_FILES),
+        errors,
+    )
+
+
+def require_paired_model_urls_and_pins(
+    urls_by_file: dict[str, dict[str, str]],
+    roles_by_file: dict[str, dict[str, str]],
+    errors: list[str],
+) -> None:
+    for relative_path, urls in sorted(urls_by_file.items()):
+        roles = roles_by_file[relative_path]
+        unpinned = sorted(role for role in urls if f"{role}_SHA256" not in roles)
+        require(
+            not unpinned,
+            f"{relative_path} declares model URL env key(s) "
+            + ", ".join(f"{role}_URL" for role in unpinned)
+            + " with no matching <ROLE>_SHA256 pin; an unpinned download is never "
+            "checksum-verified",
+            errors,
+        )
+        undownloaded = sorted(
+            key for key in roles if key.removesuffix("_SHA256") not in urls
+        )
+        require(
+            not undownloaded,
+            f"{relative_path} declares model SHA-256 env key(s) "
+            + ", ".join(undownloaded)
+            + " with no matching <ROLE>_URL; a pin with no URL beside it cannot be "
+            "checked for role parity",
+            errors,
+        )
+
+
+def require_identical_model_urls(
+    urls_by_file: dict[str, dict[str, str]], errors: list[str]
+) -> None:
+    roles = sorted({role for urls in urls_by_file.values() for role in urls})
+    for role in roles:
+        bound = {
+            relative_path: urls[role]
+            for relative_path, urls in sorted(urls_by_file.items())
+            if role in urls
+        }
+        require(
+            len(set(bound.values())) <= 1,
+            f"model URL env key {role}_URL requests different bytes per workflow ("
+            + "; ".join(f"{value} in {path}" for path, value in bound.items())
+            + "); every workflow that downloads a role must request the same object",
+            errors,
+        )
+
+
+def require_pinned_model_url_revisions(
+    urls_by_file: dict[str, dict[str, str]], errors: list[str]
+) -> None:
+    mutable: set[str] = set()
+    unversioned: set[str] = set()
+    for urls in urls_by_file.values():
+        for role, url in sorted(urls.items()):
+            segment = HUGGING_FACE_REVISION_SEGMENT.search(url)
+            if segment is None:
+                unversioned.add(role)
+            elif not IMMUTABLE_REVISION.fullmatch(segment.group(1)):
+                mutable.add(role)
+    require(
+        tuple(sorted(mutable)) == tuple(sorted(MUTABLE_REVISION_MODEL_URL_ROLES)),
+        "model URL env keys resolving through a mutable revision are "
+        + (", ".join(sorted(mutable)) or "none")
+        + ", expected "
+        + ", ".join(sorted(MUTABLE_REVISION_MODEL_URL_ROLES))
+        + "; update MUTABLE_REVISION_MODEL_URL_ROLES when a role gains or loses an "
+        "immutable 40-hex revision",
+        errors,
+    )
+    require(
+        tuple(sorted(unversioned)) == tuple(sorted(UNVERSIONED_MODEL_URL_ROLES)),
+        "model URL env keys carrying no revision segment are "
+        + (", ".join(sorted(unversioned)) or "none")
+        + ", expected "
+        + ", ".join(sorted(UNVERSIONED_MODEL_URL_ROLES))
+        + "; update UNVERSIONED_MODEL_URL_ROLES when a role moves to or from a "
+        "revisioned host",
+        errors,
+    )
+
+
+def model_file_name_roles(
+    urls_by_file: dict[str, dict[str, str]], errors: list[str]
+) -> dict[str, str]:
+    names: dict[str, str] = {}
+    for relative_path, urls in sorted(urls_by_file.items()):
+        for role, url in sorted(urls.items()):
+            name = CANONICAL_MODEL_PIN_NAMES.get(f"{role}_SHA256")
+            if name is None:
+                continue
+            file_name = model_file_name(url)
+            claimed = names.setdefault(file_name, name)
+            require(
+                claimed == name,
+                f"{relative_path} binds {role}_URL to a file named {file_name} "
+                f"that canonical {claimed} also downloads; every role must "
+                "download a distinctly named file so a documented command that "
+                "names the file names its role",
+                errors,
+            )
+    return names
+
+
+def require_markdown_model_pin_roles(
+    relative_path: str,
+    content: str,
+    file_name_roles: dict[str, str],
+    errors: list[str],
+) -> None:
+    pending: str | None = None
+    paired: dict[str, int] = {}
+    for line_number, line in enumerate(content.splitlines(), start=1):
+        role_flag = MARKDOWN_MODEL_ROLE_FLAG.search(line)
+        if role_flag is not None:
+            pending = model_file_name(role_flag.group(1))
+        pin_flag = MARKDOWN_MODEL_PIN_FLAG.search(line)
+        if pin_flag is None:
+            continue
+        pin = pin_flag.group(1)
+        file_name, pending = pending, None
+        if file_name is None:
+            errors.append(
+                f"{relative_path}:{line_number} pins {pin} with no preceding "
+                "--model-url/--model-path/--mmproj-path naming the file it pins; "
+                "the bare --*-sha256 flag carries no role"
+            )
+            continue
+        name = file_name_roles.get(file_name)
+        if name is None:
+            errors.append(
+                f"{relative_path}:{line_number} pins {pin} for {file_name}, which "
+                "no <ROLE>_URL in " + ", ".join(MODEL_PIN_ROLE_FILES) + " downloads; "
+                "documented commands must name a file some workflow pins"
+            )
+            continue
+        require(
+            name not in paired,
+            f"{relative_path}:{line_number} pins canonical {name} again (first at "
+            f"line {paired.get(name)}); each role must be documented once",
+            errors,
+        )
+        paired.setdefault(name, line_number)
+        expected = EXPECTED_MODEL_PINS.get(name, "absent")
+        require(
+            pin == expected,
+            f"{relative_path}:{line_number} pins {file_name} at {pin} but canonical "
+            f"{name} is {expected}; a documented pin must match the role named by "
+            "the --model-url/--model-path/--mmproj-path value beside it",
+            errors,
+        )
+    require(
+        len(paired) == EXPECTED_MODEL_SHA_PIN_COUNT,
+        f"{relative_path} pairs {len(paired)} documented model SHA-256 pins with a "
+        f"role, expected {EXPECTED_MODEL_SHA_PIN_COUNT}; every pin must sit on or "
+        "after the line naming the file it pins",
+        errors,
+    )
 
 
 def main() -> int:
@@ -2333,15 +2646,46 @@ def main() -> int:
         },
         errors,
     )
+    role_file_contents = {
+        ".github/workflows/ci.yml": ci,
+        ".github/workflows/bridge_candidate.yml": candidate,
+        ".github/workflows/bridge_qualification.yml": bridge_qualification,
+    }
+    model_pin_roles = {
+        relative_path: extract_model_sha_pin_roles(
+            relative_path, role_file_contents[relative_path], errors
+        )
+        for relative_path in MODEL_PIN_ROLE_FILES
+    }
+    model_urls = {
+        relative_path: extract_model_urls(
+            relative_path, role_file_contents[relative_path], errors
+        )
+        for relative_path in MODEL_PIN_ROLE_FILES
+    }
+    for relative_path in WORKFLOW_MODEL_SHA_PIN_FILES:
+        require_complete_workflow_model_sha_pin_roles(
+            relative_path, model_pin_roles[relative_path], errors
+        )
+    require_qualification_model_sha_pin_roles(
+        model_pin_roles[QUALIFICATION_MODEL_PIN_FILE], errors
+    )
     require_identical_workflow_model_sha_pin_roles(
         {
-            relative_path: extract_workflow_model_sha_pin_roles(
-                relative_path, pin_file_contents[relative_path], errors
-            )
+            relative_path: model_pin_roles[relative_path]
             for relative_path in WORKFLOW_MODEL_SHA_PIN_FILES
         },
         errors,
     )
+    require_canonical_model_sha_pins(model_pin_roles, errors)
+    require_paired_model_urls_and_pins(model_urls, model_pin_roles, errors)
+    require_identical_model_urls(model_urls, errors)
+    require_pinned_model_url_revisions(model_urls, errors)
+    file_name_roles = model_file_name_roles(model_urls, errors)
+    require_markdown_model_pin_roles(
+        "CONTRIBUTING.md", contributing, file_name_roles, errors
+    )
+    run_required_python_contract("scripts/verify_ci_reliability_pin_test.py", errors)
 
     if errors:
         print("CI reliability contract failed:", file=sys.stderr)

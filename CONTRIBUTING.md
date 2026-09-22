@@ -164,13 +164,27 @@ query strings, and fragments before printing the location.
   `publish_assets.yml` holds no pins because it neither builds nor
   smokes. `scripts/release_qualification.py` carries the same 7 plus the pinned
   ASR audio fixture, and every attestation must match them exactly.
-- The script also compares pins role by role across the two workflows, whose env
-  keys name the role, so a swap between roles in one workflow fails the gate. A
-  swap applied identically to both passes, as does one confined to this file,
-  whose bare `--model-sha256` / `--mmproj-sha256` flags carry no
-  role -- check each pin here by hand against the `--model-url` /
-  `--model-path` / `--mmproj-path` value directly above it, whose filename names
-  the model or projector the pin belongs to.
+  `.github/workflows/bridge_qualification.yml` hand-copies a 5-pin speech, TTS,
+  and ASR audio subset, so rotate it with the rest.
+  `scripts/speech_to_text_browser_smoke.py` defaults the same ASR audio URL and
+  SHA-256 in `DEFAULT_AUDIO_URL` / `DEFAULT_AUDIO_SHA256`; no check compares that
+  copy, so rotate it by hand.
+- The script maps every workflow `<ROLE>_SHA256` env key to its canonical name in
+  `EXPECTED_MODEL_PINS` and requires equality in all three workflows, so a role
+  swap fails even when applied identically to every one of them. It requires
+  every name in `EXPECTED_MODEL_PINS` to be bound by some env key across those
+  three files, requires `bridge_qualification.yml` to declare exactly its five
+  roles, and requires every role to declare both `<ROLE>_URL` and
+  `<ROLE>_SHA256` in each file that mentions it -- every `LLAMA_WEBGPU_*_URL` key
+  in those files counts as a pinned model download. It also requires each role's
+  `<ROLE>_URL` to be byte-identical across the workflows that declare it, and it
+  pairs each `--model-sha256` / `--mmproj-sha256` flag here with the
+  `--model-url` / `--model-path` / `--mmproj-path` value above it, resolving that
+  filename to the role whose workflow URL downloads the same name. The
+  state-persistence and multimodal URLs resolve through the mutable
+  `resolve/main` ref rather than an immutable 40-hex revision, and the ASR audio
+  fixture is not a Hugging Face object and carries no revision segment at all;
+  the script lists both sets and fails when a role joins or leaves them.
 - Keep `scripts/multimodal_browser_smoke.py` in normal CI for every llama.cpp
   pin update; build-only validation does not cover mtmd prompt ingestion.
 - Heavy real-model ASR and TTS gates run through
