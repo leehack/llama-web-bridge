@@ -47,9 +47,8 @@ endif()
 set(CMAKE_HAVE_LIBC_PTHREAD ON CACHE BOOL "Emscripten pthread availability" FORCE)
 
 if (LLAMADART_WEBGPU_MEM64)
-    set(LLAMA_WASM_MEM64 ON CACHE BOOL "" FORCE)
-    add_compile_options("-sMEMORY64=1")
-    add_link_options("-sMEMORY64=1" "-sWASM_BIGINT=1")
+    add_compile_options("-m64")
+    add_link_options("-m64")
 endif()
 
 set(GGML_NATIVE OFF CACHE BOOL "" FORCE)
@@ -180,8 +179,7 @@ endif()
 
 if (LLAMADART_WEBGPU_MEM64)
     list(APPEND LLAMADART_WEBGPU_LINK_OPTIONS
-        "-sMEMORY64=1"
-        "-sWASM_BIGINT=1"
+        "-m64"
         "-sMAXIMUM_MEMORY=${LLAMADART_WEBGPU_MEM64_MAX_MEMORY}"
     )
 else()
