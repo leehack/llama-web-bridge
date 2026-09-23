@@ -9,35 +9,76 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import release_qualification as rq
 from generate_release_manifest import ARTIFACTS, generate
 from release_contract import ContractError
 
+# The capabilities of every published schema-v2 manifest (v0.1.44 to v0.1.46).
+# The orchestrator re-verifies published releases with
+# release_qualification.load_candidate, which requires the generator's exact
+# capabilities, so a new capability needs a historical readback contract first.
+PUBLISHED_CAPABILITIES = {
+    "wasm32": True,
+    "memory64": True,
+    "state_persistence": {"direct": True, "worker": True},
+    "multimodal": {"direct": True, "worker": True},
+    "speech_to_text": {
+        "advertised": True,
+        "direct": True,
+        "worker": True,
+        "wasm32": True,
+        "memory64": True,
+    },
+    "text_to_speech": {
+        "advertised": True,
+        "direct": True,
+        "worker": True,
+        "wasm32": False,
+        "memory64": True,
+    },
+}
+
+
+def manifest_args(out_dir: Path) -> argparse.Namespace:
+    for index, name in enumerate(ARTIFACTS):
+        (out_dir / name).write_bytes(f"artifact-{index}".encode())
+    return argparse.Namespace(
+        out_dir=out_dir,
+        release_tag="v0.2.0-1",
+        release_rebuild=1,
+        assets_repo="leehack/llama-web-bridge-assets",
+        bridge_repo="leehack/llama-web-bridge",
+        bridge_commit="a" * 40,
+        upstream_repo="ggml-org/llama.cpp",
+        upstream_tag="v0.2.0",
+        upstream_commit="b" * 40,
+        native_repo="leehack/llamadart-native",
+        native_release_tag="v0.2.0-1",
+        native_manifest_sha256="c" * 64,
+        native_commit="d" * 40,
+        emscripten_version="6.0.8",
+        orchestrator_correlation_id="llamadart-pin:run-123",
+        github_run_id="123456789",
+        github_run_url="https://github.com/leehack/llama-web-bridge/actions/runs/123456789",
+    )
+
 
 class GenerateReleaseManifestTest(unittest.TestCase):
+    def test_published_manifests_still_pass_readback_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            out_dir = Path(directory)
+            generate(manifest_args(out_dir))
+            manifest_path = out_dir / "manifest.json"
+            manifest = json.loads(manifest_path.read_text())
+            manifest["capabilities"] = PUBLISHED_CAPABILITIES
+            manifest_path.write_text(json.dumps(manifest))
+            loaded, _ = rq.load_candidate(out_dir)
+            self.assertEqual(loaded["capabilities"], PUBLISHED_CAPABILITIES)
+
     def test_generates_schema_v2_with_legacy_aliases_and_checksums(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             out_dir = Path(directory)
-            for index, name in enumerate(ARTIFACTS):
-                (out_dir / name).write_bytes(f"artifact-{index}".encode())
-            args = argparse.Namespace(
-                out_dir=out_dir,
-                release_tag="v0.2.0-1",
-                release_rebuild=1,
-                assets_repo="leehack/llama-web-bridge-assets",
-                bridge_repo="leehack/llama-web-bridge",
-                bridge_commit="a" * 40,
-                upstream_repo="ggml-org/llama.cpp",
-                upstream_tag="v0.2.0",
-                upstream_commit="b" * 40,
-                native_repo="leehack/llamadart-native",
-                native_release_tag="v0.2.0-1",
-                native_manifest_sha256="c" * 64,
-                native_commit="d" * 40,
-                emscripten_version="6.0.8",
-                orchestrator_correlation_id="llamadart-pin:run-123",
-                github_run_id="123456789",
-                github_run_url="https://github.com/leehack/llama-web-bridge/actions/runs/123456789",
-            )
+            args = manifest_args(out_dir)
             manifest = generate(args)
             first_bytes = (out_dir / "manifest.json").read_bytes()
             generate(args)

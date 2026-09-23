@@ -84,7 +84,8 @@ Runtime-backed methods execute through a per-instance single-writer FIFO queue i
 both worker and direct runtime modes:
 
 `loadModelFromUrl`, `loadMultimodalProjector`, `unloadMultimodalProjector`,
-`getTextToSpeechCapabilities`, `synthesizeSpeech`, `createCompletion`,
+`getTextToSpeechCapabilities`, `synthesizeSpeech`, `getDecisionCapabilities`,
+`loadDecisionHead`, `runDecision`, `freeDecisionHead`, `createCompletion`,
 `tokenize`, `detokenize`, `stateSaveFile`, `stateLoadFile`, `stateSaveBytes`,
 `stateLoadBytes`, `embed`, `embedBatch`, `applyChatTemplate`.
 
@@ -495,6 +496,100 @@ explicitly.
 A second synthesis is not rejected. It — and any other shared-runtime operation
 issued while synthesis is running — waits in the FIFO queue and runs in call
 order; see [Operation serialization](#operation-serialization).
+
+## Decision heads
+
+Decision heads run Laya-style decision models: a ModernBERT encoder GGUF loaded
+with `loadModelFromUrl()` plus a safetensors head that scores the options of a
+question. The bridge returns raw scores; tokenizing prompts and turning scores
+into answers (temperatures, probabilities, act thresholds) belong to the
+caller, for example llamadart's `DecisionEngine`.
+
+The loaded model must report `general.architecture` `modern-bert`, CLS (BOS),
+SEP and MASK tokens, non-empty MASK text, and last-hidden-state output. The head
+file holds F32, F16 or BF16 tensors under Laya's PyTorch names; the official
+Laya `model.safetensors` checkpoint works too, and its `encoder.*` tensors are
+ignored. The head's width must match the encoder's hidden size.
+
+Each loaded head owns a private encoder context of the config's `max_len`
+tokens (512 for Laya) on the loaded model, plus its weights (about 100 MB for
+Laya). The head runs on WebGPU when the model was loaded with GPU layers and on
+the CPU otherwise; `deviceName` reports which. Sequences run one at a time.
+
+### `getDecisionCapabilities()`
+
+```ts
+getDecisionCapabilities(): Promise<DecisionCapabilities>
+```
+
+Returns `{ apiVersion, supported, reason? }` for the loaded model. `reason`
+explains an unsupported state, such as no model, a model that is not a
+ModernBERT encoder, a missing special token, or a core build without decision
+heads.
+
+### `loadDecisionHead(source, options?)`
+
+```ts
+loadDecisionHead(
+  source: string | ArrayBuffer | ArrayBufferView,
+  options?: {
+    configJson?: string | null;
+    onProgress?: (progress: { loaded: number; total: number }) => void;
+  },
+): Promise<DecisionHeadInfo>
+```
+
+Loads a head from a URL or from bytes and returns its handle, hidden size,
+CLS/SEP/MASK token ids, MASK text, config text and head device. `configJson`
+is the head's `rl_agent_config.json` text; without it the bridge reads the
+head's `laya.config` safetensors metadata, and a head with neither is rejected.
+The config sets `max_len` (default 512), which must not exceed the encoder's
+trained context, and `head_layers` (default 2).
+
+URL heads are fetched into the runtime's in-memory WASMFS and deleted after
+loading, so peak memory includes the whole file: the official checkpoint is
+about 800 MB. `onProgress` reports the download of a URL head. Worker mode
+resolves a relative URL against the page and sends the worker a copy of byte
+sources, so caller buffers are not detached. A worker head load fails after 10
+minutes without download progress.
+
+### `runDecision(handle, sequences)`
+
+```ts
+runDecision(handle: number, sequences: readonly DecisionSequence[]): Promise<DecisionOutput[]>
+```
+
+Each sequence has `tokens` (the full token ids, including CLS and SEP),
+`markers` (the token index of each option marker, in option order) and
+`questionType` (`0` choice, `1` score, `2` noul). Each output has `logits`,
+one raw value per marker, and the act head's `actLogits`, both `Float32Array`;
+worker mode transfers them to the caller.
+
+The bridge rejects non-integer values before calling the core. The core then
+checks every sequence before its first encoder pass: 1 to `max_len` tokens, ids
+inside the vocabulary, 1 to token-count markers, markers inside the sequence,
+and a question type from 0 to 2. One invalid sequence rejects the whole call.
+
+A run cannot be cancelled: `cancel()` does not stop it, and later operations
+wait for it in the queue. A worker run fails after 10 minutes plus 1 minute per
+sequence; the bridge then falls back to the main-thread runtime as described
+below.
+
+### `freeDecisionHead(handle)`
+
+```ts
+freeDecisionHead(handle: number): Promise<void>
+```
+
+Frees a head. Freeing an unknown or already-freed handle does nothing.
+
+Handles are not durable. `dispose()`, a worker restart, a fallback to the
+main-thread runtime, and any model load that reaches the core, even one that
+then fails, free every head, and a later
+`runDecision()` with such a handle rejects and asks for the head to be loaded
+again. When the worker fails during `runDecision()`, the bridge reloads the
+model on the main thread and rejects the run; heads must then be loaded again.
+Handles are never reused within one bridge instance.
 
 ## Runtime metadata and diagnostics
 

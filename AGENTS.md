@@ -65,7 +65,9 @@ applies:
 - speech changes: `scripts/speech_to_text_browser_smoke.py` and
   `scripts/text_to_speech_browser_smoke.py` individually. The combined
   `release_qualification.py qualify` command is workflow-only because it
-  requires GitHub Actions and `github-hosted` runner identity.
+  requires GitHub Actions and `github-hosted` runner identity;
+- decision-head changes: `scripts/decision_browser_smoke.py` with a Laya
+  encoder GGUF, head and reference fixture.
 
 Keep the tiny model in a user cache or `/private/tmp`; do not commit downloaded
 GGUFs or smoke artifacts.

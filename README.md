@@ -156,6 +156,21 @@ Run the checksum-pinned real-model gate,
 `scripts/text_to_speech_browser_smoke.py`, before publishing TTS-capable
 assets; the invocation and pins are in [CONTRIBUTING.md](CONTRIBUTING.md#validate-outputs).
 
+## Decision heads
+
+The bridge runs Laya-style decision models through `getDecisionCapabilities()`,
+`loadDecisionHead()`, `runDecision()` and `freeDecisionHead()`: a ModernBERT
+encoder GGUF plus a safetensors head that returns raw option logits and act
+logits for pre-tokenized sequences. Each head gets a private encoder context and
+runs on WebGPU when the model was loaded with GPU layers, in both direct and
+worker runtimes and in wasm32 and memory64. See [docs/api.md](docs/api.md#decision-heads).
+
+The real-model smoke, `scripts/decision_browser_smoke.py`, compares every
+fixture row with a Laya reference and stays out of default CI; the invocation is
+in [CONTRIBUTING.md](CONTRIBUTING.md#validate-outputs). No qualification gate
+runs it, so release manifests list no decision capability; probe support with
+`getDecisionCapabilities()`.
+
 ## CI
 
 This repo includes a wasm build gate in:
