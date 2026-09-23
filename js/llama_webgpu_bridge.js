@@ -8,6 +8,8 @@ var defaultModelCacheName = "llamadart-webgpu-model-cache-v1";
 var BRIDGE_DISPOSED_MESSAGE = "Bridge has been disposed.";
 var GENERATION_ALREADY_ACTIVE_RC = -7;
 var GENERATION_ALREADY_ACTIVE_MESSAGE = "Generation is already active on this bridge runtime.";
+var DECISION_API_VERSION = 1;
+var DECISION_WORKER_TIMEOUT_PER_SEQUENCE_MS = 60 * 1e3;
 function createAbortError(message) {
   if (typeof DOMException === "function") {
     return new DOMException(message, "AbortError");
@@ -502,6 +504,120 @@ function toFloat32Array(value) {
   }
   return null;
 }
+function isInt32(value) {
+  return typeof value === "number" && Number.isInteger(value) && value >= -2147483648 && value <= 2147483647;
+}
+function decisionHandleFrom(handle) {
+  if (!isInt32(handle) || handle <= 0) {
+    throw new TypeError(`Decision head handle must be a positive integer, got ${String(handle)}.`);
+  }
+  return handle;
+}
+function decisionHeadBytes(source) {
+  if (source instanceof ArrayBuffer) {
+    return new Uint8Array(source);
+  }
+  if (ArrayBuffer.isView(source)) {
+    return new Uint8Array(source.buffer, source.byteOffset, source.byteLength);
+  }
+  return null;
+}
+function decisionIntegerList(value, label) {
+  const isList = Array.isArray(value) || ArrayBuffer.isView(value) && !(value instanceof DataView);
+  if (!isList) {
+    throw new TypeError(`${label} must be an array or typed array of integers.`);
+  }
+  const list = (
+    /** @type {ArrayLike<unknown>} */
+    value
+  );
+  const out = new Int32Array(list.length);
+  for (let index = 0; index < list.length; index += 1) {
+    const item = list[index];
+    if (!isInt32(item)) {
+      throw new TypeError(`${label}[${index}] is ${String(item)}; expected a 32-bit integer.`);
+    }
+    out[index] = /** @type {number} */
+    item;
+  }
+  return out;
+}
+function normalizeDecisionSequences(sequences) {
+  if (!Array.isArray(sequences)) {
+    throw new TypeError("Decision sequences must be an array.");
+  }
+  return sequences.map((sequence, index) => {
+    const label = `Decision sequence ${index}`;
+    if (!sequence || typeof sequence !== "object") {
+      throw new TypeError(`${label} must be an object with tokens, markers and questionType.`);
+    }
+    const tokens = decisionIntegerList(sequence.tokens, `${label} tokens`);
+    const markers = decisionIntegerList(sequence.markers, `${label} markers`);
+    const questionType = sequence.questionType;
+    if (!isInt32(questionType)) {
+      throw new TypeError(
+        `${label} questionType is ${String(questionType)}; expected 0 (choice), 1 (score) or 2 (noul).`
+      );
+    }
+    return { tokens, markers, questionType: (
+      /** @type {number} */
+      questionType
+    ) };
+  });
+}
+function encodeDecisionSequences(sequences) {
+  const encoded = normalizeDecisionSequences(sequences);
+  let words = 1;
+  for (const sequence of encoded) {
+    words += 3 + sequence.tokens.length + sequence.markers.length;
+  }
+  const bytes = new Uint8Array(words * 4);
+  const view = new DataView(bytes.buffer);
+  let offset = 0;
+  const put = (value) => {
+    view.setInt32(offset, value, true);
+    offset += 4;
+  };
+  put(encoded.length);
+  for (const sequence of encoded) {
+    put(sequence.questionType);
+    put(sequence.tokens.length);
+    put(sequence.markers.length);
+    sequence.tokens.forEach(put);
+    sequence.markers.forEach(put);
+  }
+  return bytes;
+}
+function decodeDecisionOutputs(bytes, count) {
+  const malformed = () => new Error("Decision output from the WebGPU core is malformed.");
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  let offset = 0;
+  const floats = (length) => {
+    const values = new Float32Array(length);
+    for (let index = 0; index < length; index += 1) {
+      values[index] = view.getFloat32(offset, true);
+      offset += 4;
+    }
+    return values;
+  };
+  const outputs = [];
+  for (let index = 0; index < count; index += 1) {
+    if (bytes.byteLength - offset < 8) {
+      throw malformed();
+    }
+    const logitCount = view.getInt32(offset, true);
+    const actCount = view.getInt32(offset + 4, true);
+    offset += 8;
+    if (logitCount < 0 || actCount < 0 || (logitCount + actCount) * 4 > bytes.byteLength - offset) {
+      throw malformed();
+    }
+    outputs.push({ logits: floats(logitCount), actLogits: floats(actCount) });
+  }
+  if (offset !== bytes.byteLength) {
+    throw malformed();
+  }
+  return outputs;
+}
 async function decodeImageBytesToRgb(bytes, options = {}) {
   const sourceBytes = toUint8Array(bytes);
   if (!sourceBytes || sourceBytes.length === 0) {
@@ -891,6 +1007,29 @@ function installBridgeWorkerHost() {
         );
         return;
       }
+      if (method === "loadDecisionHead") {
+        const options = args[1] && typeof args[1] === "object" ? { ...args[1] } : {};
+        options.onProgress = (progress) => {
+          self.postMessage({ type: "event", id, event: "progress", payload: progress || {} });
+        };
+        const value2 = await bridge.loadDecisionHead(args[0], options);
+        self.postMessage({ type: "result", id, value: value2 });
+        return;
+      }
+      if (method === "runDecision") {
+        const value2 = await bridge.runDecision(args[0], args[1]);
+        const transfers = [];
+        for (const output of Array.isArray(value2) ? value2 : []) {
+          for (const values of [output?.logits, output?.actLogits]) {
+            const buffer = values?.buffer;
+            if (buffer instanceof ArrayBuffer && !transfers.includes(buffer)) {
+              transfers.push(buffer);
+            }
+          }
+        }
+        self.postMessage({ type: "result", id, value: value2 }, transfers);
+        return;
+      }
       if (method === "unloadMultimodalProjector") {
         const value2 = await bridge.unloadMultimodalProjector();
         self.postMessage({ type: "result", id, value: value2, state: snapshotBridgeState(bridge) });
@@ -1089,7 +1228,7 @@ var BridgeWorkerProxy = class {
   async call(method, args, onEvent, transferList = [], operationMeta = null) {
     await this._ready;
     const id = this._nextId++;
-    const timeoutMs = this._resolveRequestTimeoutMs(method);
+    const timeoutMs = this._resolveRequestTimeoutMs(method, args);
     const transfers = Array.isArray(transferList) ? transferList.filter((item) => item != null) : [];
     return new Promise((resolve, reject) => {
       let timeoutHandle = null;
@@ -1157,7 +1296,7 @@ var BridgeWorkerProxy = class {
       }
     }, timeoutMs);
   }
-  _resolveRequestTimeoutMs(method) {
+  _resolveRequestTimeoutMs(method, args = []) {
     const explicitGlobal = Number(this._config.workerRequestTimeoutMs);
     const clamp = (value, fallback) => {
       if (!Number.isFinite(value) || value <= 0) {
@@ -1176,6 +1315,13 @@ var BridgeWorkerProxy = class {
     }
     if (method === "synthesizeSpeech") {
       return clamp(Number(this._config.workerTextToSpeechTimeoutMs), clamp(explicitGlobal, 20 * 60 * 1e3));
+    }
+    if (method === "loadDecisionHead") {
+      return clamp(explicitGlobal, 10 * 60 * 1e3);
+    }
+    if (method === "runDecision") {
+      const sequences = Array.isArray(args?.[1]) ? args[1].length : 0;
+      return clamp(explicitGlobal, 10 * 60 * 1e3 + sequences * DECISION_WORKER_TIMEOUT_PER_SEQUENCE_MS);
     }
     return clamp(explicitGlobal, 12e4);
   }
@@ -1221,6 +1367,7 @@ var LlamaWebGpuBridgeRuntime = class {
     this._mmSupportsAudio = false;
     this._mediaFileCounter = 0;
     this._stateFileCounter = 0;
+    this._decisionFileCounter = 0;
     this._stagedMediaPaths = [];
     this._nCtx = 4096;
     this._abortRequested = false;
@@ -2045,6 +2192,15 @@ var LlamaWebGpuBridgeRuntime = class {
       if (externalSignal && typeof externalSignal.removeEventListener === "function") {
         externalSignal.removeEventListener("abort", onExternalAbort);
       }
+    }
+  }
+  _unlinkDecisionFile(path) {
+    if (!this._core || typeof path !== "string" || path.length === 0) {
+      return;
+    }
+    try {
+      this._core.FS.unlink(path);
+    } catch (_) {
     }
   }
   _deleteFsFile(path) {
@@ -3274,6 +3430,201 @@ var LlamaWebGpuBridgeRuntime = class {
       this._textToSpeechDone = null;
     }
   }
+  getDecisionCapabilities() {
+    const unsupported = (reason) => ({
+      apiVersion: DECISION_API_VERSION,
+      supported: false,
+      reason
+    });
+    const core = this._core;
+    if (!core) {
+      return unsupported("WebGPU core is not initialized");
+    }
+    if (typeof core._llamadart_webgpu_decision_capabilities_json !== "function") {
+      return unsupported("This WebGPU core build does not include decision heads.");
+    }
+    const coreVersion = Number(
+      core.ccall("llamadart_webgpu_decision_api_version", "number", [], [])
+    );
+    if (coreVersion !== DECISION_API_VERSION) {
+      return unsupported(
+        `The WebGPU core implements decision API version ${coreVersion}; this bridge needs version ${DECISION_API_VERSION}.`
+      );
+    }
+    const raw = core.ccall(
+      "llamadart_webgpu_decision_capabilities_json",
+      "string",
+      [],
+      []
+    ) || "{}";
+    try {
+      return JSON.parse(raw);
+    } catch (_) {
+      return unsupported("WebGPU decision capability response is invalid");
+    }
+  }
+  _ensureDecisionDir() {
+    try {
+      this._core.FS.mkdir("/decision");
+    } catch (_) {
+    }
+  }
+  async _stageDecisionHeadFromUrl(url, headPath, onProgress) {
+    const fetchTimeoutMs = this._resolveFetchTimeoutMs({}, 18e4);
+    const chunkTimeoutMs = this._resolveStreamChunkTimeoutMs({}, 9e4);
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        const response = await this._fetchWithTimeout(
+          url,
+          { cache: "no-store" },
+          fetchTimeoutMs
+        );
+        if (!response.ok) {
+          throw new Error(
+            `Failed to fetch decision head: ${response.status} ${response.statusText}`
+          );
+        }
+        await writeResponseToFsFileWithProgress(
+          response,
+          this._core.FS,
+          headPath,
+          typeof onProgress === "function" ? onProgress : null,
+          {
+            useBigIntPosition: this._coreVariant === "wasm64",
+            chunkTimeoutMs
+          }
+        );
+        return;
+      } catch (error) {
+        this._unlinkDecisionFile(headPath);
+        if (!isRetryableStreamNetworkError(error) || attempt >= 1) {
+          throw error;
+        }
+        this._runtimeNotes.push(`decision_head_fetch_retry:${attempt + 1}`);
+      }
+    }
+  }
+  /**
+   * @param {string | ArrayBuffer | ArrayBufferView} source
+   * @param {{ configJson?: string | null, onProgress?: (progress: { loaded: number, total: number }) => void }} [options]
+   */
+  async loadDecisionHead(source, options = {}) {
+    if (!this._core || this._modelBytes <= 0) {
+      throw new Error("No model loaded. Call loadModelFromUrl first.");
+    }
+    const configJson = options?.configJson ?? null;
+    if (configJson !== null && typeof configJson !== "string") {
+      throw new TypeError("Decision head configJson must be a string.");
+    }
+    let bytes = null;
+    if (typeof source === "string") {
+      if (source.length === 0) {
+        throw new Error("Decision head URL is empty.");
+      }
+    } else {
+      bytes = decisionHeadBytes(source);
+      if (!bytes) {
+        throw new TypeError("Decision head source must be a URL string, an ArrayBuffer or a typed array.");
+      }
+      if (bytes.byteLength === 0) {
+        throw new Error("Decision head bytes are empty.");
+      }
+    }
+    const capabilities = this.getDecisionCapabilities();
+    if (capabilities.supported !== true) {
+      throw new Error(
+        capabilities.reason || "The loaded model does not support decision heads."
+      );
+    }
+    const core = this._core;
+    this._ensureDecisionDir();
+    const taskId = `${Date.now()}_${++this._decisionFileCounter}`;
+    const headPath = `/decision/head_${taskId}.safetensors`;
+    const configPath = configJson === null ? null : `/decision/config_${taskId}.json`;
+    try {
+      let label = "decision head bytes";
+      if (bytes) {
+        core.FS.writeFile(headPath, bytes);
+      } else {
+        label = basenameFromUrl(source).slice(0, 256);
+        await this._stageDecisionHeadFromUrl(source, headPath, options?.onProgress);
+      }
+      if (configPath !== null) {
+        core.FS.writeFile(configPath, textEncoder.encode(configJson));
+      }
+      const handle = Number(
+        await core.ccall(
+          "llamadart_webgpu_decision_load",
+          "number",
+          ["string", "string", "string"],
+          [headPath, label, configPath],
+          { async: true }
+        )
+      );
+      if (handle <= 0) {
+        throw new Error(this._coreErrorMessage("Failed to load decision head", handle));
+      }
+      const raw = core.ccall(
+        "llamadart_webgpu_decision_head_info_json",
+        "string",
+        ["number"],
+        [handle]
+      ) || "{}";
+      return JSON.parse(raw);
+    } finally {
+      this._unlinkDecisionFile(headPath);
+      this._unlinkDecisionFile(configPath);
+    }
+  }
+  /**
+   * @param {number} handle
+   * @param {unknown} sequences
+   */
+  async runDecision(handle, sequences) {
+    const nativeHandle = decisionHandleFrom(handle);
+    const input = encodeDecisionSequences(sequences);
+    if (!this._core || this._modelBytes <= 0) {
+      throw new Error("No model loaded. Call loadModelFromUrl first.");
+    }
+    const core = this._core;
+    this._ensureDecisionDir();
+    const taskId = `${Date.now()}_${++this._decisionFileCounter}`;
+    const inputPath = `/decision/input_${taskId}.bin`;
+    const outputPath = `/decision/output_${taskId}.bin`;
+    try {
+      core.FS.writeFile(inputPath, input);
+      const count = Number(
+        await core.ccall(
+          "llamadart_webgpu_decision_run",
+          "number",
+          ["number", "string", "string"],
+          [nativeHandle, inputPath, outputPath],
+          { async: true }
+        )
+      );
+      if (count < 0) {
+        throw new Error(this._coreErrorMessage("Decision run failed", count));
+      }
+      return decodeDecisionOutputs(core.FS.readFile(outputPath), count);
+    } finally {
+      this._unlinkDecisionFile(inputPath);
+      this._unlinkDecisionFile(outputPath);
+    }
+  }
+  /** @param {number} handle */
+  async freeDecisionHead(handle) {
+    const nativeHandle = decisionHandleFrom(handle);
+    if (!this._core) {
+      return;
+    }
+    await this._core.ccall(
+      "llamadart_webgpu_decision_free",
+      "number",
+      ["number"],
+      [nativeHandle],
+      { async: true }
+    );
+  }
   _clearStagedMediaFiles() {
     if (!this._core || this._stagedMediaPaths.length === 0) {
       this._stagedMediaPaths = [];
@@ -3979,6 +4330,8 @@ var LlamaWebGpuBridge = class {
     this._disposed = false;
     this._disposePromise = null;
     this._disposalWaiters = /* @__PURE__ */ new Set();
+    this._decisionHeads = /* @__PURE__ */ new Map();
+    this._nextDecisionHandle = 1;
     if (this._shouldUseWorker()) {
       try {
         this._workerProxy = new BridgeWorkerProxy({
@@ -5454,6 +5807,203 @@ var LlamaWebGpuBridge = class {
       throw error;
     }
   }
+  /** @returns {Map<number, { owner: object, handle: number }>} */
+  _decisionHeadMap() {
+    if (!(this._decisionHeads instanceof Map)) {
+      this._decisionHeads = /* @__PURE__ */ new Map();
+      this._nextDecisionHandle = 1;
+    }
+    return this._decisionHeads;
+  }
+  _registerDecisionHead(owner, info) {
+    const heads = this._decisionHeadMap();
+    const handle = this._nextDecisionHandle++;
+    heads.set(handle, { owner, handle: Number(info?.handle) });
+    return { ...info, handle };
+  }
+  _decisionOwner() {
+    return this._workerProxy || this._runtime || null;
+  }
+  _staleDecisionHeadError(handle) {
+    return new Error(
+      `Decision head ${handle} is not loaded; it was freed, its model was unloaded, or the bridge runtime restarted. Load the decision head again.`
+    );
+  }
+  /** @param {number} handle */
+  _resolveDecisionHead(handle) {
+    decisionHandleFrom(handle);
+    const heads = this._decisionHeadMap();
+    const entry = heads.get(handle);
+    if (!entry) {
+      return null;
+    }
+    if (entry.owner !== this._decisionOwner()) {
+      heads.delete(handle);
+      return null;
+    }
+    return entry;
+  }
+  _requireDecisionRuntime() {
+    if (!this._runtime) {
+      throw new Error("No model loaded. Call loadModelFromUrl first.");
+    }
+    return this._runtime;
+  }
+  /**
+   * Moves a failed worker's work to the main-thread runtime. Heads the worker
+   * held are gone with it; the model is reloaded so later calls keep working.
+   */
+  async _recoverDecisionWorker(error) {
+    this._disableWorkerFallback(error);
+    await this._waitForWorkerDisposal();
+    await this._ensureRuntimeReadyAfterWorkerFallback({}, error);
+  }
+  async getDecisionCapabilities() {
+    return this._runExclusive(
+      () => this._getDecisionCapabilitiesUnlocked(),
+      { kind: "decision-capabilities" }
+    );
+  }
+  async _getDecisionCapabilitiesUnlocked() {
+    if (!this._workerProxy) {
+      return this._runtime ? this._runtime.getDecisionCapabilities() : { apiVersion: DECISION_API_VERSION, supported: false, reason: "WebGPU core is not initialized" };
+    }
+    try {
+      return await this._callWorker("getDecisionCapabilities", []);
+    } catch (error) {
+      this._throwIfOperationCancelled(error, "Decision capability probe was cancelled.");
+      if (!this._shouldFallbackToMainThread(error)) {
+        throw error;
+      }
+      await this._recoverDecisionWorker(error);
+      return this._requireDecisionRuntime().getDecisionCapabilities();
+    }
+  }
+  /**
+   * @param {string | ArrayBuffer | ArrayBufferView} source
+   * @param {{ configJson?: string | null, onProgress?: (progress: { loaded: number, total: number }) => void }} [options]
+   */
+  async loadDecisionHead(source, options = {}) {
+    return this._runExclusive(
+      () => this._loadDecisionHeadUnlocked(source, options),
+      { kind: "decision-head-load" }
+    );
+  }
+  /**
+   * @param {string | ArrayBuffer | ArrayBufferView} source
+   * @param {{ configJson?: string | null, onProgress?: (progress: { loaded: number, total: number }) => void }} [options]
+   */
+  async _loadDecisionHeadUnlocked(source, options = {}) {
+    const loadInRuntime = async () => {
+      const runtime = this._requireDecisionRuntime();
+      return this._registerDecisionHead(
+        runtime,
+        await runtime.loadDecisionHead(source, options)
+      );
+    };
+    if (!this._workerProxy) {
+      return loadInRuntime();
+    }
+    const proxy = this._workerProxy;
+    const workerOptions = { configJson: options?.configJson ?? null };
+    let workerSource = source;
+    const transferList = [];
+    if (typeof source === "string") {
+      workerSource = source.length > 0 ? normalizeAbsoluteUrl(source) : source;
+    } else {
+      const bytes = decisionHeadBytes(source);
+      if (bytes) {
+        const copy = new Uint8Array(bytes);
+        workerSource = copy;
+        transferList.push(copy.buffer);
+      }
+    }
+    try {
+      const info = await this._callWorker(
+        "loadDecisionHead",
+        [workerSource, workerOptions],
+        (event) => {
+          if (event.event === "progress") {
+            options?.onProgress?.(event.payload || {});
+          }
+        },
+        transferList
+      );
+      return this._registerDecisionHead(proxy, info);
+    } catch (error) {
+      this._throwIfOperationCancelled(error, "Decision head load was cancelled.");
+      if (!this._shouldFallbackToMainThread(error)) {
+        throw error;
+      }
+      await this._recoverDecisionWorker(error);
+      return loadInRuntime();
+    }
+  }
+  /**
+   * @param {number} handle
+   * @param {readonly import('./llama_webgpu_bridge.d.ts').DecisionSequence[]} sequences
+   */
+  async runDecision(handle, sequences) {
+    return this._runExclusive(
+      () => this._runDecisionUnlocked(handle, sequences),
+      { kind: "decision-run" }
+    );
+  }
+  /**
+   * @param {number} handle
+   * @param {readonly import('./llama_webgpu_bridge.d.ts').DecisionSequence[]} sequences
+   */
+  async _runDecisionUnlocked(handle, sequences) {
+    const entry = this._resolveDecisionHead(handle);
+    if (!entry) {
+      throw this._staleDecisionHeadError(handle);
+    }
+    const normalized = normalizeDecisionSequences(sequences);
+    if (!this._workerProxy) {
+      return this._requireDecisionRuntime().runDecision(entry.handle, normalized);
+    }
+    try {
+      return await this._callWorker("runDecision", [entry.handle, normalized]);
+    } catch (error) {
+      this._throwIfOperationCancelled(error, "Decision run was cancelled.");
+      if (!this._shouldFallbackToMainThread(error)) {
+        throw error;
+      }
+      this._decisionHeadMap().delete(handle);
+      await this._recoverDecisionWorker(error);
+      throw new Error(
+        `Decision head ${handle} was lost when the bridge worker failed (${serializeWorkerError(error)}). Load the decision head again.`
+      );
+    }
+  }
+  /** @param {number} handle */
+  async freeDecisionHead(handle) {
+    return this._runExclusive(
+      () => this._freeDecisionHeadUnlocked(handle),
+      { kind: "decision-head-free" }
+    );
+  }
+  /** @param {number} handle */
+  async _freeDecisionHeadUnlocked(handle) {
+    const entry = this._resolveDecisionHead(handle);
+    if (!entry) {
+      return;
+    }
+    this._decisionHeadMap().delete(handle);
+    if (!this._workerProxy) {
+      await this._requireDecisionRuntime().freeDecisionHead(entry.handle);
+      return;
+    }
+    try {
+      await this._callWorker("freeDecisionHead", [entry.handle]);
+    } catch (error) {
+      this._throwIfOperationCancelled(error, "Decision head free was cancelled.");
+      if (!this._shouldFallbackToMainThread(error)) {
+        throw error;
+      }
+      await this._recoverDecisionWorker(error);
+    }
+  }
   async tokenize(text, addSpecial = true) {
     return this._runExclusive(
       () => this._tokenizeUnlocked(text, addSpecial),
@@ -5730,6 +6280,7 @@ var LlamaWebGpuBridge = class {
       this._loadedMmProjUrl = null;
       this._workerFallbackReason = null;
       this._multimodalWorkerCpuMode = false;
+      this._decisionHeads?.clear();
       this._lifecycleState = "disposed";
     }
   }

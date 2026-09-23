@@ -203,6 +203,7 @@ _ORCHESTRATION_ONLY_PATHS = frozenset(
         "scripts/release_qualification.py",
         "scripts/stable_release_orchestrator.py",
         "scripts/verify_ci_reliability.py",
+        "scripts/verify_decision_api.py",
         "scripts/verify_state_persistence_api.py",
         "scripts/verify_text_to_speech_api.py",
     }

@@ -143,6 +143,48 @@ export interface TextToSpeechResult {
   truncated: boolean;
 }
 
+export interface DecisionCapabilities {
+  apiVersion: number;
+  supported: boolean;
+  /** Why the loaded model cannot run decision heads; absent when supported. */
+  reason?: string;
+}
+
+export interface DecisionHeadOptions {
+  /** Laya `rl_agent_config.json` text; omit to read the head's `laya.config` metadata. */
+  configJson?: string | null;
+  /** Download progress of a URL head, in bytes. */
+  onProgress?: (progress: { loaded: number; total: number }) => void;
+}
+
+export interface DecisionHeadInfo {
+  apiVersion: number;
+  handle: number;
+  hiddenSize: number;
+  clsToken: number;
+  sepToken: number;
+  maskToken: number;
+  maskText: string;
+  configJson: string;
+  deviceName: string;
+}
+
+/** 0 = choice, 1 = score, 2 = noul. */
+export type DecisionQuestionType = 0 | 1 | 2;
+
+export interface DecisionSequence {
+  tokens: Int32Array | readonly number[];
+  /** Token indexes of the option markers, in option order. */
+  markers: Int32Array | readonly number[];
+  questionType: DecisionQuestionType;
+}
+
+export interface DecisionOutput {
+  /** One raw logit per marker. */
+  logits: Float32Array;
+  actLogits: Float32Array;
+}
+
 export type ModelMetadata = Record<string, unknown>;
 
 export interface StateLoadResult {
@@ -189,6 +231,13 @@ export class LlamaWebGpuBridge {
   supportsAudio(): boolean;
   getTextToSpeechCapabilities(): Promise<TextToSpeechCapabilities>;
   synthesizeSpeech(options: TextToSpeechOptions): Promise<TextToSpeechResult>;
+  getDecisionCapabilities(): Promise<DecisionCapabilities>;
+  loadDecisionHead(
+    source: string | ArrayBuffer | ArrayBufferView,
+    options?: DecisionHeadOptions,
+  ): Promise<DecisionHeadInfo>;
+  runDecision(handle: number, sequences: readonly DecisionSequence[]): Promise<DecisionOutput[]>;
+  freeDecisionHead(handle: number): Promise<void>;
 
   getModelMetadata(): ModelMetadata | null;
   getContextSize(): number;

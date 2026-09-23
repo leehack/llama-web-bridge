@@ -31,7 +31,7 @@ try {
   writeFileSync(
     path.join(temporaryDir, 'consumer.ts'),
     [
-      "import type { CompletionOptions, EmbedOptions } from './bridge.js';",
+      "import type { CompletionOptions, DecisionHeadOptions, DecisionSequence, EmbedOptions } from './bridge.js';",
       '',
       'export const accepted: CompletionOptions = {',
       '  nPredict: 64,',
@@ -59,6 +59,18 @@ try {
       "export const rejectedImageSource: CompletionOptions = { parts: [{ type: 'image' }] };",
       '// @ts-expect-error audio parts require samples, bytes, or a URL.',
       "export const rejectedAudioSource: CompletionOptions = { parts: [{ type: 'audio' }] };",
+      '',
+      'export const acceptedDecision: DecisionSequence[] = [',
+      '  { tokens: new Int32Array([50281, 5, 50282]), markers: [1], questionType: 0 },',
+      '  { tokens: [50281, 7, 50282], markers: new Int32Array([1]), questionType: 2 },',
+      '];',
+      "export const acceptedHeadOptions: DecisionHeadOptions = { configJson: '{}' };",
+      '// @ts-expect-error question types are 0 (choice), 1 (score) or 2 (noul).',
+      'export const rejectedQuestionType: DecisionSequence = { tokens: [1], markers: [0], questionType: 3 };',
+      '// @ts-expect-error float arrays are not token ids.',
+      'export const rejectedTokens: DecisionSequence = { tokens: new Float32Array(1), markers: [0], questionType: 0 };',
+      '// @ts-expect-error configJson is the config text, not a parsed object.',
+      'export const rejectedHeadConfig: DecisionHeadOptions = { configJson: { max_len: 512 } };',
       '',
     ].join('\n'),
   );

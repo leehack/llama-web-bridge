@@ -74,9 +74,10 @@ Before opening or updating a PR, run the lightweight contracts:
 
 ```bash
 npm run check:js
-python3 -m py_compile scripts/verify_state_persistence_api.py scripts/verify_text_to_speech_api.py scripts/verify_ci_reliability.py scripts/state_persistence_browser_smoke.py scripts/multimodal_browser_smoke.py scripts/speech_to_text_browser_smoke.py scripts/text_to_speech_browser_smoke.py
+python3 -m py_compile scripts/verify_state_persistence_api.py scripts/verify_text_to_speech_api.py scripts/verify_decision_api.py scripts/verify_ci_reliability.py scripts/state_persistence_browser_smoke.py scripts/multimodal_browser_smoke.py scripts/speech_to_text_browser_smoke.py scripts/text_to_speech_browser_smoke.py scripts/decision_browser_smoke.py
 python3 scripts/verify_state_persistence_api.py
 python3 scripts/verify_text_to_speech_api.py
+python3 scripts/verify_decision_api.py
 python3 scripts/mtmd_compat_contract_test.py
 python3 scripts/verify_ci_reliability.py
 ```
@@ -141,6 +142,23 @@ python3 scripts/text_to_speech_browser_smoke.py \
   --runtime-mode all \
   --gpu-layers 99 \
   --artifacts-dir /tmp/llama-web-bridge-text-to-speech-smoke
+```
+
+For decision-head changes, compare a Laya encoder and head with the Laya
+reference fixture (llamadart's
+`test/fixtures/decision/laya_0_3_5_reference.json`) through both runtimes and
+memory modes. Pass `--config-path` with `rl_agent_config.json` for a head
+without `laya.config` metadata, such as the official `model.safetensors`, and
+`--gpu-layers 0` to check the CPU path:
+
+```bash
+python3 scripts/decision_browser_smoke.py \
+  --dist-dir /private/tmp/llama_web_bridge_dist \
+  --model-path /path/to/laya-Q8_0.gguf \
+  --head-path /path/to/laya-head.safetensors \
+  --fixture-path /path/to/laya_0_3_5_reference.json \
+  --gpu-layers 99 \
+  --artifacts-dir /tmp/llama-web-bridge-decision-smoke
 ```
 
 If the smoke downloads from a URL, errors and diagnostics must redact userinfo,

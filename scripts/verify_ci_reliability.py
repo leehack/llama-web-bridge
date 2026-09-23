@@ -968,6 +968,8 @@ def main() -> int:
     speech_smoke = read_required("scripts/speech_to_text_browser_smoke.py", errors)
     tts_smoke = read_required("scripts/text_to_speech_browser_smoke.py", errors)
     tts_contract = read_required("scripts/verify_text_to_speech_api.py", errors)
+    decision_smoke = read_required("scripts/decision_browser_smoke.py", errors)
+    decision_contract = read_required("scripts/verify_decision_api.py", errors)
     release_qualification = read_required("scripts/release_qualification.py", errors)
     release_qualification_test = read_required(
         "scripts/release_qualification_test.py", errors
@@ -1304,6 +1306,19 @@ def main() -> int:
         and "LLAMADART_WEBGPU_TTS_API_VERSION" in tts_contract
         and 'RUNTIME_MODES = ("direct", "worker")' in tts_smoke,
         "CI must syntax-check the TTS smoke and run its static API contract without executing the heavy real-model gate on hosted runners",
+        errors,
+    )
+    require(
+        "python3 scripts/verify_decision_api.py" in ci
+        and "scripts/decision_browser_smoke.py" in ci
+        and "decision_browser_smoke.py --" not in ci
+        and all(
+            "python3 scripts/verify_decision_api.py" in workflow
+            for workflow in (candidate, publish)
+        )
+        and "LLAMADART_WEBGPU_DECISION_API_VERSION" in decision_contract
+        and 'RUNTIME_MODES = ("direct", "worker")' in decision_smoke,
+        "CI, candidate and publish workflows must run the decision API contract, and CI must syntax-check the decision smoke without running it",
         errors,
     )
     for name, workflow in (
@@ -2527,6 +2542,7 @@ def main() -> int:
         and "multimodal_browser_smoke.py" in agents
         and "speech_to_text_browser_smoke.py" in agents
         and "text_to_speech_browser_smoke.py" in agents
+        and "decision_browser_smoke.py" in agents
         and "llama_cpp.version" in agents
         and "emsdk.version" in agents
         and "auto_llama_cpp_update.yml" in agents,
@@ -2560,6 +2576,7 @@ def main() -> int:
         and "scripts/multimodal_browser_smoke.py" in readme
         and "scripts/speech_to_text_browser_smoke.py" in readme
         and "scripts/text_to_speech_browser_smoke.py" in readme
+        and "scripts/decision_browser_smoke.py" in readme
         and "scripts/verify_ci_reliability.py" in readme
         and "llama_cpp.version" in readme
         and "emsdk.version" in readme
@@ -2618,6 +2635,8 @@ def main() -> int:
         and "scripts/multimodal_browser_smoke.py" in contributing
         and "scripts/speech_to_text_browser_smoke.py" in contributing
         and "scripts/text_to_speech_browser_smoke.py" in contributing
+        and "scripts/decision_browser_smoke.py" in contributing
+        and "python3 scripts/verify_decision_api.py" in contributing
         and "--model-sha256" in contributing
         and "--mmproj-sha256" in contributing
         and "llama_cpp.version" in contributing
