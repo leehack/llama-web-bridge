@@ -21,12 +21,14 @@
 #include <emscripten/wasmfs.h>
 
 #include "ggml-backend.h"
+#include "llama-cpp.h"
 #include "llama.h"
 #include "mtmd-helper.h"
 #include "mtmd.h"
 
 #include "llama_webgpu_decision.h"
 #include "llama_webgpu_embedding_json.h"
+#include "llama_webgpu_grammar.h"
 #include "llama_webgpu_mtmd_compat.h"
 #include "llama_webgpu_tts.h"
 
@@ -954,6 +956,22 @@ int32_t begin_generation_impl(
   }
 
   end_generation_state();
+
+  // Parse the grammar before the prompt touches the KV cache, so an invalid
+  // grammar rejects without side effects.
+  llama_sampler_ptr grammar_sampler;
+  if (grammar != nullptr && grammar[0] != '\0') {
+    std::string grammar_error;
+    grammar_sampler.reset(llamadart_webgpu_grammar_sampler_init(
+        g_state.vocab, grammar, "root", &grammar_error));
+    if (!grammar_sampler) {
+      set_error(
+          "Failed to initialize sampler chain (invalid grammar): " +
+          grammar_error);
+      return -5;
+    }
+  }
+
   g_cancel_requested = false;
   g_generation_has_qwen3_asr_audio =
       g_model_is_qwen3_asr &&
@@ -1022,16 +1040,7 @@ int32_t begin_generation_impl(
     return -5;
   }
 
-  if (grammar != nullptr && std::strlen(grammar) > 0) {
-    g_active_grammar =
-        llama_sampler_init_grammar(g_state.vocab, grammar, "root");
-    if (g_active_grammar == nullptr) {
-      end_generation_state();
-      set_error("Failed to initialize sampler chain (invalid grammar)");
-      return -5;
-    }
-  }
-
+  g_active_grammar = grammar_sampler.release();
   g_generation_active = true;
   return 0;
 }
