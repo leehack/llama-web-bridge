@@ -490,6 +490,134 @@ const CASES = [
     assert.ok(!flaggedCrash.warnings.some((message) => message.includes('CPU fallback')));
   }],
 
+  ['failed main-thread recovery leaves a usable direct runtime for the next load', async () => {
+    const proxy = createProxy('crashed', async (method) => {
+      if (method !== 'tokenize') {
+        return { value: undefined };
+      }
+      throw new Error('Bridge worker crashed');
+    });
+    const created = [];
+    const createTrackedRuntime = () => {
+      const index = created.length;
+      const runtime = createRuntime({
+        disposeCalls: 0,
+        async loadModelFromUrl(url, options) {
+          runtime.loadCalls.push({ url, options: { ...options } });
+          if (index === 0) {
+            throw new Error('recovery reload failed');
+          }
+          runtime._modelBytes = 1;
+        },
+        async dispose() {
+          runtime.disposeCalls += 1;
+        },
+        async tokenize(text) {
+          if (runtime._modelBytes <= 0) {
+            throw new Error('No model loaded. Call loadModelFromUrl first.');
+          }
+          return [text.length];
+        },
+        async createCompletion(prompt) {
+          if (runtime._modelBytes <= 0) {
+            throw new Error('No model loaded. Call loadModelFromUrl first.');
+          }
+          return `main:${prompt}`;
+        },
+      });
+      created.push(runtime);
+      return runtime;
+    };
+    const { bridge } = createBridge({
+      _workerProxy: proxy,
+      _loadedModelUrl: 'model.gguf',
+      _loadedModelOptions: { nGpuLayers: 0 },
+      _loadedMmProjUrl: 'mmproj.gguf',
+      _createRuntime: createTrackedRuntime,
+    });
+
+    await assert.rejects(bridge.tokenize('alpha'), /recovery reload failed/);
+
+    const [failed] = created;
+    assert.equal(bridge._workerProxy, null, 'the crashed worker stays retired');
+    assert.equal(proxy.disposeCalls, 1);
+    assert.equal(failed.disposeCalls, 1, 'the half-recovered runtime is torn down');
+    assert.notEqual(bridge._runtime, failed);
+    assert.equal(bridge._loadedModelUrl, null, 'the unrecovered model is forgotten');
+    assert.equal(bridge._loadedModelOptions, null);
+    assert.equal(bridge._loadedMmProjUrl, null);
+
+    await assert.rejects(
+      bridge.tokenize('alpha'),
+      (error) => !(error instanceof TypeError) && /No model loaded/.test(error.message),
+      'a call before a new load fails clearly instead of dereferencing a null runtime',
+    );
+    await assert.rejects(
+      bridge.createCompletion('describe', { parts: [{ type: 'image', bytes: new Uint8Array(1) }] }),
+      /No model loaded/,
+      'a media completion does not silently retry the forgotten model',
+    );
+    assert.equal(created.length, 2, 'the forgotten model is not reloaded');
+
+    await bridge.loadModelFromUrl('good.gguf', { nGpuLayers: 0 });
+    const current = bridge._runtime;
+    assert.ok(current && current !== failed, 'the load runs on a fresh direct runtime');
+    assert.deepEqual(current.loadCalls.map((call) => call.url), ['good.gguf']);
+    assert.equal(bridge._loadedModelUrl, 'good.gguf');
+    assert.deepEqual(await bridge.tokenize('beta'), [4]);
+
+    const createdBeforeDispose = created.length;
+    await bridge.dispose();
+    assert.equal(bridge._runtime, null);
+    assert.equal(current.disposeCalls, 1);
+    await assert.rejects(bridge.tokenize('gamma'), /Bridge has been disposed/);
+    await assert.rejects(bridge.loadModelFromUrl('good.gguf', {}), /Bridge has been disposed/);
+    await assert.rejects(bridge.prefetchModelToCache('good.gguf'), /Bridge has been disposed/);
+    await assert.rejects(
+      bridge._ensureRuntimeReadyAfterWorkerFallback({}, null),
+      /Bridge has been disposed/,
+    );
+    assert.equal(bridge._runtime, null);
+    assert.equal(created.length, createdBeforeDispose, 'disposal never recreates a runtime');
+  }],
+
+  ['failed recovery does not recreate a runtime once disposal has begun', async () => {
+    const proxy = createProxy('crashed', async (method) => {
+      if (method !== 'tokenize') {
+        return { value: undefined };
+      }
+      throw new Error('Bridge worker crashed');
+    });
+    let disposal = null;
+    let created = 0;
+    const { bridge } = createBridge({
+      _workerProxy: proxy,
+      _loadedModelUrl: 'model.gguf',
+      _loadedModelOptions: { nGpuLayers: 0 },
+      _createRuntime: () => {
+        created += 1;
+        return createRuntime({
+          async loadModelFromUrl() {
+            throw new Error('recovery reload failed');
+          },
+          async dispose() {
+            // The application disposes the bridge while the failed runtime is
+            // still being torn down.
+            disposal ??= bridge.dispose();
+          },
+        });
+      },
+    });
+
+    await assert.rejects(bridge.tokenize('alpha'));
+    assert.ok(disposal, 'disposal began during recovery cleanup');
+    await disposal;
+
+    assert.equal(created, 1, 'no replacement runtime is created during disposal');
+    assert.equal(bridge._runtime, null);
+    assert.equal(bridge._lifecycleState, 'disposed');
+  }],
+
   ['bridge and runtime log gates share one level table', () => {
     const levels = ['debug', 'log', 'info', 'warn', 'error', 'trace'];
     const expected = {

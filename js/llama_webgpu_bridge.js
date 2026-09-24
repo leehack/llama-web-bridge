@@ -5104,6 +5104,13 @@ var LlamaWebGpuBridge = class {
       this._backendName = "";
       this._supportsVision = false;
       this._supportsAudio = false;
+      this._loadedModelUrl = null;
+      this._loadedModelOptions = null;
+      this._loadedMmProjUrl = null;
+      if (!this._disposed && this._lifecycleState === "open" && !this._workerProxy) {
+        this._runtime = this._createRuntime();
+        operation?.runtimes?.add(this._runtime);
+      }
       throw error;
     } finally {
       if (operation && this._activeOperation === operation && operation.state === "recovering") {
