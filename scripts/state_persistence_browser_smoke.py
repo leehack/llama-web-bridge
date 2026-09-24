@@ -288,6 +288,22 @@ def write_harness(web_root: Path, model_filename: str | None) -> None:
       }});
       assert(typeof afterRestoreText === 'string', `${{mode}} completion after state restore did not return text`);
 
+      // A second load replaces the model in place. WASMFS analyzePath('/models')
+      // used to throw a bare "FS error" here, which restarted the worker.
+      const workerBeforeReload = bridge._workerProxy;
+      await bridge.loadModelFromUrl(modelUrl, {{
+        nCtx: 64,
+        nThreads: 1,
+        nGpuLayers: 0,
+        nBatch: 32,
+        nUbatch: 32,
+        useCache: false,
+        forceRemoteFetchBackend: false,
+      }});
+      assert(bridge._workerProxy === workerBeforeReload, `${{mode}} model reload replaced the runtime`);
+      const reloadedTokens = await bridge.tokenize(prompt, true);
+      assert(arraysEqual(reloadedTokens, tokens), `${{mode}} tokenization changed after model reload`);
+
       const workerSaveSnapshotReturned = mode === 'worker runtime'
         ? snapshot instanceof Uint8Array && snapshot.byteLength > 0
         : null;

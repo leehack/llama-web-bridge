@@ -422,6 +422,44 @@ async function drainResponseWithProgress(response, progressCallback, options = {
   return loaded;
 }
 
+// Emscripten's WASMFS FS.analyzePath() reads the whole entry to fill
+// `object.contents`: it throws ErrnoError ("FS error") for an existing directory
+// and copies an existing file into JS memory. Probe paths with mkdir/unlink and
+// a directory listing instead.
+function ensureFsDirectory(fs, dirPath) {
+  const slash = dirPath.lastIndexOf('/');
+  const parent = slash > 0 ? dirPath.slice(0, slash) : '/';
+  const name = dirPath.slice(slash + 1);
+  const exists = () => {
+    try {
+      const entries = fs.readdir(parent);
+      return Array.isArray(entries) && entries.includes(name);
+    } catch (_) {
+      return false;
+    }
+  };
+
+  if (exists()) {
+    return;
+  }
+  try {
+    fs.mkdir(dirPath);
+  } catch (error) {
+    if (!exists()) {
+      throw error;
+    }
+  }
+}
+
+function unlinkFsFile(fs, filePath) {
+  try {
+    fs.unlink(filePath);
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
 async function writeResponseToFsFileWithProgress(
   response,
   fs,
@@ -442,13 +480,8 @@ async function writeResponseToFsFileWithProgress(
   throwIfAborted(signal, abortMessage);
 
   if (!appendMode) {
-    try {
-      if (fs.analyzePath(filePath).exists) {
-        fs.unlink(filePath);
-      }
-    } catch (_) {
-      // best-effort replacement of stale temp files
-    }
+    // best-effort replacement of stale temp files
+    unlinkFsFile(fs, filePath);
   }
 
   if (!response.body || typeof response.body.getReader !== 'function') {
@@ -2779,16 +2812,7 @@ class LlamaWebGpuBridgeRuntime {
       return false;
     }
 
-    try {
-      if (this._core.FS.analyzePath(path).exists) {
-        this._core.FS.unlink(path);
-        return true;
-      }
-    } catch (_) {
-      // ignore best-effort cleanup failures
-    }
-
-    return false;
+    return unlinkFsFile(this._core.FS, path);
   }
 
   _releaseModelFiles() {
@@ -2805,6 +2829,35 @@ class LlamaWebGpuBridgeRuntime {
 
     this._modelPaths = [];
     return removed;
+  }
+
+  // A load replaces the current model. Free it, its projector and their FS files
+  // before downloading the next model so both never occupy the wasm heap at once.
+  // The core refuses while a generation or speech synthesis is still active,
+  // which leaves the current model untouched.
+  _releaseLoadedModel(core) {
+    const projectorPath = this._mmProjPath;
+    const hasModelFiles = Array.isArray(this._modelPaths) && this._modelPaths.length > 0;
+    if (this._modelBytes <= 0 && !projectorPath && !hasModelFiles) {
+      return false;
+    }
+
+    const rc = Number(core.ccall('llamadart_webgpu_free_model', 'number', [], []));
+    if (rc !== 0) {
+      throw new Error(this._coreErrorMessage('Failed to release the loaded model', rc));
+    }
+
+    this._clearStagedMediaFiles();
+    this._deleteFsFile(projectorPath);
+    this._releaseModelFiles();
+    this._modelPath = null;
+    this._modelBytes = 0;
+    this._modelSource = 'network';
+    this._mmProjPath = null;
+    this._mmSupportsVision = false;
+    this._mmSupportsAudio = false;
+    this._runtimeNotes.push('previous_model_released');
+    return true;
   }
 
   async _getCachedModelResponse(url, options = {}) {
@@ -3328,7 +3381,6 @@ class LlamaWebGpuBridgeRuntime {
     throwIfAborted(operationSignal, abortMessage);
     this._abortRequested = false;
     this._runtimeNotes = [];
-    this._mmProjSourceUrl = null;
     this._suppressedWarmupWarningCount = 0;
     this._didReportWarmupWarningSuppression = false;
     await this._probeBackends();
@@ -3336,6 +3388,16 @@ class LlamaWebGpuBridgeRuntime {
 
     const core = await this._ensureCore();
     throwIfAborted(operationSignal, abortMessage);
+
+    const modelUrls = expandModelShardUrls(url);
+    if (modelUrls.length === 0) {
+      throw new Error('Model URL is empty.');
+    }
+    // Release before any per-load option below changes, so a refused release
+    // leaves the current model and its configuration intact.
+    this._releaseLoadedModel(core);
+    this._mmProjSourceUrl = null;
+
     const configuredPoolHint = Number(this._threadPoolSizeHint);
     this._syncThreadPoolSizeHintFromCore();
     const coreSupportsPthreads = this._coreSupportsPthreads();
@@ -3433,10 +3495,6 @@ class LlamaWebGpuBridgeRuntime {
       }
     }
 
-    const modelUrls = expandModelShardUrls(url);
-    if (modelUrls.length === 0) {
-      throw new Error('Model URL is empty.');
-    }
     this._loadedModelUrl = cloneModelSource(url);
     if (modelUrls.length > 1) {
       this._runtimeNotes.push(`model_split_detected:${modelUrls.length}`);
@@ -3460,9 +3518,7 @@ class LlamaWebGpuBridgeRuntime {
     }
 
     if (!loadedViaRemoteFetch) {
-      if (!core.FS.analyzePath('/models').exists) {
-        core.FS.mkdir('/models');
-      }
+      ensureFsDirectory(core.FS, '/models');
 
       const progressCallback = typeof options.progressCallback === 'function'
         ? options.progressCallback
@@ -3932,9 +3988,7 @@ class LlamaWebGpuBridgeRuntime {
 
     const core = await this._ensureCore();
 
-    if (!core.FS.analyzePath('/mmproj').exists) {
-      core.FS.mkdir('/mmproj');
-    }
+    ensureFsDirectory(core.FS, '/mmproj');
 
     const fileName = basenameFromUrl(url);
     const mmprojPath = `/mmproj/${fileName}`;
@@ -4929,31 +4983,7 @@ class LlamaWebGpuBridgeRuntime {
       throw new Error('Bridge filesystem is not initialized');
     }
 
-    const hasStateDir = () => {
-      try {
-        const entries = core.FS.readdir('/');
-        return Array.isArray(entries) && entries.includes('states');
-      } catch (_) {
-        return false;
-      }
-    };
-
-    // Emscripten's generated FS.analyzePath can throw for existing directories in
-    // the pthread/browser runtime. Check the root directory listing instead so
-    // repeated bytes save/load round-trips do not retry mkdir('/states') and hit
-    // EEXIST after the first snapshot.
-    if (hasStateDir()) {
-      return;
-    }
-
-    try {
-      core.FS.mkdir('/states');
-    } catch (error) {
-      if (hasStateDir()) {
-        return;
-      }
-      throw error;
-    }
+    ensureFsDirectory(core.FS, '/states');
   }
 
   _normalizeStateTokens(tokens) {
@@ -6118,12 +6148,13 @@ export class LlamaWebGpuBridge {
     );
   }
 
-  // A completion falls back only when the worker can no longer serve requests:
-  // it crashed, stalled, timed out, never initialized, or its core aborted.
-  // A core error from a healthy worker (invalid grammar, a grammar that
-  // rejects every candidate, a context limit) is deterministic; retrying on
-  // the main thread fails the same way and strands the session there.
-  _isCompletionWorkerUnusableError(error) {
+  // A worker request falls back only when the worker can no longer serve
+  // requests: it crashed, stalled, timed out, never initialized, or its core
+  // aborted. A core error from a healthy worker (invalid grammar, a context
+  // limit, an unsupported template, a model without embeddings) is
+  // deterministic; retrying on the main thread fails the same way and strands
+  // the session there.
+  _isWorkerUnusableError(error) {
     if (error && typeof error === 'object' && error.llamadartWorkerCrash === true) {
       return true;
     }
@@ -7010,7 +7041,7 @@ export class LlamaWebGpuBridge {
         return this._runtime.createCompletion(prompt, options);
       }
 
-      if (!this._isCompletionWorkerUnusableError(error)) {
+      if (!this._isWorkerUnusableError(error)) {
         throw error;
       }
 
@@ -7470,6 +7501,9 @@ export class LlamaWebGpuBridge {
       return await this._callWorker('tokenize', [text, addSpecial]);
     } catch (error) {
       this._throwIfOperationCancelled(error, 'Tokenization was cancelled.');
+      if (!this._isWorkerUnusableError(error)) {
+        throw error;
+      }
       this._disableWorkerFallback(error);
       await this._waitForWorkerDisposal();
       await this._ensureRuntimeReadyAfterWorkerFallback({}, error);
@@ -7590,6 +7624,9 @@ export class LlamaWebGpuBridge {
       return await this._callWorker('detokenize', [normalized, special]);
     } catch (error) {
       this._throwIfOperationCancelled(error, 'Detokenization was cancelled.');
+      if (!this._isWorkerUnusableError(error)) {
+        throw error;
+      }
       this._disableWorkerFallback(error);
       await this._waitForWorkerDisposal();
       await this._ensureRuntimeReadyAfterWorkerFallback({}, error);
@@ -7613,6 +7650,9 @@ export class LlamaWebGpuBridge {
       return await this._callWorker('embed', [text, options]);
     } catch (error) {
       this._throwIfOperationCancelled(error, 'Embedding was cancelled.');
+      if (!this._isWorkerUnusableError(error)) {
+        throw error;
+      }
       this._disableWorkerFallback(error);
       await this._waitForWorkerDisposal();
       await this._ensureRuntimeReadyAfterWorkerFallback({}, error);
@@ -7639,6 +7679,9 @@ export class LlamaWebGpuBridge {
       return await this._callWorker('embedBatch', [normalized, options]);
     } catch (error) {
       this._throwIfOperationCancelled(error, 'Batch embedding was cancelled.');
+      if (!this._isWorkerUnusableError(error)) {
+        throw error;
+      }
       this._disableWorkerFallback(error);
       await this._waitForWorkerDisposal();
       await this._ensureRuntimeReadyAfterWorkerFallback({}, error);
@@ -7830,6 +7873,9 @@ export class LlamaWebGpuBridge {
       return await this._callWorker('applyChatTemplate', [messages, addAssistant, customTemplate]);
     } catch (error) {
       this._throwIfOperationCancelled(error, 'Chat template operation was cancelled.');
+      if (!this._isWorkerUnusableError(error)) {
+        throw error;
+      }
       // Template fallback runs while this operation owns the queue slot, so
       // worker replacement cannot race another runtime-backed call.
       this._disableWorkerFallback(error);

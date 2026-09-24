@@ -995,6 +995,9 @@ def main() -> int:
     native_load_arity_contract = read_required(
         "scripts/native_load_option_arity_test.mjs", errors
     )
+    model_reload_contract = read_required(
+        "scripts/model_reload_contract_test.mjs", errors
+    )
     worker_error_classification_contract = read_required(
         "scripts/bridge_worker_error_classification_test.mjs", errors
     )
@@ -1149,6 +1152,13 @@ def main() -> int:
         '"test:type-declarations"' in package_json
         and "npm run test:type-declarations" in package_json,
         "check:js must define and run the bridge type declaration contract",
+        errors,
+    )
+    require(
+        '"test:model-reload"' in package_json
+        and "npm run test:model-reload" in package_json
+        and "Model reload contract tests passed" in model_reload_contract,
+        "check:js must define and run the model reload contract",
         errors,
     )
     require(

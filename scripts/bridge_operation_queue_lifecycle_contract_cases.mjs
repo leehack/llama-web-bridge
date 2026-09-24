@@ -325,7 +325,8 @@ export const LIFECYCLE_CONTRACT_CASES = [
       assert.equal(driver.calls('dispose').length, 0, 'teardown waits for the active owner');
       assert.equal(disposalResolved, false, 'queued disposal must still be pending');
 
-      driver.error(activeCall.id, 'worker died');
+      // Only an unusable worker falls back; its trapped core posts the abort text.
+      driver.error(activeCall.id, 'RuntimeError: Aborted(undefined). Build with -sASSERTIONS for more info.');
       assert.equal(await active, 'user: hi\nassistant: ');
       await driver.settle();
 
