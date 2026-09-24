@@ -74,7 +74,7 @@ Before opening or updating a PR, run the lightweight contracts:
 
 ```bash
 npm run check:js
-python3 -m py_compile scripts/verify_state_persistence_api.py scripts/verify_text_to_speech_api.py scripts/verify_decision_api.py scripts/verify_ci_reliability.py scripts/state_persistence_browser_smoke.py scripts/multimodal_browser_smoke.py scripts/speech_to_text_browser_smoke.py scripts/text_to_speech_browser_smoke.py scripts/decision_browser_smoke.py
+python3 -m py_compile scripts/verify_state_persistence_api.py scripts/verify_text_to_speech_api.py scripts/verify_decision_api.py scripts/verify_ci_reliability.py scripts/state_persistence_browser_smoke.py scripts/multimodal_browser_smoke.py scripts/grammar_browser_smoke.py scripts/speech_to_text_browser_smoke.py scripts/text_to_speech_browser_smoke.py scripts/decision_browser_smoke.py
 python3 scripts/verify_state_persistence_api.py
 python3 scripts/verify_text_to_speech_api.py
 python3 scripts/verify_decision_api.py
@@ -106,6 +106,21 @@ python3 scripts/multimodal_browser_smoke.py \
   --mmproj-path /path/to/mmproj-F16.gguf \
   --mmproj-sha256 56e4c6cfe73b0c82e3e82bc518d7591997e61d81f723fc41a586f4fa69ea2453 \
   --artifacts-dir /tmp/llama-web-bridge-multimodal-smoke
+```
+
+For sampler or grammar changes, run grammar-constrained completion through
+direct and worker runtimes on both memory modes. CI runs it twice: with the
+state-persistence model, then with the multimodal model. Pass each model's
+`--model-url` (or `--model-path`) and `--model-sha256` pin from the commands
+above; the smoke defaults to the `LLAMA_WEBGPU_SMOKE_MODEL_URL` and
+`LLAMA_WEBGPU_SMOKE_MODEL_SHA256` environment variables:
+
+```bash
+python3 scripts/grammar_browser_smoke.py \
+  --dist-dir /private/tmp/llama_web_bridge_dist \
+  --model-url "$LLAMA_WEBGPU_SMOKE_MODEL_URL" \
+  --model-sha256 "$LLAMA_WEBGPU_SMOKE_MODEL_SHA256" \
+  --artifacts-dir /tmp/llama-web-bridge-grammar-smoke
 ```
 
 Heavy Qwen3-ASR and Qwen3-TTS gates run in the hosted automated
