@@ -6307,6 +6307,19 @@ export class LlamaWebGpuBridge {
       this._backendName = '';
       this._supportsVision = false;
       this._supportsAudio = false;
+      // The worker is already retired, so the facade is now direct-only with
+      // no model: forget the model the failed recovery could not honour, and
+      // keep an unloaded runtime so later calls fail with "No model loaded"
+      // or load a new model instead of dereferencing null; the queue then
+      // snapshots that unloaded runtime over the zeroed fields above. Disposal
+      // that began during the cleanup above owns teardown and gets no runtime.
+      this._loadedModelUrl = null;
+      this._loadedModelOptions = null;
+      this._loadedMmProjUrl = null;
+      if (!this._disposed && this._lifecycleState === 'open' && !this._workerProxy) {
+        this._runtime = this._createRuntime();
+        operation?.runtimes?.add(this._runtime);
+      }
       throw error;
     } finally {
       if (operation && this._activeOperation === operation && operation.state === 'recovering') {
