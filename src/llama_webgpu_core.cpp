@@ -1357,6 +1357,17 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_load_model(
       main_gpu);
 }
 
+EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_free_model() {
+  clear_error();
+  if (g_generation_active || g_tts_active) {
+    set_error("Model cannot be released during active generation or text-to-speech synthesis");
+    return -1;
+  }
+
+  free_runtime();
+  return 0;
+}
+
 EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_load_model_from_url(
     const char * model_url,
     int32_t n_ctx,

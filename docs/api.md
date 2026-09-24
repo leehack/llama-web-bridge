@@ -219,6 +219,14 @@ Common `options` keys:
 Returns the underlying load result from the active runtime. After a successful
 load, metadata and capability helpers reflect the loaded model.
 
+Calling it again replaces the loaded model in the same runtime, in both direct
+and worker modes. The bridge first frees the current model, its multimodal
+projector and their filesystem copies, then downloads the new model, so both
+never occupy the WASM heap at once. If the download or native load then
+fails, no model stays loaded; call `loadModelFromUrl()` again. The core refuses
+the release while a generation or speech synthesis is active, and the current
+model stays loaded. Load a projector again after switching models.
+
 ### `prefetchModelToCache(url, options?)`
 
 ```ts

@@ -18,6 +18,7 @@ TOOLING = frozenset({
     'scripts/mtmd_compat_contract_test.py',
     'scripts/wasm64_runtime_patch_contract_test.py',
     'scripts/embedding_json_contract_test.mjs', 'scripts/native_load_option_arity_test.mjs',
+    'scripts/model_reload_contract_test.mjs',
     'scripts/bridge_operation_queue_test.mjs',
     'scripts/bridge_operation_lifecycle_test.mjs', 'scripts/text_to_speech_recovery_test.mjs',
     'scripts/bridge_type_declaration_contract_test.mjs', 'scripts/worker_runtime_state_test.mjs',
