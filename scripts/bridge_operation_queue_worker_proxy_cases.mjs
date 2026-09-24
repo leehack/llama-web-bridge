@@ -9,6 +9,12 @@ import {
   workerDriver,
 } from './bridge_operation_queue_fixtures.mjs';
 
+// Only an unusable worker moves a request to the main thread; a plain core
+// error is rethrown and the worker is kept.
+function workerCrash() {
+  return Object.assign(new Error('worker died'), { llamadartWorkerCrash: true });
+}
+
 export const WORKER_PROXY_CASES = [
   [5, 'worker dispatch FIFO ordering', async () => {
     const dispatched = [];
@@ -454,7 +460,7 @@ export const WORKER_PROXY_CASES = [
       _callWorker: (method) => {
         events.push(`dispatch:${method}`);
         if (method === 'applyChatTemplate') {
-          return Promise.reject(new Error('worker died'));
+          return Promise.reject(workerCrash());
         }
         return new Promise((resolve) => {
           resolveLoad = () => {
@@ -505,7 +511,7 @@ export const WORKER_PROXY_CASES = [
       _callWorker: async (method) => {
         dispatched.push(method);
         if (method === 'applyChatTemplate') {
-          throw new Error('worker died');
+          throw workerCrash();
         }
         return [98];
       },
@@ -574,9 +580,6 @@ export const WORKER_PROXY_CASES = [
           throw new Error('worker tokenize exploded');
         }
         return 'OK';
-      },
-      _disableWorkerFallback: () => {
-        throw new Error('worker tokenize exploded');
       },
     });
 

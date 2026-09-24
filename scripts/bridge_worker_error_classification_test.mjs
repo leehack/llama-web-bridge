@@ -91,6 +91,40 @@ function createBridge(overrides = {}) {
   return { bridge, warnings };
 }
 
+// Deterministic errors a healthy worker posts for each facade method.
+const FACADE_WORKER_METHODS = [
+  {
+    method: 'tokenize',
+    coreError: 'Tokenization failed: Prompt tokenization failed',
+    invoke: (bridge) => bridge.tokenize('hello', true),
+    mainThreadResult: [1, 2],
+  },
+  {
+    method: 'detokenize',
+    coreError: 'Detokenization failed (code=-1)',
+    invoke: (bridge) => bridge.detokenize([1, 2], false),
+    mainThreadResult: 'hello',
+  },
+  {
+    method: 'embed',
+    coreError: 'Embedding generation failed: Embedding input tokenized to an empty sequence',
+    invoke: (bridge) => bridge.embed('hello', {}),
+    mainThreadResult: [0.5, 0.25],
+  },
+  {
+    method: 'embedBatch',
+    coreError: 'Embedding generation failed: Embeddings cannot be generated during active generation or text-to-speech synthesis',
+    invoke: (bridge) => bridge.embedBatch(['a', 'b'], {}),
+    mainThreadResult: [[0.5], [0.25]],
+  },
+  {
+    method: 'applyChatTemplate',
+    coreError: 'messages is not iterable',
+    invoke: (bridge) => bridge.applyChatTemplate([{ role: 'user', content: 'hi' }], true),
+    mainThreadResult: 'user: hi\nassistant: ',
+  },
+];
+
 const CASES = [
   ['main-thread fallback classification is decided by the serialized error text', () => {
     const { bridge } = createBridge();
@@ -211,9 +245,9 @@ const CASES = [
     assert.equal(bridge._workerFallbackReason, null);
   }],
 
-  ['completion falls back only when the worker itself is unusable', () => {
+  ['a worker request falls back only when the worker itself is unusable', () => {
     const { bridge } = createBridge();
-    const unusable = (error) => bridge._isCompletionWorkerUnusableError(error);
+    const unusable = (error) => bridge._isWorkerUnusableError(error);
 
     // Deterministic core errors from a healthy worker.
     for (const text of [
@@ -340,6 +374,110 @@ const CASES = [
     assert.equal(runtime.loadCalls.length, 1, 'the model is reloaded on the main thread');
     assert.deepEqual(runtimeCompletions, ['prompt']);
     assert.equal(bridge._workerFallbackReason, abortText);
+  }],
+
+  ['facade worker core errors are rethrown and keep the worker', async () => {
+    for (const { method, coreError, invoke } of FACADE_WORKER_METHODS) {
+      let dispatches = 0;
+      const proxy = createProxy(method, async (called) => {
+        if (called !== method) {
+          return { value: undefined };
+        }
+        dispatches += 1;
+        throw new Error(coreError);
+      });
+      const { bridge, warnings } = createBridge({
+        _workerProxy: proxy,
+        _loadedModelUrl: 'model.gguf',
+        _createRuntime: () => {
+          throw new Error(`${method}: the main-thread runtime must not be created`);
+        },
+      });
+
+      await assert.rejects(invoke(bridge), (error) => error.message === coreError, method);
+
+      assert.equal(dispatches, 1, method);
+      assert.equal(bridge._workerProxy, proxy, method);
+      assert.equal(proxy.disposeCalls, 0, method);
+      assert.equal(bridge._runtime, null, method);
+      assert.equal(bridge._workerFallbackReason, null, method);
+      assert.deepEqual(warnings, [], method);
+    }
+  }],
+
+  ['facade worker requests fall back when the worker is unusable', async () => {
+    const unusableErrors = [
+      () => Object.assign(new Error('Uncaught ReferenceError: x is not defined'), {
+        llamadartWorkerCrash: true,
+      }),
+      () => new Error('Worker request timeout (tokenize, 5000ms)'),
+      () => new Error('Aborted(undefined). Build with -sASSERTIONS for more info.'),
+    ];
+    for (const { method, invoke, mainThreadResult } of FACADE_WORKER_METHODS) {
+      for (const makeError of unusableErrors) {
+        const error = makeError();
+        const proxy = createProxy(method, async (called) => {
+          if (called !== method) {
+            return { value: undefined };
+          }
+          throw error;
+        });
+        const runtimeCalls = [];
+        const runtime = createRuntime({
+          [method]: async (...args) => {
+            runtimeCalls.push(args);
+            return mainThreadResult;
+          },
+        });
+        const { bridge } = createBridge({
+          _workerProxy: proxy,
+          _loadedModelUrl: 'model.gguf',
+          _loadedModelOptions: { nGpuLayers: 0 },
+          _createRuntime: () => runtime,
+        });
+        const label = `${method}: ${error.message}`;
+
+        assert.deepEqual(await invoke(bridge), mainThreadResult, label);
+
+        assert.equal(runtimeCalls.length, 1, label);
+        assert.equal(bridge._workerProxy, null, label);
+        assert.equal(proxy.disposeCalls, 1, label);
+        assert.equal(bridge._runtime, runtime, label);
+        assert.equal(bridge._workerFallbackReason, error.message, label);
+      }
+    }
+  }],
+
+  ['real worker proxy: posted facade core errors keep the worker', async () => {
+    await withStubWorkerEnvironment(async ({ workers }) => {
+      const bridge = createRealWorkerBridge();
+      const warnings = [];
+      bridge._emitBridgeWarn = (message) => warnings.push(message);
+      bridge._createRuntime = () => {
+        throw new Error('the main-thread runtime must not be created');
+      };
+      const proxy = bridge._workerProxy;
+      const driver = workerDriver(proxy, workers[0]);
+      driver.ready();
+
+      for (const { method, coreError, invoke } of FACADE_WORKER_METHODS) {
+        const pending = settleQuietly(invoke(bridge));
+        await driver.settle();
+        const calls = driver.calls(method);
+        driver.error(calls[calls.length - 1].id, coreError);
+        await assert.rejects(pending, (error) => error.message === coreError, method);
+      }
+
+      assert.equal(bridge._workerProxy, proxy);
+      assert.equal(workers[0].terminated, 0);
+      assert.equal(bridge._workerFallbackReason, null);
+      assert.deepEqual(warnings, []);
+
+      const next = settleQuietly(bridge.tokenize('ok'));
+      await driver.settle();
+      driver.reply(driver.calls('tokenize')[1].id, [7]);
+      assert.deepEqual(await next, [7], 'the kept worker serves the next request');
+    });
   }],
 
   ['real worker proxy: a posted core error is rethrown and the worker is kept', async () => {

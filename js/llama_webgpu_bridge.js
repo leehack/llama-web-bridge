@@ -4955,12 +4955,13 @@ var LlamaWebGpuBridge = class {
     const text = serializeWorkerError(error).toLowerCase();
     return text.includes("aborted(") || text.includes("runtimeerror") || text.includes("unreachable") || text.includes("memory access out of bounds") || text.includes("function signature mismatch") || text.includes("program terminated with exit");
   }
-  // A completion falls back only when the worker can no longer serve requests:
-  // it crashed, stalled, timed out, never initialized, or its core aborted.
-  // A core error from a healthy worker (invalid grammar, a grammar that
-  // rejects every candidate, a context limit) is deterministic; retrying on
-  // the main thread fails the same way and strands the session there.
-  _isCompletionWorkerUnusableError(error) {
+  // A worker request falls back only when the worker can no longer serve
+  // requests: it crashed, stalled, timed out, never initialized, or its core
+  // aborted. A core error from a healthy worker (invalid grammar, a context
+  // limit, an unsupported template, a model without embeddings) is
+  // deterministic; retrying on the main thread fails the same way and strands
+  // the session there.
+  _isWorkerUnusableError(error) {
     if (error && typeof error === "object" && error.llamadartWorkerCrash === true) {
       return true;
     }
@@ -5642,7 +5643,7 @@ var LlamaWebGpuBridge = class {
         await this._ensureRuntimeReadyAfterWorkerFallback(options, error);
         return this._runtime.createCompletion(prompt, options);
       }
-      if (!this._isCompletionWorkerUnusableError(error)) {
+      if (!this._isWorkerUnusableError(error)) {
         throw error;
       }
       this._disableWorkerFallback(error);
@@ -6045,6 +6046,9 @@ var LlamaWebGpuBridge = class {
       return await this._callWorker("tokenize", [text, addSpecial]);
     } catch (error) {
       this._throwIfOperationCancelled(error, "Tokenization was cancelled.");
+      if (!this._isWorkerUnusableError(error)) {
+        throw error;
+      }
       this._disableWorkerFallback(error);
       await this._waitForWorkerDisposal();
       await this._ensureRuntimeReadyAfterWorkerFallback({}, error);
@@ -6139,6 +6143,9 @@ var LlamaWebGpuBridge = class {
       return await this._callWorker("detokenize", [normalized, special]);
     } catch (error) {
       this._throwIfOperationCancelled(error, "Detokenization was cancelled.");
+      if (!this._isWorkerUnusableError(error)) {
+        throw error;
+      }
       this._disableWorkerFallback(error);
       await this._waitForWorkerDisposal();
       await this._ensureRuntimeReadyAfterWorkerFallback({}, error);
@@ -6159,6 +6166,9 @@ var LlamaWebGpuBridge = class {
       return await this._callWorker("embed", [text, options]);
     } catch (error) {
       this._throwIfOperationCancelled(error, "Embedding was cancelled.");
+      if (!this._isWorkerUnusableError(error)) {
+        throw error;
+      }
       this._disableWorkerFallback(error);
       await this._waitForWorkerDisposal();
       await this._ensureRuntimeReadyAfterWorkerFallback({}, error);
@@ -6180,6 +6190,9 @@ var LlamaWebGpuBridge = class {
       return await this._callWorker("embedBatch", [normalized, options]);
     } catch (error) {
       this._throwIfOperationCancelled(error, "Batch embedding was cancelled.");
+      if (!this._isWorkerUnusableError(error)) {
+        throw error;
+      }
       this._disableWorkerFallback(error);
       await this._waitForWorkerDisposal();
       await this._ensureRuntimeReadyAfterWorkerFallback({}, error);
@@ -6325,6 +6338,9 @@ var LlamaWebGpuBridge = class {
       return await this._callWorker("applyChatTemplate", [messages, addAssistant, customTemplate]);
     } catch (error) {
       this._throwIfOperationCancelled(error, "Chat template operation was cancelled.");
+      if (!this._isWorkerUnusableError(error)) {
+        throw error;
+      }
       this._disableWorkerFallback(error);
       return this._runtime.applyChatTemplate(messages, addAssistant, customTemplate);
     }
