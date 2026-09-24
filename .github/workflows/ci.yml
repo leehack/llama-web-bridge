@@ -84,6 +84,7 @@ jobs:
             scripts/release_qualification_test.py \
             scripts/state_persistence_browser_smoke.py \
             scripts/multimodal_browser_smoke.py \
+            scripts/grammar_browser_smoke.py \
             scripts/speech_to_text_browser_smoke.py \
             scripts/text_to_speech_browser_smoke.py \
             scripts/decision_browser_smoke.py
@@ -110,6 +111,7 @@ jobs:
       LLAMA_WEBGPU_SMOKE_MODEL_SHA256: 81f226c62d28ed4a1a9b9fa080fcd9f0cc40e0f9d5680036583ff98fbcd035cb
       LLAMA_WEBGPU_SMOKE_MODEL_CACHE: ~/.cache/llama-web-bridge/state-smoke-models
       LLAMA_WEBGPU_SMOKE_ARTIFACTS_DIR: /tmp/state-persistence-smoke-artifacts
+      LLAMA_WEBGPU_GRAMMAR_ARTIFACTS_DIR: /tmp/grammar-smoke-artifacts
       LLAMA_WEBGPU_MULTIMODAL_MODEL_URL: https://huggingface.co/unsloth/Qwen3.5-0.8B-GGUF/resolve/main/Qwen3.5-0.8B-Q4_K_M.gguf
       LLAMA_WEBGPU_MULTIMODAL_MODEL_SHA256: bd258782e35f7f458f8aced1adc053e6e92e89bc735ba3be89d38a06121dc517
       LLAMA_WEBGPU_MULTIMODAL_MMPROJ_URL: https://huggingface.co/unsloth/Qwen3.5-0.8B-GGUF/resolve/main/mmproj-F16.gguf
@@ -237,6 +239,19 @@ jobs:
           BRIDGE_DIST_DIR: ${{ runner.temp }}/webgpu_bridge_dist
         run: python3 scripts/multimodal_browser_smoke.py
 
+      - name: Run grammar browser smoke
+        env:
+          BRIDGE_DIST_DIR: ${{ runner.temp }}/webgpu_bridge_dist
+        run: |
+          python3 scripts/grammar_browser_smoke.py \
+            --artifacts-dir "$LLAMA_WEBGPU_GRAMMAR_ARTIFACTS_DIR/state-smoke-model"
+          python3 scripts/grammar_browser_smoke.py \
+            --model-url "$LLAMA_WEBGPU_MULTIMODAL_MODEL_URL" \
+            --model-sha256 "$LLAMA_WEBGPU_MULTIMODAL_MODEL_SHA256" \
+            --model-cache-dir "$LLAMA_WEBGPU_MULTIMODAL_MODEL_CACHE" \
+            --timeout-ms "$LLAMA_WEBGPU_MULTIMODAL_TIMEOUT_MS" \
+            --artifacts-dir "$LLAMA_WEBGPU_GRAMMAR_ARTIFACTS_DIR/multimodal-model"
+
       - name: Upload state persistence smoke diagnostics
         if: failure()
         uses: actions/upload-artifact@v4
@@ -251,6 +266,14 @@ jobs:
         with:
           name: multimodal-smoke-artifacts-${{ matrix.upstream }}
           path: ${{ env.LLAMA_WEBGPU_MULTIMODAL_ARTIFACTS_DIR }}
+          if-no-files-found: ignore
+
+      - name: Upload grammar smoke diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: grammar-smoke-artifacts-${{ matrix.upstream }}
+          path: ${{ env.LLAMA_WEBGPU_GRAMMAR_ARTIFACTS_DIR }}
           if-no-files-found: ignore
 
       - name: Upload bridge artifacts

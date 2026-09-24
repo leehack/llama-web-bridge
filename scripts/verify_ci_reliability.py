@@ -965,6 +965,7 @@ def main() -> int:
     errors: list[str] = []
     smoke = read_required("scripts/state_persistence_browser_smoke.py", errors)
     multimodal_smoke = read_required("scripts/multimodal_browser_smoke.py", errors)
+    grammar_smoke = read_required("scripts/grammar_browser_smoke.py", errors)
     speech_smoke = read_required("scripts/speech_to_text_browser_smoke.py", errors)
     tts_smoke = read_required("scripts/text_to_speech_browser_smoke.py", errors)
     tts_contract = read_required("scripts/verify_text_to_speech_api.py", errors)
@@ -1213,6 +1214,30 @@ def main() -> int:
         and "bridge.getModelMetadata()" in multimodal_smoke
         and "imageResizeDiagnostic" in multimodal_smoke,
         "multimodal real-model smoke must verify image-resize diagnostics in direct and worker metadata",
+        errors,
+    )
+    require(
+        '"topK": 1' in grammar_smoke
+        and '"topK": 40' in grammar_smoke
+        and '"topK": 0, "topP": 0.1' in grammar_smoke
+        and "JSON_GRAMMAR" in grammar_smoke
+        and 'MEMORY_MODES = ("wasm32", "wasm64")' in grammar_smoke
+        and 'RUNTIME_MODES = ("direct", "worker")' in grammar_smoke
+        and "globalWorkerFallbackReason" in grammar_smoke
+        and "llamadart.webgpu.core_variant" in grammar_smoke
+        and "scripts/grammar_browser_smoke.py \\" in ci
+        and ci.count("python3 scripts/grammar_browser_smoke.py \\") == 2
+        and '--artifacts-dir "$LLAMA_WEBGPU_GRAMMAR_ARTIFACTS_DIR/state-smoke-model"' in ci
+        and '--artifacts-dir "$LLAMA_WEBGPU_GRAMMAR_ARTIFACTS_DIR/multimodal-model"' in ci
+        and '--model-cache-dir "$LLAMA_WEBGPU_MULTIMODAL_MODEL_CACHE"' in ci
+        and '--timeout-ms "$LLAMA_WEBGPU_MULTIMODAL_TIMEOUT_MS"' in ci
+        and '--model-url "$LLAMA_WEBGPU_MULTIMODAL_MODEL_URL"' in ci
+        and '--model-sha256 "$LLAMA_WEBGPU_MULTIMODAL_MODEL_SHA256"' in ci
+        and "grammar-smoke-artifacts-${{ matrix.upstream }}" in ci
+        and "scripts/grammar_browser_smoke.py" in contributing
+        and "scripts/grammar_browser_smoke.py" in agents,
+        "CI must run the grammar smoke with greedy, sampled, top-p and JSON grammars on both memory modes and runtimes, "
+        "with the state and multimodal models, and keep failure diagnostics per matrix lane",
         errors,
     )
     require(

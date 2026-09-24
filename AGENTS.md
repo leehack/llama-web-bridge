@@ -62,6 +62,8 @@ applies:
   `scripts/state_persistence_browser_smoke.py` against a built `OUT_DIR`;
 - llama.cpp pin or multimodal changes: `scripts/multimodal_browser_smoke.py`
   through both direct and worker runtimes;
+- sampler or grammar changes: `scripts/grammar_browser_smoke.py` with the
+  state-persistence model and the multimodal model;
 - speech changes: `scripts/speech_to_text_browser_smoke.py` and
   `scripts/text_to_speech_browser_smoke.py` individually. The combined
   `release_qualification.py qualify` command is workflow-only because it

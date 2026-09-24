@@ -52,6 +52,10 @@ bool g_has_webgpu = false;
 bool g_generation_active = false;
 bool g_cancel_requested = false;
 llama_sampler * g_active_sampler = nullptr;
+// Kept out of g_active_sampler's chain so sample_next_token() can apply it
+// before or after truncation, as llama.cpp's common_sampler does.
+llama_sampler * g_active_grammar = nullptr;
+std::vector<llama_token_data> g_sampler_candidates;
 std::atomic<int32_t> g_log_level{3};
 std::atomic<int32_t> g_last_non_cont_level{GGML_LOG_LEVEL_NONE};
 
@@ -187,6 +191,10 @@ void end_generation_state() {
     llama_sampler_free(g_active_sampler);
     g_active_sampler = nullptr;
   }
+  if (g_active_grammar != nullptr) {
+    llama_sampler_free(g_active_grammar);
+    g_active_grammar = nullptr;
+  }
   g_generation_active = false;
   g_last_piece.clear();
   g_cancel_requested = false;
@@ -254,6 +262,8 @@ void refresh_tts_progress_json(
 
 void free_runtime() {
   end_generation_state();
+  g_sampler_candidates.clear();
+  g_sampler_candidates.shrink_to_fit();
   free_tts();
   // Heads hold contexts on the model, so they go before llama_model_free.
   free_decision_heads();
@@ -788,7 +798,6 @@ llama_sampler * create_sampler(
     const int32_t top_k,
     const float top_p,
     const float repeat_penalty,
-    const char * grammar,
     const uint32_t seed) {
   llama_sampler_chain_params sparams = llama_sampler_chain_default_params();
   llama_sampler * sampler = llama_sampler_chain_init(sparams);
@@ -812,20 +821,86 @@ llama_sampler * create_sampler(
     llama_sampler_chain_add(sampler, llama_sampler_init_top_p(top_p, 1));
   }
 
-  if (grammar != nullptr && std::strlen(grammar) > 0) {
-    llama_sampler * grammar_sampler =
-        llama_sampler_init_grammar(g_state.vocab, grammar, "root");
-    if (grammar_sampler == nullptr) {
-      llama_sampler_free(sampler);
-      return nullptr;
-    }
-    llama_sampler_chain_add(sampler, grammar_sampler);
-  }
-
   llama_sampler_chain_add(sampler, llama_sampler_init_temp(temp));
   llama_sampler_chain_add(sampler, llama_sampler_init_dist(seed));
 
   return sampler;
+}
+
+bool grammar_accepts_token(const llama_token token) {
+  llama_token_data single_token = {token, 1.0f, 0.0f};
+  llama_token_data_array single_token_array = {&single_token, 1, -1, false};
+  llama_sampler_apply(g_active_grammar, &single_token_array);
+  return single_token_array.data[0].logit != -INFINITY;
+}
+
+// Fills cur_p from the last logits and runs the samplers over it. Returns
+// false after set_error() when the logits are missing or nothing is selected.
+bool apply_generation_samplers(
+    const bool grammar_first,
+    llama_token_data_array & cur_p) {
+  const float * logits = llama_get_logits_ith(g_state.ctx, -1);
+  if (logits == nullptr) {
+    set_error("Failed to read logits for sampling");
+    return false;
+  }
+
+  const int32_t n_vocab = llama_vocab_n_tokens(g_state.vocab);
+  g_sampler_candidates.resize(static_cast<size_t>(n_vocab));
+  for (llama_token token_id = 0; token_id < n_vocab; token_id++) {
+    g_sampler_candidates[token_id] =
+        llama_token_data{token_id, logits[token_id], 0.0f};
+  }
+  cur_p = {
+      g_sampler_candidates.data(),
+      g_sampler_candidates.size(),
+      -1,
+      false,
+  };
+
+  if (grammar_first) {
+    llama_sampler_apply(g_active_grammar, &cur_p);
+  }
+  llama_sampler_apply(g_active_sampler, &cur_p);
+
+  if (cur_p.selected < 0 ||
+      cur_p.selected >= static_cast<int64_t>(cur_p.size)) {
+    set_error("Sampler selected no token");
+    return false;
+  }
+  return true;
+}
+
+// Mirrors llama.cpp common_sampler_sample(): sample with the chain alone,
+// check the pick against the grammar, and on rejection resample with the
+// grammar applied before truncation. Running the grammar after top-k/top-p
+// can leave only rejected tokens, and llama_grammar_accept on a rejected
+// token aborts the Wasm core. Returns LLAMA_TOKEN_NULL after set_error().
+llama_token sample_next_token() {
+  llama_token_data_array cur_p = {};
+  if (!apply_generation_samplers(false, cur_p)) {
+    return LLAMA_TOKEN_NULL;
+  }
+  llama_token token = cur_p.data[cur_p.selected].id;
+
+  if (g_active_grammar != nullptr && !grammar_accepts_token(token)) {
+    if (!apply_generation_samplers(true, cur_p)) {
+      return LLAMA_TOKEN_NULL;
+    }
+    token = cur_p.data[cur_p.selected].id;
+    // Every candidate is rejected only when the grammar can't be continued
+    // with this vocabulary; accepting the token would abort.
+    if (!grammar_accepts_token(token)) {
+      set_error("Grammar rejected every candidate token");
+      return LLAMA_TOKEN_NULL;
+    }
+  }
+
+  if (g_active_grammar != nullptr) {
+    llama_sampler_accept(g_active_grammar, token);
+  }
+  llama_sampler_accept(g_active_sampler, token);
+  return token;
 }
 
 int32_t begin_generation_impl(
@@ -941,14 +1016,20 @@ int32_t begin_generation_impl(
   }
 
   g_active_sampler =
-      create_sampler(temp, top_k, top_p, repeat_penalty, grammar, seed);
+      create_sampler(temp, top_k, top_p, repeat_penalty, seed);
   if (g_active_sampler == nullptr) {
-    if (grammar != nullptr && std::strlen(grammar) > 0) {
-      set_error("Failed to initialize sampler chain (invalid grammar)");
-    } else {
-      set_error("Failed to initialize sampler chain");
-    }
+    set_error("Failed to initialize sampler chain");
     return -5;
+  }
+
+  if (grammar != nullptr && std::strlen(grammar) > 0) {
+    g_active_grammar =
+        llama_sampler_init_grammar(g_state.vocab, grammar, "root");
+    if (g_active_grammar == nullptr) {
+      end_generation_state();
+      set_error("Failed to initialize sampler chain (invalid grammar)");
+      return -5;
+    }
   }
 
   g_generation_active = true;
@@ -977,9 +1058,9 @@ int32_t next_token_impl() {
         g_qwen3_asr_prefix_token_index < g_qwen3_asr_prefix_tokens.size();
     llama_token token = is_prefix_token
         ? g_qwen3_asr_prefix_tokens[g_qwen3_asr_prefix_token_index++]
-        : llama_sampler_sample(g_active_sampler, g_state.ctx, -1);
+        : sample_next_token();
     if (token == LLAMA_TOKEN_NULL) {
-      set_error("Sampler returned LLAMA_TOKEN_NULL");
+      // sample_next_token() has already recorded the error.
       end_generation_state();
       return -3;
     }
@@ -1026,6 +1107,8 @@ int32_t next_token_impl() {
     }
 
     if (is_prefix_token) {
+      // The prefix is internal, not generated output, so like llama.cpp's
+      // common_sampler_accept(is_generated=false) it bypasses the grammar.
       llama_sampler_accept(g_active_sampler, token);
     } else {
       return 1;
