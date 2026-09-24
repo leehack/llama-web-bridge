@@ -125,6 +125,76 @@ const FACADE_WORKER_METHODS = [
   },
 ];
 
+const NO_MODEL = 'No model loaded. Call loadModelFromUrl first.';
+
+// The shadow state a worker posts. Its runtime reports model_bytes 0 once a
+// load has dropped the previous model.
+function workerModelState(model) {
+  return {
+    metadata: {
+      'general.name': model ?? '',
+      'llamadart.webgpu.model_bytes': model ? '4' : '0',
+    },
+    contextSize: model ? 64 : 0,
+    gpuActive: false,
+    backendName: 'WASM (Prototype bridge)',
+    supportsVision: false,
+    supportsAudio: false,
+  };
+}
+
+// A proxy that holds at most one model, as a real worker does. `failLoad`
+// returns { message, keepsModel, stateless } to fail a load, or null to let
+// it succeed; `stateless` rejects without a posted state, as a crash does.
+function createModelProxy(name, { failLoad = () => null, failProjector = null } = {}) {
+  const proxy = createProxy(name, async (method, args) => {
+    if (method === 'loadModelFromUrl') {
+      const failure = failLoad(args[0]);
+      if (failure) {
+        if (!failure.keepsModel) {
+          proxy.model = null;
+        }
+        const error = new Error(failure.message);
+        throw failure.stateless ? error : Object.assign(error, { state: workerModelState(proxy.model) });
+      }
+      proxy.model = args[0];
+      return { value: 1, state: workerModelState(proxy.model) };
+    }
+    if (method === 'loadMultimodalProjector' && failProjector) {
+      throw new Error(failProjector);
+    }
+    if (proxy.model == null) {
+      throw Object.assign(new Error(NO_MODEL), { state: workerModelState(null) });
+    }
+    return { value: { method, model: proxy.model } };
+  });
+  proxy.model = null;
+  return proxy;
+}
+
+function modelLoads(proxy) {
+  return proxy.calls
+    .filter((call) => call.method === 'loadModelFromUrl')
+    .map((call) => call.args[0]);
+}
+
+// Worker requests that need the loaded model. The capability probe still
+// falls back to the main thread on any worker error.
+const MODEL_WORKER_METHODS = [
+  ['getTextToSpeechCapabilities', (bridge) => bridge.getTextToSpeechCapabilities(), { anyErrorFallsBack: true }],
+  ['synthesizeSpeech', (bridge) => bridge.synthesizeSpeech({ text: 'hi' })],
+  ['createCompletion', (bridge) => bridge.createCompletion('prompt', { nPredict: 4 })],
+  ['tokenize', (bridge) => bridge.tokenize('hello', true)],
+  ['detokenize', (bridge) => bridge.detokenize([1, 2], false)],
+  ['embed', (bridge) => bridge.embed('hello', {})],
+  ['embedBatch', (bridge) => bridge.embedBatch(['a', 'b'], {})],
+  ['stateSaveFile', (bridge) => bridge.stateSaveFile('/states/a.bin', [1])],
+  ['stateLoadFile', (bridge) => bridge.stateLoadFile('/states/a.bin', 16)],
+  ['stateSaveBytes', (bridge) => bridge.stateSaveBytes([1])],
+  ['stateLoadBytes', (bridge) => bridge.stateLoadBytes(new Uint8Array([1, 2]), 16)],
+  ['loadDecisionHead', (bridge) => bridge.loadDecisionHead(new Uint8Array([1, 2]), {})],
+];
+
 const CASES = [
   ['main-thread fallback classification is decided by the serialized error text', () => {
     const { bridge } = createBridge();
@@ -194,6 +264,294 @@ const CASES = [
     assert.equal(bridge._runtime, null, 'no main-thread runtime is created');
     assert.equal(bridge._workerFallbackReason, null);
     assert.ok(warnings.some((message) => message.includes('worker model-load FS error detected')));
+  }],
+
+  ['a model-host HTTP error is not a recoverable FS error and keeps the worker', async () => {
+    const { bridge: classifier } = createBridge();
+    for (const text of [
+      'Failed to fetch model shard: 404 Not Found',
+      'Failed to fetch model shard: 403 Forbidden',
+      'Failed to fetch model shard: 500 Internal Server Error',
+      'Range resume not honored for model shard: 404 Not Found',
+    ]) {
+      assert.equal(classifier._isRecoverableWorkerFsError(new Error(text)), false, text);
+    }
+
+    const worker = createModelProxy('holds-a', {
+      failLoad: (url) => (url === 'b.gguf'
+        ? { message: 'Failed to fetch model shard: 404 Not Found' }
+        : null),
+    });
+    const { bridge, warnings } = createBridge({
+      _workerProxy: worker,
+      _createWorkerProxy: () => {
+        throw new Error('the worker must not be restarted for an HTTP status');
+      },
+      _createRuntime: () => {
+        throw new Error('the main-thread runtime must not be created');
+      },
+    });
+    await bridge.loadModelFromUrl('a.gguf', { nGpuLayers: 0 });
+
+    await assert.rejects(
+      bridge.loadModelFromUrl('b.gguf', {}),
+      (error) => error.message === 'Failed to fetch model shard: 404 Not Found',
+    );
+
+    assert.equal(bridge._workerProxy, worker);
+    assert.equal(worker.disposeCalls, 0);
+    assert.deepEqual(modelLoads(worker), ['a.gguf', 'b.gguf']);
+    assert.ok(!warnings.some((message) => message.includes('restarting worker')));
+  }],
+
+  ['a failed load that restarted the worker forgets the previous model', async () => {
+    const fsError = { message: 'FS error: no such file or directory' };
+    const original = createModelProxy('holds-a', {
+      failLoad: (url) => (url === 'b.gguf' ? fsError : null),
+    });
+    const replacement = createModelProxy('replacement', {
+      failLoad: (url) => (url === 'b.gguf' ? fsError : null),
+    });
+    const { bridge } = createBridge({
+      _workerProxy: original,
+      _createWorkerProxy: () => replacement,
+      _createRuntime: () => {
+        throw new Error('the main-thread runtime must not be created');
+      },
+    });
+    await bridge.loadModelFromUrl('a.gguf', { nGpuLayers: 0 });
+    assert.equal(bridge.getContextSize(), 64);
+
+    await assert.rejects(bridge.loadModelFromUrl('b.gguf', {}), /FS error/);
+
+    assert.equal(bridge._workerProxy, replacement);
+    assert.equal(original.disposeCalls, 1, 'the worker holding a.gguf was retired');
+    assert.equal(bridge._loadedModelUrl, null, 'the facade no longer claims a.gguf');
+    assert.equal(bridge._loadedModelOptions, null);
+    assert.equal(bridge._loadedMmProjUrl, null);
+    assert.equal(bridge.getContextSize(), 0);
+    assert.equal(bridge.getModelMetadata()['general.name'], '');
+
+    for (const [method, invoke, { anyErrorFallsBack = false } = {}] of MODEL_WORKER_METHODS) {
+      if (!anyErrorFallsBack) {
+        await assert.rejects(invoke(bridge), (error) => error.message === NO_MODEL, method);
+      }
+    }
+    assert.deepEqual(modelLoads(replacement), ['b.gguf'], 'a.gguf is never silently reloaded');
+    assert.equal(bridge._runtime, null);
+
+    await bridge.loadModelFromUrl('a.gguf', { nGpuLayers: 0 });
+    assert.deepEqual((await bridge.tokenize('hello')).model, 'a.gguf');
+  }],
+
+  ['a restart whose retry posts no state still forgets the previous model', async () => {
+    // A real worker's second load fails with "FS error" before it drops the
+    // model it holds, so only the restart discards a.gguf.
+    const original = createModelProxy('holds-a', {
+      failLoad: (url) => (url === 'b.gguf' ? { message: 'FS error', keepsModel: true } : null),
+    });
+    const replacement = createModelProxy('replacement', {
+      failLoad: (url) => (url === 'b.gguf'
+        ? { message: 'FS error: no such file or directory', stateless: true }
+        : null),
+    });
+    const { bridge } = createBridge({
+      _workerProxy: original,
+      _createWorkerProxy: () => replacement,
+      _createRuntime: () => {
+        throw new Error('the main-thread runtime must not be created');
+      },
+    });
+    await bridge.loadModelFromUrl('a.gguf', { nGpuLayers: 0 });
+
+    await assert.rejects(bridge.loadModelFromUrl('b.gguf', {}), /FS error/);
+
+    assert.equal(bridge._workerProxy, replacement);
+    assert.equal(bridge._loadedModelUrl, null);
+    assert.equal(bridge.getContextSize(), 0);
+    assert.equal(bridge.getModelMetadata()['general.name'], undefined);
+    await assert.rejects(bridge.tokenize('hi'), (error) => error.message === NO_MODEL);
+    assert.deepEqual(modelLoads(replacement), ['b.gguf']);
+  }],
+
+  ['a worker load cancelled by its signal syncs from the worker reply', async () => {
+    for (const workerLoadsB of [false, true]) {
+      let settleLoad = null;
+      const worker = createModelProxy('holds-a');
+      const call = worker.call;
+      worker.call = (method, args, ...rest) => {
+        if (method !== 'loadModelFromUrl' || args[0] !== 'b.gguf') {
+          return call(method, args, ...rest);
+        }
+        worker.calls.push({ method, args });
+        return new Promise((resolve, reject) => {
+          settleLoad = () => {
+            if (workerLoadsB) {
+              worker.model = 'b.gguf';
+              resolve({ value: 1, state: workerModelState('b.gguf') });
+              return;
+            }
+            // The aborted download already dropped the previous model.
+            worker.model = null;
+            reject(Object.assign(new Error('Model load was cancelled.'), {
+              name: 'AbortError',
+              state: workerModelState(null),
+            }));
+          };
+        });
+      };
+      const { bridge } = createBridge({ _workerProxy: worker });
+      await bridge.loadModelFromUrl('a.gguf', { nGpuLayers: 0 });
+      const label = `workerLoadsB=${workerLoadsB}`;
+
+      const controller = new AbortController();
+      const load = settleQuietly(bridge.loadModelFromUrl('b.gguf', { signal: controller.signal }));
+      for (let i = 0; i < 20 && !settleLoad; i += 1) {
+        await Promise.resolve();
+      }
+      assert.ok(settleLoad, `${label}: the load reached the worker`);
+      controller.abort();
+      settleLoad();
+      await assert.rejects(load, (error) => error.name === 'AbortError', label);
+      // The next request queues behind the cancelled load's cleanup.
+      const next = await bridge.tokenize('hi').then((value) => value, (error) => error);
+
+      assert.equal(bridge._loadedModelUrl, null, `${label}: the facade no longer claims a.gguf`);
+      assert.equal(bridge._workerModelMissing, false, label);
+      if (workerLoadsB) {
+        assert.equal(next.model, 'b.gguf', label);
+      } else {
+        assert.equal(next.message, NO_MODEL, label);
+      }
+    }
+  }],
+
+  ['a failed worker load re-syncs the model bookkeeping with the worker state', async () => {
+    for (const { failure, keepsModel } of [
+      { failure: 'Failed to fetch model shard: 500 Internal Server Error', keepsModel: false },
+      { failure: 'Array buffer allocation failed', keepsModel: false },
+      { failure: 'WebGPU backend probe failed', keepsModel: true },
+    ]) {
+      const worker = createModelProxy('holds-a', {
+        failLoad: (url) => (url === 'b.gguf' ? { message: failure, keepsModel } : null),
+      });
+      const { bridge } = createBridge({ _workerProxy: worker });
+      await bridge.loadModelFromUrl('a.gguf', { nGpuLayers: 0 });
+
+      await assert.rejects(bridge.loadModelFromUrl('b.gguf', {}), (error) => error.message === failure);
+
+      assert.equal(bridge._workerProxy, worker, failure);
+      assert.equal(bridge._loadedModelUrl, keepsModel ? 'a.gguf' : null, failure);
+      assert.deepEqual(bridge._loadedModelOptions, keepsModel ? { nGpuLayers: 0 } : null, failure);
+      assert.equal(bridge.getContextSize(), keepsModel ? 64 : 0, failure);
+    }
+  }],
+
+  ['a failed direct-runtime load forgets the model the runtime dropped', async () => {
+    for (const keepsModel of [false, true]) {
+      const runtime = createRuntime({
+        async loadModelFromUrl(url) {
+          if (url === 'b.gguf') {
+            if (!keepsModel) {
+              runtime._modelBytes = 0;
+            }
+            throw new Error('Failed to fetch model shard: 404 Not Found');
+          }
+          runtime._modelBytes = 4;
+        },
+      });
+      const { bridge } = createBridge({ _runtime: runtime });
+      await bridge.loadModelFromUrl('a.gguf', { nGpuLayers: 0 });
+      assert.equal(bridge._loadedModelUrl, 'a.gguf');
+
+      await assert.rejects(bridge.loadModelFromUrl('b.gguf', {}), /404 Not Found/);
+
+      assert.equal(bridge._loadedModelUrl, keepsModel ? 'a.gguf' : null, `keepsModel=${keepsModel}`);
+    }
+  }],
+
+  ['a multimodal restart that could not reload the model restores it for the next request', async () => {
+    for (const [method, invoke] of MODEL_WORKER_METHODS) {
+      const reloadError = { message: 'FS error: no such file or directory' };
+      const original = createModelProxy('holds-a', { failProjector: 'FS error: projector' });
+      // The CPU projector recovery restarts twice and cannot reload a.gguf.
+      const firstReplacement = createModelProxy('first-replacement', { failLoad: () => reloadError });
+      let secondReplacementLoads = 0;
+      const secondReplacement = createModelProxy('second-replacement', {
+        failLoad: () => {
+          secondReplacementLoads += 1;
+          return secondReplacementLoads === 1 ? reloadError : null;
+        },
+      });
+      const replacements = [firstReplacement, secondReplacement];
+      const { bridge } = createBridge({
+        _workerProxy: original,
+        _createWorkerProxy: () => replacements.shift(),
+        _createRuntime: () => {
+          throw new Error(`${method}: the main-thread runtime must not be created`);
+        },
+      });
+      await bridge.loadModelFromUrl('a.gguf', { nGpuLayers: 0 });
+
+      await assert.rejects(
+        bridge.loadMultimodalProjector('mmproj.gguf'),
+        /CPU multimodal projector setup failed/,
+        method,
+      );
+      assert.equal(bridge._workerProxy, secondReplacement, method);
+      assert.equal(secondReplacement.model, null, `${method}: the replacement starts empty`);
+      assert.equal(bridge._loadedModelUrl, 'a.gguf', method);
+
+      const result = await invoke(bridge);
+
+      assert.equal(result.model, 'a.gguf', method);
+      assert.equal(result.method, method, method);
+      assert.deepEqual(modelLoads(secondReplacement), ['a.gguf', 'a.gguf'], method);
+      assert.deepEqual(
+        secondReplacement.calls.find((call) => call.method === 'loadModelFromUrl').args[1],
+        { nGpuLayers: 0 },
+        `${method}: the model reloads with its remembered options`,
+      );
+      assert.equal(bridge._workerProxy, secondReplacement, method);
+      assert.equal(bridge._runtime, null, method);
+      assert.equal(bridge._workerFallbackReason, null, method);
+
+      await invoke(bridge);
+      assert.deepEqual(modelLoads(secondReplacement), ['a.gguf', 'a.gguf'], `${method}: restored once`);
+    }
+  }],
+
+  ['a model restore that fails with a core error is rethrown and keeps the worker', async () => {
+    const original = createModelProxy('holds-a', { failProjector: 'FS error: projector' });
+    const gone = { message: 'Failed to fetch model shard: 404 Not Found' };
+    const firstReplacement = createModelProxy('first-replacement', { failLoad: () => gone });
+    const secondReplacement = createModelProxy('second-replacement', { failLoad: () => gone });
+    const replacements = [firstReplacement, secondReplacement];
+    const { bridge } = createBridge({
+      _workerProxy: original,
+      _createWorkerProxy: () => {
+        const next = replacements.shift();
+        if (!next) {
+          throw new Error('the restore must not restart the worker again');
+        }
+        return next;
+      },
+      _createRuntime: () => {
+        throw new Error('the main-thread runtime must not be created');
+      },
+    });
+    await bridge.loadModelFromUrl('a.gguf', { nGpuLayers: 0 });
+    await assert.rejects(bridge.loadMultimodalProjector('mmproj.gguf'), /CPU multimodal/);
+    const current = bridge._workerProxy;
+
+    await assert.rejects(
+      bridge.tokenize('hello'),
+      (error) => error.message === 'Failed to fetch model shard: 404 Not Found',
+    );
+
+    assert.equal(bridge._workerProxy, current);
+    assert.equal(bridge._runtime, null);
+    assert.equal(bridge._workerFallbackReason, null);
   }],
 
   ['worker model-load request timeout skips the worker restart and falls back to main thread', async () => {
