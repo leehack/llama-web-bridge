@@ -5960,10 +5960,21 @@ export class LlamaWebGpuBridge {
       this._throwIfDisposed();
     }
 
-    const replacement = new BridgeWorkerProxy({
-      moduleUrl: this._workerModuleUrl(),
-      config: this._workerConfig(),
-    });
+    let replacement;
+    try {
+      replacement = new BridgeWorkerProxy({
+        moduleUrl: this._workerModuleUrl(),
+        config: this._workerConfig(),
+      });
+    } catch (error) {
+      // The constructor throws synchronously when no worker can be created
+      // (for example a CSP SecurityError), and any previous proxy is already
+      // detached. Fall back before rethrowing so an open bridge keeps a direct
+      // runtime whichever catch the caller takes; the fallback itself refuses
+      // to recreate a runtime once disposal owns teardown.
+      this._disableWorkerFallback(error);
+      throw error;
+    }
     try {
       // Same gate as every other helper: the owner that already holds the slot
       // may still install its replacement while disposal is queued behind it,
@@ -6595,13 +6606,17 @@ export class LlamaWebGpuBridge {
       this._activeOperation?.runtimes?.add(this._runtime);
     }
 
+    // A failed worker replacement falls back before its caller does, so the
+    // caller's own fallback for the same error must not repeat the note.
+    const note = `worker_fallback:${reason}`;
     if (
       this._runtime
       && Array.isArray(this._runtime._runtimeNotes)
       && typeof reason === 'string'
       && reason.length > 0
+      && !this._runtime._runtimeNotes.includes(note)
     ) {
-      this._runtime._runtimeNotes.push(`worker_fallback:${reason}`);
+      this._runtime._runtimeNotes.push(note);
     }
   }
 

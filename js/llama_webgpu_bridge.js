@@ -4850,10 +4850,16 @@ var LlamaWebGpuBridge = class {
       await this._waitForWorkerDisposal();
       this._throwIfDisposed();
     }
-    const replacement = new BridgeWorkerProxy({
-      moduleUrl: this._workerModuleUrl(),
-      config: this._workerConfig()
-    });
+    let replacement;
+    try {
+      replacement = new BridgeWorkerProxy({
+        moduleUrl: this._workerModuleUrl(),
+        config: this._workerConfig()
+      });
+    } catch (error) {
+      this._disableWorkerFallback(error);
+      throw error;
+    }
     try {
       this._throwIfDisposed();
     } catch (error) {
@@ -5313,8 +5319,9 @@ var LlamaWebGpuBridge = class {
       this._runtime = this._createRuntime();
       this._activeOperation?.runtimes?.add(this._runtime);
     }
-    if (this._runtime && Array.isArray(this._runtime._runtimeNotes) && typeof reason === "string" && reason.length > 0) {
-      this._runtime._runtimeNotes.push(`worker_fallback:${reason}`);
+    const note = `worker_fallback:${reason}`;
+    if (this._runtime && Array.isArray(this._runtime._runtimeNotes) && typeof reason === "string" && reason.length > 0 && !this._runtime._runtimeNotes.includes(note)) {
+      this._runtime._runtimeNotes.push(note);
     }
   }
   async _callWorker(method, args, onEvent, transferList = []) {

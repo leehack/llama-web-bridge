@@ -91,7 +91,184 @@ function createBridge(overrides = {}) {
   return { bridge, warnings };
 }
 
+// Every `new Worker` throws synchronously, as under a CSP that forbids both the
+// direct and the blob worker URL, so constructing a BridgeWorkerProxy throws.
+async function withBlockedWorkers(run) {
+  const originals = {
+    Worker: globalThis.Worker,
+    createObjectURL: globalThis.URL.createObjectURL,
+    revokeObjectURL: globalThis.URL.revokeObjectURL,
+  };
+  let constructions = 0;
+  globalThis.Worker = class BlockedWorker {
+    constructor() {
+      constructions += 1;
+      const error = new Error('Worker construction violates the Content Security Policy');
+      error.name = 'SecurityError';
+      throw error;
+    }
+  };
+  globalThis.URL.createObjectURL = () => 'blob:blocked-worker';
+  globalThis.URL.revokeObjectURL = () => {};
+  try {
+    return await run({ constructions: () => constructions });
+  } finally {
+    globalThis.Worker = originals.Worker;
+    globalThis.URL.createObjectURL = originals.createObjectURL;
+    globalThis.URL.revokeObjectURL = originals.revokeObjectURL;
+  }
+}
+
+// A CPU-mode worker bridge that never created a direct runtime; its worker
+// fails every model call so the facade tries to replace it.
+function createCpuWorkerBridgeWithBrokenWorker(overrides = {}) {
+  const proxy = createProxy('broken', async (method) => {
+    if (method === 'dispose') {
+      return { value: undefined };
+    }
+    throw new Error('Bridge worker crashed');
+  });
+  const runtimes = [];
+  const { bridge, warnings } = createBridge({
+    _workerProxy: proxy,
+    _loadedModelUrl: 'model.gguf',
+    _loadedModelOptions: { nGpuLayers: 0 },
+    _createRuntime: () => {
+      const runtime = createRuntime({
+        disposeCalls: 0,
+        async tokenize(text) {
+          return [...text].map((character) => character.codePointAt(0));
+        },
+        async dispose() {
+          runtime.disposeCalls += 1;
+        },
+      });
+      runtimes.push(runtime);
+      return runtime;
+    },
+    ...overrides,
+  });
+  return { bridge, warnings, proxy, runtimes };
+}
+
+function assertDirectRuntimeAfterBlockedReplacement(bridge, proxy, runtimes) {
+  assert.ok(
+    bridge._workerProxy != null || bridge._runtime != null,
+    'an open bridge must keep a worker proxy or a direct runtime',
+  );
+  assert.equal(bridge._workerProxy, null);
+  assert.equal(proxy.disposeCalls, 1, 'the broken worker is retired');
+  assert.equal(runtimes.length, 1);
+  assert.equal(bridge._runtime, runtimes[0], 'the open bridge keeps a direct runtime');
+  assert.match(bridge._workerFallbackReason, /Content Security Policy/);
+  assert.equal(
+    runtimes[0]._runtimeNotes.filter((note) => note.startsWith('worker_fallback:')).length,
+    1,
+  );
+}
+
 const CASES = [
+  ['CPU projector setup keeps a direct runtime when the worker cannot be replaced', async () => {
+    await withBlockedWorkers(async ({ constructions }) => {
+      const { bridge, proxy, runtimes } = createCpuWorkerBridgeWithBrokenWorker({
+        _multimodalWorkerCpuMode: true,
+      });
+
+      await assert.rejects(
+        bridge.loadMultimodalProjector('mmproj.gguf'),
+        /CPU multimodal projector setup failed \(Worker construction violates the Content Security Policy\)/,
+      );
+
+      assert.ok(constructions() > 0, 'the replacement worker was attempted');
+      assertDirectRuntimeAfterBlockedReplacement(bridge, proxy, runtimes);
+      assert.deepEqual(await bridge.tokenize('hi'), [104, 105]);
+    });
+  }],
+
+  ['CPU media completion keeps a direct runtime when the worker cannot be replaced', async () => {
+    await withBlockedWorkers(async ({ constructions }) => {
+      const { bridge, proxy, runtimes } = createCpuWorkerBridgeWithBrokenWorker();
+
+      await assert.rejects(
+        bridge.createCompletion('describe', {
+          parts: [{ type: 'image', bytes: new Uint8Array(1) }],
+        }),
+        /CPU multimodal worker setup failed \(Worker construction violates the Content Security Policy\)/,
+      );
+
+      assert.ok(constructions() > 0, 'the replacement worker was attempted');
+      assertDirectRuntimeAfterBlockedReplacement(bridge, proxy, runtimes);
+      assert.deepEqual(await bridge.tokenize('hi'), [104, 105]);
+    });
+  }],
+
+  ['GPU media completion falls back once when the worker cannot be replaced', async () => {
+    await withBlockedWorkers(async () => {
+      const { bridge, proxy, runtimes } = createCpuWorkerBridgeWithBrokenWorker({
+        _loadedModelOptions: { nGpuLayers: 99 },
+      });
+      bridge._createRuntime = ((createRuntimeImpl) => () => {
+        const runtime = createRuntimeImpl();
+        runtime.createCompletion = async (prompt) => `main:${prompt}`;
+        return runtime;
+      })(bridge._createRuntime);
+
+      assert.equal(
+        await bridge.createCompletion('describe', {
+          parts: [{ type: 'image', bytes: new Uint8Array(1) }],
+        }),
+        'main:describe',
+      );
+
+      // Both the failed replacement and the caller fall back for the same
+      // error; the runtime records that fallback once.
+      assertDirectRuntimeAfterBlockedReplacement(bridge, proxy, runtimes);
+      assert.equal(runtimes[0].loadCalls.length, 1, 'the model is reloaded on the main thread');
+    });
+  }],
+
+  ['disposal owns teardown of a runtime created by a blocked worker replacement', async () => {
+    await withBlockedWorkers(async () => {
+      let failProjector;
+      const { bridge, proxy, runtimes } = createCpuWorkerBridgeWithBrokenWorker({
+        _multimodalWorkerCpuMode: true,
+      });
+      const brokenCall = proxy.call;
+      proxy.call = (method, args, onEvent) => {
+        if (method !== 'loadMultimodalProjector') {
+          return brokenCall(method, args, onEvent);
+        }
+        proxy.calls.push({ method, args });
+        return new Promise((_resolve, reject) => {
+          failProjector = () => reject(new Error('Bridge worker crashed'));
+        });
+      };
+
+      const projector = settleQuietly(bridge.loadMultimodalProjector('mmproj.gguf'));
+      for (let i = 0; i < 20 && !failProjector; i += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      }
+      assert.ok(failProjector, 'the projector request reached the worker');
+      const disposal = bridge.dispose();
+      failProjector();
+
+      await assert.rejects(projector, /CPU multimodal projector setup failed/);
+      await disposal;
+
+      assert.equal(bridge._lifecycleState, 'disposed');
+      assert.equal(bridge._workerProxy, null);
+      assert.equal(bridge._runtime, null);
+      // The settle-first owner may still fall back once; disposal then tears
+      // that runtime down and nothing recreates one afterwards.
+      assert.equal(runtimes.length, 1);
+      assert.equal(runtimes[0].disposeCalls, 1);
+      await assert.rejects(bridge.tokenize('hi'), /disposed/i);
+      await assert.rejects(bridge.loadMultimodalProjector('mmproj.gguf'), /disposed/i);
+      assert.equal(runtimes.length, 1, 'no call after disposal creates a runtime');
+      assert.equal(bridge._runtime, null);
+    });
+  }],
+
   ['main-thread fallback classification is decided by the serialized error text', () => {
     const { bridge } = createBridge();
     const fallsBack = (error) => bridge._shouldFallbackToMainThread(error);
