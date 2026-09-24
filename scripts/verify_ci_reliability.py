@@ -1231,6 +1231,8 @@ def main() -> int:
         and '"topK": 40' in grammar_smoke
         and '"topK": 0, "topP": 0.1' in grammar_smoke
         and "JSON_GRAMMAR" in grammar_smoke
+        and 'INVALID_GRAMMAR_ERROR = "(invalid grammar)"' in grammar_smoke
+        and "'root ::= \"unterminated'" in grammar_smoke
         and 'MEMORY_MODES = ("wasm32", "wasm64")' in grammar_smoke
         and 'RUNTIME_MODES = ("direct", "worker")' in grammar_smoke
         and "globalWorkerFallbackReason" in grammar_smoke
@@ -1246,7 +1248,7 @@ def main() -> int:
         and "grammar-smoke-artifacts-${{ matrix.upstream }}" in ci
         and "scripts/grammar_browser_smoke.py" in contributing
         and "scripts/grammar_browser_smoke.py" in agents,
-        "CI must run the grammar smoke with greedy, sampled, top-p and JSON grammars on both memory modes and runtimes, "
+        "CI must run the grammar smoke with invalid, greedy, sampled, top-p and JSON grammars on both memory modes and runtimes, "
         "with the state and multimodal models, and keep failure diagnostics per matrix lane",
         errors,
     )

@@ -6,7 +6,9 @@ worker runtimes of the wasm32 and wasm64 cores with a checksum-pinned GGUF and c
 text the grammar accepts. It covers greedy ``topK: 1`` decoding, which used to
 truncate the candidates to a token the grammar rejects and abort the Wasm core
 (issue #115), a sampled ``topK: 40`` run, top-p-only truncation, and a small
-JSON grammar. The worker
+JSON grammar. It first sends invalid grammars, which used to abort the core
+from the parser's throw: each must reject with an ``(invalid grammar)`` error
+and leave the runtime usable for the valid cases that follow. The worker
 runtime must still own the model afterwards: an abort there used to move the
 bridge to the main thread for the rest of the session.
 """
@@ -50,7 +52,35 @@ JSON_GRAMMAR = "\n".join(
         'ws ::= " "?',
     )
 )
+INVALID_GRAMMAR_ERROR = "(invalid grammar)"
+# The bridge's text when llama.cpp returns no grammar without throwing.
+NON_THROWING_REJECTION = "grammar rejected by llama.cpp"
+INVALID_OPTIONS = {"nPredict": 8, "temp": 0, "topK": 1, "seed": 1}
 CASES = (
+    # A parser syntax error, thrown and caught in the bridge's grammar wrapper.
+    {
+        "name": "invalid-unterminated-string",
+        "grammar": 'root ::= "unterminated',
+        "kind": "invalid",
+        "throws": True,
+        "options": INVALID_OPTIONS,
+    },
+    # Thrown by the parser's undefined-rule check after parsing succeeds.
+    {
+        "name": "invalid-undefined-rule",
+        "grammar": "root ::= answer",
+        "kind": "invalid",
+        "throws": True,
+        "options": INVALID_OPTIONS,
+    },
+    # Rejected by llama.cpp without a throw.
+    {
+        "name": "invalid-left-recursion",
+        "grammar": 'root ::= root "a" | "a"',
+        "kind": "invalid",
+        "throws": False,
+        "options": INVALID_OPTIONS,
+    },
     {
         "name": "yes-no-greedy",
         "grammar": YES_NO_GRAMMAR,
@@ -94,6 +124,8 @@ def write_harness(web_root: Path, n_ctx: int, memory_modes: tuple[str, ...]) -> 
             "modelUrl": f"/{MODEL_FILENAME}",
             "prompt": PROMPT,
             "cases": CASES,
+            "invalidGrammarError": INVALID_GRAMMAR_ERROR,
+            "nonThrowingRejection": NON_THROWING_REJECTION,
             "nCtx": n_ctx,
             "memoryModes": memory_modes,
             "runtimeModes": RUNTIME_MODES,
@@ -179,7 +211,14 @@ def write_harness(web_root: Path, n_ctx: int, memory_modes: tuple[str, ...]) -> 
             name: testCase.name,
             text,
             error,
-            valid: error === null && typeof text === 'string' && checkText(testCase.kind, text),
+            // A throwing case must carry the parser's message, which proves
+            // the throw reached the bridge's catch.
+            valid: testCase.kind === 'invalid'
+              ? text === null
+                && error !== null
+                && error.includes(config.invalidGrammarError)
+                && error.includes(config.nonThrowingRejection) === !testCase.throws
+              : error === null && typeof text === 'string' && checkText(testCase.kind, text),
           }});
         }}
 
@@ -248,8 +287,14 @@ def validate_payload(payload: dict[str, object], memory_modes: tuple[str, ...]) 
             continue
         for case in cases:
             if case.get("valid") is not True:
+                expected = (
+                    f"an error containing {INVALID_GRAMMAR_ERROR!r} and the "
+                    "parser's reason (or the non-throwing rejection for left recursion)"
+                    if case.get("name", "").startswith("invalid-")
+                    else "grammar-valid text"
+                )
                 failures.append(
-                    f"{mode} {case.get('name')}: expected grammar-valid text, "
+                    f"{mode} {case.get('name')}: expected {expected}, "
                     f"got text={case.get('text')!r} error={case.get('error')!r}"
                 )
         if entry.get("plainCompletionError") is not None:
