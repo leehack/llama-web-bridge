@@ -203,6 +203,7 @@ def write_harness(web_root: Path, n_ctx: int, memory_modes: tuple[str, ...]) -> 
           cases,
           plainCompletionError: plainError,
           execution: metadata['llamadart.webgpu.execution'] || null,
+          coreVariant: metadata['llamadart.webgpu.core_variant'] || null,
           workerFallbackReason: metadata['llamadart.webgpu.worker_fallback_reason'] || null,
         }};
       }} finally {{
@@ -254,6 +255,13 @@ def validate_payload(payload: dict[str, object], memory_modes: tuple[str, ...]) 
         if entry.get("plainCompletionError") is not None:
             failures.append(
                 f"{mode}: completion after the grammar runs failed: {entry.get('plainCompletionError')!r}"
+            )
+        expected_variant = mode.split(" ", 1)[0]
+        if entry.get("coreVariant") != expected_variant:
+            # The bridge falls back to wasm32 when the mem64 core fails to
+            # start, which would otherwise pass as wasm64 coverage.
+            failures.append(
+                f"{mode}: expected the {expected_variant} core, got {entry.get('coreVariant')!r}"
             )
         expected_execution = "worker" if mode.endswith(" worker") else "main-thread"
         if entry.get("execution") != expected_execution:

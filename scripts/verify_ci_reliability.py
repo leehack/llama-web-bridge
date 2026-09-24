@@ -1224,8 +1224,13 @@ def main() -> int:
         and 'MEMORY_MODES = ("wasm32", "wasm64")' in grammar_smoke
         and 'RUNTIME_MODES = ("direct", "worker")' in grammar_smoke
         and "globalWorkerFallbackReason" in grammar_smoke
+        and "llamadart.webgpu.core_variant" in grammar_smoke
         and "scripts/grammar_browser_smoke.py \\" in ci
-        and "python3 scripts/grammar_browser_smoke.py \\" in ci
+        and ci.count("python3 scripts/grammar_browser_smoke.py \\") == 2
+        and '--artifacts-dir "$LLAMA_WEBGPU_GRAMMAR_ARTIFACTS_DIR/state-smoke-model"' in ci
+        and '--artifacts-dir "$LLAMA_WEBGPU_GRAMMAR_ARTIFACTS_DIR/multimodal-model"' in ci
+        and '--model-cache-dir "$LLAMA_WEBGPU_MULTIMODAL_MODEL_CACHE"' in ci
+        and '--timeout-ms "$LLAMA_WEBGPU_MULTIMODAL_TIMEOUT_MS"' in ci
         and '--model-url "$LLAMA_WEBGPU_MULTIMODAL_MODEL_URL"' in ci
         and '--model-sha256 "$LLAMA_WEBGPU_MULTIMODAL_MODEL_SHA256"' in ci
         and "grammar-smoke-artifacts-${{ matrix.upstream }}" in ci
