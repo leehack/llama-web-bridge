@@ -1,6 +1,12 @@
 import assert from 'node:assert/strict';
 
 import { LlamaWebGpuBridge } from '../js/src/llama_webgpu_bridge.js';
+import {
+  createRealWorkerBridge,
+  settleQuietly,
+  withStubWorkerEnvironment,
+  workerDriver,
+} from './bridge_operation_queue_fixtures.mjs';
 
 function createProxy(name, callImpl) {
   const proxy = {
@@ -203,6 +209,202 @@ const CASES = [
     assert.equal(proxy.disposeCalls, 0);
     assert.equal(bridge._runtime, null);
     assert.equal(bridge._workerFallbackReason, null);
+  }],
+
+  ['completion falls back only when the worker itself is unusable', () => {
+    const { bridge } = createBridge();
+    const unusable = (error) => bridge._isCompletionWorkerUnusableError(error);
+
+    // Deterministic core errors from a healthy worker.
+    for (const text of [
+      'Generation step failed: Grammar rejected every candidate token',
+      'Generation step failed: Sampler returned LLAMA_TOKEN_NULL',
+      'Generation step failed: llama_decode failed while generating tokens',
+      'Failed to start generation: llama_decode failed while processing prompt',
+      'Failed to start generation: Failed to initialize sampler chain (invalid grammar)',
+      'Failed to start generation (code=-5)',
+      'Failed to start generation: prompt exceeds context size',
+      'No model loaded. Call loadModelFromUrl first.',
+    ]) {
+      assert.equal(unusable(new Error(text)), false, text);
+    }
+
+    // The worker or its core can no longer serve requests.
+    for (const text of [
+      'Aborted(undefined). Build with -sASSERTIONS for more info.',
+      'RuntimeError: Aborted(undefined). Build with -sASSERTIONS for more info.',
+      'Aborted(native code called abort())',
+      'memory access out of bounds',
+      'unreachable',
+      'Worker request timeout (createCompletion, 5000ms)',
+      'Bridge worker init timeout (3000ms)',
+      'Bridge worker completion stalled for 5000ms.',
+      'Bridge worker crashed',
+      'Bridge worker disposed',
+      'Failed to initialize bridge worker',
+    ]) {
+      assert.equal(unusable(new Error(text)), true, text);
+    }
+    assert.equal(
+      unusable(Object.assign(new Error('Uncaught ReferenceError: x is not defined'), {
+        llamadartWorkerCrash: true,
+      })),
+      true,
+      'a worker onerror crash counts whatever its text',
+    );
+    assert.equal(
+      unusable(Object.assign(new Error('stalled'), { llamadartWorkerTimeout: true })),
+      true,
+    );
+  }],
+
+  ['worker completion core error is rethrown and keeps the worker', async () => {
+    const coreError = 'Generation step failed: Grammar rejected every candidate token';
+    let completions = 0;
+    const proxy = createProxy('grammar', async (method) => {
+      if (method !== 'createCompletion') {
+        return { value: undefined };
+      }
+      completions += 1;
+      throw new Error(coreError);
+    });
+    const runtime = createRuntime({
+      async createCompletion() {
+        throw new Error('the main-thread runtime must not run the request');
+      },
+    });
+    const { bridge, warnings } = createBridge({
+      _workerProxy: proxy,
+      _loadedModelUrl: 'model.gguf',
+      _createRuntime: () => runtime,
+    });
+    let fallbackCalls = 0;
+    const disableWorkerFallback = bridge._disableWorkerFallback;
+    bridge._disableWorkerFallback = (error) => {
+      fallbackCalls += 1;
+      disableWorkerFallback.call(bridge, error);
+    };
+
+    await assert.rejects(
+      bridge.createCompletion('prompt', { grammar: 'root ::= "yes" | "no"', nPredict: 4 }),
+      (error) => error.message === coreError,
+    );
+
+    assert.equal(completions, 1);
+    assert.equal(fallbackCalls, 0);
+    assert.equal(bridge._workerProxy, proxy);
+    assert.equal(proxy.disposeCalls, 0);
+    assert.equal(bridge._runtime, null);
+    assert.equal(bridge._workerFallbackReason, null);
+    assert.equal(runtime.loadCalls.length, 0);
+    assert.ok(!warnings.some((message) => message.includes('falling back to main thread')));
+  }],
+
+  ['worker completion core abort still falls back to the main thread', async () => {
+    const abortText = 'Aborted(undefined). Build with -sASSERTIONS for more info.';
+    let completions = 0;
+    const proxy = createProxy('aborted', async (method) => {
+      if (method !== 'createCompletion') {
+        return { value: undefined };
+      }
+      completions += 1;
+      throw new Error(abortText);
+    });
+    const runtimeCompletions = [];
+    const runtime = createRuntime({
+      async createCompletion(prompt) {
+        runtimeCompletions.push(prompt);
+        return 'main-thread';
+      },
+    });
+    const { bridge } = createBridge({
+      _workerProxy: proxy,
+      _loadedModelUrl: 'model.gguf',
+      _loadedModelOptions: { nGpuLayers: 0 },
+      _createRuntime: () => runtime,
+    });
+    let fallbackCalls = 0;
+    const disableWorkerFallback = bridge._disableWorkerFallback;
+    bridge._disableWorkerFallback = (error) => {
+      fallbackCalls += 1;
+      disableWorkerFallback.call(bridge, error);
+    };
+
+    assert.equal(await bridge.createCompletion('prompt', { nPredict: 4 }), 'main-thread');
+
+    assert.equal(completions, 1);
+    assert.equal(fallbackCalls, 1);
+    assert.equal(bridge._workerProxy, null);
+    assert.equal(proxy.disposeCalls, 1);
+    assert.equal(bridge._runtime, runtime);
+    assert.equal(runtime.loadCalls.length, 1, 'the model is reloaded on the main thread');
+    assert.deepEqual(runtimeCompletions, ['prompt']);
+    assert.equal(bridge._workerFallbackReason, abortText);
+  }],
+
+  ['real worker proxy: a posted core error is rethrown and the worker is kept', async () => {
+    await withStubWorkerEnvironment(async ({ workers }) => {
+      const bridge = createRealWorkerBridge();
+      const warnings = [];
+      bridge._emitBridgeWarn = (message) => warnings.push(message);
+      bridge._createRuntime = () => {
+        throw new Error('the main-thread runtime must not be created');
+      };
+      const proxy = bridge._workerProxy;
+      const driver = workerDriver(proxy, workers[0]);
+      driver.ready();
+
+      const completion = settleQuietly(bridge.createCompletion('alpha', { nPredict: 4 }));
+      await driver.settle();
+      const [call] = driver.calls('createCompletion');
+      driver.error(call.id, 'Failed to start generation: llama_decode failed while processing prompt');
+
+      await assert.rejects(completion, /llama_decode failed while processing prompt/);
+      assert.equal(bridge._workerProxy, proxy);
+      assert.equal(workers[0].terminated, 0);
+      assert.equal(bridge._workerFallbackReason, null);
+      assert.deepEqual(warnings, []);
+
+      const next = settleQuietly(bridge.createCompletion('beta', { nPredict: 4 }));
+      await driver.settle();
+      driver.reply(driver.calls('createCompletion')[1].id, 'BETA');
+      assert.equal(await next, 'BETA', 'the kept worker serves the next request');
+    });
+  }],
+
+  ['real worker proxy: an onerror crash falls back whatever its text', async () => {
+    await withStubWorkerEnvironment(async ({ workers }) => {
+      const bridge = createRealWorkerBridge();
+      const runtime = createRuntime({
+        async createCompletion(prompt) {
+          return `main:${prompt}`;
+        },
+      });
+      bridge._emitBridgeWarn = () => {};
+      bridge._createRuntime = () => runtime;
+      bridge._loadedModelUrl = 'model.gguf';
+      bridge._loadedModelOptions = { nGpuLayers: 0 };
+      const proxy = bridge._workerProxy;
+      const driver = workerDriver(proxy, workers[0]);
+      driver.ready();
+
+      const completion = settleQuietly(bridge.createCompletion('alpha', { nPredict: 4 }));
+      await driver.settle();
+      proxy._worker.onerror({ message: 'Uncaught ReferenceError: x is not defined' });
+      // Retiring the crashed proxy sends it a best-effort dispose; answer it.
+      for (let i = 0; i < 20 && driver.calls('dispose').length === 0; i += 1) {
+        await driver.settle();
+      }
+      const [disposeCall] = driver.calls('dispose');
+      assert.ok(disposeCall, 'the crashed worker is retired');
+      driver.reply(disposeCall.id, null);
+
+      assert.equal(await completion, 'main:alpha');
+      assert.equal(bridge._workerProxy, null);
+      assert.equal(workers[0].terminated, 1);
+      assert.equal(bridge._runtime, runtime);
+      assert.equal(bridge._workerFallbackReason, 'Uncaught ReferenceError: x is not defined');
+    });
   }],
 
   ['fallback reason is always the serialized error, including for flagged errors', () => {

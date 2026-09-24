@@ -1215,7 +1215,11 @@ var BridgeWorkerProxy = class {
     };
     this._worker.onerror = (event) => {
       const message = event?.message || "Bridge worker crashed";
-      const error = new Error(String(message));
+      const error = (
+        /** @type {Error & { llamadartWorkerCrash?: boolean }} */
+        new Error(String(message))
+      );
+      error.llamadartWorkerCrash = true;
       this._clearReadyTimeout();
       this._readyReject?.(error);
       for (const pending of this._pending.values()) {
@@ -4942,6 +4946,26 @@ var LlamaWebGpuBridge = class {
     const text = serializeWorkerError(error).toLowerCase();
     return text.includes("dispatch workgroup count") || text.includes("max compute workgroups per dimension") || text.includes("invalid commandbuffer") || text.includes("ggml_webgpu: device error") || text.includes("runtimeerror: aborted") || text.includes("aborted()");
   }
+  // An aborted or trapped Wasm core stays dead. The worker host posts only
+  // the message text, so a worker-side RuntimeError arrives without its name.
+  _isWasmCoreAbortError(error) {
+    if (typeof WebAssembly !== "undefined" && error instanceof WebAssembly.RuntimeError) {
+      return true;
+    }
+    const text = serializeWorkerError(error).toLowerCase();
+    return text.includes("aborted(") || text.includes("runtimeerror") || text.includes("unreachable") || text.includes("memory access out of bounds") || text.includes("function signature mismatch") || text.includes("program terminated with exit");
+  }
+  // A completion falls back only when the worker can no longer serve requests:
+  // it crashed, stalled, timed out, never initialized, or its core aborted.
+  // A core error from a healthy worker (invalid grammar, a grammar that
+  // rejects every candidate, a context limit) is deterministic; retrying on
+  // the main thread fails the same way and strands the session there.
+  _isCompletionWorkerUnusableError(error) {
+    if (error && typeof error === "object" && error.llamadartWorkerCrash === true) {
+      return true;
+    }
+    return this._isWorkerTimeoutError(error) || this._isWasmCoreAbortError(error) || this._shouldFallbackToMainThread(error);
+  }
   _isWorkerTimeoutError(error) {
     if (error && typeof error === "object" && error.llamadartWorkerTimeout === true) {
       return true;
@@ -5617,6 +5641,9 @@ var LlamaWebGpuBridge = class {
         await this._waitForWorkerDisposal();
         await this._ensureRuntimeReadyAfterWorkerFallback(options, error);
         return this._runtime.createCompletion(prompt, options);
+      }
+      if (!this._isCompletionWorkerUnusableError(error)) {
+        throw error;
       }
       this._disableWorkerFallback(error);
       await this._waitForWorkerDisposal();
