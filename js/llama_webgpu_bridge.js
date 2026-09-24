@@ -4604,7 +4604,8 @@ var LlamaWebGpuBridge = class {
       recoveryAttempted: false,
       generationStarted: false,
       retirements: /* @__PURE__ */ new Set(),
-      deferredShadowState: null
+      deferredShadowState: null,
+      workerModelBytes: null
     };
     const predecessor = this._operationQueueTail;
     let releaseSuccessor = () => {
@@ -4849,6 +4850,20 @@ var LlamaWebGpuBridge = class {
       this._activeOperation.modelOptions = { ...this._loadedModelOptions };
       this._activeOperation.projectorSource = null;
     }
+  }
+  // A load frees the current model before fetching the next one, so most
+  // failures leave nothing loaded. Forget the remembered model then, or a later
+  // worker recovery would quietly load it again. Worker errors report the
+  // worker's model_bytes; keep the model when that is unknown.
+  _forgetModelIfReleased(operation = null) {
+    const modelBytes = this._workerProxy ? operation?.workerModelBytes ?? this._metadata?.["llamadart.webgpu.model_bytes"] : this._runtime?._modelBytes;
+    if (modelBytes == null || Number(modelBytes) > 0) {
+      return;
+    }
+    this._loadedModelUrl = null;
+    this._loadedModelOptions = null;
+    this._loadedMmProjUrl = null;
+    this._multimodalWorkerCpuMode = false;
   }
   _rememberLoadedMmProj(url) {
     const normalizedUrl = String(url || "").trim();
@@ -5365,14 +5380,24 @@ var LlamaWebGpuBridge = class {
         operation ? { operationId: operation.id, workerGeneration: operation.workerGeneration } : void 0
       );
       if (response?.state) {
+        this._recordWorkerModelBytes(operation, proxy, response.state);
         this._acceptWorkerState(operation, proxy, response.state);
       }
       return response?.value;
     } catch (error) {
       if (error && typeof error === "object" && error.state) {
+        this._recordWorkerModelBytes(operation, proxy, error.state);
         this._acceptWorkerState(operation, proxy, error.state);
       }
       throw error;
+    }
+  }
+  // A cancelled operation drops late worker state, but a failed load still has
+  // to know whether the current worker kept a model.
+  _recordWorkerModelBytes(operation, proxy, state) {
+    const modelBytes = state?.metadata?.["llamadart.webgpu.model_bytes"];
+    if (operation && proxy === this._workerProxy && modelBytes != null) {
+      operation.workerModelBytes = modelBytes;
     }
   }
   /**
@@ -5410,7 +5435,14 @@ var LlamaWebGpuBridge = class {
    */
   async loadModelFromUrl(url, options = {}) {
     return this._runExclusive(
-      () => this._loadModelFromUrlUnlocked(url, options),
+      async (operation) => {
+        try {
+          return await this._loadModelFromUrlUnlocked(url, options);
+        } catch (error) {
+          this._forgetModelIfReleased(operation);
+          throw error;
+        }
+      },
       {
         signal: options?.signal,
         abortMessage: "Model load was cancelled.",

@@ -1001,6 +1001,109 @@ const CASES = [
       globalThis.Worker = originalWorker;
     }
   }],
+
+  ...['signal', 'cancel()'].map((cancelWith) => [
+    `a worker replacement cancelled through ${cancelWith} forgets the released model`,
+    async () => {
+      let rejectLoad;
+      const proxy = createProxy('generation-9', {
+        callImpl: (method, args) => {
+          if (method === 'loadModelFromUrl' && args[0] === 'a.gguf') {
+            return Promise.resolve({
+              value: 1,
+              state: { metadata: { 'llamadart.webgpu.model_bytes': '4' } },
+            });
+          }
+          if (method === 'loadModelFromUrl') {
+            return new Promise((_resolve, reject) => { rejectLoad = reject; });
+          }
+          return Promise.resolve({ value: undefined });
+        },
+      });
+      const bridge = createBridge({ _workerProxy: proxy, _workerGeneration: 9 });
+      await bridge.loadModelFromUrl('a.gguf', { nGpuLayers: 0 });
+
+      const controller = new AbortController();
+      const pending = bridge.loadModelFromUrl('b.gguf', { nGpuLayers: 0, signal: controller.signal });
+      await tick();
+      if (cancelWith === 'signal') {
+        controller.abort();
+      } else {
+        bridge.cancel();
+      }
+      await tick();
+      // The worker freed A before the transfer was cancelled.
+      const error = new Error('Model load was cancelled.');
+      error.state = { metadata: { 'llamadart.webgpu.model_bytes': '0' } };
+      rejectLoad(error);
+
+      await expectAbort(pending);
+      assert.equal(bridge._loadedModelUrl, null);
+    },
+  ]),
+
+  ...[
+    {
+      name: 'a failed worker replacement forgets the released model',
+      error: 'Failed to fetch model shard: 403 Forbidden',
+      modelBytesAfter: '0',
+      remembered: null,
+    },
+    {
+      name: 'a refused worker replacement keeps the loaded model',
+      error: 'Failed to release the loaded model: Model cannot be released during active generation',
+      modelBytesAfter: '4',
+      remembered: 'a.gguf',
+    },
+  ].map(({ name, error: message, modelBytesAfter, remembered }) => [name, async () => {
+    const proxy = createProxy('generation-9', {
+      callImpl: (method, args) => {
+        if (method === 'loadModelFromUrl' && args[0] === 'a.gguf') {
+          return Promise.resolve({
+            value: 1,
+            state: { metadata: { 'llamadart.webgpu.model_bytes': '4' } },
+          });
+        }
+        if (method === 'loadModelFromUrl') {
+          const error = new Error(message);
+          error.state = { metadata: { 'llamadart.webgpu.model_bytes': modelBytesAfter } };
+          return Promise.reject(error);
+        }
+        if (method === 'loadMultimodalProjector') {
+          return Promise.resolve({ value: 1, state: { supportsVision: true } });
+        }
+        return Promise.resolve({ value: undefined });
+      },
+    });
+    const replays = [];
+    const bridge = createBridge({
+      _workerProxy: proxy,
+      _workerGeneration: 9,
+      _createRuntime: () => ({
+        _modelBytes: 0,
+        _runtimeNotes: [],
+        async loadModelFromUrl(source) {
+          replays.push(source);
+          this._modelBytes = 1;
+        },
+        async dispose() {},
+        supportsVision: () => false,
+        supportsAudio: () => false,
+      }),
+    });
+
+    await bridge.loadModelFromUrl('a.gguf', { nGpuLayers: 0 });
+    await bridge.loadMultimodalProjector('mmproj.gguf');
+    await assert.rejects(bridge.loadModelFromUrl('b.gguf', { nGpuLayers: 0 }), new RegExp(message.slice(0, 20)));
+
+    assert.equal(bridge._loadedModelUrl, remembered);
+    assert.equal(bridge._loadedMmProjUrl, remembered ? 'mmproj.gguf' : null);
+
+    // A later worker failure must replay only a model the worker still held.
+    bridge._workerProxy = null;
+    await bridge._ensureRuntimeReadyAfterWorkerFallback({}, new Error('worker request timeout'));
+    assert.deepEqual(replays, remembered ? [remembered] : []);
+  }]),
 ];
 
 const CASE_TIMEOUT_MS = 2000;

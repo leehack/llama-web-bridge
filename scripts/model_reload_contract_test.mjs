@@ -176,7 +176,8 @@ function streamResponse(url, bytes) {
 function createRuntime(options = {}) {
   const fs = createWasmFs();
   const core = createCore(fs, options);
-  const runtime = new LlamaWebGpuBridge({ disableWorker: true })._runtime;
+  const bridge = new LlamaWebGpuBridge({ disableWorker: true });
+  const runtime = bridge._runtime;
   runtime._core = core;
   runtime._coreVariant = 'wasm32';
   runtime._probeBackends = async () => false;
@@ -196,7 +197,7 @@ function createRuntime(options = {}) {
     core.trace.push(['fetch', url]);
     return streamResponse(url, new Uint8Array([5, 6]));
   };
-  return { runtime, core, fs };
+  return { bridge, runtime, core, fs };
 }
 
 const loadOptions = { nGpuLayers: 0, useCache: false, forceRemoteFetchBackend: false };
@@ -314,6 +315,35 @@ const cases = [
       ['remote-load', 'https://models.test/large.gguf'],
     ]);
     assert.equal(fs.files.size, 0);
+  }],
+
+  ['the facade forgets a model that a failed replacement released', async () => {
+    const { bridge, runtime } = createRuntime();
+
+    await bridge.loadModelFromUrl('https://models.test/a.gguf', loadOptions);
+    await bridge.loadMultimodalProjector('https://models.test/mmproj-a.gguf');
+    await assert.rejects(
+      bridge.loadModelFromUrl('https://models.test/missing.gguf', loadOptions),
+      /Failed to fetch model shard: 404/,
+    );
+
+    assert.equal(runtime._modelBytes, 0);
+    assert.equal(bridge._loadedModelUrl, null, 'recovery must not replay the released model');
+    assert.equal(bridge._loadedMmProjUrl, null);
+  }],
+
+  ['the facade keeps a model whose release was refused', async () => {
+    const { bridge } = createRuntime({ freeModelRc: -1 });
+
+    await bridge.loadModelFromUrl('https://models.test/a.gguf', loadOptions);
+    await bridge.loadMultimodalProjector('https://models.test/mmproj-a.gguf');
+    await assert.rejects(
+      bridge.loadModelFromUrl('https://models.test/b.gguf', loadOptions),
+      /Failed to release the loaded model/,
+    );
+
+    assert.equal(bridge._loadedModelUrl, 'https://models.test/a.gguf');
+    assert.equal(bridge._loadedMmProjUrl, 'https://models.test/mmproj-a.gguf');
   }],
 
   ['state snapshots reuse an existing /states directory', async () => {
