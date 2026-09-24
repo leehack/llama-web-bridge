@@ -259,7 +259,7 @@ Common `options` keys:
 | `topK` | Top-k sampling. Defaults to `40`. |
 | `topP` | Top-p sampling. Defaults to `0.95`. |
 | `penalty` | Repetition penalty. Defaults to `1.1`. |
-| `grammar` | Optional llama.cpp grammar string. |
+| `grammar` | Optional llama.cpp GBNF grammar with a `root` rule. An invalid grammar rejects before generation starts with an error containing `(invalid grammar)`; worker mode rethrows it without falling back to the main thread. Each rejection leaks the partly parsed grammar (a few KiB at most for typical grammars), so validate generated grammars before sending them in a loop. |
 | `seed` | Integer seed; random when omitted. |
 | `onToken(piece, currentText)` | Token callback. By default `piece` is a `Uint8Array` containing stable UTF-8 bytes. Direct runtime mode provides the current full text by default; worker mode provides `''` unless `emitCurrentTextOnToken: true` is set. |
 | `signal` | `AbortSignal`; aborting cancels this operation and rejects with `AbortError`. |

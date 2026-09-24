@@ -10,6 +10,12 @@ const BRIDGE_DISPOSED_MESSAGE = 'Bridge has been disposed.';
 const GENERATION_ALREADY_ACTIVE_RC = -7;
 const GENERATION_ALREADY_ACTIVE_MESSAGE =
   'Generation is already active on this bridge runtime.';
+// The core puts this in the error when it rejects a grammar before generation
+// starts. The worker that reported it is still healthy and the main thread
+// would reject the grammar the same way, so the facade rethrows it even on the
+// media-parts path, which otherwise falls back for any worker error.
+const INVALID_GRAMMAR_ERROR_TEXT =
+  'Failed to initialize sampler chain (invalid grammar)';
 // Decision head API version shared with llama_webgpu_decision.h.
 const DECISION_API_VERSION = 1;
 // Worker runDecision budget per sequence on top of a 10-minute base; one
@@ -6952,6 +6958,9 @@ export class LlamaWebGpuBridge {
       }
     } catch (error) {
       this._throwIfOperationCancelled(error, 'Generation was cancelled.');
+      if (serializeWorkerError(error).includes(INVALID_GRAMMAR_ERROR_TEXT)) {
+        throw error;
+      }
       if (this._hasMediaParts(options)) {
         const reason = serializeWorkerError(error);
 
