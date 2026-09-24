@@ -349,7 +349,7 @@ class ReleaseContractTest(unittest.TestCase):
         """scripts/verify_ci_reliability.py gates llama_cpp.version with this parser."""
         pin_path = Path(__file__).resolve().parents[1] / "llama_cpp.version"
         pin_contents = pin_path.read_text(encoding="utf-8")
-        self.assertEqual(pin_contents, "v0.2.0\n")
+        self.assertEqual(pin_contents, "v0.5.0\n")
         pin = pin_contents.removesuffix("\n")
         self.assertIn(
             parse_upstream_tag(pin).channel, (Channel.STABLE, Channel.DEVELOPMENT)
