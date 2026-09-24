@@ -3,9 +3,12 @@
 
 GitHub release tags are shared with the native release convention. Stable
 releases use ``vMAJOR.MINOR.PATCH`` and rebuilds append ``-N``. Development
-releases use ``bNNNN`` and rebuilds append ``-N``. Historical
-``*-llamadart.N`` wrappers remain readable so an existing manifest can be used
-as an ordering boundary, but this module never emits them.
+releases use ``bNNNN`` and rebuilds append ``-N``. Bridge asset releases keep
+npm-compatible ordering, so a new bridge asset release never carries ``-N``
+(:func:`validate_new_release_identity`); suffixed bridge tags published before
+that rule stay readable. Historical ``*-llamadart.N`` wrappers remain readable
+so an existing manifest can be used as an ordering boundary, but this module
+never emits them.
 """
 
 from __future__ import annotations
@@ -301,6 +304,26 @@ def validate_release_identity(release_tag: str, rebuild: int, upstream_tag: str)
     if release.rebuild != rebuild:
         raise ContractError(
             f"release tag {release_tag!r} encodes rebuild {release.rebuild}, not {rebuild}"
+        )
+    return release
+
+
+def validate_new_release_identity(
+    release_tag: str, rebuild: int, upstream_tag: str
+) -> ReleaseVersion:
+    """Validate a bridge asset release that is about to be built or published.
+
+    Bridge asset tags keep npm-compatible ordering, so a new release is always
+    an unsuffixed tag with rebuild 0. npm orders ``vMAJOR.MINOR.PATCH-N`` as a
+    prerelease before ``vMAJOR.MINOR.PATCH``, which would rank newer assets
+    below older ones. Suffixed tags published before this rule, such as
+    ``v0.1.47-1``, stay readable through :func:`validate_release_identity`.
+    """
+    release = validate_release_identity(release_tag, rebuild, upstream_tag)
+    if release.rebuild != 0:
+        raise ContractError(
+            f"new bridge asset release tag {release_tag!r} must not carry a rebuild "
+            "suffix; take the next free unsuffixed version instead"
         )
     return release
 
@@ -1267,7 +1290,7 @@ def main() -> int:
     args = _parser().parse_args()
     try:
         if args.command == "validate-release":
-            release = validate_release_identity(
+            release = validate_new_release_identity(
                 args.release_tag, args.release_rebuild, args.upstream_tag
             )
             result: dict[str, Any] = {

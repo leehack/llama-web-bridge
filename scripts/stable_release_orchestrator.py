@@ -57,6 +57,7 @@ from release_contract import (
     validate_immutable_release_governance,
     validate_publication_environment,
     validate_release_attestation,
+    validate_new_release_identity,
     validate_release_identity,
     validate_release_immutability,
 )
@@ -1088,16 +1089,20 @@ def select_next_release_target(
 ) -> ReleaseTarget:
     """Pick the next free bridge-asset tag, independently of the upstream tag.
 
-    ``release_tags`` are the assets repository's existing releases and set the
-    version floor. ``taken`` are tags already claimed by an unfinished pipeline;
-    they never advance the version but must not be collided with, so a claimed
-    tag falls through to the next free rebuild of the same version.
+    ``release_tags`` are the assets repository's existing releases. ``taken``
+    are tags still claimed by a pipeline. Both set the version floor, so a new
+    tag is never lower than a published tag or a live claim. A claim that is
+    released without publication stops counting, so its version may be taken
+    again or stay unused. The result is always an unsuffixed
+    ``vMAJOR.MINOR.PATCH`` with rebuild 0: npm orders ``-N`` as a prerelease of
+    the same version, so a collision moves to the next free patch version
+    instead of a rebuild suffix.
     """
     parse_upstream_tag(upstream_tag)
     published = {tag for tag in release_tags if isinstance(tag, str)}
     claimed = published | {tag for tag in taken if isinstance(tag, str)}
     versions = []
-    for tag in published:
+    for tag in claimed:
         try:
             version = parse_release_tag(tag, allow_legacy=True)
         except ContractError:
@@ -1107,17 +1112,16 @@ def select_next_release_target(
     if versions:
         highest = max(versions, key=lambda value: (*value.version_parts, value.rebuild))
         major, minor, patch = highest.version_parts
-        base_tag = f"v{major}.{minor}.{patch + 1}"
+        patch += 1
     else:
-        base_tag = INITIAL_STABLE_RELEASE_TAG
+        major, minor, patch = parse_release_tag(INITIAL_STABLE_RELEASE_TAG).version_parts
 
-    rebuild = 0
-    tag = base_tag
+    tag = f"v{major}.{minor}.{patch}"
     while tag in claimed:
-        rebuild += 1
-        tag = f"{base_tag}-{rebuild}"
-    validate_release_identity(tag, rebuild, upstream_tag)
-    return ReleaseTarget(tag, rebuild)
+        patch += 1
+        tag = f"v{major}.{minor}.{patch}"
+    validate_new_release_identity(tag, 0, upstream_tag)
+    return ReleaseTarget(tag, 0)
 
 
 # --------------------------------------------------------------------------
