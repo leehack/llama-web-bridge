@@ -8,6 +8,7 @@ var defaultModelCacheName = "llamadart-webgpu-model-cache-v1";
 var BRIDGE_DISPOSED_MESSAGE = "Bridge has been disposed.";
 var GENERATION_ALREADY_ACTIVE_RC = -7;
 var GENERATION_ALREADY_ACTIVE_MESSAGE = "Generation is already active on this bridge runtime.";
+var INVALID_GRAMMAR_ERROR_TEXT = "Failed to initialize sampler chain (invalid grammar)";
 var DECISION_API_VERSION = 1;
 var DECISION_WORKER_TIMEOUT_PER_SEQUENCE_MS = 60 * 1e3;
 function createAbortError(message) {
@@ -5650,6 +5651,9 @@ var LlamaWebGpuBridge = class {
       }
     } catch (error) {
       this._throwIfOperationCancelled(error, "Generation was cancelled.");
+      if (serializeWorkerError(error).includes(INVALID_GRAMMAR_ERROR_TEXT)) {
+        throw error;
+      }
       if (this._hasMediaParts(options)) {
         const reason = serializeWorkerError(error);
         if (isWarmup) {
