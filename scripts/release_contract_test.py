@@ -35,6 +35,7 @@ from release_contract import (
     validate_immutable_release_governance,
     validate_publication_environment,
     validate_native_identity,
+    validate_new_release_identity,
     validate_release_attestation,
     validate_release_identity,
     validate_release_immutability,
@@ -467,6 +468,46 @@ class ReleaseContractTest(unittest.TestCase):
         ):
             with self.subTest(case=label), self.assertRaises(ContractError):
                 validate_release_identity(release, rebuild, upstream)
+
+    def test_new_bridge_release_never_carries_a_rebuild_suffix(self) -> None:
+        """npm orders v0.1.50-1 before v0.1.50, so new assets stay unsuffixed."""
+        self.assertEqual(
+            validate_new_release_identity("v0.1.50", 0, "v0.5.0").tag, "v0.1.50"
+        )
+        for release, rebuild, upstream in (
+            ("v0.1.50-1", 1, "v0.5.0"),
+            ("v0.1.47-1", 1, "v0.4.1"),
+            ("b10600-1", 1, "b10600"),
+        ):
+            with self.subTest(release=release), self.assertRaises(ContractError):
+                validate_new_release_identity(release, rebuild, upstream)
+        # Suffixed tags published before the rule stay readable.
+        self.assertEqual(
+            validate_release_identity("v0.1.47-1", 1, "v0.4.1").rebuild, 1
+        )
+
+    def test_validate_release_cli_rejects_a_new_rebuild_suffix(self) -> None:
+        """bridge_candidate.yml and publish_assets.yml gate on this command."""
+        command = [
+            sys.executable,
+            str(Path(__file__).with_name("release_contract.py")),
+            "validate-release",
+            "--upstream-tag",
+            "v0.5.0",
+        ]
+        accepted = subprocess.run(
+            [*command, "--release-tag", "v0.1.50", "--release-rebuild", "0"],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+        rejected = subprocess.run(
+            [*command, "--release-tag", "v0.1.50-1", "--release-rebuild", "1"],
+            capture_output=True,
+            text=True,
+        )
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn("must not carry a rebuild suffix", rejected.stderr + rejected.stdout)
 
     def test_native_identity_still_encodes_its_upstream(self) -> None:
         self.assertEqual(

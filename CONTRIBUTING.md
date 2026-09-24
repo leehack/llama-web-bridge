@@ -374,11 +374,13 @@ default-branch schedule events remain automatic; `workflow_run` continuations
 also require a successful stage run on the default branch with owner actor and
 triggering actor before either job starts.
 
-GitHub artifact tags are `vMAJOR.MINOR.PATCH`, `vMAJOR.MINOR.PATCH-N`, `bNNNN`,
-or `bNNNN-N`. Historical `bNNNN-llamadart.N` and prior wrapper forms are
-read-only compatibility inputs. Any future npm package must use an independently
-monotonic version with stable/nightly dist-tags because npm treats
-`vMAJOR.MINOR.PATCH-N` as a prerelease.
+New bridge asset tags are npm-shaped `vMAJOR.MINOR.PATCH` with rebuild `0`:
+`select_next_release_target` skips a published or claimed version by taking
+the next free patch version, and `release_contract.py validate-release` rejects
+a new `-N` tag in the candidate and publish workflows, because npm orders
+`vMAJOR.MINOR.PATCH-N` as a prerelease. Earlier `-N` bridge tags, the native
+forms `vMAJOR.MINOR.PATCH-N`, `bNNNN` and `bNNNN-N`, historical
+`bNNNN-llamadart.N` and prior wrapper forms are read-only compatibility inputs.
 
 Never interpolate `${{ inputs.* }}` directly inside a workflow `run` script.
 Transport dispatch inputs through `env` and use quoted shell expansions.

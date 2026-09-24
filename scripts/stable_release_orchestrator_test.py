@@ -1620,12 +1620,35 @@ class ReleaseTargetTest(unittest.TestCase):
         self.assertEqual(target.release_tag, sro.INITIAL_STABLE_RELEASE_TAG)
         self.assertEqual(target.release_rebuild, 0)
 
-    def test_rebuild_suffix_when_next_version_tag_is_taken(self) -> None:
+    def test_taken_next_version_moves_to_the_next_patch_version(self) -> None:
         target = sro.select_next_release_target(
             ["v0.1.39", "v0.1.40"], upstream_tag="v0.2.0", taken={"v0.1.41"}
         )
-        self.assertEqual(target.release_tag, "v0.1.41-1")
-        self.assertEqual(target.release_rebuild, 1)
+        self.assertEqual(target.release_tag, "v0.1.42")
+        self.assertEqual(target.release_rebuild, 0)
+
+    def test_claims_set_the_floor_so_tags_follow_dispatch_order(self) -> None:
+        # v0.1.50 was claimed and released unpublished; v0.1.51 is still in
+        # flight. A later pipeline must not take v0.1.50 below it.
+        target = sro.select_next_release_target(
+            ["v0.1.49"], upstream_tag="v0.5.0", taken={"v0.1.51"}
+        )
+        self.assertEqual(target.release_tag, "v0.1.52")
+        self.assertEqual(target.release_rebuild, 0)
+
+    def test_historical_rebuild_tag_sets_the_floor_but_is_never_emitted(self) -> None:
+        target = sro.select_next_release_target(
+            ["v0.1.47", "v0.1.47-1"], upstream_tag="v0.4.1", taken={"v0.1.48"}
+        )
+        self.assertEqual(target.release_tag, "v0.1.49")
+        self.assertEqual(target.release_rebuild, 0)
+
+    def test_seed_release_collision_moves_to_the_next_patch_version(self) -> None:
+        target = sro.select_next_release_target(
+            [], upstream_tag="v0.2.0", taken={sro.INITIAL_STABLE_RELEASE_TAG}
+        )
+        self.assertEqual(target.release_tag, "v0.1.1")
+        self.assertEqual(target.release_rebuild, 0)
 
     def test_run_history_includes_claims_since_the_last_asset_publication(self) -> None:
         prior = asset_release_stub()
@@ -2734,8 +2757,8 @@ class AdvancePipelineTest(unittest.TestCase):
             qualification_status="in_progress"
         )
         inputs = gateway.dispatches[0]["inputs"]
-        self.assertEqual(inputs["release_tag"], "v0.1.40-1")
-        self.assertEqual(inputs["release_rebuild"], "1")
+        self.assertEqual(inputs["release_tag"], "v0.1.41")
+        self.assertEqual(inputs["release_rebuild"], "0")
 
     def test_later_qualified_provenance_waits_for_earlier_immutable_publication(
         self,
@@ -3413,7 +3436,7 @@ class AdvancePipelineTest(unittest.TestCase):
             dry_run=True,
             reserved_release_tags={"v0.1.40"},
         )
-        self.assertEqual(plan.release_target.release_tag, "v0.1.40-1")
+        self.assertEqual(plan.release_target.release_tag, "v0.1.41")
 
     def test_orphan_assets_tag_ref_is_reserved_before_candidate_dispatch(self) -> None:
         routes = self._routes(releases=[asset_release_stub()])
@@ -3434,8 +3457,8 @@ class AdvancePipelineTest(unittest.TestCase):
             workspace=self.tmp,
             dry_run=True,
         )
-        self.assertEqual(plan.release_target.release_tag, "v0.1.40-1")
-        self.assertEqual(plan.release_target.release_rebuild, 1)
+        self.assertEqual(plan.release_target.release_tag, "v0.1.41")
+        self.assertEqual(plan.release_target.release_rebuild, 0)
 
     def test_candidate_dispatch_inputs_carry_the_live_governance_proof(self) -> None:
         dispatched = run_payload(
@@ -4283,7 +4306,7 @@ class AdvancePipelineTest(unittest.TestCase):
             ],
             [
                 ("v0.2.0", "in_flight", "v0.1.42"),
-                ("v0.2.1", "dispatch_candidate", "v0.1.42-1"),
+                ("v0.2.1", "dispatch_candidate", "v0.1.43"),
             ],
         )
         self.assertEqual(
@@ -4291,7 +4314,7 @@ class AdvancePipelineTest(unittest.TestCase):
                 (record["workflow_file"], record["inputs"]["release_tag"], record["inputs"]["release_rebuild"])
                 for record in gateway.dispatches
             ],
-            [(sro.CANDIDATE_WORKFLOW_FILE, "v0.1.42-1", "1")],
+            [(sro.CANDIDATE_WORKFLOW_FILE, "v0.1.43", "0")],
         )
 
     def test_differing_candidate_is_qualified_not_skipped(self) -> None:

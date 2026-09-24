@@ -456,18 +456,19 @@ publication workflow run using the same `candidate_run_id` and
 `qualification_run_id`; never rerun the old run. A different candidate must never
 overwrite an earlier one under the same output tag.
 
-GitHub artifact tags follow the shared convention:
+New bridge asset release tags are npm-shaped `vMAJOR.MINOR.PATCH` with
+`release_rebuild` `0`. When the next version is already published or claimed by
+an unfinished pipeline, the orchestrator takes the next free patch version; it
+never appends `-N`, which npm orders as a prerelease below the plain version.
+A new tag is never lower than a published tag or a live claim; a claim released
+without publication stops counting, so its version may be taken again or stay
+unused. `release_contract.py validate-release`, which the candidate and publish
+workflows run, rejects a new tag with a rebuild suffix.
 
-- stable: `vMAJOR.MINOR.PATCH`
-- stable rebuild: `vMAJOR.MINOR.PATCH-N`
-- development: `bNNNN`
-- development rebuild: `bNNNN-N`
-
-Historical `bNNNN-llamadart.N` and earlier wrapper forms are accepted only when
-reading existing manifests and are never emitted. Any future npm package must
-use an independently monotonic version sequence with stable/nightly dist-tags;
-`vMAJOR.MINOR.PATCH-N` is prerelease-ordered by npm and must not be reused as the
-npm version.
+Tags published before this rule, such as `v0.1.47-1`, and the shared native
+forms (`vMAJOR.MINOR.PATCH-N`, `bNNNN`, `bNNNN-N`) stay readable. Historical
+`bNNNN-llamadart.N` and earlier wrapper forms are accepted only when reading
+existing manifests and are never emitted.
 
 After publish, assets are CDN-available at:
 
