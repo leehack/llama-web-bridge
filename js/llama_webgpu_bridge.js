@@ -329,6 +329,37 @@ async function drainResponseWithProgress(response, progressCallback, options = {
   }
   return loaded;
 }
+function ensureFsDirectory(fs, dirPath) {
+  const slash = dirPath.lastIndexOf("/");
+  const parent = slash > 0 ? dirPath.slice(0, slash) : "/";
+  const name = dirPath.slice(slash + 1);
+  const exists = () => {
+    try {
+      const entries = fs.readdir(parent);
+      return Array.isArray(entries) && entries.includes(name);
+    } catch (_) {
+      return false;
+    }
+  };
+  if (exists()) {
+    return;
+  }
+  try {
+    fs.mkdir(dirPath);
+  } catch (error) {
+    if (!exists()) {
+      throw error;
+    }
+  }
+}
+function unlinkFsFile(fs, filePath) {
+  try {
+    fs.unlink(filePath);
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
 async function writeResponseToFsFileWithProgress(response, fs, filePath, progressCallback, writeOptions = {}) {
   const total = parsePositiveInteger(writeOptions.totalBytes) || inferResponseTotalBytes(response, 0);
   const useBigIntPosition = writeOptions.useBigIntPosition === true;
@@ -340,12 +371,7 @@ async function writeResponseToFsFileWithProgress(response, fs, filePath, progres
   const abortMessage = writeOptions.abortMessage || "Model transfer was cancelled.";
   throwIfAborted(signal, abortMessage);
   if (!appendMode) {
-    try {
-      if (fs.analyzePath(filePath).exists) {
-        fs.unlink(filePath);
-      }
-    } catch (_) {
-    }
+    unlinkFsFile(fs, filePath);
   }
   if (!response.body || typeof response.body.getReader !== "function") {
     throwIfAborted(signal, abortMessage);
@@ -2211,14 +2237,7 @@ var LlamaWebGpuBridgeRuntime = class {
     if (!this._core || typeof path !== "string" || path.length === 0) {
       return false;
     }
-    try {
-      if (this._core.FS.analyzePath(path).exists) {
-        this._core.FS.unlink(path);
-        return true;
-      }
-    } catch (_) {
-    }
-    return false;
+    return unlinkFsFile(this._core.FS, path);
   }
   _releaseModelFiles() {
     const paths = Array.isArray(this._modelPaths) && this._modelPaths.length > 0 ? [...this._modelPaths] : this._modelPath ? [this._modelPath] : [];
@@ -2230,6 +2249,32 @@ var LlamaWebGpuBridgeRuntime = class {
     }
     this._modelPaths = [];
     return removed;
+  }
+  // A load replaces the current model. Free it, its projector and their FS files
+  // before downloading the next model so both never occupy the wasm heap at once.
+  // The core refuses while a generation or speech synthesis is still active,
+  // which leaves the current model untouched.
+  _releaseLoadedModel(core) {
+    const projectorPath = this._mmProjPath;
+    const hasModelFiles = Array.isArray(this._modelPaths) && this._modelPaths.length > 0;
+    if (this._modelBytes <= 0 && !projectorPath && !hasModelFiles) {
+      return false;
+    }
+    const rc = Number(core.ccall("llamadart_webgpu_free_model", "number", [], []));
+    if (rc !== 0) {
+      throw new Error(this._coreErrorMessage("Failed to release the loaded model", rc));
+    }
+    this._clearStagedMediaFiles();
+    this._deleteFsFile(projectorPath);
+    this._releaseModelFiles();
+    this._modelPath = null;
+    this._modelBytes = 0;
+    this._modelSource = "network";
+    this._mmProjPath = null;
+    this._mmSupportsVision = false;
+    this._mmSupportsAudio = false;
+    this._runtimeNotes.push("previous_model_released");
+    return true;
   }
   async _getCachedModelResponse(url, options = {}) {
     let useCache = options.useCache !== false;
@@ -2653,13 +2698,18 @@ var LlamaWebGpuBridgeRuntime = class {
     throwIfAborted(operationSignal, abortMessage);
     this._abortRequested = false;
     this._runtimeNotes = [];
-    this._mmProjSourceUrl = null;
     this._suppressedWarmupWarningCount = 0;
     this._didReportWarmupWarningSuppression = false;
     await this._probeBackends();
     throwIfAborted(operationSignal, abortMessage);
     const core = await this._ensureCore();
     throwIfAborted(operationSignal, abortMessage);
+    const modelUrls = expandModelShardUrls(url);
+    if (modelUrls.length === 0) {
+      throw new Error("Model URL is empty.");
+    }
+    this._releaseLoadedModel(core);
+    this._mmProjSourceUrl = null;
     const configuredPoolHint = Number(this._threadPoolSizeHint);
     this._syncThreadPoolSizeHintFromCore();
     const coreSupportsPthreads = this._coreSupportsPthreads();
@@ -2732,10 +2782,6 @@ var LlamaWebGpuBridgeRuntime = class {
         this._runtimeNotes.push(`safari_gpu_layers_capped:${safariMaxGpuLayers}`);
       }
     }
-    const modelUrls = expandModelShardUrls(url);
-    if (modelUrls.length === 0) {
-      throw new Error("Model URL is empty.");
-    }
     this._loadedModelUrl = cloneModelSource(url);
     if (modelUrls.length > 1) {
       this._runtimeNotes.push(`model_split_detected:${modelUrls.length}`);
@@ -2757,9 +2803,7 @@ var LlamaWebGpuBridgeRuntime = class {
       this._runtimeNotes.push("model_fetch_backend_skipped_split");
     }
     if (!loadedViaRemoteFetch) {
-      if (!core.FS.analyzePath("/models").exists) {
-        core.FS.mkdir("/models");
-      }
+      ensureFsDirectory(core.FS, "/models");
       const progressCallback = typeof options.progressCallback === "function" ? options.progressCallback : null;
       const shardLoaded = new Array(modelUrls.length).fill(0);
       const shardTotals = new Array(modelUrls.length).fill(0);
@@ -3156,9 +3200,7 @@ var LlamaWebGpuBridgeRuntime = class {
       throw new Error("Multimodal projector URL/path is empty.");
     }
     const core = await this._ensureCore();
-    if (!core.FS.analyzePath("/mmproj").exists) {
-      core.FS.mkdir("/mmproj");
-    }
+    ensureFsDirectory(core.FS, "/mmproj");
     const fileName = basenameFromUrl(url);
     const mmprojPath = `/mmproj/${fileName}`;
     const fetchTimeoutMs = this._resolveFetchTimeoutMs({}, 18e4);
@@ -4008,25 +4050,7 @@ var LlamaWebGpuBridgeRuntime = class {
     if (!core?.FS) {
       throw new Error("Bridge filesystem is not initialized");
     }
-    const hasStateDir = () => {
-      try {
-        const entries = core.FS.readdir("/");
-        return Array.isArray(entries) && entries.includes("states");
-      } catch (_) {
-        return false;
-      }
-    };
-    if (hasStateDir()) {
-      return;
-    }
-    try {
-      core.FS.mkdir("/states");
-    } catch (error) {
-      if (hasStateDir()) {
-        return;
-      }
-      throw error;
-    }
+    ensureFsDirectory(core.FS, "/states");
   }
   _normalizeStateTokens(tokens) {
     const normalized = Array.isArray(tokens) ? tokens : Array.from(tokens || []);
