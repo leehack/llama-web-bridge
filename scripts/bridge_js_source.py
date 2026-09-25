@@ -1,4 +1,7 @@
-"""Bridge JS source text for the static API contract checks.
+"""Bridge JS source text for the static contract checks.
+
+tests/js/bridge_js_source.mjs is the JS twin; keep the module order and
+method_body semantics identical.
 
 js/src/llama_webgpu_bridge.js is only the public entry; the implementation
 lives in the .js and .ts modules it imports (the public .d.ts is excluded). The

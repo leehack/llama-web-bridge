@@ -14,7 +14,10 @@ ROOT = Path(__file__).resolve().parents[1]
 class ScopeTests(unittest.TestCase):
     def test_allowlist_and_unknown_inputs(self):
         for path in ('README.md', 'docs/guide.md', 'scripts/release_publication_state.py', 'scripts/bridge_js_source.py', 'scripts/native_core_source.py',
-                     'tests/js/native_core_source.mjs',
+                     'tests/js/native_core_source.mjs', 'tests/js/bridge_js_source.mjs',
+                     'tests/js/state_persistence_api_contract_test.mjs',
+                     'tests/js/text_to_speech_api_contract_test.mjs',
+                     'tests/js/decision_api_contract_test.mjs',
                      'scripts/stable_release_orchestrator.py', 'scripts/stable_release_orchestrator_test.py',
                      'scripts/orchestrator_source.py', 'scripts/release_orchestrator_asset_releases.py',
                      'scripts/release_orchestrator_asset_releases_test.py', 'scripts/release_orchestrator_driver.py',

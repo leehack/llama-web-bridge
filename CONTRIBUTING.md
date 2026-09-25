@@ -41,7 +41,10 @@ list.
 Bridge wrapper source lives under `js/src/`; `npm run build:js` regenerates the
 checked-in browser ESM outputs and declarations under `js/`. `npm run check:js`
 runs the same generator plus TypeScript and syntax checks, so commit any updated
-`js/` outputs after source changes.
+`js/` outputs after source changes. It also runs the JS contract tests,
+including the static state-persistence, text-to-speech, and decision API
+contracts (`npm run test:api-state-persistence`, `npm run test:api-tts`, and
+`npm run test:api-decision`).
 
 `js/src/llama_webgpu_bridge.js` is the public entry. It re-exports the API and
 owns the only load-time side effects (worker host auto-boot and the
@@ -80,7 +83,10 @@ it relies on everything included before it, so keep the include order. The
 static contract checks read the core with its parts expanded
 (`scripts/native_core_source.py` and its JS twin
 `tests/js/native_core_source.mjs`), which is how the compiler sees it. Both fail
-if a part is not included exactly once as a plain `#include` line.
+if a part is not included exactly once as a plain `#include` line. They read the
+bridge the same way: `scripts/bridge_js_source.py` and its JS twin
+`tests/js/bridge_js_source.mjs` join every `js/src` module in the order the
+former single-file source declared them.
 
 For local agent/maintainer validation, prefer external build and cache paths so
 generated files do not dirty the checkout:
@@ -115,10 +121,7 @@ Before opening or updating a PR, run the lightweight contracts:
 
 ```bash
 npm run check:js
-python3 -m py_compile scripts/verify_state_persistence_api.py scripts/verify_text_to_speech_api.py scripts/verify_decision_api.py scripts/verify_ci_reliability.py scripts/state_persistence_browser_smoke.py scripts/multimodal_browser_smoke.py scripts/grammar_browser_smoke.py scripts/next_token_scores_browser_smoke.py scripts/speech_to_text_browser_smoke.py scripts/text_to_speech_browser_smoke.py scripts/decision_browser_smoke.py
-python3 scripts/verify_state_persistence_api.py
-python3 scripts/verify_text_to_speech_api.py
-python3 scripts/verify_decision_api.py
+python3 -m py_compile scripts/verify_ci_reliability.py scripts/state_persistence_browser_smoke.py scripts/multimodal_browser_smoke.py scripts/grammar_browser_smoke.py scripts/next_token_scores_browser_smoke.py scripts/speech_to_text_browser_smoke.py scripts/text_to_speech_browser_smoke.py scripts/decision_browser_smoke.py
 python3 scripts/mtmd_compat_contract_test.py
 python3 scripts/verify_ci_reliability.py
 ```

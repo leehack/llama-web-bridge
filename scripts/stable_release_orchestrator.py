@@ -96,6 +96,10 @@ _ORCHESTRATION_ONLY_PATHS = frozenset(
         "scripts/release_qualification.py",
         "scripts/stable_release_orchestrator.py",
         "scripts/verify_ci_reliability.py",
+        # Ported to tests/js/*_api_contract_test.mjs, which the _test.mjs
+        # suffix covers. Keep these entries: the commit that ported them
+        # deletes these paths, and history must not classify that commit as a
+        # build input.
         "scripts/verify_decision_api.py",
         "scripts/verify_state_persistence_api.py",
         "scripts/verify_text_to_speech_api.py",
@@ -106,6 +110,8 @@ _ORCHESTRATION_ONLY_PATHS = frozenset(
         "tests/js/bridge_operation_queue_fixtures.mjs",
         "tests/js/bridge_operation_queue_lifecycle_contract_cases.mjs",
         "tests/js/bridge_operation_queue_worker_proxy_cases.mjs",
+        # Source readers the JS contract tests import.
+        "tests/js/bridge_js_source.mjs",
         "tests/js/native_core_source.mjs",
     }
 )

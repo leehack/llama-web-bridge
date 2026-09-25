@@ -223,6 +223,15 @@ def require(condition: bool, message: str, errors: list[str]) -> None:
         errors.append(message)
 
 
+def check_js_runs(package_scripts: dict, script: str, test_file: str) -> bool:
+    """Whether `npm run check:js` runs `script`, and `script` runs `test_file`."""
+    steps = str(package_scripts.get("check:js", "")).split(" && ")
+    return (
+        f"npm run {script}" in steps
+        and package_scripts.get(script) == f"node {test_file}"
+    )
+
+
 def run_required_python_contract(relative_path: str, errors: list[str]) -> None:
     """Execute a fast contract suite so CI verifies behavior, not test-name text."""
     try:
@@ -1215,9 +1224,13 @@ def main() -> int:
     next_token_scores_smoke = read_required("scripts/next_token_scores_browser_smoke.py", errors)
     speech_smoke = read_required("scripts/speech_to_text_browser_smoke.py", errors)
     tts_smoke = read_required("scripts/text_to_speech_browser_smoke.py", errors)
-    tts_contract = read_required("scripts/verify_text_to_speech_api.py", errors)
+    tts_contract = read_required(
+        "tests/js/text_to_speech_api_contract_test.mjs", errors
+    )
     decision_smoke = read_required("scripts/decision_browser_smoke.py", errors)
-    decision_contract = read_required("scripts/verify_decision_api.py", errors)
+    decision_contract = read_required(
+        "tests/js/decision_api_contract_test.mjs", errors
+    )
     release_qualification = read_required("scripts/release_qualification.py", errors)
     release_qualification_test = read_required(
         "scripts/release_qualification_test.py", errors
@@ -1675,7 +1688,12 @@ def main() -> int:
         errors,
     )
     require(
-        "verify_text_to_speech_api.py" in ci
+        "npm run check:js" in ci
+        and check_js_runs(
+            package_scripts,
+            "test:api-tts",
+            "tests/js/text_to_speech_api_contract_test.mjs",
+        )
         and "text_to_speech_browser_smoke.py" in ci
         and "Qwen3-TTS-12Hz-1.7B-Base-GGUF/resolve/ca27d74bc954b73dadab5b71ca265d87fc861a7c" in ci
         and "LLAMA_WEBGPU_TTS_MODEL_SHA256" in ci
@@ -1689,12 +1707,16 @@ def main() -> int:
         errors,
     )
     require(
-        "python3 scripts/verify_decision_api.py" in ci
+        check_js_runs(
+            package_scripts,
+            "test:api-decision",
+            "tests/js/decision_api_contract_test.mjs",
+        )
         and "scripts/decision_browser_smoke.py" in ci
         and "decision_browser_smoke.py --" not in ci
         and all(
-            "python3 scripts/verify_decision_api.py" in workflow
-            for workflow in (candidate, publish)
+            "npm run check:js" in workflow
+            for workflow in (ci, candidate, publish)
         )
         and "LLAMADART_WEBGPU_DECISION_API_VERSION" in decision_contract
         and 'RUNTIME_MODES = ("direct", "worker")' in decision_smoke,
@@ -3187,7 +3209,7 @@ def main() -> int:
             "scripts/speech_to_text_browser_smoke.py",
             "scripts/text_to_speech_browser_smoke.py",
             "scripts/decision_browser_smoke.py",
-            "python3 scripts/verify_decision_api.py",
+            "npm run test:api-decision",
             "--model-sha256",
             "--mmproj-sha256",
             "llama_cpp.version",
