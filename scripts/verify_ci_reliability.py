@@ -11,6 +11,11 @@ from pathlib import Path
 
 from bridge_js_source import bridge_js_source
 from native_core_source import native_core_source
+from orchestrator_source import (
+    orchestrator_source,
+    orchestrator_test_source,
+    orchestrator_test_suites,
+)
 from release_contract import ContractError, parse_upstream_tag
 from release_qualification import EXPECTED_MODEL_PINS
 
@@ -1103,14 +1108,21 @@ def main() -> int:
     publication_state_test = read_required(
         "scripts/release_publication_state_test.py", errors
     )
-    orchestrator = read_required("scripts/stable_release_orchestrator.py", errors)
-    orchestrator_test = read_required(
-        "scripts/stable_release_orchestrator_test.py", errors
-    )
+    try:
+        orchestrator = orchestrator_source(ROOT)
+    except (OSError, SyntaxError, ValueError) as exc:
+        errors.append(f"release orchestrator modules cannot be read as one source: {exc}")
+        orchestrator = ""
+    try:
+        orchestrator_suites = orchestrator_test_suites(ROOT)
+        orchestrator_test = orchestrator_test_source(ROOT)
+    except (OSError, SyntaxError, ValueError) as exc:
+        errors.append(f"release orchestrator suites cannot be read as one source: {exc}")
+        orchestrator_suites = []
+        orchestrator_test = ""
     if orchestrator and orchestrator_test:
-        run_required_python_contract(
-            "scripts/stable_release_orchestrator_test.py", errors
-        )
+        for suite in orchestrator_suites:
+            run_required_python_contract(suite.relative_to(ROOT).as_posix(), errors)
     workflow_input_transport = read_required(
         "tests/js/workflow_input_transport_test.mjs", errors
     )

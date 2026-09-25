@@ -192,6 +192,13 @@ candidate and exact `candidate_run_id`/`attestation_run_id` pair.
   qualification harness digest and the candidate/publication checkouts address
   those files by their `scripts/` path at older commits, so moving them breaks
   in-flight candidates.
+- `scripts/stable_release_orchestrator.py` is the orchestrator's CLI entry; the
+  state machine lives in the `scripts/release_orchestrator_<concern>.py` modules
+  it imports, tested by `scripts/release_orchestrator_<concern>_test.py`
+  suites that share `release_orchestrator_fixtures_test.py`. List a new module in
+  `_ORCHESTRATION_ONLY_PATHS` and in `TOOLING` in `scripts/ci_scope.py`.
+  `scripts/verify_ci_reliability.py` reads the entry plus every module it
+  imports (`scripts/orchestrator_source.py`) and fails on an unimported one.
 - Keep publishing logic in workflow only.
 - Do not edit assets repository files from here outside publish flow.
 - C++ exception catching is enabled only for
