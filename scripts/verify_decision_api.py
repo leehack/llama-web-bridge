@@ -7,13 +7,14 @@ import re
 import sys
 from pathlib import Path
 
-from bridge_js_source import bridge_js_source
+from bridge_js_source import bridge_js_source, method_body
 
 ROOT = Path(__file__).resolve().parents[1]
 CORE = (ROOT / "src" / "llama_webgpu_core.cpp").read_text(encoding="utf-8")
 DECISION = (ROOT / "src" / "llama_webgpu_decision.cpp").read_text(encoding="utf-8")
 HEADER = (ROOT / "src" / "llama_webgpu_decision.h").read_text(encoding="utf-8")
 JS = bridge_js_source(ROOT)
+BRIDGE_JS = (ROOT / "js" / "src" / "bridge.js").read_text(encoding="utf-8")
 DTS = (ROOT / "js" / "src" / "llama_webgpu_bridge.d.ts").read_text(encoding="utf-8")
 CMAKE = (ROOT / "CMakeLists.txt").read_text(encoding="utf-8")
 README = (ROOT / "README.md").read_text(encoding="utf-8")
@@ -227,8 +228,8 @@ def main() -> int:
     )
     require(
         re.search(
-            r"async _loadDecisionHeadUnlocked\(.*?if \(!this\._shouldFallbackToMainThread\(error\)\) \{\s*throw error;",
-            JS,
+            r"if \(!this\._shouldFallbackToMainThread\(error\)\) \{\s*throw error;",
+            method_body(BRIDGE_JS, "async _loadDecisionHeadUnlocked("),
             re.DOTALL,
         )
         is not None,

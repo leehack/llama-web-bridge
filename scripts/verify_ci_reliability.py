@@ -177,6 +177,21 @@ for (const [jobName, rawJob] of Object.entries(mapping(mapping(workflow).jobs)))
 }
 process.stdout.write(JSON.stringify({ steps: resolved, patOutsideEnv }));
 """
+RESOLVE_JOB_PERMISSIONS_JS = r"""
+const fs = require('fs');
+const YAML = require('yaml');
+
+const workflow = YAML.parse(fs.readFileSync(0, 'utf8'), { merge: true });
+const jobs = workflow && typeof workflow.jobs === 'object' && workflow.jobs ? workflow.jobs : {};
+const permissions = {};
+for (const [name, job] of Object.entries(jobs)) {
+  permissions[name] = job && typeof job === 'object' && 'permissions' in job
+    ? job.permissions
+    : null;
+}
+process.stdout.write(JSON.stringify(permissions));
+"""
+READ_ONLY_ACTIONS_PERMISSIONS = {"actions": "read", "contents": "read"}
 
 
 def read_required(relative_path: str, errors: list[str]) -> str:
@@ -240,6 +255,31 @@ def resolve_workflow_steps(
     if not isinstance(steps, list) or not isinstance(pat_outside_env, list):
         return [], [], ["Node yaml workflow resolver returned invalid contract data"]
     return steps, [str(location) for location in pat_outside_env], []
+
+
+def resolve_job_permissions(workflow: str) -> tuple[dict[str, object], list[str]]:
+    """Parses each job's permissions, so a check cannot match a sibling job."""
+    try:
+        result = subprocess.run(
+            ["node", "-e", RESOLVE_JOB_PERMISSIONS_JS],
+            cwd=ROOT,
+            input=workflow,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError as exc:
+        return {}, [f"failed to run Node yaml job permission resolver: {exc}"]
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip()
+        return {}, [f"Node yaml job permission resolver failed: {detail}"]
+    try:
+        permissions = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        return {}, [f"Node yaml job permission resolver returned invalid JSON: {exc}"]
+    if not isinstance(permissions, dict):
+        return {}, ["Node yaml job permission resolver did not return an object"]
+    return permissions, []
 
 
 def shell_variable_reference(variable: str) -> re.Pattern[str]:
@@ -1085,6 +1125,8 @@ def main() -> int:
         "\n  verify-publication-environment:\n", 1
     )[-1].split("\n  publish-assets:\n", 1)[0]
     publish_job = publish.split("\n  publish-assets:\n", 1)[-1]
+    publish_job_permissions, permission_errors = resolve_job_permissions(publish)
+    errors.extend(permission_errors)
 
     require_well_formed_markdown_tables("docs/api.md", api_docs, errors)
     require_publication_pat_contract_self_tests(errors)
@@ -1729,12 +1771,8 @@ def main() -> int:
         and verify_environment_job.count("deployment-branch-policies") == 1
         and "scripts/release_contract.py validate-environment"
         in verify_environment_job
-        and re.search(
-            r"verify-publication-environment:\s+.*?permissions:\s+actions: read\s+contents: read",
-            publish,
-            re.DOTALL,
-        )
-        is not None
+        and publish_job_permissions.get("verify-publication-environment")
+        == READ_ONLY_ACTIONS_PERMISSIONS
         and 'if [ "${GITHUB_REPOSITORY}" != "${BRIDGE_REPO}" ]' in publish
         and 'if [ "${GITHUB_REF}" != "refs/heads/${bridge_default}" ]' in publish
         and 'echo "environment_name=bridge-assets-publication" >> "${GITHUB_OUTPUT}"'
@@ -1829,12 +1867,8 @@ def main() -> int:
     first_pat_reference = publish_job.find("secrets.WEBGPU_BRIDGE_ASSETS_PAT")
     require(
         publish.count("release_contract.py validate-environment") == 2
-        and re.search(
-            r"publish-assets:\s+.*?permissions:\s+actions: read\s+contents: read",
-            publish,
-            re.DOTALL,
-        )
-        is not None
+        and publish_job_permissions.get("publish-assets")
+        == READ_ONLY_ACTIONS_PERMISSIONS
         and post_approval_environment_check >= 0
         and first_pat_reference > post_approval_environment_check
         and "GH_TOKEN: ${{ github.token }}" in publish_job[

@@ -7,7 +7,7 @@ import re
 import sys
 from pathlib import Path
 
-from bridge_js_source import bridge_js_source
+from bridge_js_source import bridge_js_source, method_body
 
 ROOT = Path(__file__).resolve().parents[1]
 CORE = (ROOT / "src" / "llama_webgpu_core.cpp").read_text(encoding="utf-8")
@@ -41,15 +41,6 @@ NATIVE_EXPORTS = (
 def require(condition: bool, message: str, errors: list[str]) -> None:
     if not condition:
         errors.append(message)
-
-
-def method_body(source: str, signature: str) -> str:
-    """Returns a class method from its signature through its closing brace."""
-    start = source.find(f"\n  {signature}")
-    if start < 0:
-        return ""
-    end = source.find("\n  }\n", start)
-    return source[start : end + len("\n  }") if end > 0 else len(source)]
 
 
 def main() -> int:

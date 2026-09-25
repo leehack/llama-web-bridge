@@ -29,3 +29,16 @@ def bridge_js_source(root: Path) -> str:
     return "\n".join(
         path.read_text(encoding="utf-8") for path in (*internal, *ordered, *remaining)
     )
+
+
+def method_body(source: str, signature: str) -> str:
+    """Returns a class method from its signature through its closing brace.
+
+    Scoping an ordered pattern to one method keeps it from matching text in a
+    later method. A missing signature returns "", so the check fails closed.
+    """
+    start = source.find(f"\n  {signature}")
+    if start < 0:
+        return ""
+    end = source.find("\n  }\n", start)
+    return source[start : end + len("\n  }") if end > 0 else len(source)]
