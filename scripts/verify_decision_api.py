@@ -15,7 +15,7 @@ CORE = native_core_source(ROOT)
 DECISION = (ROOT / "src" / "llama_webgpu_decision.cpp").read_text(encoding="utf-8")
 HEADER = (ROOT / "src" / "llama_webgpu_decision.h").read_text(encoding="utf-8")
 JS = bridge_js_source(ROOT)
-BRIDGE_JS = (ROOT / "js" / "src" / "bridge.js").read_text(encoding="utf-8")
+BRIDGE_JS = (ROOT / "js" / "src" / "bridge.ts").read_text(encoding="utf-8")
 DTS = (ROOT / "js" / "src" / "llama_webgpu_bridge.d.ts").read_text(encoding="utf-8")
 CMAKE = (ROOT / "CMakeLists.txt").read_text(encoding="utf-8")
 README = (ROOT / "README.md").read_text(encoding="utf-8")
@@ -182,7 +182,7 @@ def main() -> int:
     require(
         "const char * config_path;" in HEADER
         and "[headPath, label, configPath]" in JS
-        and "core.FS.writeFile(configPath, textEncoder.encode(configJson))" in JS,
+        and re.search(r"core\.FS\.writeFile\(configPath, textEncoder\.encode\(configJson!?\)\)", JS) is not None,
         "configJson must reach the core as a WASMFS file, not a stack-copied ccall string",
         errors,
     )

@@ -8,8 +8,9 @@
   },
   "scripts": {
     "build:js": "node scripts/build_js_bridge.mjs",
-    "check:js": "npm run typecheck:js && npm run build:js && npm run syntax:js && npm run test:decision && npm run test:embedding-json && npm run test:model-reload && npm run test:native-load-arity && npm run test:next-token-scores && npm run test:operation-queue && npm run test:operation-lifecycle && npm run test:tts-recovery && npm run test:type-declarations && npm run test:worker-error-classification && npm run test:worker-state && npm run test:worker-token-coalescing",
+    "check:js": "npm run typecheck:js && npm run test:declared-class-fields && npm run build:js && npm run syntax:js && npm run test:decision && npm run test:embedding-json && npm run test:model-reload && npm run test:native-load-arity && npm run test:next-token-scores && npm run test:operation-queue && npm run test:operation-lifecycle && npm run test:tts-recovery && npm run test:type-declarations && npm run test:worker-error-classification && npm run test:worker-state && npm run test:worker-token-coalescing",
     "syntax:js": "node --check js/llama_webgpu_bridge.js && node --check js/llama_webgpu_bridge_worker.js",
+    "test:declared-class-fields": "node tests/js/declared_class_fields_test.mjs",
     "test:decision": "node tests/js/decision_bridge_contract_test.mjs",
     "test:embedding-json": "node tests/js/embedding_json_contract_test.mjs",
     "test:model-reload": "node tests/js/model_reload_contract_test.mjs",

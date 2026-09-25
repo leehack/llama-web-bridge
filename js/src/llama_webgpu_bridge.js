@@ -1,12 +1,12 @@
 // Public entry point of the WebGPU bridge. Bundled by scripts/build_js_bridge.mjs.
 // Modules under js/src/ are side-effect free; this file owns the load-time effects.
 
-import { LlamaWebGpuBridge } from './bridge.js';
+import { LlamaWebGpuBridge } from './bridge.ts';
 import {
   enableBridgeWorkerHost,
   installBridgeWorkerHost,
   shouldAutoBootBridgeWorkerHost,
-} from './worker_host.js';
+} from './worker_host.ts';
 
 if (shouldAutoBootBridgeWorkerHost()) {
   installBridgeWorkerHost();

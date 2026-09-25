@@ -46,21 +46,28 @@ runs the same generator plus TypeScript and syntax checks, so commit any updated
 `js/src/llama_webgpu_bridge.js` is the public entry. It re-exports the API and
 owns the only load-time side effects (worker host auto-boot and the
 `window.LlamaWebGpuBridge` global); every other module is side-effect free.
-`bridge.js` is the facade, `runtime.js` the direct runtime, `worker_proxy.js`,
-`worker_host.js`, and `worker_protocol.ts` the worker path, and `internal/`
-holds shared helpers.
+`bridge.ts` is the facade, `runtime.ts` the direct runtime, `worker_proxy.ts`,
+`worker_host.ts`, and `worker_protocol.ts` the worker path, and `internal/`
+holds shared helpers, with internal-only types in `internal/types.ts`.
 
-Modules are moving from JavaScript to TypeScript one at a time. A `.ts` module
-is type-checked with `strict` (`tsconfig.strict.json`); `.js` modules keep the
-lenient `checkJs` pass (`tsconfig.bridge.json`), and `npm run typecheck:js`
-runs both. TypeScript here is limited to erasable syntax (`erasableSyntaxOnly`):
-types, `import type`, and casts only, no enums, namespaces, or parameter
-properties. esbuild and Node both strip it without changing the code, so the
-tests run the `.ts` sources directly. A conversion must not change behaviour:
-with comments and whitespace stripped, the bundle stays byte-identical. Import
-converted modules by their `.ts` path.
+Every module except the two entries (`llama_webgpu_bridge.js` and
+`llama_webgpu_bridge_worker.js`, which is copied unbundled) is TypeScript,
+type-checked with `strict` (`tsconfig.strict.json`). The entries keep the
+lenient `checkJs` pass (`tsconfig.bridge.json`), and `npm run typecheck:js` runs
+both. `LlamaWebGpuBridge` implements the published `llama_webgpu_bridge.d.ts`
+class, and `public_api_check.ts` (types only, never bundled) compares every
+public method with strict parameter variance, so the compiler rejects an
+implementation that accepts less or returns more than the declared API.
+TypeScript here is limited to erasable syntax (`erasableSyntaxOnly`): types,
+`import type`, `declare` fields, and casts only, no enums, namespaces, or
+parameter properties. A class field without an initializer is `declare`d,
+because a plain field declaration emits code;
+`tests/js/declared_class_fields_test.mjs` enforces that. esbuild and Node both
+strip the types without changing the code, so the tests run the `.ts` sources
+directly. A type change must not change behaviour: with comments and whitespace
+stripped, the bundle stays byte-identical. Import modules by their `.ts` path.
 
-Keep `bridge.js` beside `llama_webgpu_bridge_worker.js`: it resolves the worker
+Keep `bridge.ts` beside `llama_webgpu_bridge_worker.js`: it resolves the worker
 entry relative to `import.meta.url`.
 
 The native core is one translation unit. `src/llama_webgpu_core.cpp` holds the

@@ -1,13 +1,22 @@
 // Main-thread proxy that forwards bridge calls to a dedicated worker.
 
 import { DECISION_WORKER_TIMEOUT_PER_SEQUENCE_MS } from './internal/decision.ts';
+import type { LlamaWebGpuBridgeConfig } from './llama_webgpu_bridge.d.ts';
 import { bridgeWorkerModeParam } from './worker_protocol.ts';
+import type { WorkerEventHandler, WorkerResponse } from './worker_protocol.ts';
 
-function createBridgeWorkerSource(moduleUrl) {
+// A request waiting for the worker's result.
+interface PendingRequest {
+  resolve: (message: WorkerResponse) => void;
+  reject: (error: unknown) => void;
+  onEvent: WorkerEventHandler;
+}
+
+function createBridgeWorkerSource(moduleUrl: string): string {
   return `import * as workerModule from ${JSON.stringify(moduleUrl)};\nif (workerModule && typeof workerModule.enableBridgeWorkerHost === 'function') { workerModule.enableBridgeWorkerHost(); }\n`;
 }
 
-function resolveWorkerEntryUrl(moduleUrl) {
+function resolveWorkerEntryUrl(moduleUrl: unknown): string | null {
   if (typeof moduleUrl !== 'string' || moduleUrl.length === 0) {
     return null;
   }
@@ -28,7 +37,7 @@ function resolveWorkerEntryUrl(moduleUrl) {
   }
 }
 
-function deriveBridgeModuleUrlFromWorkerEntry(moduleUrl) {
+function deriveBridgeModuleUrlFromWorkerEntry(moduleUrl: unknown): string | null {
   if (typeof moduleUrl !== 'string' || moduleUrl.length === 0) {
     return null;
   }
@@ -52,13 +61,23 @@ function deriveBridgeModuleUrlFromWorkerEntry(moduleUrl) {
 }
 
 export class BridgeWorkerProxy {
-  constructor({ moduleUrl, config }) {
+  declare _config: LlamaWebGpuBridgeConfig;
+  declare _nextId: number;
+  declare _pending: Map<number, PendingRequest>;
+  declare _workerBlobUrl: string | null;
+  declare _worker: Worker;
+  declare _ready: Promise<void>;
+  declare _readyResolve: () => void;
+  declare _readyReject: (reason?: unknown) => void;
+  declare _readyTimeoutHandle: ReturnType<typeof setTimeout> | null;
+
+  constructor({ moduleUrl, config }: { moduleUrl: string; config: LlamaWebGpuBridgeConfig }) {
     this._config = config && typeof config === 'object' ? config : {};
     this._nextId = 1;
     this._pending = new Map();
     this._workerBlobUrl = null;
 
-    let workerInitError = null;
+    let workerInitError: unknown = null;
     const moduleCandidates = [moduleUrl];
     const bridgeModuleFallback = deriveBridgeModuleUrlFromWorkerEntry(moduleUrl);
     if (bridgeModuleFallback && bridgeModuleFallback !== moduleUrl) {
@@ -112,8 +131,8 @@ export class BridgeWorkerProxy {
     this._readyTimeoutHandle = null;
     this._armReadyTimeout();
 
-    this._worker.onmessage = (event) => {
-      const message = event.data || {};
+    this._worker.onmessage = (event: MessageEvent) => {
+      const message: WorkerResponse = event.data || {};
       const type = message.type;
       if (type === 'ready') {
         this._clearReadyTimeout();
@@ -134,8 +153,8 @@ export class BridgeWorkerProxy {
 
       this._pending.delete(id);
       if (type === 'error') {
-        const workerError = /** @type {Error & { state?: unknown }} */ (
-          new Error(String(message.message || 'Worker request failed'))
+        const workerError: Error & { state?: unknown } = new Error(
+          String(message.message || 'Worker request failed'),
         );
         if (message.state && typeof message.state === 'object') {
           workerError.state = message.state;
@@ -151,9 +170,7 @@ export class BridgeWorkerProxy {
       const message = event?.message || 'Bridge worker crashed';
       // The uncaught error's text is arbitrary, so the flag is what marks the
       // worker itself as gone.
-      const error = /** @type {Error & { llamadartWorkerCrash?: boolean }} */ (
-        new Error(String(message))
-      );
+      const error: Error & { llamadartWorkerCrash?: boolean } = new Error(String(message));
       error.llamadartWorkerCrash = true;
 
       this._clearReadyTimeout();
@@ -168,7 +185,13 @@ export class BridgeWorkerProxy {
     this._worker.postMessage({ type: 'init', config });
   }
 
-  async call(method, args, onEvent, transferList = [], operationMeta = null) {
+  async call(
+    method: string,
+    args: unknown[],
+    onEvent?: WorkerEventHandler | null,
+    transferList: Transferable[] = [],
+    operationMeta: Record<string, unknown> | null = null,
+  ): Promise<WorkerResponse> {
     await this._ready;
     const id = this._nextId++;
     const timeoutMs = this._resolveRequestTimeoutMs(method, args);
@@ -177,7 +200,7 @@ export class BridgeWorkerProxy {
       : [];
 
     return new Promise((resolve, reject) => {
-      let timeoutHandle = null;
+      let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
       const clearTimer = () => {
         if (timeoutHandle != null) {
           globalThis.clearTimeout(timeoutHandle);
@@ -199,15 +222,15 @@ export class BridgeWorkerProxy {
 
       armTimer();
       this._pending.set(id, {
-        resolve: (value) => {
+        resolve: (value: WorkerResponse) => {
           clearTimer();
           resolve(value);
         },
-        reject: (error) => {
+        reject: (error: unknown) => {
           clearTimer();
           reject(error);
         },
-        onEvent: (event) => {
+        onEvent: (event: WorkerResponse) => {
           armTimer();
           onEvent?.(event);
         },
@@ -251,9 +274,9 @@ export class BridgeWorkerProxy {
     }, timeoutMs);
   }
 
-  _resolveRequestTimeoutMs(method, args = []) {
+  _resolveRequestTimeoutMs(method: string, args: unknown[] = []): number {
     const explicitGlobal = Number(this._config.workerRequestTimeoutMs);
-    const clamp = (value, fallback) => {
+    const clamp = (value: number, fallback: number): number => {
       if (!Number.isFinite(value) || value <= 0) {
         return fallback;
       }

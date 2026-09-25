@@ -15,7 +15,7 @@ CORE = native_core_source(ROOT)
 TTS = (ROOT / "src" / "llama_webgpu_tts.cpp").read_text(encoding="utf-8")
 HEADER = (ROOT / "src" / "llama_webgpu_tts.h").read_text(encoding="utf-8")
 JS = bridge_js_source(ROOT)
-RUNTIME_JS = (ROOT / "js" / "src" / "runtime.js").read_text(encoding="utf-8")
+RUNTIME_JS = (ROOT / "js" / "src" / "runtime.ts").read_text(encoding="utf-8")
 DTS = (ROOT / "js" / "src" / "llama_webgpu_bridge.d.ts").read_text(encoding="utf-8")
 CMAKE = (ROOT / "CMakeLists.txt").read_text(encoding="utf-8")
 README = (ROOT / "README.md").read_text(encoding="utf-8")
@@ -206,7 +206,7 @@ def main() -> int:
     )
     require(
         re.search(
-            r"async synthesizeSpeech\(options = \{\}\).*?"
+            r"async synthesizeSpeech\(options(?::[^=]*)? = \{\}\).*?"
             r"if \(this\._textToSpeechActive\).*?"
             r"this\._ensureTextToSpeechDir\(\)",
             JS,

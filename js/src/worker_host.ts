@@ -1,6 +1,6 @@
 // Worker-side message host that runs a bridge inside a dedicated worker.
 
-import { LlamaWebGpuBridge } from './bridge.js';
+import { LlamaWebGpuBridge } from './bridge.ts';
 import { toUint8Array } from './internal/typed_values.ts';
 import {
   bridgeWorkerModeParam,
@@ -8,6 +8,14 @@ import {
   serializeWorkerError,
   snapshotBridgeState,
 } from './worker_protocol.ts';
+import type { WorkerRequest } from './worker_protocol.ts';
+import type {
+  CompletionOptions,
+  DecisionHeadOptions,
+  DecisionSequence,
+  LoadModelOptions,
+  TextToSpeechOptions,
+} from './llama_webgpu_bridge.d.ts';
 
 const textDecoder = new TextDecoder();
 
@@ -23,9 +31,9 @@ export function installBridgeWorkerHost() {
   }
 
   bridgeWorkerHostInstalled = true;
-  let bridge = null;
+  let bridge: LlamaWebGpuBridge | null = null;
 
-  const postError = (id, error) => {
+  const postError = (id: unknown, error: unknown) => {
     let state;
     try {
       state = bridge ? snapshotBridgeState(bridge) : undefined;
@@ -41,8 +49,8 @@ export function installBridgeWorkerHost() {
     });
   };
 
-  self.onmessage = async (event) => {
-    const message = event.data || {};
+  self.onmessage = async (event: MessageEvent) => {
+    const message: WorkerRequest = event.data || {};
     const type = message.type;
     const id = message.id ?? 0;
 
@@ -65,12 +73,12 @@ export function installBridgeWorkerHost() {
       }
 
       const method = String(message.method || '');
-      const args = Array.isArray(message.args) ? message.args : [];
+      const args: unknown[] = Array.isArray(message.args) ? message.args : [];
 
       if (method === 'loadModelFromUrl') {
-        const url = args[0];
-        const options = (args[1] && typeof args[1] === 'object') ? { ...args[1] } : {};
-        options.progressCallback = (progress) => {
+        const url = args[0] as string | string[];
+        const options: LoadModelOptions = (args[1] && typeof args[1] === 'object') ? { ...args[1] } : {};
+        options.progressCallback = (progress: unknown) => {
           self.postMessage({ type: 'event', id, event: 'progress', payload: progress || {} });
         };
 
@@ -80,8 +88,8 @@ export function installBridgeWorkerHost() {
       }
 
       if (method === 'createCompletion') {
-        const prompt = args[0];
-        const options = (args[1] && typeof args[1] === 'object') ? { ...args[1] } : {};
+        const prompt = args[0] as string;
+        const options: CompletionOptions = (args[1] && typeof args[1] === 'object') ? { ...args[1] } : {};
         delete options.signal;
         const tokenEventEncoding = typeof options.tokenEventEncoding === 'string'
           ? String(options.tokenEventEncoding || '').toLowerCase()
@@ -97,15 +105,14 @@ export function installBridgeWorkerHost() {
         const shouldEmitCurrentText = options.emitCurrentTextOnToken === true;
 
         let pendingPieceText = '';
-        /** @type {Uint8Array[]} */
-        let pendingPieceBytes = [];
+        let pendingPieceBytes: Uint8Array[] = [];
         let pendingPieceByteLength = 0;
         let pendingPieceCharLength = 0;
         let pendingPieceCharDecoder = tokenEventFlushChars > 0
           ? new TextDecoder()
           : null;
         let pendingCurrentText = '';
-        let flushTimer = null;
+        let flushTimer: ReturnType<typeof setTimeout> | null = null;
 
         const flushTokenTextPayload = () => {
           if (pendingPieceText.length === 0) {
@@ -171,7 +178,7 @@ export function installBridgeWorkerHost() {
           }, tokenEventFlushMs);
         };
 
-        options.onToken = (piece, currentText) => {
+        options.onToken = (piece: unknown, currentText: unknown) => {
           if (tokenEventEncoding === 'text') {
             const pieceText = typeof piece === 'string'
               ? piece
@@ -275,15 +282,15 @@ export function installBridgeWorkerHost() {
       }
 
       if (method === 'loadMultimodalProjector') {
-        const value = await bridge.loadMultimodalProjector(args[0]);
+        const value = await bridge.loadMultimodalProjector(args[0] as string);
         self.postMessage({ type: 'result', id, value, state: snapshotBridgeState(bridge) });
         return;
       }
 
       if (method === 'synthesizeSpeech') {
-        const options = (args[0] && typeof args[0] === 'object') ? { ...args[0] } : {};
+        const options: Partial<TextToSpeechOptions> = (args[0] && typeof args[0] === 'object') ? { ...args[0] } : {};
         delete options.signal;
-        options.onProgress = (progress) => {
+        options.onProgress = (progress: unknown) => {
           self.postMessage({ type: 'event', id, event: 'progress', payload: progress || {} });
         };
         const value = await bridge.synthesizeSpeech(options);
@@ -298,18 +305,18 @@ export function installBridgeWorkerHost() {
       }
 
       if (method === 'loadDecisionHead') {
-        const options = (args[1] && typeof args[1] === 'object') ? { ...args[1] } : {};
-        options.onProgress = (progress) => {
+        const options: DecisionHeadOptions = (args[1] && typeof args[1] === 'object') ? { ...args[1] } : {};
+        options.onProgress = (progress: unknown) => {
           self.postMessage({ type: 'event', id, event: 'progress', payload: progress || {} });
         };
-        const value = await bridge.loadDecisionHead(args[0], options);
+        const value = await bridge.loadDecisionHead(args[0] as string | ArrayBuffer | ArrayBufferView, options);
         self.postMessage({ type: 'result', id, value });
         return;
       }
 
       if (method === 'runDecision') {
-        const value = await bridge.runDecision(args[0], args[1]);
-        const transfers = [];
+        const value = await bridge.runDecision(args[0] as number, args[1] as DecisionSequence[]);
+        const transfers: ArrayBuffer[] = [];
         for (const output of Array.isArray(value) ? value : []) {
           for (const values of [output?.logits, output?.actLogits]) {
             const buffer = values?.buffer;
@@ -329,7 +336,7 @@ export function installBridgeWorkerHost() {
       }
 
       if (method === 'stateSaveBytes') {
-        const value = await bridge.stateSaveBytes(args[0]);
+        const value = await bridge.stateSaveBytes(args[0] as number[] | undefined);
         const transfers = value && value.buffer instanceof ArrayBuffer
           ? [value.buffer]
           : [];
@@ -338,7 +345,7 @@ export function installBridgeWorkerHost() {
       }
 
       if (method === 'stateLoadBytes') {
-        const value = await bridge.stateLoadBytes(args[0], args[1]);
+        const value = await bridge.stateLoadBytes(args[0] as Uint8Array, args[1] as number | undefined);
         self.postMessage({ type: 'result', id, value });
         return;
       }
@@ -354,7 +361,10 @@ export function installBridgeWorkerHost() {
         return;
       }
 
-      const value = await bridge[method](...(args || []));
+      // Any other bridge method, called by name with the caller's arguments.
+      const value = await (bridge as unknown as Record<string, (...callArgs: unknown[]) => unknown>)[method](
+        ...(args || []),
+      );
       self.postMessage({ type: 'result', id, value });
     } catch (error) {
       postError(id, error);

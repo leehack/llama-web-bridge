@@ -13,10 +13,10 @@ from pathlib import Path
 
 _ORDERED_MODULES = (
     "worker_protocol.ts",
-    "worker_host.js",
-    "worker_proxy.js",
-    "runtime.js",
-    "bridge.js",
+    "worker_host.ts",
+    "worker_proxy.ts",
+    "runtime.ts",
+    "bridge.ts",
     "llama_webgpu_bridge.js",
 )
 

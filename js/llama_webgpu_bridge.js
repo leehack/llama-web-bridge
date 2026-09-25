@@ -813,7 +813,7 @@ function trimUnstableUtf8Tail(text) {
   return end === text.length ? text : text.slice(0, end);
 }
 
-// js/src/runtime.js
+// js/src/runtime.ts
 var textEncoder = new TextEncoder();
 var LlamaWebGpuBridgeRuntime = class {
   constructor(config = {}) {
@@ -1475,7 +1475,9 @@ var LlamaWebGpuBridgeRuntime = class {
         } catch (_) {
         }
         try {
-          const fetchError = String(globalThis.__llamadartFetchBackendLastError || "").trim();
+          const fetchError = String(
+            globalThis.__llamadartFetchBackendLastError || ""
+          ).trim();
           if (fetchError.length > 0) {
             const token = fetchError.slice(0, 120).replace(/[\s;=]+/g, "_").replace(/[^a-zA-Z0-9._:-]/g, "");
             if (token.length > 0) {
@@ -2337,7 +2339,9 @@ var LlamaWebGpuBridgeRuntime = class {
               break;
             } catch (error) {
               const text = String(error || "").toLowerCase();
-              const loadedBytes = Number(error?.llamadartLoadedBytes);
+              const loadedBytes = Number(
+                error?.llamadartLoadedBytes
+              );
               if (Number.isFinite(loadedBytes) && loadedBytes >= 0) {
                 const normalizedLoaded = Math.trunc(loadedBytes);
                 this._runtimeNotes.push(`model_fs_write_loaded:${normalizedLoaded}`);
@@ -2982,10 +2986,6 @@ var LlamaWebGpuBridgeRuntime = class {
       }
     }
   }
-  /**
-   * @param {string | ArrayBuffer | ArrayBufferView} source
-   * @param {{ configJson?: string | null, onProgress?: (progress: { loaded: number, total: number }) => void }} [options]
-   */
   async loadDecisionHead(source, options = {}) {
     if (!this._core || this._modelBytes <= 0) {
       throw new Error("No model loaded. Call loadModelFromUrl first.");
@@ -3054,10 +3054,6 @@ var LlamaWebGpuBridgeRuntime = class {
       this._unlinkDecisionFile(configPath);
     }
   }
-  /**
-   * @param {number} handle
-   * @param {unknown} sequences
-   */
   async runDecision(handle, sequences) {
     const nativeHandle = decisionHandleFrom(handle);
     const input = encodeDecisionSequences(sequences);
@@ -3089,7 +3085,6 @@ var LlamaWebGpuBridgeRuntime = class {
       this._unlinkDecisionFile(outputPath);
     }
   }
-  /** @param {number} handle */
   async freeDecisionHead(handle) {
     const nativeHandle = decisionHandleFrom(handle);
     if (!this._core) {
@@ -3832,7 +3827,7 @@ function snapshotBridgeState(target) {
   };
 }
 
-// js/src/worker_proxy.js
+// js/src/worker_proxy.ts
 function createBridgeWorkerSource(moduleUrl) {
   return `import * as workerModule from ${JSON.stringify(moduleUrl)};
 if (workerModule && typeof workerModule.enableBridgeWorkerHost === 'function') { workerModule.enableBridgeWorkerHost(); }
@@ -3943,9 +3938,8 @@ var BridgeWorkerProxy = class {
       }
       this._pending.delete(id);
       if (type === "error") {
-        const workerError = (
-          /** @type {Error & { state?: unknown }} */
-          new Error(String(message.message || "Worker request failed"))
+        const workerError = new Error(
+          String(message.message || "Worker request failed")
         );
         if (message.state && typeof message.state === "object") {
           workerError.state = message.state;
@@ -3957,10 +3951,7 @@ var BridgeWorkerProxy = class {
     };
     this._worker.onerror = (event) => {
       const message = event?.message || "Bridge worker crashed";
-      const error = (
-        /** @type {Error & { llamadartWorkerCrash?: boolean }} */
-        new Error(String(message))
-      );
+      const error = new Error(String(message));
       error.llamadartWorkerCrash = true;
       this._clearReadyTimeout();
       this._readyReject?.(error);
@@ -4100,7 +4091,7 @@ var BridgeWorkerProxy = class {
   }
 };
 
-// js/src/bridge.js
+// js/src/bridge.ts
 var LlamaWebGpuBridge = class {
   static supportsSafariAdaptiveGpu = LlamaWebGpuBridgeRuntime.supportsSafariAdaptiveGpu === true;
   constructor(config = {}) {
@@ -4337,11 +4328,6 @@ var LlamaWebGpuBridge = class {
    * operation has started, its signal is routed to `_cancelOperation` so the
    * cancel reaches the worker generation and runtime that operation captured
    * rather than whatever topology happens to be current.
-   *
-   * @template T
-   * @param {(operation: any) => Promise<T>} run
-   * @param {{ signal?: AbortSignal|null, abortMessage?: string, allowDisposed?: boolean, kind?: string }} [options]
-   * @returns {Promise<T>}
    */
   _runExclusive(run, options = {}) {
     const signal = options.signal || null;
@@ -4490,9 +4476,6 @@ var LlamaWebGpuBridge = class {
    * Registers a disposal listener for the lifetime of one pending operation and
    * returns its remover. A listener set is used rather than a long-lived promise
    * because a promise reaction cannot be detached.
-   *
-   * @param {() => void} onDisposed
-   * @returns {() => void}
    */
   _addDisposalWaiter(onDisposed) {
     const waiters = this._disposalWaiters;
@@ -5247,10 +5230,6 @@ var LlamaWebGpuBridge = class {
     }
     this._applyShadowState(state);
   }
-  /**
-   * @param {string|string[]} url
-   * @param {Record<string, any>} [options]
-   */
   async loadModelFromUrl(url, options = {}) {
     return this._runExclusive(
       () => this._loadModelFromUrlUnlocked(url, options),
@@ -5261,10 +5240,6 @@ var LlamaWebGpuBridge = class {
       }
     );
   }
-  /**
-   * @param {string|string[]} url
-   * @param {Record<string, any>} [options]
-   */
   async _loadModelFromUrlUnlocked(url, options = {}) {
     const attempt = { proxy: null, state: null, loaded: false };
     try {
@@ -5275,10 +5250,8 @@ var LlamaWebGpuBridge = class {
     }
   }
   /**
-   * @param {string|string[]} url
-   * @param {Record<string, any>} options
-   * @param {{ proxy: any, state: any, loaded: boolean }} attempt Records the
-   *   last worker load's proxy and reply for `_syncLoadedModelAfterFailedLoad`.
+   * @param attempt Records the last worker load's proxy and reply for
+   *   `_syncLoadedModelAfterFailedLoad`.
    */
   async _loadModelFromUrlOnTarget(url, options, attempt) {
     if (!this._workerProxy) {
@@ -5378,10 +5351,6 @@ var LlamaWebGpuBridge = class {
       this._refreshCacheMetadataSnapshot();
     }
   }
-  /**
-   * @param {string} prompt
-   * @param {Record<string, any>} [options]
-   */
   async createCompletion(prompt, options = {}) {
     return this._runExclusive(
       () => this._createCompletionUnlocked(prompt, options),
@@ -5392,10 +5361,6 @@ var LlamaWebGpuBridge = class {
       }
     );
   }
-  /**
-   * @param {string} prompt
-   * @param {Record<string, any>} [options]
-   */
   async _createCompletionUnlocked(prompt, options = {}) {
     const isWarmup = options?.warmup === true;
     const hasRetriedEmptyMultimodal = options?.__llamadartEmptyRetryAttempted === true;
@@ -5458,9 +5423,8 @@ var LlamaWebGpuBridge = class {
           return;
         }
         timeoutHandle = globalThis.setTimeout(() => {
-          const timeoutError = (
-            /** @type {Error & { llamadartWorkerTimeout?: boolean }} */
-            new Error(`Bridge worker completion stalled for ${stallTimeoutMs}ms.`)
+          const timeoutError = new Error(
+            `Bridge worker completion stalled for ${stallTimeoutMs}ms.`
           );
           timeoutError.llamadartWorkerTimeout = true;
           this._cancelOperation(this._activeOperation, "worker-timeout");
@@ -5672,7 +5636,6 @@ var LlamaWebGpuBridge = class {
       return this._runtime.getTextToSpeechCapabilities();
     }
   }
-  /** @param {Partial<import('./llama_webgpu_bridge.d.ts').TextToSpeechOptions>} [options] */
   async synthesizeSpeech(options = {}) {
     return this._runExclusive(
       () => this._synthesizeSpeechUnlocked(options),
@@ -5683,7 +5646,6 @@ var LlamaWebGpuBridge = class {
       }
     );
   }
-  /** @param {Partial<import('./llama_webgpu_bridge.d.ts').TextToSpeechOptions>} [options] */
   async _synthesizeSpeechUnlocked(options = {}) {
     if (options.signal?.aborted) {
       throw new DOMException("Text-to-speech synthesis was cancelled.", "AbortError");
@@ -5743,7 +5705,6 @@ var LlamaWebGpuBridge = class {
       throw error;
     }
   }
-  /** @returns {Map<number, { owner: object, handle: number }>} */
   _decisionHeadMap() {
     if (!(this._decisionHeads instanceof Map)) {
       this._decisionHeads = /* @__PURE__ */ new Map();
@@ -5765,7 +5726,6 @@ var LlamaWebGpuBridge = class {
       `Decision head ${handle} is not loaded; it was freed, its model was unloaded, or the bridge runtime restarted. Load the decision head again.`
     );
   }
-  /** @param {number} handle */
   _resolveDecisionHead(handle) {
     decisionHandleFrom(handle);
     const heads = this._decisionHeadMap();
@@ -5815,20 +5775,12 @@ var LlamaWebGpuBridge = class {
       return this._requireDecisionRuntime().getDecisionCapabilities();
     }
   }
-  /**
-   * @param {string | ArrayBuffer | ArrayBufferView} source
-   * @param {{ configJson?: string | null, onProgress?: (progress: { loaded: number, total: number }) => void }} [options]
-   */
   async loadDecisionHead(source, options = {}) {
     return this._runExclusive(
       () => this._loadDecisionHeadUnlocked(source, options),
       { kind: "decision-head-load" }
     );
   }
-  /**
-   * @param {string | ArrayBuffer | ArrayBufferView} source
-   * @param {{ configJson?: string | null, onProgress?: (progress: { loaded: number, total: number }) => void }} [options]
-   */
   async _loadDecisionHeadUnlocked(source, options = {}) {
     const loadInRuntime = async () => {
       const runtime = this._requireDecisionRuntime();
@@ -5876,20 +5828,12 @@ var LlamaWebGpuBridge = class {
       return loadInRuntime();
     }
   }
-  /**
-   * @param {number} handle
-   * @param {readonly import('./llama_webgpu_bridge.d.ts').DecisionSequence[]} sequences
-   */
   async runDecision(handle, sequences) {
     return this._runExclusive(
       () => this._runDecisionUnlocked(handle, sequences),
       { kind: "decision-run" }
     );
   }
-  /**
-   * @param {number} handle
-   * @param {readonly import('./llama_webgpu_bridge.d.ts').DecisionSequence[]} sequences
-   */
   async _runDecisionUnlocked(handle, sequences) {
     const entry = this._resolveDecisionHead(handle);
     if (!entry) {
@@ -5913,14 +5857,12 @@ var LlamaWebGpuBridge = class {
       );
     }
   }
-  /** @param {number} handle */
   async freeDecisionHead(handle) {
     return this._runExclusive(
       () => this._freeDecisionHeadUnlocked(handle),
       { kind: "decision-head-free" }
     );
   }
-  /** @param {number} handle */
   async _freeDecisionHeadUnlocked(handle) {
     const entry = this._resolveDecisionHead(handle);
     if (!entry) {
@@ -6206,8 +6148,6 @@ var LlamaWebGpuBridge = class {
    * Work queued before disposal is rejected with a stable lifecycle error rather
    * than dereferencing a torn-down runtime. Not `async`, so repeated calls hand
    * back the identical teardown promise.
-   *
-   * @returns {Promise<void>}
    */
   dispose() {
     if (this._disposed) {
@@ -6289,7 +6229,7 @@ var LlamaWebGpuBridge = class {
   }
 };
 
-// js/src/worker_host.js
+// js/src/worker_host.ts
 var textDecoder = new TextDecoder();
 var bridgeWorkerHostInstalled = false;
 function installBridgeWorkerHost() {
@@ -6572,7 +6512,9 @@ function installBridgeWorkerHost() {
         });
         return;
       }
-      const value = await bridge[method](...args || []);
+      const value = await bridge[method](
+        ...args || []
+      );
       self.postMessage({ type: "result", id, value });
     } catch (error) {
       postError(id, error);

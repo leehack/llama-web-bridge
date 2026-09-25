@@ -15,7 +15,8 @@ class ScopeTests(unittest.TestCase):
     def test_allowlist_and_unknown_inputs(self):
         for path in ('README.md', 'docs/guide.md', 'scripts/release_publication_state.py', 'scripts/bridge_js_source.py', 'scripts/native_core_source.py',
                      'tests/js/native_core_source.mjs',
-                     'scripts/stable_release_orchestrator_test.py', 'tests/js/worker_runtime_state_test.mjs'):
+                     'scripts/stable_release_orchestrator_test.py', 'tests/js/worker_runtime_state_test.mjs',
+                     'tests/js/declared_class_fields_test.mjs'):
             self.assertFalse(native_required([path]), path)
         for path in ('src/core.cpp', 'src/core/exports_tts.inc', 'src/core/new_part.inc', 'js/llama_webgpu_bridge.ts', 'package-lock.json',
                      'scripts/build_bridge.sh', 'scripts/state_persistence_browser_smoke.py',

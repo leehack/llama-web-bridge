@@ -1404,6 +1404,26 @@ def main() -> int:
         "npm run typecheck:js must type-check every js/src TypeScript module with strict",
         errors,
     )
+    public_api_check = read_required("js/src/public_api_check.ts", errors)
+    require(
+        "type ImplementationMatchesPublicApi = Assert<" in public_api_check
+        and "LlamaWebGpuBridge extends StrictMethods<PublicLlamaWebGpuBridge> ? true : false"
+        in public_api_check
+        and "export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {" in js_source,
+        "LlamaWebGpuBridge must implement the published declaration and "
+        "js/src/public_api_check.ts must compare its methods with strict variance",
+        errors,
+    )
+    require(
+        package_scripts.get("test:declared-class-fields")
+        == "node tests/js/declared_class_fields_test.mjs"
+        and "npm run test:declared-class-fields && "
+        in str(package_scripts.get("check:js", "")),
+        "npm run check:js must run the declared-class-field test: a TypeScript "
+        "class field without an initializer must be `declare`d, because a plain "
+        "field declaration emits code",
+        errors,
+    )
     require(
         not any(
             path
@@ -1453,7 +1473,7 @@ def main() -> int:
     )
     require(
         "export { LlamaWebGpuBridge, enableBridgeWorkerHost };" in js_entry
-        and "export class LlamaWebGpuBridge {" in js_source
+        and "export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {" in js_source
         and "export function enableBridgeWorkerHost" in js_source,
         "js/src/llama_webgpu_bridge.js must remain the source of the public bridge exports",
         errors,

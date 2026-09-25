@@ -9,8 +9,8 @@ import { readNativeCoreSource } from './native_core_source.mjs';
 const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const coreSource = readNativeCoreSource();
 const bridgeSources = {
-  'js/src/runtime.js': readFileSync(
-    path.join(rootDir, 'js/src/runtime.js'),
+  'js/src/runtime.ts': readFileSync(
+    path.join(rootDir, 'js/src/runtime.ts'),
     'utf8',
   ),
   'js/llama_webgpu_bridge.js': readFileSync(

@@ -18,7 +18,7 @@ TOOLING = frozenset({
     'scripts/verify_ci_reliability.py', 'scripts/verify_ci_reliability_pin_test.py',
     'scripts/mtmd_compat_contract_test.py',
     'scripts/wasm64_runtime_patch_contract_test.py',
-    'tests/js/embedding_json_contract_test.mjs', 'tests/js/native_load_option_arity_test.mjs',
+    'tests/js/embedding_json_contract_test.mjs', 'tests/js/declared_class_fields_test.mjs', 'tests/js/native_load_option_arity_test.mjs',
     'tests/js/model_reload_contract_test.mjs',
     'tests/js/bridge_operation_queue_test.mjs',
     'tests/js/bridge_operation_lifecycle_test.mjs', 'tests/js/text_to_speech_recovery_test.mjs',

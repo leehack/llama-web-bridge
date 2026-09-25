@@ -1,6 +1,6 @@
 // State and error shapes shared by the worker host and the bridge facade.
 
-import type { LlamaWebGpuBridge, ModelMetadata } from './llama_webgpu_bridge.d.ts';
+import type { LlamaWebGpuBridge, LlamaWebGpuBridgeConfig, ModelMetadata } from './llama_webgpu_bridge.d.ts';
 
 // Model state a worker reports so the facade can answer synchronous getters.
 export interface BridgeStateSnapshot {
@@ -10,6 +10,38 @@ export interface BridgeStateSnapshot {
   backendName: string;
   supportsVision: boolean;
   supportsAudio: boolean;
+}
+
+// A message from the worker host: a result, an error, or a progress/token event.
+export interface WorkerResponse {
+  type: string;
+  id?: number;
+  value?: unknown;
+  state?: BridgeStateSnapshot;
+  message?: string;
+  event?: string;
+  payload?: unknown;
+}
+
+export type WorkerEventHandler = (message: WorkerResponse) => void;
+
+// A message to the worker host: `init` with the bridge config, or a `call`
+// of a bridge method by name. Its fields come from another thread, so the
+// host validates them rather than trusting these types.
+export interface WorkerRequest {
+  type?: string;
+  id?: number;
+  config?: LlamaWebGpuBridgeConfig;
+  method?: unknown;
+  args?: unknown;
+}
+
+// A failed worker request: the worker's state at the failure, or a flag that
+// marks the worker itself as crashed or stalled.
+export interface WorkerRequestError extends Error {
+  state?: BridgeStateSnapshot;
+  llamadartWorkerCrash?: boolean;
+  llamadartWorkerTimeout?: boolean;
 }
 
 type BridgeStateSource = Pick<
