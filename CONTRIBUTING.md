@@ -10,7 +10,9 @@ Published artifacts are consumed from `llama-web-bridge-assets`.
 ## Prerequisites
 
 - Emscripten SDK (`emcmake`, `emcc`) matching `emsdk.version`
-- Node.js/npm for JS bridge bundling and TypeScript `checkJs`
+- Node.js 22.18 or newer (CI uses 24) and npm, for JS bridge bundling and
+  type-checking; the tests run the `.ts` sources through Node's built-in type
+  stripping
 - CMake toolchain
 - Access to a llama.cpp checkout matching `llama_cpp.version`
 
@@ -45,9 +47,21 @@ runs the same generator plus TypeScript and syntax checks, so commit any updated
 owns the only load-time side effects (worker host auto-boot and the
 `window.LlamaWebGpuBridge` global); every other module is side-effect free.
 `bridge.js` is the facade, `runtime.js` the direct runtime, `worker_proxy.js`,
-`worker_host.js`, and `worker_protocol.js` the worker path, and `internal/`
-holds shared helpers. Keep `bridge.js` beside `llama_webgpu_bridge_worker.js`:
-it resolves the worker entry relative to `import.meta.url`.
+`worker_host.js`, and `worker_protocol.ts` the worker path, and `internal/`
+holds shared helpers.
+
+Modules are moving from JavaScript to TypeScript one at a time. A `.ts` module
+is type-checked with `strict` (`tsconfig.strict.json`); `.js` modules keep the
+lenient `checkJs` pass (`tsconfig.bridge.json`), and `npm run typecheck:js`
+runs both. TypeScript here is limited to erasable syntax (`erasableSyntaxOnly`):
+types, `import type`, and casts only, no enums, namespaces, or parameter
+properties. esbuild and Node both strip it without changing the code, so the
+tests run the `.ts` sources directly. A conversion must not change behaviour:
+with comments and whitespace stripped, the bundle stays byte-identical. Import
+converted modules by their `.ts` path.
+
+Keep `bridge.js` beside `llama_webgpu_bridge_worker.js`: it resolves the worker
+entry relative to `import.meta.url`.
 
 For local agent/maintainer validation, prefer external build and cache paths so
 generated files do not dirty the checkout:

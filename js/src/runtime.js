@@ -1,19 +1,19 @@
 // Direct (same-thread) runtime that drives the Emscripten core.
 
-import { createAbortError, throwIfAborted } from './internal/abort.js';
+import { createAbortError, throwIfAborted } from './internal/abort.ts';
 import {
   GENERATION_ALREADY_ACTIVE_MESSAGE,
   GENERATION_ALREADY_ACTIVE_RC,
   defaultModelCacheName,
-} from './internal/constants.js';
-import { importCoreFactory } from './internal/core_loader.js';
+} from './internal/constants.ts';
+import { importCoreFactory } from './internal/core_loader.ts';
 import {
   DECISION_API_VERSION,
   decisionHandleFrom,
   decisionHeadBytes,
   decodeDecisionOutputs,
   encodeDecisionSequences,
-} from './internal/decision.js';
+} from './internal/decision.ts';
 import {
   drainResponseWithProgress,
   ensureFsDirectory,
@@ -23,18 +23,18 @@ import {
   sumProgressValues,
   unlinkFsFile,
   writeResponseToFsFileWithProgress,
-} from './internal/download.js';
-import { isCrossOriginIsolatedRuntime, isSafariUserAgent } from './internal/environment.js';
-import { decodeImageBytesToRgb } from './internal/image.js';
-import { logLevelForName, logThresholdForConfiguredLevel } from './internal/logging.js';
+} from './internal/download.ts';
+import { isCrossOriginIsolatedRuntime, isSafariUserAgent } from './internal/environment.ts';
+import { decodeImageBytesToRgb } from './internal/image.ts';
+import { logLevelForName, logThresholdForConfiguredLevel } from './internal/logging.ts';
 import {
   basenameFromUrl,
   cloneModelSource,
   expandModelShardUrls,
   hasModelSource,
   normalizeAbsoluteUrl,
-} from './internal/model_source.js';
-import { nextTokenCandidateIds, scoredTokensFrom } from './internal/next_token_scores.js';
+} from './internal/model_source.ts';
+import { nextTokenCandidateIds, scoredTokensFrom } from './internal/next_token_scores.ts';
 import {
   parseBooleanFlag,
   parseEnumValue,
@@ -42,13 +42,13 @@ import {
   parseOptionalBooleanFlag,
   parsePositiveInteger,
   parsePositiveNumber,
-} from './internal/parse.js';
+} from './internal/parse.ts';
 import {
   buildPromptFromMessages,
   looksLikeCorruptedGeneration,
   trimUnstableUtf8Tail,
-} from './internal/text.js';
-import { isInt32, toFloat32Array, toUint8Array } from './internal/typed_values.js';
+} from './internal/text.ts';
+import { isInt32, toFloat32Array, toUint8Array } from './internal/typed_values.ts';
 
 const textEncoder = new TextEncoder();
 

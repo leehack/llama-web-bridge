@@ -6,10 +6,14 @@
     "allowJs": true,
     "checkJs": true,
     "noEmit": true,
+    "allowImportingTsExtensions": true,
+    "erasableSyntaxOnly": true,
+    "verbatimModuleSyntax": true,
     "strict": false,
     "skipLibCheck": true,
     "lib": ["ES2022", "DOM", "WebWorker"],
     "types": []
   },
-  "include": ["js/src/**/*.js"]
+  "include": ["js/src/**/*.js", "js/src/**/*.ts"],
+  "exclude": ["js/src/**/*.d.ts"]
 }

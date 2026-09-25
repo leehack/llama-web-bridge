@@ -32,6 +32,8 @@ await build({
   minify: false,
   sourcemap: false,
   legalComments: 'none',
+  // Match tsconfig and Node's type stripping: keep every value import as written.
+  tsconfigRaw: { compilerOptions: { verbatimModuleSyntax: true } },
   banner: { js: generatedBanner('js/src/llama_webgpu_bridge.js').trimEnd() },
   logLevel: 'info',
 });

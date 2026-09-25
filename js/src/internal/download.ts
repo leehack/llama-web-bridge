@@ -1,9 +1,47 @@
 // Streaming model downloads with progress into the Emscripten filesystem.
 
-import { createAbortError, throwIfAborted } from './abort.js';
-import { parsePositiveInteger } from './parse.js';
+import type { BridgeProgressEvent } from '../llama_webgpu_bridge.d.ts';
+import { createAbortError, throwIfAborted } from './abort.ts';
+import { parsePositiveInteger } from './parse.ts';
 
-export function hasReadableResponseStream(response) {
+// The subset of the Emscripten WASMFS `FS` API these helpers use. Stream
+// handles are opaque to JS.
+export interface EmscriptenFs {
+  readdir(path: string): unknown;
+  mkdir(path: string): void;
+  unlink(path: string): void;
+  open(path: string, flags: string): unknown;
+  write(
+    stream: unknown,
+    buffer: Uint8Array,
+    offset: number,
+    length: number,
+    position: number | bigint,
+  ): number;
+  close(stream: unknown): void;
+  writeFile(path: string, data: Uint8Array): void;
+}
+
+export type ProgressCallback = (event: BridgeProgressEvent) => void;
+
+export interface DrainOptions {
+  chunkTimeoutMs?: unknown;
+}
+
+export interface WriteResponseOptions {
+  totalBytes?: unknown;
+  useBigIntPosition?: boolean;
+  startOffset?: unknown;
+  preservePartialOnError?: boolean;
+  chunkTimeoutMs?: unknown;
+  signal?: AbortSignal | null;
+  abortMessage?: string;
+}
+
+// A transfer failure annotated with how far the file got, for resumable loads.
+type TransferError = Error & { llamadartLoadedBytes?: number; llamadartFilePath?: string };
+
+export function hasReadableResponseStream(response: Response | null | undefined): boolean {
   return !!(
     response
     && response.body
@@ -11,7 +49,7 @@ export function hasReadableResponseStream(response) {
   );
 }
 
-export function sumProgressValues(values) {
+export function sumProgressValues(values: Iterable<unknown> | null | undefined): number {
   let total = 0;
   for (const value of values || []) {
     const numeric = Number(value);
@@ -22,7 +60,7 @@ export function sumProgressValues(values) {
   return total;
 }
 
-function parseTotalFromContentRangeHeader(contentRangeHeader) {
+function parseTotalFromContentRangeHeader(contentRangeHeader: string | null): number {
   if (typeof contentRangeHeader !== 'string' || contentRangeHeader.length === 0) {
     return 0;
   }
@@ -35,7 +73,10 @@ function parseTotalFromContentRangeHeader(contentRangeHeader) {
   return parsePositiveInteger(contentRangeHeader.slice(slash + 1));
 }
 
-export function inferResponseTotalBytes(response, loadedFallback = 0) {
+export function inferResponseTotalBytes(
+  response: Response | null | undefined,
+  loadedFallback: unknown = 0,
+): number {
   if (!response || !response.headers) {
     return parsePositiveInteger(loadedFallback);
   }
@@ -60,7 +101,7 @@ export function inferResponseTotalBytes(response, loadedFallback = 0) {
   return parsePositiveInteger(loadedFallback);
 }
 
-export function isRetryableStreamNetworkError(error) {
+export function isRetryableStreamNetworkError(error: unknown): boolean {
   const text = String(error || '').toLowerCase();
   return text.includes('network error')
     || text.includes('failed to fetch')
@@ -72,17 +113,21 @@ export function isRetryableStreamNetworkError(error) {
     || text.includes('timed out');
 }
 
-async function readStreamChunkWithTimeout(reader, timeoutMs, label = 'stream read') {
+async function readStreamChunkWithTimeout(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  timeoutMs: unknown,
+  label = 'stream read',
+): Promise<ReadableStreamReadResult<Uint8Array>> {
   const resolvedTimeout = Number(timeoutMs);
   if (!Number.isFinite(resolvedTimeout) || resolvedTimeout <= 0) {
     return reader.read();
   }
 
-  let timeoutHandle = null;
+  let timeoutHandle: ReturnType<typeof globalThis.setTimeout> | null = null;
   try {
     return await Promise.race([
       reader.read(),
-      new Promise((_, reject) => {
+      new Promise<never>((_, reject) => {
         timeoutHandle = globalThis.setTimeout(() => {
           reject(new Error(`${label} timeout (${resolvedTimeout}ms)`));
         }, resolvedTimeout);
@@ -95,7 +140,11 @@ async function readStreamChunkWithTimeout(reader, timeoutMs, label = 'stream rea
   }
 }
 
-export async function drainResponseWithProgress(response, progressCallback, options = {}) {
+export async function drainResponseWithProgress(
+  response: Response,
+  progressCallback?: ProgressCallback | null,
+  options: DrainOptions = {},
+): Promise<number> {
   const total = Number(response.headers.get('content-length')) || 0;
   const chunkTimeoutMs = parsePositiveInteger(options.chunkTimeoutMs);
 
@@ -149,7 +198,7 @@ export async function drainResponseWithProgress(response, progressCallback, opti
 // `object.contents`: it throws ErrnoError ("FS error") for an existing directory
 // and copies an existing file into JS memory. Probe paths with mkdir/unlink and
 // a directory listing instead.
-export function ensureFsDirectory(fs, dirPath) {
+export function ensureFsDirectory(fs: EmscriptenFs, dirPath: string): void {
   const slash = dirPath.lastIndexOf('/');
   const parent = slash > 0 ? dirPath.slice(0, slash) : '/';
   const name = dirPath.slice(slash + 1);
@@ -174,7 +223,7 @@ export function ensureFsDirectory(fs, dirPath) {
   }
 }
 
-export function unlinkFsFile(fs, filePath) {
+export function unlinkFsFile(fs: EmscriptenFs, filePath: string): boolean {
   try {
     fs.unlink(filePath);
     return true;
@@ -184,12 +233,12 @@ export function unlinkFsFile(fs, filePath) {
 }
 
 export async function writeResponseToFsFileWithProgress(
-  response,
-  fs,
-  filePath,
-  progressCallback,
-  writeOptions = {},
-) {
+  response: Response,
+  fs: EmscriptenFs,
+  filePath: string,
+  progressCallback?: ProgressCallback | null,
+  writeOptions: WriteResponseOptions = {},
+): Promise<number> {
   const total = parsePositiveInteger(writeOptions.totalBytes)
     || inferResponseTotalBytes(response, 0);
   const useBigIntPosition = writeOptions.useBigIntPosition === true;
@@ -237,8 +286,7 @@ export async function writeResponseToFsFileWithProgress(
   let loaded = 0;
   let lastBucket = -1;
   let writePosition = startOffset;
-  /** @type {bigint | null} */
-  let writePositionBigInt = null;
+  let writePositionBigInt: bigint | null = null;
 
   try {
     while (true) {
@@ -286,14 +334,14 @@ export async function writeResponseToFsFileWithProgress(
       }
     }
   } catch (error) {
-    if (signal?.aborted && error?.name !== 'AbortError') {
+    if (signal?.aborted && (error as Error | null)?.name !== 'AbortError') {
       error = createAbortError(abortMessage);
     }
 
     try {
       if (error && typeof error === 'object') {
-        error.llamadartLoadedBytes = startOffset + loaded;
-        error.llamadartFilePath = filePath;
+        (error as TransferError).llamadartLoadedBytes = startOffset + loaded;
+        (error as TransferError).llamadartFilePath = filePath;
       }
     } catch (_) {
       // ignore metadata attachment failures
@@ -311,7 +359,7 @@ export async function writeResponseToFsFileWithProgress(
       // ignore best-effort reader cancellation failures
     }
 
-    if (!preservePartialOnError || signal?.aborted || error?.name === 'AbortError') {
+    if (!preservePartialOnError || signal?.aborted || (error as Error | null)?.name === 'AbortError') {
       try {
         fs.unlink(filePath);
       } catch (_) {

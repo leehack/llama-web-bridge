@@ -1,6 +1,6 @@
 // Browser and runtime capability detection.
 
-export function isSafariUserAgent(userAgent) {
+export function isSafariUserAgent(userAgent: unknown): boolean {
   if (typeof userAgent !== 'string' || userAgent.length === 0) {
     return false;
   }
@@ -10,7 +10,7 @@ export function isSafariUserAgent(userAgent) {
   return hasSafariToken && !hasOtherBrowserToken;
 }
 
-export function isCrossOriginIsolatedRuntime() {
+export function isCrossOriginIsolatedRuntime(): boolean {
   try {
     if (typeof globalThis.crossOriginIsolated === 'boolean') {
       return globalThis.crossOriginIsolated;

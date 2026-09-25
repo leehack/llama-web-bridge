@@ -1,6 +1,6 @@
 // Log level names and thresholds.
 
-export function logLevelForName(level) {
+export function logLevelForName(level: unknown): number {
   switch (level) {
     case 'debug':
       return 0;
@@ -16,7 +16,7 @@ export function logLevelForName(level) {
   }
 }
 
-export function logThresholdForConfiguredLevel(level) {
+export function logThresholdForConfiguredLevel(level: unknown): number {
   switch (level) {
     case 0:
       return 99;

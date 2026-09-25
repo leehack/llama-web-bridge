@@ -1,18 +1,18 @@
 // Public bridge facade: picks the worker or direct runtime and owns the operation queue.
 
-import { createAbortError } from './internal/abort.js';
-import { BRIDGE_DISPOSED_MESSAGE, INVALID_GRAMMAR_ERROR_TEXT } from './internal/constants.js';
+import { createAbortError } from './internal/abort.ts';
+import { BRIDGE_DISPOSED_MESSAGE, INVALID_GRAMMAR_ERROR_TEXT } from './internal/constants.ts';
 import {
   DECISION_API_VERSION,
   decisionHandleFrom,
   decisionHeadBytes,
   normalizeDecisionSequences,
-} from './internal/decision.js';
-import { logLevelForName, logThresholdForConfiguredLevel } from './internal/logging.js';
-import { cloneModelSource, hasModelSource, normalizeAbsoluteUrl } from './internal/model_source.js';
-import { toUint8Array } from './internal/typed_values.js';
+} from './internal/decision.ts';
+import { logLevelForName, logThresholdForConfiguredLevel } from './internal/logging.ts';
+import { cloneModelSource, hasModelSource, normalizeAbsoluteUrl } from './internal/model_source.ts';
+import { toUint8Array } from './internal/typed_values.ts';
 import { LlamaWebGpuBridgeRuntime } from './runtime.js';
-import { emptyBridgeState, serializeWorkerError } from './worker_protocol.js';
+import { emptyBridgeState, serializeWorkerError } from './worker_protocol.ts';
 import { BridgeWorkerProxy } from './worker_proxy.js';
 
 export class LlamaWebGpuBridge {

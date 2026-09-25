@@ -1,0 +1,10 @@
+{
+  "extends": "./tsconfig.bridge.json",
+  "compilerOptions": {
+    "allowJs": false,
+    "checkJs": false,
+    "strict": true
+  },
+  "include": ["js/src/**/*.ts"],
+  "exclude": ["js/src/**/*.d.ts"]
+}

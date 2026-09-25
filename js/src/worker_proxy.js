@@ -1,7 +1,7 @@
 // Main-thread proxy that forwards bridge calls to a dedicated worker.
 
-import { DECISION_WORKER_TIMEOUT_PER_SEQUENCE_MS } from './internal/decision.js';
-import { bridgeWorkerModeParam } from './worker_protocol.js';
+import { DECISION_WORKER_TIMEOUT_PER_SEQUENCE_MS } from './internal/decision.ts';
+import { bridgeWorkerModeParam } from './worker_protocol.ts';
 
 function createBridgeWorkerSource(moduleUrl) {
   return `import * as workerModule from ${JSON.stringify(moduleUrl)};\nif (workerModule && typeof workerModule.enableBridgeWorkerHost === 'function') { workerModule.enableBridgeWorkerHost(); }\n`;

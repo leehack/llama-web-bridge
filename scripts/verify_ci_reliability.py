@@ -203,6 +203,15 @@ def read_required(relative_path: str, errors: list[str]) -> str:
         return ""
 
 
+def json_object(text: str) -> dict:
+    """Parses a JSON object, or returns {} so the caller's checks fail."""
+    try:
+        value = json.loads(text)
+    except ValueError:
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
 def require(condition: bool, message: str, errors: list[str]) -> None:
     if not condition:
         errors.append(message)
@@ -560,22 +569,26 @@ def extract_section(
     return content[start:end]
 
 
-def list_typescript_files(errors: list[str]) -> set[Path]:
+def list_typescript_files(
+    errors: list[str], project: str = "tsconfig.bridge.json"
+) -> set[Path]:
     tsc = ROOT / "node_modules" / "typescript" / "bin" / "tsc"
     try:
         result = subprocess.run(
-            ["node", str(tsc), "-p", "tsconfig.bridge.json", "--noEmit", "--listFiles"],
+            ["node", str(tsc), "-p", project, "--noEmit", "--listFiles"],
             cwd=ROOT,
             check=False,
             capture_output=True,
             text=True,
         )
     except OSError as exc:
-        errors.append(f"failed to run tsc --listFiles: {exc}")
+        errors.append(f"failed to run tsc -p {project} --listFiles: {exc}")
         return set()
 
     if result.returncode != 0:
-        errors.append(f"tsc --listFiles failed with exit code {result.returncode}")
+        errors.append(
+            f"tsc -p {project} --listFiles failed with exit code {result.returncode}"
+        )
         return set()
 
     return {Path(line).resolve() for line in result.stdout.splitlines() if line.strip()}
@@ -1057,6 +1070,7 @@ def main() -> int:
     js_build = read_required("scripts/build_js_bridge.mjs", errors)
     package_json = read_required("package.json", errors)
     tsconfig = read_required("tsconfig.bridge.json", errors)
+    strict_tsconfig = read_required("tsconfig.strict.json", errors)
     js_entry = read_required("js/src/llama_webgpu_bridge.js", errors)
     try:
         js_source = bridge_js_source(ROOT)
@@ -1121,6 +1135,12 @@ def main() -> int:
         readme_publication_credentials.split()
     )
     typechecked_files = list_typescript_files(errors)
+    strict_typechecked_files = list_typescript_files(errors, "tsconfig.strict.json")
+    typescript_sources = {
+        path.resolve()
+        for path in (ROOT / "js" / "src").rglob("*.ts")
+        if not path.name.endswith(".d.ts")
+    }
     verify_environment_job = publish.split(
         "\n  verify-publication-environment:\n", 1
     )[-1].split("\n  publish-assets:\n", 1)[0]
@@ -1349,6 +1369,48 @@ def main() -> int:
     require(
         (ROOT / "js/src/llama_webgpu_bridge.js").resolve() in typechecked_files,
         "tsc --listFiles must include js/src/llama_webgpu_bridge.js",
+        errors,
+    )
+    package_manifest = json_object(package_json)
+    package_scripts = package_manifest.get("scripts") or {}
+    strict_config = json_object(strict_tsconfig)
+    require(
+        '"erasableSyntaxOnly": true' in tsconfig
+        and '"verbatimModuleSyntax": true' in tsconfig
+        and re.search(
+            r"^  tsconfigRaw: \{ compilerOptions: \{ verbatimModuleSyntax: true \} \},$",
+            js_build,
+            re.MULTILINE,
+        )
+        is not None,
+        "TypeScript sources must stay erasable, with verbatim imports in tsc and esbuild",
+        errors,
+    )
+    require(
+        str(package_scripts.get("check:js", "")).startswith("npm run typecheck:js && ")
+        and "tsc -p tsconfig.strict.json --noEmit"
+        in str(package_scripts.get("typecheck:js", ""))
+        and strict_config.get("extends") == "./tsconfig.bridge.json"
+        # Only these overrides: any other option could loosen the strict pass.
+        and strict_config.get("compilerOptions")
+        == {"allowJs": False, "checkJs": False, "strict": True}
+        and bool(typescript_sources)
+        and typescript_sources <= strict_typechecked_files,
+        "npm run typecheck:js must type-check every js/src TypeScript module with strict",
+        errors,
+    )
+    require(
+        not any(
+            path
+            for pattern in ("*.mts", "*.cts")
+            for path in (ROOT / "js" / "src").rglob(pattern)
+        ),
+        "js/src must not hold .mts or .cts modules, which neither typecheck covers",
+        errors,
+    )
+    require(
+        (package_manifest.get("engines") or {}).get("node") == ">=22.18.0",
+        "package.json must require a Node.js release that strips TypeScript types",
         errors,
     )
     require(

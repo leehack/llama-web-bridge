@@ -26,7 +26,8 @@ metadata, cancellation, disposal, and worker-host bootstrap.
 Requirements:
 
 - Emscripten SDK (`emcmake`, `emcc`) matching `emsdk.version` in `PATH`
-- Node.js/npm for the JS bridge build pipeline (`npm ci`, `npm run check:js`)
+- Node.js 22.18+ and npm for the JS bridge build pipeline (`npm ci`,
+  `npm run check:js`)
 - llama.cpp source checkout matching `llama_cpp.version` or a compatible checkout exposing
   `llama_state_save_file` / `llama_state_load_file` with the signatures used by
   `src/llama_webgpu_core.cpp`

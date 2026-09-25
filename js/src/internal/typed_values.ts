@@ -1,6 +1,6 @@
 // Typed-array and integer coercion helpers.
 
-export function toUint8Array(value) {
+export function toUint8Array(value: unknown): Uint8Array | null {
   if (!value) {
     return null;
   }
@@ -24,7 +24,7 @@ export function toUint8Array(value) {
   return null;
 }
 
-export function toFloat32Array(value) {
+export function toFloat32Array(value: unknown): Float32Array | null {
   if (!value) {
     return null;
   }
@@ -52,7 +52,9 @@ export function toFloat32Array(value) {
   return null;
 }
 
-export function isInt32(value) {
+// Not a type predicate: a false result must not narrow a number argument to
+// never, since non-integers and out-of-range numbers land there too.
+export function isInt32(value: unknown): boolean {
   return typeof value === 'number'
     && Number.isInteger(value)
     && value >= -0x80000000

@@ -1,13 +1,13 @@
 // Worker-side message host that runs a bridge inside a dedicated worker.
 
 import { LlamaWebGpuBridge } from './bridge.js';
-import { toUint8Array } from './internal/typed_values.js';
+import { toUint8Array } from './internal/typed_values.ts';
 import {
   bridgeWorkerModeParam,
   emptyBridgeState,
   serializeWorkerError,
   snapshotBridgeState,
-} from './worker_protocol.js';
+} from './worker_protocol.ts';
 
 const textDecoder = new TextDecoder();
 

@@ -1,6 +1,15 @@
 // Model source descriptors, URLs, and split-GGUF shard expansion.
 
-export function cloneModelSource(source) {
+// One model URL, or the caller's explicit ordered shard list kept as given.
+export type ModelSource = string | unknown[];
+
+interface SplitShardPattern {
+  prefix: string;
+  width: number;
+  total: number;
+}
+
+export function cloneModelSource(source: unknown): ModelSource {
   if (Array.isArray(source)) {
     // Preserve the caller's explicit shard order and values. The loader may
     // normalize the URLs for fetches, but recovery must never turn the array
@@ -11,15 +20,15 @@ export function cloneModelSource(source) {
   return String(source || '').trim();
 }
 
-export function hasModelSource(source) {
+export function hasModelSource(source: unknown): boolean {
   return Array.isArray(source)
     ? source.length > 0
     : typeof source === 'string' && source.length > 0;
 }
 
-export function basenameFromUrl(url) {
+export function basenameFromUrl(url: unknown): string {
   try {
-    const parsed = new URL(url, typeof window !== 'undefined' ? window.location.href : undefined);
+    const parsed = new URL(url as string, typeof window !== 'undefined' ? window.location.href : undefined);
     const pathname = parsed.pathname || '';
     const name = pathname.split('/').pop() || 'model.gguf';
     return name.includes('?') ? name.split('?')[0] : name;
@@ -29,15 +38,15 @@ export function basenameFromUrl(url) {
   }
 }
 
-export function normalizeAbsoluteUrl(url) {
+export function normalizeAbsoluteUrl(url: unknown): string {
   try {
-    return new URL(url, typeof window !== 'undefined' ? window.location.href : undefined).toString();
+    return new URL(url as string, typeof window !== 'undefined' ? window.location.href : undefined).toString();
   } catch (_) {
     return String(url);
   }
 }
 
-function parseSplitShardPattern(fileName) {
+function parseSplitShardPattern(fileName: unknown): SplitShardPattern | null {
   if (typeof fileName !== 'string' || fileName.length === 0) {
     return null;
   }
@@ -59,7 +68,7 @@ function parseSplitShardPattern(fileName) {
   };
 }
 
-export function expandModelShardUrls(modelUrlOrUrls) {
+export function expandModelShardUrls(modelUrlOrUrls: unknown): string[] {
   if (Array.isArray(modelUrlOrUrls)) {
     return modelUrlOrUrls
       .map((value) => String(value || '').trim())
@@ -84,7 +93,7 @@ export function expandModelShardUrls(modelUrlOrUrls) {
     }
 
     const totalShardId = String(split.total).padStart(split.width, '0');
-    const urls = [];
+    const urls: string[] = [];
     for (let shardIndex = 1; shardIndex <= split.total; shardIndex += 1) {
       const shardId = String(shardIndex).padStart(split.width, '0');
       parsed.pathname = `${dirPath}${split.prefix}-${shardId}-of-${totalShardId}.gguf`;

@@ -1,8 +1,27 @@
 // Decoding encoded image bytes to RGB for multimodal input.
 
-import { toUint8Array } from './typed_values.js';
+import { toUint8Array } from './typed_values.ts';
 
-export async function decodeImageBytesToRgb(bytes, options = {}) {
+export interface DecodeImageOptions {
+  maxPixels?: unknown;
+  maxEdge?: unknown;
+  mimeType?: unknown;
+}
+
+// A PNG re-encode of the source image, downscaled to the configured limits.
+export interface DecodedImage {
+  bytes: Uint8Array;
+  width: number;
+  height: number;
+  sourceWidth: number;
+  sourceHeight: number;
+  resized: boolean;
+}
+
+export async function decodeImageBytesToRgb(
+  bytes: unknown,
+  options: DecodeImageOptions = {},
+): Promise<DecodedImage | null> {
   const sourceBytes = toUint8Array(bytes);
   if (!sourceBytes || sourceBytes.length === 0) {
     return null;
@@ -25,13 +44,13 @@ export async function decodeImageBytesToRgb(bytes, options = {}) {
     return null;
   }
 
-  let bitmap = null;
+  let bitmap: ImageBitmap | null = null;
   try {
     const mimeType =
       typeof options.mimeType === 'string' && options.mimeType.length > 0
         ? options.mimeType
         : 'image/png';
-    const blob = new Blob([/** @type {BlobPart} */ (sourceBytes)], { type: mimeType });
+    const blob = new Blob([sourceBytes as BlobPart], { type: mimeType });
     bitmap = await createImageBitmap(blob);
 
     const sourceWidth = Math.max(1, Math.trunc(Number(bitmap.width) || 0));
@@ -54,8 +73,8 @@ export async function decodeImageBytesToRgb(bytes, options = {}) {
     const width = Math.max(1, Math.round(sourceWidth * scale));
     const height = Math.max(1, Math.round(sourceHeight * scale));
 
-    let canvas = null;
-    let context = null;
+    let canvas: OffscreenCanvas | HTMLCanvasElement | null = null;
+    let context: OffscreenCanvasRenderingContext2D | CanvasRenderingContext2D | null = null;
     if (typeof OffscreenCanvas === 'function') {
       canvas = new OffscreenCanvas(width, height);
       context = canvas.getContext('2d', {
@@ -80,7 +99,7 @@ export async function decodeImageBytesToRgb(bytes, options = {}) {
 
     context.drawImage(bitmap, 0, 0, width, height);
 
-    let encodedBytes = null;
+    let encodedBytes: Uint8Array | null = null;
     if (canvas && 'convertToBlob' in canvas && typeof canvas.convertToBlob === 'function') {
       const encodedBlob = await canvas.convertToBlob({ type: 'image/png' });
       if (encodedBlob) {
@@ -95,8 +114,8 @@ export async function decodeImageBytesToRgb(bytes, options = {}) {
       && typeof canvas.toBlob === 'function'
       && typeof Promise === 'function'
     ) {
-      const encodedBlob = await new Promise((resolve) => {
-        canvas.toBlob((value) => {
+      const encodedBlob = await new Promise<Blob | null>((resolve) => {
+        (canvas as HTMLCanvasElement).toBlob((value) => {
           resolve(value || null);
         }, 'image/png');
       });

@@ -1,6 +1,15 @@
 // Prompt assembly and generated-text sanitation.
 
-export function buildPromptFromMessages(messages, addAssistant) {
+// A chat message as callers pass it; role and content are stringified.
+interface PromptMessage {
+  role?: unknown;
+  content?: unknown;
+}
+
+export function buildPromptFromMessages(
+  messages: readonly (PromptMessage | null | undefined)[] | null | undefined,
+  addAssistant: unknown,
+): string {
   const lines = [];
   for (const msg of messages || []) {
     const role = String(msg?.role ?? 'user');
@@ -13,7 +22,7 @@ export function buildPromptFromMessages(messages, addAssistant) {
   return lines.join('\n');
 }
 
-export function looksLikeCorruptedGeneration(text) {
+export function looksLikeCorruptedGeneration(text: unknown): boolean {
   if (typeof text !== 'string' || text.length === 0) {
     return false;
   }
@@ -62,7 +71,7 @@ export function looksLikeCorruptedGeneration(text) {
   return false;
 }
 
-export function trimUnstableUtf8Tail(text) {
+export function trimUnstableUtf8Tail(text: unknown): string {
   if (typeof text !== 'string' || text.length === 0) {
     return '';
   }
