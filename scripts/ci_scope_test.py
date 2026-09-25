@@ -29,7 +29,8 @@ class ScopeTests(unittest.TestCase):
                      'scripts/release_orchestrator_transport.py', 'scripts/release_orchestrator_transport_test.py',
                      'scripts/release_orchestrator_workflow_runs.py', 'scripts/release_orchestrator_workflow_runs_test.py',
                      'tests/js/worker_runtime_state_test.mjs',
-                     'tests/js/declared_class_fields_test.mjs'):
+                     'tests/js/declared_class_fields_test.mjs',
+                     'scripts/verify_ci_reliability_pin_test.py', 'scripts/verify_ci_reliability_doc_facts_test.py'):
             self.assertFalse(native_required([path]), path)
         for path in ('src/core.cpp', 'src/core/exports_tts.inc', 'src/core/new_part.inc', 'js/llama_webgpu_bridge.ts', 'package-lock.json',
                      'scripts/build_bridge.sh', 'scripts/state_persistence_browser_smoke.py',

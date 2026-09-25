@@ -133,12 +133,16 @@ GGUFs or smoke artifacts.
     `leehack/llama-web-bridge`. The orchestrator proves the owner identity and
     the governance read live and fails closed if either is absent.
 - CI reliability contract: `scripts/verify_ci_reliability.py`
-  - Asserts specific sentences in `README.md`, `AGENTS.md`, and
-    `CONTRIBUTING.md` (publication contract, baseline, smoke script names), the
-    7-pin set in `CONTRIBUTING.md` and both build workflows, and that
-    `README.md` and `AGENTS.md` hold no pins and link to
-    `CONTRIBUTING.md#validate-outputs`. Update it in the same change as any doc
-    restructure.
+  - Asserts the facts that `README.md`, `AGENTS.md`, `CONTRIBUTING.md`, and
+    `docs/api.md` state (publication contract, baseline, smoke script names),
+    not their sentences: names, tags, and URLs as tokens, and each relation (a
+    key and its value, or a qualifier such as "only", "exact", "never", or
+    "unless") as a short ordered phrase, scoped to its Markdown section or list
+    item with whitespace normalized. Rewording or reflowing the prose around a
+    fact passes; dropping, changing, or inverting a fact fails. It also asserts the 7-pin set in `CONTRIBUTING.md`
+    and both build workflows, and that `README.md` and `AGENTS.md` hold no pins
+    and link to `CONTRIBUTING.md#validate-outputs`. Update it in the same
+    change as a doc restructure that renames a heading or moves a fact.
 - Publish workflow: `.github/workflows/publish_assets.yml`
   - Never builds. It downloads the exact candidate artifact and attestation by
     immutable artifact ID and verifies the candidate manifest's

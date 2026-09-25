@@ -557,22 +557,208 @@ jobs:
     )
 
 
-def extract_section(
-    relative_path: str,
-    content: str,
-    start_marker: str,
-    end_marker: str,
-    errors: list[str],
+# Documentation checks assert the facts a sentence carries rather than the
+# sentence. A standalone fact -- a file, workflow, environment, or secret name,
+# a tag, flag, or URL -- is a bare token. A relation -- subject and object, a
+# key and its value, or a qualifier such as "only", "exact", "never", or
+# "unless" -- is a short ordered phrase that holds the binding, so inverting,
+# swapping, or dropping the qualifier fails. Whitespace is normalized, so
+# reflowing a paragraph or rewording the prose around a fact never fails a
+# check. Scoping a check to a Markdown section or list item keeps it from being
+# satisfied by an unrelated part of the document.
+MARKDOWN_HEADING = re.compile(r"^(#{1,6})[ \t]+(.*?)[ \t#]*$")
+MARKDOWN_LIST_MARKER = re.compile(r"^([ \t]*)(?:[-*+]|\d+[.)])[ \t]+")
+MARKDOWN_FENCE = re.compile(r"^[ \t]*(`{3,}|~{3,})")
+# An identifier shaped like a credential. Publication has exactly one.
+SECRET_LIKE_IDENTIFIER = re.compile(r"\b[A-Z][A-Z0-9_]*_(?:TOKEN|PAT|SECRET|KEY)\b")
+MARKDOWN_BLANK_LINE_SEPARATOR = re.compile(r"\n[ \t]*\n")
+
+
+def normalize_prose(text: str) -> str:
+    return " ".join(text.split())
+
+
+def markdown_lines(content: str) -> list[tuple[str, bool]]:
+    """Pairs each line with whether it belongs to a fenced code block."""
+    lines: list[tuple[str, bool]] = []
+    fence = ""
+    for line in content.splitlines():
+        match = MARKDOWN_FENCE.match(line)
+        if match and not fence:
+            fence = match.group(1)
+            lines.append((line, True))
+        elif (
+            match
+            and match.group(1)[0] == fence[0]
+            and len(match.group(1)) >= len(fence)
+            and not line.strip()[len(match.group(1)) :].strip()
+        ):
+            fence = ""
+            lines.append((line, True))
+        else:
+            lines.append((line, bool(fence)))
+    return lines
+
+
+def markdown_section(
+    relative_path: str, content: str, title: str, errors: list[str]
 ) -> str:
-    start = content.find(start_marker)
-    if start < 0:
-        errors.append(f"{relative_path} is missing the expected section marker: {start_marker}")
+    """Returns the body under the heading `title`, subsections included.
+
+    The title must head exactly one section, so a duplicate cannot silently
+    shadow the one a check reads.
+    """
+    sections: list[list[str]] = []
+    body: list[str] | None = None
+    level = 0
+    for line, in_code in markdown_lines(content):
+        heading = None if in_code else MARKDOWN_HEADING.match(line)
+        if heading and body is not None and len(heading.group(1)) <= level:
+            body = None
+        if heading and normalize_prose(heading.group(2)) == title:
+            body, level = [], len(heading.group(1))
+            sections.append(body)
+        elif body is not None:
+            body.append(line)
+    if not sections:
+        errors.append(f"{relative_path} is missing the Markdown section: {title}")
         return ""
-    end = content.find(end_marker, start + len(start_marker))
-    if end < 0:
-        errors.append(f"{relative_path} is missing the expected section terminator: {end_marker}")
-        return content[start:]
-    return content[start:end]
+    if len(sections) > 1:
+        errors.append(
+            f"{relative_path} has {len(sections)} Markdown sections titled {title}; "
+            "a checked section title must be unique"
+        )
+    return "\n".join(sections[0])
+
+
+def markdown_paragraphs(text: str) -> list[str]:
+    return [
+        block.strip("\n")
+        for block in MARKDOWN_BLANK_LINE_SEPARATOR.split(text)
+        if block.strip()
+    ]
+
+
+def markdown_list_items(text: str) -> list[str]:
+    """Splits text into list items without their nested items.
+
+    An item keeps its wrapped lines and indented continuation paragraphs.
+    """
+    items: list[list[str]] = []
+    current: list[str] | None = None
+    after_blank = False
+    for line, in_code in markdown_lines(text):
+        if not line.strip():
+            after_blank = True
+            continue
+        if not in_code and MARKDOWN_LIST_MARKER.match(line):
+            current = [line]
+            items.append(current)
+        elif (
+            current is not None
+            and (in_code or not MARKDOWN_HEADING.match(line))
+            and (not after_blank or line[:1] in " \t")
+        ):
+            current.append(line)
+        else:
+            current = None
+        after_blank = False
+    return ["\n".join(item) for item in items]
+
+
+def markdown_list_block(
+    relative_path: str, content: str, head_fact: str, errors: list[str]
+) -> str:
+    """Returns the top-level list item naming `head_fact`, nested items included."""
+    blocks: list[list[str]] = []
+    current: list[str] | None = None
+    for line, in_code in markdown_lines(content):
+        marker = None if in_code else MARKDOWN_LIST_MARKER.match(line)
+        if marker and not marker.group(1):
+            current = [line]
+            blocks.append(current)
+        elif current is not None and (not line.strip() or line[:1] in " \t"):
+            current.append(line)
+        else:
+            current = None
+    wanted = normalize_prose(head_fact)
+    for block in blocks:
+        if wanted in normalize_prose(markdown_list_items("\n".join(block))[0]):
+            return "\n".join(block)
+    errors.append(f"{relative_path} is missing the list item naming {head_fact}")
+    return ""
+
+
+def markdown_paragraph_with_list(
+    relative_path: str, content: str, intro_fact: str, errors: list[str]
+) -> str:
+    """Returns the paragraph naming `intro_fact` and the list that follows it."""
+    paragraphs = markdown_paragraphs(content)
+    wanted = normalize_prose(intro_fact)
+    for index, paragraph in enumerate(paragraphs):
+        if wanted not in normalize_prose(paragraph):
+            continue
+        block = [paragraph]
+        for following in paragraphs[index + 1 :]:
+            if not MARKDOWN_LIST_MARKER.match(following):
+                break
+            block.append(following)
+        return "\n\n".join(block)
+    errors.append(f"{relative_path} is missing the paragraph naming {intro_fact}")
+    return ""
+
+
+def markdown_top_level_item_count(text: str) -> int:
+    return sum(
+        1
+        for line, in_code in markdown_lines(text)
+        if not in_code
+        and (marker := MARKDOWN_LIST_MARKER.match(line)) is not None
+        and not marker.group(1)
+    )
+
+
+def require_doc_facts(
+    relative_path: str,
+    scope: str,
+    text: str,
+    facts: tuple[str, ...],
+    purpose: str,
+    errors: list[str],
+    unit: str | None = None,
+    ignore_case: bool = False,
+) -> None:
+    """Requires every fact in `text`, or in one list item of it.
+
+    `scope` names where `text` came from for the error message; `unit` is
+    None or "item".
+    """
+
+    def fold(value: str) -> str:
+        value = normalize_prose(value)
+        return value.lower() if ignore_case else value
+
+    if unit is None:
+        blocks = [text]
+    elif unit == "item":
+        blocks = markdown_list_items(text)
+    else:
+        raise ValueError(f"unknown documentation fact unit: {unit}")
+    wanted = [(fact, fold(fact)) for fact in facts]
+    closest = list(facts)
+    for block in blocks:
+        folded = fold(block)
+        missing = [fact for fact, value in wanted if value not in folded]
+        if not missing:
+            return
+        if len(missing) < len(closest):
+            closest = missing
+    where = f"{relative_path} ({scope})" if scope else relative_path
+    within = f" in one {unit}" if unit else ""
+    errors.append(
+        f"{where} must state {purpose}{within}; missing: "
+        + ", ".join(repr(fact) for fact in closest)
+    )
 
 
 def list_typescript_files(
@@ -1126,30 +1312,22 @@ def main() -> int:
     workflow_input_transport = read_required(
         "tests/js/workflow_input_transport_test.mjs", errors
     )
-    agents_publication = extract_section(
+    agents_publication = markdown_list_block(
         "AGENTS.md",
-        agents,
-        "- Publish workflow: `.github/workflows/publish_assets.yml`",
-        "\n## Change Boundaries",
+        markdown_section("AGENTS.md", agents, "CI / Release", errors),
+        "`.github/workflows/publish_assets.yml`",
         errors,
     )
-    readme_publication = extract_section(
-        "README.md",
-        readme,
-        "## Publishing",
-        "\n## Maintainer Docs",
-        errors,
-    )
-    readme_publication_text = " ".join(readme_publication.split())
-    readme_publication_credentials = extract_section(
+    readme_publication = markdown_section("README.md", readme, "Publishing", errors)
+    readme_publication_text = normalize_prose(readme_publication)
+    readme_publication_credentials = markdown_paragraph_with_list(
         "README.md",
         readme_publication,
-        "Required externally configured credentials:",
-        "\nEvery request supplies",
+        "externally configured credentials",
         errors,
     )
-    readme_publication_credentials_text = " ".join(
-        readme_publication_credentials.split()
+    contributing_publication = markdown_section(
+        "CONTRIBUTING.md", contributing, "Publish Process", errors
     )
     typechecked_files = list_typescript_files(errors)
     strict_typechecked_files = list_typescript_files(errors, "tsconfig.strict.json")
@@ -1909,36 +2087,78 @@ def main() -> int:
         "the single-credential publication contract must not reintroduce a second token or environment-secret inventory API path",
         errors,
     )
-    require(
-        "solo-maintainer publication contract does not require a reviewer rule"
-        in readme_publication_text
-        and "administrator bypass disabled" in readme_publication_text
-        and "exact `main` branch policy" in readme_publication_text
-        and "environment-scoped secret" in readme_publication_text
-        and "`WEBGPU_BRIDGE_ASSETS_PAT`" in readme_publication_credentials
-        and "only externally configured publication credential"
-        in readme_publication_credentials
-        and readme_publication_credentials.count("\n- ") == 1
-        and readme_publication_credentials_text
-        == (
-            "Required externally configured credentials: - "
-            "`WEBGPU_BRIDGE_ASSETS_PAT` (read access to provenance repositories "
-            "and write access to `leehack/llama-web-bridge-assets`, stored only "
-            "in the publication environment). This is the only externally "
-            "configured publication credential."
+    # README Publishing: the solo-maintainer, single-credential, main-only
+    # publication contract. Each phrase holds one relation of the contract.
+    for facts, purpose in (
+        (
+            (
+                "`bridge-assets-publication` with administrator bypass disabled",
+                "exactly one custom deployment branch policy to `main`",
+                "store `WEBGPU_BRIDGE_ASSETS_PAT` as an environment-scoped secret",
+            ),
+            "the externally configured publication environment",
+        ),
+        (
+            ("solo-maintainer publication contract does not require a reviewer rule",),
+            "that the solo-maintainer publication contract requires no reviewer rule",
+        ),
+        (
+            (
+                "`github.token` to validate the environment identity",
+                "exact `main` branch policy before entering the privileged job",
+                "again immediately before the first publication-PAT-bearing step",
+            ),
+            "the twice-run environment policy validation",
+        ),
+        (
+            (
+                "validators come from the trusted workflow commit on `main`",
+                "historical bridge source supplies only exact candidate harness "
+                "bytes, toolchain pin, and build identity",
+            ),
+            "where the publication validators come from",
+        ),
+        (
+            (
+                "fails closed unless the credential is non-empty",
+                "does not print its value",
+            ),
+            "the fail-closed, non-printing publication PAT guard",
+        ),
+    ):
+        require_doc_facts(
+            "README.md", "Publishing", readme_publication, facts, purpose, errors
         )
-        and "`github.token`" in readme_publication_text
-        and "before entering the privileged job and again immediately before"
-        in readme_publication_text
-        and "immediately before the first publication-PAT-bearing step"
-        in readme_publication_text
-        and "trusted workflow commit on `main`" in readme_publication_text
-        and "historical bridge source supplies only exact candidate harness "
-        "bytes, toolchain pin, and build identity"
-        in readme_publication_text
-        and "credential is non-empty" in readme_publication_text
-        and "does not print its value" in readme_publication_text
-        and readme_publication_text.lower().count("reviewer") == 1
+    require_doc_facts(
+        "README.md",
+        "Publishing credentials",
+        readme_publication_credentials,
+        (
+            "Required externally configured credentials",
+            "`WEBGPU_BRIDGE_ASSETS_PAT` (read access to provenance repositories",
+            "write access to `leehack/llama-web-bridge-assets`",
+            "stored only in the publication environment",
+            "the only externally configured publication credential",
+        ),
+        "the single required publication credential, its access, and where it is stored",
+        errors,
+    )
+    require(
+        markdown_top_level_item_count(readme_publication_credentials) == 1,
+        "README.md (Publishing credentials) must list exactly one externally configured publication credential",
+        errors,
+    )
+    extra_publication_credentials = sorted(
+        set(SECRET_LIKE_IDENTIFIER.findall(readme_publication)) - {PUBLICATION_PAT_NAME}
+    )
+    require(
+        not extra_publication_credentials,
+        "README.md (Publishing) must name no credential other than "
+        f"{PUBLICATION_PAT_NAME}; found: {', '.join(extra_publication_credentials)}",
+        errors,
+    )
+    require(
+        readme_publication_text.lower().count("reviewer") == 1
         and "self-review" not in readme_publication_text.lower()
         and "self review" not in readme_publication_text.lower()
         and re.search(
@@ -1957,7 +2177,7 @@ def main() -> int:
                 "after reviewer approval",
             )
         ),
-        "README Publishing guidance must match the solo-maintainer, single-credential, main-only publication contract",
+        "README Publishing guidance must not reintroduce a reviewer, self-review, or second-credential requirement",
         errors,
     )
     post_approval_environment_check = publish_job.find(
@@ -2201,24 +2421,69 @@ def main() -> int:
         "publication must never attempt cleanup, deletion, retagging, or mutation when an immutability or attestation check fails",
         errors,
     )
-    require(
-        all(
-            "immutable-releases" in document
-            and "https://in-toto.io/attestation/release/v0.2" in document
-            and "gh release verify" in document
-            and "immutable-publication-unverified" in document
-            for document in (agents_publication, readme_publication, contributing)
+    for relative_path, scope, document, facts in (
+        (
+            "AGENTS.md",
+            "Publish workflow",
+            agents_publication,
+            (
+                "/immutable-releases",
+                "gh release verify <tag> --repo",
+                "`https://in-toto.io/attestation/release/v0.2` attestation",
+                "non-retryable `immutable-publication-unverified` outcome",
+            ),
+        ),
+        (
+            "README.md",
+            "Publishing",
+            readme_publication,
+            (
+                "/immutable-releases",
+                "gh release verify <tag> --repo",
+                "predicate type `https://in-toto.io/attestation/release/v0.2`",
+                "non-retryable `immutable-publication-unverified` outcome",
+                "requires `assets_immutable_releases_enabled=true`",
+            ),
+        ),
+        (
+            "CONTRIBUTING.md",
+            "Publish Process",
+            contributing_publication,
+            (
+                "/immutable-releases",
+                "gh release verify <tag> --repo",
+                "predicate type `https://in-toto.io/attestation/release/v0.2`",
+                "reported as `immutable-publication-unverified`",
+                "`assets_immutable_releases_enabled=true`",
+            ),
+        ),
+    ):
+        require_doc_facts(
+            relative_path,
+            scope,
+            document,
+            facts,
+            "the immutable-release governance gate and the post-publication "
+            "readback and attestation verification",
+            errors,
         )
-        and "assets_immutable_releases_enabled" in agents
-        and "assets_immutable_releases_enabled" in readme_publication
-        and "assets_immutable_releases_enabled=true" in contributing
-        # The immutable automation baseline is a fresh identity; v0.1.38 is
-        # historical and never a repair/rebuild path.
-        and "### Immutable Automation Baseline" in agents
-        and "kanban:t_7f112b91:web-v0.1.39" in agents
-        and "`release_tag`: `v0.1.39`" in agents
-        and "`release_rebuild`: `0`" in agents,
-        "AGENTS.md, README.md, and CONTRIBUTING.md must document the immutable-release governance gate, the post-publication readback and attestation verification, and the verified immutable automation baseline",
+    # The immutable automation baseline is a fresh identity; v0.1.38 is
+    # historical and never a repair/rebuild path. Each key stays bound to its
+    # value in one list item.
+    agents_baseline = markdown_section(
+        "AGENTS.md", agents, "Immutable Automation Baseline", errors
+    )
+    require_doc_facts(
+        "AGENTS.md",
+        "Immutable Automation Baseline",
+        agents_baseline,
+        (
+            "`release_tag`: `v0.1.39`",
+            "`release_rebuild`: `0`",
+            "`orchestrator_correlation_id`: `kanban:t_7f112b91:web-v0.1.39`",
+            "`assets_immutable_releases_enabled`: `true`",
+        ),
+        "the verified immutable automation baseline",
         errors,
     )
     require(
@@ -2727,55 +2992,125 @@ def main() -> int:
         "speech-to-text smoke must validate both memory/runtime modes, cancellation, and a pinned transcript",
         errors,
     )
-    require(
-        "npm run check:js" in agents
-        and "js/src/" in agents
-        and "generated bridge wrapper outputs" in agents
-        and "independent review" in agents
-        and "state_persistence_browser_smoke.py" in agents
-        and "multimodal_browser_smoke.py" in agents
-        and "speech_to_text_browser_smoke.py" in agents
-        and "text_to_speech_browser_smoke.py" in agents
-        and "decision_browser_smoke.py" in agents
-        and "llama_cpp.version" in agents
-        and "emsdk.version" in agents
-        and "auto_llama_cpp_update.yml" in agents,
-        "AGENTS.md must document the JS build gate, agent PR workflow, browser smoke expectations, and pinned toolchain policies",
+    require_doc_facts(
+        "AGENTS.md",
+        "",
+        agents,
+        (
+            "npm run check:js",
+            "state_persistence_browser_smoke.py",
+            "multimodal_browser_smoke.py",
+            "speech_to_text_browser_smoke.py",
+            "text_to_speech_browser_smoke.py",
+            "decision_browser_smoke.py",
+            "llama_cpp.version",
+            "emsdk.version",
+            "auto_llama_cpp_update.yml",
+        ),
+        "the JS build gate, browser smoke expectations, and pinned toolchain policies",
         errors,
     )
-    require(
-        "solo-maintainer publication contract does not require a reviewer rule" in agents_publication
-        and "custom deployment branches to `main`" in agents_publication
-        and "`WEBGPU_BRIDGE_ASSETS_PAT` as an environment-scoped secret" in agents_publication
-        and "Use the default job token to validate the environment identity" in agents_publication
-        and "fail closed unless" in agents_publication
-        and "without printing its value" in agents_publication
-        and "pinned repository-owner maintainer reviewer" not in agents_publication
-        and "required_reviewers" not in agents_publication
-        and "prevent_self_review" not in agents_publication
-        and "bypass and self-review" not in agents_publication
-        and "Require the reviewer inventory" not in agents_publication
-        and "Revalidate the bypass, reviewer" not in agents_publication,
-        "AGENTS.md publish guidance must preserve the solo-maintainer PAT/main-only contract without pinned-reviewer, self-review, quorum, or reviewer-revalidation requirements",
+    require_doc_facts(
+        "AGENTS.md",
+        "Change Boundaries",
+        markdown_section("AGENTS.md", agents, "Change Boundaries", errors),
+        (
+            "source code in `js/src/`",
+            "generated bridge wrapper outputs and declaration "
+            "(`js/llama_webgpu_bridge.js`, `js/llama_webgpu_bridge_worker.js`, "
+            "`js/llama_webgpu_bridge.d.ts`) are regenerated by `npm run check:js`",
+            "never hand-edit them",
+        ),
+        "that the bridge wrapper outputs are generated from js/src/ by npm run check:js",
+        errors,
+        unit="item",
+    )
+    require_doc_facts(
+        "AGENTS.md",
+        "Agent PR Workflow",
+        markdown_section("AGENTS.md", agents, "Agent PR Workflow", errors),
+        ("independent review before committing",),
+        "the independent review step of the agent PR workflow",
         errors,
     )
+    # AGENTS.md Publish workflow: the solo-maintainer PAT/main-only publication
+    # contract. Each phrase holds one relation of the contract.
+    for facts, purpose in (
+        (
+            (
+                "creates `bridge-assets-publication`",
+                "disables administrator bypass",
+                "restricts custom deployment branches to `main`",
+                "stores `WEBGPU_BRIDGE_ASSETS_PAT` as an environment-scoped secret",
+            ),
+            "the externally configured publication environment",
+        ),
+        (
+            ("solo-maintainer publication contract does not require a reviewer rule",),
+            "that the solo-maintainer publication contract requires no reviewer rule",
+        ),
+        (
+            (
+                "default job token to validate the environment identity",
+                "exact `main` branch policy before approval and again after approval",
+            ),
+            "the default-token environment validation before and after approval",
+        ),
+        (
+            (
+                "fail closed unless the injected credential is non-empty",
+                "without printing its value",
+            ),
+            "the fail-closed, non-printing publication PAT guard",
+        ),
+    ):
+        require_doc_facts(
+            "AGENTS.md",
+            "Publish workflow",
+            agents_publication,
+            facts,
+            purpose,
+            errors,
+            unit="item",
+        )
     require(
-        "FORCE_JAVASCRIPT_ACTIONS_TO_NODE24" in readme
-        and "npm run check:js" in readme
-        and "js/src/llama_webgpu_bridge.js" in readme
-        and "llama_webgpu_bridge.d.ts" in readme
-        and "docs/api.md" in readme
-        and "state-persistence-smoke-artifacts" in readme
-        and "multimodal-smoke-artifacts" in readme
-        and "scripts/multimodal_browser_smoke.py" in readme
-        and "scripts/speech_to_text_browser_smoke.py" in readme
-        and "scripts/text_to_speech_browser_smoke.py" in readme
-        and "scripts/decision_browser_smoke.py" in readme
-        and "scripts/verify_ci_reliability.py" in readme
-        and "llama_cpp.version" in readme
-        and "emsdk.version" in readme
-        and "auto_llama_cpp_update.yml" in readme,
-        "README.md must document the public API reference, CI reliability, JS build/type-checking, diagnostics, and pinned toolchain automation",
+        all(
+            obsolete not in agents
+            for obsolete in (
+                "pinned repository-owner maintainer reviewer",
+                "required_reviewers",
+                "prevent_self_review",
+                "bypass and self-review",
+                "Require the reviewer inventory",
+                "Revalidate the bypass, reviewer",
+            )
+        ),
+        "AGENTS.md publish guidance must not reintroduce pinned-reviewer, self-review, quorum, or reviewer-revalidation requirements",
+        errors,
+    )
+    require_doc_facts(
+        "README.md",
+        "",
+        readme,
+        (
+            "FORCE_JAVASCRIPT_ACTIONS_TO_NODE24",
+            "npm run check:js",
+            "js/src/llama_webgpu_bridge.js",
+            "llama_webgpu_bridge.d.ts",
+            "docs/api.md",
+            "state-persistence-smoke-artifacts",
+            "multimodal-smoke-artifacts",
+            "scripts/multimodal_browser_smoke.py",
+            "scripts/speech_to_text_browser_smoke.py",
+            "scripts/text_to_speech_browser_smoke.py",
+            "scripts/decision_browser_smoke.py",
+            "scripts/verify_ci_reliability.py",
+            "llama_cpp.version",
+            "emsdk.version",
+            "auto_llama_cpp_update.yml",
+        ),
+        "the public API reference, CI reliability, JS build/type-checking, "
+        "diagnostics, and pinned toolchain automation",
         errors,
     )
     for api_name in (
@@ -2814,29 +3149,51 @@ def main() -> int:
             f"docs/api.md must document the public JavaScript API member: {api_name}",
             errors,
         )
-    require(
-        "worker" in api_docs.lower()
-        and "direct runtime" in api_docs.lower()
-        and "llama_webgpu_bridge.d.ts" in api_docs
-        and "state persistence" in api_docs.lower(),
-        "docs/api.md must explain declarations, worker/direct runtime behavior, and state persistence semantics",
+    require_doc_facts(
+        "docs/api.md",
+        "",
+        api_docs,
+        ("llama_webgpu_bridge.d.ts",),
+        "the declaration file",
         errors,
     )
-    require(
-        "Agent Workflow Guardrails" in contributing
-        and "npm run check:js" in contributing
-        and "js/src/" in contributing
-        and "scripts/verify_ci_reliability.py" in contributing
-        and "scripts/multimodal_browser_smoke.py" in contributing
-        and "scripts/speech_to_text_browser_smoke.py" in contributing
-        and "scripts/text_to_speech_browser_smoke.py" in contributing
-        and "scripts/decision_browser_smoke.py" in contributing
-        and "python3 scripts/verify_decision_api.py" in contributing
-        and "--model-sha256" in contributing
-        and "--mmproj-sha256" in contributing
-        and "llama_cpp.version" in contributing
-        and "emsdk.version" in contributing,
-        "CONTRIBUTING.md must document JS build/type-checking, maintainer/agent workflow guardrails, checksum-pinned smoke usage, and toolchain pin handling",
+    require_doc_facts(
+        "docs/api.md",
+        "",
+        api_docs,
+        ("worker", "direct runtime", "state persistence"),
+        "worker/direct runtime behavior and state persistence semantics",
+        errors,
+        ignore_case=True,
+    )
+    require_doc_facts(
+        "CONTRIBUTING.md",
+        "Agent Workflow Guardrails",
+        markdown_section(
+            "CONTRIBUTING.md", contributing, "Agent Workflow Guardrails", errors
+        ),
+        ("scripts/verify_ci_reliability.py",),
+        "the maintainer/agent workflow guardrails",
+        errors,
+    )
+    require_doc_facts(
+        "CONTRIBUTING.md",
+        "",
+        contributing,
+        (
+            "npm run check:js",
+            "js/src/",
+            "scripts/multimodal_browser_smoke.py",
+            "scripts/speech_to_text_browser_smoke.py",
+            "scripts/text_to_speech_browser_smoke.py",
+            "scripts/decision_browser_smoke.py",
+            "python3 scripts/verify_decision_api.py",
+            "--model-sha256",
+            "--mmproj-sha256",
+            "llama_cpp.version",
+            "emsdk.version",
+        ),
+        "JS build/type-checking, checksum-pinned smoke usage, and toolchain pin handling",
         errors,
     )
     for relative_path, content in (("README.md", readme), ("AGENTS.md", agents)):
