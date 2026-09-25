@@ -159,6 +159,9 @@ jobs:
         uses: mymindstorm/setup-emsdk@v14
         with:
           version: ${{ env.EMSCRIPTEN_VERSION }}
+          # A fixed install path keeps compiler and sysroot paths identical
+          # across runs; the default random temp path defeats ccache.
+          actions-cache-folder: .emsdk-cache
 
       - name: Verify resolved Emscripten compiler
         run: python3 scripts/verify_emscripten_version.py --emit-github-env "$GITHUB_ENV"
