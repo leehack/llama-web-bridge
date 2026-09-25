@@ -180,14 +180,15 @@ This repo includes a wasm build gate in:
 
 - `.github/workflows/ci.yml`
 
-It builds wasm32 and memory64 against both the pinned `llama.cpp` tag in
-`llama_cpp.version` and the exact v0.4.0 compatibility revision. Both lanes run
-the JS/compatibility contracts and real state-persistence and multimodal browser
-smokes. A lane that succeeds uploads its seven built files as
-`webgpu-bridge-dist` (pinned lane) or `webgpu-bridge-dist-v0.4.0`; a lane that
-fails uploads no dist and instead `state-persistence-smoke-artifacts-<lane>`
-and `multimodal-smoke-artifacts-<lane>` (`<lane>` is `pinned` or `v0.4.0`)
-when those directories exist. Neither lane changes a pin or publishes assets.
+After the JS/compatibility contracts pass, it builds wasm32 and memory64 against
+the pinned `llama.cpp` tag in `llama_cpp.version` and runs real
+state-persistence, multimodal, grammar and next-token-score browser smokes. A
+successful run uploads its seven built files as `webgpu-bridge-dist`; a failed
+run uploads no dist and instead the smoke diagnostics that exist
+(`state-persistence-smoke-artifacts`, `multimodal-smoke-artifacts`,
+`grammar-smoke-artifacts`, `next-token-scores-smoke-artifacts`). CI never
+changes a pin or publishes assets. Builds against llama.cpp v0.4.0 are no longer
+tested in CI.
 To run the media-helper and static CI contracts locally:
 
 ```bash
@@ -234,9 +235,9 @@ are easy to regress during agent-driven maintenance:
   cancellation, immediate reuse, and PCM/WAV validation;
 - the CI model cache path expands `~` before resolving so it matches the
   `actions/cache` directory;
-- browser smoke failures upload `state-persistence-smoke-artifacts-<lane>` with
+- browser smoke failures upload `state-persistence-smoke-artifacts` with
   console logs, result JSON, and screenshots when available, plus
-  `multimodal-smoke-artifacts-<lane>` for vision failures.
+  `multimodal-smoke-artifacts` for vision failures.
 
 Run `scripts/state_persistence_browser_smoke.py` locally after building the
 bridge if a change touches state persistence, workers, browser smoke, or

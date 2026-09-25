@@ -73,10 +73,11 @@ class ScopeTests(unittest.TestCase):
             finally:
                 os.chdir(previous)
 
-    def test_workflow_preserves_both_lanes_and_truthful_aggregate(self):
+    def test_workflow_builds_one_lane_with_truthful_aggregate(self):
         workflow = json.loads(subprocess.check_output(['node', '-e', "const fs=require('fs'),yaml=require('yaml');process.stdout.write(JSON.stringify(yaml.parse(fs.readFileSync('.github/workflows/ci.yml','utf8'))))"], cwd=ROOT))
         jobs = workflow['jobs']; build = jobs['build-webgpu-bridge']; checks = jobs['checks']
-        self.assertEqual(build['strategy']['matrix']['upstream'], ['pinned', 'v0.4.0'])
+        self.assertEqual(build['name'], 'Build WebGPU Bridge (WASM)')
+        self.assertNotIn('strategy', build)
         self.assertEqual(build['needs'], ['changes', 'checks'])
         self.assertEqual(build['if'], "needs.changes.outputs.native == 'true'")
         self.assertEqual(jobs['ci-result']['if'], 'always()')

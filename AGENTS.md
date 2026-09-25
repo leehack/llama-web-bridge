@@ -79,16 +79,16 @@ GGUFs or smoke artifacts.
 ## CI / Release
 
 - CI build gate: `.github/workflows/ci.yml`
-  - Builds wasm32/memory64 against the `llama_cpp.version` pin and exact v0.4.0
-    in separate matrix lanes (`upstream: pinned` / `v0.4.0`). Preserve the
-    original pinned check/artifact identities (`Build WebGPU Bridge (WASM)`,
-    `webgpu-bridge-dist`) and keep each lane's diagnostics uploads suffixed by
-    lane. Neither lane publishes or changes the source pin.
+  - Builds wasm32/memory64 against the `llama_cpp.version` pin in one lane.
+    Preserve its check/artifact identities (`Build WebGPU Bridge (WASM)`,
+    `webgpu-bridge-dist`). It neither publishes nor changes the source pin.
+    Builds against llama.cpp v0.4.0 are no longer tested in CI; the
+    `src/llama_webgpu_mtmd_compat.h` shim and its static contract remain.
   - Verifies the active `emcc` identity against `emsdk.version` and
     contract-tests all five required wasm64 WASMFS patches.
   - `scripts/ci_scope.py` lets `README.md`, `CONTRIBUTING.md`, `LICENSE`, and
-    `docs/*.md` changes skip the build lanes; `AGENTS.md` is not in that
-    allowlist, so editing it still runs them.
+    `docs/*.md` changes skip the build lane; `AGENTS.md` is not in that
+    allowlist, so editing it still runs it.
 - Candidate build: `.github/workflows/bridge_candidate.yml`
   - The only workflow that builds publishable assets. It uploads the bundle as
     `exact-webgpu-bridge-dist`, which qualification and publication download by

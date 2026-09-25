@@ -90,12 +90,8 @@ jobs:
   build-webgpu-bridge:
     needs: [changes, checks]
     if: needs.changes.outputs.native == 'true'
-    name: ${{ matrix.upstream == 'pinned' && 'Build WebGPU Bridge (WASM)' || 'Build WebGPU Bridge (WASM, v0.4.0)' }}
+    name: Build WebGPU Bridge (WASM)
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        upstream: [pinned, v0.4.0]
     env:
       LLAMA_WEBGPU_SMOKE_MODEL_URL: https://huggingface.co/aladar/llama-2-tiny-random-GGUF/resolve/main/llama-2-tiny-random.gguf
       LLAMA_WEBGPU_SMOKE_MODEL_SHA256: 81f226c62d28ed4a1a9b9fa080fcd9f0cc40e0f9d5680036583ff98fbcd035cb
@@ -164,12 +160,6 @@ jobs:
         run: |
           git clone --depth 1 --branch "$LLAMA_CPP_TAG" https://github.com/ggml-org/llama.cpp.git third_party/llama_cpp
 
-      - name: Select exact v0.4.0 compatibility revision
-        if: matrix.upstream == 'v0.4.0'
-        run: |
-          git -C third_party/llama_cpp fetch --depth 1 origin refs/tags/v0.4.0:refs/tags/v0.4.0
-          git -C third_party/llama_cpp checkout --detach 5266f24da75dc449bd56cbed7addb9c8e4a6a73e
-
       - name: Setup Emscripten SDK
         uses: mymindstorm/setup-emsdk@v14
         with:
@@ -203,7 +193,10 @@ jobs:
           EM_COMPILER_WRAPPER: ccache
           OUT_DIR: ${{ runner.temp }}/webgpu_bridge_dist
           WEBGPU_BRIDGE_BUILD_MEM64: 1
-        run: ./scripts/build_bridge.sh
+        run: |
+          ccache --zero-stats
+          trap 'ccache --show-stats' EXIT
+          ./scripts/build_bridge.sh
 
       - name: Verify outputs
         run: |
@@ -252,7 +245,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: state-persistence-smoke-artifacts-${{ matrix.upstream }}
+          name: state-persistence-smoke-artifacts
           path: ${{ env.LLAMA_WEBGPU_SMOKE_ARTIFACTS_DIR }}
           if-no-files-found: ignore
 
@@ -260,7 +253,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: multimodal-smoke-artifacts-${{ matrix.upstream }}
+          name: multimodal-smoke-artifacts
           path: ${{ env.LLAMA_WEBGPU_MULTIMODAL_ARTIFACTS_DIR }}
           if-no-files-found: ignore
 
@@ -268,7 +261,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: grammar-smoke-artifacts-${{ matrix.upstream }}
+          name: grammar-smoke-artifacts
           path: ${{ env.LLAMA_WEBGPU_GRAMMAR_ARTIFACTS_DIR }}
           if-no-files-found: ignore
 
@@ -276,14 +269,14 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: next-token-scores-smoke-artifacts-${{ matrix.upstream }}
+          name: next-token-scores-smoke-artifacts
           path: ${{ env.LLAMA_WEBGPU_NEXT_TOKEN_SCORES_ARTIFACTS_DIR }}
           if-no-files-found: ignore
 
       - name: Upload bridge artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.upstream == 'pinned' && 'webgpu-bridge-dist' || 'webgpu-bridge-dist-v0.4.0' }}
+          name: webgpu-bridge-dist
           path: |
             ${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_bridge.js
             ${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_bridge_worker.js

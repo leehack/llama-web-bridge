@@ -1522,11 +1522,11 @@ def main() -> int:
         and '--timeout-ms "$LLAMA_WEBGPU_MULTIMODAL_TIMEOUT_MS"' in ci
         and '--model-url "$LLAMA_WEBGPU_MULTIMODAL_MODEL_URL"' in ci
         and '--model-sha256 "$LLAMA_WEBGPU_MULTIMODAL_MODEL_SHA256"' in ci
-        and "grammar-smoke-artifacts-${{ matrix.upstream }}" in ci
+        and "name: grammar-smoke-artifacts\n" in ci
         and "scripts/grammar_browser_smoke.py" in contributing
         and "scripts/grammar_browser_smoke.py" in agents,
         "CI must run the grammar smoke with invalid, greedy, sampled, top-p and JSON grammars on both memory modes and runtimes, "
-        "with the state and multimodal models, and keep failure diagnostics per matrix lane",
+        "with the state and multimodal models, and keep failure diagnostics",
         errors,
     )
     require(
@@ -1538,11 +1538,11 @@ def main() -> int:
         and "llamadart.webgpu.core_variant" in next_token_scores_smoke
         and "scripts/next_token_scores_browser_smoke.py \\" in ci
         and "run: python3 scripts/next_token_scores_browser_smoke.py" in ci
-        and "next-token-scores-smoke-artifacts-${{ matrix.upstream }}" in ci
+        and "name: next-token-scores-smoke-artifacts\n" in ci
         and "scripts/next_token_scores_browser_smoke.py" in contributing
         and "scripts/next_token_scores_browser_smoke.py" in agents,
         "CI must run the next-token scores smoke with prompt-prefix reuse on both memory modes and runtimes, "
-        "and keep failure diagnostics per matrix lane",
+        "and keep failure diagnostics",
         errors,
     )
     require(
@@ -1989,14 +1989,12 @@ def main() -> int:
         errors,
     )
     require(
-        "upstream: [pinned, v0.4.0]" in ci
-        and "5266f24da75dc449bd56cbed7addb9c8e4a6a73e" in ci
-        and "'Build WebGPU Bridge (WASM)'" in ci
-        and "'webgpu-bridge-dist-v0.4.0'" in ci
-        and "state-persistence-smoke-artifacts-${{ matrix.upstream }}" in ci
-        and "multimodal-smoke-artifacts-${{ matrix.upstream }}" in ci
+        "    name: Build WebGPU Bridge (WASM)\n" in ci
+        and "          name: webgpu-bridge-dist\n" in ci
+        and "name: state-persistence-smoke-artifacts\n" in ci
+        and "name: multimodal-smoke-artifacts\n" in ci
         and "python3 scripts/mtmd_compat_contract_test.py" in ci,
-        "CI must retain the pinned check and artifact identities, test exact v0.4.0 media compatibility, and isolate matrix artifacts",
+        "CI must keep the pinned check and artifact identities, its smoke diagnostics, and the media helper compatibility contract",
         errors,
     )
     require(

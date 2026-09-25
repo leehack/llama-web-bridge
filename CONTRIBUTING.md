@@ -451,7 +451,7 @@ Transport dispatch inputs through `env` and use quoted shell expansions.
 CI always runs the shared JS and workflow contracts. An explicit allowlist in
 `scripts/ci_scope.py` lets known documentation and tooling-only changes avoid the
 WASM builds. Runtime JS, C++, browser harnesses, build inputs, workflows, pins,
-and unknown paths retain both the pinned and v0.4.0 build/smoke lanes. Rename and
+and unknown paths retain the pinned build/smoke lane. Rename and
 deletion comparisons include both paths. The `CI validation` result always
 reports and rejects failed, cancelled, missing, or unexpectedly skipped work.
 Only superseded PR runs are cancelled; main/manual runs remain independent.
@@ -460,7 +460,7 @@ The CI compiler cache stores objects outside the checkout, separated by runner
 OS/architecture, exact Emscripten version, resolved llama.cpp commit, and build
 script/CMake/patch inputs. ccache also checks compiler contents, source inputs,
 and compile flags. Every selected build still links fresh artifacts and runs
-both existing browser smokes. Candidate and publication workflows do not consume
+every CI browser smoke. Candidate and publication workflows do not consume
 this cache or this change selector, so `scripts/ci_scope.py` is listed in
 `_ORCHESTRATION_ONLY_PATHS` in `scripts/stable_release_orchestrator.py`. List any
 new CI-only script there too: an unclassified path is governed by default and
