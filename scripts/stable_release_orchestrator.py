@@ -195,6 +195,7 @@ _ORCHESTRATION_ONLY_PATHS = frozenset(
         "CONTRIBUTING.md",
         "LICENSE",
         "README.md",
+        "scripts/bridge_js_source.py",
         "scripts/bridge_operation_queue_direct_cases.mjs",
         "scripts/bridge_operation_queue_fixtures.mjs",
         "scripts/bridge_operation_queue_lifecycle_contract_cases.mjs",

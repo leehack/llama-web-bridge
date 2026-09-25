@@ -1,0 +1,31 @@
+"""Bridge JS source text for the static API contract checks.
+
+js/src/llama_webgpu_bridge.js is only the public entry; the implementation
+lives in the modules it imports. The checks read every module, joined in the
+order the former single-file source declared them (helpers, worker host and
+proxy, direct runtime, facade), so multi-token patterns keep their scope. A
+missing listed module raises instead of silently narrowing a check.
+"""
+from __future__ import annotations
+
+from pathlib import Path
+
+_ORDERED_MODULES = (
+    "worker_protocol.js",
+    "worker_host.js",
+    "worker_proxy.js",
+    "runtime.js",
+    "bridge.js",
+    "llama_webgpu_bridge.js",
+)
+
+
+def bridge_js_source(root: Path) -> str:
+    source_dir = root / "js" / "src"
+    internal = sorted((source_dir / "internal").glob("*.js"))
+    ordered = [source_dir / name for name in _ORDERED_MODULES]
+    listed = {*internal, *ordered}
+    remaining = sorted(path for path in source_dir.rglob("*.js") if path not in listed)
+    return "\n".join(
+        path.read_text(encoding="utf-8") for path in (*internal, *ordered, *remaining)
+    )

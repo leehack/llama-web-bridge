@@ -9,6 +9,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+from bridge_js_source import bridge_js_source
 from release_contract import ContractError, parse_upstream_tag
 from release_qualification import EXPECTED_MODEL_PINS
 
@@ -1016,7 +1017,12 @@ def main() -> int:
     js_build = read_required("scripts/build_js_bridge.mjs", errors)
     package_json = read_required("package.json", errors)
     tsconfig = read_required("tsconfig.bridge.json", errors)
-    js_source = read_required("js/src/llama_webgpu_bridge.js", errors)
+    js_entry = read_required("js/src/llama_webgpu_bridge.js", errors)
+    try:
+        js_source = bridge_js_source(ROOT)
+    except OSError as exc:
+        errors.append(f"bridge JS modules are not readable: {exc}")
+        js_source = ""
     js_output = read_required("js/llama_webgpu_bridge.js", errors)
     js_dts = read_required("js/llama_webgpu_bridge.d.ts", errors)
     cmake = read_required("CMakeLists.txt", errors)
@@ -1337,7 +1343,8 @@ def main() -> int:
         errors,
     )
     require(
-        "export class LlamaWebGpuBridge" in js_source
+        "export { LlamaWebGpuBridge, enableBridgeWorkerHost };" in js_entry
+        and "export class LlamaWebGpuBridge {" in js_source
         and "export function enableBridgeWorkerHost" in js_source,
         "js/src/llama_webgpu_bridge.js must remain the source of the public bridge exports",
         errors,

@@ -12,6 +12,7 @@ TOOLING = frozenset({
     'scripts/stable_release_orchestrator.py', 'scripts/stable_release_orchestrator_test.py',
     'scripts/release_qualification_test.py', 'scripts/release_contract_test.py',
     'scripts/generate_release_manifest_test.py',
+    'scripts/bridge_js_source.py',
     'scripts/verify_state_persistence_api.py', 'scripts/verify_text_to_speech_api.py',
     'scripts/verify_decision_api.py', 'tests/js/decision_bridge_contract_test.mjs',
     'scripts/verify_ci_reliability.py', 'scripts/verify_ci_reliability_pin_test.py',

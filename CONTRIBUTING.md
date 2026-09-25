@@ -41,6 +41,14 @@ checked-in browser ESM outputs and declarations under `js/`. `npm run check:js`
 runs the same generator plus TypeScript and syntax checks, so commit any updated
 `js/` outputs after source changes.
 
+`js/src/llama_webgpu_bridge.js` is the public entry. It re-exports the API and
+owns the only load-time side effects (worker host auto-boot and the
+`window.LlamaWebGpuBridge` global); every other module is side-effect free.
+`bridge.js` is the facade, `runtime.js` the direct runtime, `worker_proxy.js`,
+`worker_host.js`, and `worker_protocol.js` the worker path, and `internal/`
+holds shared helpers. Keep `bridge.js` beside `llama_webgpu_bridge_worker.js`:
+it resolves the worker entry relative to `import.meta.url`.
+
 For local agent/maintainer validation, prefer external build and cache paths so
 generated files do not dirty the checkout:
 

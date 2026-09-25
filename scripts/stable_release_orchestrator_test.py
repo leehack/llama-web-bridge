@@ -591,6 +591,7 @@ class BridgeSourceIdentityTest(unittest.TestCase):
             ".github/workflows/auto_llama_cpp_update.yml",
             "README.md",
             "docs/api.md",
+            "scripts/bridge_js_source.py",
             "scripts/bridge_operation_queue_direct_cases.mjs",
             "scripts/bridge_operation_queue_fixtures.mjs",
             "scripts/bridge_operation_queue_lifecycle_contract_cases.mjs",
