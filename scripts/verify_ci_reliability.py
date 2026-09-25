@@ -10,6 +10,7 @@ import sys
 from pathlib import Path
 
 from bridge_js_source import bridge_js_source
+from native_core_source import native_core_source
 from release_contract import ContractError, parse_upstream_tag
 from release_qualification import EXPECTED_MODEL_PINS
 
@@ -1080,7 +1081,11 @@ def main() -> int:
     js_output = read_required("js/llama_webgpu_bridge.js", errors)
     js_dts = read_required("js/llama_webgpu_bridge.d.ts", errors)
     cmake = read_required("CMakeLists.txt", errors)
-    core = read_required("src/llama_webgpu_core.cpp", errors)
+    try:
+        core = native_core_source(ROOT)
+    except (OSError, ValueError) as exc:
+        errors.append(f"C++ core sources cannot be read with their parts expanded: {exc}")
+        core = ""
     version_contents = read_required("llama_cpp.version", errors)
     version = (
         version_contents[:-1]

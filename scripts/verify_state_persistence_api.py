@@ -8,9 +8,10 @@ import sys
 from pathlib import Path
 
 from bridge_js_source import bridge_js_source
+from native_core_source import native_core_source
 
 ROOT = Path(__file__).resolve().parents[1]
-SRC = (ROOT / "src" / "llama_webgpu_core.cpp").read_text(encoding="utf-8")
+SRC = native_core_source(ROOT)
 JS = bridge_js_source(ROOT)
 CMAKE = (ROOT / "CMakeLists.txt").read_text(encoding="utf-8")
 README = (ROOT / "README.md").read_text(encoding="utf-8")

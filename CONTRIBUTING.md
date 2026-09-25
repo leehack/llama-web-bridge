@@ -63,6 +63,18 @@ converted modules by their `.ts` path.
 Keep `bridge.js` beside `llama_webgpu_bridge_worker.js`: it resolves the worker
 entry relative to `import.meta.url`.
 
+The native core is one translation unit. `src/llama_webgpu_core.cpp` holds the
+headers, the anonymous namespace, the `extern "C"` block with
+`llamadart_webgpu_shutdown`, and `main`, and includes its parts from `src/core/`
+inside the namespace and the block. The `exports_*.inc` parts hold the other
+exported `llamadart_webgpu_*` functions grouped by feature; the remaining parts
+hold the state and internal helpers they use. A part is not a standalone file:
+it relies on everything included before it, so keep the include order. The
+static contract checks read the core with its parts expanded
+(`scripts/native_core_source.py` and its JS twin
+`tests/js/native_core_source.mjs`), which is how the compiler sees it. Both fail
+if a part is not included exactly once as a plain `#include` line.
+
 For local agent/maintainer validation, prefer external build and cache paths so
 generated files do not dirty the checkout:
 

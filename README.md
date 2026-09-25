@@ -4,7 +4,8 @@ Reusable llama.cpp web bridge runtime (JS + WASM).
 
 This repository provides:
 
-- `src/llama_webgpu_core.cpp` (native bridge core)
+- `src/llama_webgpu_core.cpp` (native bridge core; it includes its parts from
+  `src/core/`)
 - `js/src/llama_webgpu_bridge.js` (JS runtime wrapper entry; its modules live
   under `js/src/`)
 - `js/llama_webgpu_bridge.js` (generated bundled browser ESM wrapper)
@@ -30,7 +31,7 @@ Requirements:
   `npm run check:js`)
 - llama.cpp source checkout matching `llama_cpp.version` or a compatible checkout exposing
   `llama_state_save_file` / `llama_state_load_file` with the signatures used by
-  `src/llama_webgpu_core.cpp`
+  the native core (`src/llama_webgpu_core.cpp` and `src/core/`)
 
 Build command:
 

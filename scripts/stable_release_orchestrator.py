@@ -201,6 +201,7 @@ _ORCHESTRATION_ONLY_PATHS = frozenset(
         "scripts/bridge_operation_queue_lifecycle_contract_cases.mjs",
         "scripts/bridge_operation_queue_worker_proxy_cases.mjs",
         "scripts/ci_scope.py",
+        "scripts/native_core_source.py",
         "scripts/release_publication_state.py",
         "scripts/release_qualification.py",
         "scripts/stable_release_orchestrator.py",
@@ -215,6 +216,7 @@ _ORCHESTRATION_ONLY_PATHS = frozenset(
         "tests/js/bridge_operation_queue_fixtures.mjs",
         "tests/js/bridge_operation_queue_lifecycle_contract_cases.mjs",
         "tests/js/bridge_operation_queue_worker_proxy_cases.mjs",
+        "tests/js/native_core_source.mjs",
     }
 )
 _ORCHESTRATION_ONLY_PREFIXES = ("docs/",)

@@ -8,9 +8,10 @@ import sys
 from pathlib import Path
 
 from bridge_js_source import bridge_js_source, method_body
+from native_core_source import native_core_source
 
 ROOT = Path(__file__).resolve().parents[1]
-CORE = (ROOT / "src" / "llama_webgpu_core.cpp").read_text(encoding="utf-8")
+CORE = native_core_source(ROOT)
 TTS = (ROOT / "src" / "llama_webgpu_tts.cpp").read_text(encoding="utf-8")
 HEADER = (ROOT / "src" / "llama_webgpu_tts.h").read_text(encoding="utf-8")
 JS = bridge_js_source(ROOT)

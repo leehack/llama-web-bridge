@@ -13,14 +13,9 @@ import {
   withStubWorkerEnvironment,
   workerDriver,
 } from './bridge_operation_queue_fixtures.mjs';
-
-import { readFileSync } from 'node:fs';
-import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { readNativeCoreSource } from './native_core_source.mjs';
 
 import { LlamaWebGpuBridge } from '../../js/src/llama_webgpu_bridge.js';
-
-const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 
 export const LIFECYCLE_CONTRACT_CASES = [
   [16, 'dispose rejects queued work and tears down after the active owner (direct)', async () => {
@@ -208,7 +203,7 @@ export const LIFECYCLE_CONTRACT_CASES = [
   }],
 
   [21, 'C++ begin_generation guard rejects before destroying state', async () => {
-    const core = readFileSync(path.join(rootDir, 'src/llama_webgpu_core.cpp'), 'utf8');
+    const core = readNativeCoreSource();
     const start = core.indexOf('int32_t begin_generation_impl(');
     assert.ok(start > 0, 'begin_generation_impl must exist');
     const body = core.slice(start, core.indexOf('\n}\n', start));

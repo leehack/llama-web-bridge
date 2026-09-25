@@ -598,6 +598,7 @@ class BridgeSourceIdentityTest(unittest.TestCase):
             "scripts/bridge_operation_queue_worker_proxy_cases.mjs",
             "scripts/ci_scope.py",
             "scripts/ci_scope_test.py",
+            "scripts/native_core_source.py",
             "scripts/release_qualification.py",
             "scripts/stable_release_orchestrator_test.py",
             "scripts/worker_runtime_state_test.mjs",
@@ -605,6 +606,7 @@ class BridgeSourceIdentityTest(unittest.TestCase):
             "tests/js/bridge_operation_queue_fixtures.mjs",
             "tests/js/bridge_operation_queue_lifecycle_contract_cases.mjs",
             "tests/js/bridge_operation_queue_worker_proxy_cases.mjs",
+            "tests/js/native_core_source.mjs",
             "tests/js/worker_runtime_state_test.mjs",
         ):
             with self.subTest(path=path):
@@ -619,6 +621,8 @@ class BridgeSourceIdentityTest(unittest.TestCase):
             "scripts/release_contract.py",
             "scripts/verify_emscripten_version.py",
             "src/llama_webgpu_core.cpp",
+            "src/core/exports_tts.inc",
+            "src/core/new_part.inc",
             "tests/js/new_fixture.mjs",
             "tests/new_build_input.mjs",
             "unknown/new-build-input.cfg",

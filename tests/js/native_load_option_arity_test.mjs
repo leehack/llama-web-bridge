@@ -4,9 +4,10 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { LlamaWebGpuBridge } from '../../js/src/llama_webgpu_bridge.js';
+import { readNativeCoreSource } from './native_core_source.mjs';
 
 const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
-const coreSource = readFileSync(path.join(rootDir, 'src/llama_webgpu_core.cpp'), 'utf8');
+const coreSource = readNativeCoreSource();
 const bridgeSources = {
   'js/src/runtime.js': readFileSync(
     path.join(rootDir, 'js/src/runtime.js'),
