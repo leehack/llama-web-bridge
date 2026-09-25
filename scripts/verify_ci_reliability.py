@@ -980,27 +980,27 @@ def main() -> int:
         ".github/workflows/bridge_qualification.yml", errors
     )
     candidate = read_required(".github/workflows/bridge_candidate.yml", errors)
-    embedding_contract = read_required("scripts/embedding_json_contract_test.mjs", errors)
+    embedding_contract = read_required("tests/js/embedding_json_contract_test.mjs", errors)
     worker_token_contract = read_required(
-        "scripts/worker_token_coalescing_test.mjs", errors
+        "tests/js/worker_token_coalescing_test.mjs", errors
     )
     worker_state_contract = read_required(
-        "scripts/worker_runtime_state_test.mjs", errors
+        "tests/js/worker_runtime_state_test.mjs", errors
     )
     operation_queue_contract = read_required(
-        "scripts/bridge_operation_queue_test.mjs", errors
+        "tests/js/bridge_operation_queue_test.mjs", errors
     )
     operation_lifecycle_contract = read_required(
-        "scripts/bridge_operation_lifecycle_test.mjs", errors
+        "tests/js/bridge_operation_lifecycle_test.mjs", errors
     )
     native_load_arity_contract = read_required(
-        "scripts/native_load_option_arity_test.mjs", errors
+        "tests/js/native_load_option_arity_test.mjs", errors
     )
     model_reload_contract = read_required(
-        "scripts/model_reload_contract_test.mjs", errors
+        "tests/js/model_reload_contract_test.mjs", errors
     )
     worker_error_classification_contract = read_required(
-        "scripts/bridge_worker_error_classification_test.mjs", errors
+        "tests/js/bridge_worker_error_classification_test.mjs", errors
     )
     ci = read_required(".github/workflows/ci.yml", errors)
     publish = read_required(".github/workflows/publish_assets.yml", errors)
@@ -1047,7 +1047,7 @@ def main() -> int:
             "scripts/stable_release_orchestrator_test.py", errors
         )
     workflow_input_transport = read_required(
-        "scripts/workflow_input_transport_test.mjs", errors
+        "tests/js/workflow_input_transport_test.mjs", errors
     )
     agents_publication = extract_section(
         "AGENTS.md",
@@ -1101,7 +1101,7 @@ def main() -> int:
             errors,
         )
     transport_result = subprocess.run(
-        ["node", "scripts/workflow_input_transport_test.mjs"],
+        ["node", "tests/js/workflow_input_transport_test.mjs"],
         cwd=ROOT,
         check=False,
         capture_output=True,

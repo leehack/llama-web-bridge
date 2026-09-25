@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 
-import { LlamaWebGpuBridge } from '../js/src/llama_webgpu_bridge.js';
+import { LlamaWebGpuBridge } from '../../js/src/llama_webgpu_bridge.js';
 
 const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
 

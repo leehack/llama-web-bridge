@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import {
   LlamaWebGpuBridge,
   enableBridgeWorkerHost,
-} from '../js/src/llama_webgpu_bridge.js';
+} from '../../js/src/llama_webgpu_bridge.js';
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();

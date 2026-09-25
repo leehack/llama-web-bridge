@@ -20,7 +20,7 @@ API_DOCS_FLAT = " ".join(API_DOCS.split())
 SMOKE = (ROOT / "scripts" / "text_to_speech_browser_smoke.py").read_text(
     encoding="utf-8"
 )
-RECOVERY_TEST = (ROOT / "scripts" / "text_to_speech_recovery_test.mjs").read_text(
+RECOVERY_TEST = (ROOT / "tests" / "js" / "text_to_speech_recovery_test.mjs").read_text(
     encoding="utf-8"
 )
 

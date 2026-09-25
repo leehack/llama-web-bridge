@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const temporaryDir = mkdtempSync(path.join(tmpdir(), 'llama-web-bridge-embedding-json-'));
 const sourcePath = path.join(temporaryDir, 'embedding_json_contract_test.cpp');
 const executablePath = path.join(temporaryDir, 'embedding_json_contract_test');

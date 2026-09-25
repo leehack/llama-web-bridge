@@ -1,5 +1,5 @@
 
-import { LlamaWebGpuBridge } from '../js/src/llama_webgpu_bridge.js';
+import { LlamaWebGpuBridge } from '../../js/src/llama_webgpu_bridge.js';
 
 // Public async methods intentionally stay off the single-writer queue.
 export const UNQUEUED_ASYNC_METHODS = new Map([

@@ -96,7 +96,7 @@ jobs:
       - name: Validate release orchestration and CI selection
         run: |
           python3 -m unittest discover -s scripts -p '*_test.py'
-          node scripts/workflow_input_transport_test.mjs
+          node tests/js/workflow_input_transport_test.mjs
 
   build-webgpu-bridge:
     needs: [changes, checks]

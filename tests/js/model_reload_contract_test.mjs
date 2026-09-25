@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 
-import { LlamaWebGpuBridge } from '../js/src/llama_webgpu_bridge.js';
+import { LlamaWebGpuBridge } from '../../js/src/llama_webgpu_bridge.js';
 
 // Mirrors the generated WASMFS glue: every failure is an ErrnoError whose
 // message is the bare "FS error", and analyzePath() reads the entry it finds.

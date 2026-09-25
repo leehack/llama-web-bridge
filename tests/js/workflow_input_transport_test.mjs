@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 
 import { parseAllDocuments } from "yaml";
 
-const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 // Fail closed on every input-context spelling, including mixed dotted/bracket
 // dereferences such as github.event['inputs'] and github['event']['inputs'].
 const INPUT_CONTEXT = /\binputs\b/i;

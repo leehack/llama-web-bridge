@@ -3,9 +3,9 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { LlamaWebGpuBridge } from '../js/src/llama_webgpu_bridge.js';
+import { LlamaWebGpuBridge } from '../../js/src/llama_webgpu_bridge.js';
 
-const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const coreSource = readFileSync(path.join(rootDir, 'src/llama_webgpu_core.cpp'), 'utf8');
 const bridgeSources = {
   'js/src/llama_webgpu_bridge.js': readFileSync(

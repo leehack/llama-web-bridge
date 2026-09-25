@@ -5,9 +5,9 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { LlamaWebGpuBridge } from '../js/src/llama_webgpu_bridge.js';
+import { LlamaWebGpuBridge } from '../../js/src/llama_webgpu_bridge.js';
 
-const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const temporaryDir = mkdtempSync(path.join(tmpdir(), 'llama-web-bridge-next-token-scores-'));
 const sourcePath = path.join(temporaryDir, 'next_token_scores_contract_test.cpp');
 const executablePath = path.join(temporaryDir, 'next_token_scores_contract_test');

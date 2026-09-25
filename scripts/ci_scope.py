@@ -13,16 +13,16 @@ TOOLING = frozenset({
     'scripts/release_qualification_test.py', 'scripts/release_contract_test.py',
     'scripts/generate_release_manifest_test.py',
     'scripts/verify_state_persistence_api.py', 'scripts/verify_text_to_speech_api.py',
-    'scripts/verify_decision_api.py', 'scripts/decision_bridge_contract_test.mjs',
+    'scripts/verify_decision_api.py', 'tests/js/decision_bridge_contract_test.mjs',
     'scripts/verify_ci_reliability.py', 'scripts/verify_ci_reliability_pin_test.py',
     'scripts/mtmd_compat_contract_test.py',
     'scripts/wasm64_runtime_patch_contract_test.py',
-    'scripts/embedding_json_contract_test.mjs', 'scripts/native_load_option_arity_test.mjs',
-    'scripts/model_reload_contract_test.mjs',
-    'scripts/bridge_operation_queue_test.mjs',
-    'scripts/bridge_operation_lifecycle_test.mjs', 'scripts/text_to_speech_recovery_test.mjs',
-    'scripts/bridge_type_declaration_contract_test.mjs', 'scripts/worker_runtime_state_test.mjs',
-    'scripts/worker_token_coalescing_test.mjs', 'scripts/workflow_input_transport_test.mjs',
+    'tests/js/embedding_json_contract_test.mjs', 'tests/js/native_load_option_arity_test.mjs',
+    'tests/js/model_reload_contract_test.mjs',
+    'tests/js/bridge_operation_queue_test.mjs',
+    'tests/js/bridge_operation_lifecycle_test.mjs', 'tests/js/text_to_speech_recovery_test.mjs',
+    'tests/js/bridge_type_declaration_contract_test.mjs', 'tests/js/worker_runtime_state_test.mjs',
+    'tests/js/worker_token_coalescing_test.mjs', 'tests/js/workflow_input_transport_test.mjs',
 })
 
 

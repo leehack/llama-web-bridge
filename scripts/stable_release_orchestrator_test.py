@@ -599,6 +599,12 @@ class BridgeSourceIdentityTest(unittest.TestCase):
             "scripts/ci_scope_test.py",
             "scripts/release_qualification.py",
             "scripts/stable_release_orchestrator_test.py",
+            "scripts/worker_runtime_state_test.mjs",
+            "tests/js/bridge_operation_queue_direct_cases.mjs",
+            "tests/js/bridge_operation_queue_fixtures.mjs",
+            "tests/js/bridge_operation_queue_lifecycle_contract_cases.mjs",
+            "tests/js/bridge_operation_queue_worker_proxy_cases.mjs",
+            "tests/js/worker_runtime_state_test.mjs",
         ):
             with self.subTest(path=path):
                 self.assertFalse(sro.is_governed_bridge_path(path))
@@ -612,6 +618,8 @@ class BridgeSourceIdentityTest(unittest.TestCase):
             "scripts/release_contract.py",
             "scripts/verify_emscripten_version.py",
             "src/llama_webgpu_core.cpp",
+            "tests/js/new_fixture.mjs",
+            "tests/new_build_input.mjs",
             "unknown/new-build-input.cfg",
         ):
             with self.subTest(path=path):

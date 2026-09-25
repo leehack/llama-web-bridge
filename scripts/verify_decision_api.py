@@ -19,7 +19,7 @@ API_DOCS = (ROOT / "docs" / "api.md").read_text(encoding="utf-8")
 API_DOCS_FLAT = " ".join(API_DOCS.split())
 PACKAGE = (ROOT / "package.json").read_text(encoding="utf-8")
 SMOKE = (ROOT / "scripts" / "decision_browser_smoke.py").read_text(encoding="utf-8")
-CONTRACT_TEST = (ROOT / "scripts" / "decision_bridge_contract_test.mjs").read_text(
+CONTRACT_TEST = (ROOT / "tests" / "js" / "decision_bridge_contract_test.mjs").read_text(
     encoding="utf-8"
 )
 

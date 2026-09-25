@@ -207,6 +207,13 @@ _ORCHESTRATION_ONLY_PATHS = frozenset(
         "scripts/verify_decision_api.py",
         "scripts/verify_state_persistence_api.py",
         "scripts/verify_text_to_speech_api.py",
+        # Current home of the scripts/bridge_operation_queue_* fixtures above.
+        # Keep the scripts/ entries: the commit that moved them deletes those
+        # paths, and history must not classify that commit as a build input.
+        "tests/js/bridge_operation_queue_direct_cases.mjs",
+        "tests/js/bridge_operation_queue_fixtures.mjs",
+        "tests/js/bridge_operation_queue_lifecycle_contract_cases.mjs",
+        "tests/js/bridge_operation_queue_worker_proxy_cases.mjs",
     }
 )
 _ORCHESTRATION_ONLY_PREFIXES = ("docs/",)
@@ -215,6 +222,7 @@ _ORCHESTRATION_ONLY_SCRIPT_SUFFIXES = (
     "_test.mjs",
     "_test.py",
 )
+_ORCHESTRATION_ONLY_JS_TEST_SUFFIX = "_test.mjs"
 
 _COMMIT_RE = re.compile(r"[0-9a-f]{40}")
 _RUN_ID_RE = re.compile(r"[1-9][0-9]*")
@@ -267,6 +275,10 @@ def is_governed_bridge_path(path: str) -> bool:
         return False
     if path.startswith("scripts/") and path.endswith(
         _ORCHESTRATION_ONLY_SCRIPT_SUFFIXES
+    ):
+        return False
+    if path.startswith("tests/js/") and path.endswith(
+        _ORCHESTRATION_ONLY_JS_TEST_SUFFIX
     ):
         return False
     return True
