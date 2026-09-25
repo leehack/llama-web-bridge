@@ -87,7 +87,7 @@ both worker and direct runtime modes:
 `getTextToSpeechCapabilities`, `synthesizeSpeech`, `getDecisionCapabilities`,
 `loadDecisionHead`, `runDecision`, `freeDecisionHead`, `createCompletion`,
 `tokenize`, `detokenize`, `stateSaveFile`, `stateLoadFile`, `stateSaveBytes`,
-`stateLoadBytes`, `embed`, `embedBatch`, `applyChatTemplate`.
+`stateLoadBytes`, `embed`, `embedBatch`, `scoreNextToken`, `applyChatTemplate`.
 
 Overlapping calls wait their turn and run in call order. A failing operation
 releases the queue for the calls behind it, and separate bridge instances never
@@ -392,6 +392,48 @@ embedBatch(texts: string[], options?: { normalize?: boolean }): Promise<number[]
 Generates embeddings for multiple strings. Empty input resolves to `[]`. The
 direct runtime currently processes the batch sequentially; worker mode forwards
 the batch request to the worker runtime.
+
+## Next-token scoring
+
+### `scoreNextToken(prompt, options?)`
+
+```ts
+scoreNextToken(
+  prompt: string,
+  options?: {
+    candidates?: ArrayLike<number>;
+    topK?: number;
+    reusePromptPrefix?: boolean;
+  },
+): Promise<{
+  candidates: { token: number; bytes: Uint8Array; logprob: number }[];
+  top: { token: number; bytes: Uint8Array; logprob: number }[];
+  promptTokens: number;
+}>
+```
+
+Evaluates `prompt` (tokenized with special tokens, like `createCompletion`) and
+returns natural-log probabilities for the next position without generating. The
+values are a softmax over the raw logits, like llama-server `n_probs`; sampling
+settings do not apply.
+
+- `candidates` scores the given token ids, in request order.
+- `topK` returns the most probable tokens, highest first; ties keep the lower id.
+  Defaults to 0.
+- `reusePromptPrefix` keeps the KV cache prefix shared with the previous prompt
+  or completion. Defaults to `true`.
+- `bytes` is the token's text as raw bytes; one piece can hold part of a UTF-8
+  sequence. `logprob` is `-Infinity` for a zero probability, or when a
+  non-finite logit leaves it undefined.
+
+Each returned token costs a piece conversion, so keep `topK` small; values up to
+the vocabulary size are accepted.
+
+Pass `candidates`, a positive `topK`, or both. The call rejects when a token id
+or `topK` is outside the vocabulary (the message contains
+`is outside the vocabulary`), when media is pending, for encoder models, and
+when the prompt exceeds the context. A `cancel()` issued while idle does not
+affect later calls.
 
 ## Multimodal projector APIs
 

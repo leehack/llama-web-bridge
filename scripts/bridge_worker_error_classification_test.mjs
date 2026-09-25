@@ -194,6 +194,12 @@ const FACADE_WORKER_METHODS = [
     mainThreadResult: [[0.5], [0.25]],
   },
   {
+    method: 'scoreNextToken',
+    coreError: 'Next-token scoring failed: Token id 99 is outside the vocabulary of 32 tokens',
+    invoke: (bridge) => bridge.scoreNextToken('hello', { candidates: [99] }),
+    mainThreadResult: { candidates: [], top: [], promptTokens: 1 },
+  },
+  {
     method: 'applyChatTemplate',
     coreError: 'messages is not iterable',
     invoke: (bridge) => bridge.applyChatTemplate([{ role: 'user', content: 'hi' }], true),
@@ -264,6 +270,7 @@ const MODEL_WORKER_METHODS = [
   ['detokenize', (bridge) => bridge.detokenize([1, 2], false)],
   ['embed', (bridge) => bridge.embed('hello', {})],
   ['embedBatch', (bridge) => bridge.embedBatch(['a', 'b'], {})],
+  ['scoreNextToken', (bridge) => bridge.scoreNextToken('hello', { topK: 1 })],
   ['stateSaveFile', (bridge) => bridge.stateSaveFile('/states/a.bin', [1])],
   ['stateLoadFile', (bridge) => bridge.stateLoadFile('/states/a.bin', 16)],
   ['stateSaveBytes', (bridge) => bridge.stateSaveBytes([1])],

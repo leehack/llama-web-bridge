@@ -534,6 +534,38 @@ function toFloat32Array(value) {
 function isInt32(value) {
   return typeof value === "number" && Number.isInteger(value) && value >= -2147483648 && value <= 2147483647;
 }
+function nextTokenCandidateIds(value) {
+  if (value == null) {
+    return [];
+  }
+  const isList = Array.isArray(value) || ArrayBuffer.isView(value) && !(value instanceof DataView);
+  if (!isList) {
+    throw new TypeError("Next-token candidates must be an array or typed array of token ids.");
+  }
+  return Array.from(
+    /** @type {ArrayLike<unknown>} */
+    value,
+    (item, index) => {
+      if (!isInt32(item)) {
+        throw new TypeError(`Next-token candidates[${index}] is ${String(item)}; expected a 32-bit integer.`);
+      }
+      return (
+        /** @type {number} */
+        item
+      );
+    }
+  );
+}
+function scoredTokensFrom(entries) {
+  if (!Array.isArray(entries)) {
+    return [];
+  }
+  return entries.map((entry) => ({
+    token: Number(entry?.token),
+    bytes: Uint8Array.from(Array.isArray(entry?.bytes) ? entry.bytes : []),
+    logprob: typeof entry?.logprob === "number" ? entry.logprob : -Infinity
+  }));
+}
 function decisionHandleFrom(handle) {
   if (!isInt32(handle) || handle <= 0) {
     throw new TypeError(`Decision head handle must be a positive integer, got ${String(handle)}.`);
@@ -4198,6 +4230,39 @@ var LlamaWebGpuBridgeRuntime = class {
     }
     return vectors;
   }
+  async scoreNextToken(prompt, options = {}) {
+    if (this._modelBytes <= 0) {
+      throw new Error("No model loaded. Call loadModelFromUrl first.");
+    }
+    if (typeof prompt !== "string") {
+      throw new TypeError("Next-token scoring prompt must be a string.");
+    }
+    const candidates = nextTokenCandidateIds(options?.candidates);
+    const topK = options?.topK ?? 0;
+    if (!isInt32(topK)) {
+      throw new TypeError(`Next-token topK is ${String(topK)}; expected a 32-bit integer.`);
+    }
+    const reusePromptPrefix = options?.reusePromptPrefix !== false;
+    const rc = Number(
+      await this._core.ccall(
+        "llamadart_webgpu_score_next_token_to_json",
+        "number",
+        ["string", "string", "number", "number"],
+        [prompt, JSON.stringify(candidates), topK, reusePromptPrefix ? 1 : 0],
+        { async: true }
+      )
+    );
+    if (rc < 0) {
+      throw new Error(this._coreErrorMessage("Next-token scoring failed", rc));
+    }
+    const raw = this._core.ccall("llamadart_webgpu_last_next_token_scores_json", "string", [], []) || "{}";
+    const parsed = JSON.parse(raw);
+    return {
+      candidates: scoredTokensFrom(parsed?.candidates),
+      top: scoredTokensFrom(parsed?.top),
+      promptTokens: Number(parsed?.promptTokens) || 0
+    };
+  }
   getModelMetadata() {
     let modelMetadata = {};
     try {
@@ -6344,6 +6409,30 @@ var LlamaWebGpuBridge = class {
       await this._waitForWorkerDisposal();
       await this._ensureRuntimeReadyAfterWorkerFallback({}, error);
       return this._runtime.embedBatch(normalized, options);
+    }
+  }
+  async scoreNextToken(prompt, options = {}) {
+    return this._runExclusive(
+      () => this._scoreNextTokenUnlocked(prompt, options),
+      { kind: "next-token-scoring" }
+    );
+  }
+  async _scoreNextTokenUnlocked(prompt, options = {}) {
+    if (!this._workerProxy) {
+      return this._runtime.scoreNextToken(prompt, options);
+    }
+    try {
+      await this._restoreWorkerModelIfMissing();
+      return await this._callWorker("scoreNextToken", [prompt, options]);
+    } catch (error) {
+      this._throwIfOperationCancelled(error, "Next-token scoring was cancelled.");
+      if (!this._isWorkerUnusableError(error)) {
+        throw error;
+      }
+      this._disableWorkerFallback(error);
+      await this._waitForWorkerDisposal();
+      await this._ensureRuntimeReadyAfterWorkerFallback({}, error);
+      return this._runtime.scoreNextToken(prompt, options);
     }
   }
   getModelMetadata() {

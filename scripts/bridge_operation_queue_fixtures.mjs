@@ -231,6 +231,18 @@ export function createStubCore(scripts = {}) {
         case 'llamadart_webgpu_last_embedding_json':
           return core.lastEmbeddingJson;
 
+        case 'llamadart_webgpu_score_next_token_to_json':
+          core.trace.push(['score', args[0]]);
+          core.lastNextTokenScoresJson = JSON.stringify({
+            candidates: [],
+            top: [{ token: tokensFor(args[0])[0], bytes: [], logprob: 0 }],
+            promptTokens: tokensFor(args[0]).length,
+          });
+          return 0;
+
+        case 'llamadart_webgpu_last_next_token_scores_json':
+          return core.lastNextTokenScoresJson;
+
         case 'llamadart_webgpu_state_save_file':
           core.trace.push(['stateSave', args[0]]);
           files.set(args[0], new Uint8Array([1, 2, 3]));

@@ -966,6 +966,7 @@ def main() -> int:
     smoke = read_required("scripts/state_persistence_browser_smoke.py", errors)
     multimodal_smoke = read_required("scripts/multimodal_browser_smoke.py", errors)
     grammar_smoke = read_required("scripts/grammar_browser_smoke.py", errors)
+    next_token_scores_smoke = read_required("scripts/next_token_scores_browser_smoke.py", errors)
     speech_smoke = read_required("scripts/speech_to_text_browser_smoke.py", errors)
     tts_smoke = read_required("scripts/text_to_speech_browser_smoke.py", errors)
     tts_contract = read_required("scripts/verify_text_to_speech_api.py", errors)
@@ -1250,6 +1251,22 @@ def main() -> int:
         and "scripts/grammar_browser_smoke.py" in agents,
         "CI must run the grammar smoke with invalid, greedy, sampled, top-p and JSON grammars on both memory modes and runtimes, "
         "with the state and multimodal models, and keep failure diagnostics per matrix lane",
+        errors,
+    )
+    require(
+        'MEMORY_MODES = ("wasm32", "wasm64")' in next_token_scores_smoke
+        and 'RUNTIME_MODES = ("direct", "worker")' in next_token_scores_smoke
+        and "reusePromptPrefix: false" in next_token_scores_smoke
+        and "bridge.cancel();" in next_token_scores_smoke
+        and "globalWorkerFallbackReason" in next_token_scores_smoke
+        and "llamadart.webgpu.core_variant" in next_token_scores_smoke
+        and "scripts/next_token_scores_browser_smoke.py \\" in ci
+        and "run: python3 scripts/next_token_scores_browser_smoke.py" in ci
+        and "next-token-scores-smoke-artifacts-${{ matrix.upstream }}" in ci
+        and "scripts/next_token_scores_browser_smoke.py" in contributing
+        and "scripts/next_token_scores_browser_smoke.py" in agents,
+        "CI must run the next-token scores smoke with prompt-prefix reuse on both memory modes and runtimes, "
+        "and keep failure diagnostics per matrix lane",
         errors,
     )
     require(
@@ -2639,6 +2656,7 @@ def main() -> int:
         "stateLoadBytes",
         "embed",
         "embedBatch",
+        "scoreNextToken",
         "loadMultimodalProjector",
         "unloadMultimodalProjector",
         "supportsVision",

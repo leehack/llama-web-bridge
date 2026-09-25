@@ -184,6 +184,7 @@ export const LIFECYCLE_CONTRACT_CASES = [
         'detokenize',
         'embed',
         'embedBatch',
+        'scoreNextToken',
         'applyChatTemplate',
       ],
       'the set of queued public operations changed',
