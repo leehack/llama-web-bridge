@@ -8,6 +8,7 @@ import subprocess
 import tempfile
 import unittest
 
+from native_core_source import native_core_source
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -65,7 +66,7 @@ int main() {
                 subprocess.run([str(executable)], check=True)
 
     def test_production_routes_through_compatibility_helpers(self):
-        core = (ROOT / "src/llama_webgpu_core.cpp").read_text()
+        core = native_core_source(ROOT)
         tts = (ROOT / "src/llama_webgpu_tts.cpp").read_text()
         self.assertEqual(core.count("llama_webgpu_bitmap_from_file("), 1)
         self.assertEqual(core.count("llama_webgpu_bitmap_from_buffer("), 1)

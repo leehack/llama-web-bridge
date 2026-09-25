@@ -7,11 +7,15 @@ import re
 import sys
 from pathlib import Path
 
+from bridge_js_source import bridge_js_source, method_body
+from native_core_source import native_core_source
+
 ROOT = Path(__file__).resolve().parents[1]
-CORE = (ROOT / "src" / "llama_webgpu_core.cpp").read_text(encoding="utf-8")
+CORE = native_core_source(ROOT)
 TTS = (ROOT / "src" / "llama_webgpu_tts.cpp").read_text(encoding="utf-8")
 HEADER = (ROOT / "src" / "llama_webgpu_tts.h").read_text(encoding="utf-8")
-JS = (ROOT / "js" / "src" / "llama_webgpu_bridge.js").read_text(encoding="utf-8")
+JS = bridge_js_source(ROOT)
+RUNTIME_JS = (ROOT / "js" / "src" / "runtime.ts").read_text(encoding="utf-8")
 DTS = (ROOT / "js" / "src" / "llama_webgpu_bridge.d.ts").read_text(encoding="utf-8")
 CMAKE = (ROOT / "CMakeLists.txt").read_text(encoding="utf-8")
 README = (ROOT / "README.md").read_text(encoding="utf-8")
@@ -20,7 +24,7 @@ API_DOCS_FLAT = " ".join(API_DOCS.split())
 SMOKE = (ROOT / "scripts" / "text_to_speech_browser_smoke.py").read_text(
     encoding="utf-8"
 )
-RECOVERY_TEST = (ROOT / "scripts" / "text_to_speech_recovery_test.mjs").read_text(
+RECOVERY_TEST = (ROOT / "tests" / "js" / "text_to_speech_recovery_test.mjs").read_text(
     encoding="utf-8"
 )
 
@@ -178,9 +182,8 @@ def main() -> int:
         "const mmprojPath = this._mmProjPath;" in JS
         and "this._deleteFsFile(mmprojPath);" in JS
         and re.search(
-            r"async unloadMultimodalProjector\(\).*?if \(rc !== 0\).*?"
-            r"this\._deleteFsFile\(mmprojPath\);",
-            JS,
+            r"if \(rc !== 0\) \{[^}]*?\bthrow\b.*?this\._deleteFsFile\(mmprojPath\);",
+            method_body(RUNTIME_JS, "async unloadMultimodalProjector() {"),
             re.DOTALL,
         )
         is not None,
@@ -189,10 +192,12 @@ def main() -> int:
     )
     require(
         re.search(
-            r"async dispose\(\).*?const mmprojPath = this\._mmProjPath;.*?"
-            r"llamadart_webgpu_mmproj_free', 'number'.*?"
-            r"llamadart_webgpu_shutdown'.*?this\._deleteFsFile\(mmprojPath\);",
-            JS,
+            r"const mmprojPath = this\._mmProjPath;.*?"
+            r"const mmprojFreeRc = Number\(\s*"
+            r"this\._core\.ccall\('llamadart_webgpu_mmproj_free', 'number'.*?"
+            r"llamadart_webgpu_shutdown'.*?this\._deleteFsFile\(mmprojPath\);.*?"
+            r"if \(mmprojFreeRc !== 0\)",
+            method_body(RUNTIME_JS, "async dispose() {"),
             re.DOTALL,
         )
         is not None,
@@ -201,7 +206,7 @@ def main() -> int:
     )
     require(
         re.search(
-            r"async synthesizeSpeech\(options = \{\}\).*?"
+            r"async synthesizeSpeech\(options(?::[^=]*)? = \{\}\).*?"
             r"if \(this\._textToSpeechActive\).*?"
             r"this\._ensureTextToSpeechDir\(\)",
             JS,

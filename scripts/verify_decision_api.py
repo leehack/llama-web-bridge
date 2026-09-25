@@ -7,11 +7,15 @@ import re
 import sys
 from pathlib import Path
 
+from bridge_js_source import bridge_js_source, method_body
+from native_core_source import native_core_source
+
 ROOT = Path(__file__).resolve().parents[1]
-CORE = (ROOT / "src" / "llama_webgpu_core.cpp").read_text(encoding="utf-8")
+CORE = native_core_source(ROOT)
 DECISION = (ROOT / "src" / "llama_webgpu_decision.cpp").read_text(encoding="utf-8")
 HEADER = (ROOT / "src" / "llama_webgpu_decision.h").read_text(encoding="utf-8")
-JS = (ROOT / "js" / "src" / "llama_webgpu_bridge.js").read_text(encoding="utf-8")
+JS = bridge_js_source(ROOT)
+BRIDGE_JS = (ROOT / "js" / "src" / "bridge.ts").read_text(encoding="utf-8")
 DTS = (ROOT / "js" / "src" / "llama_webgpu_bridge.d.ts").read_text(encoding="utf-8")
 CMAKE = (ROOT / "CMakeLists.txt").read_text(encoding="utf-8")
 README = (ROOT / "README.md").read_text(encoding="utf-8")
@@ -19,7 +23,7 @@ API_DOCS = (ROOT / "docs" / "api.md").read_text(encoding="utf-8")
 API_DOCS_FLAT = " ".join(API_DOCS.split())
 PACKAGE = (ROOT / "package.json").read_text(encoding="utf-8")
 SMOKE = (ROOT / "scripts" / "decision_browser_smoke.py").read_text(encoding="utf-8")
-CONTRACT_TEST = (ROOT / "scripts" / "decision_bridge_contract_test.mjs").read_text(
+CONTRACT_TEST = (ROOT / "tests" / "js" / "decision_bridge_contract_test.mjs").read_text(
     encoding="utf-8"
 )
 
@@ -178,7 +182,7 @@ def main() -> int:
     require(
         "const char * config_path;" in HEADER
         and "[headPath, label, configPath]" in JS
-        and "core.FS.writeFile(configPath, textEncoder.encode(configJson))" in JS,
+        and re.search(r"core\.FS\.writeFile\(configPath, textEncoder\.encode\(configJson!?\)\)", JS) is not None,
         "configJson must reach the core as a WASMFS file, not a stack-copied ccall string",
         errors,
     )
@@ -225,8 +229,8 @@ def main() -> int:
     )
     require(
         re.search(
-            r"async _loadDecisionHeadUnlocked\(.*?if \(!this\._shouldFallbackToMainThread\(error\)\) \{\s*throw error;",
-            JS,
+            r"if \(!this\._shouldFallbackToMainThread\(error\)\) \{\s*throw error;",
+            method_body(BRIDGE_JS, "async _loadDecisionHeadUnlocked("),
             re.DOTALL,
         )
         is not None,

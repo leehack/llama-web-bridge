@@ -10,7 +10,9 @@ Published artifacts are consumed from `llama-web-bridge-assets`.
 ## Prerequisites
 
 - Emscripten SDK (`emcmake`, `emcc`) matching `emsdk.version`
-- Node.js/npm for JS bridge bundling and TypeScript `checkJs`
+- Node.js 22.18 or newer (CI uses 24) and npm, for JS bridge bundling and
+  type-checking; the tests run the `.ts` sources through Node's built-in type
+  stripping
 - CMake toolchain
 - Access to a llama.cpp checkout matching `llama_cpp.version`
 
@@ -40,6 +42,45 @@ Bridge wrapper source lives under `js/src/`; `npm run build:js` regenerates the
 checked-in browser ESM outputs and declarations under `js/`. `npm run check:js`
 runs the same generator plus TypeScript and syntax checks, so commit any updated
 `js/` outputs after source changes.
+
+`js/src/llama_webgpu_bridge.js` is the public entry. It re-exports the API and
+owns the only load-time side effects (worker host auto-boot and the
+`window.LlamaWebGpuBridge` global); every other module is side-effect free.
+`bridge.ts` is the facade, `runtime.ts` the direct runtime, `worker_proxy.ts`,
+`worker_host.ts`, and `worker_protocol.ts` the worker path, and `internal/`
+holds shared helpers, with internal-only types in `internal/types.ts`.
+
+Every module except the two entries (`llama_webgpu_bridge.js` and
+`llama_webgpu_bridge_worker.js`, which is copied unbundled) is TypeScript,
+type-checked with `strict` (`tsconfig.strict.json`). The entries keep the
+lenient `checkJs` pass (`tsconfig.bridge.json`), and `npm run typecheck:js` runs
+both. `LlamaWebGpuBridge` implements the published `llama_webgpu_bridge.d.ts`
+class, and `public_api_check.ts` (types only, never bundled) compares every
+public method with strict parameter variance, so the compiler rejects an
+implementation that accepts less or returns more than the declared API.
+TypeScript here is limited to erasable syntax (`erasableSyntaxOnly`): types,
+`import type`, `declare` fields, and casts only, no enums, namespaces, or
+parameter properties. A class field without an initializer is `declare`d,
+because a plain field declaration emits code;
+`tests/js/declared_class_fields_test.mjs` enforces that. esbuild and Node both
+strip the types without changing the code, so the tests run the `.ts` sources
+directly. A type change must not change behaviour: with comments and whitespace
+stripped, the bundle stays byte-identical. Import modules by their `.ts` path.
+
+Keep `bridge.ts` beside `llama_webgpu_bridge_worker.js`: it resolves the worker
+entry relative to `import.meta.url`.
+
+The native core is one translation unit. `src/llama_webgpu_core.cpp` holds the
+headers, the anonymous namespace, the `extern "C"` block with
+`llamadart_webgpu_shutdown`, and `main`, and includes its parts from `src/core/`
+inside the namespace and the block. The `exports_*.inc` parts hold the other
+exported `llamadart_webgpu_*` functions grouped by feature; the remaining parts
+hold the state and internal helpers they use. A part is not a standalone file:
+it relies on everything included before it, so keep the include order. The
+static contract checks read the core with its parts expanded
+(`scripts/native_core_source.py` and its JS twin
+`tests/js/native_core_source.mjs`), which is how the compiler sees it. Both fail
+if a part is not included exactly once as a plain `#include` line.
 
 For local agent/maintainer validation, prefer external build and cache paths so
 generated files do not dirty the checkout:

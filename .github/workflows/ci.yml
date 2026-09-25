@@ -78,6 +78,7 @@ jobs:
             scripts/verify_emscripten_version.py \
             scripts/verify_ci_reliability.py \
             scripts/verify_ci_reliability_pin_test.py \
+            scripts/verify_ci_reliability_doc_facts_test.py \
             scripts/patch_wasm64_runtime.py \
             scripts/wasm64_runtime_patch_contract_test.py \
             scripts/release_qualification.py \
@@ -96,7 +97,7 @@ jobs:
       - name: Validate release orchestration and CI selection
         run: |
           python3 -m unittest discover -s scripts -p '*_test.py'
-          node scripts/workflow_input_transport_test.mjs
+          node tests/js/workflow_input_transport_test.mjs
 
   build-webgpu-bridge:
     needs: [changes, checks]
