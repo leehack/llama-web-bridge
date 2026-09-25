@@ -14,6 +14,7 @@ CORE = (ROOT / "src" / "llama_webgpu_core.cpp").read_text(encoding="utf-8")
 TTS = (ROOT / "src" / "llama_webgpu_tts.cpp").read_text(encoding="utf-8")
 HEADER = (ROOT / "src" / "llama_webgpu_tts.h").read_text(encoding="utf-8")
 JS = bridge_js_source(ROOT)
+RUNTIME_JS = (ROOT / "js" / "src" / "runtime.js").read_text(encoding="utf-8")
 DTS = (ROOT / "js" / "src" / "llama_webgpu_bridge.d.ts").read_text(encoding="utf-8")
 CMAKE = (ROOT / "CMakeLists.txt").read_text(encoding="utf-8")
 README = (ROOT / "README.md").read_text(encoding="utf-8")
@@ -40,6 +41,15 @@ NATIVE_EXPORTS = (
 def require(condition: bool, message: str, errors: list[str]) -> None:
     if not condition:
         errors.append(message)
+
+
+def method_body(source: str, signature: str) -> str:
+    """Returns a class method from its signature through its closing brace."""
+    start = source.find(f"\n  {signature}")
+    if start < 0:
+        return ""
+    end = source.find("\n  }\n", start)
+    return source[start : end + len("\n  }") if end > 0 else len(source)]
 
 
 def main() -> int:
@@ -180,9 +190,8 @@ def main() -> int:
         "const mmprojPath = this._mmProjPath;" in JS
         and "this._deleteFsFile(mmprojPath);" in JS
         and re.search(
-            r"async unloadMultimodalProjector\(\).*?if \(rc !== 0\).*?"
-            r"this\._deleteFsFile\(mmprojPath\);",
-            JS,
+            r"if \(rc !== 0\) \{[^}]*?\bthrow\b.*?this\._deleteFsFile\(mmprojPath\);",
+            method_body(RUNTIME_JS, "async unloadMultimodalProjector() {"),
             re.DOTALL,
         )
         is not None,
@@ -191,10 +200,12 @@ def main() -> int:
     )
     require(
         re.search(
-            r"async dispose\(\).*?const mmprojPath = this\._mmProjPath;.*?"
-            r"llamadart_webgpu_mmproj_free', 'number'.*?"
-            r"llamadart_webgpu_shutdown'.*?this\._deleteFsFile\(mmprojPath\);",
-            JS,
+            r"const mmprojPath = this\._mmProjPath;.*?"
+            r"const mmprojFreeRc = Number\(\s*"
+            r"this\._core\.ccall\('llamadart_webgpu_mmproj_free', 'number'.*?"
+            r"llamadart_webgpu_shutdown'.*?this\._deleteFsFile\(mmprojPath\);.*?"
+            r"if \(mmprojFreeRc !== 0\)",
+            method_body(RUNTIME_JS, "async dispose() {"),
             re.DOTALL,
         )
         is not None,
