@@ -143,6 +143,10 @@ class BridgeSourceIdentityTest(unittest.TestCase):
             "scripts/release_qualification.py",
             "scripts/stable_release_orchestrator.py",
             "scripts/stable_release_orchestrator_test.py",
+            "scripts/verify_ci_reliability.mjs",
+            "scripts/verify_ci_reliability.py",
+            "scripts/verify_ci_reliability_doc_facts_test.py",
+            "scripts/verify_ci_reliability_pin_test.py",
             "scripts/verify_decision_api.py",
             "scripts/verify_state_persistence_api.py",
             "scripts/verify_text_to_speech_api.py",
@@ -156,6 +160,7 @@ class BridgeSourceIdentityTest(unittest.TestCase):
             "tests/js/native_core_source.mjs",
             "tests/js/state_persistence_api_contract_test.mjs",
             "tests/js/text_to_speech_api_contract_test.mjs",
+            "tests/js/verify_ci_reliability_test.mjs",
             "tests/js/worker_runtime_state_test.mjs",
         ):
             with self.subTest(path=path):

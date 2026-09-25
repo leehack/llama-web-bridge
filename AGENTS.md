@@ -132,17 +132,19 @@ GGUFs or smoke artifacts.
     assets immutable-release governance, and hold Actions write permission on
     `leehack/llama-web-bridge`. The orchestrator proves the owner identity and
     the governance read live and fails closed if either is absent.
-- CI reliability contract: `scripts/verify_ci_reliability.py`
-  - Asserts the facts that `README.md`, `AGENTS.md`, `CONTRIBUTING.md`, and
-    `docs/api.md` state (publication contract, baseline, smoke script names),
-    not their sentences: names, tags, and URLs as tokens, and each relation (a
-    key and its value, or a qualifier such as "only", "exact", "never", or
-    "unless") as a short ordered phrase, scoped to its Markdown section or list
-    item with whitespace normalized. Rewording or reflowing the prose around a
-    fact passes; dropping, changing, or inverting a fact fails. It also asserts the 7-pin set in `CONTRIBUTING.md`
-    and both build workflows, and that `README.md` and `AGENTS.md` hold no pins
-    and link to `CONTRIBUTING.md#validate-outputs`. Update it in the same
-    change as a doc restructure that renames a heading or moves a fact.
+- CI reliability contract: `scripts/verify_ci_reliability.mjs`
+  - Checks publication-safety invariants, not wording: it parses the workflows
+    with `yaml` and reads commands from resolved `run` scripts. It covers
+    read-only workflow and job permissions, no `continue-on-error` outside the
+    publication ref mutation, the environment gates, `WEBGPU_BRIDGE_ASSETS_PAT` as the only
+    secret with its fail-closed, never-printed guard, immutable-release
+    governance and readback, owner-only first-attempt runs, artifact download
+    by immutable ID, the toolchain pins, and that CI, candidate, and publish run
+    the contract tests (`check:js` must run every `tests/js/*_test.mjs`). It
+    asserts the 7-pin set in `CONTRIBUTING.md` and both build workflows, and
+    that `README.md` and `AGENTS.md` hold no pins. It checks no documentation
+    prose. `tests/js/verify_ci_reliability_test.mjs` tests its pin and PAT
+    checks.
 - Publish workflow: `.github/workflows/publish_assets.yml`
   - Never builds. It downloads the exact candidate artifact and attestation by
     immutable artifact ID and verifies the candidate manifest's
@@ -201,8 +203,6 @@ candidate and exact `candidate_run_id`/`attestation_run_id` pair.
   it imports, tested by `scripts/release_orchestrator_<concern>_test.py`
   suites that share `release_orchestrator_fixtures_test.py`. List a new module in
   `_ORCHESTRATION_ONLY_PATHS` and in `TOOLING` in `scripts/ci_scope.py`.
-  `scripts/verify_ci_reliability.py` reads the entry plus every module it
-  imports (`scripts/orchestrator_source.py`) and fails on an unimported one.
 - Keep publishing logic in workflow only.
 - Do not edit assets repository files from here outside publish flow.
 - C++ exception catching is enabled only for

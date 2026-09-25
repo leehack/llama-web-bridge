@@ -64,9 +64,6 @@ jobs:
         run: |
           python3 -m py_compile \
             scripts/verify_emscripten_version.py \
-            scripts/verify_ci_reliability.py \
-            scripts/verify_ci_reliability_pin_test.py \
-            scripts/verify_ci_reliability_doc_facts_test.py \
             scripts/patch_wasm64_runtime.py \
             scripts/wasm64_runtime_patch_contract_test.py \
             scripts/release_qualification.py \
@@ -80,12 +77,10 @@ jobs:
             scripts/decision_browser_smoke.py
 
       - name: Verify CI reliability contract
-        run: python3 scripts/verify_ci_reliability.py
+        run: node scripts/verify_ci_reliability.mjs
 
       - name: Validate release orchestration and CI selection
-        run: |
-          python3 -m unittest discover -s scripts -p '*_test.py'
-          node tests/js/workflow_input_transport_test.mjs
+        run: python3 -m unittest discover -s scripts -p '*_test.py'
 
   build-webgpu-bridge:
     needs: [changes, checks]

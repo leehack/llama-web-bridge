@@ -83,10 +83,10 @@ it relies on everything included before it, so keep the include order. The
 static contract checks read the core with its parts expanded
 (`scripts/native_core_source.py` and its JS twin
 `tests/js/native_core_source.mjs`), which is how the compiler sees it. Both fail
-if a part is not included exactly once as a plain `#include` line. They read the
-bridge the same way: `scripts/bridge_js_source.py` and its JS twin
-`tests/js/bridge_js_source.mjs` join every `js/src` module in the order the
-former single-file source declared them.
+if a part is not included exactly once as a plain `#include` line. The JS API
+contract tests read the bridge the same way: `tests/js/bridge_js_source.mjs`
+joins every `js/src` module in the order the former single-file source declared
+them.
 
 For local agent/maintainer validation, prefer external build and cache paths so
 generated files do not dirty the checkout:
@@ -121,9 +121,9 @@ Before opening or updating a PR, run the lightweight contracts:
 
 ```bash
 npm run check:js
-python3 -m py_compile scripts/verify_ci_reliability.py scripts/state_persistence_browser_smoke.py scripts/multimodal_browser_smoke.py scripts/grammar_browser_smoke.py scripts/next_token_scores_browser_smoke.py scripts/speech_to_text_browser_smoke.py scripts/text_to_speech_browser_smoke.py scripts/decision_browser_smoke.py
+python3 -m py_compile scripts/state_persistence_browser_smoke.py scripts/multimodal_browser_smoke.py scripts/grammar_browser_smoke.py scripts/next_token_scores_browser_smoke.py scripts/speech_to_text_browser_smoke.py scripts/text_to_speech_browser_smoke.py scripts/decision_browser_smoke.py
 python3 scripts/mtmd_compat_contract_test.py
-python3 scripts/verify_ci_reliability.py
+node scripts/verify_ci_reliability.mjs
 ```
 
 For state-persistence, worker, or workflow changes, also run the browser smoke
@@ -236,17 +236,20 @@ query strings, and fragments before printing the location.
 
 ## Agent Workflow Guardrails
 
-- Keep workflow reliability rules in `scripts/verify_ci_reliability.py` when
-  changing `.github/workflows/ci.yml`, `.github/workflows/bridge_candidate.yml`,
+- Keep the publication-safety rules in `scripts/verify_ci_reliability.mjs`
+  current when changing `.github/workflows/ci.yml`,
+  `.github/workflows/bridge_candidate.yml`,
   `.github/workflows/publish_assets.yml`,
   `.github/workflows/auto_llama_cpp_update.yml`,
-  `.github/workflows/bridge_qualification.yml`, JS build pipeline files,
-  `scripts/release_qualification.py`, or
-  `scripts/state_persistence_browser_smoke.py`.
+  `.github/workflows/bridge_qualification.yml`, or the model pins in
+  `scripts/release_qualification.py`. It checks permissions, environment gates,
+  PAT handling, pins, fail-closed guards, and that CI runs the contract tests;
+  it does not check wording, step names it does not anchor on, or docs prose.
+  Every new `tests/js/*_test.mjs` must be run by `npm run check:js`.
 - Rotate all 7 model/projector SHA-256 pins in the three files that hard-code
   them together: `CONTRIBUTING.md`, `.github/workflows/ci.yml`,
   `.github/workflows/bridge_candidate.yml`.
-  `scripts/verify_ci_reliability.py` requires the three sets to be identical with
+  `scripts/verify_ci_reliability.mjs` requires the three sets to be identical with
   exactly 7 pins each; a stale `bridge_candidate.yml` breaks the candidate job,
   not just CI. `README.md` and `AGENTS.md` hold no pins and link here.
   `publish_assets.yml` holds no pins because it neither builds nor
@@ -288,7 +291,7 @@ query strings, and fragments before printing the location.
   build or hosted gate, dispatch a new candidate run instead of rerunning one.
 - Preserve `llama_cpp.version` as the default ordinary CI/development build pin.
   It holds exactly one upstream tag in either channel, stable
-  `vMAJOR.MINOR.PATCH` or development `bNNNN`; `scripts/verify_ci_reliability.py`
+  `vMAJOR.MINOR.PATCH` or development `bNNNN`; `scripts/verify_ci_reliability.mjs`
   rejects every other form. Exact release publication receives upstream identity
   from the orchestrator and must not require a bridge pin PR.
 - Preserve `emsdk.version` as the single compiler source for CI and publish.

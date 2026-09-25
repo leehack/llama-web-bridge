@@ -13,13 +13,13 @@ ROOT = Path(__file__).resolve().parents[1]
 
 class ScopeTests(unittest.TestCase):
     def test_allowlist_and_unknown_inputs(self):
-        for path in ('README.md', 'docs/guide.md', 'scripts/release_publication_state.py', 'scripts/bridge_js_source.py', 'scripts/native_core_source.py',
+        for path in ('README.md', 'docs/guide.md', 'scripts/release_publication_state.py', 'scripts/native_core_source.py',
                      'tests/js/native_core_source.mjs', 'tests/js/bridge_js_source.mjs',
                      'tests/js/state_persistence_api_contract_test.mjs',
                      'tests/js/text_to_speech_api_contract_test.mjs',
                      'tests/js/decision_api_contract_test.mjs',
                      'scripts/stable_release_orchestrator.py', 'scripts/stable_release_orchestrator_test.py',
-                     'scripts/orchestrator_source.py', 'scripts/release_orchestrator_asset_releases.py',
+                     'scripts/release_orchestrator_asset_releases.py',
                      'scripts/release_orchestrator_asset_releases_test.py', 'scripts/release_orchestrator_driver.py',
                      'scripts/release_orchestrator_driver_test.py', 'scripts/release_orchestrator_driver_backlog_test.py',
                      'scripts/release_orchestrator_driver_identical_release_test.py',
@@ -33,7 +33,7 @@ class ScopeTests(unittest.TestCase):
                      'scripts/release_orchestrator_workflow_runs.py', 'scripts/release_orchestrator_workflow_runs_test.py',
                      'tests/js/worker_runtime_state_test.mjs',
                      'tests/js/declared_class_fields_test.mjs',
-                     'scripts/verify_ci_reliability_pin_test.py', 'scripts/verify_ci_reliability_doc_facts_test.py'):
+                     'scripts/verify_ci_reliability.mjs', 'tests/js/verify_ci_reliability_test.mjs'):
             self.assertFalse(native_required([path]), path)
         for path in ('src/core.cpp', 'src/core/exports_tts.inc', 'src/core/new_part.inc', 'js/llama_webgpu_bridge.ts', 'package-lock.json',
                      'scripts/build_bridge.sh', 'scripts/state_persistence_browser_smoke.py',

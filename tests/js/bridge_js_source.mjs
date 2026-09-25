@@ -1,5 +1,4 @@
-// Bridge JS source text for the static API contract tests; the JS twin of
-// scripts/bridge_js_source.py. js/src/llama_webgpu_bridge.js is only the public
+// Bridge JS source text for the static API contract tests. js/src/llama_webgpu_bridge.js is only the public
 // entry; the implementation lives in the .js and .ts modules it imports (the
 // public .d.ts is excluded). The tests read every module, joined in the order
 // the former single-file source declared them (helpers, worker host and proxy,
