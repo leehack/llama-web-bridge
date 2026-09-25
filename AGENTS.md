@@ -64,6 +64,8 @@ applies:
   through both direct and worker runtimes;
 - sampler or grammar changes: `scripts/grammar_browser_smoke.py` with the
   state-persistence model and the multimodal model;
+- next-token scoring or prompt-evaluation changes:
+  `scripts/next_token_scores_browser_smoke.py` with the state-persistence model;
 - speech changes: `scripts/speech_to_text_browser_smoke.py` and
   `scripts/text_to_speech_browser_smoke.py` individually. The combined
   `release_qualification.py qualify` command is workflow-only because it

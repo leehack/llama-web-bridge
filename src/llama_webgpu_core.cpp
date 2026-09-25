@@ -30,6 +30,7 @@
 #include "llama_webgpu_embedding_json.h"
 #include "llama_webgpu_grammar.h"
 #include "llama_webgpu_mtmd_compat.h"
+#include "llama_webgpu_next_token_scores.h"
 #include "llama_webgpu_tts.h"
 
 namespace {
@@ -67,6 +68,7 @@ std::string g_last_piece;
 std::string g_last_tokens_json = "[]";
 std::string g_last_detokenized;
 std::string g_last_embedding_json = "[]";
+std::string g_last_next_token_scores_json = "{}";
 std::string g_backend_json = "[]";
 std::string g_model_meta_json = "{}";
 bool g_model_uses_gpu_ops = false;
@@ -294,6 +296,7 @@ void free_runtime() {
   g_last_tokens_json = "[]";
   g_last_detokenized.clear();
   g_last_embedding_json = "[]";
+  g_last_next_token_scores_json = "{}";
   g_model_meta_json = "{}";
   g_model_uses_gpu_ops = false;
   g_model_is_qwen3_asr = false;
@@ -905,6 +908,55 @@ llama_token sample_next_token() {
   return token;
 }
 
+// Decodes prompt_tokens into sequence 0, keeping the longest prefix shared
+// with the previous prompt when reuse_prefix is true. At least one token is
+// decoded, so the last position always has logits. Returns false after
+// decode_tokens() records the error.
+bool evaluate_prompt_tokens(
+    const std::vector<llama_token> & prompt_tokens,
+    const bool reuse_prefix) {
+  size_t prefix = 0;
+  if (reuse_prefix) {
+    const size_t max_prefix =
+        std::min(g_cached_prompt_tokens.size(), prompt_tokens.size());
+    while (prefix < max_prefix &&
+           g_cached_prompt_tokens[prefix] == prompt_tokens[prefix]) {
+      prefix++;
+    }
+  }
+
+  if (prefix == prompt_tokens.size() && prefix > 0) {
+    prefix--;
+  }
+
+  if (prefix == 0) {
+    llama_memory_clear(llama_get_memory(g_state.ctx), false);
+  } else {
+    const bool removed = llama_memory_seq_rm(
+        llama_get_memory(g_state.ctx),
+        0,
+        static_cast<llama_pos>(prefix),
+        -1);
+    if (!removed) {
+      prefix = 0;
+      llama_memory_clear(llama_get_memory(g_state.ctx), false);
+    }
+  }
+
+  if (prefix < prompt_tokens.size()) {
+    std::vector<llama_token> eval_tokens(
+        prompt_tokens.begin() + prefix,
+        prompt_tokens.end());
+    if (!decode_tokens(eval_tokens)) {
+      g_cached_prompt_tokens.clear();
+      return false;
+    }
+  }
+
+  g_cached_prompt_tokens = prompt_tokens;
+  return true;
+}
+
 int32_t begin_generation_impl(
     const char * prompt,
     float temp,
@@ -994,43 +1046,9 @@ int32_t begin_generation_impl(
       return -3;
     }
 
-    size_t prefix = 0;
-    const size_t max_prefix =
-        std::min(g_cached_prompt_tokens.size(), prompt_tokens.size());
-    while (prefix < max_prefix &&
-           g_cached_prompt_tokens[prefix] == prompt_tokens[prefix]) {
-      prefix++;
+    if (!evaluate_prompt_tokens(prompt_tokens, true)) {
+      return -4;
     }
-
-    if (prefix == prompt_tokens.size() && prefix > 0) {
-      prefix--;
-    }
-
-    if (prefix == 0) {
-      llama_memory_clear(llama_get_memory(g_state.ctx), false);
-    } else {
-      const bool removed = llama_memory_seq_rm(
-          llama_get_memory(g_state.ctx),
-          0,
-          static_cast<llama_pos>(prefix),
-          -1);
-      if (!removed) {
-        prefix = 0;
-        llama_memory_clear(llama_get_memory(g_state.ctx), false);
-      }
-    }
-
-    if (prefix < prompt_tokens.size()) {
-      std::vector<llama_token> eval_tokens(
-          prompt_tokens.begin() + prefix,
-          prompt_tokens.end());
-      if (!decode_tokens(eval_tokens)) {
-        g_cached_prompt_tokens.clear();
-        return -4;
-      }
-    }
-
-    g_cached_prompt_tokens = prompt_tokens;
   }
 
   g_active_sampler =
@@ -1987,6 +2005,127 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_embed_to_json(
 
 EMSCRIPTEN_KEEPALIVE const char * llamadart_webgpu_last_embedding_json() {
   return g_last_embedding_json.c_str();
+}
+
+// Scores the position after prompt with a softmax over the raw logits, like
+// llama-server n_probs; sampling settings do not apply. -3 means a candidate
+// or top_k is outside the vocabulary.
+EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_score_next_token_to_json(
+    const char * prompt,
+    const char * candidates_json,
+    int32_t top_k,
+    int32_t reuse_prompt_prefix) {
+  clear_error();
+  g_last_next_token_scores_json = "{}";
+
+  if (!ensure_loaded()) {
+    return -1;
+  }
+
+  if (g_generation_active || g_tts_active) {
+    set_error("Next-token scoring cannot run during active generation or text-to-speech synthesis");
+    return -10;
+  }
+
+  if (prompt == nullptr) {
+    set_error("Prompt is null");
+    return -2;
+  }
+
+  if (!llama_model_has_decoder(g_state.model) ||
+      llama_model_has_encoder(g_state.model)) {
+    set_error("Next-token scoring needs a decoder-only model");
+    return -5;
+  }
+
+  if (!g_pending_media.empty()) {
+    set_error("Next-token scoring does not accept media; clear pending media first");
+    return -4;
+  }
+
+  const int32_t n_vocab = llama_vocab_n_tokens(g_state.vocab);
+  std::vector<llama_token> candidates;
+  parse_token_list(candidates_json, candidates);
+  for (const llama_token token : candidates) {
+    if (token < 0 || token >= n_vocab) {
+      set_error(
+          "Token id " + std::to_string(token) +
+          " is outside the vocabulary of " + std::to_string(n_vocab) +
+          " tokens");
+      return -3;
+    }
+  }
+  if (top_k < 0 || top_k > n_vocab) {
+    set_error(
+        "topK " + std::to_string(top_k) +
+        " is outside the vocabulary of " + std::to_string(n_vocab) +
+        " tokens");
+    return -3;
+  }
+  if (candidates.empty() && top_k == 0) {
+    set_error("Pass candidates, a positive topK, or both");
+    return -4;
+  }
+
+  std::vector<llama_token> prompt_tokens;
+  if (!tokenize_text(std::string(prompt), true, prompt_tokens)) {
+    return -6;
+  }
+  if (prompt_tokens.empty()) {
+    set_error("Prompt tokenized to an empty sequence");
+    return -6;
+  }
+  const uint32_t n_ctx = llama_n_ctx(g_state.ctx);
+  if (prompt_tokens.size() > n_ctx) {
+    set_error(
+        "Prompt has " + std::to_string(prompt_tokens.size()) +
+        " tokens; the context holds " + std::to_string(n_ctx));
+    return -6;
+  }
+
+  // An idle cancel() leaves the flag set, and it would abort this decode.
+  g_cancel_requested = false;
+  if (!evaluate_prompt_tokens(prompt_tokens, reuse_prompt_prefix != 0)) {
+    return -7;
+  }
+
+  const float * logits = llama_get_logits_ith(g_state.ctx, -1);
+  if (logits == nullptr) {
+    set_error("Prompt evaluation produced no logits for the last token");
+    return -8;
+  }
+
+  const double log_sum = llamadart_webgpu_detail::log_sum_exp(logits, n_vocab);
+  auto scored = [&](const llama_token token) {
+    return llamadart_webgpu_detail::ScoredToken{
+        token,
+        token_to_piece(token, true),
+        llamadart_webgpu_detail::rank_logit(logits[token]) - log_sum,
+    };
+  };
+
+  std::vector<llamadart_webgpu_detail::ScoredToken> scored_candidates;
+  scored_candidates.reserve(candidates.size());
+  for (const llama_token token : candidates) {
+    scored_candidates.push_back(scored(token));
+  }
+
+  std::vector<llamadart_webgpu_detail::ScoredToken> scored_top;
+  for (const int32_t token :
+       llamadart_webgpu_detail::top_token_ids(logits, n_vocab, top_k)) {
+    scored_top.push_back(scored(token));
+  }
+
+  g_last_next_token_scores_json =
+      llamadart_webgpu_detail::serialize_next_token_scores_json(
+          scored_candidates,
+          scored_top,
+          static_cast<int32_t>(prompt_tokens.size()));
+  return 0;
+}
+
+EMSCRIPTEN_KEEPALIVE const char * llamadart_webgpu_last_next_token_scores_json() {
+  return g_last_next_token_scores_json.c_str();
 }
 
 EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_generate(

@@ -55,6 +55,7 @@ export const DIRECT_CASES = [
       bridge.embed('c'),
       bridge.detokenize([100]),
       bridge.stateSaveBytes([1]),
+      bridge.scoreNextToken('e', { topK: 1 }),
     ]);
 
     assert.equal(results[0], 'A');
@@ -62,9 +63,10 @@ export const DIRECT_CASES = [
     assert.deepEqual(results[2], [99]);
     assert.equal(results[3], 'd');
     assert.deepEqual([...results[4]], [1, 2, 3]);
+    assert.deepEqual(results[5].top.map((entry) => entry.token), [101]);
     assert.deepEqual(
       opTrace(core).map(([kind]) => kind),
-      ['begin', 'end', 'tokenize', 'embed', 'detokenize', 'stateSave'],
+      ['begin', 'end', 'tokenize', 'embed', 'detokenize', 'stateSave', 'score'],
       'cross-operation ordering must follow call order without interleaving',
     );
   }],

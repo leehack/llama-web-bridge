@@ -17,7 +17,7 @@ Applications that consume the browser assets directly should start with the
 [`LlamaWebGpuBridge` public API reference](docs/api.md). The generated
 `llama_webgpu_bridge.d.ts` file is published with the JS/WASM assets; the API
 reference explains the runtime behavior for model loading, generation,
-tokenization, embeddings, multimodal projector support, state persistence,
+tokenization, embeddings, next-token scoring, multimodal projector support, state persistence,
 metadata, cancellation, disposal, and worker-host bootstrap.
 
 ## Build

@@ -100,6 +100,29 @@ export interface EmbedOptions {
   normalize?: boolean;
 }
 
+export interface NextTokenScoreOptions {
+  /** Token ids to score, in the order the result lists them. */
+  candidates?: ArrayLike<number>;
+  /** How many of the most probable tokens to return; 0 returns none. */
+  topK?: number;
+  /** Reuse the KV cache prefix shared with the previous prompt. Defaults to true. */
+  reusePromptPrefix?: boolean;
+}
+
+export interface ScoredToken {
+  token: number;
+  /** The token's text as raw bytes; a piece may split a UTF-8 sequence. */
+  bytes: Uint8Array;
+  /** Natural-log probability; -Infinity when it is zero or a non-finite logit makes it undefined. */
+  logprob: number;
+}
+
+export interface NextTokenScores {
+  candidates: ScoredToken[];
+  top: ScoredToken[];
+  promptTokens: number;
+}
+
 export interface TextToSpeechCapabilities {
   apiVersion: number;
   supported: boolean;
@@ -224,6 +247,7 @@ export class LlamaWebGpuBridge {
 
   embed(text: string, options?: EmbedOptions): Promise<number[]>;
   embedBatch(texts: string[], options?: EmbedOptions): Promise<number[][]>;
+  scoreNextToken(prompt: string, options?: NextTokenScoreOptions): Promise<NextTokenScores>;
 
   loadMultimodalProjector(url: string): Promise<unknown>;
   unloadMultimodalProjector(): Promise<unknown>;
