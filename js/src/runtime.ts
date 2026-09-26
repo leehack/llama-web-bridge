@@ -60,6 +60,7 @@ import {
   trimUnstableUtf8Tail,
 } from './internal/text.ts';
 import { bufferSourceBytes, isInt32, toFloat32Array, toUint8Array } from './internal/typed_values.ts';
+import type { ResolvedSpeculativeOptions } from './internal/completion_options.ts';
 import type { ProgressCallback } from './internal/download.ts';
 import type { ModelSource } from './internal/model_source.ts';
 import type { CcallArgType, LlamaCoreModule, LogMethod } from './internal/types.ts';
@@ -70,6 +71,8 @@ import type {
   DecisionCapabilities,
   DecisionHeadInfo,
   DecisionHeadOptions,
+  DraftModelInfo,
+  DraftModelLoadOptions,
   EmbedOptions,
   LlamaWebGpuBridgeConfig,
   LoadModelOptions,
@@ -200,6 +203,8 @@ export class LlamaWebGpuBridgeRuntime {
   declare _ropeFrequencyScale: number;
   declare _splitMode: number;
   declare _mainGpu: number;
+  declare _loadMtp: boolean;
+  declare _speculativeRollbackTokenMax: number;
   declare _isSafari: boolean;
   declare _coreVariant: string;
   declare _preferMemory64: boolean;
@@ -208,6 +213,8 @@ export class LlamaWebGpuBridgeRuntime {
   declare _modelCacheName: string;
   declare _loadedModelUrl: ModelSource | null;
   declare _mmProjSourceUrl: string | null;
+  declare _draftModel: { url: string; options: DraftModelLoadOptions; info: DraftModelInfo } | null;
+  declare _speculativeFileCounter: number;
   declare _suppressedWarmupWarningCount: number;
   declare _didReportWarmupWarningSuppression: boolean;
   declare _remoteFetchThresholdBytes: number;
@@ -277,6 +284,8 @@ export class LlamaWebGpuBridgeRuntime {
     this._ropeFrequencyScale = 0;
     this._splitMode = -1;
     this._mainGpu = -1;
+    this._loadMtp = false;
+    this._speculativeRollbackTokenMax = 0;
     this._isSafari = isSafariUserAgent(this._config.userAgent ?? globalThis.navigator?.userAgent ?? '');
     this._coreVariant = 'uninitialized';
     this._preferMemory64 = this._config.preferMemory64 !== false;
@@ -285,6 +294,8 @@ export class LlamaWebGpuBridgeRuntime {
     this._modelCacheName = defaultModelCacheName;
     this._loadedModelUrl = null;
     this._mmProjSourceUrl = null;
+    this._draftModel = null;
+    this._speculativeFileCounter = 0;
     this._suppressedWarmupWarningCount = 0;
     this._didReportWarmupWarningSuppression = false;
     this._remoteFetchThresholdBytes = Number(config.remoteFetchThresholdBytes) > 0
@@ -581,6 +592,7 @@ export class LlamaWebGpuBridgeRuntime {
 
     const previousPreferMemory64 = this._preferMemory64;
     const previousMMProjSourceUrl = this._mmProjSourceUrl;
+    const previousDraftModel = this._draftModel;
 
     try {
       this._preferMemory64 = false;
@@ -600,6 +612,14 @@ export class LlamaWebGpuBridgeRuntime {
           await this.loadMultimodalProjector(previousMMProjSourceUrl);
         } catch (_) {
           this._runtimeNotes.push('generation_recovery_mmproj_reload_failed');
+        }
+      }
+
+      if (previousDraftModel) {
+        try {
+          await this.loadDraftModel(previousDraftModel.url, previousDraftModel.options);
+        } catch (_) {
+          this._runtimeNotes.push('generation_recovery_draft_reload_failed');
         }
       }
 
@@ -917,6 +937,8 @@ export class LlamaWebGpuBridgeRuntime {
     if (this._mainGpu < 0) {
       this._mainGpu = -1;
     }
+    this._loadMtp = parseBooleanFlag(options.loadMtp, false);
+    this._speculativeRollbackTokenMax = parsePositiveInteger(options.speculativeRollbackTokenMax);
 
     const wantsQuantizedKvCache = this._cacheTypeK !== 1 || this._cacheTypeV !== 1;
     if (this._flashAttention === 0 && wantsQuantizedKvCache) {
@@ -947,6 +969,8 @@ export class LlamaWebGpuBridgeRuntime {
       this._ropeFrequencyScale,
       this._splitMode,
       this._mainGpu,
+      this._loadMtp ? 1 : 0,
+      this._speculativeRollbackTokenMax,
     ];
   }
 
@@ -1374,6 +1398,7 @@ export class LlamaWebGpuBridgeRuntime {
     this._mmProjPath = null;
     this._mmSupportsVision = false;
     this._mmSupportsAudio = false;
+    this._draftModel = null;
     this._runtimeNotes.push('previous_model_released');
     return true;
   }
@@ -2608,6 +2633,221 @@ export class LlamaWebGpuBridgeRuntime {
     this._mmProjSourceUrl = null;
   }
 
+  // Bytes the core heap can still allocate, or null for a core without the
+  // probe.
+  _heapHeadroomBytes(core: LlamaCoreModule): number | null {
+    try {
+      const value = Number(core.ccall('llamadart_webgpu_heap_headroom_bytes', 'number', [], []));
+      return Number.isFinite(value) && value >= 0 ? value : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  // Throws when `bytes` more would not fit in the core heap, naming the
+  // memory64 core when the wasm32 core's 4 GiB limit is the reason.
+  _requireHeapHeadroom(core: LlamaCoreModule, bytes: number, what: string) {
+    const headroom = this._heapHeadroomBytes(core);
+    if (headroom == null || !(bytes > headroom)) {
+      return;
+    }
+    const mib = (value: number, round: (value: number) => number) => `${round(value / (1024 * 1024))} MiB`;
+    const detail = this._coreVariant === 'wasm32'
+      ? 'the wasm32 core addresses at most 4 GiB; memory64 is required: load the bridge with '
+        + 'coreModuleUrlMem64 and preferMemory64 in a browser with WebAssembly memory64 support'
+      : 'free memory by unloading other models or use a smaller draft model';
+    throw new Error(
+      `${what} needs about ${mib(bytes, Math.ceil)} but only ${mib(headroom, Math.floor)} of WebAssembly memory `
+      + `is left; ${detail}.`,
+    );
+  }
+
+  async loadDraftModel(url: string, options: DraftModelLoadOptions = {}): Promise<DraftModelInfo> {
+    if (!this._core || this._modelBytes <= 0) {
+      throw new Error('No model loaded. Call loadModelFromUrl first.');
+    }
+    if (typeof url !== 'string' || url.length === 0) {
+      throw new Error('Draft model URL is empty.');
+    }
+    const core = this._core;
+    const abortMessage = 'Draft model load was cancelled.';
+    throwIfAborted(options.signal || null, abortMessage);
+
+    const rc = Number(core.ccall('llamadart_webgpu_draft_model_free', 'number', [], []));
+    if (rc !== 0) {
+      throw new Error(this._coreErrorMessage('Failed to release the draft model', rc));
+    }
+    this._draftModel = null;
+
+    ensureFsDirectory(core.FS, '/draft');
+    const draftPath = `/draft/${basenameFromUrl(url)}`;
+    // cancel() aborts the transfer controller, the caller's signal aborts it too.
+    const controller = this._beginTransferAbortController();
+    const onCallerAbort = () => controller?.abort();
+    options.signal?.addEventListener('abort', onCallerAbort, { once: true });
+    const signal = controller?.signal ?? options.signal ?? null;
+    // The target model's cache bookkeeping describes the target, not the draft.
+    const targetCacheFields = [this._modelSource, this._modelCacheState, this._modelCacheName] as const;
+    try {
+      let response: Response;
+      try {
+        response = await this._getCachedModelResponse(url, {
+          useCache: options.useCache,
+          force: options.force,
+          signal,
+          requireReadableStream: true,
+        });
+      } finally {
+        [this._modelSource, this._modelCacheState, this._modelCacheName] = targetCacheFields;
+      }
+      if (!response.ok) {
+        throw new Error(`Failed to fetch draft model: ${response.status} ${response.statusText}`);
+      }
+      const totalBytes = inferResponseTotalBytes(response, 0);
+      if (totalBytes > 0) {
+        this._requireHeapHeadroom(
+          core,
+          this._nGpuLayers === 0 ? totalBytes * 2 : totalBytes,
+          'The draft model',
+        );
+      }
+      const progressCallback = typeof options.progressCallback === 'function'
+        ? options.progressCallback
+        : null;
+      await writeResponseToFsFileWithProgress(
+        response,
+        core.FS,
+        draftPath,
+        progressCallback as ProgressCallback | null,
+        {
+          useBigIntPosition: this._coreVariant === 'wasm64',
+          totalBytes,
+          chunkTimeoutMs: this._resolveStreamChunkTimeoutMs({}, 90000),
+          signal,
+          abortMessage,
+        },
+      );
+      throwIfAborted(signal, abortMessage);
+
+      const loadRc = Number(
+        await core.ccall(
+          'llamadart_webgpu_draft_model_load',
+          'number',
+          ['string'],
+          [draftPath],
+          { async: true },
+        ),
+      );
+      if (loadRc !== 0) {
+        let message = this._coreErrorMessage('Failed to load draft model', loadRc);
+        if (this._coreVariant === 'wasm32' && /memory|alloc/i.test(message)) {
+          message += '; the wasm32 core addresses at most 4 GiB, so a larger draft model needs the memory64 core';
+        }
+        throw new Error(message);
+      }
+      const info = JSON.parse(
+        core.ccall('llamadart_webgpu_draft_model_info_json', 'string', [], []) || '{}',
+      ) as DraftModelInfo;
+      this._draftModel = {
+        url,
+        options: { useCache: options.useCache, force: false },
+        info,
+      };
+      return { ...info };
+    } finally {
+      options.signal?.removeEventListener('abort', onCallerAbort);
+      this._clearTransferAbortController(controller);
+      this._deleteFsFile(draftPath);
+    }
+  }
+
+  async unloadDraftModel(): Promise<void> {
+    if (!this._core) {
+      this._draftModel = null;
+      return;
+    }
+    const rc = Number(this._core.ccall('llamadart_webgpu_draft_model_free', 'number', [], []));
+    if (rc !== 0) {
+      throw new Error(this._coreErrorMessage('Failed to unload the draft model', rc));
+    }
+    this._draftModel = null;
+  }
+
+  // Writes one n-gram cache source to the core filesystem and returns its
+  // path; the caller deletes it.
+  async _stageNgramCache(source: string | ArrayBuffer | ArrayBufferView, name: string): Promise<string> {
+    const core = this._core!;
+    ensureFsDirectory(core.FS, '/speculative');
+    this._speculativeFileCounter += 1;
+    const path = `/speculative/${name}_${Date.now()}_${this._speculativeFileCounter}.lcs`;
+    if (typeof source === 'string') {
+      const response = await this._fetchWithTimeout(
+        source,
+        { cache: 'no-store' },
+        this._resolveFetchTimeoutMs({}, 180000),
+      );
+      if (!response.ok) {
+        throw new Error(`Failed to fetch the ${name} n-gram cache: ${response.status} ${response.statusText}`);
+      }
+      core.FS.writeFile(path, new Uint8Array(await response.arrayBuffer()));
+    } else {
+      const bytes = source instanceof ArrayBuffer
+        ? new Uint8Array(source)
+        : new Uint8Array(source.buffer, source.byteOffset, source.byteLength);
+      core.FS.writeFile(path, bytes);
+    }
+    return path;
+  }
+
+  // Passes the speculative settings to the core for the next
+  // begin_generation, which consumes them. Returns the staged cache files.
+  async _setNextSpeculative(
+    speculative: ResolvedSpeculativeOptions,
+    maxTokens: number,
+    stagedPaths: string[],
+  ) {
+    const core = this._core!;
+    const staticPath = speculative.ngramCacheStatic == null
+      ? ''
+      : await this._stageNgramCache(speculative.ngramCacheStatic, 'static');
+    if (staticPath) {
+      stagedPaths.push(staticPath);
+    }
+    const dynamicPath = speculative.ngramCacheDynamic == null
+      ? ''
+      : await this._stageNgramCache(speculative.ngramCacheDynamic, 'dynamic');
+    if (dynamicPath) {
+      stagedPaths.push(dynamicPath);
+    }
+    const rc = Number(core.ccall(
+      'llamadart_webgpu_set_next_speculative',
+      'number',
+      [
+        'string', 'number', 'number', 'number', 'number', 'number', 'number', 'number', 'number',
+        'number', 'number', 'string', 'string', 'number',
+      ],
+      [
+        speculative.strategies.join(','),
+        speculative.draftTokenMax,
+        speculative.draftTokenMin,
+        speculative.minProbability,
+        speculative.draftSplitProbability,
+        speculative.ngramSizeN,
+        speculative.ngramSizeM,
+        speculative.ngramMinHits,
+        speculative.ngramMatch,
+        speculative.ngramTokenMin,
+        speculative.ngramTokenMax,
+        staticPath,
+        dynamicPath,
+        maxTokens,
+      ],
+    ));
+    if (rc !== 0) {
+      throw new Error(this._coreErrorMessage('Failed to configure speculative decoding', rc));
+    }
+  }
+
   supportsVision() {
     return this._mmSupportsVision;
   }
@@ -3548,8 +3788,12 @@ export class LlamaWebGpuBridgeRuntime {
     await this._stageMultimodalParts(options.parts, options);
 
     let generationStarted = false;
+    const speculativePaths: string[] = [];
 
     try {
+      if (sampling.speculative) {
+        await this._setNextSpeculative(sampling.speculative, nPredict, speculativePaths);
+      }
       const beginRc = Number(
         await this._core!.ccall(
           'llamadart_webgpu_begin_generation',
@@ -3586,6 +3830,9 @@ export class LlamaWebGpuBridgeRuntime {
       }
 
       generationStarted = true;
+      for (const path of speculativePaths.splice(0)) {
+        this._deleteFsFile(path);
+      }
 
       let generated = 0;
       const shouldEmitCurrentText = options.emitCurrentTextOnToken !== false;
@@ -3635,7 +3882,10 @@ export class LlamaWebGpuBridgeRuntime {
             break;
           }
 
-          if (this._shouldAttemptGenerationRecovery(stepErrorText, options, generated)) {
+          if (
+            sampling.speculative == null
+            && this._shouldAttemptGenerationRecovery(stepErrorText, options, generated)
+          ) {
             const recovered = await this._recoverGenerationWithCpuFallback(options);
             if (recovered) {
               if (generationStarted) {
@@ -3704,6 +3954,7 @@ export class LlamaWebGpuBridgeRuntime {
         const counts = JSON.parse(
           this._core!.ccall('llamadart_webgpu_last_generation_usage_json', 'string', [], []) || '{}',
         );
+        const speculative = counts?.speculative;
         options.onUsage({
           promptTokens: Number(counts?.promptTokens) || 0,
           cachedPromptTokens: Number(counts?.cachedPromptTokens) || 0,
@@ -3711,12 +3962,26 @@ export class LlamaWebGpuBridgeRuntime {
           timeToFirstTokenMs: firstTokenAt == null ? null : firstTokenAt - startedAt,
           durationMs: performance.now() - startedAt,
           finishReason,
+          ...(speculative && typeof speculative === 'object'
+            ? {
+                speculative: {
+                  draftTokens: Number(speculative.draftTokens) || 0,
+                  acceptedDraftTokens: Number(speculative.acceptedDraftTokens) || 0,
+                  draftAttempts: Number(speculative.draftAttempts) || 0,
+                  verifyTokens: Number(speculative.verifyTokens) || 0,
+                  replayTokens: Number(speculative.replayTokens) || 0,
+                },
+              }
+            : {}),
         });
       }
       return text;
     } finally {
       if (generationStarted) {
         this._core!.ccall('llamadart_webgpu_end_generation', null, [], []);
+      }
+      for (const path of speculativePaths) {
+        this._deleteFsFile(path);
       }
       this._clearPendingMedia();
     }

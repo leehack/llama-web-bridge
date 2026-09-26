@@ -38,6 +38,8 @@ const optionParameters = [
   { name: 'rope_freq_scale', field: '_ropeFrequencyScale', input: 29.5, expected: 29.5 },
   { name: 'split_mode', field: '_splitMode', input: 30, expected: 30 },
   { name: 'main_gpu', field: '_mainGpu', input: 31, expected: 31 },
+  { name: 'load_mtp', field: '_loadMtp', input: true, expected: 1 },
+  { name: 'n_rs_seq', field: '_speculativeRollbackTokenMax', input: 33, expected: 33 },
 ];
 
 const leadingValueTokens = {

@@ -84,12 +84,12 @@ Runtime-backed methods execute through a per-instance single-writer FIFO queue i
 both worker and direct runtime modes:
 
 `loadModelFromUrl`, `loadMultimodalProjector`, `unloadMultimodalProjector`,
-`getTextToSpeechCapabilities`, `synthesizeSpeech`, `getDecisionCapabilities`,
-`loadDecisionHead`, `runDecision`, `freeDecisionHead`,
-`getLoraAdapterCapabilities`, `loadLoraAdapter`, `setLoraAdapter`,
-`removeLoraAdapter`, `clearLoraAdapters`, `createCompletion`,
-`getCompletionCapabilities`, `tokenize`, `detokenize`, `stateSaveFile`,
-`stateLoadFile`, `stateSaveBytes`,
+`loadDraftModel`, `unloadDraftModel`, `getTextToSpeechCapabilities`,
+`synthesizeSpeech`, `getDecisionCapabilities`, `loadDecisionHead`,
+`runDecision`, `freeDecisionHead`, `getLoraAdapterCapabilities`,
+`loadLoraAdapter`, `setLoraAdapter`, `removeLoraAdapter`, `clearLoraAdapters`,
+`createCompletion`, `getCompletionCapabilities`, `tokenize`, `detokenize`,
+`stateSaveFile`, `stateLoadFile`, `stateSaveBytes`,
 `stateLoadBytes`, `embed`, `embedBatch`, `scoreNextToken`, `applyChatTemplate`.
 
 Overlapping calls wait their turn and run in call order. A failing operation
@@ -224,6 +224,8 @@ Common `options` keys:
 | `useCache`, `force` | Cache Storage controls for model responses. |
 | `streamResumeRetries` | Retry count for resumable streamed model loads. |
 | `remoteFetchThresholdBytes`, `remoteFetchChunkBytes` | Per-load remote-fetch tuning. |
+| `loadMtp` | Loads the model's MTP layers, which `draft-mtp` speculative decoding needs. Defaults to `false`. |
+| `speculativeRollbackTokenMax` | llama.cpp's `n_rs_seq`: rollback snapshots per sequence. A model with recurrent state, such as Qwen3.5, needs at least the draft length for `draft-*` speculative decoding. Defaults to `0`. |
 
 Returns the underlying load result from the active runtime. After a successful
 load, metadata and capability helpers reflect the loaded model.
@@ -234,8 +236,8 @@ projector and their filesystem copies, then downloads the new model, so both
 never occupy the WASM heap at once. If the download or native load then
 fails, no model stays loaded; call `loadModelFromUrl()` again. The core refuses
 the release while a generation or speech synthesis is active, and the current
-model stays loaded. Load a projector and LoRA adapters again after switching
-models.
+model stays loaded. Load a projector, LoRA adapters and a draft model again
+after switching models.
 
 ### `prefetchModelToCache(url, options?)`
 
@@ -292,6 +294,7 @@ Common `options` keys:
 | `tokenEventFlushChars` | When worker coalescing is enabled, flush once the buffered decoded text reaches this many JavaScript characters. `0` (default) disables the size threshold. Values are clamped to `1..1024` when positive. |
 | `parts` | Optional multimodal parts after a projector is loaded. Image parts require `{ type: 'image', bytes }` or `{ type: 'image', url }`; audio parts require `{ type: 'audio', samples }`, `{ type: 'audio', bytes }`, or `{ type: 'audio', url }`. `bytes` and `samples` accept an `ArrayBuffer`, any `ArrayBuffer` view, or a number array. Image `width` and `height` identify raw RGB bytes when their dimensions match the byte length. |
 | `mediaMaxPredict` | Cap for multimodal generation token count. |
+| `speculativeDecoding` | `{ strategies, ... }`: llama.cpp speculative decoding; see [Speculative decoding](#speculative-decoding). |
 
 Call `cancel()` or abort the supplied signal to request a best-effort stop.
 
@@ -310,6 +313,7 @@ generation starts. A nonzero `minP` or `presencePenalty`, or any
 | `timeToFirstTokenMs` | Milliseconds from the runtime starting the completion to its first streamed text, or `null` when it streamed none. |
 | `durationMs` | Milliseconds from the runtime starting the completion to its end. |
 | `finishReason` | `stop` at an end-of-generation token, `length` at `nPredict` or the context limit, `cancelled` after `cancel()` or an abort during generation. |
+| `speculative` | Present only for a `speculativeDecoding` completion: `{ draftTokens, acceptedDraftTokens, draftAttempts, verifyTokens, replayTokens }`, the drafted and accepted tokens, draft steps (including those that drafted nothing), target tokens decoded to verify drafts, and target tokens decoded again after restoring a recurrent-state checkpoint. |
 
 Both times are measured by the runtime that generates, inside the worker in
 worker mode. They include staging media and evaluating the prompt, and exclude
@@ -325,9 +329,87 @@ cancelled generation once it returns.
 getCompletionCapabilities(): Promise<CompletionCapabilities>
 ```
 
-Returns `{ presencePenalty, minP, thinkingBudget }`: whether the loaded core
-applies each `createCompletion` option. Every flag is `false` until a model load initializes
-the core.
+Returns `{ presencePenalty, minP, thinkingBudget, speculativeDecoding }`:
+whether the loaded core applies each `createCompletion` option. Every flag is
+`false` until a model load initializes the core. `speculativeDecoding` maps each
+strategy to whether the loaded models can run it now: the n-gram strategies need
+only a speculative-capable core, `draft-mtp` needs a model with MTP layers
+loaded with `loadMtp: true`, and the other `draft-*` strategies need a matching
+draft from `loadDraftModel()`.
+
+### Speculative decoding
+
+`speculativeDecoding` drafts tokens and verifies them with the loaded model, as
+llama.cpp's `llama-server` does. Every sampled token comes from the target
+model, so greedy sampling (`temp: 0` or `topK: 1`) produces the same tokens as a
+completion without it. Strategies use llama.cpp's `--spec-type` names:
+
+| Strategy | Drafts from |
+| --- | --- |
+| `ngram-simple`, `ngram-map-k`, `ngram-map-k4v` | Matches of the last `ngramSizeN` tokens in the prompt and output. |
+| `ngram-mod` | A hashed pool of earlier n-grams. |
+| `ngram-cache` | Prompt and output n-grams, optionally with `ngramCacheStatic`/`ngramCacheDynamic` files from `llama-lookup-create`. |
+| `draft-simple` | A standalone draft model from `loadDraftModel()` that shares the target's vocabulary. |
+| `draft-eagle3` | An EAGLE3 draft from `loadDraftModel()`. |
+| `draft-dflash`, `draft-dspark` | A DFlash-architecture block draft from `loadDraftModel()`; llama.cpp reads which of the two it is from its tensors. |
+| `draft-mtp` | The target's own MTP layers; load the model with `loadMtp: true`. |
+
+`strategies` combines any n-gram strategies with at most one `draft-*`
+strategy. The other keys are optional; omitted ones keep llama.cpp's defaults:
+
+| Key | Description |
+| --- | --- |
+| `draftTokenMax` | Maximum draft tokens per step, an integer from `0`. `draft-*` strategies use it or 3, `ngram-simple`/`ngram-map-k`/`ngram-map-k4v` use `ngramSizeM` or 48, `ngram-mod` uses `ngramTokenMax`, then it, then 64, and `ngram-cache` uses it or 8. The largest applies; 0 becomes 64. |
+| `draftTokenMin`, `minProbability`, `draftSplitProbability` | Draft-model minimum length, minimum token probability and split probability. They need a `draft-*` strategy. |
+| `ngramSizeN`, `ngramSizeM`, `ngramMinHits` | Lookup size, draft size and minimum hits of `ngram-simple`, `ngram-map-k` and `ngram-map-k4v`, from `1` to `65535`. |
+| `ngramMatch`, `ngramTokenMin`, `ngramTokenMax` | Lookup length and draft length bounds of `ngram-mod`. `ngramTokenMax` defaults to `draftTokenMax`. |
+| `ngramCacheStatic`, `ngramCacheDynamic` | `ngram-cache` files as a URL string, `ArrayBuffer` or typed array. The dynamic cache is read, never written back. A malformed file rejects. |
+
+The rules are those of native llamadart's `SpeculativeDecodingConfig`, and an
+invalid combination rejects with a `TypeError`, `RangeError` or `Error` before
+any work. Speculative decoding needs a text-only prompt and rejects with
+`grammar`, `thinkingBudget` or `parts`. It evaluates the whole prompt instead of
+reusing a cached prefix, and each step drafts at most `nPredict` minus the
+tokens generated so far, minus one.
+
+A model with recurrent state cannot drop rejected draft tokens from its memory.
+With the n-gram strategies the bridge saves that state before each verification
+and replays the accepted tokens after a rejection (`replayTokens`). The
+`draft-*` strategies instead need the model loaded with
+`speculativeRollbackTokenMax` of at least the draft length, and each draft is
+capped at that value. A request the loaded models cannot run, such as
+`draft-mtp` without MTP layers or `draft-dflash` with a DSpark draft, rejects
+with a message naming what is missing.
+
+## Draft models
+
+### `loadDraftModel(url, options?)`
+
+```ts
+loadDraftModel(url: string, options?: DraftModelLoadOptions): Promise<DraftModelInfo>
+```
+
+Downloads a draft GGUF and loads it with the target model's load settings,
+replacing any draft. `options` takes `progressCallback`, `signal`, `useCache`
+and `force`, as `loadModelFromUrl()` does. Resolves to `{ architecture,
+strategy? }`: the GGUF's `general.architecture`, and `draft-dflash` or
+`draft-dspark` for a DFlash-architecture draft. A target model load unloads the
+draft; the bridge reloads it after it reloads the target on its own, such as
+after a worker restart, and warns and forgets it when that reload fails.
+
+The draft is staged in the WASM heap before it loads. When the server reports
+the draft's size and it would not fit in the memory left, the call rejects
+before reading the body; on the wasm32 core, whose heap is limited to 4 GiB, the
+message says a memory64 core is required.
+
+### `unloadDraftModel()`
+
+```ts
+unloadDraftModel(): Promise<void>
+```
+
+Frees the draft model. `draft-simple`, `draft-eagle3`, `draft-dflash` and
+`draft-dspark` then reject until a draft is loaded again.
 
 ## Tokenization and chat templates
 

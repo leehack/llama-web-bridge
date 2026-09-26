@@ -166,6 +166,8 @@ export const LIFECYCLE_CONTRACT_CASES = [
         'getCompletionCapabilities',
         'loadMultimodalProjector',
         'unloadMultimodalProjector',
+        'loadDraftModel',
+        'unloadDraftModel',
         'getTextToSpeechCapabilities',
         'synthesizeSpeech',
         'getDecisionCapabilities',

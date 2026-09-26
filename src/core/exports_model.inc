@@ -20,7 +20,9 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_load_model(
     double rope_freq_base,
     double rope_freq_scale,
     int32_t split_mode,
-    int32_t main_gpu) {
+    int32_t main_gpu,
+    int32_t load_mtp,
+    int32_t n_rs_seq) {
   clear_error();
   g_last_output.clear();
   g_cancel_requested = false;
@@ -55,7 +57,9 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_load_model(
       rope_freq_base,
       rope_freq_scale,
       split_mode,
-      main_gpu);
+      main_gpu,
+      load_mtp != 0,
+      n_rs_seq);
 }
 
 EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_free_model() {
@@ -88,7 +92,9 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_load_model_from_url(
     double rope_freq_base,
     double rope_freq_scale,
     int32_t split_mode,
-    int32_t main_gpu) {
+    int32_t main_gpu,
+    int32_t load_mtp,
+    int32_t n_rs_seq) {
   clear_error();
   g_last_output.clear();
   g_cancel_requested = false;
@@ -169,7 +175,9 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_load_model_from_url(
           rope_freq_base,
           rope_freq_scale,
           split_mode,
-          main_gpu);
+          main_gpu,
+          load_mtp != 0,
+          n_rs_seq);
   if (unlink(fetch_file_path.c_str()) != 0 && errno != ENOENT) {
     // best-effort cleanup of temporary fetch path
   }

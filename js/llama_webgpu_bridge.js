@@ -17,11 +17,31 @@ function throwIfAborted(signal, message = "Bridge operation was cancelled.") {
 }
 
 // js/src/internal/completion_options.ts
+var SPECULATIVE_DECODING_STRATEGIES = Object.freeze([
+  "draft-simple",
+  "draft-eagle3",
+  "draft-mtp",
+  "draft-dflash",
+  "draft-dspark",
+  "ngram-simple",
+  "ngram-map-k",
+  "ngram-map-k4v",
+  "ngram-mod",
+  "ngram-cache"
+]);
+function speculativeFlags(isSupported) {
+  return Object.fromEntries(
+    SPECULATIVE_DECODING_STRATEGIES.map((strategy) => [strategy, isSupported(strategy)])
+  );
+}
 var NO_COMPLETION_CAPABILITIES = Object.freeze({
   presencePenalty: false,
   minP: false,
-  thinkingBudget: false
+  thinkingBudget: false,
+  speculativeDecoding: Object.freeze(speculativeFlags(() => false))
 });
+var MAX_NGRAM_SIZE = 65535;
+var MAX_INT32 = 2147483647;
 var MAX_THINKING_BUDGET_TOKENS = 2147483647;
 function optionalNumber(value, name, isValid, range) {
   if (value == null) {
@@ -64,14 +84,163 @@ function thinkingBudget(value, hasMediaParts) {
   }
   return { maxTokens, startTag, endTag, forcedMessage };
 }
+function speculativeInteger(config, name, min, max) {
+  const value = config[name];
+  if (value == null) {
+    return null;
+  }
+  if (!Number.isInteger(value) || value < min || value > max) {
+    throw new RangeError(
+      `CompletionOptions.speculativeDecoding.${name} must be an integer from ${min} to ${max}; got ${String(value)}.`
+    );
+  }
+  return value;
+}
+function speculativeProbability(config, name) {
+  const value = config[name];
+  if (value == null) {
+    return null;
+  }
+  if (typeof value !== "number" || !(value >= 0 && value <= 1)) {
+    throw new RangeError(
+      `CompletionOptions.speculativeDecoding.${name} must be a number from 0 to 1; got ${String(value)}.`
+    );
+  }
+  return value;
+}
+function ngramCacheSource(config, name) {
+  const value = config[name];
+  if (value == null) {
+    return null;
+  }
+  const isBytes = value instanceof ArrayBuffer || ArrayBuffer.isView(value);
+  if (!(typeof value === "string" || isBytes)) {
+    throw new TypeError(
+      `CompletionOptions.speculativeDecoding.${name} must be a URL string, an ArrayBuffer or a typed array.`
+    );
+  }
+  if ((typeof value === "string" ? value.length : value.byteLength) === 0) {
+    throw new TypeError(`CompletionOptions.speculativeDecoding.${name} is empty.`);
+  }
+  return value;
+}
+function isDraftStrategy(strategy) {
+  return strategy.startsWith("draft-");
+}
+function speculativeDecoding(value, conflicts) {
+  if (value == null) {
+    return null;
+  }
+  if (typeof value !== "object") {
+    throw new TypeError("CompletionOptions.speculativeDecoding must be an object.");
+  }
+  const config = value;
+  const requested = config.strategies;
+  if (!Array.isArray(requested) || requested.length === 0) {
+    throw new TypeError("CompletionOptions.speculativeDecoding.strategies must be a non-empty array.");
+  }
+  const strategies = [];
+  for (const strategy of requested) {
+    if (!SPECULATIVE_DECODING_STRATEGIES.includes(strategy)) {
+      throw new TypeError(
+        `CompletionOptions.speculativeDecoding.strategies has an unknown strategy ${JSON.stringify(strategy)}; expected one of ${SPECULATIVE_DECODING_STRATEGIES.join(", ")}.`
+      );
+    }
+    if (!strategies.includes(strategy)) {
+      strategies.push(strategy);
+    }
+  }
+  const draftTokenMax = speculativeInteger(config, "draftTokenMax", 0, MAX_INT32);
+  const draftTokenMin = speculativeInteger(config, "draftTokenMin", 0, MAX_INT32);
+  const minProbability = speculativeProbability(config, "minProbability");
+  const draftSplitProbability = speculativeProbability(config, "draftSplitProbability");
+  const ngramSizeN = speculativeInteger(config, "ngramSizeN", 1, MAX_NGRAM_SIZE);
+  const ngramSizeM = speculativeInteger(config, "ngramSizeM", 1, MAX_NGRAM_SIZE);
+  const ngramMinHits = speculativeInteger(config, "ngramMinHits", 1, MAX_NGRAM_SIZE);
+  const ngramMatch = speculativeInteger(config, "ngramMatch", 1, MAX_INT32);
+  const ngramTokenMin = speculativeInteger(config, "ngramTokenMin", 0, MAX_INT32);
+  const ngramTokenMax = speculativeInteger(config, "ngramTokenMax", 0, MAX_INT32);
+  const ngramCacheStatic = ngramCacheSource(config, "ngramCacheStatic");
+  const ngramCacheDynamic = ngramCacheSource(config, "ngramCacheDynamic");
+  if (strategies.filter(isDraftStrategy).length > 1) {
+    throw new Error(
+      "CompletionOptions.speculativeDecoding can mix n-gram strategies with at most one draft-* strategy."
+    );
+  }
+  if (!strategies.some(isDraftStrategy) && (draftTokenMin != null || minProbability != null || draftSplitProbability != null)) {
+    throw new Error(
+      "CompletionOptions.speculativeDecoding: n-gram strategies use token history and do not support draftTokenMin, minProbability or draftSplitProbability unless a draft-* strategy is also enabled."
+    );
+  }
+  if ((ngramCacheStatic != null || ngramCacheDynamic != null) && !strategies.includes("ngram-cache")) {
+    throw new Error(
+      "CompletionOptions.speculativeDecoding: ngramCacheStatic and ngramCacheDynamic need the ngram-cache strategy."
+    );
+  }
+  if (ngramTokenMin != null && ngramTokenMax != null && ngramTokenMin > ngramTokenMax) {
+    throw new RangeError(
+      `CompletionOptions.speculativeDecoding.ngramTokenMin (${ngramTokenMin}) must not exceed ngramTokenMax (${ngramTokenMax}).`
+    );
+  }
+  let resolvedDraftTokenMax = 0;
+  for (const strategy of strategies) {
+    let strategyMax;
+    if (isDraftStrategy(strategy)) {
+      strategyMax = draftTokenMax ?? 3;
+    } else if (strategy === "ngram-mod") {
+      strategyMax = ngramTokenMax ?? draftTokenMax ?? 64;
+    } else if (strategy === "ngram-cache") {
+      strategyMax = draftTokenMax ?? 8;
+    } else {
+      strategyMax = ngramSizeM ?? 48;
+    }
+    resolvedDraftTokenMax = Math.max(resolvedDraftTokenMax, strategyMax);
+  }
+  if (resolvedDraftTokenMax === 0) {
+    resolvedDraftTokenMax = 64;
+  }
+  if ((draftTokenMin ?? 0) > resolvedDraftTokenMax) {
+    throw new RangeError(
+      `CompletionOptions.speculativeDecoding.draftTokenMin (${draftTokenMin}) must not exceed the draft token maximum (${resolvedDraftTokenMax}).`
+    );
+  }
+  if (conflicts.hasMediaParts) {
+    throw new Error("CompletionOptions.speculativeDecoding supports text-only prompts; remove the media parts.");
+  }
+  if (conflicts.hasThinkingBudget) {
+    throw new Error("CompletionOptions.speculativeDecoding cannot be combined with CompletionOptions.thinkingBudget.");
+  }
+  if (conflicts.hasGrammar) {
+    throw new Error("CompletionOptions.speculativeDecoding does not support CompletionOptions.grammar.");
+  }
+  return {
+    strategies,
+    draftTokenMax: resolvedDraftTokenMax,
+    draftTokenMin: draftTokenMin ?? 0,
+    minProbability: minProbability ?? -1,
+    draftSplitProbability: draftSplitProbability ?? -1,
+    ngramSizeN: ngramSizeN ?? 0,
+    ngramSizeM: ngramSizeM ?? 0,
+    ngramMinHits: ngramMinHits ?? 0,
+    ngramMatch: ngramMatch ?? 0,
+    ngramTokenMin: ngramTokenMin ?? -1,
+    ngramTokenMax: ngramTokenMax ?? (strategies.includes("ngram-mod") ? draftTokenMax ?? 0 : 0),
+    ngramCacheStatic,
+    ngramCacheDynamic
+  };
+}
 function resolveCompletionSamplingOptions(options) {
+  const hasMediaParts = Array.isArray(options?.parts) && options.parts.length > 0;
+  const budget = thinkingBudget(options?.thinkingBudget, hasMediaParts);
   return {
     minP: optionalNumber(options?.minP, "minP", (value) => value >= 0 && value <= 1, " from 0 to 1") ?? 0,
     presencePenalty: optionalNumber(options?.presencePenalty, "presencePenalty", () => true, "") ?? 0,
-    thinkingBudget: thinkingBudget(
-      options?.thinkingBudget,
-      Array.isArray(options?.parts) && options.parts.length > 0
-    )
+    thinkingBudget: budget,
+    speculative: speculativeDecoding(options?.speculativeDecoding, {
+      hasMediaParts,
+      hasGrammar: typeof options?.grammar === "string" && options.grammar.length > 0,
+      hasThinkingBudget: budget != null
+    })
   };
 }
 function completionCapabilitiesFrom(raw) {
@@ -81,17 +250,20 @@ function completionCapabilitiesFrom(raw) {
   } catch (_) {
     return { ...NO_COMPLETION_CAPABILITIES };
   }
+  const speculative = parsed?.speculativeDecoding;
   return {
     presencePenalty: parsed?.presencePenalty === true,
     minP: parsed?.minP === true,
-    thinkingBudget: parsed?.thinkingBudget === true
+    thinkingBudget: parsed?.thinkingBudget === true,
+    speculativeDecoding: speculativeFlags((strategy) => speculative?.[strategy] === true)
   };
 }
 function requireCompletionCapabilities(sampling, capabilities) {
   const missing = [
     sampling.minP !== 0 && !capabilities.minP ? "minP" : null,
     sampling.presencePenalty !== 0 && !capabilities.presencePenalty ? "presencePenalty" : null,
-    sampling.thinkingBudget != null && !capabilities.thinkingBudget ? "thinkingBudget" : null
+    sampling.thinkingBudget != null && !capabilities.thinkingBudget ? "thinkingBudget" : null,
+    sampling.speculative != null && !Object.values(capabilities.speculativeDecoding).includes(true) ? "speculativeDecoding" : null
   ].filter((name) => name != null);
   if (missing.length > 0) {
     throw new Error(
@@ -969,6 +1141,8 @@ var LlamaWebGpuBridgeRuntime = class {
     this._ropeFrequencyScale = 0;
     this._splitMode = -1;
     this._mainGpu = -1;
+    this._loadMtp = false;
+    this._speculativeRollbackTokenMax = 0;
     this._isSafari = isSafariUserAgent(this._config.userAgent ?? globalThis.navigator?.userAgent ?? "");
     this._coreVariant = "uninitialized";
     this._preferMemory64 = this._config.preferMemory64 !== false;
@@ -977,6 +1151,8 @@ var LlamaWebGpuBridgeRuntime = class {
     this._modelCacheName = defaultModelCacheName;
     this._loadedModelUrl = null;
     this._mmProjSourceUrl = null;
+    this._draftModel = null;
+    this._speculativeFileCounter = 0;
     this._suppressedWarmupWarningCount = 0;
     this._didReportWarmupWarningSuppression = false;
     this._remoteFetchThresholdBytes = Number(config.remoteFetchThresholdBytes) > 0 ? Number(config.remoteFetchThresholdBytes) : 1900 * 1024 * 1024;
@@ -1191,6 +1367,7 @@ var LlamaWebGpuBridgeRuntime = class {
     );
     const previousPreferMemory64 = this._preferMemory64;
     const previousMMProjSourceUrl = this._mmProjSourceUrl;
+    const previousDraftModel = this._draftModel;
     try {
       this._preferMemory64 = false;
       await this.loadModelFromUrl(modelUrl, {
@@ -1208,6 +1385,13 @@ var LlamaWebGpuBridgeRuntime = class {
           await this.loadMultimodalProjector(previousMMProjSourceUrl);
         } catch (_) {
           this._runtimeNotes.push("generation_recovery_mmproj_reload_failed");
+        }
+      }
+      if (previousDraftModel) {
+        try {
+          await this.loadDraftModel(previousDraftModel.url, previousDraftModel.options);
+        } catch (_) {
+          this._runtimeNotes.push("generation_recovery_draft_reload_failed");
         }
       }
       this._runtimeNotes.push("generation_recovery_cpu_applied");
@@ -1453,6 +1637,8 @@ var LlamaWebGpuBridgeRuntime = class {
     if (this._mainGpu < 0) {
       this._mainGpu = -1;
     }
+    this._loadMtp = parseBooleanFlag(options.loadMtp, false);
+    this._speculativeRollbackTokenMax = parsePositiveInteger(options.speculativeRollbackTokenMax);
     const wantsQuantizedKvCache = this._cacheTypeK !== 1 || this._cacheTypeV !== 1;
     if (this._flashAttention === 0 && wantsQuantizedKvCache) {
       throw new Error(
@@ -1480,7 +1666,9 @@ var LlamaWebGpuBridgeRuntime = class {
       this._ropeFrequencyBase,
       this._ropeFrequencyScale,
       this._splitMode,
-      this._mainGpu
+      this._mainGpu,
+      this._loadMtp ? 1 : 0,
+      this._speculativeRollbackTokenMax
     ];
   }
   _nativeLoadOptionTypes() {
@@ -1822,6 +2010,7 @@ var LlamaWebGpuBridgeRuntime = class {
     this._mmProjPath = null;
     this._mmSupportsVision = false;
     this._mmSupportsAudio = false;
+    this._draftModel = null;
     this._runtimeNotes.push("previous_model_released");
     return true;
   }
@@ -2839,6 +3028,206 @@ var LlamaWebGpuBridgeRuntime = class {
     this._mmSupportsAudio = false;
     this._mmProjSourceUrl = null;
   }
+  // Bytes the core heap can still allocate, or null for a core without the
+  // probe.
+  _heapHeadroomBytes(core) {
+    try {
+      const value = Number(core.ccall("llamadart_webgpu_heap_headroom_bytes", "number", [], []));
+      return Number.isFinite(value) && value >= 0 ? value : null;
+    } catch (_) {
+      return null;
+    }
+  }
+  // Throws when `bytes` more would not fit in the core heap, naming the
+  // memory64 core when the wasm32 core's 4 GiB limit is the reason.
+  _requireHeapHeadroom(core, bytes, what) {
+    const headroom = this._heapHeadroomBytes(core);
+    if (headroom == null || !(bytes > headroom)) {
+      return;
+    }
+    const mib = (value, round) => `${round(value / (1024 * 1024))} MiB`;
+    const detail = this._coreVariant === "wasm32" ? "the wasm32 core addresses at most 4 GiB; memory64 is required: load the bridge with coreModuleUrlMem64 and preferMemory64 in a browser with WebAssembly memory64 support" : "free memory by unloading other models or use a smaller draft model";
+    throw new Error(
+      `${what} needs about ${mib(bytes, Math.ceil)} but only ${mib(headroom, Math.floor)} of WebAssembly memory is left; ${detail}.`
+    );
+  }
+  async loadDraftModel(url, options = {}) {
+    if (!this._core || this._modelBytes <= 0) {
+      throw new Error("No model loaded. Call loadModelFromUrl first.");
+    }
+    if (typeof url !== "string" || url.length === 0) {
+      throw new Error("Draft model URL is empty.");
+    }
+    const core = this._core;
+    const abortMessage = "Draft model load was cancelled.";
+    throwIfAborted(options.signal || null, abortMessage);
+    const rc = Number(core.ccall("llamadart_webgpu_draft_model_free", "number", [], []));
+    if (rc !== 0) {
+      throw new Error(this._coreErrorMessage("Failed to release the draft model", rc));
+    }
+    this._draftModel = null;
+    ensureFsDirectory(core.FS, "/draft");
+    const draftPath = `/draft/${basenameFromUrl(url)}`;
+    const controller = this._beginTransferAbortController();
+    const onCallerAbort = () => controller?.abort();
+    options.signal?.addEventListener("abort", onCallerAbort, { once: true });
+    const signal = controller?.signal ?? options.signal ?? null;
+    const targetCacheFields = [this._modelSource, this._modelCacheState, this._modelCacheName];
+    try {
+      let response;
+      try {
+        response = await this._getCachedModelResponse(url, {
+          useCache: options.useCache,
+          force: options.force,
+          signal,
+          requireReadableStream: true
+        });
+      } finally {
+        [this._modelSource, this._modelCacheState, this._modelCacheName] = targetCacheFields;
+      }
+      if (!response.ok) {
+        throw new Error(`Failed to fetch draft model: ${response.status} ${response.statusText}`);
+      }
+      const totalBytes = inferResponseTotalBytes(response, 0);
+      if (totalBytes > 0) {
+        this._requireHeapHeadroom(
+          core,
+          this._nGpuLayers === 0 ? totalBytes * 2 : totalBytes,
+          "The draft model"
+        );
+      }
+      const progressCallback = typeof options.progressCallback === "function" ? options.progressCallback : null;
+      await writeResponseToFsFileWithProgress(
+        response,
+        core.FS,
+        draftPath,
+        progressCallback,
+        {
+          useBigIntPosition: this._coreVariant === "wasm64",
+          totalBytes,
+          chunkTimeoutMs: this._resolveStreamChunkTimeoutMs({}, 9e4),
+          signal,
+          abortMessage
+        }
+      );
+      throwIfAborted(signal, abortMessage);
+      const loadRc = Number(
+        await core.ccall(
+          "llamadart_webgpu_draft_model_load",
+          "number",
+          ["string"],
+          [draftPath],
+          { async: true }
+        )
+      );
+      if (loadRc !== 0) {
+        let message = this._coreErrorMessage("Failed to load draft model", loadRc);
+        if (this._coreVariant === "wasm32" && /memory|alloc/i.test(message)) {
+          message += "; the wasm32 core addresses at most 4 GiB, so a larger draft model needs the memory64 core";
+        }
+        throw new Error(message);
+      }
+      const info = JSON.parse(
+        core.ccall("llamadart_webgpu_draft_model_info_json", "string", [], []) || "{}"
+      );
+      this._draftModel = {
+        url,
+        options: { useCache: options.useCache, force: false },
+        info
+      };
+      return { ...info };
+    } finally {
+      options.signal?.removeEventListener("abort", onCallerAbort);
+      this._clearTransferAbortController(controller);
+      this._deleteFsFile(draftPath);
+    }
+  }
+  async unloadDraftModel() {
+    if (!this._core) {
+      this._draftModel = null;
+      return;
+    }
+    const rc = Number(this._core.ccall("llamadart_webgpu_draft_model_free", "number", [], []));
+    if (rc !== 0) {
+      throw new Error(this._coreErrorMessage("Failed to unload the draft model", rc));
+    }
+    this._draftModel = null;
+  }
+  // Writes one n-gram cache source to the core filesystem and returns its
+  // path; the caller deletes it.
+  async _stageNgramCache(source, name) {
+    const core = this._core;
+    ensureFsDirectory(core.FS, "/speculative");
+    this._speculativeFileCounter += 1;
+    const path = `/speculative/${name}_${Date.now()}_${this._speculativeFileCounter}.lcs`;
+    if (typeof source === "string") {
+      const response = await this._fetchWithTimeout(
+        source,
+        { cache: "no-store" },
+        this._resolveFetchTimeoutMs({}, 18e4)
+      );
+      if (!response.ok) {
+        throw new Error(`Failed to fetch the ${name} n-gram cache: ${response.status} ${response.statusText}`);
+      }
+      core.FS.writeFile(path, new Uint8Array(await response.arrayBuffer()));
+    } else {
+      const bytes = source instanceof ArrayBuffer ? new Uint8Array(source) : new Uint8Array(source.buffer, source.byteOffset, source.byteLength);
+      core.FS.writeFile(path, bytes);
+    }
+    return path;
+  }
+  // Passes the speculative settings to the core for the next
+  // begin_generation, which consumes them. Returns the staged cache files.
+  async _setNextSpeculative(speculative, maxTokens, stagedPaths) {
+    const core = this._core;
+    const staticPath = speculative.ngramCacheStatic == null ? "" : await this._stageNgramCache(speculative.ngramCacheStatic, "static");
+    if (staticPath) {
+      stagedPaths.push(staticPath);
+    }
+    const dynamicPath = speculative.ngramCacheDynamic == null ? "" : await this._stageNgramCache(speculative.ngramCacheDynamic, "dynamic");
+    if (dynamicPath) {
+      stagedPaths.push(dynamicPath);
+    }
+    const rc = Number(core.ccall(
+      "llamadart_webgpu_set_next_speculative",
+      "number",
+      [
+        "string",
+        "number",
+        "number",
+        "number",
+        "number",
+        "number",
+        "number",
+        "number",
+        "number",
+        "number",
+        "number",
+        "string",
+        "string",
+        "number"
+      ],
+      [
+        speculative.strategies.join(","),
+        speculative.draftTokenMax,
+        speculative.draftTokenMin,
+        speculative.minProbability,
+        speculative.draftSplitProbability,
+        speculative.ngramSizeN,
+        speculative.ngramSizeM,
+        speculative.ngramMinHits,
+        speculative.ngramMatch,
+        speculative.ngramTokenMin,
+        speculative.ngramTokenMax,
+        staticPath,
+        dynamicPath,
+        maxTokens
+      ]
+    ));
+    if (rc !== 0) {
+      throw new Error(this._coreErrorMessage("Failed to configure speculative decoding", rc));
+    }
+  }
   supportsVision() {
     return this._mmSupportsVision;
   }
@@ -3654,7 +4043,11 @@ var LlamaWebGpuBridgeRuntime = class {
     const seed = Number.isInteger(options.seed) ? Number(options.seed) : Math.floor(Math.random() * 4294967295);
     await this._stageMultimodalParts(options.parts, options);
     let generationStarted = false;
+    const speculativePaths = [];
     try {
+      if (sampling.speculative) {
+        await this._setNextSpeculative(sampling.speculative, nPredict, speculativePaths);
+      }
       const beginRc = Number(
         await this._core.ccall(
           "llamadart_webgpu_begin_generation",
@@ -3699,6 +4092,9 @@ var LlamaWebGpuBridgeRuntime = class {
         throw new Error(this._coreErrorMessage("Failed to start generation", beginRc));
       }
       generationStarted = true;
+      for (const path of speculativePaths.splice(0)) {
+        this._deleteFsFile(path);
+      }
       let generated = 0;
       const shouldEmitCurrentText = options.emitCurrentTextOnToken !== false;
       const tokenEventEncoding = typeof options.tokenEventEncoding === "string" ? String(options.tokenEventEncoding || "").toLowerCase() : "bytes";
@@ -3735,7 +4131,7 @@ var LlamaWebGpuBridgeRuntime = class {
             );
             break;
           }
-          if (this._shouldAttemptGenerationRecovery(stepErrorText, options, generated)) {
+          if (sampling.speculative == null && this._shouldAttemptGenerationRecovery(stepErrorText, options, generated)) {
             const recovered = await this._recoverGenerationWithCpuFallback(options);
             if (recovered) {
               if (generationStarted) {
@@ -3789,19 +4185,32 @@ var LlamaWebGpuBridgeRuntime = class {
         const counts = JSON.parse(
           this._core.ccall("llamadart_webgpu_last_generation_usage_json", "string", [], []) || "{}"
         );
+        const speculative = counts?.speculative;
         options.onUsage({
           promptTokens: Number(counts?.promptTokens) || 0,
           cachedPromptTokens: Number(counts?.cachedPromptTokens) || 0,
           completionTokens: Number(counts?.completionTokens) || 0,
           timeToFirstTokenMs: firstTokenAt == null ? null : firstTokenAt - startedAt,
           durationMs: performance.now() - startedAt,
-          finishReason
+          finishReason,
+          ...speculative && typeof speculative === "object" ? {
+            speculative: {
+              draftTokens: Number(speculative.draftTokens) || 0,
+              acceptedDraftTokens: Number(speculative.acceptedDraftTokens) || 0,
+              draftAttempts: Number(speculative.draftAttempts) || 0,
+              verifyTokens: Number(speculative.verifyTokens) || 0,
+              replayTokens: Number(speculative.replayTokens) || 0
+            }
+          } : {}
         });
       }
       return text;
     } finally {
       if (generationStarted) {
         this._core.ccall("llamadart_webgpu_end_generation", null, [], []);
+      }
+      for (const path of speculativePaths) {
+        this._deleteFsFile(path);
       }
       this._clearPendingMedia();
     }
@@ -4396,7 +4805,7 @@ var BridgeWorkerProxy = class {
       }
       return Math.max(5e3, Math.min(36e5, Math.trunc(value)));
     };
-    if (method === "loadModelFromUrl") {
+    if (method === "loadModelFromUrl" || method === "loadDraftModel") {
       return clamp(Number(this._config.workerModelLoadTimeoutMs), clamp(explicitGlobal, 3 * 60 * 1e3));
     }
     if (method === "loadMultimodalProjector") {
@@ -4468,6 +4877,7 @@ var LlamaWebGpuBridge = class {
     this._loadedModelUrl = null;
     this._loadedModelOptions = null;
     this._loadedMmProjUrl = null;
+    this._loadedDraftModel = null;
     this._multimodalWorkerCpuMode = false;
     this._workerModelMissing = false;
     this._bridgeWarnRecent = /* @__PURE__ */ new Map();
@@ -4958,6 +5368,7 @@ var LlamaWebGpuBridge = class {
     this._loadedModelOptions = this._sanitizeModelLoadOptions(options);
     this._loadedMmProjUrl = null;
     this._forgetLoraAdapters();
+    this._loadedDraftModel = null;
     this._multimodalWorkerCpuMode = this._workerProxy != null;
     this._workerModelMissing = false;
     if (this._activeOperation) {
@@ -4971,6 +5382,7 @@ var LlamaWebGpuBridge = class {
     this._loadedModelOptions = null;
     this._loadedMmProjUrl = null;
     this._forgetLoraAdapters();
+    this._loadedDraftModel = null;
     this._multimodalWorkerCpuMode = false;
     this._workerModelMissing = false;
   }
@@ -5124,6 +5536,15 @@ var LlamaWebGpuBridge = class {
     if (typeof this._loadedMmProjUrl === "string" && this._loadedMmProjUrl.length > 0) {
       await this._callWorker("loadMultimodalProjector", [this._loadedMmProjUrl]);
     }
+    const draft = this._loadedDraftModel;
+    if (draft) {
+      try {
+        await this._callWorker("loadDraftModel", [draft.url, draft.options]);
+      } catch (error) {
+        this._throwIfOperationCancelled(error, "Draft model reload was cancelled.");
+        this._forgetDraftModelAfterReloadFailure(error);
+      }
+    }
     this._throwIfDisposed();
     await this._restoreLoraAdapters();
     this._throwIfDisposed();
@@ -5231,6 +5652,7 @@ var LlamaWebGpuBridge = class {
     const shouldUseCpuMultimodalFallback = multimodalRuntimeRequired && modelLoadedWithGpu && (dispatchWorkgroupFallback || workerTimedOut);
     try {
       if (Number(this._runtime?._modelBytes) > 0 && !forceReloadRequested && !shouldUseCpuMultimodalFallback) {
+        await this._ensureRuntimeDraftModel();
         if (shouldEnsureMultimodalInRuntime) {
           const runtimeSupportsMedia = typeof this._runtime.supportsVision === "function" && this._runtime.supportsVision() || typeof this._runtime.supportsAudio === "function" && this._runtime.supportsAudio();
           if (!runtimeSupportsMedia) {
@@ -5300,6 +5722,7 @@ var LlamaWebGpuBridge = class {
       }
       await this._restoreLoraAdapters();
       this._throwIfDisposed();
+      await this._ensureRuntimeDraftModel();
     } catch (error) {
       if (this._disposed || this._lifecycleState === "disposing") {
         throw new Error(BRIDGE_DISPOSED_MESSAGE);
@@ -5322,6 +5745,7 @@ var LlamaWebGpuBridge = class {
       this._loadedModelOptions = null;
       this._loadedMmProjUrl = null;
       this._forgetLoraAdapters();
+      this._loadedDraftModel = null;
       if (!this._disposed && this._lifecycleState === "open" && !this._workerProxy) {
         this._runtime = this._createRuntime();
         operation?.runtimes?.add(this._runtime);
@@ -6040,6 +6464,117 @@ var LlamaWebGpuBridge = class {
       this._supportsVision = this._runtime.supportsVision();
       this._supportsAudio = this._runtime.supportsAudio();
       return result;
+    }
+  }
+  // Loads the remembered draft model into the direct runtime when that
+  // runtime does not hold it.
+  async _ensureRuntimeDraftModel() {
+    const draft = this._loadedDraftModel;
+    const runtime = this._runtime;
+    if (!draft || !runtime || runtime._draftModel?.url === draft.url) {
+      return;
+    }
+    this._throwIfDisposed();
+    try {
+      await runtime.loadDraftModel(draft.url, {
+        ...draft.options,
+        signal: this._operationSignal() || void 0
+      });
+    } catch (error) {
+      this._throwIfOperationCancelled(error, "Draft model reload was cancelled.");
+      this._forgetDraftModelAfterReloadFailure(error);
+    }
+    this._throwIfDisposed();
+  }
+  // A reloaded target starts without its draft model. A failed draft reload
+  // leaves none, so draft-* strategies then reject until loadDraftModel runs.
+  _forgetDraftModelAfterReloadFailure(error) {
+    this._loadedDraftModel = null;
+    this._emitBridgeWarn(
+      `llamadart: draft model reload failed after the model was reloaded (${serializeWorkerError(error)}); call loadDraftModel again.`
+    );
+  }
+  async loadDraftModel(url, options = {}) {
+    return this._runExclusive(
+      () => this._loadDraftModelUnlocked(url, options),
+      {
+        signal: options?.signal,
+        abortMessage: "Draft model load was cancelled.",
+        kind: "draft-model-load"
+      }
+    );
+  }
+  async _loadDraftModelUnlocked(url, options = {}) {
+    const absoluteUrl = typeof url === "string" && url.length > 0 ? normalizeAbsoluteUrl(url) : url;
+    const remembered = {
+      url: absoluteUrl,
+      options: typeof options?.useCache === "boolean" ? { useCache: options.useCache } : {}
+    };
+    const loadInRuntime = async () => {
+      this._loadedDraftModel = null;
+      const info = await this._runtime.loadDraftModel(absoluteUrl, {
+        ...options,
+        signal: this._operationSignal() || options.signal || void 0
+      });
+      this._loadedDraftModel = remembered;
+      return info;
+    };
+    if (!this._workerProxy) {
+      return loadInRuntime();
+    }
+    const workerOptions = { ...options };
+    delete workerOptions.progressCallback;
+    delete workerOptions.signal;
+    try {
+      await this._restoreWorkerModelIfMissing();
+      this._loadedDraftModel = null;
+      const info = await this._callWorker(
+        "loadDraftModel",
+        [absoluteUrl, workerOptions],
+        (event) => {
+          if (event.event === "progress" && typeof options.progressCallback === "function") {
+            options.progressCallback(event.payload || {});
+          }
+        }
+      );
+      this._throwIfCallerCancelled("Draft model load was cancelled.");
+      this._loadedDraftModel = remembered;
+      return info;
+    } catch (error) {
+      this._throwIfOperationCancelled(error, "Draft model load was cancelled.");
+      if (!this._isWorkerUnusableError(error)) {
+        throw error;
+      }
+      this._disableWorkerFallback(error);
+      await this._waitForWorkerDisposal();
+      await this._ensureRuntimeReadyAfterWorkerFallback({}, error);
+      return loadInRuntime();
+    }
+  }
+  async unloadDraftModel() {
+    return this._runExclusive(
+      () => this._unloadDraftModelUnlocked(),
+      { kind: "draft-model-unload" }
+    );
+  }
+  async _unloadDraftModelUnlocked() {
+    if (!this._workerProxy) {
+      await this._runtime?.unloadDraftModel();
+      this._loadedDraftModel = null;
+      return;
+    }
+    try {
+      await this._callWorker("unloadDraftModel", []);
+      this._loadedDraftModel = null;
+    } catch (error) {
+      this._throwIfOperationCancelled(error, "Draft model unload was cancelled.");
+      if (!this._isWorkerUnusableError(error)) {
+        throw error;
+      }
+      this._loadedDraftModel = null;
+      this._disableWorkerFallback(error);
+      await this._waitForWorkerDisposal();
+      await this._runtime?.unloadDraftModel();
     }
   }
   supportsVision() {
@@ -6889,6 +7424,7 @@ var LlamaWebGpuBridge = class {
       this._loadedModelUrl = null;
       this._loadedModelOptions = null;
       this._loadedMmProjUrl = null;
+      this._loadedDraftModel = null;
       this._workerFallbackReason = null;
       this._multimodalWorkerCpuMode = false;
       this._workerModelMissing = false;
@@ -6975,6 +7511,16 @@ function installBridgeWorkerHost() {
         };
         const value2 = await bridge.loadModelFromUrl(url, options);
         self.postMessage({ type: "result", id, value: value2, state: snapshotBridgeState(bridge) });
+        return;
+      }
+      if (method === "loadDraftModel") {
+        const options = args[1] && typeof args[1] === "object" ? { ...args[1] } : {};
+        delete options.signal;
+        options.progressCallback = (progress) => {
+          self.postMessage({ type: "event", id, event: "progress", payload: progress || {} });
+        };
+        const value2 = await bridge.loadDraftModel(args[0], options);
+        self.postMessage({ type: "result", id, value: value2 });
         return;
       }
       if (method === "createCompletion") {

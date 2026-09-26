@@ -1,13 +1,23 @@
 import assert from 'node:assert/strict';
 
-import { completionCapabilitiesFrom } from '../../js/src/internal/completion_options.ts';
+import {
+  NO_COMPLETION_CAPABILITIES,
+  SPECULATIVE_DECODING_STRATEGIES,
+  completionCapabilitiesFrom,
+} from '../../js/src/internal/completion_options.ts';
 import { LlamaWebGpuBridge } from '../../js/src/llama_webgpu_bridge.js';
 import { createDirectBridge, createWorkerBridge } from './bridge_operation_queue_fixtures.mjs';
 import { readNativeCoreSource } from './native_core_source.mjs';
 
 const coreSource = readNativeCoreSource();
-const SUPPORTED = { presencePenalty: true, minP: true, thinkingBudget: true };
-const NONE = { presencePenalty: false, minP: false, thinkingBudget: false };
+const NO_SPECULATIVE = NO_COMPLETION_CAPABILITIES.speculativeDecoding;
+const SUPPORTED = {
+  presencePenalty: true,
+  minP: true,
+  thinkingBudget: true,
+  speculativeDecoding: NO_SPECULATIVE,
+};
+const NONE = { presencePenalty: false, minP: false, thinkingBudget: false, speculativeDecoding: NO_SPECULATIVE };
 const BUDGET = { maxTokens: 8, startTag: '<think>', endTag: '</think>' };
 const BUDGET_PARAMETERS = [
   'thinking_budget_tokens',
@@ -30,12 +40,23 @@ function nativeParameterNames(name) {
   return match[1].split(',').map((parameter) => parameter.trim().match(/(\w+)$/)[1]);
 }
 
-// The capability string the core returns, as the C++ literal decodes it.
+// The capability string the core returns with no MTP head and no draft
+// model: its fixed flags from the C++ literal, and each strategy flag false
+// unless the C++ table sets it to the literal true.
 function coreCapabilityJson() {
   const body = functionBody('llamadart_webgpu_completion_capabilities_json()');
-  const literal = body.match(/return\s+("(?:[^"\\]|\\.)*");/);
-  assert.ok(literal, 'the capability export must return one string literal');
-  return JSON.parse(literal[1]);
+  const literal = body.match(/"\{\\"presencePenalty\\":true,\\"minP\\":true,\\"thinkingBudget\\":true,"/);
+  assert.ok(literal, 'the capability export must start with its fixed flags');
+  const strategies = [...body.matchAll(/\{"([a-z0-9-]+)",\s*([^}]*)\}/g)];
+  assert.deepEqual(strategies.map(([, name]) => name), SPECULATIVE_DECODING_STRATEGIES);
+  return JSON.stringify({
+    presencePenalty: true,
+    minP: true,
+    thinkingBudget: true,
+    speculativeDecoding: Object.fromEntries(
+      strategies.map(([, name, flag]) => [name, flag.trim() === 'true']),
+    ),
+  });
 }
 
 // A direct bridge whose stub core records begin_generation's arguments and,
@@ -217,7 +238,7 @@ const CASES = [
     const { bridge, begins } = directBridge(JSON.stringify({ minP: true }));
     assert.deepEqual(
       await bridge.getCompletionCapabilities(),
-      { presencePenalty: false, minP: true, thinkingBudget: false },
+      { presencePenalty: false, minP: true, thinkingBudget: false, speculativeDecoding: NO_SPECULATIVE },
     );
     await bridge.createCompletion('hello', { minP: 0.1 });
     await assert.rejects(
@@ -227,10 +248,16 @@ const CASES = [
     assert.equal(begins.length, 1);
   }],
 
-  ['the core literal reports every option', async () => {
-    assert.deepEqual(completionCapabilitiesFrom(coreCapabilityJson()), SUPPORTED);
+  ['the core literal reports every option and the n-gram strategies', async () => {
+    const expected = {
+      ...SUPPORTED,
+      speculativeDecoding: Object.fromEntries(
+        SPECULATIVE_DECODING_STRATEGIES.map((name) => [name, name.startsWith('ngram-')]),
+      ),
+    };
+    assert.deepEqual(completionCapabilitiesFrom(coreCapabilityJson()), expected);
     const { bridge } = directBridge(coreCapabilityJson());
-    assert.deepEqual(await bridge.getCompletionCapabilities(), SUPPORTED);
+    assert.deepEqual(await bridge.getCompletionCapabilities(), expected);
   }],
 
   ['a malformed or non-boolean capability response reports nothing', async () => {
@@ -294,7 +321,7 @@ const CASES = [
   ['the native grammar pauses while the reasoning budget is inside a block', async () => {
     const gate = functionBody('bool grammar_is_active()');
     assert.match(gate, /return state == REASONING_BUDGET_IDLE \|\| state == REASONING_BUDGET_DONE;/);
-    const sample = functionBody('llama_token sample_next_token()');
+    const sample = functionBody('llama_token sample_next_token(');
     const gateIndex = sample.indexOf('const bool use_grammar = grammar_is_active();');
     assert.ok(gateIndex >= 0, 'the gate is read once per token');
     assert.ok(gateIndex < sample.indexOf('llama_sampler_accept(g_active_sampler, token);'),

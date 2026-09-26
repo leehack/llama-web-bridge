@@ -14,6 +14,7 @@ import type {
   CompletionUsage,
   DecisionHeadOptions,
   DecisionSequence,
+  DraftModelLoadOptions,
   LoadModelOptions,
   LoraAdapterLoadOptions,
   TextToSpeechOptions,
@@ -86,6 +87,17 @@ export function installBridgeWorkerHost() {
 
         const value = await bridge.loadModelFromUrl(url, options);
         self.postMessage({ type: 'result', id, value, state: snapshotBridgeState(bridge) });
+        return;
+      }
+
+      if (method === 'loadDraftModel') {
+        const options: DraftModelLoadOptions = (args[1] && typeof args[1] === 'object') ? { ...args[1] } : {};
+        delete options.signal;
+        options.progressCallback = (progress: unknown) => {
+          self.postMessage({ type: 'event', id, event: 'progress', payload: progress || {} });
+        };
+        const value = await bridge.loadDraftModel(args[0] as string, options);
+        self.postMessage({ type: 'result', id, value });
         return;
       }
 

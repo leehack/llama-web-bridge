@@ -1,6 +1,5 @@
-// Linked with --post-js. Exception catching is enabled only for
-// llamadart_webgpu_grammar_sampler_init and llamadart_webgpu_lora_adapter_init
-// (EXCEPTION_CATCHING_ALLOWED in CMakeLists.txt), but that link setting also
+// Linked with --post-js. Exception catching is enabled only for the functions
+// in EXCEPTION_CATCHING_ALLOWED (CMakeLists.txt), but that link setting also
 // makes every other C++ throw escape ccall as a CppException instead of
 // aborting. Restore the abort, so an uncaught throw still reaches onAbort and
 // rejects with "Aborted(...)" as it does in a build without exception

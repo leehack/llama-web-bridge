@@ -49,7 +49,31 @@ export interface LoadModelOptions {
   signal?: AbortSignal;
   remoteFetchThresholdBytes?: number;
   remoteFetchChunkBytes?: number;
+  /** Load the model's MTP layers, which `draft-mtp` speculative decoding needs. Defaults to false. */
+  loadMtp?: boolean;
+  /** Rollback snapshots per sequence, llama.cpp's `n_rs_seq`: a model with recurrent state needs at least the draft length for `draft-*` speculative decoding. Defaults to 0. */
+  speculativeRollbackTokenMax?: number;
   [key: string]: unknown;
+}
+
+/** Options for `loadDraftModel`. */
+export interface DraftModelLoadOptions {
+  /** Receives `{ loaded, total }` download progress. */
+  progressCallback?: (progress: BridgeProgressEvent) => void;
+  /** Cancels the download. */
+  signal?: AbortSignal;
+  /** Use Cache Storage for the draft GGUF. Defaults to true. */
+  useCache?: boolean;
+  /** Refetch even when Cache Storage holds the draft GGUF. */
+  force?: boolean;
+}
+
+/** The loaded draft model. */
+export interface DraftModelInfo {
+  /** The GGUF's `general.architecture`. */
+  architecture: string;
+  /** `draft-dflash` or `draft-dspark` for a DFlash-architecture draft, as llama.cpp reads its metadata; absent otherwise. */
+  strategy?: 'draft-dflash' | 'draft-dspark';
 }
 
 export type TokenEventEncoding = 'bytes' | 'text' | (string & {});
@@ -92,6 +116,68 @@ export interface CompletionUsage {
   durationMs: number;
   /** `stop` at an end-of-generation token, `length` at `nPredict` or the context limit, `cancelled` after `cancel()` or an abort. */
   finishReason: CompletionFinishReason;
+  /** Speculative decoding counters; present only when the completion used `speculativeDecoding`. */
+  speculative?: SpeculativeDecodingUsage;
+}
+
+/** Speculative decoding counters of one completion. */
+export interface SpeculativeDecodingUsage {
+  /** Draft tokens proposed. */
+  draftTokens: number;
+  /** Draft tokens the target model accepted. */
+  acceptedDraftTokens: number;
+  /** Draft steps attempted, including those that proposed no tokens. */
+  draftAttempts: number;
+  /** Target-model tokens decoded to verify drafts. */
+  verifyTokens: number;
+  /** Target-model tokens decoded again after restoring a recurrent-state checkpoint. */
+  replayTokens: number;
+}
+
+/** llama.cpp speculative decoding strategies, by their `--spec-type` names. */
+export type SpeculativeDecodingStrategy =
+  | 'draft-simple'
+  | 'draft-eagle3'
+  | 'draft-mtp'
+  | 'draft-dflash'
+  | 'draft-dspark'
+  | 'ngram-simple'
+  | 'ngram-map-k'
+  | 'ngram-map-k4v'
+  | 'ngram-mod'
+  | 'ngram-cache';
+
+/** An n-gram cache file from `llama-lookup-create`: a URL, or its bytes. */
+export type NgramCacheSource = string | ArrayBuffer | ArrayBufferView;
+
+/** llama.cpp speculative decoding for one completion. Omitted numbers use llama.cpp's defaults. */
+export interface SpeculativeDecodingOptions {
+  /** Strategies to combine: any n-gram strategies plus at most one `draft-*` strategy. */
+  strategies: readonly SpeculativeDecodingStrategy[];
+  /** Maximum draft tokens per step, from 0, resolved as native llamadart resolves it: `draft-*` strategies use this or 3, `ngram-simple`/`ngram-map-k`/`ngram-map-k4v` use `ngramSizeM` or 48, `ngram-mod` uses `ngramTokenMax`, then this, then 64, and `ngram-cache` uses this or 8. The largest applies; 0 becomes 64. */
+  draftTokenMax?: number;
+  /** Minimum draft tokens a draft model must propose, from 0 to the resolved `draftTokenMax`. Needs a `draft-*` strategy. */
+  draftTokenMin?: number;
+  /** Minimum draft-token probability, from 0 to 1. Needs a `draft-*` strategy. */
+  minProbability?: number;
+  /** Draft split probability, from 0 to 1. Needs a `draft-*` strategy. */
+  draftSplitProbability?: number;
+  /** Lookup n-gram size for `ngram-simple`, `ngram-map-k` and `ngram-map-k4v`, from 1 to 65535. */
+  ngramSizeN?: number;
+  /** Draft m-gram size for `ngram-simple`, `ngram-map-k` and `ngram-map-k4v`, from 1 to 65535; also their draft length. */
+  ngramSizeM?: number;
+  /** Minimum lookup hits before `ngram-map-k`/`ngram-map-k4v` propose an m-gram, from 1 to 65535. */
+  ngramMinHits?: number;
+  /** Lookup length for `ngram-mod`, from 1. */
+  ngramMatch?: number;
+  /** Minimum draft length for `ngram-mod`, from 0. */
+  ngramTokenMin?: number;
+  /** Maximum draft length for `ngram-mod`, from 0; defaults to `draftTokenMax` when `ngram-mod` is enabled. */
+  ngramTokenMax?: number;
+  /** Static n-gram cache for `ngram-cache`. */
+  ngramCacheStatic?: NgramCacheSource;
+  /** Dynamic n-gram cache for `ngram-cache`, read once; the bridge does not write it back. */
+  ngramCacheDynamic?: NgramCacheSource;
 }
 
 export interface CompletionOptions {
@@ -119,6 +205,8 @@ export interface CompletionOptions {
   seed?: number;
   /** Caps the tokens generated inside each reasoning block; text-only prompts. */
   thinkingBudget?: ThinkingBudgetOptions | null;
+  /** Drafts tokens and verifies them with the loaded model; text-only prompts without `grammar` or `thinkingBudget`. With greedy sampling the output matches a completion without it. */
+  speculativeDecoding?: SpeculativeDecodingOptions | null;
 }
 
 /** llama.cpp's reasoning budget: after `maxTokens` tokens inside a reasoning block, plus any that finish a UTF-8 character, the sampler forces `forcedMessage` and `endTag`. A grammar pauses after `startTag` until `endTag` completes. */
@@ -141,6 +229,8 @@ export interface CompletionCapabilities {
   minP: boolean;
   /** `CompletionOptions.thinkingBudget` is applied. */
   thinkingBudget: boolean;
+  /** Each speculative strategy the loaded models can run now: `draft-mtp` needs a model loaded with `loadMtp` that has MTP layers, and the other `draft-*` strategies a matching `loadDraftModel` draft. */
+  speculativeDecoding: Record<SpeculativeDecodingStrategy, boolean>;
 }
 
 export interface EmbedOptions {
@@ -305,6 +395,9 @@ export class LlamaWebGpuBridge {
 
   createCompletion(prompt: string, options?: CompletionOptions): Promise<string>;
   getCompletionCapabilities(): Promise<CompletionCapabilities>;
+  /** Loads a draft GGUF for `draft-simple`, `draft-eagle3`, `draft-dflash` or `draft-dspark`, replacing any draft. A model load unloads it. */
+  loadDraftModel(url: string, options?: DraftModelLoadOptions): Promise<DraftModelInfo>;
+  unloadDraftModel(): Promise<void>;
   tokenize(text: string, addSpecial?: boolean): Promise<number[]>;
   detokenize(tokens: number[] | ArrayLike<number>, special?: boolean): Promise<string>;
   applyChatTemplate(
