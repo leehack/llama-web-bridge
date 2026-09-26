@@ -2,7 +2,6 @@
 dist/
 node_modules/
 /third_party/
-/.emsdk-cache/
 # Ad-hoc emcc runs in the repo root emit these default output names.
 a.out.js
 a.out.wasm

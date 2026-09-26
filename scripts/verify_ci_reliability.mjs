@@ -921,11 +921,16 @@ function checkToolchainPins({ ci, candidate, publish }, files, errors) {
     'emsdk.version must contain one exact Emscripten semantic version',
   );
   // Row 44: install exactly the pinned emsdk and verify the resolved emcc.
+  // An install is setup-emsdk or an emsdk install/activate command; each one
+  // must name the resolved pin.
   for (const workflow of [ci, candidate]) {
-    const emsdk = workflow.steps.filter((step) => /(?:^|\/)setup-emsdk@/.test(step.uses));
+    const setup = workflow.steps.filter((step) => /(?:^|\/)setup-emsdk@/.test(step.uses));
+    const commands = [...workflow.runText.matchAll(/\bemsdk"?\s+(install|activate)\b(.*)/g)];
     check.require(
-      emsdk.length > 0 && emsdk.every((step) => step.with.version === '${{ env.EMSCRIPTEN_VERSION }}'),
-      `${workflow.path} must install the resolved emsdk.version (version: \${{ env.EMSCRIPTEN_VERSION }}) in every setup-emsdk step`,
+      setup.length + commands.length > 0
+        && setup.every((step) => step.with.version === '${{ env.EMSCRIPTEN_VERSION }}')
+        && commands.every(([, , rest]) => /^\s+"\$\{?EMSCRIPTEN_VERSION\}?"\s*$/.test(rest)),
+      `${workflow.path} must install the resolved emsdk.version: setup-emsdk with version: \${{ env.EMSCRIPTEN_VERSION }}, or emsdk install/activate "$EMSCRIPTEN_VERSION"`,
     );
     check.includes(workflow.path, workflow.runText, [
       'scripts/verify_emscripten_version.py --print-pin',
@@ -1370,7 +1375,7 @@ function checkCandidateAndQualification({ candidate, qualification, publish }, e
     `${publish.path} must pin the candidate and qualification workflow paths and the exact artifact names`,
   );
   check.excludes(publish.path, publish.text, [
-    'scripts/build_bridge.sh', 'WEBGPU_BRIDGE_BUILD_MEM64', 'setup-emsdk', 'scripts/generate_release_manifest.py',
+    'scripts/build_bridge.sh', 'WEBGPU_BRIDGE_BUILD_MEM64', 'setup-emsdk', 'emsdk install', 'emsdk_env.sh', 'scripts/generate_release_manifest.py',
     'bridge-source/scripts/release_qualification.py', 'bridge-source/scripts/release_publication_state.py',
   ], 'never rebuild the candidate or run a validator from the historical build source');
   // Row 91: qualification accepts no hand-produced attestation, proves the

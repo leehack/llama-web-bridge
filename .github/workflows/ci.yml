@@ -150,13 +150,23 @@ jobs:
         run: |
           git clone --depth 1 --branch "$LLAMA_CPP_TAG" https://github.com/ggml-org/llama.cpp.git third_party/llama_cpp
 
+      # Installed at a fixed path, not with setup-emsdk: its random temp
+      # directory changes the compiler and sysroot paths on every run, so
+      # ccache never hits.
       - name: Setup Emscripten SDK
-        uses: mymindstorm/setup-emsdk@v14
-        with:
-          version: ${{ env.EMSCRIPTEN_VERSION }}
-          # A fixed install path keeps compiler and sysroot paths identical
-          # across runs; the default random temp path defeats ccache.
-          actions-cache-folder: .emsdk-cache
+        env:
+          EMSDK_DIR: ${{ runner.temp }}/emsdk
+        run: |
+          git clone --depth 1 --branch "$EMSCRIPTEN_VERSION" https://github.com/emscripten-core/emsdk.git "$EMSDK_DIR"
+          "$EMSDK_DIR/emsdk" install "$EMSCRIPTEN_VERSION"
+          "$EMSDK_DIR/emsdk" activate "$EMSCRIPTEN_VERSION"
+          source "$EMSDK_DIR/emsdk_env.sh"
+          {
+            echo "PATH=$PATH"
+            echo "EMSDK=$EMSDK"
+            echo "EMSDK_NODE=$EMSDK_NODE"
+            if [ -n "${EM_CONFIG:-}" ]; then echo "EM_CONFIG=$EM_CONFIG"; fi
+          } >> "$GITHUB_ENV"
 
       - name: Verify resolved Emscripten compiler
         run: python3 scripts/verify_emscripten_version.py --emit-github-env "$GITHUB_ENV"
@@ -172,9 +182,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ runner.temp }}/webgpu-ccache
-          key: webgpu-ccache-v1-${{ runner.os }}-${{ runner.arch }}-${{ env.EMSCRIPTEN_VERSION }}-${{ steps.compiler-cache.outputs.upstream }}-${{ hashFiles('CMakeLists.txt', 'scripts/build_bridge.sh', 'scripts/patch_*.mjs') }}-${{ github.sha }}
+          key: webgpu-ccache-v2-${{ runner.os }}-${{ runner.arch }}-${{ env.EMSCRIPTEN_VERSION }}-${{ steps.compiler-cache.outputs.upstream }}-${{ hashFiles('CMakeLists.txt', 'scripts/build_bridge.sh', 'scripts/patch_*.mjs') }}-${{ github.sha }}
           restore-keys: |
-            webgpu-ccache-v1-${{ runner.os }}-${{ runner.arch }}-${{ env.EMSCRIPTEN_VERSION }}-${{ steps.compiler-cache.outputs.upstream }}-${{ hashFiles('CMakeLists.txt', 'scripts/build_bridge.sh', 'scripts/patch_*.mjs') }}-
+            webgpu-ccache-v2-${{ runner.os }}-${{ runner.arch }}-${{ env.EMSCRIPTEN_VERSION }}-${{ steps.compiler-cache.outputs.upstream }}-${{ hashFiles('CMakeLists.txt', 'scripts/build_bridge.sh', 'scripts/patch_*.mjs') }}-
 
       - name: Build bridge artifacts
         env:
