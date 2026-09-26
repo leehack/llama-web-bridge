@@ -27,7 +27,7 @@ state persistence, metadata, cancellation, disposal, and worker-host bootstrap.
 Requirements:
 
 - Emscripten SDK (`emcmake`, `emcc`) matching `emsdk.version` in `PATH`
-- Node.js 22.18+ and npm for the JS bridge build pipeline (`npm ci`,
+- Node.js 22.18+ or 24.2+ and npm for the JS bridge build pipeline (`npm ci`,
   `npm run check:js`)
 - llama.cpp source checkout matching `llama_cpp.version` or a compatible checkout exposing
   `llama_state_save_file` / `llama_state_load_file` with the signatures used by
@@ -218,8 +218,8 @@ comments never fails it:
   generated output via `git diff --exit-code`; `check:js` ends with `npm test`,
   which runs every `tests/**/*_test.mjs` contract test, including the release
   contract suites; the candidate and publish workflows run `check:js` and this
-  contract themselves; and no workflow runs Python, `pip`, `py_compile` or a
-  `*.py` script;
+  contract themselves; and no workflow runs a Python interpreter or package
+  tool, a `*.py` script, a python shell or a Python image;
 - `llama_cpp.version` holds one exact upstream tag in either channel (stable
   `vMAJOR.MINOR.PATCH` or development `bNNNN`) and CI builds it;
   `emsdk.version` holds one exact Emscripten version, which CI and the candidate

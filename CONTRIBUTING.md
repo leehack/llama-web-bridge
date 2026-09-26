@@ -10,7 +10,7 @@ Published artifacts are consumed from `llama-web-bridge-assets`.
 ## Prerequisites
 
 - Emscripten SDK (`emcmake`, `emcc`) matching `emsdk.version`
-- Node.js 22.18 or newer (CI uses 24) and npm, for JS bridge bundling and
+- Node.js 22.18+ or 24.2+ (CI uses 24) and npm, for JS bridge bundling and
   type-checking; the tests run the `.ts` sources through Node's built-in type
   stripping
 - CMake toolchain
@@ -285,7 +285,8 @@ query strings, and fragments before printing the location.
   `.github/workflows/bridge_qualification.yml`, or the model pins in
   `scripts/release/qualification.mjs`. It checks permissions, environment gates,
   PAT handling, pins, fail-closed guards, that CI runs the contract tests, and
-  that no workflow runs Python, `pip`, `py_compile` or a `*.py` script;
+  that no workflow runs a Python interpreter or package tool, a `*.py`
+  script, a python shell or a Python image;
   it does not check wording, step names it does not anchor on, or docs prose.
   A new test under `tests/` runs once it is named `*_test.mjs`; any other file
   under `tests/` must be a helper that a test imports.

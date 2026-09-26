@@ -528,6 +528,7 @@ export function resolveWorkflowSteps(workflow) {
   }
   const patOutsideEnv = [];
   const { env: rootEnv, jobs, ...rootOutsideEnv } = root;
+  const defaultShell = (defaults) => mapping(mapping(defaults).run).shell;
   if (containsPat(rootOutsideEnv) || (!isMapping(rootEnv) && containsPat(rootEnv))) {
     patOutsideEnv.push('workflow root properties');
   }
@@ -538,6 +539,9 @@ export function resolveWorkflowSteps(workflow) {
       patOutsideEnv.push(`job ${jobName} properties`);
     }
     const inheritedEnv = { ...mapping(rootEnv), ...mapping(jobEnv) };
+    const job = mapping(rawJob);
+    const jobShell = defaultShell(job.defaults) ?? defaultShell(root.defaults);
+    const container = typeof job.container === 'string' ? job.container : mapping(job.container).image;
     (Array.isArray(rawSteps) ? rawSteps : []).forEach((rawStep, index) => {
       const step = mapping(rawStep);
       const { env: stepEnv, ...stepOutsideEnv } = step;
@@ -551,6 +555,9 @@ export function resolveWorkflowSteps(workflow) {
         with: mapping(step.with),
         env: { ...inheritedEnv, ...mapping(stepEnv) },
         run: typeof step.run === 'string' ? step.run : '',
+        // The shell the run script runs in, and the job container image.
+        shell: String(step.shell ?? jobShell ?? ''),
+        container: typeof container === 'string' ? container : '',
         raw: step,
         patOutsideEnv: containsPat(stepOutsideEnv) || (!isMapping(stepEnv) && containsPat(stepEnv))
           ? `step ${jobName}/${name || index} properties`
@@ -915,18 +922,29 @@ export const RELEASE_CONTRACT_SUITES = Object.freeze([
 ]);
 
 // No workflow runs Python: the release harness, its contracts and the
-// Emscripten verifier are Node, so python3, pip, py_compile, a *.py script or
-// actions/setup-python in any workflow is a regression.
-const PYTHON_COMMAND = /(?<![\w.-])(?:python[0-9.]*|pip[0-9.]*|py_compile)(?![\w-])|(?<![\w./-])[\w./-]*[\w-]\.py(?![\w-])/;
+// Emscripten verifier are Node, so a Python interpreter or package tool
+// (python3, pip, pipx, uv, pytest, poetry, ...), a *.py script, a python
+// shell, a Python or uv image, or a Python or uv setup action in any workflow
+// is a regression.
+const PYTHON_COMMAND = new RegExp(
+  String.raw`(?<![\w.-])(?:i?python[0-9.]*|pypy[0-9.]*|py|pipx?[0-9.]*|pipenv|poetry|uvx?|pytest|py_compile|conda|mamba|tox|hatch|pdm)(?![\w.-])`
+  + String.raw`|(?<![\w./-])[\w./-]*[\w-]\.py[cz]?(?![\w-])`,
+);
+const PYTHON_IMAGE = /(?:^|[/:])(?:python|pypy|uv(?![\w-]))/;
+const PYTHON_SETUP = /(?:^|\/)setup-(?:python|uv)@/;
 
 export function checkNoPython(workflows, errors) {
   for (const workflow of workflows) {
     for (const step of workflow.steps) {
       const match = PYTHON_COMMAND.exec(step.run);
-      if (match !== null || /(?:^|\/)setup-python@/.test(step.uses)) {
+      const culprit = match !== null ? JSON.stringify(match[0])
+        : PYTHON_SETUP.test(step.uses) || (/^docker:\/\//.test(step.uses) && PYTHON_IMAGE.test(step.uses)) ? step.uses
+          : PYTHON_COMMAND.test(step.shell) ? `shell: ${step.shell}`
+            : PYTHON_IMAGE.test(step.container) ? `container: ${step.container}` : '';
+      if (culprit) {
         errors.push(
-          `${workflow.path} step ${step.job}/${step.name || step.index} runs Python (${match ? JSON.stringify(match[0]) : step.uses}); `
-          + 'no workflow may run python3, pip, py_compile or a *.py script',
+          `${workflow.path} step ${step.job}/${step.name || step.index} runs Python (${culprit}); `
+          + 'no workflow may run a Python interpreter or package tool, a *.py script, a python shell or a Python image',
         );
       }
     }

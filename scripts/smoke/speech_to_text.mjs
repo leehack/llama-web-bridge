@@ -2,7 +2,7 @@
 // Real-model browser smoke for Qwen3-ASR audio ingestion.
 //
 // Ported from speech_to_text_browser_smoke.py with the same flags, environment
-// variables, harness page and output. release_qualification.py runs it as the
+// variables, harness page and output. release/qualify.mjs runs it as the
 // speech-to-text gate, and both read the fixture audio pin and the expected
 // transcript from speech_to_text_fixture.json.
 

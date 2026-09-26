@@ -850,8 +850,8 @@ export function nodeExecutable({ which = pyWhich } = {}) {
     );
   }
   const node = pyResolve(found);
-  // The smokes start main() through import.meta.main (Node.js 22.18+); an
-  // older node would exit 0 without running a gate.
+  // The smokes start main() through import.meta.main (Node.js 22.18+ or
+  // 24.2+); any other node would exit 0 without running a gate.
   const result = spawnSync(node, ['--version'], { timeout: 30000, killSignal: 'SIGKILL', stdio: ['inherit', 'pipe', 'pipe'] });
   if (result.error) {
     if (result.error.code === 'ETIMEDOUT') throw new TimeoutExpired([node, '--version'], 30);
@@ -865,10 +865,10 @@ export function nodeExecutable({ which = pyWhich } = {}) {
     || (() => {
       const major = BigInt(pyIntFromString(match[1]));
       const minor = BigInt(pyIntFromString(match[2]));
-      return major < 22n || (major === 22n && minor < 18n);
+      return !(major > 24n || (major === 24n && minor >= 2n) || (major === 22n && minor >= 18n));
     })();
   if (tooOld) {
-    throw new ContractError(`node ${version || '(unknown version)'} is too old; the qualification gates need Node.js 22.18 or newer`);
+    throw new ContractError(`node ${version || '(unknown version)'} is too old; the qualification gates need Node.js 22.18+ or 24.2+`);
   }
   return node;
 }

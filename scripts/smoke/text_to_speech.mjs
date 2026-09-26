@@ -2,7 +2,7 @@
 // Real-model browser smoke for Qwen3-TTS audio generation.
 //
 // Ported from text_to_speech_browser_smoke.py with the same flags, harness
-// page and output. release_qualification.py runs it as the text-to-speech gate
+// page and output. release/qualify.mjs runs it as the text-to-speech gate
 // and checks each WAV it writes against the peak and RMS the page reported, so
 // the WAV bytes are exactly the ones the page encoded.
 

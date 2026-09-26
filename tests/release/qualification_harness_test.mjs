@@ -10,6 +10,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { test } from 'node:test';
 
+import { build, transformSync } from 'esbuild';
+
 import { ContractError } from '../../scripts/release/contract.mjs';
 import { pyJsonDumps } from '../../scripts/release/json.mjs';
 import { pyExpanduser, pyNormpath, pyResolve } from '../../scripts/release/python_compat.mjs';
@@ -43,6 +45,15 @@ function withTmp(fn) {
   const tmp = makeTempDir();
   try {
     return fn(tmp);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
+async function withTmpAsync(fn) {
+  const tmp = makeTempDir();
+  try {
+    return await fn(tmp);
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true });
   }
@@ -116,52 +127,110 @@ test('test_speech_fixture_fails_closed', () => withTmp((tmp) => {
   raises(() => loadSpeechFixture(file));
 }));
 
-// The module specifiers of `text`: static imports and re-exports (which
-// may span lines), bare imports, and dynamic import() calls, whose target
-// must be a plain string literal. Comment lines are prose, not code.
-const STATIC_SPECIFIER = /^[ \t]*(?:import|export)\b[^;'"`]*?\bfrom\s*(['"])([^'"]+)\1/gm;
-const BARE_SPECIFIER = /^[ \t]*import\s*(['"])([^'"]+)\1/gm;
-const DYNAMIC_IMPORT = /(?<![\w$.])import\s*\(/g;
-const LITERAL_ARGUMENT = /^\s*(['"])([^'"`$\\]+)\1\s*\)/;
+// The only non-relative imports the harness may make: node: builtins, the
+// smokes' 'playwright' (the candidate's locked dependency), and the bridge
+// module the smokes' page code imports from the served web root.
+const PAGE_BRIDGE = '/llama_webgpu_bridge.js';
+const EXTERNAL_IMPORT = /import\s*\(\s*(["'])(?:node:[\w/]+|playwright|\/llama_webgpu_bridge\.js)\1\s*\)/y;
 
-function moduleSpecifiers(name, text) {
-  const specifiers = [...text.matchAll(STATIC_SPECIFIER), ...text.matchAll(BARE_SPECIFIER)].map((match) => match[2]);
-  for (const match of text.matchAll(DYNAMIC_IMPORT)) {
-    const lineStart = text.lastIndexOf('\n', match.index) + 1;
-    if (/^\s*(?:\/\/|\*|\/\*)/.test(text.slice(lineStart, match.index))) continue;
-    const literal = LITERAL_ARGUMENT.exec(text.slice(match.index + match[0].length));
-    assert.ok(literal, `${name} has an import() whose target is not a string literal, which the closure cannot follow`);
-    specifiers.push(literal[2]);
+// Bundle the harness entries with esbuild, the parser the JS bridge build
+// already uses, and return the sorted scripts/ files the bundle read, plus
+// `extraFiles` (the speech fixture, which qualification.mjs reads by path).
+// esbuild parses every import form (string-named bindings, imports after
+// other statements, .js modules, JSON with import attributes); a bare
+// package, a path outside scripts/, or an import() the bundle cannot follow
+// fails the closure.
+export async function harnessClosure(scriptsDir, entries, extraFiles = []) {
+  const rejectUnknownImports = {
+    name: 'harness-imports',
+    setup(pluginBuild) {
+      pluginBuild.onResolve({ filter: /.*/ }, (args) => {
+        if (args.kind === 'entry-point' || args.path.startsWith('./') || args.path.startsWith('../')) return undefined;
+        if (args.path.startsWith('node:') || args.path === 'playwright' || args.path === PAGE_BRIDGE) {
+          return { path: args.path, external: true };
+        }
+        return { errors: [{ text: `${args.importer} imports ${JSON.stringify(args.path)}` }] };
+      });
+    },
+  };
+  const result = await build({
+    absWorkingDir: path.resolve(scriptsDir),
+    entryPoints: entries,
+    bundle: true,
+    write: false,
+    metafile: true,
+    platform: 'node',
+    format: 'esm',
+    outdir: 'bundle',
+    logLevel: 'silent',
+    // Tree shaking must not drop code the scan below has to see, whatever a
+    // package.json sideEffects field or a /* @__PURE__ */ comment says.
+    ignoreAnnotations: true,
+    // List a symlink under its own name, so the check below sees it.
+    preserveSymlinks: true,
+    plugins: [rejectUnknownImports],
+  });
+  assert.deepEqual(result.warnings.map((warning) => warning.text), []);
+  // An import() the bundle kept is external or computed; only the external
+  // ones above are allowed, so a computed target cannot hide a module.
+  for (const output of result.outputFiles) {
+    for (const match of output.text.matchAll(/(?<![\w$.])import\s*\(/g)) {
+      EXTERNAL_IMPORT.lastIndex = match.index;
+      assert.ok(EXTERNAL_IMPORT.test(output.text), `the harness keeps an import() it cannot follow: ${output.text.slice(match.index, match.index + 60)}`);
+    }
   }
-  return specifiers;
-}
-
-// Parse the imports of the harness entries and return the sorted closure of
-// scripts/ files they reach, plus `extraFiles` (the speech fixture, which
-// qualification.mjs reads by path). Only node: builtins, the smokes'
-// 'playwright' (the candidate's locked dependency) and the '/...' web-root
-// URLs the smokes' page code imports may be non-relative.
-export function harnessClosure(scriptsDir, entries, extraFiles = []) {
-  const seen = new Set();
-  const visit = (name) => {
-    if (seen.has(name)) return;
-    seen.add(name);
-    if (!name.endsWith('.mjs')) return;
+  const files = Object.keys(result.metafile.inputs);
+  for (const name of files) {
+    assert.ok(!name.startsWith('../') && !path.isAbsolute(name), `the harness reads ${name} from outside scripts/`);
+    // ES modules and JSON only: a .js module's meaning depends on an undigested
+    // package.json, and a symlink's target is digested under another name.
+    assert.ok(/\.(?:mjs|json)$/.test(name), `the harness imports ${name}, which is neither .mjs nor .json`);
+    assert.ok(!fs.lstatSync(path.join(scriptsDir, name)).isSymbolicLink(), `the harness imports ${name}, a symlink`);
     const text = fs.readFileSync(path.join(scriptsDir, name), 'utf8');
     assert.ok(!/\bcreateRequire\b|(?<![\w$.])require\s*\(/.test(text), `${name} loads modules through require`);
-    for (const spec of moduleSpecifiers(name, text)) {
-      if (spec.startsWith('./') || spec.startsWith('../')) {
-        const target = path.posix.normalize(path.posix.join(path.posix.dirname(name), spec));
-        assert.ok(!target.startsWith('../'), `${name} imports ${spec} from outside scripts/`);
-        visit(target);
-      } else {
-        assert.ok(spec.startsWith('node:') || spec.startsWith('/') || spec === 'playwright', `${name} imports ${JSON.stringify(spec)}`);
-      }
-    }
-  };
-  for (const entry of entries) visit(entry);
-  for (const file of extraFiles) seen.add(file);
-  return [...seen].sort();
+  }
+  return [...new Set([...files, ...extraFiles])].sort();
+}
+
+// Nothing in the closure locates a file it runs or reads except through
+// reviewed lines: the entry-point checks, the program name, qualify's
+// scripts directory and the two smokes it joins onto it, the speech fixture,
+// and the harness digest's own reads, all of which resolve inside the
+// digested tree. Command-line arguments are only ever the user's
+// (argv.slice(2)), never the script's own path, nothing starts a Worker, and
+// no string names a scripts/ path relative to the working directory.
+//
+// The lines are checked as esbuild prints them, so comments are gone and
+// spacing is normal. This catches accidental file locations, not deliberate
+// evasion: an alias of a reviewed value (qualification.mjs's `directory`), a
+// computed property name or an eval'd string can still reach a file.
+const REVIEWED_LINES = new Set([
+  'release/qualify.mjs:const SCRIPTS_DIR = path.dirname(path.dirname(fs.realpathSync(fileURLToPath(import.meta.url))));',
+  'release/qualify.mjs:const scriptsDir = deps.scriptsDir ?? SCRIPTS_DIR;',
+  'release/qualify.mjs:scriptsDir,',
+  'release/qualify.mjs:pyJoinPath(scriptsDir, SPEECH_SMOKE),',
+  'release/qualify.mjs:pyJoinPath(scriptsDir, TTS_SMOKE),',
+  'release/qualify.mjs:SCRIPTS_DIR,',
+  'release/qualification.mjs:const SPEECH_FIXTURE = Object.freeze(loadSpeechFixture(path.join(import.meta.dirname, "..", SPEECH_FIXTURE_FILE)));',
+  'release/qualification.mjs:function harnessSourceSha256(scriptsDir, { sources = HARNESS_SOURCES } = {}) {',
+  'release/qualification.mjs:function requireHarnessMatchesBridgeSource(scriptsDir, bridgeSha, { sources = HARNESS_SOURCES } = {}) {',
+  'release/qualification.mjs:const directory = pyPath(String(scriptsDir));',
+  'release/qualification.mjs:const result = spawnSync("git", ["-C", repositoryPath, "show", `${bridgeSha}:scripts/${name}`], {',
+]);
+const PROG_NAME = /progName\(import\.meta\.url\)/g;
+
+export function unreviewedFileLocations(name, text) {
+  const { code } = transformSync(text, { format: 'esm', loader: 'js', legalComments: 'none', ignoreAnnotations: true });
+  const found = [];
+  for (const rawLine of code.split('\n')) {
+    const line = rawLine.trim();
+    const withoutProg = line.replace(PROG_NAME, '');
+    const locates = /\bimport\.meta\b(?!\.main\b)/.test(withoutProg)
+      || /\b(?:scriptsDir|SCRIPTS_DIR|__dirname|__filename|Worker)\b|scripts\//.test(line)
+      || /\bprocess\.argv\b(?!\.slice\(2\))|\bprocess\s*\[/.test(line);
+    if (locates && !REVIEWED_LINES.has(`${name}:${line}`)) found.push(line);
+  }
+  return found;
 }
 
 // The harness entries: the qualification CLI and the module it runs the
@@ -174,8 +243,8 @@ function harnessEntries() {
   return ['release/qualification.mjs', 'release/qualify.mjs', ...QUALIFICATION_SMOKES, ...candidateGates];
 }
 
-test('test_harness_sources_are_exactly_what_the_gates_execute_or_read', () => {
-  const closure = harnessClosure(SCRIPTS_DIR, harnessEntries(), [SPEECH_FIXTURE_FILE]);
+test('test_harness_sources_are_exactly_what_the_gates_execute_or_read', async () => {
+  const closure = await harnessClosure(SCRIPTS_DIR, harnessEntries(), [SPEECH_FIXTURE_FILE]);
   assert.deepEqual([...HARNESS_SOURCES].sort(), closure);
   assert.deepEqual([...HARNESS_SOURCES], closure, 'HARNESS_SOURCES must be listed sorted');
   assert.equal(new Set(HARNESS_SOURCES).size, HARNESS_SOURCES.length);
@@ -184,72 +253,115 @@ test('test_harness_sources_are_exactly_what_the_gates_execute_or_read', () => {
   for (const name of ['release/contract.mjs', 'release/manifest.mjs', 'release/publication_state.mjs']) {
     assert.ok(closure.includes(name), name);
   }
-  // Nothing outside the closure locates a file through import.meta: only the
-  // entry-point checks, the program name, and the two reviewed paths into
-  // scripts/ (qualify's scripts directory and the speech fixture), which
-  // both resolve inside the digested tree.
-  const reviewed = new Set([
-    'release/qualify.mjs:export const SCRIPTS_DIR = path.dirname(path.dirname(fs.realpathSync(fileURLToPath(import.meta.url))));',
-    "release/qualification.mjs:export const SPEECH_FIXTURE = Object.freeze(loadSpeechFixture(path.join(import.meta.dirname, '..', SPEECH_FIXTURE_FILE)));",
-  ]);
   for (const name of closure.filter((file) => file.endsWith('.mjs'))) {
-    const text = fs.readFileSync(path.join(SCRIPTS_DIR, name), 'utf8');
-    assert.ok(!text.includes('__dirname') && !text.includes('__filename'), name);
-    for (const line of text.split('\n')) {
-      const uses = [...line.matchAll(/import\.meta\.(\w+)/g)].map((match) => match[1]);
-      if (uses.length === 0 || uses.every((use) => use === 'main')) continue;
-      if (/progName\(import\.meta\.url\)/.test(line) && uses.every((use) => use === 'url')) continue;
-      assert.ok(reviewed.has(`${name}:${line.trim()}`), `${name} uses import.meta outside the reviewed paths: ${line.trim()}`);
-    }
+    assert.deepEqual(unreviewedFileLocations(name, fs.readFileSync(path.join(SCRIPTS_DIR, name), 'utf8')), [], name);
   }
 });
 
-test('the harness closure follows every relative import form and fails on a new one', () => withTmp((tmp) => {
-  const files = {
+test('the harness closure follows every import form and fails on one it cannot follow', () => withTmpAsync(async (tmp) => {
+  // The scripts tree is a subdirectory, so a file outside it can exist.
+  const root = path.join(tmp, 'scripts');
+  const write = (files) => {
+    for (const [name, text] of Object.entries(files)) {
+      fs.mkdirSync(path.dirname(path.join(root, name)), { recursive: true });
+      fs.writeFileSync(path.join(root, name), text);
+    }
+  };
+  write({
     'release/entry.mjs': [
       "import { a } from './a.mjs';",
       "export { b } from './b.mjs';",
       "import './side.mjs';",
       "const lazy = await import('./lazy.mjs');",
+      'const template = await import(`./template.mjs`);',
       "import fs from 'node:fs';",
       "import data from '../smoke/data.json' with { type: 'json' };",
       'import {',
       '  multi,',
       "} from './multi.mjs';",
+      "const later = 1; import './later.mjs';",
+      "/* c */ import { \"named\" as named } from './named.mjs';",
+      "import './helper.mjs';",
       "// A comment naming import('./commented.mjs') or from './commented.mjs' is prose.",
     ].join('\n'),
-    'release/a.mjs': "import { c } from '../smoke/c.mjs';",
-    'release/b.mjs': '',
-    'release/multi.mjs': '',
+    'release/a.mjs': "export { c as a } from '../smoke/c.mjs';",
+    'release/b.mjs': 'export const b = 1;',
+    'release/multi.mjs': 'export const multi = 1;',
     'release/side.mjs': '',
     'release/lazy.mjs': '',
+    'release/template.mjs': '',
+    'release/later.mjs': '',
+    'release/named.mjs': 'const n = 1; export { n as "named" };',
+    'release/helper.mjs': "import './helper_dependency.mjs';",
+    'release/helper_dependency.mjs': '',
     'release/unlisted.mjs': '',
-    'smoke/c.mjs': "const page = () => import('/llama_webgpu_bridge.js');\nimport('playwright');",
+    'release/required.mjs': '',
+    '../outside.mjs': '',
+    'smoke/c.mjs': "export const c = () => import('/llama_webgpu_bridge.js');\nexport const p = () => import('playwright');",
     'smoke/data.json': '{}',
-  };
-  for (const [name, text] of Object.entries(files)) {
-    fs.mkdirSync(path.dirname(path.join(tmp, name)), { recursive: true });
-    fs.writeFileSync(path.join(tmp, name), text);
-  }
-  assert.deepEqual(harnessClosure(tmp, ['release/entry.mjs'], ['fixture.json']), [
-    'fixture.json', 'release/a.mjs', 'release/b.mjs', 'release/entry.mjs', 'release/lazy.mjs', 'release/multi.mjs', 'release/side.mjs',
+  });
+  assert.deepEqual(await harnessClosure(root, ['release/entry.mjs'], ['fixture.json']), [
+    'fixture.json', 'release/a.mjs', 'release/b.mjs', 'release/entry.mjs', 'release/helper.mjs', 'release/helper_dependency.mjs',
+    'release/later.mjs', 'release/lazy.mjs', 'release/multi.mjs', 'release/named.mjs', 'release/side.mjs', 'release/template.mjs',
     'smoke/c.mjs', 'smoke/data.json',
   ]);
   // A new relative import widens the closure, so HARNESS_SOURCES no longer
   // equals it.
-  fs.appendFileSync(path.join(tmp, 'release/b.mjs'), "\nimport './unlisted.mjs';\n");
-  assert.ok(harnessClosure(tmp, ['release/entry.mjs']).includes('release/unlisted.mjs'));
+  fs.appendFileSync(path.join(root, 'release/b.mjs'), "\nimport './unlisted.mjs';\n");
+  assert.ok((await harnessClosure(root, ['release/entry.mjs'])).includes('release/unlisted.mjs'));
   for (const [label, text] of [
     ['a package', "import yaml from 'yaml';"],
-    ['a computed import()', 'const m = await import(name);'],
-    ['a template literal import()', 'const m = await import(`./x.mjs`);'],
-    ['require', "const x = require('./x.cjs');"],
-    ['an import from outside scripts/', "import '../../x.mjs';"],
+    ['a bare builtin', "import fs from 'fs';"],
+    ['a computed import()', 'export const m = await import(name);'],
+    ['a computed import() after a line-leading operator', 'export const m = 2\n  * await import(name);'],
+    ['an absolute import()', "export const m = await import('/abs/evil.mjs');"],
+    ['require', "const x = require('./required.mjs');"],
+    ['createRequire', "import { createRequire } from 'node:module';"],
+    ['an import from outside scripts/', "import '../../outside.mjs';"],
+    ['a .js module', "import './plain.js';"],
+    ['a symlink', "import './link.mjs';"],
+    ['a computed import() in code tree shaking would drop', "import { unused } from './pure/pure.mjs';"],
   ]) {
-    fs.writeFileSync(path.join(tmp, 'release/b.mjs'), text);
-    assert.throws(() => harnessClosure(tmp, ['release/entry.mjs']), assert.AssertionError, label);
+    write({
+      'release/plain.js': '',
+      'release/pure/pure.mjs': 'export const unused = 1;\nawait import(name);\n',
+      'release/pure/package.json': '{"sideEffects": false}',
+    });
+    fs.rmSync(path.join(root, 'release/link.mjs'), { force: true });
+    fs.symlinkSync('side.mjs', path.join(root, 'release/link.mjs'));
+    fs.writeFileSync(path.join(root, 'release/b.mjs'), `${text}\nexport const b = 1;\n`);
+    await assert.rejects(harnessClosure(root, ['release/entry.mjs']), label);
   }
 }));
+
+test('the reviewed-lines check sees file locations however they are spelled', () => {
+  // The real reviewed lines pass as written.
+  assert.deepEqual(unreviewedFileLocations('release/qualify.mjs', 'const scriptsDir = deps.scriptsDir ?? SCRIPTS_DIR;\n'), []);
+  assert.deepEqual(unreviewedFileLocations('release/x.mjs', [
+    'if (import.meta.main) runCli(main);',
+    'const PROG = progName(import.meta.url);',
+    'export async function main(argv = process.argv.slice(2)) {}',
+    '// import.meta.dirname and scripts/x.mjs in a comment are prose',
+  ].join('\n')), []);
+  for (const text of [
+    'const { dirname } = import.meta;',
+    'const m = import.meta; use(m);',
+    'use(import.meta["dirname"]);',
+    'use(import . meta.dirname);',
+    'const x = 2\n  * read(path.join(import.meta.dirname, "x"));',
+    'const u = "file://" + import.meta.dirname;',
+    'const p = progName(import.meta.url), d = path.dirname(fileURLToPath(import.meta.url));',
+    'export function harnessSourceSha256(scriptsDir, { sources = HARNESS_SOURCES } = {}) { return read(scriptsDir); }',
+    'const scriptsDir = deps.scriptsDir ?? SCRIPTS_DIR; read(scriptsDir);',
+    'spawn(node, ["scripts/smoke/x.mjs"]);',
+    'const self = process.argv[1];',
+    'const a = process["argv"];',
+    'new Worker("./x.mjs");',
+    'const d = __dirname;',
+  ]) {
+    assert.notDeepEqual(unreviewedFileLocations('release/qualify.mjs', text), [], text);
+  }
+});
 
 test('test_harness_version_moves_with_the_harness_sources', () => {
   // A new harness file list is a new harness: bump HARNESS_VERSION with it,

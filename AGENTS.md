@@ -207,8 +207,9 @@ candidate and exact `candidate_run_id`/`attestation_run_id` pair.
   or adding a harness module changes the digest and needs a new candidate.
   `tests/release/qualification_harness_test.mjs` requires that list to equal
   the harness's import closure. No workflow runs Python;
-  `scripts/ci/verify_ci_reliability.mjs` fails on any `python`, `pip`,
-  `py_compile` or `*.py` command.
+  `scripts/ci/verify_ci_reliability.mjs` fails on a Python interpreter or
+  package tool, a `*.py` script, a python shell, a Python image, or a
+  `setup-python`/`setup-uv` step.
 - `scripts/release/orchestrator/cli.mjs` is the orchestrator's CLI entry; the
   state machine lives in the `scripts/release/orchestrator/<concern>.mjs`
   modules it imports, tested by `tests/release/orchestrator/<concern>_test.mjs`
