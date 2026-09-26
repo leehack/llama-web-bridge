@@ -1,7 +1,8 @@
 // Contract tests for the browser smoke helpers (scripts/browser_smoke_support.mjs)
-// and the checks the Node smokes run on their result. Expected values were
-// produced by the Python smokes and Python's json/repr, which the Node smokes
-// replace byte for byte. No browser is started here.
+// and the checks the Node smokes run on their result, including the in-page
+// checks of the state and multimodal harnesses, run against fake bridges.
+// Expected values were produced by the Python smokes and Python's json/repr,
+// which the Node smokes replace byte for byte. No browser is started here.
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
@@ -364,6 +365,272 @@ process.on('exit', () => fs.rmSync(tmp, { recursive: true, force: true }));
   for (const page of [state, grammar, scores, multimodal]) {
     assert.ok(page.startsWith('\n<!doctype html>\n<meta charset="utf-8">\n'));
     assert.ok(page.endsWith('})();\n</script>\n'));
+  }
+}
+
+// --- Harness pages against a fake bridge --------------------------------------
+
+// Runs a harness page's module script in Node against a fake bridge class, so the
+// in-page usage assertions are exercised without a browser. The page imports the
+// bridge from '/llama_webgpu_bridge.js'; that one call is redirected to the fake.
+async function runHarnessPage(page, Bridge, extraDocument = {}) {
+  const body = page.slice(page.indexOf('<script type="module">\n') + '<script type="module">\n'.length, page.lastIndexOf('</script>'));
+  const importCall = "await import('/llama_webgpu_bridge.js')";
+  assert.equal(body.split(importCall).length, 2, 'the harness must import the bridge exactly once');
+  const script = body.replace(importCall, '({ LlamaWebGpuBridge: window.__FakeBridge })').trim();
+  const result = { textContent: 'pending' };
+  const window = { crossOriginIsolated: true, __FakeBridge: Bridge };
+  const document = { getElementById: (id) => (id === 'result' ? result : null), ...extraDocument };
+  await new Function('window', 'document', `'use strict'; return ${script}`)(window, document);
+  assert.equal(result.textContent, JSON.stringify(window.__smokeResult));
+  return window.__smokeResult;
+}
+
+const firstErrorLine = (payload) => {
+  assert.equal(payload.ok, false, JSON.stringify(payload));
+  return payload.error.split('\n')[0];
+};
+
+// Words as tokens after a BOS token, like a tokenizer that adds special tokens.
+const fakeTokenize = (text) => [1, ...text.split(/\s+/).filter(Boolean).map((word) => 100 + word.length)];
+
+// A fake bridge for the state harness. The KV cache keeps the prompt and the
+// generated token, a repeated prompt keeps all but its last token, and an abort
+// during generation resolves in the direct runtime and rejects in the worker.
+// `tweak.usage(context)` returns the usages to report for one completion.
+const stateBridge = (tweak = {}) => class FakeStateBridge {
+  constructor({ disableWorker }) {
+    this.mode = disableWorker ? 'direct runtime' : 'worker runtime';
+    this.loaded = false;
+    this.cache = [];
+    this.calls = 0;
+    if (!disableWorker) this._workerProxy = {};
+  }
+
+  async loadModelFromUrl(url, options) {
+    assert.equal(url, '/state-smoke-model.gguf');
+    for (let loaded = 1; loaded <= 3; loaded += 1) options.progressCallback?.({ loaded, total: 3 });
+    this.loaded = true;
+    this.cache = [];
+  }
+
+  requireModel() {
+    if (!this.loaded) throw new Error('No model loaded');
+  }
+
+  async tokenize(text) { this.requireModel(); return fakeTokenize(text); }
+
+  async embed(text) { this.requireModel(); return [text.length, 0.5, -0.25]; }
+
+  async embedBatch(texts) { return Promise.all(texts.map((text) => this.embed(text))); }
+
+  getContextSize() { return 64; }
+
+  async stateSaveBytes(tokens) {
+    this.requireModel();
+    return new Uint8Array(tokens.flatMap((token) => [token & 0xff, token >> 8]));
+  }
+
+  async stateLoadBytes(bytes) {
+    this.requireModel();
+    const tokens = [];
+    for (let index = 0; index < bytes.length; index += 2) tokens.push(bytes[index] | (bytes[index + 1] << 8));
+    this.cache = tokens;
+    return { tokens };
+  }
+
+  async stateSaveFile() { this.requireModel(); }
+
+  async stateLoadFile() { this.requireModel(); }
+
+  async _callWorker(name, args, _signal, transfer) {
+    // Like postMessage: the worker gets copies and the transferred buffers detach.
+    return this[name](...structuredClone(args, { transfer }));
+  }
+
+  async createCompletion(prompt, options) {
+    this.requireModel();
+    const tokens = fakeTokenize(prompt);
+    let cached = 0;
+    while (cached < tokens.length - 1 && this.cache[cached] === tokens[cached]) cached += 1;
+    let completionTokens = 0;
+    let finishReason = 'length';
+    while (completionTokens < options.nPredict) {
+      completionTokens += 1;
+      options.onToken?.(new Uint8Array([120]), 'x'.repeat(completionTokens));
+      if (options.signal?.aborted) {
+        finishReason = 'cancelled';
+        break;
+      }
+    }
+    this.cache = [...tokens, 120];
+    const usage = {
+      promptTokens: tokens.length,
+      cachedPromptTokens: cached,
+      completionTokens,
+      timeToFirstTokenMs: 2,
+      durationMs: 5,
+      finishReason,
+    };
+    this.calls += 1;
+    const context = { mode: this.mode, call: this.calls, prompt, usage };
+    for (const reported of tweak.usage ? tweak.usage(context) : [usage]) options.onUsage?.(reported);
+    const outcome = tweak.abort?.(context)
+      ?? (finishReason === 'cancelled' && this.mode === 'worker runtime' ? 'reject' : 'resolve');
+    if (outcome === 'reject') throw new DOMException('The operation was aborted.', 'AbortError');
+    if (outcome instanceof Error) throw outcome;
+    return 'x'.repeat(completionTokens);
+  }
+
+  async dispose() {}
+};
+
+{
+  const page = stateSmoke.renderHarness('state-smoke-model.gguf');
+  const onCall = (mode, call, change) => ({
+    usage: (context) => (context.mode === mode && context.call === call ? change(context.usage) : [context.usage]),
+  });
+  const passed = await runHarnessPage(page, stateBridge());
+  assert.equal(passed.ok, true, passed.error);
+  stateSmoke.checkPayload(passed, true);
+  const [direct, worker] = passed.modeResults;
+  assert.deepEqual(direct.initialUsage,
+    { promptTokens: 2, cachedPromptTokens: 0, completionTokens: 1, timeToFirstTokenMs: 2, durationMs: 5, finishReason: 'length' });
+  assert.equal(direct.restoredUsage.cachedPromptTokens, 1);
+  assert.deepEqual([direct.repeatedUsage.promptTokens, direct.repeatedUsage.cachedPromptTokens], [10, 9]);
+  assert.deepEqual([direct.abortOutcome, worker.abortOutcome], ['resolved', 'rejected']);
+  assert.deepEqual([direct.abortedUsage.finishReason, direct.abortedUsage.completionTokens], ['cancelled', 1]);
+  assert.equal(worker.detachedAfterLoadTransfer, true);
+  // A completion that stops before streaming anything has no first-token time.
+  assert.equal((await runHarnessPage(page, stateBridge(onCall('worker runtime', 1,
+    (usage) => [{ ...usage, completionTokens: 0, finishReason: 'stop', timeToFirstTokenMs: null }])))).ok, true);
+  // No model: the harness never completes, so usage is not checked.
+  assert.equal((await runHarnessPage(stateSmoke.renderHarness(null), stateBridge({ usage: () => [] }))).ok, true);
+
+  const edit = (fields) => (usage) => [{ ...usage, ...fields }];
+  // Completions per mode: 1 initial, 2 mutation, 3 after restore, 4 and 5 repeated prompt, 6 aborted.
+  const cases = [
+    [onCall('direct runtime', 1, () => []), 'direct runtime initial completion reported usage 0 times'],
+    [onCall('worker runtime', 1, (usage) => [usage, usage]), 'worker runtime initial completion reported usage 2 times'],
+    [onCall('direct runtime', 1, edit({ promptTokens: 3 })), 'direct runtime initial completion reported 3 prompt tokens, expected 2'],
+    [onCall('direct runtime', 1, edit({ cachedPromptTokens: 2 })), 'direct runtime initial completion reported 2 cached prompt tokens'],
+    [onCall('direct runtime', 1, edit({ cachedPromptTokens: 0.5 })), 'direct runtime initial completion reported 0.5 cached prompt tokens'],
+    [onCall('direct runtime', 1, edit({ cachedPromptTokens: -1 })), 'direct runtime initial completion reported -1 cached prompt tokens'],
+    [onCall('direct runtime', 1, edit({ completionTokens: 2 })), 'direct runtime initial completion reported 2 completion tokens'],
+    [onCall('direct runtime', 1, edit({ finishReason: 'stop' })), 'direct runtime initial completion finished with stop after 1 tokens'],
+    [onCall('direct runtime', 1, edit({ completionTokens: 0 })), 'direct runtime initial completion finished with length after 0 tokens'],
+    [onCall('direct runtime', 1, edit({ durationMs: undefined })), 'direct runtime initial completion reported duration undefined'],
+    [onCall('direct runtime', 1, edit({ durationMs: -1 })), 'direct runtime initial completion reported duration -1'],
+    [onCall('direct runtime', 1, edit({ timeToFirstTokenMs: 6 })), 'direct runtime initial completion reported time to first token 6'],
+    [onCall('direct runtime', 1, edit({ timeToFirstTokenMs: -1 })), 'direct runtime initial completion reported time to first token -1'],
+    [onCall('worker runtime', 3, () => []), 'worker runtime completion after state restore reported usage 0 times'],
+    [onCall('worker runtime', 3, edit({ promptTokens: 1 })), 'worker runtime completion after state restore reported 1 prompt tokens, expected 2'],
+    [onCall('direct runtime', 3, edit({ cachedPromptTokens: 0 })),
+      'direct runtime completion after state restore reused 0 of 2 prompt tokens'],
+    [onCall('direct runtime', 4, () => []), 'direct runtime repeated prompt reported usage 1 times'],
+    [onCall('direct runtime', 5, edit({ promptTokens: 11 })), 'direct runtime repeated prompt reported 10,11 prompt tokens, expected 10'],
+    [onCall('worker runtime', 5, edit({ cachedPromptTokens: 1 })), 'worker runtime repeated prompt reused 1 of 10 prompt tokens'],
+    [{ abort: (context) => (context.mode === 'worker runtime' && context.call === 6 ? 'resolve' : undefined) },
+      'worker runtime aborted completion resolved'],
+    [{ abort: (context) => (context.mode === 'direct runtime' && context.call === 6 ? 'reject' : undefined) },
+      'direct runtime aborted completion rejected'],
+    [{ abort: (context) => (context.call === 6 ? new Error('boom') : undefined) }, 'direct runtime aborted completion failed: Error: boom'],
+    [onCall('worker runtime', 6, () => []), 'worker runtime aborted completion reported usage 0 times'],
+    [onCall('direct runtime', 6, (usage) => [usage, usage]), 'direct runtime aborted completion reported usage 2 times'],
+    [onCall('direct runtime', 6, edit({ finishReason: 'length' })), 'direct runtime aborted completion finished with length'],
+    [onCall('direct runtime', 6, edit({ completionTokens: 0 })), 'direct runtime aborted completion reported 0 completion tokens'],
+    [onCall('worker runtime', 6, edit({ completionTokens: 8 })), 'worker runtime aborted completion reported 8 completion tokens'],
+  ];
+  for (const [tweak, message] of cases) {
+    assert.equal(firstErrorLine(await runHarnessPage(page, stateBridge(tweak))), `Error: ${message}`, message);
+  }
+}
+
+// A fake bridge for the multimodal harness: the image adds 64 prompt positions
+// and the direct runtime exposes the native media helpers the page calls.
+const multimodalBridge = (tweak = {}) => class FakeMultimodalBridge {
+  constructor({ disableWorker }) {
+    this.mode = disableWorker ? 'direct runtime' : 'worker runtime';
+    const files = new Map();
+    const helpers = {
+      llamadart_webgpu_media_add_file: ([file]) => (files.has(file) ? 0 : -4),
+      llamadart_webgpu_media_add_encoded: ([bytes, length]) => {
+        if (length === 0) return -3;
+        return length === bytes.length && length > 8 ? 0 : -4;
+      },
+      llamadart_webgpu_media_clear_pending: () => null,
+    };
+    if (disableWorker) {
+      this._runtime = {
+        _core: {
+          FS: { writeFile: (file, bytes) => files.set(file, bytes), unlink: (file) => files.delete(file) },
+          ccall: (name, _returnType, _argTypes, args) => helpers[name](args),
+        },
+      };
+    }
+  }
+
+  async loadModelFromUrl(url) { assert.equal(url, '/multimodal-model.gguf'); }
+
+  async loadMultimodalProjector(url) { assert.equal(url, '/multimodal-mmproj.gguf'); }
+
+  supportsVision() { return true; }
+
+  async tokenize(text) { return fakeTokenize(text); }
+
+  async createCompletion(prompt, options) {
+    assert.equal(options.parts[0].type, 'image');
+    const usage = {
+      promptTokens: fakeTokenize(prompt).length + 64,
+      cachedPromptTokens: 0,
+      completionTokens: 12,
+      timeToFirstTokenMs: 40,
+      durationMs: 90,
+      finishReason: 'stop',
+    };
+    for (const reported of tweak.usage ? tweak.usage({ mode: this.mode, usage }) : [usage]) options.onUsage?.(reported);
+    return 'I see a box with the word HELLO.';
+  }
+
+  getModelMetadata() { return { 'llamadart.webgpu.runtime_notes': 'x;media_image_resized:320x180->300x169' }; }
+
+  async dispose() {}
+};
+
+{
+  const canvas = {
+    getContext: () => ({ fillRect() {}, fillText() {} }),
+    toBlob: (callback) => callback({ arrayBuffer: async () => new Uint8Array(32).fill(7).buffer }),
+  };
+  const page = multimodalSmoke.renderHarness();
+  const run = (tweak) => runHarnessPage(page, multimodalBridge(tweak), { createElement: () => canvas });
+  const passed = await run();
+  assert.equal(passed.ok, true, passed.error);
+  multimodalSmoke.checkPayload(passed);
+  assert.deepEqual(passed.modeResults.map((entry) => [entry.mode, entry.promptTextTokens, entry.usage.promptTokens]),
+    [['direct runtime', 5, 69], ['worker runtime', 5, 69]]);
+  assert.equal(passed.modeResults[0].imageResizeDiagnostic, 'media_image_resized:320x180->300x169');
+
+  const onMode = (mode, change) => ({ usage: (context) => (context.mode === mode ? change(context.usage) : [context.usage]) });
+  const edit = (fields) => (usage) => [{ ...usage, ...fields }];
+  // nPredict (64) tokens end with 'length'.
+  assert.equal((await run(onMode('direct runtime', edit({ completionTokens: 64, finishReason: 'length' })))).ok, true);
+  const cases = [
+    [onMode('direct runtime', () => []), 'direct runtime reported usage 0 times'],
+    [onMode('worker runtime', (usage) => [usage, usage]), 'worker runtime reported usage 2 times'],
+    [onMode('direct runtime', edit({ promptTokens: 5 })),
+      'direct runtime reported 5 prompt positions for an image prompt of 5 text tokens'],
+    [onMode('worker runtime', edit({ cachedPromptTokens: 4 })), 'worker runtime reused 4 tokens of a multimodal prompt'],
+    [onMode('direct runtime', edit({ completionTokens: 0 })), 'direct runtime reported 0 completion tokens'],
+    [onMode('direct runtime', edit({ completionTokens: 65 })), 'direct runtime reported 65 completion tokens'],
+    [onMode('direct runtime', edit({ finishReason: 'length' })), 'direct runtime finished with length after 12 tokens'],
+    [onMode('direct runtime', edit({ completionTokens: 64 })), 'direct runtime finished with stop after 64 tokens'],
+    [onMode('worker runtime', edit({ timeToFirstTokenMs: null })), 'worker runtime reported time to first token null of 90 ms'],
+    [onMode('direct runtime', edit({ timeToFirstTokenMs: 0 })), 'direct runtime reported time to first token 0 of 90 ms'],
+    [onMode('direct runtime', edit({ timeToFirstTokenMs: 91 })), 'direct runtime reported time to first token 91 of 90 ms'],
+  ];
+  for (const [tweak, message] of cases) {
+    assert.equal(firstErrorLine(await run(tweak)), `Error: ${message}`, message);
   }
 }
 

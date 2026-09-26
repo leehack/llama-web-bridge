@@ -144,7 +144,10 @@ export function renderHarness() {
           }
         }
 
+        const usages = [];
+        const promptTextTokens = (await bridge.tokenize('what do you see?', true)).length;
         const output = await bridge.createCompletion('what do you see?', {
+          onUsage: (usage) => usages.push(usage),
           nPredict: 64,
           temp: 0,
           topK: 1,
@@ -161,6 +164,25 @@ export function renderHarness() {
           outputText.toLowerCase().includes('hello'),
           \`\${mode} did not recognize the synthetic HELLO image: \${outputText}\`,
         );
+        assert(usages.length === 1, \`\${mode} reported usage \${usages.length} times\`);
+        const [usage] = usages;
+        assert(
+          usage.promptTokens > promptTextTokens,
+          \`\${mode} reported \${usage.promptTokens} prompt positions for an image prompt of \${promptTextTokens} text tokens\`,
+        );
+        assert(usage.cachedPromptTokens === 0, \`\${mode} reused \${usage.cachedPromptTokens} tokens of a multimodal prompt\`);
+        assert(
+          usage.completionTokens > 0 && usage.completionTokens <= 64,
+          \`\${mode} reported \${usage.completionTokens} completion tokens\`,
+        );
+        assert(
+          usage.finishReason === (usage.completionTokens === 64 ? 'length' : 'stop'),
+          \`\${mode} finished with \${usage.finishReason} after \${usage.completionTokens} tokens\`,
+        );
+        assert(
+          usage.timeToFirstTokenMs > 0 && usage.timeToFirstTokenMs <= usage.durationMs,
+          \`\${mode} reported time to first token \${usage.timeToFirstTokenMs} of \${usage.durationMs} ms\`,
+        );
         const metadata = bridge.getModelMetadata();
         const runtimeNotes = String(metadata['llamadart.webgpu.runtime_notes'] || '');
         assert(
@@ -171,6 +193,8 @@ export function renderHarness() {
           mode,
           elapsedMs: Math.round(performance.now() - startedAt),
           output: outputText.slice(0, 160),
+          promptTextTokens,
+          usage,
           imageResizeDiagnostic: runtimeNotes
             .split(';')
             .find((note) => note.startsWith('media_image_resized:')),
