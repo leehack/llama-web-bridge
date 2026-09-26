@@ -672,7 +672,7 @@ export function validatePublicationPatContract(workflow, expectedSteps) {
 // Workflow model
 // ---------------------------------------------------------------------------
 
-class Workflow {
+export class Workflow {
   constructor(relativePath, text, errors) {
     this.path = relativePath;
     this.text = text;
@@ -746,6 +746,9 @@ class Workflow {
 const deepEqual = (left, right) => JSON.stringify(left) === JSON.stringify(right);
 const occurrences = (text, needle) => text.split(needle).length - 1;
 const normalizeSpace = (text) => (typeof text === 'string' ? text.replace(/\s+/g, ' ').trim() : '');
+// A run script with its backslash-newline continuations joined and runs of
+// blanks collapsed, so a command matches however its arguments are wrapped.
+const shellCommands = (text) => String(text).replace(/\\\n/g, ' ').replace(/[ \t]+/g, ' ');
 const quoteAll = (values) => values.map((value) => JSON.stringify(value)).join(', ');
 
 function checker(errors) {
@@ -764,11 +767,13 @@ function checker(errors) {
   };
 }
 
+// `validator` is the command that runs the release contract CLI, such as
+// `python3 scripts/release_contract.py` or `node scripts/release/contract.mjs`.
 function environmentValidationMissing(run, validator) {
   return [
     'gh api "repos/${BRIDGE_REPO}/environments/bridge-assets-publication"',
     'gh api "repos/${BRIDGE_REPO}/environments/bridge-assets-publication/deployment-branch-policies"',
-    `python3 ${validator} validate-environment`,
+    `${validator} validate-environment`,
     '--branch-policies-json',
   ].filter((needle) => !run.includes(needle));
 }
@@ -785,6 +790,8 @@ export const TEST_COMMAND = "node --test 'tests/**/*_test.mjs'";
 
 // Static imports, re-exports, bare imports and literal dynamic imports.
 const RELATIVE_IMPORT = /(?:\bfrom|\bimport)\s*\(?\s*(['"`])(\.\.?\/[^'"`$]+)\1/g;
+// Every literal module specifier, relative or not.
+const IMPORT_SPECIFIER = /(?:\bfrom|\bimport)\s*\(?\s*(['"`])([^'"`$]+)\1/g;
 
 function relativeImports(from, text) {
   return [...String(text).matchAll(RELATIVE_IMPORT)]
@@ -985,6 +992,111 @@ function checkToolchainPins({ ci, candidate, publish }, files, errors) {
   );
 }
 
+// The release orchestrator: the Node CLI entry and the state-machine modules
+// beside it, and the release contract and qualification CLIs the scan
+// workflow runs.
+export const ORCHESTRATOR_DIRECTORY = 'scripts/release/orchestrator';
+export const ORCHESTRATOR_ENTRY = `${ORCHESTRATOR_DIRECTORY}/cli.mjs`;
+export const ORCHESTRATOR_COMMAND = `node ${ORCHESTRATOR_ENTRY}`;
+export const RELEASE_CONTRACT_COMMAND = 'node scripts/release/contract.mjs';
+export const RELEASE_QUALIFICATION_COMMAND = 'node scripts/release/qualification.mjs';
+// The shared release modules the orchestrator imports. They have their own
+// contracts, so their text is not part of the orchestrator source; any other
+// relative import would hide code from the checks and is rejected.
+export const SHARED_RELEASE_MODULES = Object.freeze([
+  'archive', 'cli', 'contract', 'json', 'manifest', 'publication_state', 'python_compat', 'qualification',
+].map((name) => `scripts/release/${name}.mjs`));
+
+/**
+ * Returns the orchestrator source as { path: text }: the entry, then every
+ * module it reaches through relative imports, by path. `files` maps each
+ * scripts/release/orchestrator/*.mjs path to its text. A module the entry
+ * does not reach, an import of a missing module, a relative import outside
+ * the orchestrator and SHARED_RELEASE_MODULES, or an import whose target is
+ * not a string literal is an error, so a check can neither silently widen nor
+ * narrow.
+ */
+export function orchestratorModules(files, errors) {
+  if (!has(files, ORCHESTRATOR_ENTRY)) {
+    errors.push(`${ORCHESTRATOR_ENTRY} is missing`);
+    return {};
+  }
+  const reached = new Set([ORCHESTRATOR_ENTRY]);
+  const pending = [ORCHESTRATOR_ENTRY];
+  while (pending.length > 0) {
+    const from = pending.pop();
+    const text = String(files[from]);
+    if (/\bimport\s*\(\s*(?!['"`][^'"`$]*['"`]\s*\))/.test(text)) {
+      errors.push(`${from} has an import() whose target is not a string literal, so the orchestrator source cannot be resolved`);
+    }
+    // Only node: builtins and relative modules, never a package, a subpath
+    // import, an absolute path or URL, or CommonJS loading, which would all
+    // load code this walk never reads.
+    for (const [, , specifier] of text.matchAll(IMPORT_SPECIFIER)) {
+      if (!/^(?:node:|\.\.?\/)/.test(specifier)) {
+        errors.push(`${from} imports ${specifier}; the orchestrator may import only node: builtins and relative modules`);
+      }
+    }
+    if (/\bcreateRequire\b|(?<![\w$.])require\s*\(/.test(text)) {
+      errors.push(`${from} loads modules through require, which the orchestrator import walk cannot follow`);
+    }
+    for (const target of relativeImports(from, text)) {
+      if (path.posix.dirname(target) === ORCHESTRATOR_DIRECTORY) {
+        if (!has(files, target)) {
+          errors.push(`${from} imports ${target}, which does not exist`);
+        } else if (!reached.has(target)) {
+          reached.add(target);
+          pending.push(target);
+        }
+      } else if (!SHARED_RELEASE_MODULES.includes(target)) {
+        errors.push(`${from} imports ${target}, which is neither a module in ${ORCHESTRATOR_DIRECTORY} nor a shared release module`);
+      }
+    }
+  }
+  const unreached = Object.keys(files).filter((relativePath) => !reached.has(relativePath)).sort();
+  if (unreached.length > 0) {
+    errors.push(`${ORCHESTRATOR_ENTRY} must reach every ${ORCHESTRATOR_DIRECTORY}/*.mjs module through its imports; unreached: ${unreached.join(', ')}`);
+  }
+  const modules = [ORCHESTRATOR_ENTRY, ...[...reached].filter((relativePath) => relativePath !== ORCHESTRATOR_ENTRY).sort()];
+  return Object.fromEntries(modules.map((relativePath) => [relativePath, files[relativePath]]));
+}
+
+// Row 53: the dispatch booleans the orchestrator may never write as a literal
+// 'true'. Each JavaScript spelling is matched: a property (`{ key: 'true' }`,
+// `"key": "true"`), an assignment (`inputs.key = 'true'`,
+// `inputs['key'] = 'true'`) and a Map entry or set (`['key', 'true']`,
+// `.set('key', 'true')`), with any quote.
+export const LIVE_PROOF_DISPATCH_BOOLEANS = ['assets_immutable_releases_enabled', 'publish_approved'];
+// The one sanctioned literal: in the driver, the approval is asserted only on
+// the statement right after the live publication-environment proof. Both
+// statements must open their own lines, so a commented-out or conditional
+// proof does not sanction the assignment.
+export const SANCTIONED_APPROVAL_MODULE = 'scripts/release/orchestrator/driver.mjs';
+export const SANCTIONED_APPROVAL = /^[ \t]*requirePublicationEnvironment\(gateway\);[ \t]*\r?\n[ \t]*inputs\.publish_approved = 'true';/gm;
+
+export function literalDispatchBooleans(source, { sanctioned = false } = {}) {
+  const text = sanctioned ? String(source).replace(SANCTIONED_APPROVAL, '') : String(source);
+  const found = [];
+  for (const key of LIVE_PROOF_DISPATCH_BOOLEANS) {
+    // The key, bare or quoted, then the literal 'true' in any quote.
+    const quotedKey = String.raw`(?:${key}\b|(['"\x60])${key}\1)`;
+    const literalTrue = String.raw`(['"\x60])true\2`;
+    const spellings = [
+      // A property: { key: 'true' } or "key": "true".
+      new RegExp(String.raw`(?<![\w$.])${quotedKey}\s*:\s*${literalTrue}`),
+      // An assignment: inputs.key = 'true' or inputs['key'] = 'true'.
+      new RegExp(String.raw`(?:\.\s*${key}\b|\[\s*(['"\x60])${key}\1\s*\])\s*=(?!=)\s*${literalTrue}`),
+      // A Map entry or Map.set: ['key', 'true'] or .set('key', 'true').
+      new RegExp(String.raw`(['"\x60])${key}\1\s*,\s*${literalTrue}`),
+    ];
+    for (const spelling of spellings) {
+      const match = spelling.exec(text);
+      if (match !== null) found.push(match[0].trim());
+    }
+  }
+  return found;
+}
+
 function checkOrchestration(autoUpdate, orchestratorSources, errors) {
   const check = checker(errors);
   // Row 49: provenance by immutable asset id, one credential used only inside
@@ -995,7 +1107,22 @@ function checkOrchestration(autoUpdate, orchestratorSources, errors) {
   check.excludes(autoUpdate.path, autoUpdate.text, [
     'gh release view', 'gh release download', 'ORCHESTRATOR_DISPATCH_TOKEN',
     'gh workflow run', 'create-pull-request', 'git push',
-  ], 'fetch provenance only by asset id and dispatch only through stable_release_orchestrator.py');
+  ], `fetch provenance only by asset id and dispatch only through ${ORCHESTRATOR_ENTRY}`);
+  // The native provenance is selected, resolved, scanned and validated by the
+  // Node orchestrator and release contract CLIs, and the deleted Python
+  // orchestrator is never named again. Commands are matched with shell line
+  // continuations joined.
+  const commands = shellCommands(autoUpdate.runText);
+  check.includes(autoUpdate.path, commands, [
+    `${ORCHESTRATOR_COMMAND} select-stable-native-backlog`,
+    `${ORCHESTRATOR_COMMAND} resolve-bridge-source`,
+    `${ORCHESTRATOR_COMMAND} scan-native`,
+    `${RELEASE_CONTRACT_COMMAND} resolve-tag-commit`,
+    `${RELEASE_CONTRACT_COMMAND} validate-native-release`,
+    '--native-tag-commit "${native_tag_commit}"',
+  ], 'select, resolve, scan and validate native provenance with the Node orchestrator and release contract CLIs');
+  check.excludes(autoUpdate.path, autoUpdate.text, ['stable_release_orchestrator.py', 'scripts/release_orchestrator_'],
+    'never run the deleted Python orchestrator');
   check.require(
     autoUpdate.patOutsideEnv.length === 0,
     `${autoUpdate.path} must reference the publication PAT only in a step env value; found in ${autoUpdate.patOutsideEnv.join(', ')}`,
@@ -1011,12 +1138,38 @@ function checkOrchestration(autoUpdate, orchestratorSources, errors) {
     const environmentName = typeof environment === 'string' ? environment : mapping(environment).name;
     const validated = autoUpdate.jobSteps(step.job).some((other) => other.index < step.index
       && other.env.GH_TOKEN === '${{ github.token }}'
-      && environmentValidationMissing(other.run, 'scripts/release_contract.py').length === 0);
+      && environmentValidationMissing(shellCommands(other.run), RELEASE_CONTRACT_COMMAND).length === 0);
     check.require(
       environmentName === 'bridge-assets-publication' && validated,
-      `${autoUpdate.path} job ${step.job} may use the PAT only inside the bridge-assets-publication environment, after a github.token step validates that environment policy with scripts/release_contract.py validate-environment`,
+      `${autoUpdate.path} job ${step.job} may use the PAT only inside the bridge-assets-publication environment, after a github.token step validates that environment policy with ${RELEASE_CONTRACT_COMMAND} validate-environment`,
+    );
+    // The credential reaches only the orchestrator entry, which alone dispatches.
+    check.require(
+      shellCommands(step.run).includes(`${ORCHESTRATOR_COMMAND} orchestrate-backlog`),
+      `${autoUpdate.path} step ${step.job}/${step.name || step.index} may hand the PAT only to ${ORCHESTRATOR_COMMAND} orchestrate-backlog`,
     );
   }
+  // The release modules are zero-dependency: every job that runs one sets up
+  // Node.js 24 before its first node command, with no package cache, and the
+  // workflow never installs packages, so no dependency code runs beside the
+  // publication PAT.
+  for (const name of Object.keys(autoUpdate.jobs)) {
+    const steps = autoUpdate.jobSteps(name);
+    const firstNode = steps.find((step) => /(?:^|[\s;&|(`$])node\s/.test(step.run));
+    if (firstNode === undefined) continue;
+    const setups = steps.filter((step) => /^actions\/setup-node@/.test(step.uses));
+    check.require(
+      setups.length > 0
+        && setups[0].index < firstNode.index
+        && setups.every((step) => step.uses === 'actions/setup-node@v4' && String(step.with['node-version']) === '24'
+          && !has(step.with, 'cache') && !has(step.with, 'cache-dependency-path')),
+      `${autoUpdate.path} job ${name} must set up Node.js 24 with actions/setup-node@v4 before its first node command, without a package cache`,
+    );
+  }
+  check.require(
+    !/\b(?:npm|pnpm|yarn|npx|pip3?|corepack)\b/.test(autoUpdate.runText),
+    `${autoUpdate.path} must never install or run packages (npm, npx, pnpm, yarn, pip, corepack); the release modules are zero-dependency`,
+  );
   // Rows 50-51: every job, and so every environment job, rejects a non-owner
   // manual caller and an unsuccessful, non-default-branch or non-owner
   // workflow_run before the environment exposes the credential.
@@ -1045,19 +1198,32 @@ function checkOrchestration(autoUpdate, orchestratorSources, errors) {
     proof !== undefined
       && autoUpdate.job(proof.job).environment === undefined
       && jobNames.every((name) => autoUpdate.job(name).environment === undefined || autoUpdate.transitiveNeeds(name).has(proof.job))
-      && proof.run.includes('scripts/release_qualification.py verify-run')
+      && shellCommands(proof.run).includes(`${RELEASE_QUALIFICATION_COMMAND} verify-run`)
       && proof.run.includes('--run-attempt 1')
       && /\.github\/workflows\/bridge_candidate\.yml\)\s+artifact_name=exact-webgpu-bridge-dist\b/.test(proof.run)
       && /\.github\/workflows\/bridge_qualification\.yml\)\s+artifact_name=qualification-attestation\b/.test(proof.run)
       && /\.github\/workflows\/publish_assets\.yml\)\s+artifact_name=bridge-qualification-outcome\b/.test(proof.run),
-    `${autoUpdate.path} must prove a continuation's first attempt and exact stage artifact with release_qualification.py verify-run, in a job every environment job needs`,
+    `${autoUpdate.path} must prove a continuation's first attempt and exact stage artifact with ${RELEASE_QUALIFICATION_COMMAND} verify-run, in a job every environment job needs`,
   );
   // Row 53: the governance and approval booleans come only from live proofs.
+  check.require(
+    has(orchestratorSources, ORCHESTRATOR_ENTRY),
+    `the orchestrator source must start at ${ORCHESTRATOR_ENTRY}`,
+  );
   for (const [relativePath, source] of Object.entries(orchestratorSources)) {
-    check.excludes(relativePath, source, ['"assets_immutable_releases_enabled": "true"', '"publish_approved": "true"'],
-      'derive the governance and approval booleans only from live proofs, never a literal');
+    const literals = literalDispatchBooleans(source, { sanctioned: relativePath === SANCTIONED_APPROVAL_MODULE });
+    check.require(
+      literals.length === 0,
+      `${relativePath} must derive the governance and approval booleans only from live proofs, never a literal; found: ${quoteAll(literals)}`,
+    );
   }
+  check.require(
+    (String(orchestratorSources[SANCTIONED_APPROVAL_MODULE] ?? '').match(SANCTIONED_APPROVAL) ?? []).length === 1,
+    `${SANCTIONED_APPROVAL_MODULE} must assert publish_approved exactly once, on the statement right after requirePublicationEnvironment(gateway)`,
+  );
 }
+
+export { checkOrchestration };
 
 function checkPublication({ publish, candidate }, errors) {
   const check = checker(errors);
@@ -1124,7 +1290,7 @@ function checkPublication({ publish, candidate }, errors) {
       && !containsMatch(verifyJob, SECRETS_CONTEXT)
       && verifyStep !== undefined
       && verifyStep.env.GH_TOKEN === '${{ github.token }}'
-      && environmentValidationMissing(verifyStep.run, 'scripts/release_contract.py').length === 0
+      && environmentValidationMissing(verifyStep.run, 'python3 scripts/release_contract.py').length === 0
       && verifyStep.id !== ''
       && mapping(verifyJob.outputs).environment_name === `\${{ steps.${verifyStep.id}.outputs.environment_name }}`
       && publish.transitiveNeeds('verify-publication-environment').has('validate-request'),
@@ -1149,7 +1315,7 @@ function checkPublication({ publish, candidate }, errors) {
       && firstPat.index === revalidate.index + 1
       && revalidate.env.GH_TOKEN === '${{ github.token }}'
       && !containsMatch(revalidate.raw, SECRETS_CONTEXT)
-      && environmentValidationMissing(revalidate.run, 'publication-policy/scripts/release_contract.py').length === 0,
+      && environmentValidationMissing(revalidate.run, 'python3 publication-policy/scripts/release_contract.py').length === 0,
     `${publish.path}: publish-assets must have read-only permissions and revalidate the environment policy with github.token and the trusted publication-policy validator in the step immediately before its first PAT-bearing step`,
   );
 
@@ -1530,10 +1696,11 @@ export function collectErrors() {
     'package.json', 'llama_cpp.version', 'emsdk.version', 'README.md', 'AGENTS.md', 'CONTRIBUTING.md',
     'scripts/verify_emscripten_version.py', 'scripts/build_bridge.sh', 'scripts/generate_release_manifest.py',
   ].map((relativePath) => [relativePath, readRequired(relativePath, errors)]));
-  const orchestratorSources = Object.fromEntries([
-    'stable_release_orchestrator.py',
-    ...listRequired('scripts', /^release_orchestrator_.*\.py$/, errors).filter((name) => !name.endsWith('_test.py')),
-  ].map((name) => [`scripts/${name}`, readRequired(`scripts/${name}`, errors)]));
+  const orchestratorSources = orchestratorModules(Object.fromEntries(
+    listRequired(ORCHESTRATOR_DIRECTORY, /\.mjs$/, errors)
+      .map((name) => `${ORCHESTRATOR_DIRECTORY}/${name}`)
+      .map((relativePath) => [relativePath, readRequired(relativePath, errors)]),
+  ), errors);
 
   const known = new Set(Object.values(WORKFLOWS));
   const allWorkflows = [

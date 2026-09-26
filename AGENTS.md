@@ -113,12 +113,12 @@ GGUFs or smoke artifacts.
   - The resolver uses full default-branch history to keep the exact source SHA
     that executes a new candidate separate from the newest first-parent commit
     that changed governed runtime/build inputs. `AGENTS.md`, `README.md`, and
-    `CONTRIBUTING.md` are in `_ORCHESTRATION_ONLY_PATHS` and `docs/` in
-    `_ORCHESTRATION_ONLY_PREFIXES` in `scripts/stable_release_orchestrator.py`,
+    `CONTRIBUTING.md` are in `ORCHESTRATION_ONLY_PATHS` and `docs/` in
+    `ORCHESTRATION_ONLY_PREFIXES` in `scripts/release/orchestrator/cli.mjs`,
     so docs-only commits never advance the build identity; every unclassified
     new path is governed by default.
   - Every dispatch sends exactly the target workflow's declared
-    `workflow_dispatch` inputs (`require_exact_dispatch_inputs`) at the exact
+    `workflow_dispatch` inputs (`requireExactDispatchInputs`) at the exact
     default-branch `--ref` after a live `immutable-releases` governance read;
     duplicate in-flight or successful runs for one stage fail closed, and a
     run-name readback follows each dispatch.
@@ -201,11 +201,14 @@ candidate and exact `candidate_run_id`/`attestation_run_id` pair.
   tests stay in `scripts/`: the qualification harness digest and the
   candidate/publication checkouts address those files by their `scripts/` path
   at older commits, so moving them breaks in-flight candidates.
-- `scripts/stable_release_orchestrator.py` is the orchestrator's CLI entry; the
-  state machine lives in the `scripts/release_orchestrator_<concern>.py` modules
-  it imports, tested by `scripts/release_orchestrator_<concern>_test.py`
-  suites that share `release_orchestrator_fixtures_test.py`. List a new module in
-  `_ORCHESTRATION_ONLY_PATHS` and in `TOOLING` in `scripts/ci_scope.mjs`.
+- `scripts/release/orchestrator/cli.mjs` is the orchestrator's CLI entry; the
+  state machine lives in the `scripts/release/orchestrator/<concern>.mjs`
+  modules it imports, tested by `tests/release/orchestrator/<concern>_test.mjs`
+  suites that share `tests/release/orchestrator/fixtures.mjs`. List a new module
+  in `ORCHESTRATION_ONLY_PATHS` in `cli.mjs` and in `TOOLING` in
+  `scripts/ci_scope.mjs`; `scripts/verify_ci_reliability.mjs` fails on a module
+  `cli.mjs` does not import. The deleted Python orchestrator's paths stay in
+  both lists.
 - Keep publishing logic in workflow only.
 - Do not edit assets repository files from here outside publish flow.
 - C++ exception catching is enabled only for the functions listed in

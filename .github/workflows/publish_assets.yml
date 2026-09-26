@@ -1,6 +1,6 @@
 name: Publish Exact Qualified Bridge Assets
 
-# Parsed by scripts/stable_release_orchestrator.py so a retry can prove whether
+# Parsed by scripts/release/orchestrator/run_names.mjs so a retry can prove whether
 # this exact candidate/qualification/output publication already ran.
 run-name: publish-assets ${{ inputs.orchestrator_correlation_id }} candidate:${{ inputs.candidate_run_id }} qualification:${{ inputs.qualification_run_id }} source:${{ inputs.bridge_source_sha }} tag:${{ inputs.release_tag }} rebuild:${{ inputs.release_rebuild }}
 

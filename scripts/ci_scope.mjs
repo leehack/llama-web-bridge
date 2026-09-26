@@ -14,6 +14,12 @@ import process from 'node:process';
 export const TOOLING = new Set([
   'scripts/release_publication_state.py', 'scripts/release_publication_state_test.py',
   'scripts/release/publication_state.mjs',
+  'scripts/release/orchestrator/model.mjs', 'scripts/release/orchestrator/native.mjs',
+  'scripts/release/orchestrator/planner.mjs', 'scripts/release/orchestrator/release_tags.mjs',
+  'scripts/release/orchestrator/run_names.mjs', 'scripts/release/orchestrator/transport.mjs',
+  'scripts/release/orchestrator/workflow_runs.mjs',
+  'scripts/release/orchestrator/asset_releases.mjs', 'scripts/release/orchestrator/cli.mjs',
+  'scripts/release/orchestrator/driver.mjs', 'scripts/release/orchestrator/stage_proofs.mjs',
   'scripts/stable_release_orchestrator.py', 'scripts/stable_release_orchestrator_test.py',
   'scripts/release_orchestrator_asset_releases.py', 'scripts/release_orchestrator_asset_releases_test.py',
   'scripts/release_orchestrator_driver.py', 'scripts/release_orchestrator_driver_test.py',

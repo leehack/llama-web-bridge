@@ -43,6 +43,12 @@ const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../.
     'scripts/verify_ci_reliability.mjs', 'tests/js/verify_ci_reliability_test.mjs',
     'tests/release/contract_test.mjs', 'tests/release/fixtures/attestation.json',
     'scripts/release/publication_state.mjs',
+    'scripts/release/orchestrator/model.mjs', 'scripts/release/orchestrator/native.mjs',
+    'scripts/release/orchestrator/planner.mjs', 'scripts/release/orchestrator/release_tags.mjs',
+    'scripts/release/orchestrator/run_names.mjs', 'scripts/release/orchestrator/transport.mjs',
+    'scripts/release/orchestrator/workflow_runs.mjs', 'tests/release/orchestrator/fixtures.mjs',
+    'scripts/release/orchestrator/asset_releases.mjs', 'scripts/release/orchestrator/cli.mjs',
+    'scripts/release/orchestrator/driver.mjs', 'scripts/release/orchestrator/stage_proofs.mjs',
   ]) {
     assert.equal(nativeRequired([file]), false, file);
   }
@@ -66,6 +72,8 @@ const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../.
     'CMakeLists.txt', 'docs/native.cpp', 'unknown.lock',
     // Only the release tests are exempt; the release modules keep the lanes.
     'scripts/release/contract.mjs', 'scripts/release/qualification.mjs', 'tests/releases/x_test.mjs',
+    // A new orchestrator module is listed explicitly, never by prefix.
+    'scripts/release/orchestrator/unlisted.mjs',
   ]) {
     assert.equal(nativeRequired(['README.md', file]), true, file);
   }
