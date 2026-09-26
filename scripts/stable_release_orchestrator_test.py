@@ -195,7 +195,19 @@ class BridgeSourceIdentityTest(unittest.TestCase):
             "scripts/release/qualification.mjs",
             "scripts/release/qualify.mjs",
             "scripts/release/wav.mjs",
+            "scripts/release/orchestrator/asset_releases.mjs",
+            "scripts/release/orchestrator/cli.mjs",
+            "scripts/release/orchestrator/driver.mjs",
+            "scripts/release/orchestrator/model.mjs",
+            "scripts/release/orchestrator/native.mjs",
+            "scripts/release/orchestrator/planner.mjs",
+            "scripts/release/orchestrator/release_tags.mjs",
+            "scripts/release/orchestrator/run_names.mjs",
+            "scripts/release/orchestrator/stage_proofs.mjs",
+            "scripts/release/orchestrator/transport.mjs",
+            "scripts/release/orchestrator/workflow_runs.mjs",
             "tests/release/zip_fixture.mjs",
+            "tests/release/orchestrator/fixtures.mjs",
             "tests/release/fixtures/attestation.json",
         ):
             with self.subTest(path=path):
@@ -234,6 +246,7 @@ class BridgeSourceIdentityTest(unittest.TestCase):
             "scripts/release/manifest.mjs",
             "scripts/release/python_compat.mjs",
             "scripts/release/unlisted.mjs",
+            "scripts/release/orchestrator/unlisted.mjs",
             "scripts/build/verify_emscripten_version.mjs",
             "unknown/new-build-input.cfg",
         ):

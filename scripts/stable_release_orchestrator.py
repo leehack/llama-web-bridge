@@ -116,6 +116,19 @@ _ORCHESTRATION_ONLY_PATHS = frozenset(
         "scripts/release/qualification.mjs",
         "scripts/release/qualify.mjs",
         "scripts/release/wav.mjs",
+        # Node port of the orchestrator modules above, not yet wired in. Each
+        # module is listed explicitly, never by prefix.
+        "scripts/release/orchestrator/asset_releases.mjs",
+        "scripts/release/orchestrator/cli.mjs",
+        "scripts/release/orchestrator/driver.mjs",
+        "scripts/release/orchestrator/model.mjs",
+        "scripts/release/orchestrator/native.mjs",
+        "scripts/release/orchestrator/planner.mjs",
+        "scripts/release/orchestrator/release_tags.mjs",
+        "scripts/release/orchestrator/run_names.mjs",
+        "scripts/release/orchestrator/stage_proofs.mjs",
+        "scripts/release/orchestrator/transport.mjs",
+        "scripts/release/orchestrator/workflow_runs.mjs",
         # The speech gate's audio pin and transcript, read by
         # release_qualification.py and the speech smoke. Like both of them it
         # decides how a candidate is qualified and is never in the artifact.

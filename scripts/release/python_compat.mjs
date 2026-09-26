@@ -10,7 +10,8 @@ import os, { constants as osConstants } from 'node:os';
 import process from 'node:process';
 
 import {
-  PyException, isPyException, pyPath, pyRepr, pyStrerror,
+  PY_WHITESPACE, PyException, isPyException, pyPath, pyRepr, pyStrerror, pyStrftimeUtc,
+  pyStrptimeUtcOrRaise, pyTypeName,
 } from './json.mjs';
 
 // True for the errors Python raises as OSError: Node system errors and a
@@ -179,4 +180,110 @@ export function pyExpanduser(text) {
   const expanded = home.replace(/\/+$/u, '') || '/';
   if (expanded.startsWith('~')) throw new PyException('RuntimeError', 'Could not determine home directory.');
   return pyPath(`${expanded}${tail}`);
+}
+
+// --- re, str.split, tuple ordering and datetime for the orchestrator port ----
+
+// re.fullmatch(pattern, value) for an anchored /^...$/ pattern: the match or
+// null, raising TypeError for a non-str as re does.
+export function pyFullmatch(pattern, value) {
+  if (typeof value !== 'string') {
+    throw new PyException('TypeError', `expected string or bytes-like object, got '${pyTypeName(value)}'`);
+  }
+  return pattern.exec(value);
+}
+
+const WHITESPACE_RUN = new RegExp(`[${PY_WHITESPACE}]+`, 'u');
+const WHITESPACE_ONLY = new RegExp(`^[${PY_WHITESPACE}]*$`, 'u');
+
+// str.split() with no separator: runs of str.isspace() characters split,
+// leading and trailing whitespace dropped, no empty fields.
+export function pyStrSplit(text) {
+  if (WHITESPACE_ONLY.test(text)) return [];
+  const fields = text.split(WHITESPACE_RUN);
+  if (fields[0] === '') fields.shift();
+  if (fields.at(-1) === '') fields.pop();
+  return fields;
+}
+
+// Python ordering of two tuples of ints (numbers or bigints): negative, zero
+// or positive.
+export function pyCompareIntTuples(left, right) {
+  for (let index = 0; index < Math.min(left.length, right.length); index += 1) {
+    const a = BigInt(left[index]);
+    const b = BigInt(right[index]);
+    if (a !== b) return a < b ? -1 : 1;
+  }
+  return left.length - right.length;
+}
+
+// Days from 0001-01-01 of a proleptic Gregorian date (datetime.toordinal() - 1).
+function daysFromCivil(year, month, day) {
+  const y = month <= 2 ? year - 1 : year;
+  const era = Math.floor(y / 400);
+  const yoe = y - era * 400;
+  const doy = Math.floor((153 * (month + (month > 2 ? -3 : 9)) + 2) / 5) + day - 1;
+  const doe = yoe * 365 + Math.floor(yoe / 4) - Math.floor(yoe / 100) + doy;
+  // 719162 days separate 0001-01-01 from 1970-01-01; 719468 separate 0000-03-01.
+  return era * 146097 + doe - 719468 + 719162;
+}
+
+function civilFromDays(days) {
+  const z = days - 719162 + 719468;
+  const era = Math.floor(z / 146097);
+  const doe = z - era * 146097;
+  const yoe = Math.floor((doe - Math.floor(doe / 1460) + Math.floor(doe / 36524) - Math.floor(doe / 146096)) / 365);
+  const doy = doe - (365 * yoe + Math.floor(yoe / 4) - Math.floor(yoe / 100));
+  const mp = Math.floor((5 * doy + 2) / 153);
+  const day = doy - Math.floor((153 * mp + 2) / 5) + 1;
+  const month = mp + (mp < 10 ? 3 : -9);
+  return { year: yoe + era * 400 + (month <= 2 ? 1 : 0), month, day };
+}
+
+const DAY_SECONDS = 86400;
+// datetime.min and datetime.max (whole seconds), as seconds from datetime.min.
+const MAX_SECONDS = (daysFromCivil(9999, 12, 31) + 1) * DAY_SECONDS - 1;
+
+// An aware UTC datetime with whole seconds, the subset of datetime the
+// orchestrator's run-history windows use: strptime of the canonical
+// "%Y-%m-%dT%H:%M:%SZ" form, adding seconds (OverflowError past datetime.min
+// or datetime.max, as timedelta arithmetic raises it), comparison and strftime.
+export class PyUtcDatetime {
+  constructor(seconds) {
+    if (!Number.isSafeInteger(seconds) || seconds < 0 || seconds > MAX_SECONDS) {
+      throw new PyException('OverflowError', 'date value out of range');
+    }
+    this.seconds = seconds;
+    Object.freeze(this);
+  }
+
+  static fromFields({ year, month, day, hour, minute, second }) {
+    return new PyUtcDatetime(daysFromCivil(year, month, day) * DAY_SECONDS + hour * 3600 + minute * 60 + second);
+  }
+
+  // datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).
+  static strptime(value) {
+    return PyUtcDatetime.fromFields(pyStrptimeUtcOrRaise(value));
+  }
+
+  // self + timedelta(seconds=delta).
+  addSeconds(delta) {
+    return new PyUtcDatetime(this.seconds + delta);
+  }
+
+  fields() {
+    const days = Math.floor(this.seconds / DAY_SECONDS);
+    const rest = this.seconds - days * DAY_SECONDS;
+    return {
+      ...civilFromDays(days),
+      hour: Math.floor(rest / 3600),
+      minute: Math.floor((rest % 3600) / 60),
+      second: rest % 60,
+    };
+  }
+
+  // .strftime("%Y-%m-%dT%H:%M:%SZ") with glibc's unpadded %Y.
+  strftime() {
+    return pyStrftimeUtc(this.fields());
+  }
 }

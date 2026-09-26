@@ -777,8 +777,14 @@ function pyNumberJson(value, allowNan) {
 // float (_floatstr), so either one inside `maxNesting` enclosing containers
 // raises RecursionError, in the order Python meets it. The budget depends on
 // the Python caller's own stack depth, so the caller supplies it.
-export function pyJsonDumps(value, { indent = null, sortKeys = false, allowNan = true, maxNesting = Infinity } = {}) {
-  const itemSeparator = indent === null ? ', ' : ',';
+//
+// separators, when given, is json.dumps's (item_separator, key_separator)
+// pair, such as [',', ':'] for the most compact form.
+export function pyJsonDumps(value, {
+  indent = null, sortKeys = false, allowNan = true, maxNesting = Infinity, separators = null,
+} = {}) {
+  const itemSeparator = separators === null ? (indent === null ? ', ' : ',') : separators[0];
+  const keySeparator = separators === null ? ': ' : separators[1];
   const recursionError = () => new PyException('RecursionError', 'maximum recursion depth exceeded');
   // The text of a scalar at `level`, or a new frame for a container. Checks run
   // in the order the recursive encoder meets them.
@@ -803,7 +809,7 @@ export function pyJsonDumps(value, { indent = null, sortKeys = false, allowNan =
         throw new PyException('TypeError', 'the Node port only serializes str dict keys');
       }
       if (sortKeys) items = items.sort(([left], [right]) => compareCodePoints(left, right));
-      const children = items.map(([key, element]) => [`${pyJsonString(key)}: `, element]);
+      const children = items.map(([key, element]) => [`${pyJsonString(key)}${keySeparator}`, element]);
       return { level, prefix, children, next: 0, entries: [], brackets: ['{', '}'] };
     }
     throw new PyException('TypeError', `Object of type ${pyTypeName(item)} is not JSON serializable`);
@@ -1177,6 +1183,25 @@ export function pyStrptimeUtc(value) {
   if (!match || match[0].length !== value.length) return null;
   const [year, month, day, hour, minute, second] = match.slice(1).map(decimalText);
   if (year < 1 || day > daysInMonth(year, month) || second > 59) return null;
+  return { year, month, day, hour, minute, second };
+}
+
+// datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ") as pyStrptimeUtc parses it,
+// raising the ValueError CPython 3.12 raises where pyStrptimeUtc returns null:
+// no match, unconverted data, then the datetime constructor's range checks in
+// its order (year, day, second).
+export function pyStrptimeUtcOrRaise(value) {
+  const match = UTC_FORMAT.exec(value);
+  if (!match) {
+    throw new PyException('ValueError', `time data ${pyRepr(value)} does not match format '%Y-%m-%dT%H:%M:%SZ'`);
+  }
+  if (match[0].length !== value.length) {
+    throw new PyException('ValueError', `unconverted data remains: ${value.slice(match[0].length)}`);
+  }
+  const [year, month, day, hour, minute, second] = match.slice(1).map(decimalText);
+  if (year < 1) throw new PyException('ValueError', `year ${year} is out of range`);
+  if (day > daysInMonth(year, month)) throw new PyException('ValueError', 'day is out of range for month');
+  if (second > 59) throw new PyException('ValueError', 'second must be in 0..59');
   return { year, month, day, hour, minute, second };
 }
 
