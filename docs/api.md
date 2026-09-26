@@ -281,6 +281,7 @@ Common `options` keys:
 | `presencePenalty` | Subtracted once from the logit of each token among this completion's last 64 tokens; prompt tokens do not count. Defaults to `0`, which disables it. |
 | `grammar` | Optional llama.cpp GBNF grammar with a `root` rule. An invalid grammar rejects before generation starts with an error containing `(invalid grammar)`; worker mode rethrows it without falling back to the main thread. Each rejection leaks the partly parsed grammar (a few KiB at most for typical grammars), so validate generated grammars before sending them in a loop. |
 | `seed` | Integer seed; random when omitted. |
+| `thinkingBudget` | `{ maxTokens, startTag, endTag, forcedMessage? }`: llama.cpp's reasoning budget. After `maxTokens` tokens inside a block opened by `startTag`, plus any that finish a UTF-8 character, the sampler forces `forcedMessage` (default empty) and `endTag`. A block the prompt leaves open counts from the start of generation, so `maxTokens: 0` forces the end at once. Each new `startTag` gets a fresh budget. A grammar constrains `startTag` like any other text, then pauses until `endTag` completes. `maxTokens` is an integer from `0` to `2147483647`; the tags must be non-empty. Each tag is tokenized on its own, as native llamadart does: with a vocabulary that adds a leading space to text, such as Llama 2's SentencePiece, a tag in the prompt matches only after a space, and the forced end tag starts with one. Text-only prompts: with `parts` it rejects. |
 | `onUsage(usage)` | Called at most once, with the `CompletionUsage` of the last attempt whose generation returned, before the promise resolves or rejects with an `AbortError`. Not called when no generation returned: other rejections, a skipped multimodal warmup, or a worker failure after a cancel. |
 | `onToken(piece, currentText)` | Token callback. By default `piece` is a `Uint8Array` containing stable UTF-8 bytes. Direct runtime mode provides the current full text by default; worker mode provides `''` unless `emitCurrentTextOnToken: true` is set. |
 | `signal` | `AbortSignal`; aborting cancels this operation and rejects with `AbortError`. |
@@ -294,10 +295,10 @@ Common `options` keys:
 
 Call `cancel()` or abort the supplied signal to request a best-effort stop.
 
-An invalid `minP` or a `presencePenalty` that is not finite as a 32-bit float
-rejects with a `RangeError`
-before generation starts. A nonzero value rejects when the loaded core does not
-apply that option.
+An invalid `minP`, a `presencePenalty` that is not finite as a 32-bit float,
+or an invalid `thinkingBudget` rejects with a `RangeError` or `TypeError` before
+generation starts. A nonzero `minP` or `presencePenalty`, or any
+`thinkingBudget`, rejects when the loaded core does not apply that option.
 
 `CompletionUsage` fields:
 
@@ -324,8 +325,8 @@ cancelled generation once it returns.
 getCompletionCapabilities(): Promise<CompletionCapabilities>
 ```
 
-Returns `{ presencePenalty, minP }`: whether the loaded core applies each
-`createCompletion` option. Every flag is `false` until a model load initializes
+Returns `{ presencePenalty, minP, thinkingBudget }`: whether the loaded core
+applies each `createCompletion` option. Every flag is `false` until a model load initializes
 the core.
 
 ## Tokenization and chat templates

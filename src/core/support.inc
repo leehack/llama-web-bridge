@@ -103,6 +103,7 @@ void ensure_backend_initialized() {
 }
 
 void end_generation_state() {
+  g_active_reasoning_budget = nullptr;
   if (g_active_sampler != nullptr) {
     llama_sampler_free(g_active_sampler);
     g_active_sampler = nullptr;

@@ -3554,7 +3554,10 @@ export class LlamaWebGpuBridgeRuntime {
         await this._core!.ccall(
           'llamadart_webgpu_begin_generation',
           'number',
-          ['string', 'number', 'number', 'number', 'number', 'string', 'number', 'number', 'number'],
+          [
+            'string', 'number', 'number', 'number', 'number', 'string', 'number', 'number', 'number',
+            'number', 'string', 'string', 'string',
+          ],
           [
             String(prompt),
             temp,
@@ -3565,6 +3568,10 @@ export class LlamaWebGpuBridgeRuntime {
             seed >>> 0,
             sampling.minP,
             sampling.presencePenalty,
+            sampling.thinkingBudget?.maxTokens ?? 0,
+            sampling.thinkingBudget?.startTag ?? null,
+            sampling.thinkingBudget?.endTag ?? null,
+            sampling.thinkingBudget?.forcedMessage ?? null,
           ],
           { async: true },
         ),

@@ -2,6 +2,7 @@
 // Part of llama_webgpu_core.cpp, included inside its anonymous namespace;
 // not a standalone translation unit.
 
+// Takes ownership of reasoning_budget, which may be null.
 llama_sampler * create_sampler(
     const float temp,
     const int32_t top_k,
@@ -9,7 +10,9 @@ llama_sampler * create_sampler(
     const float min_p,
     const float repeat_penalty,
     const float presence_penalty,
-    const uint32_t seed) {
+    const uint32_t seed,
+    llama_sampler * reasoning_budget) {
+  llama_sampler_ptr owned_reasoning_budget(reasoning_budget);
   llama_sampler_chain_params sparams = llama_sampler_chain_default_params();
   llama_sampler * sampler = llama_sampler_chain_init(sparams);
   if (sampler == nullptr) {
@@ -22,6 +25,10 @@ llama_sampler * create_sampler(
         sampler,
         llama_sampler_init_penalties(
             vocab_size, 64, repeat_penalty, 0.0f, presence_penalty));
+  }
+
+  if (owned_reasoning_budget) {
+    llama_sampler_chain_add(sampler, owned_reasoning_budget.release());
   }
 
   if (top_k > 0) {
@@ -40,6 +47,20 @@ llama_sampler * create_sampler(
   llama_sampler_chain_add(sampler, llama_sampler_init_dist(seed));
 
   return sampler;
+}
+
+// Mirrors llamadart-native's reasoning-budget sampler: the grammar pauses
+// while a reasoning block is open or its end is being forced.
+bool grammar_is_active() {
+  if (g_active_grammar == nullptr) {
+    return false;
+  }
+  if (g_active_reasoning_budget == nullptr) {
+    return true;
+  }
+  const common_reasoning_budget_state state =
+      common_reasoning_budget_get_state(g_active_reasoning_budget);
+  return state == REASONING_BUDGET_IDLE || state == REASONING_BUDGET_DONE;
 }
 
 bool grammar_accepts_token(const llama_token token) {
@@ -92,13 +113,14 @@ bool apply_generation_samplers(
 // can leave only rejected tokens, and llama_grammar_accept on a rejected
 // token aborts the Wasm core. Returns LLAMA_TOKEN_NULL after set_error().
 llama_token sample_next_token() {
+  const bool use_grammar = grammar_is_active();
   llama_token_data_array cur_p = {};
   if (!apply_generation_samplers(false, cur_p)) {
     return LLAMA_TOKEN_NULL;
   }
   llama_token token = cur_p.data[cur_p.selected].id;
 
-  if (g_active_grammar != nullptr && !grammar_accepts_token(token)) {
+  if (use_grammar && !grammar_accepts_token(token)) {
     if (!apply_generation_samplers(true, cur_p)) {
       return LLAMA_TOKEN_NULL;
     }
@@ -111,7 +133,7 @@ llama_token sample_next_token() {
     }
   }
 
-  if (g_active_grammar != nullptr) {
+  if (use_grammar) {
     llama_sampler_accept(g_active_grammar, token);
   }
   llama_sampler_accept(g_active_sampler, token);
@@ -172,6 +194,72 @@ bool evaluate_prompt_tokens(
   return true;
 }
 
+// Tokenized reasoning-budget tags, as llamadart-native's
+// llama_dart_sampler_init_reasoning_budget tokenizes them.
+struct reasoning_budget_config {
+  int32_t max_tokens = 0;
+  llama_tokens start_tokens;
+  llama_tokens end_tokens;
+  llama_tokens forced_tokens;
+};
+
+// Returns false after set_error() when a tag is empty or yields no tokens.
+bool resolve_reasoning_budget(
+    const int32_t max_tokens,
+    const char * start_tag,
+    const char * end_tag,
+    const char * forced_message,
+    reasoning_budget_config & out) {
+  if (max_tokens < 0) {
+    set_error("thinking budget max_tokens must be non-negative");
+    return false;
+  }
+  if (end_tag == nullptr || start_tag[0] == '\0' || end_tag[0] == '\0') {
+    set_error("thinking budget start and end tags must be non-empty");
+    return false;
+  }
+  out.max_tokens = max_tokens;
+  out.start_tokens = common_tokenize(g_state.vocab, start_tag, false, true);
+  out.end_tokens = common_tokenize(g_state.vocab, end_tag, false, true);
+  std::string forced_text = forced_message == nullptr ? "" : forced_message;
+  forced_text += end_tag;
+  out.forced_tokens = common_tokenize(g_state.vocab, forced_text, false, true);
+  if (out.start_tokens.empty() || out.end_tokens.empty() ||
+      out.forced_tokens.empty()) {
+    set_error("thinking budget tags produce no tokens for this vocabulary");
+    return false;
+  }
+  return true;
+}
+
+bool token_sequence_at(
+    const std::vector<llama_token> & tokens,
+    const size_t start,
+    const llama_tokens & sequence) {
+  return sequence.size() <= tokens.size() - start &&
+      std::equal(sequence.begin(), sequence.end(), tokens.begin() + start);
+}
+
+// A prompt that ends inside an opened reasoning block starts the budget
+// counting, as llamadart-native derives it.
+common_reasoning_budget_state reasoning_budget_initial_state(
+    const reasoning_budget_config & config,
+    const std::vector<llama_token> & prompt_tokens) {
+  common_reasoning_budget_state state = REASONING_BUDGET_IDLE;
+  for (size_t index = 0; index < prompt_tokens.size();) {
+    if (token_sequence_at(prompt_tokens, index, config.start_tokens)) {
+      state = REASONING_BUDGET_COUNTING;
+      index += config.start_tokens.size();
+    } else if (token_sequence_at(prompt_tokens, index, config.end_tokens)) {
+      state = REASONING_BUDGET_IDLE;
+      index += config.end_tokens.size();
+    } else {
+      index++;
+    }
+  }
+  return state;
+}
+
 int32_t begin_generation_impl(
     const char * prompt,
     float temp,
@@ -181,7 +269,11 @@ int32_t begin_generation_impl(
     const char * grammar,
     uint32_t seed,
     const float min_p,
-    const float presence_penalty) {
+    const float presence_penalty,
+    const int32_t thinking_budget_tokens,
+    const char * thinking_start_tag,
+    const char * thinking_end_tag,
+    const char * thinking_forced_message) {
   // Defence in depth behind the bridge's single-writer queue: reject before
   // touching any shared state, so a stray second begin cannot destroy the
   // in-flight generation's output, sampler, or g_last_error. The caller maps
@@ -237,6 +329,23 @@ int32_t begin_generation_impl(
     return -2;
   }
 
+  const bool has_reasoning_budget = thinking_start_tag != nullptr;
+  reasoning_budget_config reasoning_budget;
+  if (has_reasoning_budget) {
+    if (!g_pending_media.empty()) {
+      set_error("thinking budget supports text-only prompts");
+      return -2;
+    }
+    if (!resolve_reasoning_budget(
+            thinking_budget_tokens,
+            thinking_start_tag,
+            thinking_end_tag,
+            thinking_forced_message,
+            reasoning_budget)) {
+      return -2;
+    }
+  }
+
   end_generation_state();
 
   // Parse the grammar before the prompt touches the KV cache, so an invalid
@@ -263,6 +372,7 @@ int32_t begin_generation_impl(
       !g_pending_media.empty();
 
   const std::string prompt_text = prompt;
+  llama_sampler_ptr reasoning_budget_sampler;
   if (!g_pending_media.empty()) {
     llama_memory_clear(llama_get_memory(g_state.ctx), false);
     g_cached_prompt_tokens.clear();
@@ -284,16 +394,38 @@ int32_t begin_generation_impl(
     }
     g_usage_prompt_tokens = static_cast<int32_t>(prompt_tokens.size());
     g_usage_cached_prompt_tokens = static_cast<int32_t>(reused_tokens);
+
+    if (has_reasoning_budget) {
+      reasoning_budget_sampler.reset(common_reasoning_budget_init(
+          g_state.vocab,
+          {reasoning_budget.start_tokens},
+          {reasoning_budget.end_tokens},
+          reasoning_budget.forced_tokens,
+          reasoning_budget.max_tokens,
+          reasoning_budget_initial_state(reasoning_budget, prompt_tokens)));
+      if (!reasoning_budget_sampler) {
+        set_error("Failed to initialize the thinking budget sampler");
+        return -5;
+      }
+    }
   }
 
-  g_active_sampler =
-      create_sampler(
-          temp, top_k, top_p, min_p, repeat_penalty, presence_penalty, seed);
+  llama_sampler * reasoning_budget_ptr = reasoning_budget_sampler.get();
+  g_active_sampler = create_sampler(
+      temp,
+      top_k,
+      top_p,
+      min_p,
+      repeat_penalty,
+      presence_penalty,
+      seed,
+      reasoning_budget_sampler.release());
   if (g_active_sampler == nullptr) {
     set_error("Failed to initialize sampler chain");
     return -5;
   }
 
+  g_active_reasoning_budget = reasoning_budget_ptr;
   g_active_grammar = grammar_sampler.release();
   g_generation_active = true;
   return 0;

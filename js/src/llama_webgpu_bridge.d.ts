@@ -117,6 +117,20 @@ export interface CompletionOptions {
   presencePenalty?: number;
   grammar?: string;
   seed?: number;
+  /** Caps the tokens generated inside each reasoning block; text-only prompts. */
+  thinkingBudget?: ThinkingBudgetOptions | null;
+}
+
+/** llama.cpp's reasoning budget: after `maxTokens` tokens inside a reasoning block, plus any that finish a UTF-8 character, the sampler forces `forcedMessage` and `endTag`. A grammar pauses after `startTag` until `endTag` completes. */
+export interface ThinkingBudgetOptions {
+  /** Integer from 0 to 2147483647. 0 forces the end as soon as a block opens, or at once when the prompt ends inside one. */
+  maxTokens: number;
+  /** Opens a reasoning block, such as `<think>`. */
+  startTag: string;
+  /** Closes a reasoning block, such as `</think>`. */
+  endTag: string;
+  /** Text forced before `endTag` when the budget runs out; empty by default. */
+  forcedMessage?: string;
 }
 
 /** Completion options the loaded core applies. Every flag is false until a model load initializes the core. */
@@ -125,6 +139,8 @@ export interface CompletionCapabilities {
   presencePenalty: boolean;
   /** `CompletionOptions.minP` is applied. */
   minP: boolean;
+  /** `CompletionOptions.thinkingBudget` is applied. */
+  thinkingBudget: boolean;
 }
 
 export interface EmbedOptions {
