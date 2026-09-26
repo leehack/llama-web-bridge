@@ -37,7 +37,8 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
 Build llama-web-bridge wasm/js artifacts.
 
 Requirements:
-  npm               JS bridge bundling/type-checking
+  node, npm         JS bridge bundling/type-checking and the wasm64 runtime patch
+  c++, git          Host C++17 compiler and git for the npm run check:js contracts
   emcmake, emcc     Emscripten SDK matching emsdk.version in PATH
   cmake             CMake configure/build driver
   llama.cpp         Source checkout via LLAMA_CPP_DIR or ../llama.cpp
@@ -172,8 +173,14 @@ if [[ "$BUILD_MEM64" == "1" ]]; then
   cp "$CORE_MEM64_WASM" "$OUT_DIR/llama_webgpu_core_mem64.wasm"
 
   echo "[bridge] applying wasm64 runtime bigint interop patch"
-  python3 "$BRIDGE_DIR/scripts/patch_wasm64_runtime.py" \
-    "$OUT_DIR/llama_webgpu_core_mem64.js"
+  patch_summary="$(node "$BRIDGE_DIR/scripts/patch_wasm64_runtime.mjs" \
+    "$OUT_DIR/llama_webgpu_core_mem64.js")"
+  echo "$patch_summary"
+  # Fail closed if the patcher returned without patching.
+  if [[ "$patch_summary" != "Patched wasm64 generated JavaScript: "* ]]; then
+    echo "[bridge] error: wasm64 runtime patch did not report a patched file" >&2
+    exit 1
+  fi
 fi
 
 echo "[bridge] done"

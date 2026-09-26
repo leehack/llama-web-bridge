@@ -14,6 +14,8 @@ Published artifacts are consumed from `llama-web-bridge-assets`.
   type-checking; the tests run the `.ts` sources through Node's built-in type
   stripping
 - CMake toolchain
+- A host C++17 compiler (`c++`, or `$CXX`): `npm run check:js` compiles the
+  media-helper compatibility contract with it
 - Access to a llama.cpp checkout matching `llama_cpp.version`
 
 ## Setup
@@ -41,7 +43,13 @@ list.
 Bridge wrapper source lives under `js/src/`; `npm run build:js` regenerates the
 checked-in browser ESM outputs and declarations under `js/`. `npm run check:js`
 runs the same generator plus TypeScript and syntax checks, so commit any updated
-`js/` outputs after source changes.
+`js/` outputs after source changes. It also runs the JS contract tests,
+including the static state-persistence, text-to-speech, and decision API
+contracts (`npm run test:api-state-persistence`, `npm run test:api-tts`, and
+`npm run test:api-decision`), the media-helper compatibility contract
+(`npm run test:mtmd-compat`), the wasm64 runtime patch contract for
+`scripts/patch_wasm64_runtime.mjs` (`npm run test:wasm64-runtime-patch`), and
+the CI change selector (`npm run test:ci-scope`).
 
 `js/src/llama_webgpu_bridge.js` is the public entry. It re-exports the API and
 owns the only load-time side effects (worker host auto-boot and the
@@ -78,9 +86,11 @@ exported `llamadart_webgpu_*` functions grouped by feature; the remaining parts
 hold the state and internal helpers they use. A part is not a standalone file:
 it relies on everything included before it, so keep the include order. The
 static contract checks read the core with its parts expanded
-(`scripts/native_core_source.py` and its JS twin
-`tests/js/native_core_source.mjs`), which is how the compiler sees it. Both fail
-if a part is not included exactly once as a plain `#include` line.
+(`tests/js/native_core_source.mjs`), which is how the compiler sees it. It fails
+if a part is not included exactly once as a plain `#include` line. The JS API
+contract tests read the bridge the same way: `tests/js/bridge_js_source.mjs`
+joins every `js/src` module in the order the former single-file source declared
+them.
 
 For local agent/maintainer validation, prefer external build and cache paths so
 generated files do not dirty the checkout:
@@ -115,12 +125,8 @@ Before opening or updating a PR, run the lightweight contracts:
 
 ```bash
 npm run check:js
-python3 -m py_compile scripts/verify_state_persistence_api.py scripts/verify_text_to_speech_api.py scripts/verify_decision_api.py scripts/verify_ci_reliability.py scripts/state_persistence_browser_smoke.py scripts/multimodal_browser_smoke.py scripts/grammar_browser_smoke.py scripts/next_token_scores_browser_smoke.py scripts/speech_to_text_browser_smoke.py scripts/text_to_speech_browser_smoke.py scripts/decision_browser_smoke.py
-python3 scripts/verify_state_persistence_api.py
-python3 scripts/verify_text_to_speech_api.py
-python3 scripts/verify_decision_api.py
-python3 scripts/mtmd_compat_contract_test.py
-python3 scripts/verify_ci_reliability.py
+python3 -m py_compile scripts/state_persistence_browser_smoke.py scripts/multimodal_browser_smoke.py scripts/grammar_browser_smoke.py scripts/next_token_scores_browser_smoke.py scripts/speech_to_text_browser_smoke.py scripts/text_to_speech_browser_smoke.py scripts/decision_browser_smoke.py
+node scripts/verify_ci_reliability.mjs
 ```
 
 For state-persistence, worker, or workflow changes, also run the browser smoke
@@ -233,17 +239,20 @@ query strings, and fragments before printing the location.
 
 ## Agent Workflow Guardrails
 
-- Keep workflow reliability rules in `scripts/verify_ci_reliability.py` when
-  changing `.github/workflows/ci.yml`, `.github/workflows/bridge_candidate.yml`,
+- Keep the publication-safety rules in `scripts/verify_ci_reliability.mjs`
+  current when changing `.github/workflows/ci.yml`,
+  `.github/workflows/bridge_candidate.yml`,
   `.github/workflows/publish_assets.yml`,
   `.github/workflows/auto_llama_cpp_update.yml`,
-  `.github/workflows/bridge_qualification.yml`, JS build pipeline files,
-  `scripts/release_qualification.py`, or
-  `scripts/state_persistence_browser_smoke.py`.
+  `.github/workflows/bridge_qualification.yml`, or the model pins in
+  `scripts/release_qualification.py`. It checks permissions, environment gates,
+  PAT handling, pins, fail-closed guards, and that CI runs the contract tests;
+  it does not check wording, step names it does not anchor on, or docs prose.
+  Every new `tests/js/*_test.mjs` must be run by `npm run check:js`.
 - Rotate all 7 model/projector SHA-256 pins in the three files that hard-code
   them together: `CONTRIBUTING.md`, `.github/workflows/ci.yml`,
   `.github/workflows/bridge_candidate.yml`.
-  `scripts/verify_ci_reliability.py` requires the three sets to be identical with
+  `scripts/verify_ci_reliability.mjs` requires the three sets to be identical with
   exactly 7 pins each; a stale `bridge_candidate.yml` breaks the candidate job,
   not just CI. `README.md` and `AGENTS.md` hold no pins and link here.
   `publish_assets.yml` holds no pins because it neither builds nor
@@ -285,7 +294,7 @@ query strings, and fragments before printing the location.
   build or hosted gate, dispatch a new candidate run instead of rerunning one.
 - Preserve `llama_cpp.version` as the default ordinary CI/development build pin.
   It holds exactly one upstream tag in either channel, stable
-  `vMAJOR.MINOR.PATCH` or development `bNNNN`; `scripts/verify_ci_reliability.py`
+  `vMAJOR.MINOR.PATCH` or development `bNNNN`; `scripts/verify_ci_reliability.mjs`
   rejects every other form. Exact release publication receives upstream identity
   from the orchestrator and must not require a bridge pin PR.
 - Preserve `emsdk.version` as the single compiler source for CI and publish.
@@ -446,9 +455,9 @@ Transport dispatch inputs through `env` and use quoted shell expansions.
 ## CI change selection and compiler cache
 
 CI always runs the shared JS and workflow contracts. An explicit allowlist in
-`scripts/ci_scope.py` lets known documentation and tooling-only changes avoid the
+`scripts/ci_scope.mjs` lets known documentation and tooling-only changes avoid the
 WASM builds. Runtime JS, C++, browser harnesses, build inputs, workflows, pins,
-and unknown paths retain both the pinned and v0.4.0 build/smoke lanes. Rename and
+and unknown paths retain the pinned build/smoke lane. Rename and
 deletion comparisons include both paths. The `CI validation` result always
 reports and rejects failed, cancelled, missing, or unexpectedly skipped work.
 Only superseded PR runs are cancelled; main/manual runs remain independent.
@@ -457,8 +466,8 @@ The CI compiler cache stores objects outside the checkout, separated by runner
 OS/architecture, exact Emscripten version, resolved llama.cpp commit, and build
 script/CMake/patch inputs. ccache also checks compiler contents, source inputs,
 and compile flags. Every selected build still links fresh artifacts and runs
-both existing browser smokes. Candidate and publication workflows do not consume
-this cache or this change selector, so `scripts/ci_scope.py` is listed in
+every CI browser smoke. Candidate and publication workflows do not consume
+this cache or this change selector, so `scripts/ci_scope.mjs` is listed in
 `_ORCHESTRATION_ONLY_PATHS` in `scripts/stable_release_orchestrator.py`. List any
 new CI-only script there too: an unclassified path is governed by default and
 advances the release build identity. Track follow-up work in

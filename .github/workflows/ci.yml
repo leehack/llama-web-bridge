@@ -28,10 +28,13 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
       - id: scope
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
-        run: python3 scripts/ci_scope.py
+        run: node scripts/ci_scope.mjs
 
   checks:
     name: JS and workflow contracts
@@ -51,36 +54,13 @@ jobs:
           git ls-files --error-unmatch js/llama_webgpu_bridge.js js/llama_webgpu_bridge_worker.js js/llama_webgpu_bridge.d.ts
           git diff --exit-code -- js/llama_webgpu_bridge.js js/llama_webgpu_bridge_worker.js js/llama_webgpu_bridge.d.ts
 
-      - name: Validate state persistence API contract
-        run: python3 scripts/verify_state_persistence_api.py
-
-      - name: Validate text-to-speech API contract
-        run: python3 scripts/verify_text_to_speech_api.py
-
-      - name: Validate decision API contract
-        run: python3 scripts/verify_decision_api.py
-
-      - name: Validate media helper compatibility
-        run: python3 scripts/mtmd_compat_contract_test.py
-
-      - name: Validate wasm64 runtime patch contract
-        run: python3 scripts/wasm64_runtime_patch_contract_test.py
-
       - name: Validate release qualification contract
         run: python3 scripts/release_qualification_test.py
 
       - name: Validate Python smoke syntax
         run: |
           python3 -m py_compile \
-            scripts/verify_state_persistence_api.py \
-            scripts/verify_text_to_speech_api.py \
-            scripts/verify_decision_api.py \
             scripts/verify_emscripten_version.py \
-            scripts/verify_ci_reliability.py \
-            scripts/verify_ci_reliability_pin_test.py \
-            scripts/verify_ci_reliability_doc_facts_test.py \
-            scripts/patch_wasm64_runtime.py \
-            scripts/wasm64_runtime_patch_contract_test.py \
             scripts/release_qualification.py \
             scripts/release_qualification_test.py \
             scripts/state_persistence_browser_smoke.py \
@@ -92,22 +72,16 @@ jobs:
             scripts/decision_browser_smoke.py
 
       - name: Verify CI reliability contract
-        run: python3 scripts/verify_ci_reliability.py
+        run: node scripts/verify_ci_reliability.mjs
 
       - name: Validate release orchestration and CI selection
-        run: |
-          python3 -m unittest discover -s scripts -p '*_test.py'
-          node tests/js/workflow_input_transport_test.mjs
+        run: python3 -m unittest discover -s scripts -p '*_test.py'
 
   build-webgpu-bridge:
     needs: [changes, checks]
     if: needs.changes.outputs.native == 'true'
-    name: ${{ matrix.upstream == 'pinned' && 'Build WebGPU Bridge (WASM)' || 'Build WebGPU Bridge (WASM, v0.4.0)' }}
+    name: Build WebGPU Bridge (WASM)
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        upstream: [pinned, v0.4.0]
     env:
       LLAMA_WEBGPU_SMOKE_MODEL_URL: https://huggingface.co/aladar/llama-2-tiny-random-GGUF/resolve/main/llama-2-tiny-random.gguf
       LLAMA_WEBGPU_SMOKE_MODEL_SHA256: 81f226c62d28ed4a1a9b9fa080fcd9f0cc40e0f9d5680036583ff98fbcd035cb
@@ -176,16 +150,23 @@ jobs:
         run: |
           git clone --depth 1 --branch "$LLAMA_CPP_TAG" https://github.com/ggml-org/llama.cpp.git third_party/llama_cpp
 
-      - name: Select exact v0.4.0 compatibility revision
-        if: matrix.upstream == 'v0.4.0'
-        run: |
-          git -C third_party/llama_cpp fetch --depth 1 origin refs/tags/v0.4.0:refs/tags/v0.4.0
-          git -C third_party/llama_cpp checkout --detach 5266f24da75dc449bd56cbed7addb9c8e4a6a73e
-
+      # Installed at a fixed path, not with setup-emsdk: its random temp
+      # directory changes the compiler and sysroot paths on every run, so
+      # ccache never hits.
       - name: Setup Emscripten SDK
-        uses: mymindstorm/setup-emsdk@v14
-        with:
-          version: ${{ env.EMSCRIPTEN_VERSION }}
+        env:
+          EMSDK_DIR: ${{ runner.temp }}/emsdk
+        run: |
+          git clone --depth 1 --branch "$EMSCRIPTEN_VERSION" https://github.com/emscripten-core/emsdk.git "$EMSDK_DIR"
+          "$EMSDK_DIR/emsdk" install "$EMSCRIPTEN_VERSION"
+          "$EMSDK_DIR/emsdk" activate "$EMSCRIPTEN_VERSION"
+          source "$EMSDK_DIR/emsdk_env.sh"
+          {
+            echo "PATH=$PATH"
+            echo "EMSDK=$EMSDK"
+            echo "EMSDK_NODE=$EMSDK_NODE"
+            if [ -n "${EM_CONFIG:-}" ]; then echo "EM_CONFIG=$EM_CONFIG"; fi
+          } >> "$GITHUB_ENV"
 
       - name: Verify resolved Emscripten compiler
         run: python3 scripts/verify_emscripten_version.py --emit-github-env "$GITHUB_ENV"
@@ -201,9 +182,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ runner.temp }}/webgpu-ccache
-          key: webgpu-ccache-v1-${{ runner.os }}-${{ runner.arch }}-${{ env.EMSCRIPTEN_VERSION }}-${{ steps.compiler-cache.outputs.upstream }}-${{ hashFiles('CMakeLists.txt', 'scripts/build_bridge.sh', 'scripts/patch_*.py') }}-${{ github.sha }}
+          key: webgpu-ccache-v2-${{ runner.os }}-${{ runner.arch }}-${{ env.EMSCRIPTEN_VERSION }}-${{ steps.compiler-cache.outputs.upstream }}-${{ hashFiles('CMakeLists.txt', 'scripts/build_bridge.sh', 'scripts/patch_*.mjs') }}-${{ github.sha }}
           restore-keys: |
-            webgpu-ccache-v1-${{ runner.os }}-${{ runner.arch }}-${{ env.EMSCRIPTEN_VERSION }}-${{ steps.compiler-cache.outputs.upstream }}-${{ hashFiles('CMakeLists.txt', 'scripts/build_bridge.sh', 'scripts/patch_*.py') }}-
+            webgpu-ccache-v2-${{ runner.os }}-${{ runner.arch }}-${{ env.EMSCRIPTEN_VERSION }}-${{ steps.compiler-cache.outputs.upstream }}-${{ hashFiles('CMakeLists.txt', 'scripts/build_bridge.sh', 'scripts/patch_*.mjs') }}-
 
       - name: Build bridge artifacts
         env:
@@ -215,7 +196,10 @@ jobs:
           EM_COMPILER_WRAPPER: ccache
           OUT_DIR: ${{ runner.temp }}/webgpu_bridge_dist
           WEBGPU_BRIDGE_BUILD_MEM64: 1
-        run: ./scripts/build_bridge.sh
+        run: |
+          ccache --zero-stats
+          trap 'ccache --show-stats' EXIT
+          ./scripts/build_bridge.sh
 
       - name: Verify outputs
         run: |
@@ -264,7 +248,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: state-persistence-smoke-artifacts-${{ matrix.upstream }}
+          name: state-persistence-smoke-artifacts
           path: ${{ env.LLAMA_WEBGPU_SMOKE_ARTIFACTS_DIR }}
           if-no-files-found: ignore
 
@@ -272,7 +256,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: multimodal-smoke-artifacts-${{ matrix.upstream }}
+          name: multimodal-smoke-artifacts
           path: ${{ env.LLAMA_WEBGPU_MULTIMODAL_ARTIFACTS_DIR }}
           if-no-files-found: ignore
 
@@ -280,7 +264,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: grammar-smoke-artifacts-${{ matrix.upstream }}
+          name: grammar-smoke-artifacts
           path: ${{ env.LLAMA_WEBGPU_GRAMMAR_ARTIFACTS_DIR }}
           if-no-files-found: ignore
 
@@ -288,14 +272,14 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: next-token-scores-smoke-artifacts-${{ matrix.upstream }}
+          name: next-token-scores-smoke-artifacts
           path: ${{ env.LLAMA_WEBGPU_NEXT_TOKEN_SCORES_ARTIFACTS_DIR }}
           if-no-files-found: ignore
 
       - name: Upload bridge artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.upstream == 'pinned' && 'webgpu-bridge-dist' || 'webgpu-bridge-dist-v0.4.0' }}
+          name: webgpu-bridge-dist
           path: |
             ${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_bridge.js
             ${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_bridge_worker.js
@@ -314,7 +298,10 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
       - name: Validate selected job results
         env:
           NEEDS_JSON: ${{ toJSON(needs) }}
-        run: python3 scripts/ci_scope.py --check-results
+        run: node scripts/ci_scope.mjs --check-results

@@ -74,13 +74,24 @@ _ORCHESTRATION_ONLY_PATHS = frozenset(
         "CONTRIBUTING.md",
         "LICENSE",
         "README.md",
+        # Deleted with the Node port of verify_ci_reliability, which was their
+        # last importer. Keep them: history must not classify the deleting
+        # commit as a build input.
         "scripts/bridge_js_source.py",
         "scripts/bridge_operation_queue_direct_cases.mjs",
         "scripts/bridge_operation_queue_fixtures.mjs",
         "scripts/bridge_operation_queue_lifecycle_contract_cases.mjs",
         "scripts/bridge_operation_queue_worker_proxy_cases.mjs",
+        # Ported to scripts/ci_scope.mjs. Keep the .py entry: the commit that
+        # ported it deletes that path, and history must not classify that
+        # commit as a build input.
+        "scripts/ci_scope.mjs",
         "scripts/ci_scope.py",
+        # Deleted with the Node port of mtmd_compat_contract_test.py, its last
+        # importer; tests/js/native_core_source.mjs is its twin. Keep it: history
+        # must not classify the deleting commit as a build input.
         "scripts/native_core_source.py",
+        # Deleted with the Node port of verify_ci_reliability; see above.
         "scripts/orchestrator_source.py",
         "scripts/release_orchestrator_asset_releases.py",
         "scripts/release_orchestrator_driver.py",
@@ -95,7 +106,15 @@ _ORCHESTRATION_ONLY_PATHS = frozenset(
         "scripts/release_publication_state.py",
         "scripts/release_qualification.py",
         "scripts/stable_release_orchestrator.py",
+        # Ported to scripts/verify_ci_reliability.mjs. Keep the .py entry: the
+        # commit that ported it deletes that path, and history must not
+        # classify that commit as a build input.
+        "scripts/verify_ci_reliability.mjs",
         "scripts/verify_ci_reliability.py",
+        # Ported to tests/js/*_api_contract_test.mjs, which the _test.mjs
+        # suffix covers. Keep these entries: the commit that ported them
+        # deletes these paths, and history must not classify that commit as a
+        # build input.
         "scripts/verify_decision_api.py",
         "scripts/verify_state_persistence_api.py",
         "scripts/verify_text_to_speech_api.py",
@@ -106,6 +125,8 @@ _ORCHESTRATION_ONLY_PATHS = frozenset(
         "tests/js/bridge_operation_queue_fixtures.mjs",
         "tests/js/bridge_operation_queue_lifecycle_contract_cases.mjs",
         "tests/js/bridge_operation_queue_worker_proxy_cases.mjs",
+        # Source readers the JS contract tests import.
+        "tests/js/bridge_js_source.mjs",
         "tests/js/native_core_source.mjs",
     }
 )
