@@ -330,7 +330,7 @@ query strings, and fragments before printing the location.
 - Main-branch and PR CI never dispatch publication. Stable release discovery
   prepares an ordered `release-candidates.json` backlog for every
   stable native release after the immutable native `v0.2.0-1` / Web-assets
-  `v0.1.39` baseline and invokes `scripts/stable_release_orchestrator.py` to
+  `v0.1.39` baseline and invokes `scripts/release/orchestrator/cli.mjs` to
   idempotently advance candidate, automated qualification, and publication
   stages. Each successful stage wakes an immediate `workflow_run` continuation;
   the daily schedule discovers new native releases and is the idempotent repair
@@ -495,7 +495,7 @@ script/CMake/patch inputs. ccache also checks compiler contents, source inputs,
 and compile flags. Every selected build still links fresh artifacts and runs
 every CI browser smoke. Candidate and publication workflows do not consume
 this cache or this change selector, so `scripts/ci_scope.mjs` is listed in
-`_ORCHESTRATION_ONLY_PATHS` in `scripts/stable_release_orchestrator.py`. List any
+`ORCHESTRATION_ONLY_PATHS` in `scripts/release/orchestrator/cli.mjs`. List any
 new CI-only script there too: an unclassified path is governed by default and
 advances the release build identity. Track follow-up work in
 [llamadart issue #532](https://github.com/leehack/llamadart/issues/532).

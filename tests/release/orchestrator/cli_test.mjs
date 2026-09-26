@@ -1,9 +1,9 @@
 // Tests of scripts/release/orchestrator/cli.mjs, the CLI entry: governed-path
 // classification, bridge source identity, and caller authorization. One test
-// per test method of scripts/stable_release_orchestrator_test.py, with the
-// same names and assertions, plus Node-only checks: the classifier sets equal
-// the Python sets they copy (the source of truth until the workflow switches
-// to this entry), and the command-line surface.
+// per test method of the deleted scripts/stable_release_orchestrator_test.py,
+// with the same names, assertions and case lists, plus Node-only checks: the
+// classifier sets are pinned by those case lists, and the command-line
+// surface.
 
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
@@ -81,152 +81,167 @@ test('test_malformed_git_path_is_rejected', () => {
   assert.throws(() => sro.isGovernedBridgePath('../outside'), ContractError);
 });
 
+// The orchestration-only and governed paths of the deleted Python suite,
+// plus every other ORCHESTRATION_ONLY_PATHS entry.
+const ORCHESTRATION_ONLY_CASES = Object.freeze([
+  '.github/workflows/auto_llama_cpp_update.yml',
+  'README.md',
+  'docs/api.md',
+  'scripts/bridge_js_source.py',
+  'scripts/bridge_operation_queue_direct_cases.mjs',
+  'scripts/bridge_operation_queue_fixtures.mjs',
+  'scripts/bridge_operation_queue_lifecycle_contract_cases.mjs',
+  'scripts/bridge_operation_queue_worker_proxy_cases.mjs',
+  'scripts/browser_smoke_support.mjs',
+  'scripts/ci_scope.mjs',
+  'scripts/ci_scope.py',
+  'scripts/ci_scope_test.py',
+  'scripts/decision_browser_smoke.mjs',
+  'scripts/decision_browser_smoke.py',
+  'scripts/grammar_browser_smoke.mjs',
+  'scripts/grammar_browser_smoke.py',
+  'scripts/mtmd_compat_contract_test.py',
+  'scripts/multimodal_browser_smoke.mjs',
+  'scripts/multimodal_browser_smoke.py',
+  'scripts/native_core_source.py',
+  'scripts/next_token_scores_browser_smoke.mjs',
+  'scripts/next_token_scores_browser_smoke.py',
+  'scripts/orchestrator_source.py',
+  'scripts/release_orchestrator_asset_releases.py',
+  'scripts/release_orchestrator_asset_releases_test.py',
+  'scripts/release_orchestrator_driver.py',
+  'scripts/release_orchestrator_driver_backlog_test.py',
+  'scripts/release_orchestrator_driver_identical_release_test.py',
+  'scripts/release_orchestrator_driver_publication_test.py',
+  'scripts/release_orchestrator_driver_test.py',
+  'scripts/release_orchestrator_fixtures_test.py',
+  'scripts/release_orchestrator_model.py',
+  'scripts/release_orchestrator_native.py',
+  'scripts/release_orchestrator_native_test.py',
+  'scripts/release_orchestrator_planner.py',
+  'scripts/release_orchestrator_planner_test.py',
+  'scripts/release_orchestrator_release_tags.py',
+  'scripts/release_orchestrator_release_tags_test.py',
+  'scripts/release_orchestrator_run_names.py',
+  'scripts/release_orchestrator_run_names_test.py',
+  'scripts/release_orchestrator_stage_proofs.py',
+  'scripts/release_orchestrator_transport.py',
+  'scripts/release_orchestrator_transport_test.py',
+  'scripts/release_orchestrator_workflow_runs.py',
+  'scripts/release_orchestrator_workflow_runs_test.py',
+  'scripts/release_qualification.py',
+  'scripts/speech_to_text_browser_smoke.mjs',
+  'scripts/speech_to_text_browser_smoke.py',
+  'scripts/speech_to_text_fixture.json',
+  'scripts/stable_release_orchestrator.py',
+  'scripts/stable_release_orchestrator_test.py',
+  'scripts/state_persistence_browser_smoke.mjs',
+  'scripts/state_persistence_browser_smoke.py',
+  'scripts/text_to_speech_browser_smoke.mjs',
+  'scripts/text_to_speech_browser_smoke.py',
+  'scripts/verify_ci_reliability.mjs',
+  'scripts/verify_ci_reliability.py',
+  'scripts/verify_ci_reliability_doc_facts_test.py',
+  'scripts/verify_ci_reliability_pin_test.py',
+  'scripts/verify_decision_api.py',
+  'scripts/verify_state_persistence_api.py',
+  'scripts/verify_text_to_speech_api.py',
+  'scripts/wasm64_runtime_patch_contract_test.py',
+  'scripts/worker_runtime_state_test.mjs',
+  'tests/js/bridge_js_source.mjs',
+  'tests/js/bridge_operation_queue_direct_cases.mjs',
+  'tests/js/bridge_operation_queue_fixtures.mjs',
+  'tests/js/bridge_operation_queue_lifecycle_contract_cases.mjs',
+  'tests/js/bridge_operation_queue_worker_proxy_cases.mjs',
+  'tests/js/browser_smoke_support_test.mjs',
+  'tests/js/ci_scope_test.mjs',
+  'tests/js/decision_api_contract_test.mjs',
+  'tests/js/mtmd_compat_contract_test.mjs',
+  'tests/js/multimodal_harness_parity_test.mjs',
+  'tests/js/native_core_source.mjs',
+  'tests/js/state_persistence_api_contract_test.mjs',
+  'tests/js/state_persistence_harness_parity_test.mjs',
+  'tests/js/text_to_speech_api_contract_test.mjs',
+  'tests/js/verify_ci_reliability_test.mjs',
+  'tests/js/wasm64_runtime_patch_contract_test.mjs',
+  'tests/js/worker_runtime_state_test.mjs',
+  'tests/js/nested/new_contract_test.mjs',
+  'tests/new_suite/new_contract_test.mjs',
+  'tests/release/contract_test.mjs',
+  'scripts/release/archive.mjs',
+  'scripts/release/publication_state.mjs',
+  'scripts/release/qualification.mjs',
+  'scripts/release/qualify.mjs',
+  'scripts/release/wav.mjs',
+  'scripts/release/orchestrator/asset_releases.mjs',
+  'scripts/release/orchestrator/cli.mjs',
+  'scripts/release/orchestrator/driver.mjs',
+  'scripts/release/orchestrator/model.mjs',
+  'scripts/release/orchestrator/native.mjs',
+  'scripts/release/orchestrator/planner.mjs',
+  'scripts/release/orchestrator/release_tags.mjs',
+  'scripts/release/orchestrator/run_names.mjs',
+  'scripts/release/orchestrator/stage_proofs.mjs',
+  'scripts/release/orchestrator/transport.mjs',
+  'scripts/release/orchestrator/workflow_runs.mjs',
+  'tests/release/zip_fixture.mjs',
+  'tests/release/orchestrator/fixtures.mjs',
+  'tests/release/fixtures/attestation.json',
+  // Every other listed path, so the lists pin ORCHESTRATION_ONLY_PATHS.
+  '.gitignore',
+  '.github/workflows/bridge_qualification.yml',
+  '.github/workflows/ci.yml',
+  '.github/workflows/publish_assets.yml',
+  'AGENTS.md',
+  'CONTRIBUTING.md',
+  'LICENSE',
+  'scripts/release_publication_state.py',
+]);
+
+const GOVERNED_CASES = Object.freeze([
+  'CMakeLists.txt',
+  '.github/workflows/bridge_candidate.yml',
+  'package.json',
+  'js/llama_webgpu_bridge.d.ts',
+  'scripts/build_bridge.sh',
+  'scripts/generate_release_manifest.py',
+  // The wasm64 runtime patch rewrites a published asset: its Python
+  // original and the Node port are both build inputs.
+  'scripts/patch_wasm64_runtime.mjs',
+  'scripts/patch_wasm64_runtime.py',
+  'scripts/release_contract.py',
+  // A new orchestrator module is listed explicitly, never by prefix.
+  'scripts/release_orchestrator_unlisted.py',
+  // So is a new smoke helper; only the smoke entry points match by suffix.
+  'scripts/browser_smoke_unlisted.mjs',
+  'scripts/browser_smoke.mjs',
+  // Only the speech fixture is listed; another data file is governed.
+  'scripts/text_to_speech_fixture.json',
+  'scripts/verify_emscripten_version.py',
+  'src/llama_webgpu_core.cpp',
+  'src/core/exports_tts.inc',
+  'src/core/new_part.inc',
+  'tests/js/new_fixture.mjs',
+  'tests/new_build_input.mjs',
+  // Only tests/release/ is exempt as a whole.
+  'tests/releases/new_fixture.mjs',
+  'scripts/release/contract.mjs',
+  'scripts/release/errors.mjs',
+  'scripts/release/json.mjs',
+  'scripts/release/cli.mjs',
+  'scripts/release/manifest.mjs',
+  'scripts/release/python_compat.mjs',
+  'scripts/release/unlisted.mjs',
+  'scripts/release/orchestrator/unlisted.mjs',
+  'scripts/build/verify_emscripten_version.mjs',
+  'unknown/new-build-input.cfg',
+]);
+
 test('test_path_contract_is_fail_closed_for_runtime_and_new_inputs', () => {
-  for (const file of [
-    '.github/workflows/auto_llama_cpp_update.yml',
-    'README.md',
-    'docs/api.md',
-    'scripts/bridge_js_source.py',
-    'scripts/bridge_operation_queue_direct_cases.mjs',
-    'scripts/bridge_operation_queue_fixtures.mjs',
-    'scripts/bridge_operation_queue_lifecycle_contract_cases.mjs',
-    'scripts/bridge_operation_queue_worker_proxy_cases.mjs',
-    'scripts/browser_smoke_support.mjs',
-    'scripts/ci_scope.mjs',
-    'scripts/ci_scope.py',
-    'scripts/ci_scope_test.py',
-    'scripts/decision_browser_smoke.mjs',
-    'scripts/decision_browser_smoke.py',
-    'scripts/grammar_browser_smoke.mjs',
-    'scripts/grammar_browser_smoke.py',
-    'scripts/mtmd_compat_contract_test.py',
-    'scripts/multimodal_browser_smoke.mjs',
-    'scripts/multimodal_browser_smoke.py',
-    'scripts/native_core_source.py',
-    'scripts/next_token_scores_browser_smoke.mjs',
-    'scripts/next_token_scores_browser_smoke.py',
-    'scripts/orchestrator_source.py',
-    'scripts/release_orchestrator_asset_releases.py',
-    'scripts/release_orchestrator_asset_releases_test.py',
-    'scripts/release_orchestrator_driver.py',
-    'scripts/release_orchestrator_driver_backlog_test.py',
-    'scripts/release_orchestrator_driver_identical_release_test.py',
-    'scripts/release_orchestrator_driver_publication_test.py',
-    'scripts/release_orchestrator_driver_test.py',
-    'scripts/release_orchestrator_fixtures_test.py',
-    'scripts/release_orchestrator_model.py',
-    'scripts/release_orchestrator_native.py',
-    'scripts/release_orchestrator_native_test.py',
-    'scripts/release_orchestrator_planner.py',
-    'scripts/release_orchestrator_planner_test.py',
-    'scripts/release_orchestrator_release_tags.py',
-    'scripts/release_orchestrator_release_tags_test.py',
-    'scripts/release_orchestrator_run_names.py',
-    'scripts/release_orchestrator_run_names_test.py',
-    'scripts/release_orchestrator_stage_proofs.py',
-    'scripts/release_orchestrator_transport.py',
-    'scripts/release_orchestrator_transport_test.py',
-    'scripts/release_orchestrator_workflow_runs.py',
-    'scripts/release_orchestrator_workflow_runs_test.py',
-    'scripts/release_qualification.py',
-    'scripts/speech_to_text_browser_smoke.mjs',
-    'scripts/speech_to_text_browser_smoke.py',
-    'scripts/speech_to_text_fixture.json',
-    'scripts/stable_release_orchestrator.py',
-    'scripts/stable_release_orchestrator_test.py',
-    'scripts/state_persistence_browser_smoke.mjs',
-    'scripts/state_persistence_browser_smoke.py',
-    'scripts/text_to_speech_browser_smoke.mjs',
-    'scripts/text_to_speech_browser_smoke.py',
-    'scripts/verify_ci_reliability.mjs',
-    'scripts/verify_ci_reliability.py',
-    'scripts/verify_ci_reliability_doc_facts_test.py',
-    'scripts/verify_ci_reliability_pin_test.py',
-    'scripts/verify_decision_api.py',
-    'scripts/verify_state_persistence_api.py',
-    'scripts/verify_text_to_speech_api.py',
-    'scripts/wasm64_runtime_patch_contract_test.py',
-    'scripts/worker_runtime_state_test.mjs',
-    'tests/js/bridge_js_source.mjs',
-    'tests/js/bridge_operation_queue_direct_cases.mjs',
-    'tests/js/bridge_operation_queue_fixtures.mjs',
-    'tests/js/bridge_operation_queue_lifecycle_contract_cases.mjs',
-    'tests/js/bridge_operation_queue_worker_proxy_cases.mjs',
-    'tests/js/browser_smoke_support_test.mjs',
-    'tests/js/ci_scope_test.mjs',
-    'tests/js/decision_api_contract_test.mjs',
-    'tests/js/mtmd_compat_contract_test.mjs',
-    'tests/js/multimodal_harness_parity_test.mjs',
-    'tests/js/native_core_source.mjs',
-    'tests/js/state_persistence_api_contract_test.mjs',
-    'tests/js/state_persistence_harness_parity_test.mjs',
-    'tests/js/text_to_speech_api_contract_test.mjs',
-    'tests/js/verify_ci_reliability_test.mjs',
-    'tests/js/wasm64_runtime_patch_contract_test.mjs',
-    'tests/js/worker_runtime_state_test.mjs',
-    'tests/js/nested/new_contract_test.mjs',
-    'tests/new_suite/new_contract_test.mjs',
-    'tests/release/contract_test.mjs',
-    'scripts/release/archive.mjs',
-    'scripts/release/publication_state.mjs',
-    'scripts/release/qualification.mjs',
-    'scripts/release/qualify.mjs',
-    'scripts/release/wav.mjs',
-    'scripts/release/orchestrator/asset_releases.mjs',
-    'scripts/release/orchestrator/cli.mjs',
-    'scripts/release/orchestrator/driver.mjs',
-    'scripts/release/orchestrator/model.mjs',
-    'scripts/release/orchestrator/native.mjs',
-    'scripts/release/orchestrator/planner.mjs',
-    'scripts/release/orchestrator/release_tags.mjs',
-    'scripts/release/orchestrator/run_names.mjs',
-    'scripts/release/orchestrator/stage_proofs.mjs',
-    'scripts/release/orchestrator/transport.mjs',
-    'scripts/release/orchestrator/workflow_runs.mjs',
-    'tests/release/zip_fixture.mjs',
-    'tests/release/orchestrator/fixtures.mjs',
-    'tests/release/fixtures/attestation.json',
-  ]) {
+  for (const file of ORCHESTRATION_ONLY_CASES) {
     assert.equal(sro.isGovernedBridgePath(file), false, file);
   }
-  for (const file of [
-    'CMakeLists.txt',
-    '.github/workflows/bridge_candidate.yml',
-    'package.json',
-    'js/llama_webgpu_bridge.d.ts',
-    'scripts/build_bridge.sh',
-    'scripts/generate_release_manifest.py',
-    // The wasm64 runtime patch rewrites a published asset: its Python
-    // original and the Node port are both build inputs.
-    'scripts/patch_wasm64_runtime.mjs',
-    'scripts/patch_wasm64_runtime.py',
-    'scripts/release_contract.py',
-    // A new orchestrator module is listed explicitly, never by prefix.
-    'scripts/release_orchestrator_unlisted.py',
-    // So is a new smoke helper; only the smoke entry points match by suffix.
-    'scripts/browser_smoke_unlisted.mjs',
-    'scripts/browser_smoke.mjs',
-    // Only the speech fixture is listed; another data file is governed.
-    'scripts/text_to_speech_fixture.json',
-    'scripts/verify_emscripten_version.py',
-    'src/llama_webgpu_core.cpp',
-    'src/core/exports_tts.inc',
-    'src/core/new_part.inc',
-    'tests/js/new_fixture.mjs',
-    'tests/new_build_input.mjs',
-    // Only tests/release/ is exempt as a whole.
-    'tests/releases/new_fixture.mjs',
-    'scripts/release/contract.mjs',
-    'scripts/release/errors.mjs',
-    'scripts/release/json.mjs',
-    'scripts/release/cli.mjs',
-    'scripts/release/manifest.mjs',
-    'scripts/release/python_compat.mjs',
-    'scripts/release/unlisted.mjs',
-    'scripts/release/orchestrator/unlisted.mjs',
-    'scripts/build/verify_emscripten_version.mjs',
-    'unknown/new-build-input.cfg',
-  ]) {
+  for (const file of GOVERNED_CASES) {
     assert.equal(sro.isGovernedBridgePath(file), true, file);
   }
 });
@@ -253,7 +268,7 @@ test('test_workflow_run_trigger_and_both_job_gates_are_exact', () => {
   const workflow = fs.readFileSync(WORKFLOW, 'utf8');
   const count = (needle) => workflow.split(needle).length - 1;
   assert.ok(workflow.includes('fetch-depth: 0'));
-  assert.ok(workflow.includes('scripts/stable_release_orchestrator.py resolve-bridge-source'));
+  assert.ok(workflow.includes('node scripts/release/orchestrator/cli.mjs resolve-bridge-source'));
   assert.ok(workflow.includes('--bridge-build-sha "${bridge_build_sha}"'));
   const manualGate = (
     "github.event_name == 'workflow_dispatch' && "
@@ -285,7 +300,7 @@ test('test_workflow_run_trigger_and_both_job_gates_are_exact', () => {
   assert.ok(workflow.includes(proof));
   const marker = `      - name: ${proof}\n`;
   const proofBlock = workflow.slice(workflow.indexOf(marker) + marker.length).split('\n      - name:')[0];
-  assert.ok(proofBlock.includes('scripts/release_qualification.py verify-run'));
+  assert.ok(proofBlock.includes('node scripts/release/qualification.mjs verify-run'));
   assert.ok(proofBlock.includes('--run-attempt 1'));
   for (const exactMapping of [
     '.github/workflows/bridge_candidate.yml)\n              artifact_name=exact-webgpu-bridge-dist',
@@ -299,45 +314,48 @@ test('test_workflow_run_trigger_and_both_job_gates_are_exact', () => {
 
 // --- Node only ------------------------------------------------------------------
 
-// The double-quoted string literals of a Python expression, comments
-// skipped; the classifier's literals hold no quote, backslash or '#'.
-function pythonStrings(source) {
-  const strings = [];
-  for (const line of source.split('\n')) {
-    const code = line.replace(/#.*$/u, '');
-    for (const match of code.matchAll(/"([^"\\]*)"/gu)) strings.push(match[1]);
-  }
-  return strings;
-}
-
-// The source text of `name = <opening>...<closing>` in the Python entry.
-function pythonAssignment(source, name, opening, closing) {
-  const start = source.indexOf(`\n${name} = ${opening}`);
-  assert.notEqual(start, -1, name);
-  const end = source.indexOf(closing, start);
-  assert.notEqual(end, -1, name);
-  return source.slice(start, end + closing.length);
-}
-
-test('classifier sets equal the Python sets they copy', () => {
-  const source = fs.readFileSync(path.join(ROOT, 'scripts', 'stable_release_orchestrator.py'), 'utf8');
-  const paths = pythonStrings(pythonAssignment(source, '_ORCHESTRATION_ONLY_PATHS', 'frozenset(\n    {', '\n    }\n)'));
-  assert.equal(new Set(paths).size, paths.length);
-  assert.deepEqual([...sro.ORCHESTRATION_ONLY_PATHS].sort(), [...paths].sort());
-  assert.deepEqual(sro.ORCHESTRATION_ONLY_PREFIXES, pythonStrings(pythonAssignment(source, '_ORCHESTRATION_ONLY_PREFIXES', '(', ')\n')));
-  assert.deepEqual(
-    sro.ORCHESTRATION_ONLY_SCRIPT_SUFFIXES,
-    pythonStrings(pythonAssignment(source, '_ORCHESTRATION_ONLY_SCRIPT_SUFFIXES', '(', '\n)\n')),
-  );
-  assert.deepEqual(
-    [sro.ORCHESTRATION_ONLY_JS_TEST_SUFFIX],
-    pythonStrings(pythonAssignment(source, '_ORCHESTRATION_ONLY_JS_TEST_SUFFIX', '"', '"\n')),
-  );
+// The classifier is the source of truth; the case lists pin it. Every listed
+// path is an orchestration-only case, so dropping an entry fails the path
+// contract above and adding one needs a case here.
+test('the case lists pin every classifier set', () => {
+  const cases = new Set(ORCHESTRATION_ONLY_CASES);
+  assert.equal(cases.size, ORCHESTRATION_ONLY_CASES.length);
+  assert.equal(new Set(GOVERNED_CASES).size, GOVERNED_CASES.length);
+  for (const listed of sro.ORCHESTRATION_ONLY_PATHS) assert.ok(cases.has(listed), listed);
+  assert.deepEqual(sro.ORCHESTRATION_ONLY_PREFIXES, ['docs/', 'tests/release/']);
+  assert.deepEqual(sro.ORCHESTRATION_ONLY_SCRIPT_SUFFIXES, ['_browser_smoke.mjs', '_browser_smoke.py', '_test.mjs', '_test.py']);
+  assert.equal(sro.ORCHESTRATION_ONLY_JS_TEST_SUFFIX, '_test.mjs');
   // Every orchestrator module is listed explicitly, never by prefix.
   const modules = fs.readdirSync(path.join(ROOT, 'scripts', 'release', 'orchestrator'))
     .filter((name) => name.endsWith('.mjs'))
     .map((name) => `scripts/release/orchestrator/${name}`);
   for (const module of modules) assert.ok(sro.ORCHESTRATION_ONLY_PATHS.has(module), module);
+});
+
+// The Python orchestrator, deleted when the scan workflow switched to this
+// entry, stays orchestration-only, so history never classifies the deleting
+// commit as a build input.
+test('the deleted Python orchestrator stays orchestration-only', () => {
+  const modules = [
+    'asset_releases', 'driver', 'model', 'native', 'planner', 'release_tags', 'run_names', 'stage_proofs', 'transport',
+    'workflow_runs',
+  ];
+  const suites = [
+    'asset_releases', 'driver', 'driver_backlog', 'driver_identical_release', 'driver_publication', 'fixtures', 'native',
+    'planner', 'release_tags', 'run_names', 'transport', 'workflow_runs',
+  ];
+  const deleted = [
+    'scripts/stable_release_orchestrator.py',
+    'scripts/stable_release_orchestrator_test.py',
+    ...modules.map((name) => `scripts/release_orchestrator_${name}.py`),
+    ...suites.map((name) => `scripts/release_orchestrator_${name}_test.py`),
+  ];
+  assert.equal(deleted.length, 24);
+  for (const file of deleted) {
+    assert.equal(fs.existsSync(path.join(ROOT, file)), false, file);
+    assert.ok(ORCHESTRATION_ONLY_CASES.includes(file), file);
+    assert.equal(sro.isGovernedBridgePath(file), false, file);
+  }
 });
 
 test('invalid paths are rejected with the Python repr', () => {

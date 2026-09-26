@@ -1,18 +1,28 @@
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { readdirSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 
 import {
   CANONICAL_MODEL_PIN_NAMES,
   EXPECTED_MODEL_PINS,
+  ORCHESTRATOR_COMMAND,
+  ORCHESTRATOR_DIRECTORY,
+  ORCHESTRATOR_ENTRY,
   PUBLICATION_PAT_GUARD_ERROR,
   PUBLICATION_PAT_NAME,
+  RELEASE_CONTRACT_COMMAND,
+  RELEASE_QUALIFICATION_COMMAND,
   ROOT,
+  SANCTIONED_APPROVAL,
   TEST_COMMAND,
+  Workflow,
   checkJsContractTestsRegistered,
+  checkOrchestration,
   extractModelShaPinRoles,
   extractModelUrls,
+  literalDispatchBooleans,
   modelFileNameRoles,
+  orchestratorModules,
   parseExpectedModelPins,
   requireCanonicalModelShaPins,
   requireIdenticalModelUrls,
@@ -508,6 +518,172 @@ assertRejected(validatePublicationPatContract('jobs: [unterminated', EXPECTED_ST
     'tests/js/f_test.mjs': 'await import(`./${name}.mjs`);',
     'tests/js/g.mjs': '',
   }), ['tests/js/g.mjs']);
+}
+
+// --- Orchestration ---------------------------------------------------------
+
+// The scan workflow runs the Node orchestrator and release CLIs, and the
+// orchestrator source is the entry plus every module it imports. Each check
+// is proven against a mutated copy of the real workflow and sources.
+{
+  const AUTO_UPDATE = '.github/workflows/auto_llama_cpp_update.yml';
+  const workflowText = read(AUTO_UPDATE);
+  const sourceFiles = Object.fromEntries(
+    readdirSync(path.join(ROOT, ORCHESTRATOR_DIRECTORY))
+      .filter((name) => name.endsWith('.mjs'))
+      .map((name) => [`${ORCHESTRATOR_DIRECTORY}/${name}`, read(`${ORCHESTRATOR_DIRECTORY}/${name}`)]),
+  );
+  const sources = (files = sourceFiles) => {
+    const errors = [];
+    const modules = orchestratorModules(files, errors);
+    return { modules, errors };
+  };
+  const orchestrationErrors = (text = workflowText, modules = sources().modules) => {
+    const errors = [];
+    const workflow = new Workflow(AUTO_UPDATE, text, errors);
+    checkOrchestration(workflow, modules, errors);
+    return errors;
+  };
+  const mutate = (old, replacement, text = workflowText) => {
+    assert.ok(text.includes(old), `the workflow no longer contains ${JSON.stringify(old)}`);
+    return text.split(old).join(replacement);
+  };
+
+  // The real workflow and sources pass, and the source is the entry first,
+  // then every module by path.
+  assert.deepEqual(sources().errors, []);
+  assert.deepEqual(Object.keys(sources().modules), [
+    ORCHESTRATOR_ENTRY,
+    ...Object.keys(sourceFiles).filter((file) => file !== ORCHESTRATOR_ENTRY).sort(),
+  ]);
+  assert.deepEqual(orchestrationErrors(), []);
+
+  // Each command needle: the Python command it replaced is rejected.
+  for (const [nodeCommand, pythonCommand, fragment] of [
+    [`${RELEASE_QUALIFICATION_COMMAND} verify-run`, 'python3 scripts/release_qualification.py verify-run',
+      `with ${RELEASE_QUALIFICATION_COMMAND} verify-run`],
+    [`${RELEASE_CONTRACT_COMMAND} validate-environment`, 'python3 scripts/release_contract.py validate-environment',
+      `with ${RELEASE_CONTRACT_COMMAND} validate-environment`],
+    [`${RELEASE_CONTRACT_COMMAND} resolve-tag-commit`, 'python3 scripts/release_contract.py resolve-tag-commit',
+      `"${RELEASE_CONTRACT_COMMAND} resolve-tag-commit"`],
+    [`${RELEASE_CONTRACT_COMMAND} validate-native-release`, 'python3 scripts/release_contract.py validate-native-release',
+      `"${RELEASE_CONTRACT_COMMAND} validate-native-release"`],
+    [`${ORCHESTRATOR_COMMAND} resolve-bridge-source`, 'python3 scripts/stable_release_orchestrator.py resolve-bridge-source',
+      `"${ORCHESTRATOR_COMMAND} resolve-bridge-source"`],
+    [`${ORCHESTRATOR_COMMAND} scan-native`, 'python3 scripts/stable_release_orchestrator.py scan-native',
+      `"${ORCHESTRATOR_COMMAND} scan-native"`],
+    [`${ORCHESTRATOR_COMMAND} orchestrate-backlog`, 'python3 scripts/stable_release_orchestrator.py orchestrate-backlog',
+      `may hand the PAT only to ${ORCHESTRATOR_COMMAND} orchestrate-backlog`],
+  ]) {
+    assertRejected(orchestrationErrors(mutate(nodeCommand, pythonCommand)), fragment);
+  }
+  assertRejected(orchestrationErrors(mutate(`${ORCHESTRATOR_COMMAND} \\\n                select-stable-native-backlog`,
+    'python3 scripts/stable_release_orchestrator.py \\\n                select-stable-native-backlog')),
+  `"${ORCHESTRATOR_COMMAND} select-stable-native-backlog"`);
+  // The Python orchestrator is never named again, even beside the Node commands.
+  assertRejected(orchestrationErrors(mutate('set -euo pipefail\n          dry_run_flag=()',
+    'set -euo pipefail\n          python3 scripts/stable_release_orchestrator.py --help\n          dry_run_flag=()')),
+  'never run the deleted Python orchestrator');
+  assertRejected(orchestrationErrors(`${workflowText}# scripts/release_orchestrator_driver.py\n`),
+    'never run the deleted Python orchestrator');
+  // Dispatch goes only through the orchestrator entry.
+  assertRejected(orchestrationErrors(mutate('set -euo pipefail\n          dry_run_flag=()',
+    'set -euo pipefail\n          gh workflow run bridge_candidate.yml\n          dry_run_flag=()')),
+  'dispatch only through scripts/release/orchestrator/cli.mjs');
+  assertRejected(orchestrationErrors(mutate(`${ORCHESTRATOR_COMMAND} orchestrate-backlog`, 'node scripts/release/other.mjs orchestrate-backlog')),
+    `may hand the PAT only to ${ORCHESTRATOR_COMMAND} orchestrate-backlog`);
+  // The environment is validated with the job token before the PAT step.
+  assertRejected(orchestrationErrors(mutate('          GH_TOKEN: ${{ github.token }}\n        run: |\n          set -euo pipefail\n          gh api "repos/${BRIDGE_REPO}/environments',
+    '          GH_TOKEN: ${{ secrets.OTHER }}\n        run: |\n          set -euo pipefail\n          gh api "repos/${BRIDGE_REPO}/environments')),
+  'may use the PAT only inside the bridge-assets-publication environment');
+  assertRejected(orchestrationErrors(mutate('    environment:\n      name: bridge-assets-publication\n', '')),
+    'may use the PAT only inside the bridge-assets-publication environment');
+  assertRejected(orchestrationErrors(mutate('WEBGPU_BRIDGE_ASSETS_PAT: ${{ secrets.WEBGPU_BRIDGE_ASSETS_PAT }}',
+    'RELEASE_CREDENTIAL: ${{ secrets.WEBGPU_BRIDGE_ASSETS_PAT }}')), `bind the publication PAT only as ${PUBLICATION_PAT_NAME}`);
+
+  // Node.js 24 is set up without a cache before each job's first node
+  // command, and nothing installs packages.
+  const setupNode = '      - uses: actions/setup-node@v4\n        with:\n          node-version: 24\n';
+  const setupCount = workflowText.split(setupNode).length - 1;
+  assert.equal(setupCount, 2);
+  const lastSetup = workflowText.lastIndexOf(setupNode);
+  const withoutAdvanceSetup = workflowText.slice(0, lastSetup) + workflowText.slice(lastSetup + setupNode.length);
+  assertRejected(orchestrationErrors(withoutAdvanceSetup), 'job advance_stable_release must set up Node.js 24');
+  assertRejected(orchestrationErrors(mutate(setupNode, '')), 'job prepare_release_candidate must set up Node.js 24');
+  assertRejected(orchestrationErrors(mutate('node-version: 24', 'node-version: 22')), 'must set up Node.js 24');
+  assertRejected(orchestrationErrors(mutate(setupNode, `${setupNode}          cache: npm\n`)), 'without a package cache');
+  // Set up only after the first node command.
+  assertRejected(orchestrationErrors(mutate(`${setupNode}\n      - name: Prove the exact workflow continuation before environment use\n`,
+    '      - name: Prove the exact workflow continuation before environment use\n')
+    .replace('      - name: Resolve native-aligned candidate\n', `${setupNode}\n      - name: Resolve native-aligned candidate\n`)),
+  'job prepare_release_candidate must set up Node.js 24 with actions/setup-node before its first node command');
+  for (const install of ['npm ci', 'npm install', 'npx --no-install playwright', 'pip install yaml', 'corepack enable']) {
+    assertRejected(orchestrationErrors(mutate('set -euo pipefail\n          dry_run_flag=()', `set -euo pipefail\n          ${install}\n          dry_run_flag=()`)),
+      'must never install or run packages');
+  }
+
+  // The orchestrator source: an unimported module, an import of a missing
+  // one, an import outside the orchestrator and the shared release modules,
+  // or a non-literal import() fails; so does a missing entry.
+  const extra = `${ORCHESTRATOR_DIRECTORY}/unimported.mjs`;
+  assertRejected(sources({ ...sourceFiles, [extra]: 'export const x = 1;\n' }).errors, `unreached: ${extra}`);
+  const driver = `${ORCHESTRATOR_DIRECTORY}/driver.mjs`;
+  assertRejected(sources({ ...sourceFiles, [driver]: `import './missing.mjs';\n${sourceFiles[driver]}` }).errors,
+    `imports ${ORCHESTRATOR_DIRECTORY}/missing.mjs, which does not exist`);
+  assertRejected(sources({ ...sourceFiles, [driver]: `import '../../ci_scope.mjs';\n${sourceFiles[driver]}` }).errors,
+    'imports scripts/ci_scope.mjs, which is neither');
+  assertRejected(sources({ ...sourceFiles, [driver]: `import '../qualify.mjs';\n${sourceFiles[driver]}` }).errors,
+    'imports scripts/release/qualify.mjs, which is neither');
+  assertRejected(sources({ ...sourceFiles, [driver]: `const m = await import(name);\n${sourceFiles[driver]}` }).errors,
+    'has an import() whose target is not a string literal');
+  // A module reached only through an unreached one is itself unreached.
+  const cut = { ...sourceFiles, [ORCHESTRATOR_ENTRY]: sourceFiles[ORCHESTRATOR_ENTRY].replace("import { advancePipeline } from './driver.mjs';\n", '') };
+  assert.notEqual(cut[ORCHESTRATOR_ENTRY], sourceFiles[ORCHESTRATOR_ENTRY]);
+  assert.ok(sources(cut).errors.some((error) => /unreached: /.test(error) && error.split('unreached: ')[1].split(', ').includes(driver)),
+    sources(cut).errors.join('\n'));
+  const withoutEntry = { ...sourceFiles };
+  delete withoutEntry[ORCHESTRATOR_ENTRY];
+  assertRejected(sources(withoutEntry).errors, `${ORCHESTRATOR_ENTRY} is missing`);
+  assertRejected(orchestrationErrors(workflowText, {}), `must start at ${ORCHESTRATOR_ENTRY}`);
+
+  // Row 53: every JavaScript spelling of a literal 'true' governance or
+  // approval boolean is found, in any orchestrator module.
+  for (const key of ['assets_immutable_releases_enabled', 'publish_approved']) {
+    for (const literal of [
+      `inputs.${key} = 'true';`,
+      `inputs.${key}='true'`,
+      `inputs . ${key} = "true"`,
+      `inputs['${key}'] = 'true';`,
+      `inputs["${key}"] = \`true\``,
+      `const inputs = { ${key}: 'true' };`,
+      `{${key}:"true"}`,
+      `"${key}": "true"`,
+      `'${key}': 'true'`,
+      `new Map([['${key}', 'true']])`,
+      `inputs.set("${key}", 'true')`,
+    ]) {
+      assert.notDeepEqual(literalDispatchBooleans(literal), [], literal);
+      const errors = orchestrationErrors(workflowText, { ...sources().modules, [driver]: `${sourceFiles[driver]}\n${literal}\n` });
+      assertRejected(errors, `${driver} must derive the governance and approval booleans only from live proofs`);
+    }
+    for (const allowed of [
+      `inputs.${key} = governance.enabled === true ? 'true' : 'false';`,
+      `if (inputs.${key} === 'true') {}`,
+      `inputs.${key} == 'true'`,
+      `other_${key}: 'true'`,
+      `inputs.${key}_extra = 'true'`,
+      `'${key}',`,
+      `${key}: 'false'`,
+    ]) {
+      assert.deepEqual(literalDispatchBooleans(allowed), [], allowed);
+    }
+  }
+  // The approval is sanctioned only right after the live environment proof.
+  assert.deepEqual(literalDispatchBooleans(sourceFiles[driver]), []);
+  assert.match(sourceFiles[driver], SANCTIONED_APPROVAL);
+  const unproven = sourceFiles[driver].replace('    requirePublicationEnvironment(gateway);\n    inputs.publish_approved', '    inputs.publish_approved');
+  assert.notEqual(unproven, sourceFiles[driver]);
+  assert.deepEqual(literalDispatchBooleans(unproven), [".publish_approved = 'true'"]);
 }
 
 console.log('CI reliability verifier tests passed');

@@ -1,6 +1,6 @@
 name: Qualify Exact Bridge Candidate
 
-# Parsed by scripts/stable_release_orchestrator.py to bind this qualification to
+# Parsed by scripts/release/orchestrator/run_names.mjs to bind this qualification to
 # the exact candidate run it proves; the runs API never echoes dispatch inputs.
 run-name: bridge-qualification ${{ inputs.orchestrator_correlation_id }} candidate:${{ inputs.candidate_run_id }}
 

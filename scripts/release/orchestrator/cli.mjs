@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 // Artifact-driven automatic stable Web bridge release state machine: the CLI
-// entry, the Node port of scripts/stable_release_orchestrator.py.
+// entry that .github/workflows/auto_llama_cpp_update.yml runs. It replaced
+// the Python scripts/stable_release_orchestrator.py.
 //
 // Each event-driven scan resolves every stable native release after the
 // immutable automation baseline, then idempotently advances each three-stage
@@ -20,11 +21,10 @@
 // advances anything.
 //
 // The state machine lives in the sibling modules; this file keeps the
-// governed-path classifier, the bridge source identity it resolves, and the
-// command-line surface. Until the workflow switches to this entry, the
-// Python sets in scripts/stable_release_orchestrator.py are the source of
-// truth for the classifier; tests/release/orchestrator/cli_test.mjs keeps
-// the copies below equal to them.
+// governed-path classifier (the source of truth that AGENTS.md and
+// CONTRIBUTING.md name), the bridge source identity it resolves, and the
+// command-line surface. A new sibling module must be listed in
+// ORCHESTRATION_ONLY_PATHS below and in TOOLING in scripts/ci_scope.mjs.
 //
 // main(argv, { env, createGateway, stdout, stderr }) is the entry the tests
 // drive: `env` replaces process.env, createGateway({ readToken,
@@ -61,7 +61,9 @@ import { GhGateway } from './transport.mjs';
 // published, but they do not change the runtime/build inputs placed in the
 // bridge artifact. Everything not explicitly classified here is governed by
 // default so a newly added build input cannot silently inherit an older
-// release identity. The comments on each entry are in the Python original.
+// release identity. This is the source of truth for the classifier. A path
+// stays listed after its file is deleted: history must not classify the
+// deleting commit as a build input.
 export const ORCHESTRATION_ONLY_PATHS = Object.freeze(new Set([
   '.gitignore',
   '.github/workflows/auto_llama_cpp_update.yml',
@@ -72,16 +74,27 @@ export const ORCHESTRATION_ONLY_PATHS = Object.freeze(new Set([
   'CONTRIBUTING.md',
   'LICENSE',
   'README.md',
+  // Deleted with the Node port of verify_ci_reliability, which was their
+  // last importer.
   'scripts/bridge_js_source.py',
   'scripts/bridge_operation_queue_direct_cases.mjs',
   'scripts/bridge_operation_queue_fixtures.mjs',
   'scripts/bridge_operation_queue_lifecycle_contract_cases.mjs',
   'scripts/bridge_operation_queue_worker_proxy_cases.mjs',
+  // Shared by the scripts/*_browser_smoke.mjs harnesses, which the
+  // _browser_smoke.mjs suffix covers.
   'scripts/browser_smoke_support.mjs',
+  // Ported to scripts/ci_scope.mjs; the .py path was deleted.
   'scripts/ci_scope.mjs',
   'scripts/ci_scope.py',
+  // Deleted with the Node port of mtmd_compat_contract_test.py, its last
+  // importer; tests/js/native_core_source.mjs is its twin.
   'scripts/native_core_source.py',
+  // Deleted with the Node port of verify_ci_reliability; see above.
   'scripts/orchestrator_source.py',
+  // The Python release orchestrator, deleted when the scan workflow switched
+  // to the Node orchestrator below. Its tests, and those of every module,
+  // match the _test.py suffix.
   'scripts/release_orchestrator_asset_releases.py',
   'scripts/release_orchestrator_driver.py',
   'scripts/release_orchestrator_model.py',
@@ -94,11 +107,16 @@ export const ORCHESTRATION_ONLY_PATHS = Object.freeze(new Set([
   'scripts/release_orchestrator_workflow_runs.py',
   'scripts/release_publication_state.py',
   'scripts/release_qualification.py',
+  // Node ports of the two above. The shared json/cli/errors/contract/manifest
+  // modules stay governed, like release_contract.py and
+  // generate_release_manifest.py.
   'scripts/release/archive.mjs',
   'scripts/release/publication_state.mjs',
   'scripts/release/qualification.mjs',
   'scripts/release/qualify.mjs',
   'scripts/release/wav.mjs',
+  // The Node release orchestrator. Each module is listed explicitly, never by
+  // prefix.
   'scripts/release/orchestrator/asset_releases.mjs',
   'scripts/release/orchestrator/cli.mjs',
   'scripts/release/orchestrator/driver.mjs',
@@ -110,23 +128,36 @@ export const ORCHESTRATION_ONLY_PATHS = Object.freeze(new Set([
   'scripts/release/orchestrator/stage_proofs.mjs',
   'scripts/release/orchestrator/transport.mjs',
   'scripts/release/orchestrator/workflow_runs.mjs',
+  // The speech gate's audio pin and transcript, read by
+  // release_qualification.py and the speech smoke. Like both of them it
+  // decides how a candidate is qualified and is never in the artifact.
   'scripts/speech_to_text_fixture.json',
+  // The Python orchestrator's CLI entry; see the modules above.
   'scripts/stable_release_orchestrator.py',
+  // Ported to scripts/verify_ci_reliability.mjs; the .py path was deleted.
   'scripts/verify_ci_reliability.mjs',
   'scripts/verify_ci_reliability.py',
+  // Ported to tests/js/*_api_contract_test.mjs, which the _test.mjs suffix
+  // covers; the .py paths were deleted.
   'scripts/verify_decision_api.py',
   'scripts/verify_state_persistence_api.py',
   'scripts/verify_text_to_speech_api.py',
+  // Current home of the scripts/bridge_operation_queue_* fixtures above,
+  // whose scripts/ paths were deleted.
   'tests/js/bridge_operation_queue_direct_cases.mjs',
   'tests/js/bridge_operation_queue_fixtures.mjs',
   'tests/js/bridge_operation_queue_lifecycle_contract_cases.mjs',
   'tests/js/bridge_operation_queue_worker_proxy_cases.mjs',
+  // Source readers the JS contract tests import.
   'tests/js/bridge_js_source.mjs',
   'tests/js/native_core_source.mjs',
 ]));
 // The release tooling's Node tests and their fixtures never reach a build.
 export const ORCHESTRATION_ONLY_PREFIXES = Object.freeze(['docs/', 'tests/release/']);
 export const ORCHESTRATION_ONLY_SCRIPT_SUFFIXES = Object.freeze([
+  // Node ports of the Python browser smokes. Keep the .py suffix: the
+  // commits that port a smoke delete its .py path, and history must not
+  // classify those commits as build inputs.
   '_browser_smoke.mjs',
   '_browser_smoke.py',
   '_test.mjs',

@@ -69,6 +69,11 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      # The release modules are zero-dependency: no npm install, no cache.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
       - name: Prove the exact workflow continuation before environment use
         if: ${{ github.event_name == 'workflow_run' }}
         env:
@@ -103,7 +108,7 @@ jobs:
               ;;
           esac
           bridge_default="$(gh api "repos/${BRIDGE_REPO}" --jq '.default_branch')"
-          verification="$(python3 scripts/release_qualification.py verify-run \
+          verification="$(node scripts/release/qualification.mjs verify-run \
             --run-json "${RUNNER_TEMP}/continuation-run/run.json" \
             --artifacts-json "${RUNNER_TEMP}/continuation-run/artifacts.json" \
             --run-id "${TRIGGER_RUN_ID}" \
@@ -144,7 +149,7 @@ jobs:
               jq -n --arg tag "${REQUESTED_NATIVE_TAG}" '[$tag]' \
                 > "${RUNNER_TEMP}/native-tags.json"
             else
-              python3 scripts/stable_release_orchestrator.py \
+              node scripts/release/orchestrator/cli.mjs \
                 select-stable-native-backlog \
                 --releases-json "${RUNNER_TEMP}/native-releases.json" \
                 --output-json "${RUNNER_TEMP}/native-tags.json"
@@ -155,7 +160,7 @@ jobs:
           fi
           jq -r '.[]' "${RUNNER_TEMP}/native-tags.json" \
             > "${RUNNER_TEMP}/native-tags.txt"
-          python3 scripts/stable_release_orchestrator.py resolve-bridge-source \
+          node scripts/release/orchestrator/cli.mjs resolve-bridge-source \
             --repository . --head HEAD \
             --output-json "${RUNNER_TEMP}/bridge-source-identity.json"
           bridge_source_sha="$(jq -er '.bridge_source_sha' \
@@ -205,12 +210,12 @@ jobs:
             git ls-remote --tags "https://github.com/${NATIVE_REPO}.git" \
               "refs/tags/${NATIVE_TAG}" "refs/tags/${NATIVE_TAG}^{}" \
               > "${candidate_dir}/native-tag-refs.txt"
-            native_tag_commit="$(python3 scripts/release_contract.py resolve-tag-commit \
+            native_tag_commit="$(node scripts/release/contract.mjs resolve-tag-commit \
               --ls-remote "${candidate_dir}/native-tag-refs.txt" \
               --tag "${NATIVE_TAG}")"
 
             provenance_json="release-candidates/${NATIVE_TAG}.json"
-            python3 scripts/stable_release_orchestrator.py scan-native \
+            node scripts/release/orchestrator/cli.mjs scan-native \
               --manifest "${candidate_dir}/assets.json" \
               --native-release-tag "${NATIVE_TAG}" \
               --native-release-published-at "${native_published_at}" \
@@ -222,7 +227,7 @@ jobs:
             upstream_tag="$(jq -er '.upstream_tag' "${provenance_json}")"
             upstream_commit="$(jq -er '.upstream_commit' "${provenance_json}")"
             manifest_sha256="$(jq -er '.native_manifest_sha256' "${provenance_json}")"
-            python3 scripts/release_contract.py validate-native-release \
+            node scripts/release/contract.mjs validate-native-release \
               --manifest "${candidate_dir}/assets.json" \
               --checksums "${candidate_dir}/SHA256SUMS" \
               --release-json "${candidate_dir}/native-release.json" \
@@ -282,6 +287,12 @@ jobs:
         with:
           persist-credentials: false
 
+      # This job holds the publication PAT, so it never installs packages;
+      # the release modules are zero-dependency.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
       - uses: actions/download-artifact@v4
         with:
           name: bridge-release-candidate
@@ -295,7 +306,7 @@ jobs:
             > "${RUNNER_TEMP}/publication-environment.json"
           gh api "repos/${BRIDGE_REPO}/environments/bridge-assets-publication/deployment-branch-policies" \
             > "${RUNNER_TEMP}/publication-branch-policies.json"
-          python3 scripts/release_contract.py validate-environment \
+          node scripts/release/contract.mjs validate-environment \
             --environment-json "${RUNNER_TEMP}/publication-environment.json" \
             --branch-policies-json "${RUNNER_TEMP}/publication-branch-policies.json"
 
@@ -313,7 +324,7 @@ jobs:
           if [ "${DRY_RUN_REQUESTED}" = "true" ]; then
             dry_run_flag+=(--dry-run)
           fi
-          python3 scripts/stable_release_orchestrator.py orchestrate-backlog \
+          node scripts/release/orchestrator/cli.mjs orchestrate-backlog \
             --provenance-list-json release-candidates.json \
             --workspace "${RUNNER_TEMP}/orchestrator" \
             --output-plan-json orchestration-plan.json \
