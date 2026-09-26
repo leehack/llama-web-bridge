@@ -108,6 +108,14 @@ _ORCHESTRATION_ONLY_PATHS = frozenset(
         "scripts/release_orchestrator_workflow_runs.py",
         "scripts/release_publication_state.py",
         "scripts/release_qualification.py",
+        # Node ports of the two above, not yet wired in. The shared
+        # json/cli/errors/contract/manifest modules stay governed, like
+        # release_contract.py and generate_release_manifest.py.
+        "scripts/release/archive.mjs",
+        "scripts/release/publication_state.mjs",
+        "scripts/release/qualification.mjs",
+        "scripts/release/qualify.mjs",
+        "scripts/release/wav.mjs",
         # The speech gate's audio pin and transcript, read by
         # release_qualification.py and the speech smoke. Like both of them it
         # decides how a candidate is qualified and is never in the artifact.
@@ -137,7 +145,8 @@ _ORCHESTRATION_ONLY_PATHS = frozenset(
         "tests/js/native_core_source.mjs",
     }
 )
-_ORCHESTRATION_ONLY_PREFIXES = ("docs/",)
+# The release tooling's Node tests and their fixtures never reach a build.
+_ORCHESTRATION_ONLY_PREFIXES = ("docs/", "tests/release/")
 _ORCHESTRATION_ONLY_SCRIPT_SUFFIXES = (
     # Node ports of the Python browser smokes. Keep the .py suffix: the
     # commits that port a smoke delete its .py path, and history must not
@@ -182,7 +191,7 @@ def is_governed_bridge_path(path: str) -> bool:
         _ORCHESTRATION_ONLY_SCRIPT_SUFFIXES
     ):
         return False
-    if path.startswith("tests/js/") and path.endswith(
+    if path.startswith("tests/") and path.endswith(
         _ORCHESTRATION_ONLY_JS_TEST_SUFFIX
     ):
         return False
