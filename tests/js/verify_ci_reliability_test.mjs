@@ -8,6 +8,8 @@ import {
   PUBLICATION_PAT_GUARD_ERROR,
   PUBLICATION_PAT_NAME,
   ROOT,
+  TEST_COMMAND,
+  checkJsContractTestsRegistered,
   extractModelShaPinRoles,
   extractModelUrls,
   modelFileNameRoles,
@@ -460,5 +462,52 @@ jobs:
           fi
 `, EXPECTED_STEPS), 'PAT-bearing steps are');
 assertRejected(validatePublicationPatContract('jobs: [unterminated', EXPECTED_STEPS), 'workflow YAML cannot be resolved');
+
+// R1: npm test runs one glob over tests/, check:js runs npm test, and every
+// other file under tests/ is a helper that a test imports.
+{
+  const packageJson = (scripts) => JSON.stringify({ scripts });
+  const good = { 'check:js': 'npm run typecheck:js && npm test', test: TEST_COMMAND };
+  const files = {
+    'tests/js/a_test.mjs': "import { x } from './helper.mjs';\nconst late = await import(`./late.mjs`);",
+    'tests/js/helper.mjs': "export { y as x } from './nested/deep_helper.mjs';",
+    'tests/js/late.mjs': 'export {};',
+    'tests/js/nested/deep_helper.mjs': "import '../../shared/bare.mjs';\nexport const y = 1;",
+    'tests/js/nested/b_test.mjs': '',
+    'tests/shared/bare.mjs': '',
+  };
+  const errorsFor = (json, testFiles) => {
+    const errors = [];
+    checkJsContractTestsRegistered(json, testFiles, errors);
+    return errors;
+  };
+  assert.deepEqual(errorsFor(packageJson(good), files), []);
+  assert.deepEqual(errorsFor(packageJson({ ...good, 'check:js': 'npm run test' }), files), []);
+  assert.match(errorsFor(packageJson({ ...good, test: "node --test 'tests/js/*_test.mjs'" }), files).join('\n'), /npm test must be exactly/);
+  assert.match(errorsFor(packageJson({ ...good, test: `${TEST_COMMAND} || true` }), files).join('\n'), /npm test must be exactly/);
+  assert.match(errorsFor(packageJson({ ...good, 'check:js': 'npm run typecheck:js' }), files).join('\n'), /check:js must run npm test/);
+  assert.match(errorsFor(packageJson({ ...good, 'check:js': 'npm test || true' }), files).join('\n'), /check:js must run npm test/);
+  assert.match(errorsFor('{', files).join('\n'), /package.json is not valid JSON/);
+  assert.match(errorsFor(packageJson(good), {}).join('\n'), /no \*_test\.mjs contract tests/);
+  const unreached = (extra) => errorsFor(packageJson(good), { ...files, ...extra })
+    .map((error) => /^(\S+) is neither/.exec(error)?.[1]);
+  // A misnamed test, and a helper imported only by an unrun file, never run.
+  assert.deepEqual(unreached({
+    'tests/js/c.test.mjs': "import './orphan_helper.mjs';",
+    'tests/js/orphan_helper.mjs': '',
+  }), ['tests/js/c.test.mjs', 'tests/js/orphan_helper.mjs']);
+  // Naming a file in a string or path list, or importing a same-named file in
+  // another directory, does not reach it.
+  assert.deepEqual(unreached({
+    'tests/js/d_test.mjs': "const listed = ['tests/js/e.test.mjs', './e.test.mjs'];",
+    'tests/js/e.test.mjs': '',
+    'tests/other/helper.mjs': '',
+  }), ['tests/js/e.test.mjs', 'tests/other/helper.mjs']);
+  // An interpolated dynamic import cannot be resolved statically.
+  assert.deepEqual(unreached({
+    'tests/js/f_test.mjs': 'await import(`./${name}.mjs`);',
+    'tests/js/g.mjs': '',
+  }), ['tests/js/g.mjs']);
+}
 
 console.log('CI reliability verifier tests passed');

@@ -192,7 +192,7 @@ tested in CI.
 To run the media-helper and static CI contracts locally:
 
 ```bash
-npm run test:mtmd-compat
+node tests/js/mtmd_compat_contract_test.mjs
 node scripts/verify_ci_reliability.mjs
 ```
 
@@ -203,10 +203,10 @@ comments never fails it:
 
 - CI, candidate, and publish workflows install dependencies with
   `npm ci --ignore-scripts`, run `npm run check:js`, and fail on stale checked-in
-  generated output via `git diff --exit-code`; `check:js` runs every
-  `tests/js/*_test.mjs` contract test, CI runs every `scripts/*_test.py` suite,
-  and the candidate and publish workflows run the release contract suites and
-  this contract themselves;
+  generated output via `git diff --exit-code`; `check:js` ends with `npm test`,
+  which runs every `tests/**/*_test.mjs` contract test; CI runs every
+  `scripts/*_test.py` suite; and the candidate and publish workflows run the
+  release contract suites and this contract themselves;
 - `llama_cpp.version` holds one exact upstream tag in either channel (stable
   `vMAJOR.MINOR.PATCH` or development `bNNNN`) and CI builds it;
   `emsdk.version` holds one exact Emscripten version, which CI and the candidate

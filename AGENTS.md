@@ -140,11 +140,12 @@ GGUFs or smoke artifacts.
     secret with its fail-closed, never-printed guard, immutable-release
     governance and readback, owner-only first-attempt runs, artifact download
     by immutable ID, the toolchain pins, and that CI, candidate, and publish run
-    the contract tests (`check:js` must run every `tests/js/*_test.mjs`). It
-    asserts the 7-pin set in `CONTRIBUTING.md` and both build workflows, and
-    that `README.md` and `AGENTS.md` hold no pins. It checks no documentation
-    prose. `tests/js/verify_ci_reliability_test.mjs` tests its pin and PAT
-    checks.
+    the contract tests (`check:js` must run `npm test`, which globs every
+    `tests/**/*_test.mjs`, and every other file under `tests/` must be a helper
+    a test imports). It asserts the 7-pin set in `CONTRIBUTING.md` and both
+    build workflows, and that `README.md` and `AGENTS.md` hold no pins. It
+    checks no documentation prose. `tests/js/verify_ci_reliability_test.mjs`
+    tests its test-registration, pin and PAT checks.
 - Publish workflow: `.github/workflows/publish_assets.yml`
   - Never builds. It downloads the exact candidate artifact and attestation by
     immutable artifact ID and verifies the candidate manifest's
