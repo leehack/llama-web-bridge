@@ -26,7 +26,7 @@ import {
   withServer,
   withTempDir,
   writeStdout,
-} from './browser_smoke_support.mjs';
+} from './support.mjs';
 
 const DESCRIPTION = `Browser smoke for runtime LoRA adapters.
 
@@ -381,7 +381,7 @@ export function validatePayload(payload, memoryModes, gpuLayers) {
 
 export function parseArgs(argv) {
   return parseSmokeArgs(argv, {
-    prog: 'lora_adapter_browser_smoke.mjs',
+    prog: 'lora_adapter.mjs',
     description: DESCRIPTION,
     options: [
       { flag: '--dist-dir', type: 'path', default: () => env.path('BRIDGE_DIST_DIR', 'dist') },

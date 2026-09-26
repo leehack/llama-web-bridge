@@ -1,5 +1,5 @@
 // Regression contracts for the generated wasm64 JavaScript patch
-// (scripts/patch_wasm64_runtime.mjs).
+// (scripts/build/patch_wasm64_runtime.mjs).
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
@@ -7,7 +7,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { PATCHES, PatchError, patchWasm64Runtime } from '../../scripts/patch_wasm64_runtime.mjs';
+import { PATCHES, PatchError, patchWasm64Runtime } from '../../scripts/build/patch_wasm64_runtime.mjs';
 
 // Representative fragments from the Emscripten 6.0.8 output shape validated on
 // main. Both raw numeric values and already-wrapped values are included because
@@ -62,7 +62,7 @@ for (const [missingName] of PATCHES) {
 // The command line patches the file in place, reports it, and is idempotent;
 // a missing symbol exits 1 and leaves the file untouched.
 {
-  const script = fileURLToPath(new URL('../../scripts/patch_wasm64_runtime.mjs', import.meta.url));
+  const script = fileURLToPath(new URL('../../scripts/build/patch_wasm64_runtime.mjs', import.meta.url));
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'wasm64-patch-'));
   try {
     const target = path.join(directory, 'core_mem64.js');

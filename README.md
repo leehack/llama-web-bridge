@@ -27,7 +27,7 @@ state persistence, metadata, cancellation, disposal, and worker-host bootstrap.
 Requirements:
 
 - Emscripten SDK (`emcmake`, `emcc`) matching `emsdk.version` in `PATH`
-- Node.js 22.18+ and npm for the JS bridge build pipeline (`npm ci`,
+- Node.js 22.18+ or 24.2+ and npm for the JS bridge build pipeline (`npm ci`,
   `npm run check:js`)
 - llama.cpp source checkout matching `llama_cpp.version` or a compatible checkout exposing
   `llama_state_save_file` / `llama_state_load_file` with the signatures used by
@@ -38,15 +38,15 @@ Build command:
 ```bash
 npm ci
 npm run check:js
-./scripts/build_bridge.sh
+./scripts/build/build_bridge.sh
 ```
 
-`./scripts/build_bridge.sh` also runs the JS bridge build before copying wrapper
+`./scripts/build/build_bridge.sh` also runs the JS bridge build before copying wrapper
 assets, but running `npm run check:js` explicitly is useful before PRs because it
 performs TypeScript `checkJs`, regenerates the checked-in browser ESM wrapper and
 declaration files with esbuild, and syntax-checks the generated bridge files.
 
-`./scripts/build_bridge.sh --help` lists every environment variable the build
+`./scripts/build/build_bridge.sh --help` lists every environment variable the build
 reads (source, build, and output directories, wasm64, stack, memory, and
 pthread settings) with its default.
 
@@ -156,7 +156,7 @@ functional but substantially slower. This generated-audio support is
 experimental upstream and stays out of default CI.
 
 Run the checksum-pinned real-model gate,
-`scripts/text_to_speech_browser_smoke.mjs`, before publishing TTS-capable
+`scripts/smoke/text_to_speech.mjs`, before publishing TTS-capable
 assets; the invocation and pins are in [CONTRIBUTING.md](CONTRIBUTING.md#validate-outputs).
 
 ## Decision heads
@@ -168,7 +168,7 @@ logits for pre-tokenized sequences. Each head gets a private encoder context and
 runs on WebGPU when the model was loaded with GPU layers, in both direct and
 worker runtimes and in wasm32 and memory64. See [docs/api.md](docs/api.md#decision-heads).
 
-The real-model smoke, `scripts/decision_browser_smoke.mjs`, compares every
+The real-model smoke, `scripts/smoke/decision.mjs`, compares every
 fixture row with a Laya reference and stays out of default CI; the invocation is
 in [CONTRIBUTING.md](CONTRIBUTING.md#validate-outputs). No qualification gate
 runs it, so release manifests list no decision capability; probe support with
@@ -182,7 +182,7 @@ applied set and scales at runtime, in direct and worker runtimes and in wasm32
 and memory64. aLoRA adapters are rejected. Probe support with
 `getLoraAdapterCapabilities()`. See [docs/api.md](docs/api.md#lora-adapters).
 
-The real-model smoke, `scripts/lora_adapter_browser_smoke.mjs`, stays out of
+The real-model smoke, `scripts/smoke/lora_adapter.mjs`, stays out of
 default CI; the invocation is in
 [CONTRIBUTING.md](CONTRIBUTING.md#validate-outputs).
 
@@ -204,8 +204,8 @@ tested in CI.
 To run the media-helper and static CI contracts locally:
 
 ```bash
-node tests/js/mtmd_compat_contract_test.mjs
-node scripts/verify_ci_reliability.mjs
+node tests/bridge/mtmd_compat_contract_test.mjs
+node scripts/ci/verify_ci_reliability.mjs
 ```
 
 The reliability contract checks the publication-safety invariants of the CI,
@@ -216,9 +216,10 @@ comments never fails it:
 - CI, candidate, and publish workflows install dependencies with
   `npm ci --ignore-scripts`, run `npm run check:js`, and fail on stale checked-in
   generated output via `git diff --exit-code`; `check:js` ends with `npm test`,
-  which runs every `tests/**/*_test.mjs` contract test; CI runs every
-  `scripts/*_test.py` suite; and the candidate and publish workflows run the
-  release contract suites and this contract themselves;
+  which runs every `tests/**/*_test.mjs` contract test, including the release
+  contract suites; the candidate and publish workflows run `check:js` and this
+  contract themselves; and no workflow runs a Python interpreter or package
+  tool, a `*.py` script, a python shell or a Python image;
 - `llama_cpp.version` holds one exact upstream tag in either channel (stable
   `vMAJOR.MINOR.PATCH` or development `bNNNN`) and CI builds it;
   `emsdk.version` holds one exact Emscripten version, which CI and the candidate
@@ -226,7 +227,7 @@ comments never fails it:
   `emscripten_version` in `manifest.json`;
 - all 7 model/projector SHA-256 pins are identical across `CONTRIBUTING.md`,
   `ci.yml`, and `bridge_candidate.yml`, every role's pin and URL match
-  `release_qualification.py` and each other across workflows, and `README.md`
+  `scripts/release/qualification.mjs` and each other across workflows, and `README.md`
   and `AGENTS.md` hold no pins;
 - every workflow and job keeps the job token read-only, and no guard step or
   job may `continue-on-error` (only the publication ref mutation, whose outcome
@@ -255,9 +256,9 @@ comments never fails it:
 - CI runs the state-persistence, multimodal, grammar, and next-token-score
   browser smokes.
 
-Run `scripts/state_persistence_browser_smoke.mjs` locally after building the
+Run `scripts/smoke/state_persistence.mjs` locally after building the
 bridge if a change touches state persistence, workers, browser smoke, or
-workflow diagnostics, and `scripts/multimodal_browser_smoke.mjs` for llama.cpp
+workflow diagnostics, and `scripts/smoke/multimodal.mjs` for llama.cpp
 pin or multimodal changes. Both invocations, with their pinned models, are in
 [CONTRIBUTING.md](CONTRIBUTING.md#validate-outputs).
 
@@ -295,10 +296,10 @@ The harness:
   lifecycle and verifying each generated file is a readable PCM16 mono 24 kHz
   WAV with a recorded SHA-256, byte length, frame count, and non-silent
   peak/RMS waveform evidence;
-- records per-phase and per-mode timing plus peak RSS, normalized to bytes on
-  both the Linux (kibibyte) and macOS (byte) `ru_maxrss` conventions; the value
-  is cumulative across harness children up to the end of each phase, because
-  `RUSAGE_CHILDREN` cannot be reset;
+- records per-phase and per-mode timing plus peak RSS, measured for each smoke
+  through `/usr/bin/time` and normalized to bytes on both the Linux (kibibyte)
+  and macOS (byte) `ru_maxrss` conventions; the value is the largest peak of
+  any smoke run up to the end of each phase;
 - pins every model, projector, and audio fixture SHA-256, and digests its own
   harness sources so the attestation names the code that produced it;
 - leaves real-device playback, intelligibility, and speaker-reference fidelity
@@ -314,17 +315,17 @@ artifact. The orchestrator advances publication only after that exact
 first-attempt qualification run succeeds. No maintainer creates, transports, or
 submits an attestation, and the qualification workflow holds no publication PAT.
 
-`scripts/speech_to_text_browser_smoke.mjs` and
-`scripts/text_to_speech_browser_smoke.mjs` remain runnable on their own while
-iterating locally. The combined `release_qualification.py qualify` command is
+`scripts/smoke/speech_to_text.mjs` and
+`scripts/smoke/text_to_speech.mjs` remain runnable on their own while
+iterating locally. The combined `scripts/release/qualification.mjs qualify` command is
 reserved for the hosted workflow because it requires GitHub Actions and
 `github-hosted` runner identity. Both invocations are in
 [CONTRIBUTING.md](CONTRIBUTING.md#validate-outputs).
 
 The default audio is Qwen's official English example fixture.
-`scripts/speech_to_text_fixture.json` pins its URL, its SHA-256 and the exact
+`scripts/smoke/speech_to_text_fixture.json` pins its URL, its SHA-256 and the exact
 normalized transcript observed through the Web runtime, for both the speech
-smoke and `release_qualification.py`, so an upstream fixture replacement fails
+smoke and `scripts/release/qualification.mjs`, so an upstream fixture replacement fails
 loudly. Use `--memory-mode wasm32` or `--memory-mode wasm64` to classify one
 variant; the default validates
 both. Diagnostics land in `speech-to-text-smoke-artifacts` and
@@ -486,7 +487,7 @@ an unfinished pipeline, the orchestrator takes the next free patch version; it
 never appends `-N`, which npm orders as a prerelease below the plain version.
 A new tag is never lower than a published tag or a live claim; a claim released
 without publication stops counting, so its version may be taken again or stay
-unused. `release_contract.py validate-release`, which the candidate and publish
+unused. `scripts/release/contract.mjs validate-release`, which the candidate and publish
 workflows run, rejects a new tag with a rebuild suffix.
 
 Tags published before this rule, such as `v0.1.47-1`, and the shared native

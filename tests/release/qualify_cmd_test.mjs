@@ -94,7 +94,7 @@ test('test_node_executable_fails_closed_without_node', () => {
   fs.mkdirSync(path.dirname(fake));
   const link = path.join(tmp, 'node-link');
   fs.symlinkSync(fake, link);
-  for (const [version, accepted] of [['v24.2.0', true], ['v22.18.0', true], ['v22.17.1', false], ['v20.19.0', false], ['', false]]) {
+  for (const [version, accepted] of [['v24.2.0', true], ['v25.0.0', true], ['v22.18.0', true], ['v22.17.1', false], ['v23.11.0', false], ['v24.1.0', false], ['v20.19.0', false], ['', false]]) {
     fs.writeFileSync(fake, `#!/bin/sh\necho '${version}'\n`);
     fs.chmodSync(fake, 0o755);
     if (accepted) {
@@ -116,8 +116,8 @@ test('node --version digits follow re\'s Unicode 15.0 \\d and int()\'s 4300-digi
     return () => nodeExecutable({ which: () => fake });
   };
   // Python 3.12: \d takes U+0662 but not U+10D42 (a digit since Unicode 16).
-  assert.equal(version('v\u{662}\u{664}.0.0\n')(), fs.realpathSync(fake));
-  assert.throws(version('v\u{10d42}\u{664}.0.0\n'), (error) => error instanceof ContractError && error.message.includes('too old'));
+  assert.equal(version('v\u{662}\u{664}.2.0\n')(), fs.realpathSync(fake));
+  assert.throws(version('v\u{10d42}\u{664}.2.0\n'), (error) => error instanceof ContractError && error.message.includes('too old'));
   // int() of more than 4300 digits raises ValueError, uncaught as in Python.
   assert.throws(version(`v${'2'.repeat(4301)}.0.0\n`), (error) => isPyException(error, 'ValueError')
     && error.message.startsWith('Exceeds the limit (4300 digits) for integer string conversion: value has 4301 digits'));
@@ -153,7 +153,7 @@ test('test_qualify_runs_the_node_smokes_with_the_pinned_inputs', async () => {
   assert.deepEqual([speechLabel, speechTimeout, ttsLabel, ttsTimeout], ['speech-to-text', 67, 'text-to-speech', 68]);
   const diagnostics = fs.realpathSync(path.join(tmp, 'diag'));
   assert.deepEqual(speech, [
-    '/opt/node/bin/node', path.join(REPO_SCRIPTS_DIR, 'speech_to_text_browser_smoke.mjs'),
+    '/opt/node/bin/node', path.join(REPO_SCRIPTS_DIR, 'smoke', 'speech_to_text.mjs'),
     '--dist-dir', speech[3],
     '--model-path', fs.realpathSync(inputs.sm),
     '--model-sha256', SPEECH_MODEL_SHA256,
@@ -166,7 +166,7 @@ test('test_qualify_runs_the_node_smokes_with_the_pinned_inputs', async () => {
     '--artifacts-dir', path.join(diagnostics, 'speech-to-text'),
   ]);
   assert.deepEqual(tts, [
-    '/opt/node/bin/node', path.join(REPO_SCRIPTS_DIR, 'text_to_speech_browser_smoke.mjs'),
+    '/opt/node/bin/node', path.join(REPO_SCRIPTS_DIR, 'smoke', 'text_to_speech.mjs'),
     '--dist-dir', speech[3],
     '--model-path', fs.realpathSync(inputs.tm),
     '--model-sha256', TTS_MODEL_SHA256,
@@ -178,7 +178,7 @@ test('test_qualify_runs_the_node_smokes_with_the_pinned_inputs', async () => {
     '--timeout-ms', '8000',
     '--artifacts-dir', path.join(diagnostics, 'text-to-speech'),
   ]);
-  assert.deepEqual([speech, tts].map((command) => path.basename(command[1])), [...QUALIFICATION_SMOKES]);
+  assert.deepEqual([speech, tts].map((command) => path.relative(REPO_SCRIPTS_DIR, command[1])), [...QUALIFICATION_SMOKES]);
 });
 
 // --- qualifyCmd -----------------------------------------------------------------------
@@ -381,12 +381,12 @@ test('nodeExecutable accepts the running Node and reports what it cannot run', (
   fs.writeFileSync(noisy, "#!/bin/sh\necho ' v24.1.0-nightly '\n");
   fs.chmodSync(noisy, 0o755);
   assert.throws(() => nodeExecutable({ which: () => noisy }), (error) => error instanceof ContractError
-    && error.message === 'node v24.1.0-nightly is too old; the qualification gates need Node.js 22.18 or newer');
+    && error.message === 'node v24.1.0-nightly is too old; the qualification gates need Node.js 22.18+ or 24.2+');
   fs.writeFileSync(noisy, '#!/bin/sh\necho "v٢٢.١٨.0"\n');
   assert.equal(nodeExecutable({ which: () => noisy }), fs.realpathSync(noisy));
   fs.writeFileSync(noisy, '#!/bin/sh\nexit 3\n');
   assert.throws(() => nodeExecutable({ which: () => noisy }), (error) => error instanceof ContractError
-    && error.message === 'node (unknown version) is too old; the qualification gates need Node.js 22.18 or newer');
+    && error.message === 'node (unknown version) is too old; the qualification gates need Node.js 22.18+ or 24.2+');
 });
 
 test('pyWhich finds an executable file on PATH, as shutil.which does', () => {

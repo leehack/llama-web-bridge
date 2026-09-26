@@ -13,6 +13,7 @@ import { ContractError } from '../../scripts/release/contract.mjs';
 import { pyJsonDumps } from '../../scripts/release/json.mjs';
 import {
   CANDIDATE_ARTIFACT_NAME,
+  CANDIDATE_ALLOWED_MEMBERS,
   CANDIDATE_WORKFLOW_PATH,
   QUALIFICATION_WORKFLOW_PATH,
   canonicalJson,
@@ -33,6 +34,7 @@ import {
   setUp,
   workflowRun,
 } from './qualification_fixtures.mjs';
+import { ZIP_DEFLATED, writeZip } from './zip_fixture.mjs';
 
 function raises(fn, message = undefined) {
   let caught;
@@ -245,7 +247,7 @@ test('the CLI subcommands print Python bytes and errors', async () => {
     const mismatch = await cli(['verify-attestation', '--attestation', attestation, '--release-rebuild', '2']);
     assert.deepEqual(mismatch, { stdout: '', stderr: 'error: attestation release_rebuild mismatch: expected 2, got 1\n', status: 1 });
     const missingHarness = await cli(['verify-attestation', '--attestation', attestation, '--harness-dir', tmp]);
-    assert.deepEqual(missingHarness, { stdout: '', stderr: 'error: harness source is missing: browser_smoke_support.mjs\n', status: 1 });
+    assert.deepEqual(missingHarness, { stdout: '', stderr: 'error: harness source is missing: release/archive.mjs\n', status: 1 });
 
     assert.deepEqual(await cli(['candidate-fingerprint', '--candidate-dist', context.candidate]), {
       stdout: `${context.fingerprint}\n`, stderr: '', status: 0,
@@ -259,6 +261,101 @@ test('the CLI subcommands print Python bytes and errors', async () => {
     // Error lines are sanitized like every other diagnostic.
     const leaked = await cli(['candidate-fingerprint', '--candidate-dist', path.join(tmp, 'api_key=hunter2')]);
     assert.deepEqual(leaked, { stdout: '', stderr: `error: candidate directory does not exist: ${tmp}/<redacted-credential>\n`, status: 1 });
+  } finally {
+    context.cleanup();
+  }
+});
+
+// extract-artifact replaced the workflows' Python heredocs (the
+// _extract_flat_artifact_archive calls and the inline zipfile extractor of
+// the prequalification record): silent on success, `error: <message>` and
+// exit status 1 on any rejection, with nothing left in the destination.
+test('extract-artifact extracts each artifact type fail-closed', async () => {
+  const context = setUp();
+  try {
+    const { tmp } = context;
+    let counter = 0;
+    const extract = async (type, entries, options) => {
+      counter += 1;
+      const archive = writeZip(path.join(tmp, `archive-${counter}.zip`), entries, options);
+      const destination = path.join(tmp, `out-${counter}`);
+      const result = await cli(['extract-artifact', '--type', type, '--archive', archive, '--destination', destination]);
+      return { result, destination };
+    };
+    const ok = { stdout: '', stderr: '', status: 0 };
+
+    const candidateFiles = [...CANDIDATE_ALLOWED_MEMBERS].map((name) => [name, fs.readFileSync(path.join(context.candidate, name))]);
+    const candidate = await extract('candidate', candidateFiles, { compression: ZIP_DEFLATED });
+    assert.deepEqual(candidate.result, ok);
+    for (const [name, data] of candidateFiles) assert.deepEqual(fs.readFileSync(path.join(candidate.destination, name)), data, name);
+    assert.deepEqual(fs.readdirSync(candidate.destination).sort(), [...CANDIDATE_ALLOWED_MEMBERS].sort());
+
+    const attestationText = canonicalJson(context.attestation);
+    const attestation = await extract('attestation', [['qualification-attestation.json', attestationText]]);
+    assert.deepEqual(attestation.result, ok);
+    assert.equal(fs.readFileSync(path.join(attestation.destination, 'qualification-attestation.json'), 'utf8'), attestationText);
+
+    const record = `${pyJsonDumps({ schema_version: 1, candidate_fingerprint: 'f'.repeat(64) }, { indent: 2 })}\n`;
+    const prequalification = await extract('prequalification', [['candidate-prequalification.json', record]], { compression: ZIP_DEFLATED });
+    assert.deepEqual(prequalification.result, ok);
+    assert.deepEqual(fs.readdirSync(prequalification.destination), ['candidate-prequalification.json']);
+    assert.equal(fs.readFileSync(path.join(prequalification.destination, 'candidate-prequalification.json'), 'utf8'), record);
+    // Exactly at the 128 KiB member bound is accepted (stored: a repeated
+    // byte deflates past the compression-ratio bound).
+    const atBound = await extract('prequalification', [['candidate-prequalification.json', 'x'.repeat(128 * 1024)]]);
+    assert.deepEqual(atBound.result, ok);
+
+    // Every refusal of the inline extractor it replaced, and the flat
+    // extractor's stricter ones.
+    const name = 'candidate-prequalification.json';
+    for (const [label, type, entries, options, expected] of [
+      ['a second member', 'prequalification', [[name, record], ['extra.json', '{}']], undefined,
+        'artifact archive end-of-central-directory member count must be exactly 1, got 2'],
+      ['another name', 'prequalification', [['prequalification.json', record]], undefined,
+        "artifact archive contains unauthorized member: 'prequalification.json'"],
+      ['a directory', 'prequalification', [[`${name}/`, '']], undefined, 'is not a flat regular file'],
+      ['a symlink', 'prequalification', [{ name, data: 'target', externalAttr: 0o120777 << 16 }], undefined, 'is not a flat regular file'],
+      ['a member over 128 KiB', 'prequalification', [[name, 'x'.repeat(128 * 1024 + 1)]], { compression: ZIP_DEFLATED },
+        `artifact archive member '${name}' uncompressed size 131073 exceeds bound 131072`],
+      ['an archive over 1 MiB', 'prequalification', [[name, 'x'.repeat(1024 * 1024)]], undefined,
+        'artifact archive size 1048736 exceeds bound 1048576: '],
+      ['hidden metadata', 'prequalification', [{ name, data: record, extra: [0xca, 0xfe, 0, 0] }], undefined, 'carries hidden metadata'],
+      ['an attestation as a candidate', 'candidate', [['qualification-attestation.json', attestationText]], undefined,
+        'member count must be exactly 9, got 1'],
+      ['an unknown type', 'bogus', [[name, record]], undefined, "unknown artifact type: 'bogus'"],
+    ]) {
+      const { result, destination } = await extract(type, entries, options);
+      assert.equal(result.status, 1, label);
+      assert.equal(result.stdout, '', label);
+      assert.ok(result.stderr.startsWith('error: ') && result.stderr.includes(expected), `${label}: ${result.stderr}`);
+      assert.deepEqual(fs.existsSync(destination) ? fs.readdirSync(destination) : [], [], label);
+    }
+    // An encrypted member (flag bit 0) is refused.
+    const encrypted = writeZip(path.join(tmp, 'encrypted.zip'), [[name, record]]);
+    const bytes = fs.readFileSync(encrypted);
+    bytes.writeUInt16LE(1, 6);
+    bytes.writeUInt16LE(1, bytes.indexOf('PK\x01\x02', 0, 'latin1') + 8);
+    fs.writeFileSync(encrypted, bytes);
+    const refused = await cli(['extract-artifact', '--type', 'prequalification', '--archive', encrypted, '--destination', path.join(tmp, 'encrypted')]);
+    assert.equal(refused.status, 1);
+    assert.match(refused.stderr, /^error: artifact archive member is encrypted: 'candidate-prequalification.json'\n$/);
+    // The destination must be new or empty, as the workflows create it.
+    const occupied = path.join(tmp, 'occupied');
+    fs.mkdirSync(occupied);
+    fs.writeFileSync(path.join(occupied, 'stale'), '');
+    const archive = writeZip(path.join(tmp, 'again.zip'), [[name, record]]);
+    assert.deepEqual(await cli(['extract-artifact', '--type', 'prequalification', '--archive', archive, '--destination', occupied]), {
+      stdout: '', stderr: `error: artifact destination is not empty: ${occupied}\n`, status: 1,
+    });
+    for (const argv of [
+      ['extract-artifact', '--archive', archive, '--destination', occupied],
+      ['extract-artifact', '--type', 'candidate', '--destination', occupied],
+      ['extract-artifact', '--type', 'candidate', '--archive', archive],
+    ]) {
+      const usage = await cli(argv);
+      assert.equal(usage.status, 2);
+      assert.match(usage.stderr, /extract-artifact: error: the following arguments are required: /);
+    }
   } finally {
     context.cleanup();
   }

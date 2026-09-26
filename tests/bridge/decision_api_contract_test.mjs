@@ -1,7 +1,7 @@
 // Static API contract checks for versioned Web decision-head support.
 import { bridgeJsSource, methodBody, readRepoText } from './bridge_js_source.mjs';
 import { readNativeCoreSource } from './native_core_source.mjs';
-import { TEST_COMMAND } from '../../scripts/verify_ci_reliability.mjs';
+import { TEST_COMMAND } from '../../scripts/ci/verify_ci_reliability.mjs';
 
 const CORE = readNativeCoreSource();
 const DECISION = readRepoText('src/llama_webgpu_decision.cpp');
@@ -18,8 +18,8 @@ const API_DOCS_FLAT = API_DOCS
   .filter(Boolean)
   .join(' ');
 const PACKAGE = readRepoText('package.json');
-const SMOKE = readRepoText('scripts/decision_browser_smoke.mjs');
-const CONTRACT_TEST = readRepoText('tests/js/decision_bridge_contract_test.mjs');
+const SMOKE = readRepoText('scripts/smoke/decision.mjs');
+const CONTRACT_TEST = readRepoText('tests/bridge/decision_bridge_contract_test.mjs');
 
 const NATIVE_EXPORTS = [
   'llamadart_webgpu_decision_api_version',
@@ -264,7 +264,7 @@ require(
   'public API docs must document decision heads, their encoder requirement, and handle lifetime',
 );
 require(
-  README.includes('Decision heads') && README.includes('decision_browser_smoke.mjs'),
+  README.includes('Decision heads') && README.includes('scripts/smoke/decision.mjs'),
   'README must document decision heads and their real-model smoke',
 );
 require(

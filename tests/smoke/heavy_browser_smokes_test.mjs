@@ -11,10 +11,10 @@ import path from 'node:path';
 import process from 'node:process';
 import { fileURLToPath } from 'node:url';
 
-import { pyB64Decode, pyJson, pyJsonLoads, readPyText, resolvePath } from '../../scripts/browser_smoke_support.mjs';
-import * as decisionSmoke from '../../scripts/decision_browser_smoke.mjs';
-import * as speechSmoke from '../../scripts/speech_to_text_browser_smoke.mjs';
-import * as ttsSmoke from '../../scripts/text_to_speech_browser_smoke.mjs';
+import { pyB64Decode, pyJson, pyJsonLoads, readPyText, resolvePath } from '../../scripts/smoke/support.mjs';
+import * as decisionSmoke from '../../scripts/smoke/decision.mjs';
+import * as speechSmoke from '../../scripts/smoke/speech_to_text.mjs';
+import * as ttsSmoke from '../../scripts/smoke/text_to_speech.mjs';
 
 const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'heavy-browser-smokes-test-'));
@@ -26,7 +26,7 @@ const sha256 = (bytes) => createHash('sha256').update(bytes).digest('hex');
 // The speech smoke's defaults are speech_to_text_fixture.json, which
 // release_qualification.py reads too.
 {
-  const fixture = JSON.parse(fs.readFileSync(path.join(rootDir, 'scripts/speech_to_text_fixture.json'), 'utf8'));
+  const fixture = JSON.parse(fs.readFileSync(path.join(rootDir, 'scripts/smoke/speech_to_text_fixture.json'), 'utf8'));
   assert.deepEqual(Object.keys(fixture).sort(), ['audio_sha256', 'audio_url', 'expected_text']);
   assert.equal(speechSmoke.DEFAULT_AUDIO_URL, fixture.audio_url);
   assert.equal(speechSmoke.DEFAULT_AUDIO_SHA256, fixture.audio_sha256);
@@ -278,7 +278,7 @@ const sha256 = (bytes) => createHash('sha256').update(bytes).digest('hex');
 
 // The smokes fail before the browser for bad inputs, with the Python messages.
 {
-  const smoke = (name, args) => spawnSync(process.execPath, [path.join(rootDir, 'scripts', name), ...args], {
+  const smoke = (name, args) => spawnSync(process.execPath, [path.join(rootDir, 'scripts', 'smoke', name), ...args], {
     encoding: 'utf8',
     env: { PATH: process.env.PATH, HOME: process.env.HOME },
   });
@@ -293,41 +293,41 @@ const sha256 = (bytes) => createHash('sha256').update(bytes).digest('hex');
     assert.equal(result.stderr, `${label} browser smoke failed: ${message}\n`);
   };
   const missing = path.join(tmp, 'missing');
-  failed(smoke('speech_to_text_browser_smoke.mjs', ['--dist-dir', missing]), 'speech-to-text',
+  failed(smoke('speech_to_text.mjs', ['--dist-dir', missing]), 'speech-to-text',
     `dist directory does not exist: ${resolvePath(missing)}`);
-  failed(smoke('speech_to_text_browser_smoke.mjs', ['--dist-dir', dist]), 'speech-to-text', 'Qwen3-ASR model SHA-256 is required');
+  failed(smoke('speech_to_text.mjs', ['--dist-dir', dist]), 'speech-to-text', 'Qwen3-ASR model SHA-256 is required');
   const speechInputs = ['--dist-dir', dist, '--model-path', model, '--model-sha256', modelSha, '--mmproj-path', model,
     '--mmproj-sha256', modelSha.toUpperCase(), '--audio-path', model, '--audio-sha256', modelSha];
-  failed(smoke('speech_to_text_browser_smoke.mjs', [...speechInputs.slice(0, 6), '--mmproj-sha256', modelSha]), 'speech-to-text',
+  failed(smoke('speech_to_text.mjs', [...speechInputs.slice(0, 6), '--mmproj-sha256', modelSha]), 'speech-to-text',
     'Qwen3-ASR projector URL or local path is required');
-  failed(smoke('speech_to_text_browser_smoke.mjs', [...speechInputs, '--expect', ' 　\n']), 'speech-to-text',
+  failed(smoke('speech_to_text.mjs', [...speechInputs, '--expect', ' 　\n']), 'speech-to-text',
     'expected transcript is required');
-  failed(smoke('speech_to_text_browser_smoke.mjs', speechInputs), 'speech-to-text',
+  failed(smoke('speech_to_text.mjs', speechInputs), 'speech-to-text',
     `missing bridge artifact: ${path.join(resolvePath(dist), 'llama_webgpu_bridge.js')}`);
-  assert.equal(smoke('speech_to_text_browser_smoke.mjs', ['--memory-mode', 'wasm16']).status, 2);
+  assert.equal(smoke('speech_to_text.mjs', ['--memory-mode', 'wasm16']).status, 2);
 
   const ttsInputs = ['--dist-dir', dist, '--model-path', model, '--mmproj-path', model];
-  failed(smoke('text_to_speech_browser_smoke.mjs', [...ttsInputs.slice(0, 4), '--mmproj-path', missing]), 'text-to-speech',
+  failed(smoke('text_to_speech.mjs', [...ttsInputs.slice(0, 4), '--mmproj-path', missing]), 'text-to-speech',
     `projector does not exist: ${resolvePath(missing)}`);
-  failed(smoke('text_to_speech_browser_smoke.mjs', [...ttsInputs, '--speaker-audio-sha256', 'ab']), 'text-to-speech',
+  failed(smoke('text_to_speech.mjs', [...ttsInputs, '--speaker-audio-sha256', 'ab']), 'text-to-speech',
     'speaker audio checksum requires --speaker-audio-path');
-  failed(smoke('text_to_speech_browser_smoke.mjs', [...ttsInputs, '--max-frames', '0']), 'text-to-speech', 'max frames must be positive');
-  failed(smoke('text_to_speech_browser_smoke.mjs', [...ttsInputs, '--mmproj-sha256', '00']), 'text-to-speech', 'projector checksum mismatch');
-  failed(smoke('text_to_speech_browser_smoke.mjs', [...ttsInputs, '--model-sha256', modelSha.toUpperCase()]), 'text-to-speech',
+  failed(smoke('text_to_speech.mjs', [...ttsInputs, '--max-frames', '0']), 'text-to-speech', 'max frames must be positive');
+  failed(smoke('text_to_speech.mjs', [...ttsInputs, '--mmproj-sha256', '00']), 'text-to-speech', 'projector checksum mismatch');
+  failed(smoke('text_to_speech.mjs', [...ttsInputs, '--model-sha256', modelSha.toUpperCase()]), 'text-to-speech',
     `missing bridge artifact: ${path.join(resolvePath(dist), 'llama_webgpu_bridge.js')}`);
-  const ttsUsage = smoke('text_to_speech_browser_smoke.mjs', []);
+  const ttsUsage = smoke('text_to_speech.mjs', []);
   assert.equal(ttsUsage.status, 2);
-  assert.ok(ttsUsage.stderr.endsWith('text_to_speech_browser_smoke.mjs: error: the following arguments are required: --model-path, --mmproj-path\n'));
+  assert.ok(ttsUsage.stderr.endsWith('text_to_speech.mjs: error: the following arguments are required: --model-path, --mmproj-path\n'));
 
   const decisionInputs = ['--dist-dir', dist, '--model-path', model, '--head-path', model, '--fixture-path', model];
-  failed(smoke('decision_browser_smoke.mjs', [...decisionInputs.slice(0, 6), '--fixture-path', missing]), 'decision',
+  failed(smoke('decision.mjs', [...decisionInputs.slice(0, 6), '--fixture-path', missing]), 'decision',
     `fixture does not exist: ${resolvePath(missing)}`);
-  failed(smoke('decision_browser_smoke.mjs', [...decisionInputs, '--config-sha256', 'ab']), 'decision', 'config checksum requires --config-path');
-  failed(smoke('decision_browser_smoke.mjs', [...decisionInputs, '--context-size', '0']), 'decision', 'context size must be positive');
-  failed(smoke('decision_browser_smoke.mjs', [...decisionInputs, '--head-sha256', '00']), 'decision', 'head checksum mismatch');
+  failed(smoke('decision.mjs', [...decisionInputs, '--config-sha256', 'ab']), 'decision', 'config checksum requires --config-path');
+  failed(smoke('decision.mjs', [...decisionInputs, '--context-size', '0']), 'decision', 'context size must be positive');
+  failed(smoke('decision.mjs', [...decisionInputs, '--head-sha256', '00']), 'decision', 'head checksum mismatch');
   const listFixture = path.join(tmp, 'list-fixture.json');
   fs.writeFileSync(listFixture, '[1]');
-  failed(smoke('decision_browser_smoke.mjs', [...decisionInputs.slice(0, 6), '--fixture-path', listFixture]), 'decision',
+  failed(smoke('decision.mjs', [...decisionInputs.slice(0, 6), '--fixture-path', listFixture]), 'decision',
     'fixture is not a JSON object');
 }
 

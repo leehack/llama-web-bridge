@@ -24,7 +24,7 @@
 // governed-path classifier (the source of truth that AGENTS.md and
 // CONTRIBUTING.md name), the bridge source identity it resolves, and the
 // command-line surface. A new sibling module must be listed in
-// ORCHESTRATION_ONLY_PATHS below and in TOOLING in scripts/ci_scope.mjs.
+// ORCHESTRATION_ONLY_PATHS below and in TOOLING in scripts/ci/ci_scope.mjs.
 //
 // main(argv, { env, createGateway, stdout, stderr }) is the entry the tests
 // drive: `env` replaces process.env, createGateway({ readToken,
@@ -82,13 +82,17 @@ export const ORCHESTRATION_ONLY_PATHS = Object.freeze(new Set([
   'scripts/bridge_operation_queue_lifecycle_contract_cases.mjs',
   'scripts/bridge_operation_queue_worker_proxy_cases.mjs',
   // Shared by the scripts/*_browser_smoke.mjs harnesses, which the
-  // _browser_smoke.mjs suffix covers.
+  // _browser_smoke.mjs suffix covers. Moved to scripts/smoke/support.mjs.
   'scripts/browser_smoke_support.mjs',
-  // Ported to scripts/ci_scope.mjs; the .py path was deleted.
+  // Ported to scripts/ci_scope.mjs; the .py path was deleted. Moved to
+  // scripts/ci/ci_scope.mjs.
   'scripts/ci_scope.mjs',
   'scripts/ci_scope.py',
+  // The CI change selector and the CI reliability contract.
+  'scripts/ci/ci_scope.mjs',
+  'scripts/ci/verify_ci_reliability.mjs',
   // Deleted with the Node port of mtmd_compat_contract_test.py, its last
-  // importer; tests/js/native_core_source.mjs is its twin.
+  // importer; tests/bridge/native_core_source.mjs is its twin.
   'scripts/native_core_source.py',
   // Deleted with the Node port of verify_ci_reliability; see above.
   'scripts/orchestrator_source.py',
@@ -128,13 +132,28 @@ export const ORCHESTRATION_ONLY_PATHS = Object.freeze(new Set([
   'scripts/release/orchestrator/stage_proofs.mjs',
   'scripts/release/orchestrator/transport.mjs',
   'scripts/release/orchestrator/workflow_runs.mjs',
+  // The browser smokes, moved from scripts/*_browser_smoke.mjs, and the module
+  // they share. Each is listed explicitly, never by prefix.
+  'scripts/smoke/decision.mjs',
+  'scripts/smoke/grammar.mjs',
+  'scripts/smoke/lora_adapter.mjs',
+  'scripts/smoke/multimodal.mjs',
+  'scripts/smoke/next_token_scores.mjs',
+  'scripts/smoke/speculative.mjs',
+  'scripts/smoke/speech_to_text.mjs',
+  'scripts/smoke/state_persistence.mjs',
+  'scripts/smoke/support.mjs',
+  'scripts/smoke/text_to_speech.mjs',
   // The speech gate's audio pin and transcript, read by
   // release_qualification.py and the speech smoke. Like both of them it
   // decides how a candidate is qualified and is never in the artifact.
+  'scripts/smoke/speech_to_text_fixture.json',
+  // Its path before the move to scripts/smoke/.
   'scripts/speech_to_text_fixture.json',
   // The Python orchestrator's CLI entry; see the modules above.
   'scripts/stable_release_orchestrator.py',
   // Ported to scripts/verify_ci_reliability.mjs; the .py path was deleted.
+  // Moved to scripts/ci/verify_ci_reliability.mjs.
   'scripts/verify_ci_reliability.mjs',
   'scripts/verify_ci_reliability.py',
   // Ported to tests/js/*_api_contract_test.mjs, which the _test.mjs suffix
@@ -142,22 +161,30 @@ export const ORCHESTRATION_ONLY_PATHS = Object.freeze(new Set([
   'scripts/verify_decision_api.py',
   'scripts/verify_state_persistence_api.py',
   'scripts/verify_text_to_speech_api.py',
-  // Current home of the scripts/bridge_operation_queue_* fixtures above,
-  // whose scripts/ paths were deleted.
+  // Home of the scripts/bridge_operation_queue_* fixtures above, whose
+  // scripts/ paths were deleted, until tests/js/ moved to tests/bridge/.
   'tests/js/bridge_operation_queue_direct_cases.mjs',
   'tests/js/bridge_operation_queue_fixtures.mjs',
   'tests/js/bridge_operation_queue_lifecycle_contract_cases.mjs',
   'tests/js/bridge_operation_queue_worker_proxy_cases.mjs',
-  // Source readers the JS contract tests import.
+  // Source readers the JS contract tests import, before the same move.
   'tests/js/bridge_js_source.mjs',
   'tests/js/native_core_source.mjs',
+  // The same fixtures and source readers in tests/bridge/.
+  'tests/bridge/bridge_operation_queue_direct_cases.mjs',
+  'tests/bridge/bridge_operation_queue_fixtures.mjs',
+  'tests/bridge/bridge_operation_queue_lifecycle_contract_cases.mjs',
+  'tests/bridge/bridge_operation_queue_worker_proxy_cases.mjs',
+  'tests/bridge/bridge_js_source.mjs',
+  'tests/bridge/native_core_source.mjs',
 ]));
 // The release tooling's Node tests and their fixtures never reach a build.
 export const ORCHESTRATION_ONLY_PREFIXES = Object.freeze(['docs/', 'tests/release/']);
 export const ORCHESTRATION_ONLY_SCRIPT_SUFFIXES = Object.freeze([
   // Node ports of the Python browser smokes. Keep the .py suffix: the
   // commits that port a smoke delete its .py path, and history must not
-  // classify those commits as build inputs.
+  // classify those commits as build inputs. Keep the .mjs suffix for the
+  // same reason: the smokes moved to scripts/smoke/, listed above.
   '_browser_smoke.mjs',
   '_browser_smoke.py',
   '_test.mjs',

@@ -1,7 +1,8 @@
 #!/usr/bin/env node
-// Digest-bound automated release qualification and attestation validation,
-// the Node port of scripts/release_qualification.py (everything but running
-// the heavy gates, which lives in ./qualify.mjs).
+// Digest-bound automated release qualification and attestation validation
+// (everything but running the heavy gates, which lives in ./qualify.mjs).
+// Ported from scripts/release_qualification.py, which the harness 5.0.0
+// cutover deleted; the workflows run only this module.
 //
 // The heavy real-model Qwen3-ASR and Qwen3-TTS gates run in their own hosted
 // qualification workflow rather than inside the candidate build. That run
@@ -15,7 +16,7 @@
 // lanes that stay unproven or unavailable there, so an automatic publication
 // never claims coverage nothing executed.
 //
-// Every validator accepts and rejects exactly what the Python module does,
+// Every validator accepts and rejects exactly what the Python module did,
 // with the same ContractError text; values follow the JSON value model of
 // ./json.mjs (int vs PyFloat, Python equality and repr). The attestation bytes
 // are Python's json.dumps(indent=2, sort_keys=True) + "\n". Keyword arguments
@@ -97,7 +98,9 @@ export {
 export const QUALIFICATION_SCHEMA_VERSION = 2;
 export const ATTESTATION_TYPE = 'llama-web-bridge-automated-qualification';
 // 4.0.0: the heavy gates run the Node smokes (scripts/*_browser_smoke.mjs).
-export const HARNESS_VERSION = '4.0.0';
+// 5.0.0: the harness itself is Node (scripts/release/*.mjs); the Python
+// release_*.py harness is gone.
+export const HARNESS_VERSION = '5.0.0';
 
 // --- small Python helpers ---------------------------------------------------
 
@@ -302,31 +305,43 @@ export const EXPECTED_MODEL_PINS = Object.freeze({
 });
 
 // The Node smokes qualify runs with the candidate's locked Playwright.
-export const SPEECH_SMOKE = 'speech_to_text_browser_smoke.mjs';
-export const TTS_SMOKE = 'text_to_speech_browser_smoke.mjs';
+export const SPEECH_SMOKE = 'smoke/speech_to_text.mjs';
+export const TTS_SMOKE = 'smoke/text_to_speech.mjs';
 export const QUALIFICATION_SMOKES = Object.freeze([SPEECH_SMOKE, TTS_SMOKE]);
 
-// Every scripts/ file the gates execute or read at the candidate source, the
-// same list as release_qualification.py's HARNESS_SOURCES while the Python
-// harness is authoritative (so this verifier accepts the attestations it
-// produces): the qualification command with its Python import closure, the
-// speech and text-to-speech smokes it runs, the state-persistence and
-// multimodal smokes the candidate build runs as its hosted gates, the module
-// all four import, and the speech fixture. A name is a path relative to the
-// scripts/ directory and may contain '/'. The digest binds an attestation to
-// the exact harness that produced it, so publication can prove the harness
-// that ran is the exact bridge source being published.
+// Every scripts/ file the gates execute or read at the candidate source: the
+// qualification entry modules (this one and ./qualify.mjs) with every module
+// they import, the speech and text-to-speech smokes qualify runs, the
+// state-persistence and multimodal smokes the candidate build runs as its
+// hosted gates, the module those smokes import, and the speech fixture. The
+// release modules the entries reach (contract, manifest, publication_state
+// and the shared json/cli/errors helpers) are part of it, as their .py
+// originals were part of the Python harness. A name is a path relative to the
+// scripts/ directory and may contain '/'. tests/release/qualification_harness_test.mjs
+// recomputes the import closure and requires this list to equal it exactly,
+// so a new import fails until it is listed here (with a HARNESS_VERSION bump).
+// The digest binds an attestation to the exact harness that produced it, so
+// publication can prove the harness that ran is the exact bridge source being
+// published.
 export const HARNESS_SOURCES = Object.freeze([
-  'browser_smoke_support.mjs',
-  'generate_release_manifest.py',
-  'multimodal_browser_smoke.mjs',
-  'release_contract.py',
-  'release_publication_state.py',
-  'release_qualification.py',
-  'speech_to_text_browser_smoke.mjs',
-  'speech_to_text_fixture.json',
-  'state_persistence_browser_smoke.mjs',
-  'text_to_speech_browser_smoke.mjs',
+  'release/archive.mjs',
+  'release/cli.mjs',
+  'release/contract.mjs',
+  'release/errors.mjs',
+  'release/json.mjs',
+  'release/manifest.mjs',
+  'release/publication_state.mjs',
+  'release/python_compat.mjs',
+  'release/qualification.mjs',
+  'release/qualify.mjs',
+  'release/unicode15.mjs',
+  'release/wav.mjs',
+  'smoke/multimodal.mjs',
+  'smoke/speech_to_text.mjs',
+  'smoke/speech_to_text_fixture.json',
+  'smoke/state_persistence.mjs',
+  'smoke/support.mjs',
+  'smoke/text_to_speech.mjs',
 ]);
 
 const COMMIT_RE = /^[0-9a-f]{40}$/u;
@@ -393,7 +408,7 @@ function pyPathName(text) {
 // as its defaults. One file for both, because a second pinned copy here could
 // drift into silently disagreeing with the gate about what a passing
 // transcript is.
-export const SPEECH_FIXTURE_FILE = 'speech_to_text_fixture.json';
+export const SPEECH_FIXTURE_FILE = 'smoke/speech_to_text_fixture.json';
 export const SPEECH_FIXTURE_KEYS = Object.freeze(['audio_sha256', 'audio_url', 'expected_text']);
 
 export function loadSpeechFixture(fixturePath) {
@@ -418,7 +433,7 @@ export function loadSpeechFixture(fixturePath) {
   return fixture;
 }
 
-// The fixture sits in scripts/, beside the Python harness that reads it.
+// The fixture sits in scripts/smoke/, beside the speech smoke that reads it.
 export const SPEECH_FIXTURE = Object.freeze(loadSpeechFixture(path.join(import.meta.dirname, '..', SPEECH_FIXTURE_FILE)));
 export const EXPECTED_SPEECH_TRANSCRIPT = normalizeTranscript(SPEECH_FIXTURE.expected_text);
 
@@ -1709,6 +1724,12 @@ export const COMMANDS = Object.freeze({
   },
   'candidate-fingerprint': { options: [required('--candidate-dist', 'path')] },
   'harness-digest': { options: [required('--harness-dir', 'path')] },
+  // Fail-closed extraction of a downloaded artifact archive (candidate,
+  // attestation or prequalification) into a new or empty directory; silent
+  // on success.
+  'extract-artifact': {
+    options: [required('--type'), required('--archive', 'path'), required('--destination', 'path')],
+  },
 });
 
 export const PROG = progName(import.meta.url);
@@ -1771,6 +1792,11 @@ function harnessDigestCmd(args, write) {
   return 0;
 }
 
+function extractArtifactCmd(args) {
+  extractFlatArtifactArchive(args.archive, args.destination, { artifactType: args.type });
+  return 0;
+}
+
 // `qualify` runs the heavy gates, which live in ./qualify.mjs.
 async function qualifyCmd(args, write) {
   const module = await import('./qualify.mjs');
@@ -1783,6 +1809,7 @@ const RUNNERS = Object.freeze({
   'verify-attestation': verifyAttestationCmd,
   'candidate-fingerprint': candidateFingerprintCmd,
   'harness-digest': harnessDigestCmd,
+  'extract-artifact': extractArtifactCmd,
 });
 
 // str(exc) of a ContractError or OSError.

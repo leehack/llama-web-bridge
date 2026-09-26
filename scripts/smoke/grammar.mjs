@@ -32,7 +32,7 @@ import {
   withServer,
   withTempDir,
   writeStdout,
-} from './browser_smoke_support.mjs';
+} from './support.mjs';
 
 const DESCRIPTION = `Browser smoke for grammar-constrained completion and sampler options.
 
@@ -148,7 +148,7 @@ const INVALID_SAMPLER_OPTIONS = Object.freeze([
   { minP: -0.1 },
   { presencePenalty: Number.POSITIVE_INFINITY },
 ]);
-// speculative_browser_smoke.mjs checks the speculativeDecoding capabilities.
+// speculative.mjs checks the speculativeDecoding capabilities.
 export const COMPLETION_CAPABILITIES = Object.freeze(['presencePenalty', 'minP', 'thinkingBudget']);
 // Each tag follows a space: SentencePiece vocabularies tokenize a tag at the
 // start of text with a space prefix, so only a spaced tag in the prompt
@@ -520,7 +520,7 @@ export function validateThinkingBudget(entry) {
 
 export function parseArgs(argv) {
   return parseSmokeArgs(argv, {
-    prog: 'grammar_browser_smoke.mjs',
+    prog: 'grammar.mjs',
     description: DESCRIPTION,
     options: [
       {

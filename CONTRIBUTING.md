@@ -10,7 +10,7 @@ Published artifacts are consumed from `llama-web-bridge-assets`.
 ## Prerequisites
 
 - Emscripten SDK (`emcmake`, `emcc`) matching `emsdk.version`
-- Node.js 22.18 or newer (CI uses 24) and npm, for JS bridge bundling and
+- Node.js 22.18+ or 24.2+ (CI uses 24) and npm, for JS bridge bundling and
   type-checking; the tests run the `.ts` sources through Node's built-in type
   stripping
 - CMake toolchain
@@ -24,19 +24,19 @@ Published artifacts are consumed from `llama-web-bridge-assets`.
 git clone https://github.com/leehack/llama-web-bridge.git
 cd llama-web-bridge
 npm ci
-./scripts/build_bridge.sh --help
+./scripts/build/build_bridge.sh --help
 ```
 
 ## Local Build
 
 ```bash
 npm run check:js
-./scripts/build_bridge.sh
+./scripts/build/build_bridge.sh
 # or
-LLAMA_CPP_DIR=../llama.cpp OUT_DIR=dist ./scripts/build_bridge.sh
+LLAMA_CPP_DIR=../llama.cpp OUT_DIR=dist ./scripts/build/build_bridge.sh
 ```
 
-`./scripts/build_bridge.sh --help` is the complete list of environment
+`./scripts/build/build_bridge.sh --help` is the complete list of environment
 variables the build reads, with their defaults; the docs do not repeat the
 list.
 
@@ -47,8 +47,8 @@ runs the same generator plus TypeScript and syntax checks, so commit any updated
 `tests/**/*_test.mjs` contract test in parallel through Node's test runner,
 including the static state-persistence, text-to-speech, and decision API
 contracts, the media-helper compatibility contract, the wasm64 runtime patch
-contract for `scripts/patch_wasm64_runtime.mjs`, and the CI change selector.
-Run one test file directly with `node tests/js/<name>_test.mjs`.
+contract for `scripts/build/patch_wasm64_runtime.mjs`, and the CI change selector.
+Run one test file directly with `node tests/<area>/<name>_test.mjs`.
 
 `js/src/llama_webgpu_bridge.js` is the public entry. It re-exports the API and
 owns the only load-time side effects (worker host auto-boot and the
@@ -69,7 +69,7 @@ TypeScript here is limited to erasable syntax (`erasableSyntaxOnly`): types,
 `import type`, `declare` fields, and casts only, no enums, namespaces, or
 parameter properties. A class field without an initializer is `declare`d,
 because a plain field declaration emits code;
-`tests/js/declared_class_fields_test.mjs` enforces that. esbuild and Node both
+`tests/bridge/declared_class_fields_test.mjs` enforces that. esbuild and Node both
 strip the types without changing the code, so the tests run the `.ts` sources
 directly. A type change must not change behaviour: with comments and whitespace
 stripped, the bundle stays byte-identical. Import modules by their `.ts` path.
@@ -85,9 +85,9 @@ exported `llamadart_webgpu_*` functions grouped by feature; the remaining parts
 hold the state and internal helpers they use. A part is not a standalone file:
 it relies on everything included before it, so keep the include order. The
 static contract checks read the core with its parts expanded
-(`tests/js/native_core_source.mjs`), which is how the compiler sees it. It fails
+(`tests/bridge/native_core_source.mjs`), which is how the compiler sees it. It fails
 if a part is not included exactly once as a plain `#include` line. The JS API
-contract tests read the bridge the same way: `tests/js/bridge_js_source.mjs`
+contract tests read the bridge the same way: `tests/bridge/bridge_js_source.mjs`
 joins every `js/src` module in the order the former single-file source declared
 them.
 
@@ -101,7 +101,7 @@ BUILD_DIR=/private/tmp/llama_web_bridge_build \
 MEM64_BUILD_DIR=/private/tmp/llama_web_bridge_build_mem64 \
 OUT_DIR=/private/tmp/llama_web_bridge_dist \
 WEBGPU_BRIDGE_BUILD_MEM64=1 \
-./scripts/build_bridge.sh
+./scripts/build/build_bridge.sh
 ```
 
 ## Validate Outputs
@@ -124,8 +124,7 @@ Before opening or updating a PR, run the lightweight contracts:
 
 ```bash
 npm run check:js
-python3 -m unittest discover -s scripts -p '*_test.py'
-node scripts/verify_ci_reliability.mjs
+node scripts/ci/verify_ci_reliability.mjs
 ```
 
 Every browser smoke runs on Node with the locked `playwright` dev dependency:
@@ -140,7 +139,7 @@ against a built dist directory. Use a checksum-pinned tiny model and keep caches
 and artifacts outside the repository:
 
 ```bash
-node scripts/state_persistence_browser_smoke.mjs \
+node scripts/smoke/state_persistence.mjs \
   --dist-dir /private/tmp/llama_web_bridge_dist \
   --model-url https://huggingface.co/aladar/llama-2-tiny-random-GGUF/resolve/main/llama-2-tiny-random.gguf \
   --model-sha256 81f226c62d28ed4a1a9b9fa080fcd9f0cc40e0f9d5680036583ff98fbcd035cb \
@@ -152,7 +151,7 @@ For llama.cpp pin or multimodal changes, run checksum-pinned real image
 inference through both direct and worker runtimes:
 
 ```bash
-node scripts/multimodal_browser_smoke.mjs \
+node scripts/smoke/multimodal.mjs \
   --dist-dir /private/tmp/llama_web_bridge_dist \
   --model-path /path/to/Qwen3.5-0.8B-Q4_K_M.gguf \
   --model-sha256 bd258782e35f7f458f8aced1adc053e6e92e89bc735ba3be89d38a06121dc517 \
@@ -170,7 +169,7 @@ above; the smoke defaults to the `LLAMA_WEBGPU_SMOKE_MODEL_URL` and
 `LLAMA_WEBGPU_SMOKE_MODEL_SHA256` environment variables:
 
 ```bash
-node scripts/grammar_browser_smoke.mjs \
+node scripts/smoke/grammar.mjs \
   --dist-dir /private/tmp/llama_web_bridge_dist \
   --model-url "$LLAMA_WEBGPU_SMOKE_MODEL_URL" \
   --model-sha256 "$LLAMA_WEBGPU_SMOKE_MODEL_SHA256" \
@@ -181,7 +180,7 @@ For next-token scoring changes, run `scoreNextToken` through direct and worker
 runtimes on both memory modes with the state-persistence model:
 
 ```bash
-node scripts/next_token_scores_browser_smoke.mjs \
+node scripts/smoke/next_token_scores.mjs \
   --dist-dir /private/tmp/llama_web_bridge_dist \
   --model-url "$LLAMA_WEBGPU_SMOKE_MODEL_URL" \
   --model-sha256 "$LLAMA_WEBGPU_SMOKE_MODEL_SHA256" \
@@ -196,7 +195,7 @@ model; `--group all` adds real-weight groups for every strategy, read from
 drafts and the n-gram cache have no download URL, so place them there first:
 
 ```bash
-node scripts/speculative_browser_smoke.mjs \
+node scripts/smoke/speculative.mjs \
   --dist-dir /private/tmp/llama_web_bridge_dist \
   --group all \
   --models-dir ~/.cache/llama-web-bridge/speculative-smoke-models \
@@ -213,12 +212,12 @@ the candidate source's locked npm dependencies and Playwright Chromium, requires
 GitHub Actions `github-hosted` runner identity, and emits one canonical
 attestation. That attestation binds the candidate artifact ID/run/attempt/workflow/digest and the
 producing qualification run ID/attempt/workflow/source SHA. The combined
-`release_qualification.py qualify` command is therefore workflow-only.
+`scripts/release/qualification.mjs qualify` command is therefore workflow-only.
 
 For local reproduction, run the individual smokes directly:
 
 ```bash
-node scripts/speech_to_text_browser_smoke.mjs \
+node scripts/smoke/speech_to_text.mjs \
   --dist-dir /private/tmp/llama_web_bridge_dist \
   --model-path /path/to/Qwen3-ASR-0.6B-Q8_0.gguf \
   --model-sha256 bca259818b50ca7c4c05e9bdb35a5dc04fa039653a6d6f3f0f331f96f6aa1971 \
@@ -228,7 +227,7 @@ node scripts/speech_to_text_browser_smoke.mjs \
 ```
 
 ```bash
-node scripts/text_to_speech_browser_smoke.mjs \
+node scripts/smoke/text_to_speech.mjs \
   --dist-dir /private/tmp/llama_web_bridge_dist \
   --model-path /path/to/Qwen3-TTS-12Hz-1.7B-Base-Q4_K_M.gguf \
   --model-sha256 8d18c94acb2addd042f97da63c98be144eafa76d0d9495177eab65130cf85129 \
@@ -248,7 +247,7 @@ without `laya.config` metadata, such as the official `model.safetensors`, and
 `--gpu-layers 0` to check the CPU path:
 
 ```bash
-node scripts/decision_browser_smoke.mjs \
+node scripts/smoke/decision.mjs \
   --dist-dir /private/tmp/llama_web_bridge_dist \
   --model-path /path/to/laya-Q8_0.gguf \
   --head-path /path/to/laya-head.safetensors \
@@ -266,7 +265,7 @@ model reload check, because reloading a model on one bridge aborts in headless
 Chromium with WebGPU enabled, with or without adapters:
 
 ```bash
-node scripts/lora_adapter_browser_smoke.mjs \
+node scripts/smoke/lora_adapter.mjs \
   --dist-dir /private/tmp/llama_web_bridge_dist \
   --mismatch-model-url "$LLAMA_WEBGPU_SMOKE_MODEL_URL" \
   --mismatch-model-sha256 "$LLAMA_WEBGPU_SMOKE_MODEL_SHA256" \
@@ -278,32 +277,34 @@ query strings, and fragments before printing the location.
 
 ## Agent Workflow Guardrails
 
-- Keep the publication-safety rules in `scripts/verify_ci_reliability.mjs`
+- Keep the publication-safety rules in `scripts/ci/verify_ci_reliability.mjs`
   current when changing `.github/workflows/ci.yml`,
   `.github/workflows/bridge_candidate.yml`,
   `.github/workflows/publish_assets.yml`,
   `.github/workflows/auto_llama_cpp_update.yml`,
   `.github/workflows/bridge_qualification.yml`, or the model pins in
-  `scripts/release_qualification.py`. It checks permissions, environment gates,
-  PAT handling, pins, fail-closed guards, and that CI runs the contract tests;
+  `scripts/release/qualification.mjs`. It checks permissions, environment gates,
+  PAT handling, pins, fail-closed guards, that CI runs the contract tests, and
+  that no workflow runs a Python interpreter or package tool, a `*.py`
+  script, a python shell or a Python image;
   it does not check wording, step names it does not anchor on, or docs prose.
-  A new test in `tests/js/` runs once it is named `*_test.mjs`; any other file
+  A new test under `tests/` runs once it is named `*_test.mjs`; any other file
   under `tests/` must be a helper that a test imports.
 - Rotate all 7 model/projector SHA-256 pins in the three files that hard-code
   them together: `CONTRIBUTING.md`, `.github/workflows/ci.yml`,
   `.github/workflows/bridge_candidate.yml`.
-  `scripts/verify_ci_reliability.mjs` requires the three sets to be identical with
+  `scripts/ci/verify_ci_reliability.mjs` requires the three sets to be identical with
   exactly 7 pins each; a stale `bridge_candidate.yml` breaks the candidate job,
   not just CI. `README.md` and `AGENTS.md` hold no pins and link here.
   `publish_assets.yml` holds no pins because it neither builds nor
-  smokes. `scripts/release_qualification.py` carries the same 7 plus the pinned
+  smokes. `scripts/release/qualification.mjs` carries the same 7 plus the pinned
   ASR audio fixture, and every attestation must match them exactly.
   `.github/workflows/bridge_qualification.yml` hand-copies a 5-pin speech, TTS,
   and ASR audio subset, so rotate it with the rest.
-  `scripts/speech_to_text_fixture.json` holds the same ASR audio URL and
+  `scripts/smoke/speech_to_text_fixture.json` holds the same ASR audio URL and
   SHA-256, which the speech smoke uses as defaults, with the expected
-  transcript that `scripts/release_qualification.py` also reads.
-  `scripts/release_qualification_test.py` requires its SHA-256 to equal the
+  transcript that `scripts/release/qualification.mjs` also reads.
+  `tests/release/qualification_pins_test.mjs` requires its SHA-256 to equal the
   pin; nothing compares its URL, so rotate that by hand.
 - The script maps every workflow `<ROLE>_SHA256` env key to its canonical name in
   `EXPECTED_MODEL_PINS` and requires equality in all three workflows, so a role
@@ -321,11 +322,11 @@ query strings, and fragments before printing the location.
   `resolve/main` ref rather than an immutable 40-hex revision, and the ASR audio
   fixture is not a Hugging Face object and carries no revision segment at all;
   the script lists both sets and fails when a role joins or leaves them.
-- Keep `scripts/multimodal_browser_smoke.mjs` in normal CI for every llama.cpp
+- Keep `scripts/smoke/multimodal.mjs` in normal CI for every llama.cpp
   pin update; build-only validation does not cover mtmd prompt ingestion.
 - Heavy real-model ASR and TTS gates run through
-  `scripts/release_qualification.py` in automated qualification. Keep the
-  candidate manifest honest: `generate_release_manifest.py` must record those
+  `scripts/release/qualification.mjs` in automated qualification. Keep the
+  candidate manifest honest: `scripts/release/manifest.mjs` must record those
   two gates as `required-automated-qualification`, never as a candidate-build
   pass, and must
   keep real-device playback, intelligibility, and speaker-reference fidelity in
@@ -336,7 +337,7 @@ query strings, and fragments before printing the location.
   build or hosted gate, dispatch a new candidate run instead of rerunning one.
 - Preserve `llama_cpp.version` as the default ordinary CI/development build pin.
   It holds exactly one upstream tag in either channel, stable
-  `vMAJOR.MINOR.PATCH` or development `bNNNN`; `scripts/verify_ci_reliability.mjs`
+  `vMAJOR.MINOR.PATCH` or development `bNNNN`; `scripts/ci/verify_ci_reliability.mjs`
   rejects every other form. Exact release publication receives upstream identity
   from the orchestrator and must not require a bridge pin PR.
 - Preserve `emsdk.version` as the single compiler source for CI and publish.
@@ -478,8 +479,8 @@ also require a successful stage run on the default branch with owner actor and
 triggering actor before either job starts.
 
 New bridge asset tags are npm-shaped `vMAJOR.MINOR.PATCH` with rebuild `0`:
-`select_next_release_target` skips a published or claimed version by taking
-the next free patch version, and `release_contract.py validate-release` rejects
+`selectNextReleaseTarget` skips a published or claimed version by taking
+the next free patch version, and `scripts/release/contract.mjs validate-release` rejects
 a new `-N` tag in the candidate and publish workflows, because npm orders
 `vMAJOR.MINOR.PATCH-N` as a prerelease. Earlier `-N` bridge tags, the native
 forms `vMAJOR.MINOR.PATCH-N`, `bNNNN` and `bNNNN-N`, historical
@@ -497,7 +498,7 @@ Transport dispatch inputs through `env` and use quoted shell expansions.
 ## CI change selection and compiler cache
 
 CI always runs the shared JS and workflow contracts. An explicit allowlist in
-`scripts/ci_scope.mjs` lets known documentation and tooling-only changes avoid the
+`scripts/ci/ci_scope.mjs` lets known documentation and tooling-only changes avoid the
 WASM builds. Runtime JS, C++, browser harnesses, build inputs, workflows, pins,
 and unknown paths retain the pinned build/smoke lane. Rename and
 deletion comparisons include both paths. The `CI validation` result always
@@ -509,7 +510,7 @@ OS/architecture, exact Emscripten version, resolved llama.cpp commit, and build
 script/CMake/patch inputs. ccache also checks compiler contents, source inputs,
 and compile flags. Every selected build still links fresh artifacts and runs
 every CI browser smoke. Candidate and publication workflows do not consume
-this cache or this change selector, so `scripts/ci_scope.mjs` is listed in
+this cache or this change selector, so `scripts/ci/ci_scope.mjs` is listed in
 `ORCHESTRATION_ONLY_PATHS` in `scripts/release/orchestrator/cli.mjs`. List any
 new CI-only script there too: an unclassified path is governed by default and
 advances the release build identity. Track follow-up work in

@@ -2,9 +2,16 @@ import assert from 'node:assert/strict';
 import { readdirSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 
+import { EXPECTED_MODEL_PINS as QUALIFICATION_MODEL_PINS } from '../../scripts/release/qualification.mjs';
 import {
   CANONICAL_MODEL_PIN_NAMES,
+  EMSCRIPTEN_VERIFIER,
   EXPECTED_MODEL_PINS,
+  QUALIFICATION_MODULE,
+  QUALIFY_COMMAND,
+  RELEASE_CONTRACT_SUITES,
+  RELEASE_MANIFEST_MODULE,
+  collectErrors as collectRepositoryErrors,
   ORCHESTRATOR_COMMAND,
   ORCHESTRATOR_DIRECTORY,
   ORCHESTRATOR_ENTRY,
@@ -32,7 +39,7 @@ import {
   requireQualificationModelShaPinRoles,
   requireQualificationNodeHarness,
   validatePublicationPatContract,
-} from '../../scripts/verify_ci_reliability.mjs';
+} from '../../scripts/ci/verify_ci_reliability.mjs';
 
 // Contract tests for the CI reliability verifier: the role-aware model pin,
 // URL and revision parity checks, and the publication PAT validator's
@@ -40,25 +47,52 @@ import {
 
 const read = (relativePath) => readFileSync(path.join(ROOT, relativePath), 'utf8');
 
-// EXPECTED_MODEL_PINS is read from release_qualification.py and fails closed.
+// EXPECTED_MODEL_PINS is parsed from the JavaScript source of
+// scripts/release/qualification.mjs, equals what that module exports, and
+// fails closed.
 {
   assert.equal(Object.keys(EXPECTED_MODEL_PINS).length, 8);
   for (const pin of Object.values(EXPECTED_MODEL_PINS)) assert.match(pin, /^[0-9a-f]{64}$/);
-  assert.deepEqual(parseExpectedModelPins(read('scripts/release_qualification.py')), EXPECTED_MODEL_PINS);
-  const source = read('scripts/release_qualification.py');
+  const source = read(QUALIFICATION_MODULE);
+  assert.deepEqual(parseExpectedModelPins(source), EXPECTED_MODEL_PINS);
+  assert.deepEqual(EXPECTED_MODEL_PINS, { ...QUALIFICATION_MODEL_PINS });
+  const entry = '  tts_model_sha256: TTS_MODEL_SHA256,\n';
+  assert.ok(source.includes(entry));
+  assert.throws(() => parseExpectedModelPins(source.replace(entry, '')), /declares 7 pins, expected 8/);
   assert.throws(
-    () => parseExpectedModelPins(source.replace('    "tts_model_sha256": TTS_MODEL_SHA256,\n', '')),
-    /declares 7 pins, expected 8/,
+    () => parseExpectedModelPins(source.replace(entry, '  tts_model_sha256: UNKNOWN_SHA256,\n')),
+    /maps tts_model_sha256 to UNKNOWN_SHA256, which is not a 64-hex constant/,
   );
   assert.throws(
-    () => parseExpectedModelPins(source.replace('"tts_model_sha256": TTS_MODEL_SHA256', '"tts_model_sha256": UNKNOWN_SHA256')),
-    /not a 64-hex constant/,
-  );
-  assert.throws(
-    () => parseExpectedModelPins(source.replace('"tts_model_sha256": TTS_MODEL_SHA256', '"tts_model_sha256": TTS_MODEL_SHA256 + ""')),
+    () => parseExpectedModelPins(source.replace(entry, "  tts_model_sha256: TTS_MODEL_SHA256 + '',\n")),
     /cannot resolve/,
   );
-  assert.throws(() => parseExpectedModelPins(''), /no EXPECTED_MODEL_PINS/);
+  assert.throws(
+    () => parseExpectedModelPins(source.replace(entry, `${entry}  tts_model_sha256: TTS_MODEL_SHA256,\n`)),
+    /names tts_model_sha256 twice/,
+  );
+  // A quoted key and a trailing comment are JavaScript the reader follows.
+  assert.deepEqual(
+    parseExpectedModelPins(source.replace(entry, "  'tts_model_sha256': TTS_MODEL_SHA256, // the TTS model\n")),
+    EXPECTED_MODEL_PINS,
+  );
+  // A role mapped to another role's constant is the canonical value the
+  // workflows are checked against, so the pin parity checks see the swap.
+  const swapped = parseExpectedModelPins(source.replace(entry, '  tts_model_sha256: SPEECH_MODEL_SHA256,\n'));
+  assert.equal(swapped.tts_model_sha256, EXPECTED_MODEL_PINS.speech_model_sha256);
+  const constant = `export const TTS_MODEL_SHA256 = '${EXPECTED_MODEL_PINS.tts_model_sha256}';\n`;
+  assert.ok(source.includes(constant));
+  assert.throws(() => parseExpectedModelPins(source.replace(constant, `${constant}${constant}`)), /defines TTS_MODEL_SHA256 twice/);
+  assert.throws(() => parseExpectedModelPins(source.replace(constant, constant.replace(/'[0-9a-f]{64}'/, "'abc'"))),
+    /TTS_MODEL_SHA256, which is not a 64-hex constant/);
+  assert.throws(() => parseExpectedModelPins(source.replace(constant, constant.replace('export const', 'const'))),
+    /TTS_MODEL_SHA256, which is not a 64-hex constant/);
+  assert.throws(() => parseExpectedModelPins(source.replace('export const EXPECTED_MODEL_PINS = Object.freeze({', 'export const EXPECTED_MODEL_PINS = ({')),
+    /no export const EXPECTED_MODEL_PINS = Object.freeze/);
+  assert.throws(() => parseExpectedModelPins(''), /no export const EXPECTED_MODEL_PINS/);
+  // The retired Python syntax is not read.
+  assert.throws(() => parseExpectedModelPins('TTS_MODEL_SHA256 = (\n    "' + 'a'.repeat(64) + '"\n)\nEXPECTED_MODEL_PINS = {\n    "tts_model_sha256": TTS_MODEL_SHA256,\n}\n'),
+    /no export const EXPECTED_MODEL_PINS/);
 }
 
 // --- Model pin parity ------------------------------------------------------
@@ -120,7 +154,7 @@ function workflow(roles, { urls = {}, pins = {} } = {}) {
 
 function markdown({ pins = {}, roles = DOCUMENTED_ROLES } = {}) {
   const resolved = { ...EXPECTED_MODEL_PINS, ...pins };
-  const lines = ['```bash', 'node scripts/example_browser_smoke.mjs \\'];
+  const lines = ['```bash', 'node scripts/smoke/example.mjs \\'];
   for (const [roleFlag, value, pinFlag, name] of roles) {
     lines.push(`  ${roleFlag} ${value} \\`);
     lines.push(`  ${pinFlag} ${resolved[name]} \\`);
@@ -269,7 +303,7 @@ assertRejected(
   } finally {
     delete CANONICAL_MODEL_PIN_NAMES.LLAMA_WEBGPU_ABSENT_MODEL_SHA256;
   }
-  assertRejected(errors, 'EXPECTED_MODEL_PINS does not declare');
+  assertRejected(errors, 'that EXPECTED_MODEL_PINS in scripts/release/qualification.mjs does not declare');
 }
 
 // URL trailing comment accepted
@@ -348,18 +382,20 @@ assertRejected(
   const setupNode = '        uses: actions/setup-node@v4\n        with:\n          node-version: 24\n';
   const npmCi = '      - name: Install the candidate\'s locked npm dependencies\n        working-directory: candidate-source\n        run: npm ci --ignore-scripts\n';
   const chromium = '        working-directory: candidate-source\n        run: npx --no-install playwright install --only-shell chromium\n';
-  for (const needle of [setupNode, npmCi, chromium]) assert.ok(real.includes(needle), needle);
+  for (const needle of [setupNode, npmCi, chromium, QUALIFY_COMMAND]) assert.ok(real.includes(needle), needle);
+  assert.equal(real.split(setupNode).length - 1, 2);
   const qualifyStep = real.slice(real.indexOf('      - name: Run the heavy Qwen3-ASR and Qwen3-TTS gates'), real.indexOf('      - name: Re-verify the attestation'));
   const setupMessage = 'must set up Node.js 24, run npm ci --ignore-scripts and install the Playwright Chromium in candidate-source';
   for (const [label, text] of [
-    ['no setup-node', real.replace(setupNode, '        uses: actions/cache@v4\n        with:\n          node-version: 24\n')],
-    ['Node 22', real.replace(setupNode, setupNode.replace('24', '22'))],
+    ['no setup-node', real.replaceAll(setupNode, '        uses: actions/cache@v4\n        with:\n          node-version: 24\n')],
+    ['Node 22', real.replaceAll(setupNode, setupNode.replace('24', '22'))],
     ['npm ci in the trusted checkout', real.replace(npmCi, npmCi.replace('        working-directory: candidate-source\n', ''))],
     ['npm ci with lifecycle scripts', real.replace(npmCi, npmCi.replace('npm ci --ignore-scripts', 'npm ci'))],
     ['Chromium from the trusted checkout', real.replace(chromium, chromium.replace('        working-directory: candidate-source\n', ''))],
     ['setup after qualify', real.replace(qualifyStep, '').replace('      - name: Re-verify the attestation', `${qualifyStep}      - name: Re-verify the attestation`)
       .replace(npmCi, '').replace('      - name: Upload verified', `${npmCi}\n      - name: Upload verified`)],
-    ['no qualify', real.replace('release_qualification.py qualify', 'release_qualification.py run-gates')],
+    ['no qualify', real.replace(QUALIFY_COMMAND, 'node candidate-source/scripts/release/qualification.mjs run-gates')],
+    ['qualify from the trusted checkout', real.replace(QUALIFY_COMMAND, 'node scripts/release/qualification.mjs qualify')],
   ]) {
     assert.ok(qualificationErrors(text).some((error) => error.includes(setupMessage)), label);
   }
@@ -479,11 +515,11 @@ assertRejected(validatePublicationPatContract('jobs: [unterminated', EXPECTED_ST
   const packageJson = (scripts) => JSON.stringify({ scripts });
   const good = { 'check:js': 'npm run typecheck:js && npm test', test: TEST_COMMAND };
   const files = {
-    'tests/js/a_test.mjs': "import { x } from './helper.mjs';\nconst late = await import(`./late.mjs`);",
-    'tests/js/helper.mjs': "export { y as x } from './nested/deep_helper.mjs';",
-    'tests/js/late.mjs': 'export {};',
-    'tests/js/nested/deep_helper.mjs': "import '../../shared/bare.mjs';\nexport const y = 1;",
-    'tests/js/nested/b_test.mjs': '',
+    'tests/bridge/a_test.mjs': "import { x } from './helper.mjs';\nconst late = await import(`./late.mjs`);",
+    'tests/bridge/helper.mjs': "export { y as x } from './nested/deep_helper.mjs';",
+    'tests/bridge/late.mjs': 'export {};',
+    'tests/bridge/nested/deep_helper.mjs': "import '../../shared/bare.mjs';\nexport const y = 1;",
+    'tests/bridge/nested/b_test.mjs': '',
     'tests/shared/bare.mjs': '',
   };
   const errorsFor = (json, testFiles) => {
@@ -493,7 +529,7 @@ assertRejected(validatePublicationPatContract('jobs: [unterminated', EXPECTED_ST
   };
   assert.deepEqual(errorsFor(packageJson(good), files), []);
   assert.deepEqual(errorsFor(packageJson({ ...good, 'check:js': 'npm run test' }), files), []);
-  assert.match(errorsFor(packageJson({ ...good, test: "node --test 'tests/js/*_test.mjs'" }), files).join('\n'), /npm test must be exactly/);
+  assert.match(errorsFor(packageJson({ ...good, test: "node --test 'tests/bridge/*_test.mjs'" }), files).join('\n'), /npm test must be exactly/);
   assert.match(errorsFor(packageJson({ ...good, test: `${TEST_COMMAND} || true` }), files).join('\n'), /npm test must be exactly/);
   assert.match(errorsFor(packageJson({ ...good, 'check:js': 'npm run typecheck:js' }), files).join('\n'), /check:js must run npm test/);
   assert.match(errorsFor(packageJson({ ...good, 'check:js': 'npm test || true' }), files).join('\n'), /check:js must run npm test/);
@@ -503,21 +539,21 @@ assertRejected(validatePublicationPatContract('jobs: [unterminated', EXPECTED_ST
     .map((error) => /^(\S+) is neither/.exec(error)?.[1]);
   // A misnamed test, and a helper imported only by an unrun file, never run.
   assert.deepEqual(unreached({
-    'tests/js/c.test.mjs': "import './orphan_helper.mjs';",
-    'tests/js/orphan_helper.mjs': '',
-  }), ['tests/js/c.test.mjs', 'tests/js/orphan_helper.mjs']);
+    'tests/bridge/c.test.mjs': "import './orphan_helper.mjs';",
+    'tests/bridge/orphan_helper.mjs': '',
+  }), ['tests/bridge/c.test.mjs', 'tests/bridge/orphan_helper.mjs']);
   // Naming a file in a string or path list, or importing a same-named file in
   // another directory, does not reach it.
   assert.deepEqual(unreached({
-    'tests/js/d_test.mjs': "const listed = ['tests/js/e.test.mjs', './e.test.mjs'];",
-    'tests/js/e.test.mjs': '',
+    'tests/bridge/d_test.mjs': "const listed = ['tests/bridge/e.test.mjs', './e.test.mjs'];",
+    'tests/bridge/e.test.mjs': '',
     'tests/other/helper.mjs': '',
-  }), ['tests/js/e.test.mjs', 'tests/other/helper.mjs']);
+  }), ['tests/bridge/e.test.mjs', 'tests/other/helper.mjs']);
   // An interpolated dynamic import cannot be resolved statically.
   assert.deepEqual(unreached({
-    'tests/js/f_test.mjs': 'await import(`./${name}.mjs`);',
-    'tests/js/g.mjs': '',
-  }), ['tests/js/g.mjs']);
+    'tests/bridge/f_test.mjs': 'await import(`./${name}.mjs`);',
+    'tests/bridge/g.mjs': '',
+  }), ['tests/bridge/g.mjs']);
 }
 
 // --- Orchestration ---------------------------------------------------------
@@ -632,8 +668,8 @@ assertRejected(validatePublicationPatContract('jobs: [unterminated', EXPECTED_ST
   const driver = `${ORCHESTRATOR_DIRECTORY}/driver.mjs`;
   assertRejected(sources({ ...sourceFiles, [driver]: `import './missing.mjs';\n${sourceFiles[driver]}` }).errors,
     `imports ${ORCHESTRATOR_DIRECTORY}/missing.mjs, which does not exist`);
-  assertRejected(sources({ ...sourceFiles, [driver]: `import '../../ci_scope.mjs';\n${sourceFiles[driver]}` }).errors,
-    'imports scripts/ci_scope.mjs, which is neither');
+  assertRejected(sources({ ...sourceFiles, [driver]: `import '../../ci/ci_scope.mjs';\n${sourceFiles[driver]}` }).errors,
+    'imports scripts/ci/ci_scope.mjs, which is neither');
   assertRejected(sources({ ...sourceFiles, [driver]: `import '../qualify.mjs';\n${sourceFiles[driver]}` }).errors,
     'imports scripts/release/qualify.mjs, which is neither');
   assertRejected(sources({ ...sourceFiles, [driver]: `const m = await import(name);\n${sourceFiles[driver]}` }).errors,
@@ -718,6 +754,185 @@ assertRejected(validatePublicationPatContract('jobs: [unterminated', EXPECTED_ST
     const { errors } = sources({ ...sourceFiles, [planner]: `${sourceFiles[planner]}\n${line}\n` });
     assertRejected(errors, expected);
     assert.ok(errors.every((error) => error.startsWith(planner)), label);
+  }
+}
+
+// --- Release workflow commands ---------------------------------------------
+
+// Every command needle of the candidate, qualification, publish and CI
+// checks, proven against a mutated copy of the real file: the tree passes,
+// and each mutation (most of them the Python command the Node one replaced)
+// is rejected for its own reason.
+{
+  const PUBLISH_PATH = '.github/workflows/publish_assets.yml';
+  const BUILD_SCRIPT = 'scripts/build/build_bridge.sh';
+  assert.deepEqual(collectRepositoryErrors(), []);
+  // Replace every occurrence of `old` (or only the first, with once) in the
+  // real file and return the verifier's errors.
+  const mutated = (relativePath, old, replacement, { once = false } = {}) => {
+    const text = read(relativePath);
+    assert.ok(text.includes(old), `${relativePath} no longer contains ${JSON.stringify(old)}`);
+    const changed = once ? text.replace(old, () => replacement) : text.split(old).join(replacement);
+    return collectRepositoryErrors({ [relativePath]: changed });
+  };
+  const cases = [
+    // No workflow runs Python (the R2 rule that replaced "CI runs the Python
+    // unittest suite").
+    [CANDIDATE_PATH, 'node scripts/release/contract.mjs validate-release', 'python3 scripts/release_contract.py validate-release',
+      'runs Python ("python3")'],
+    [CI_PATH, 'run: node scripts/ci/verify_ci_reliability.mjs', "run: python3 -m unittest discover -s scripts -p '*_test.py'",
+      'runs Python ("python3")'],
+    [CI_PATH, 'run: node scripts/ci/verify_ci_reliability.mjs', 'run: python -m py_compile x',
+      'runs Python ("python")'],
+    [PUBLISH_PATH, '          npm ci --ignore-scripts\n', '          npm ci --ignore-scripts\n          pip install -r requirements.txt\n',
+      'runs Python ("pip")'],
+    [CANDIDATE_PATH, './scripts/build/build_bridge.sh', './scripts/build/build_bridge.py', 'runs Python ("./scripts/build/build_bridge.py")'],
+    [CI_PATH, '      - uses: actions/setup-node@v4\n        with:\n          node-version: 24\n      - id: scope',
+      '      - uses: actions/setup-python@v5\n        with:\n          node-version: 24\n      - id: scope', 'runs Python (actions/setup-python@v5)'],
+    [CI_PATH, 'run: node scripts/ci/verify_ci_reliability.mjs', 'run: pipx run check-jsonschema x', 'runs Python ("pipx")'],
+    [CI_PATH, 'run: node scripts/ci/verify_ci_reliability.mjs', 'run: uvx ruff check', 'runs Python ("uvx")'],
+    [CI_PATH, 'run: node scripts/ci/verify_ci_reliability.mjs', 'run: uv run x', 'runs Python ("uv")'],
+    [CI_PATH, 'run: node scripts/ci/verify_ci_reliability.mjs', 'shell: python\n        run: print(1)', 'runs Python (shell: python)'],
+    [CI_PATH, 'run: node scripts/ci/verify_ci_reliability.mjs', 'uses: docker://python:3.12-slim', 'runs Python (docker://python:3.12-slim)'],
+    [CI_PATH, 'run: node scripts/ci/verify_ci_reliability.mjs', 'run: pytest -q', 'runs Python ("pytest")'],
+    [CI_PATH, 'run: node scripts/ci/verify_ci_reliability.mjs', 'run: poetry install', 'runs Python ("poetry")'],
+    [CI_PATH, 'run: node scripts/ci/verify_ci_reliability.mjs', 'run: py -3 -m x', 'runs Python ("py")'],
+    [CI_PATH, 'run: node scripts/ci/verify_ci_reliability.mjs', 'run: ./tool.pyz', 'runs Python ("./tool.pyz")'],
+    [CI_PATH, 'run: node scripts/ci/verify_ci_reliability.mjs', 'uses: astral-sh/setup-uv@v6', 'runs Python (astral-sh/setup-uv@v6)'],
+    [CI_PATH, 'run: node scripts/ci/verify_ci_reliability.mjs', 'uses: docker://ghcr.io/astral-sh/uv:latest', 'runs Python (docker://ghcr.io/astral-sh/uv:latest)'],
+    [CI_PATH, '    runs-on: ubuntu-latest\n', '    runs-on: ubuntu-latest\n    defaults:\n      run:\n        shell: python3 {0}\n', 'runs Python (shell: python3 {0})', { once: true }],
+    [CI_PATH, '    runs-on: ubuntu-latest\n', '    runs-on: ubuntu-latest\n    container: python:3.12\n', 'runs Python (container: python:3.12)', { once: true }],
+    // R2: CI runs this contract.
+    [CI_PATH, 'run: node scripts/ci/verify_ci_reliability.mjs', 'run: true', 'must run the CI reliability contract'],
+    // R3: candidate and publish run the release suites through check:js.
+    [CANDIDATE_PATH, '          npm run check:js\n', '', 'run the release contract suites (through npm run check:js)'],
+    [PUBLISH_PATH, '          node scripts/ci/verify_ci_reliability.mjs\n', '', 'run the release contract suites (through npm run check:js)'],
+    // Rows 44-46: the Emscripten pin, its verifier and the manifest record.
+    [CI_PATH, 'node scripts/build/verify_emscripten_version.mjs --print-pin', 'python3 scripts/verify_emscripten_version.py --print-pin',
+      'resolve emsdk.version and verify the resolved emcc version before building'],
+    [CANDIDATE_PATH, 'node scripts/build/verify_emscripten_version.mjs --emit-github-env', 'python3 scripts/verify_emscripten_version.py --emit-github-env',
+      'resolve emsdk.version and verify the resolved emcc version before building'],
+    [EMSCRIPTEN_VERIFIER, "spawnSync('emcc', ['--version']", "spawnSync('emcc', ['-v']", 'the Emscripten verifier must compare emcc'],
+    [EMSCRIPTEN_VERIFIER, 'if (resolved !== expected)', 'if (false)', 'the Emscripten verifier must compare emcc'],
+    [EMSCRIPTEN_VERIFIER, '`EMSCRIPTEN_VERSION=${resolved}\\n`', '`EMSCRIPTEN_VERSION=${expected}\\n`', 'the Emscripten verifier must compare emcc'],
+    [EMSCRIPTEN_VERIFIER, "const PIN_NAME = 'emsdk.version';", "const PIN_NAME = 'emsdk.txt';", 'the Emscripten verifier must compare emcc'],
+    [BUILD_SCRIPT, 'node "$BRIDGE_DIR/scripts/build/verify_emscripten_version.mjs"', 'python3 "$BRIDGE_DIR/scripts/verify_emscripten_version.py"',
+      'and gate direct builds'],
+    [BUILD_SCRIPT, 'node "$BRIDGE_DIR/scripts/build/verify_emscripten_version.mjs"\n', '', 'and gate direct builds'],
+    // configure echoed before the gate: the gate no longer runs first
+    [BUILD_SCRIPT, 'node "$BRIDGE_DIR/scripts/build/verify_emscripten_version.mjs"\n',
+      'echo "[bridge] configuring with emcmake"\nnode "$BRIDGE_DIR/scripts/build/verify_emscripten_version.mjs"\n', 'and gate direct builds'],
+    [RELEASE_MANIFEST_MODULE, 'emscripten_version: args.emscriptenVersion,', "emscripten_version: '6.0.8',",
+      'must record the runtime-verified Emscripten compiler version'],
+    [CANDIDATE_PATH, 'node scripts/release/manifest.mjs \\', 'python3 scripts/generate_release_manifest.py \\',
+      'must record the runtime-verified Emscripten compiler version'],
+    // The environment validators: the trusted checkout before approval, the
+    // publication-policy checkout after it.
+    [PUBLISH_PATH, 'node scripts/release/contract.mjs validate-environment', 'python3 scripts/release_contract.py validate-environment',
+      'job verify-publication-environment must run after the approval check'],
+    [PUBLISH_PATH, 'node publication-policy/scripts/release/contract.mjs validate-environment', 'python3 publication-policy/scripts/release_contract.py validate-environment',
+      'revalidate the environment policy with github.token and the trusted publication-policy validator'],
+    [PUBLISH_PATH, 'node publication-policy/scripts/release/contract.mjs validate-environment', 'node scripts/release/contract.mjs validate-environment',
+      'revalidate the environment policy with github.token and the trusted publication-policy validator'],
+    // Rows 73-76: exact provenance.
+    [PUBLISH_PATH, 'node scripts/release/contract.mjs resolve-tag-commit', 'python3 scripts/release_contract.py resolve-tag-commit',
+      'must resolve the upstream and native tag commits itself', { once: true }],
+    [PUBLISH_PATH, 'node scripts/release/contract.mjs validate-native-request', 'python3 scripts/release_contract.py validate-native-request',
+      'must validate native tag, upstream commit, and manifest SHA-256 inputs before the first native network request'],
+    [PUBLISH_PATH, 'node scripts/release/contract.mjs validate-native-release', 'python3 scripts/release_contract.py validate-native-release',
+      `missing: "${RELEASE_CONTRACT_COMMAND} validate-native-release"`],
+    [PUBLISH_PATH, 'node scripts/release/contract.mjs require-correlation-id', 'true',
+      'the correlation id and both repositories'],
+    [PUBLISH_PATH, '--repository "${NATIVE_REPO}" --field native_repo', '--repository "${NATIVE_REPO}" --field assets_repo',
+      'the correlation id and both repositories'],
+    [PUBLISH_PATH, 'node publication-policy/scripts/release/contract.mjs resolve-tag-commit', 'python3 publication-policy/scripts/release_contract.py resolve-tag-commit',
+      'must resolve the existing asset tag with the strict trusted parser', { once: true }],
+    // Rows 78-80: classification, governance and readback, all with the
+    // trusted publication-policy CLIs.
+    [PUBLISH_PATH, 'node publication-policy/scripts/release/publication_state.mjs classify', 'python3 publication-policy/scripts/release_publication_state.py classify',
+      'must re-query the remote state after a failed ref mutation'],
+    [PUBLISH_PATH, 'node publication-policy/scripts/release/publication_state.mjs classify', 'node bridge-source/scripts/release/publication_state.mjs classify',
+      'never rebuild the candidate or run a validator from the historical build source'],
+    [PUBLISH_PATH, 'node publication-policy/scripts/release/publication_state.mjs state-changed', 'python3 publication-policy/scripts/release_publication_state.py state-changed',
+      'publication_state.mjs state-changed"'],
+    [PUBLISH_PATH, 'node publication-policy/scripts/release/publication_state.mjs mutation-unknown', 'python3 publication-policy/scripts/release_publication_state.py mutation-unknown',
+      'publication_state.mjs mutation-unknown"'],
+    [PUBLISH_PATH, 'node publication-policy/scripts/release/publication_state.mjs validate-target', 'python3 publication-policy/scripts/release_publication_state.py validate-target',
+      'publication_state.mjs validate-target"'],
+    [PUBLISH_PATH, '&& node publication-policy/scripts/release/publication_state.mjs \\\n              verify-immutable-publication',
+      '&& python3 publication-policy/scripts/release_publication_state.py \\\n              verify-immutable-publication',
+      'publication_state.mjs verify-immutable-publication"'],
+    [PUBLISH_PATH, 'node publication-policy/scripts/release/contract.mjs \\\n            validate-immutable-release-governance',
+      'python3 publication-policy/scripts/release_contract.py \\\n            validate-immutable-release-governance',
+      'must prove immutable-release governance through the repository API before the first ref mutation'],
+    [PUBLISH_PATH, 'node publication-policy/scripts/release/contract.mjs \\\n                 validate-immutable-release-governance',
+      'python3 publication-policy/scripts/release_contract.py \\\n                 validate-immutable-release-governance',
+      'must prove immutable-release governance through the repository API before the first ref mutation'],
+    // Rows 87-91: verify-run, verify-attestation, extraction and qualify.
+    [PUBLISH_PATH, 'node scripts/release/qualification.mjs verify-attestation', 'python3 scripts/release_qualification.py verify-attestation',
+      'job verify-candidate-and-qualification must verify the attestation with node scripts/release/qualification.mjs verify-attestation'],
+    [PUBLISH_PATH, 'node publication-policy/scripts/release/qualification.mjs verify-attestation', 'node bridge-source/scripts/release/qualification.mjs verify-attestation',
+      'job publish-assets must verify the attestation with node publication-policy/scripts/release/qualification.mjs verify-attestation'],
+    [PUBLISH_PATH, 'node scripts/release/qualification.mjs verify-run', 'python3 scripts/release_qualification.py verify-run',
+      `missing: "${RELEASE_QUALIFICATION_COMMAND} verify-run"`],
+    [PUBLISH_PATH, 'node scripts/release/qualification.mjs extract-artifact --type candidate', 'node scripts/release/archive.mjs --type candidate',
+      'download all three artifacts by immutable id'],
+    [PUBLISH_PATH, 'extract-artifact --type attestation', 'extract-artifact --type candidate', 'download all three artifacts by immutable id'],
+    [PUBLISH_PATH, 'extract-artifact --type prequalification', 'extract-artifact --type attestation', 'download all three artifacts by immutable id'],
+    [PUBLISH_PATH, '--harness-dir bridge-source/scripts)"', '--harness-dir scripts)"', 'download all three artifacts by immutable id'],
+    [PUBLISH_PATH, 'node scripts/release/contract.mjs validate-candidate-prequalification', 'true', 'download all three artifacts by immutable id'],
+    [PUBLISH_PATH, 'node bridge-source/scripts/build/verify_emscripten_version.mjs --print-pin', 'node scripts/build/verify_emscripten_version.mjs --print-pin',
+      'may run only node bridge-source/scripts/build/verify_emscripten_version.mjs --print-pin'],
+    [PUBLISH_PATH, 'node scripts/release/contract.mjs validate-release', 'node bridge-source/scripts/release/contract.mjs validate-release',
+      'never rebuild the candidate or run a validator from the historical build source'],
+    [PUBLISH_PATH, 'node bridge-source/scripts/build/verify_emscripten_version.mjs --print-pin', 'node bridge-source/scripts/release/manifest.mjs --print-pin',
+      'never rebuild the candidate or run a validator from the historical build source'],
+    [QUALIFICATION_PATH, 'node scripts/release/qualification.mjs verify-run', 'python3 scripts/release_qualification.py verify-run',
+      `missing: "${RELEASE_QUALIFICATION_COMMAND} verify-run"`],
+    [QUALIFICATION_PATH, 'node scripts/release/qualification.mjs extract-artifact --type candidate', 'node scripts/release/qualification.mjs extract-artifact --type attestation',
+      'bind the attestation to the exact candidate artifact id'],
+    [QUALIFICATION_PATH, 'node scripts/release/qualification.mjs verify-attestation', 'node candidate-source/scripts/release/qualification.mjs verify-attestation',
+      `missing: "${RELEASE_QUALIFICATION_COMMAND} verify-attestation"`],
+    [QUALIFICATION_PATH, 'node scripts/release/qualification.mjs candidate-fingerprint', 'python3 scripts/release_qualification.py candidate-fingerprint',
+      `missing: "${RELEASE_QUALIFICATION_COMMAND} candidate-fingerprint"`],
+    [QUALIFICATION_PATH, QUALIFY_COMMAND, 'python3 candidate-source/scripts/release_qualification.py qualify', `missing: "${QUALIFY_COMMAND}`],
+    [QUALIFICATION_PATH, '--harness-dir candidate-source/scripts', '--harness-dir scripts', 'missing: "--harness-dir candidate-source/scripts"'],
+    // Node.js 24 before each job's first node command; the privileged publish
+    // jobs without a package cache and without packages.
+    [QUALIFICATION_PATH, '      - name: Setup Node.js for the trusted contract\n        uses: actions/setup-node@v4\n        with:\n          node-version: 24\n\n', '',
+      `${QUALIFICATION_PATH} job qualify must set up Node.js 24 with actions/setup-node@v4 before its first node command`],
+    [CANDIDATE_PATH, 'uses: actions/setup-node@v4', 'uses: actions/setup-node@v5',
+      `${CANDIDATE_PATH} job build-candidate must set up Node.js 24`],
+    [CI_PATH, '      - uses: actions/setup-node@v4\n        with:\n          node-version: 24\n      - id: scope', '      - id: scope',
+      `${CI_PATH} job changes must set up Node.js 24`],
+    [PUBLISH_PATH, '      - name: Setup Node.js\n        uses: actions/setup-node@v4\n        with:\n          node-version: 24\n      - name: Fail closed', '      - name: Fail closed',
+      `${PUBLISH_PATH} job verify-publication-environment must set up Node.js 24`],
+    [PUBLISH_PATH, '      - name: Setup Node.js\n        uses: actions/setup-node@v4\n        with:\n          node-version: 24\n\n      - name: Download gated', '      - name: Download gated',
+      `${PUBLISH_PATH} job publish-assets must set up Node.js 24 with actions/setup-node@v4 before its first node command, without a package cache`],
+    [PUBLISH_PATH, '        with:\n          node-version: 24\n\n      - name: Download gated', '        with:\n          node-version: 24\n          cache: npm\n\n      - name: Download gated',
+      `${PUBLISH_PATH} job publish-assets must set up Node.js 24 with actions/setup-node@v4 before its first node command, without a package cache`],
+    [PUBLISH_PATH, '          node-version: 24\n      - name: Fail closed', '          node-version: 22\n      - name: Fail closed',
+      `${PUBLISH_PATH} job verify-publication-environment must set up Node.js 24`],
+    [PUBLISH_PATH, '          set -euo pipefail\n          node publication-policy/scripts/release/qualification.mjs verify-attestation',
+      '          set -euo pipefail\n          npm ci --ignore-scripts\n          node publication-policy/scripts/release/qualification.mjs verify-attestation',
+      `${PUBLISH_PATH} job publish-assets must never install or run packages`],
+    [PUBLISH_PATH, '          set -euo pipefail\n          gh api "repos/${BRIDGE_REPO}/environments/bridge-assets-publication" \\\n            > "${RUNNER_TEMP}/publication-environment.json"',
+      '          set -euo pipefail\n          npx --yes some-package\n          gh api "repos/${BRIDGE_REPO}/environments/bridge-assets-publication" \\\n            > "${RUNNER_TEMP}/publication-environment.json"',
+      `${PUBLISH_PATH} job verify-publication-environment must never install or run packages`],
+  ];
+  for (const [relativePath, old, replacement, fragment, options] of cases) {
+    const errors = mutated(relativePath, old, replacement, options);
+    const label = `${relativePath}: ${JSON.stringify(old)} -> ${JSON.stringify(replacement)}`;
+    assert.ok(
+      errors.some((error) => error.includes(fragment)),
+      `${label}: no error contained ${JSON.stringify(fragment)}: ${errors.join('\n') || '(no errors)'}`,
+    );
+  }
+  // R3: each release contract suite must exist under tests/, where npm test
+  // runs it.
+  assert.ok(RELEASE_CONTRACT_SUITES.length >= 9);
+  for (const suite of RELEASE_CONTRACT_SUITES) {
+    assertRejected(collectRepositoryErrors({ [suite]: null }), `the release contract suites npm run check:js must run are missing: ${suite}`);
   }
 }
 

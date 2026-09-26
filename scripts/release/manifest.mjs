@@ -1,9 +1,10 @@
 #!/usr/bin/env node
-// Generate the checksummed bridge asset manifest from validated inputs, the
-// Node port of scripts/generate_release_manifest.py.
+// Generate the checksummed bridge asset manifest from validated inputs,
+// ported from scripts/generate_release_manifest.py (deleted at the harness
+// 5.0.0 cutover).
 //
-// manifest.json and sha256sums.txt are published artifact bytes, so they are
-// byte-identical to the Python generator's for the same inputs:
+// manifest.json and sha256sums.txt are published artifact bytes, so they stay
+// byte-identical to what the Python generator wrote for the same inputs:
 // manifest.json is json.dumps(manifest, indent=2, sort_keys=True) + "\n" and
 // sha256sums.txt is "<sha256>  <name>" per artifact, newline-joined, plus "\n".
 

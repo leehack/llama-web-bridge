@@ -1,6 +1,7 @@
 #!/usr/bin/env node
-// Release identity and ordering contract for Web bridge asset publication, the
-// Node port of scripts/release_contract.py.
+// Release identity and ordering contract for Web bridge asset publication,
+// ported from scripts/release_contract.py (deleted at the harness 5.0.0
+// cutover).
 //
 // GitHub release tags are shared with the native release convention. Stable
 // releases use `vMAJOR.MINOR.PATCH` and rebuilds append `-N`. Development
@@ -11,7 +12,7 @@
 // existing manifest can be used as an ordering boundary, but this module never
 // emits them.
 //
-// Every validator accepts and rejects exactly what the Python module does,
+// Every validator accepts and rejects exactly what the Python module did,
 // with the same ContractError text; values follow the JSON value model of
 // ./json.mjs (int vs PyFloat, Python equality and repr).
 
@@ -1139,6 +1140,10 @@ export const COMMANDS = Object.freeze({
   'validate-environment': {
     options: [required('--environment-json', 'path'), required('--branch-policies-json', 'path')],
   },
+  // The workflows' input checks: silent on success, `error: <message>` and
+  // exit status 1 otherwise.
+  'require-correlation-id': { options: [required('--orchestrator-correlation-id')] },
+  'require-repository': { options: [required('--repository'), required('--field')] },
 });
 
 function dumps(value) {
@@ -1220,6 +1225,10 @@ function runCommand(command, args, write) {
       emscriptenVersion: args.emscriptenVersion,
       nativeCommit: args.nativeCommit,
     })));
+  } else if (command === 'require-correlation-id') {
+    requireCorrelationId(args.orchestratorCorrelationId);
+  } else if (command === 'require-repository') {
+    requireRepository(args.repository, args.field);
   } else {
     const environmentPayload = pyJsonLoads(pyReadText(args.environmentJson));
     const branchPoliciesPayload = pyJsonLoads(pyReadText(args.branchPoliciesJson));

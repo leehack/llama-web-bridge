@@ -165,6 +165,14 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      # The release and build CLIs are zero-dependency Node modules; npm ci
+      # below installs only the JS toolchain and the gates' Playwright.
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
       - name: Validate exact bridge and release inputs
         run: |
           set -euo pipefail
@@ -172,24 +180,19 @@ jobs:
             echo "error: checked-out bridge source does not match the requested full SHA"
             exit 1
           fi
-          python3 scripts/release_contract.py validate-release \
+          node scripts/release/contract.mjs validate-release \
             --release-tag "${RELEASE_TAG}" --release-rebuild "${RELEASE_REBUILD}" \
             --upstream-tag "${UPSTREAM_TAG}"
-          python3 scripts/release_contract.py validate-native-request \
+          node scripts/release/contract.mjs validate-native-request \
             --native-release-tag "${NATIVE_RELEASE_TAG}" \
             --upstream-tag "${UPSTREAM_TAG}" --upstream-commit "${UPSTREAM_COMMIT}" \
             --manifest-sha256 "${NATIVE_MANIFEST_SHA256}"
-          python3 - "${ORCHESTRATOR_CORRELATION_ID}" <<'PY'
-          import sys
-          from scripts.release_contract import require_correlation_id
-          require_correlation_id(sys.argv[1])
-          PY
-          python3 - "${ASSETS_REPO}" "${NATIVE_REPO}" <<'PY'
-          import sys
-          from scripts.release_contract import require_repository
-          require_repository(sys.argv[1], "assets_repo")
-          require_repository(sys.argv[2], "native_repo")
-          PY
+          node scripts/release/contract.mjs require-correlation-id \
+            --orchestrator-correlation-id "${ORCHESTRATOR_CORRELATION_ID}"
+          node scripts/release/contract.mjs require-repository \
+            --repository "${ASSETS_REPO}" --field assets_repo
+          node scripts/release/contract.mjs require-repository \
+            --repository "${NATIVE_REPO}" --field native_repo
 
       - name: Resolve immutable upstream and native release tag commits
         id: native_tag
@@ -199,7 +202,7 @@ jobs:
           git ls-remote https://github.com/ggml-org/llama.cpp.git \
             "refs/tags/${UPSTREAM_TAG}" "refs/tags/${UPSTREAM_TAG}^{}" \
             > "${RUNNER_TEMP}/upstream-tag-refs.txt"
-          RESOLVED_UPSTREAM_COMMIT="$(python3 scripts/release_contract.py resolve-tag-commit \
+          RESOLVED_UPSTREAM_COMMIT="$(node scripts/release/contract.mjs resolve-tag-commit \
             --ls-remote "${RUNNER_TEMP}/upstream-tag-refs.txt" \
             --tag "${UPSTREAM_TAG}")"
           if [ "${RESOLVED_UPSTREAM_COMMIT}" != "${UPSTREAM_COMMIT}" ]; then
@@ -209,7 +212,7 @@ jobs:
           git ls-remote "https://github.com/${NATIVE_REPO}.git" \
             "refs/tags/${NATIVE_RELEASE_TAG}" "refs/tags/${NATIVE_RELEASE_TAG}^{}" \
             > "${RUNNER_TEMP}/native-release/tag-refs.txt"
-          NATIVE_TAG_COMMIT="$(python3 scripts/release_contract.py resolve-tag-commit \
+          NATIVE_TAG_COMMIT="$(node scripts/release/contract.mjs resolve-tag-commit \
             --ls-remote "${RUNNER_TEMP}/native-release/tag-refs.txt" \
             --tag "${NATIVE_RELEASE_TAG}")"
           echo "native_tag_commit=${NATIVE_TAG_COMMIT}" >> "${GITHUB_OUTPUT}"
@@ -232,7 +235,7 @@ jobs:
               "repos/${NATIVE_REPO}/releases/assets/${asset_id}" \
               > "${RUNNER_TEMP}/native-release/${name}"
           done
-          IDENTITY="$(python3 scripts/release_contract.py validate-native-release \
+          IDENTITY="$(node scripts/release/contract.mjs validate-native-release \
             --manifest "${RUNNER_TEMP}/native-release/assets.json" \
             --checksums "${RUNNER_TEMP}/native-release/SHA256SUMS" \
             --release-json "${RUNNER_TEMP}/native-release/release.json" \
@@ -259,28 +262,18 @@ jobs:
             exit 1
           fi
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 24
-          cache: npm
-
       - name: Validate generated JS and release contracts
         run: |
           npm ci --ignore-scripts
           npm run check:js
           git ls-files --error-unmatch js/llama_webgpu_bridge.js js/llama_webgpu_bridge_worker.js js/llama_webgpu_bridge.d.ts
           git diff --exit-code -- js/llama_webgpu_bridge.js js/llama_webgpu_bridge_worker.js js/llama_webgpu_bridge.d.ts
-          python3 scripts/release_contract_test.py
-          python3 scripts/generate_release_manifest_test.py
-          python3 scripts/release_publication_state_test.py
-          python3 scripts/release_qualification_test.py
-          node scripts/verify_ci_reliability.mjs
+          node scripts/ci/verify_ci_reliability.mjs
 
       - name: Resolve Emscripten SDK pin
         id: emscripten
         run: |
-          EMSCRIPTEN_VERSION="$(python3 scripts/verify_emscripten_version.py --print-pin)"
+          EMSCRIPTEN_VERSION="$(node scripts/build/verify_emscripten_version.mjs --print-pin)"
           echo "EMSCRIPTEN_VERSION=${EMSCRIPTEN_VERSION}" >> "${GITHUB_ENV}"
           echo "emscripten_version=${EMSCRIPTEN_VERSION}" >> "${GITHUB_OUTPUT}"
 
@@ -294,8 +287,8 @@ jobs:
           OUT_DIR: ${{ runner.temp }}/webgpu_bridge_dist
           WEBGPU_BRIDGE_BUILD_MEM64: 1
         run: |
-          python3 scripts/verify_emscripten_version.py --emit-github-env "$GITHUB_ENV"
-          ./scripts/build_bridge.sh
+          node scripts/build/verify_emscripten_version.mjs --emit-github-env "$GITHUB_ENV"
+          ./scripts/build/build_bridge.sh
 
       - name: Cache release smoke models
         uses: actions/cache@v4
@@ -313,13 +306,13 @@ jobs:
         id: state_gate
         env:
           BRIDGE_DIST_DIR: ${{ runner.temp }}/webgpu_bridge_dist
-        run: node scripts/state_persistence_browser_smoke.mjs
+        run: node scripts/smoke/state_persistence.mjs
 
       - name: Run durable multimodal gate
         id: multimodal_gate
         env:
           BRIDGE_DIST_DIR: ${{ runner.temp }}/webgpu_bridge_dist
-        run: node scripts/multimodal_browser_smoke.mjs
+        run: node scripts/smoke/multimodal.mjs
 
       - name: Generate schema-v2 manifest and checksums
         env:
@@ -327,7 +320,7 @@ jobs:
           NATIVE_COMMIT: ${{ steps.native.outputs.native_commit }}
         run: |
           set -euo pipefail
-          python3 scripts/generate_release_manifest.py \
+          node scripts/release/manifest.mjs \
             --out-dir "${OUT_DIR}" --release-tag "${RELEASE_TAG}" --release-rebuild "${RELEASE_REBUILD}" \
             --assets-repo "${ASSETS_REPO}" --bridge-repo "${BRIDGE_REPO}" --bridge-commit "${BRIDGE_SOURCE_SHA}" \
             --upstream-tag "${UPSTREAM_TAG}" --upstream-commit "${UPSTREAM_COMMIT}" \
@@ -348,9 +341,9 @@ jobs:
           NATIVE_COMMIT: ${{ steps.native.outputs.native_commit }}
         run: |
           set -euo pipefail
-          FINGERPRINT="$(python3 scripts/release_qualification.py candidate-fingerprint \
+          FINGERPRINT="$(node scripts/release/qualification.mjs candidate-fingerprint \
             --candidate-dist "${OUT_DIR}")"
-          HARNESS_SHA256="$(python3 scripts/release_qualification.py harness-digest \
+          HARNESS_SHA256="$(node scripts/release/qualification.mjs harness-digest \
             --harness-dir scripts)"
           echo "candidate_fingerprint=${FINGERPRINT}" >> "${GITHUB_OUTPUT}"
           jq -n --arg correlation "${ORCHESTRATOR_CORRELATION_ID}" \

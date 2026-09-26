@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 // Classify exact bridge publication state for idempotent, fail-closed retries,
-// the Node port of scripts/release_publication_state.py.
+// ported from scripts/release_publication_state.py (deleted at the harness
+// 5.0.0 cutover).
 //
-// Every validator accepts and rejects what the Python module does, with the
+// Every validator accepts and rejects what the Python module did, with the
 // same ContractError text; the CLI prints the same outcome JSON
 // (json.dumps(..., sort_keys=True)) and exits 0 exactly when the outcome is
 // allowed. The assets repository is read through the same `git -C <repo>`

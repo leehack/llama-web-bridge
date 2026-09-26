@@ -16,7 +16,7 @@ import { fileURLToPath } from 'node:url';
 
 import { isMap, isScalar, parse as parseYaml, parseDocument } from 'yaml';
 
-export const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+export const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 
 const WORKFLOWS = {
   ci: '.github/workflows/ci.yml',
@@ -46,9 +46,9 @@ const SHA256_HEX = /(?<![0-9a-fA-F])[0-9a-fA-F]{64}(?![0-9a-fA-F])/g;
 const MODEL_SHA_PIN_MARKER = /(--[A-Za-z0-9][A-Za-z0-9-]*-sha256|_SHA256:)(?:[ \t="'`]|\\\r?\n)+$/;
 // The set check above is role-blind: swapping two pins between roles inside one
 // file keeps every value present and passes. Both workflows name the role in
-// the env key, and every workflow pin is compared against
-// release_qualification.EXPECTED_MODEL_PINS, which every attestation's
-// model_pins must equal, so a swap applied identically everywhere still fails.
+// the env key, and every workflow pin is compared against EXPECTED_MODEL_PINS
+// in scripts/release/qualification.mjs, which every attestation's model_pins
+// must equal, so a swap applied identically everywhere still fails.
 // CONTRIBUTING.md's bare `--model-sha256` / `--mmproj-sha256` flags carry no
 // role; it lives in the `--model-url` / `--model-path` / `--mmproj-path` value
 // beside each flag, which names a distinct model or projector file.
@@ -122,26 +122,34 @@ const sorted = (values) => [...values].sort();
 const sameList = (left, right) => left.length === right.length && left.every((value, i) => value === right[i]);
 const has = (object, key) => Object.prototype.hasOwnProperty.call(object, key);
 
+// The qualification module whose EXPECTED_MODEL_PINS every pin is checked
+// against.
+export const QUALIFICATION_MODULE = 'scripts/release/qualification.mjs';
+
 /**
- * Reads EXPECTED_MODEL_PINS from scripts/release_qualification.py: its
- * `NAME_SHA256 = ("<hex>")` constants and the dict naming them. Throws unless it
- * resolves exactly eight distinct names, each to a 64-hex constant.
+ * Reads EXPECTED_MODEL_PINS from scripts/release/qualification.mjs: its
+ * `export const NAME_SHA256 = '<hex>';` constants and the
+ * `export const EXPECTED_MODEL_PINS = Object.freeze({ role: NAME_SHA256, ... });`
+ * literal naming them. Throws unless it resolves exactly eight distinct
+ * names, each to a 64-hex constant.
  */
 export function parseExpectedModelPins(source) {
   const constants = new Map();
-  const constant = /^([A-Z][A-Z0-9_]*_SHA256)[ \t]*=[ \t]*\(?\s*["']([0-9a-fA-F]{64})["']\s*\)?[ \t]*$/gm;
+  const constant = /^export[ \t]+const[ \t]+([A-Z][A-Z0-9_]*_SHA256)[ \t]*=[ \t]*(['"])([0-9a-fA-F]{64})\2[ \t]*;[ \t]*$/gm;
   for (const match of source.matchAll(constant)) {
-    if (constants.has(match[1])) throw new Error(`release_qualification.py defines ${match[1]} twice`);
-    constants.set(match[1], match[2]);
+    if (constants.has(match[1])) throw new Error(`qualification.mjs defines ${match[1]} twice`);
+    constants.set(match[1], match[3]);
   }
-  const block = /^EXPECTED_MODEL_PINS[ \t]*=[ \t]*\{([^}]*)\}/m.exec(source);
-  if (!block) throw new Error('release_qualification.py has no EXPECTED_MODEL_PINS = {...} literal');
-  const body = block[1].replace(/#[^\n]*/g, '');
-  const entry = /["']([a-z0-9_]+)["']\s*:\s*([A-Z][A-Z0-9_]*)\s*(?:,|$)/g;
+  const blocks = [...source.matchAll(/^export[ \t]+const[ \t]+EXPECTED_MODEL_PINS[ \t]*=[ \t]*Object\.freeze\([ \t]*\{([^}]*)\}[ \t]*\)[ \t]*;/gm)];
+  if (blocks.length === 0) throw new Error('qualification.mjs has no export const EXPECTED_MODEL_PINS = Object.freeze({...}); literal');
+  if (blocks.length > 1) throw new Error('qualification.mjs defines EXPECTED_MODEL_PINS twice');
+  const body = blocks[0][1].replace(/\/\/[^\n]*/g, '');
+  const entry = /(?:([a-z0-9_]+)|(['"])([a-z0-9_]+)\2)\s*:\s*([A-Z][A-Z0-9_]*)\s*(?:,|$)/g;
   const leftover = body.replace(entry, '').trim();
   if (leftover) throw new Error(`EXPECTED_MODEL_PINS has an entry this reader cannot resolve: ${leftover.split('\n')[0]}`);
   const pins = {};
-  for (const [, name, reference] of body.matchAll(entry)) {
+  for (const [, bare, , quoted, reference] of body.matchAll(entry)) {
+    const name = bare ?? quoted;
     if (has(pins, name)) throw new Error(`EXPECTED_MODEL_PINS names ${name} twice`);
     if (!constants.has(reference)) {
       throw new Error(`EXPECTED_MODEL_PINS maps ${name} to ${reference}, which is not a 64-hex constant`);
@@ -158,9 +166,9 @@ export function parseExpectedModelPins(source) {
 let expectedModelPinsError = '';
 function loadExpectedModelPins() {
   try {
-    return parseExpectedModelPins(fs.readFileSync(path.join(ROOT, 'scripts/release_qualification.py'), 'utf8'));
+    return parseExpectedModelPins(fs.readFileSync(path.join(ROOT, QUALIFICATION_MODULE), 'utf8'));
   } catch (error) {
-    expectedModelPinsError = `cannot read release_qualification.EXPECTED_MODEL_PINS: ${error.message}`;
+    expectedModelPinsError = `cannot read EXPECTED_MODEL_PINS from ${QUALIFICATION_MODULE}: ${error.message}`;
     return {};
   }
 }
@@ -190,7 +198,7 @@ export function extractModelShaPins(relativePath, content, errors) {
     errors.push(
       `${relativePath} declares ${pins.length} model SHA-256 pins, expected `
       + `${EXPECTED_MODEL_SHA_PIN_COUNT}; update EXPECTED_MODEL_SHA_PIN_COUNT in `
-      + 'scripts/verify_ci_reliability.mjs when the pinned model set changes',
+      + 'scripts/ci/verify_ci_reliability.mjs when the pinned model set changes',
     );
   }
   return new Set(pins);
@@ -305,7 +313,7 @@ export function requireCanonicalModelShaPins(rolesByFile, errors) {
   if (unmapped.length > 0) {
     errors.push(
       `CANONICAL_MODEL_PIN_NAMES maps to canonical pin name(s) ${unmapped.join(', ')} `
-      + 'that release_qualification.EXPECTED_MODEL_PINS does not declare',
+      + `that EXPECTED_MODEL_PINS in ${QUALIFICATION_MODULE} does not declare`,
     );
   }
   const covered = new Set();
@@ -315,7 +323,7 @@ export function requireCanonicalModelShaPins(rolesByFile, errors) {
       if (!has(CANONICAL_MODEL_PIN_NAMES, key)) {
         errors.push(
           `${relativePath} binds model SHA-256 env key ${key} that CANONICAL_MODEL_PIN_NAMES does `
-          + 'not name; add the role there and to release_qualification.EXPECTED_MODEL_PINS so the '
+          + `not name; add the role there and to EXPECTED_MODEL_PINS in ${QUALIFICATION_MODULE} so the `
           + 'pin is compared against a canonical value',
         );
         continue;
@@ -326,7 +334,7 @@ export function requireCanonicalModelShaPins(rolesByFile, errors) {
       if (roles[key] !== expected) {
         errors.push(
           `${relativePath} binds ${key} to ${roles[key]} but canonical ${name} is ${expected}; `
-          + 'every workflow copy must equal the pin release_qualification.py checks the '
+          + `every workflow copy must equal the pin ${QUALIFICATION_MODULE} checks the `
           + 'attestation against, so a role swap repeated across workflows still fails here',
         );
       }
@@ -336,7 +344,7 @@ export function requireCanonicalModelShaPins(rolesByFile, errors) {
   if (missing.length > 0) {
     errors.push(
       `canonical model pin(s) ${missing.join(', ')} are declared in `
-      + 'release_qualification.EXPECTED_MODEL_PINS but bound by no <ROLE>_SHA256 env key in '
+      + `EXPECTED_MODEL_PINS in ${QUALIFICATION_MODULE} but bound by no <ROLE>_SHA256 env key in `
       + MODEL_PIN_ROLE_FILES.join(', '),
     );
   }
@@ -520,6 +528,7 @@ export function resolveWorkflowSteps(workflow) {
   }
   const patOutsideEnv = [];
   const { env: rootEnv, jobs, ...rootOutsideEnv } = root;
+  const defaultShell = (defaults) => mapping(mapping(defaults).run).shell;
   if (containsPat(rootOutsideEnv) || (!isMapping(rootEnv) && containsPat(rootEnv))) {
     patOutsideEnv.push('workflow root properties');
   }
@@ -530,6 +539,9 @@ export function resolveWorkflowSteps(workflow) {
       patOutsideEnv.push(`job ${jobName} properties`);
     }
     const inheritedEnv = { ...mapping(rootEnv), ...mapping(jobEnv) };
+    const job = mapping(rawJob);
+    const jobShell = defaultShell(job.defaults) ?? defaultShell(root.defaults);
+    const container = typeof job.container === 'string' ? job.container : mapping(job.container).image;
     (Array.isArray(rawSteps) ? rawSteps : []).forEach((rawStep, index) => {
       const step = mapping(rawStep);
       const { env: stepEnv, ...stepOutsideEnv } = step;
@@ -543,6 +555,9 @@ export function resolveWorkflowSteps(workflow) {
         with: mapping(step.with),
         env: { ...inheritedEnv, ...mapping(stepEnv) },
         run: typeof step.run === 'string' ? step.run : '',
+        // The shell the run script runs in, and the job container image.
+        shell: String(step.shell ?? jobShell ?? ''),
+        container: typeof container === 'string' ? container : '',
         raw: step,
         patOutsideEnv: containsPat(stepOutsideEnv) || (!isMapping(stepEnv) && containsPat(stepEnv))
           ? `step ${jobName}/${name || index} properties`
@@ -768,14 +783,17 @@ function checker(errors) {
 }
 
 // `validator` is the command that runs the release contract CLI, such as
-// `python3 scripts/release_contract.py` or `node scripts/release/contract.mjs`.
+// `node scripts/release/contract.mjs` or
+// `node publication-policy/scripts/release/contract.mjs`. Commands are matched
+// with shell line continuations joined.
 function environmentValidationMissing(run, validator) {
+  const commands = shellCommands(run);
   return [
     'gh api "repos/${BRIDGE_REPO}/environments/bridge-assets-publication"',
     'gh api "repos/${BRIDGE_REPO}/environments/bridge-assets-publication/deployment-branch-policies"',
     `${validator} validate-environment`,
     '--branch-policies-json',
-  ].filter((needle) => !run.includes(needle));
+  ].filter((needle) => !commands.includes(needle));
 }
 
 // ---------------------------------------------------------------------------
@@ -889,7 +907,51 @@ function checkNoContinueOnError(workflows, errors) {
   }
 }
 
-function checkCiRunsContracts({ ci, candidate, publish }, errors) {
+// The Node suites that replaced the Python release contract suites the
+// candidate and publish workflows ran before the harness moved to Node.
+export const RELEASE_CONTRACT_SUITES = Object.freeze([
+  'tests/build/verify_emscripten_version_test.mjs',
+  'tests/release/archive_test.mjs',
+  'tests/release/contract_test.mjs',
+  'tests/release/manifest_test.mjs',
+  'tests/release/publication_state_test.mjs',
+  'tests/release/qualification_attestation_test.mjs',
+  'tests/release/qualification_harness_test.mjs',
+  'tests/release/qualification_pins_test.mjs',
+  'tests/release/qualification_run_test.mjs',
+]);
+
+// No workflow runs Python: the release harness, its contracts and the
+// Emscripten verifier are Node, so a Python interpreter or package tool
+// (python3, pip, pipx, uv, pytest, poetry, ...), a *.py script, a python
+// shell, a Python or uv image, or a Python or uv setup action in any workflow
+// is a regression.
+const PYTHON_COMMAND = new RegExp(
+  String.raw`(?<![\w.-])(?:i?python[0-9.]*|pypy[0-9.]*|py|pipx?[0-9.]*|pipenv|poetry|uvx?|pytest|py_compile|conda|mamba|tox|hatch|pdm)(?![\w.-])`
+  + String.raw`|(?<![\w./-])[\w./-]*[\w-]\.py[cz]?(?![\w-])`,
+);
+const PYTHON_IMAGE = /(?:^|[/:])(?:python|pypy|uv(?![\w-]))/;
+const PYTHON_SETUP = /(?:^|\/)setup-(?:python|uv)@/;
+
+export function checkNoPython(workflows, errors) {
+  for (const workflow of workflows) {
+    for (const step of workflow.steps) {
+      const match = PYTHON_COMMAND.exec(step.run);
+      const culprit = match !== null ? JSON.stringify(match[0])
+        : PYTHON_SETUP.test(step.uses) || (/^docker:\/\//.test(step.uses) && PYTHON_IMAGE.test(step.uses)) ? step.uses
+          : PYTHON_COMMAND.test(step.shell) ? `shell: ${step.shell}`
+            : PYTHON_IMAGE.test(step.container) ? `container: ${step.container}` : '';
+      if (culprit) {
+        errors.push(
+          `${workflow.path} step ${step.job}/${step.name || step.index} runs Python (${culprit}); `
+          + 'no workflow may run a Python interpreter or package tool, a *.py script, a python shell or a Python image',
+        );
+      }
+    }
+  }
+}
+
+function checkCiRunsContracts({ ci, candidate, publish }, testFiles, errors) {
   const check = checker(errors);
   // Row 41: CI, candidate and publish run the JS contract tests without npm
   // lifecycle scripts and prove the tracked generated bridge matches its source.
@@ -901,32 +963,33 @@ function checkCiRunsContracts({ ci, candidate, publish }, errors) {
       'git diff --exit-code -- js/llama_webgpu_bridge.js js/llama_webgpu_bridge_worker.js js/llama_webgpu_bridge.d.ts',
     ], 'install dependencies without lifecycle scripts, run npm run check:js, and prove the tracked generated bridge outputs are current');
   }
-  // R2 and row 105: CI runs every Python contract suite and this contract.
-  check.includes(ci.path, ci.runText, [
-    "python3 -m unittest discover -s scripts -p '*_test.py'",
-    'node scripts/verify_ci_reliability.mjs',
-  ], 'run every Python contract suite and the CI reliability contract');
+  // R2 and row 105: CI runs this contract (npm run check:js, above, runs every
+  // contract test).
+  check.includes(ci.path, ci.runText, ['node scripts/ci/verify_ci_reliability.mjs'], 'run the CI reliability contract');
   // R3: the privileged workflows run the release contract suites from their
-  // own checkout.
+  // own checkout. They are Node tests under tests/, which npm run check:js
+  // (row 41) runs through npm test's glob; each named suite must exist.
   for (const workflow of [candidate, publish]) {
     check.includes(workflow.path, workflow.runText, [
-      'python3 scripts/release_contract_test.py',
-      'python3 scripts/generate_release_manifest_test.py',
-      'python3 scripts/release_publication_state_test.py',
-      'python3 scripts/release_qualification_test.py',
-      'node scripts/verify_ci_reliability.mjs',
-    ], 'run the release contract suites and the CI reliability contract');
+      'npm run check:js',
+      'node scripts/ci/verify_ci_reliability.mjs',
+    ], 'run the release contract suites (through npm run check:js) and the CI reliability contract');
   }
+  const missingSuites = RELEASE_CONTRACT_SUITES.filter((suite) => !has(testFiles, suite));
+  check.require(
+    missingSuites.length === 0,
+    `the release contract suites npm run check:js must run are missing: ${missingSuites.join(', ')}`,
+  );
   // Rows 21, 22, 101, 103: CI runs the checksum-pinned browser smokes.
   check.require(
-    (ci.runText.match(/node scripts\/grammar_browser_smoke\.mjs\b/g) ?? []).length === 2
+    (ci.runText.match(/node scripts\/smoke\/grammar\.mjs\b/g) ?? []).length === 2
       && ci.runText.includes('--model-sha256 "$LLAMA_WEBGPU_MULTIMODAL_MODEL_SHA256"'),
     `${ci.path} must run the grammar smoke twice, once with the checksum-pinned multimodal model`,
   );
   check.includes(ci.path, ci.runText, [
-    'node scripts/next_token_scores_browser_smoke.mjs',
-    'node scripts/state_persistence_browser_smoke.mjs',
-    'node scripts/multimodal_browser_smoke.mjs',
+    'node scripts/smoke/next_token_scores.mjs',
+    'node scripts/smoke/state_persistence.mjs',
+    'node scripts/smoke/multimodal.mjs',
   ], 'run the next-token scores, state persistence and multimodal browser smokes');
   // Row 57: CI builds the llama.cpp pin.
   check.includes(ci.path, ci.runText, ["tr -d '[:space:]' < llama_cpp.version"], 'resolve the llama.cpp tag from llama_cpp.version');
@@ -967,27 +1030,30 @@ function checkToolchainPins({ ci, candidate, publish }, files, errors) {
       `${workflow.path} must install the resolved emsdk.version: setup-emsdk with version: \${{ env.EMSCRIPTEN_VERSION }}, or emsdk install/activate "$EMSCRIPTEN_VERSION"`,
     );
     check.includes(workflow.path, workflow.runText, [
-      'scripts/verify_emscripten_version.py --print-pin',
-      'scripts/verify_emscripten_version.py --emit-github-env "$GITHUB_ENV"',
+      `${EMSCRIPTEN_VERIFIER_COMMAND} --print-pin`,
+      `${EMSCRIPTEN_VERIFIER_COMMAND} --emit-github-env "$GITHUB_ENV"`,
     ], 'resolve emsdk.version and verify the resolved emcc version before building');
   }
-  // Row 45: the verifier compares emcc with emsdk.version and gates direct builds.
-  const verifier = files['scripts/verify_emscripten_version.py'];
-  const build = files['scripts/build_bridge.sh'];
+  // Row 45: the verifier compares emcc with emsdk.version and gates direct
+  // builds before anything is configured.
+  const verifier = files[EMSCRIPTEN_VERIFIER];
+  const build = files['scripts/build/build_bridge.sh'];
+  const buildGate = build.indexOf(`node "$BRIDGE_DIR/${EMSCRIPTEN_VERIFIER}"`);
   check.require(
-    verifier.includes('emsdk.version')
-      && verifier.includes('["emcc", "--version"]')
-      && verifier.includes('resolved != expected')
-      && verifier.includes('EMSCRIPTEN_VERSION={resolved}')
-      && build.includes('scripts/verify_emscripten_version.py')
-      && build.indexOf('scripts/verify_emscripten_version.py') < build.indexOf('echo "[bridge] configuring with emcmake"'),
+    verifier.includes("const PIN_NAME = 'emsdk.version';")
+      && verifier.includes("spawnSync('emcc', ['--version']")
+      && verifier.includes('if (resolved !== expected)')
+      && verifier.includes('`EMSCRIPTEN_VERSION=${resolved}\\n`')
+      && buildGate >= 0
+      && buildGate < build.indexOf('echo "[bridge] configuring with emcmake"'),
     'the Emscripten verifier must compare emcc against emsdk.version, export the resolved compiler identity, and gate direct builds',
   );
   // Row 46: the manifest records the verified compiler.
   check.require(
     candidate.runText.includes('--emscripten-version "${EMSCRIPTEN_VERSION}"')
       && publish.runText.includes('--emscripten-version "${EMSCRIPTEN_VERSION}"')
-      && files['scripts/generate_release_manifest.py'].includes('"emscripten_version": args.emscripten_version'),
+      && shellCommands(candidate.runText).includes(`${RELEASE_MANIFEST_COMMAND} --out-dir "\${OUT_DIR}"`)
+      && files[RELEASE_MANIFEST_MODULE].includes('emscripten_version: args.emscriptenVersion,'),
     'the asset manifest must record the runtime-verified Emscripten compiler version',
   );
 }
@@ -1000,6 +1066,19 @@ export const ORCHESTRATOR_ENTRY = `${ORCHESTRATOR_DIRECTORY}/cli.mjs`;
 export const ORCHESTRATOR_COMMAND = `node ${ORCHESTRATOR_ENTRY}`;
 export const RELEASE_CONTRACT_COMMAND = 'node scripts/release/contract.mjs';
 export const RELEASE_QUALIFICATION_COMMAND = 'node scripts/release/qualification.mjs';
+// The other release and build CLIs the candidate, qualification and publish
+// workflows run, and the trusted-checkout forms publish-assets runs.
+export const RELEASE_MANIFEST_MODULE = 'scripts/release/manifest.mjs';
+export const RELEASE_MANIFEST_COMMAND = `node ${RELEASE_MANIFEST_MODULE}`;
+export const PUBLICATION_STATE_COMMAND = 'node scripts/release/publication_state.mjs';
+export const EMSCRIPTEN_VERIFIER = 'scripts/build/verify_emscripten_version.mjs';
+export const EMSCRIPTEN_VERIFIER_COMMAND = `node ${EMSCRIPTEN_VERIFIER}`;
+export const POLICY_CONTRACT_COMMAND = 'node publication-policy/scripts/release/contract.mjs';
+export const POLICY_QUALIFICATION_COMMAND = 'node publication-policy/scripts/release/qualification.mjs';
+export const POLICY_PUBLICATION_STATE_COMMAND = 'node publication-policy/scripts/release/publication_state.mjs';
+export const EXTRACT_ARTIFACT_COMMAND = `${RELEASE_QUALIFICATION_COMMAND} extract-artifact`;
+// qualify runs the candidate's own harness, from its checkout.
+export const QUALIFY_COMMAND = 'node candidate-source/scripts/release/qualification.mjs qualify';
 // The shared release modules the orchestrator imports. They have their own
 // contracts, so their text is not part of the orchestrator source; any other
 // relative import would hide code from the checks and is rejected.
@@ -1059,6 +1138,58 @@ export function orchestratorModules(files, errors) {
   }
   const modules = [ORCHESTRATOR_ENTRY, ...[...reached].filter((relativePath) => relativePath !== ORCHESTRATOR_ENTRY).sort()];
   return Object.fromEntries(modules.map((relativePath) => [relativePath, files[relativePath]]));
+}
+
+const NODE_COMMAND = /(?:^|[\s;&|(`$])node\s/;
+const PACKAGE_COMMAND = /\b(?:npm|pnpm|yarn|npx|pip3?|corepack)\b/;
+
+/**
+ * A job that runs a node command must set up Node.js 24 with
+ * actions/setup-node@v4 before its first one. A `privileged` job (it holds
+ * or gates the publication credential) must also set it up without a package
+ * cache and never install or run packages, since the release modules it runs
+ * are zero-dependency.
+ */
+export function nodeSetupErrors(workflow, jobName, { privileged = false } = {}) {
+  const steps = workflow.jobSteps(jobName);
+  const errors = [];
+  const firstNode = steps.find((step) => NODE_COMMAND.test(step.run));
+  if (firstNode !== undefined) {
+    const setups = steps.filter((step) => /^actions\/setup-node@/.test(step.uses));
+    const uncached = (step) => !has(step.with, 'cache') && !has(step.with, 'cache-dependency-path');
+    if (!(setups.length > 0
+      && setups[0].index < firstNode.index
+      && setups.every((step) => step.uses === 'actions/setup-node@v4' && String(step.with['node-version']) === '24'
+        && (!privileged || uncached(step))))) {
+      errors.push(
+        `${workflow.path} job ${jobName} must set up Node.js 24 with actions/setup-node@v4 before its first node command`
+          + (privileged ? ', without a package cache' : ''),
+      );
+    }
+  }
+  if (privileged && steps.some((step) => PACKAGE_COMMAND.test(step.run))) {
+    errors.push(
+      `${workflow.path} job ${jobName} must never install or run packages (npm, npx, pnpm, yarn, pip, corepack); `
+        + 'the release modules it runs are zero-dependency',
+    );
+  }
+  return errors;
+}
+
+// The publish jobs that hold or gate the publication credential.
+export const PRIVILEGED_PUBLISH_JOBS = Object.freeze(['validate-request', 'verify-publication-environment', 'publish-assets']);
+
+// Every job of the CI and release stage workflows sets up Node.js 24 before
+// it runs node; the privileged publish jobs install nothing.
+export function checkNodeSetup({ ci, candidate, qualification, publish }, errors) {
+  for (const workflow of [ci, candidate, qualification, publish]) {
+    for (const name of Object.keys(workflow.jobs)) {
+      const privileged = workflow === publish && PRIVILEGED_PUBLISH_JOBS.includes(name);
+      errors.push(...nodeSetupErrors(workflow, name, { privileged }));
+    }
+  }
+  const unlisted = PRIVILEGED_PUBLISH_JOBS.filter((name) => !has(publish.jobs, name));
+  if (unlisted.length > 0) errors.push(`${publish.path} has no job ${unlisted.join(', ')}; update PRIVILEGED_PUBLISH_JOBS`);
 }
 
 // Row 53: the dispatch booleans the orchestrator may never write as a literal
@@ -1153,21 +1284,9 @@ function checkOrchestration(autoUpdate, orchestratorSources, errors) {
   // Node.js 24 before its first node command, with no package cache, and the
   // workflow never installs packages, so no dependency code runs beside the
   // publication PAT.
-  for (const name of Object.keys(autoUpdate.jobs)) {
-    const steps = autoUpdate.jobSteps(name);
-    const firstNode = steps.find((step) => /(?:^|[\s;&|(`$])node\s/.test(step.run));
-    if (firstNode === undefined) continue;
-    const setups = steps.filter((step) => /^actions\/setup-node@/.test(step.uses));
-    check.require(
-      setups.length > 0
-        && setups[0].index < firstNode.index
-        && setups.every((step) => step.uses === 'actions/setup-node@v4' && String(step.with['node-version']) === '24'
-          && !has(step.with, 'cache') && !has(step.with, 'cache-dependency-path')),
-      `${autoUpdate.path} job ${name} must set up Node.js 24 with actions/setup-node@v4 before its first node command, without a package cache`,
-    );
-  }
+  for (const name of Object.keys(autoUpdate.jobs)) errors.push(...nodeSetupErrors(autoUpdate, name, { privileged: true }));
   check.require(
-    !/\b(?:npm|pnpm|yarn|npx|pip3?|corepack)\b/.test(autoUpdate.runText),
+    !PACKAGE_COMMAND.test(autoUpdate.runText),
     `${autoUpdate.path} must never install or run packages (npm, npx, pnpm, yarn, pip, corepack); the release modules are zero-dependency`,
   );
   // Rows 50-51: every job, and so every environment job, rejects a non-owner
@@ -1290,11 +1409,11 @@ function checkPublication({ publish, candidate }, errors) {
       && !containsMatch(verifyJob, SECRETS_CONTEXT)
       && verifyStep !== undefined
       && verifyStep.env.GH_TOKEN === '${{ github.token }}'
-      && environmentValidationMissing(verifyStep.run, 'python3 scripts/release_contract.py').length === 0
+      && environmentValidationMissing(verifyStep.run, RELEASE_CONTRACT_COMMAND).length === 0
       && verifyStep.id !== ''
       && mapping(verifyJob.outputs).environment_name === `\${{ steps.${verifyStep.id}.outputs.environment_name }}`
       && publish.transitiveNeeds('verify-publication-environment').has('validate-request'),
-    `${publish.path} job verify-publication-environment must run after the approval check with read-only permissions and no secret, validate the environment and its deployment branch policies with github.token and scripts/release_contract.py validate-environment, and only then output the environment name`,
+    `${publish.path} job verify-publication-environment must run after the approval check with read-only permissions and no secret, validate the environment and its deployment branch policies with github.token and ${RELEASE_CONTRACT_COMMAND} validate-environment, and only then output the environment name`,
   );
   const environmentJobs = Object.keys(publish.jobs).filter((name) => publish.job(name).environment !== undefined);
   check.require(
@@ -1315,8 +1434,8 @@ function checkPublication({ publish, candidate }, errors) {
       && firstPat.index === revalidate.index + 1
       && revalidate.env.GH_TOKEN === '${{ github.token }}'
       && !containsMatch(revalidate.raw, SECRETS_CONTEXT)
-      && environmentValidationMissing(revalidate.run, 'python3 publication-policy/scripts/release_contract.py').length === 0,
-    `${publish.path}: publish-assets must have read-only permissions and revalidate the environment policy with github.token and the trusted publication-policy validator in the step immediately before its first PAT-bearing step`,
+      && environmentValidationMissing(revalidate.run, POLICY_CONTRACT_COMMAND).length === 0,
+    `${publish.path}: publish-assets must have read-only permissions and revalidate the environment policy with github.token and the trusted publication-policy validator (${POLICY_CONTRACT_COMMAND} validate-environment) in the step immediately before its first PAT-bearing step`,
   );
 
   // Row 72: the PAT is fail-closed, never printed, and used only by the
@@ -1325,8 +1444,9 @@ function checkPublication({ publish, candidate }, errors) {
 
   // Rows 73-75: exact provenance identities, fetched by immutable asset id,
   // with inputs validated before the first native network request.
-  check.includes(publish.path, runText, [
-    'scripts/release_contract.py validate-native-release',
+  const commands = shellCommands(runText);
+  check.includes(publish.path, commands, [
+    `${RELEASE_CONTRACT_COMMAND} validate-native-release`,
     '"repos/${NATIVE_REPO}/releases/assets/${asset_id}"',
     '--checksums "${RUNNER_TEMP}/native-release/SHA256SUMS"',
     '--manifest-sha256 "${NATIVE_MANIFEST_SHA256}"',
@@ -1338,16 +1458,19 @@ function checkPublication({ publish, candidate }, errors) {
     'resolved upstream tag commit does not match upstream_commit',
     'git ls-remote "https://github.com/${NATIVE_REPO}.git"',
     '"refs/tags/${NATIVE_RELEASE_TAG}" "refs/tags/${NATIVE_RELEASE_TAG}^{}"',
-    'scripts/release_contract.py resolve-tag-commit',
+    `${RELEASE_CONTRACT_COMMAND} resolve-tag-commit`,
     '--native-tag-commit "${NATIVE_TAG_COMMIT}"',
-  ], 'verify the exact bridge, upstream tag/commit, native tag/commit and native manifest checksum identities');
+    `${RELEASE_CONTRACT_COMMAND} require-correlation-id --orchestrator-correlation-id "\${ORCHESTRATOR_CORRELATION_ID}"`,
+    `${RELEASE_CONTRACT_COMMAND} require-repository --repository "\${ASSETS_REPO}" --field assets_repo`,
+    `${RELEASE_CONTRACT_COMMAND} require-repository --repository "\${NATIVE_REPO}" --field native_repo`,
+  ], 'verify the exact bridge, upstream tag/commit, native tag/commit and native manifest checksum identities, the correlation id and both repositories');
   check.require(
-    occurrences(runText, 'python3 scripts/release_contract.py resolve-tag-commit') >= 2
+    occurrences(commands, `${RELEASE_CONTRACT_COMMAND} resolve-tag-commit`) >= 2
       && publish.steps.some((step) => step.run.includes('--native-tag-commit "${NATIVE_TAG_COMMIT}"')
         && step.env.NATIVE_TAG_COMMIT === '${{ steps.native_tag.outputs.native_tag_commit }}'),
     `${publish.path} must resolve the upstream and native tag commits itself and check the manifest against the resolved native tag commit (steps.native_tag)`,
   );
-  const nativeRequest = runText.indexOf('scripts/release_contract.py validate-native-request');
+  const nativeRequest = runText.indexOf(`${RELEASE_CONTRACT_COMMAND} validate-native-request`);
   const upstreamLookup = runText.indexOf('git ls-remote https://github.com/ggml-org/llama.cpp.git');
   const nativeLookup = runText.indexOf('git ls-remote "https://github.com/${NATIVE_REPO}.git"');
   const requestSpan = runText.slice(nativeRequest, nativeLookup);
@@ -1363,7 +1486,7 @@ function checkPublication({ publish, candidate }, errors) {
     const step = publish.step('publish-assets', name);
     check.require(
       step !== undefined
-        && step.run.includes('publication-policy/scripts/release_contract.py resolve-tag-commit')
+        && step.run.includes(`${POLICY_CONTRACT_COMMAND} resolve-tag-commit`)
         && step.run.includes('fetched asset release tag changed after immutable resolution'),
       `${publish.path} step ${name} must resolve the existing asset tag with the strict trusted parser and verify the fetched ref did not change`,
     );
@@ -1377,8 +1500,11 @@ function checkPublication({ publish, candidate }, errors) {
   );
   // Row 78: fail-closed classification, honest gates, checksum verification
   // and an atomic push.
-  check.includes(publish.path, runText, [
-    'scripts/release_publication_state.py classify',
+  check.includes(publish.path, commands, [
+    `${POLICY_PUBLICATION_STATE_COMMAND} classify`,
+    `${POLICY_PUBLICATION_STATE_COMMAND} state-changed`,
+    `${POLICY_PUBLICATION_STATE_COMMAND} mutation-unknown`,
+    `${POLICY_PUBLICATION_STATE_COMMAND} validate-target`,
     'recoverable-partial',
     'publication_outcome',
     'cp "${RUNNER_TEMP}/preflight.json" "${RUNNER_TEMP}/publication-outcome.json"',
@@ -1403,9 +1529,10 @@ function checkPublication({ publish, candidate }, errors) {
   // Row 79: immutable-release governance is proven before any ref mutation.
   const firstRefMutation = publish.stepIndex('publish-assets', (step) => step.name === 'Apply only the classified ref mutation');
   const governanceCheck = publish.stepIndex('publish-assets',
-    (step) => /release_contract\.py\s+(?:\\\s+)?validate-immutable-release-governance/.test(step.run));
+    (step) => shellCommands(step.run).includes(`${POLICY_CONTRACT_COMMAND} validate-immutable-release-governance`));
   check.require(
     occurrences(publishJob, '"repos/${ASSETS_REPO}/immutable-releases"') >= 3
+      && occurrences(shellCommands(publishJob), `${POLICY_CONTRACT_COMMAND} validate-immutable-release-governance`) >= 3
       && publishJob.includes('--repository "${ASSETS_REPO}"')
       && governanceCheck >= 0 && firstRefMutation >= 0 && governanceCheck < firstRefMutation
       && publishJob.includes('immutable-governance-unverified')
@@ -1424,12 +1551,12 @@ function checkPublication({ publish, candidate }, errors) {
     `${candidate.path} must refuse to build unless the dispatcher asserts immutable releases are enabled, and record that assertion`,
   );
   // Row 80: the published release is read back immutable and attested.
-  check.includes(`${publish.path} (publish-assets)`, publishJob, [
+  check.includes(`${publish.path} (publish-assets)`, shellCommands(publishJob), [
     '"repos/${ASSETS_REPO}/releases/tags/${RELEASE_TAG}"',
     '"repos/${ASSETS_REPO}/releases/${published_release_id}"',
     'gh release verify "${RELEASE_TAG}" --repo "${ASSETS_REPO}"',
     '--format json',
-    'verify-immutable-publication',
+    `${POLICY_PUBLICATION_STATE_COMMAND} verify-immutable-publication`,
     '--release-by-id-json "${RUNNER_TEMP}/published-release-by-id.json"',
     'immutable-publication-unverified',
     'touch "${RUNNER_TEMP}/ref-push-attempted"',
@@ -1442,7 +1569,7 @@ function checkPublication({ publish, candidate }, errors) {
   const requery = publish.jobSteps('publish-assets').find((step) => step.index > firstRefMutation
     && normalizeSpace(String(step.raw.if ?? '')).includes("steps.mutate.outcome == 'failure'"));
   check.require(
-    firstRefMutation >= 0 && requery !== undefined && requery.run.includes('scripts/release_publication_state.py classify'),
+    firstRefMutation >= 0 && requery !== undefined && requery.run.includes(`${POLICY_PUBLICATION_STATE_COMMAND} classify`),
     `${publish.path} must re-query the remote state after a failed ref mutation`,
   );
   const formatProbe = publish.stepIndex('publish-assets', (step) => step.run.includes("gh release verify --help | grep -F -- '--format'"));
@@ -1469,7 +1596,7 @@ function checkCandidateAndQualification({ candidate, qualification, publish }, e
     `${candidate.path} must refuse any run attempt other than 1`,
   );
   check.require(
-    (candidate.runText.match(/\.\/scripts\/build_bridge\.sh\b/g) ?? []).length === 1,
+    (candidate.runText.match(/\.\/scripts\/build\/build_bridge\.sh\b/g) ?? []).length === 1,
     `${candidate.path} must build the candidate exactly once`,
   );
   check.require(
@@ -1477,13 +1604,13 @@ function checkCandidateAndQualification({ candidate, qualification, publish }, e
       && Object.keys(candidate.jobs).every((name) => candidate.job(name).environment === undefined),
     `${candidate.path} must stay unprivileged: no publication PAT and no environment`,
   );
-  const build = candidate.steps.find((step) => /\.\/scripts\/build_bridge\.sh\b/.test(step.run));
+  const build = candidate.steps.find((step) => /\.\/scripts\/build\/build_bridge\.sh\b/.test(step.run));
   const stateGate = candidate.steps.find((step) => step.id === 'state_gate');
   const multimodalGate = candidate.steps.find((step) => step.id === 'multimodal_gate');
   check.require(
     build !== undefined && String(build.env.WEBGPU_BRIDGE_BUILD_MEM64) === '1'
-      && stateGate?.run.trim() === 'node scripts/state_persistence_browser_smoke.mjs'
-      && multimodalGate?.run.trim() === 'node scripts/multimodal_browser_smoke.mjs'
+      && stateGate?.run.trim() === 'node scripts/smoke/state_persistence.mjs'
+      && multimodalGate?.run.trim() === 'node scripts/smoke/multimodal.mjs'
       && candidate.steps.some((step) => step.env.STATE_CONCLUSION === '${{ steps.state_gate.outcome }}'
         && step.env.MULTIMODAL_CONCLUSION === '${{ steps.multimodal_gate.outcome }}'),
     `${candidate.path} must build the memory64 core and record the outcomes of its state persistence and multimodal gates`,
@@ -1521,11 +1648,14 @@ function checkCandidateAndQualification({ candidate, qualification, publish }, e
     '--qualification-run-attempt 1',
     '--qualification-source-sha "${QUALIFICATION_SOURCE_SHA}"',
   ];
-  for (const job of ['verify-candidate-and-qualification', 'publish-assets']) {
-    const verification = publish.jobSteps(job).find((step) => step.run.includes('scripts/release_qualification.py verify-attestation'));
+  for (const [job, validator] of [
+    ['verify-candidate-and-qualification', RELEASE_QUALIFICATION_COMMAND],
+    ['publish-assets', POLICY_QUALIFICATION_COMMAND],
+  ]) {
+    const verification = publish.jobSteps(job).find((step) => step.run.includes(`${validator} verify-attestation`));
     check.require(
       verification !== undefined && bindingArgs.every((arg) => verification.run.includes(arg)),
-      `${publish.path} job ${job} must verify the attestation against the exact candidate artifact id, both first attempts, and the qualification run and source`,
+      `${publish.path} job ${job} must verify the attestation with ${validator} verify-attestation against the exact candidate artifact id, both first attempts, and the qualification run and source`,
     );
   }
   check.require(
@@ -1535,18 +1665,20 @@ function checkCandidateAndQualification({ candidate, qualification, publish }, e
       && Object.keys(publish.jobs).every((name) => !has(mapping(publish.job(name).outputs), 'qualification_artifact_id')),
     `${publish.path} must carry the proven candidate artifact id into the privileged job and never export a qualification artifact id`,
   );
-  check.includes(qualification.path, qualification.runText, [
+  check.includes(qualification.path, shellCommands(qualification.runText), [
     '--candidate-artifact-id "${CANDIDATE_ARTIFACT_ID}"',
     '--candidate-run-attempt 1',
     '--qualification-run-id "${GITHUB_RUN_ID}"',
     '--qualification-run-attempt 1',
     '--qualification-source-sha "${GITHUB_SHA}"',
-    'artifact_type="candidate"',
+    `${EXTRACT_ARTIFACT_COMMAND} --type candidate --archive "\${RUNNER_TEMP}/candidate.zip" --destination "\${RUNNER_TEMP}/candidate"`,
   ], 'bind the attestation to the exact candidate artifact id, both first attempts, and its own run and source');
-  check.includes(publish.path, publish.runText, [
-    'artifact_type="candidate"',
-    'artifact_type="attestation"',
-    'scripts/release_qualification.py verify-run',
+  check.includes(publish.path, shellCommands(publish.runText), [
+    `${EXTRACT_ARTIFACT_COMMAND} --type candidate --archive "\${RUNNER_TEMP}/candidate.zip" --destination "\${RUNNER_TEMP}/candidate"`,
+    `${EXTRACT_ARTIFACT_COMMAND} --type attestation --archive "\${RUNNER_TEMP}/attestation.zip" --destination "\${RUNNER_TEMP}/attestation"`,
+    `${EXTRACT_ARTIFACT_COMMAND} --type prequalification --archive "\${RUNNER_TEMP}/candidate-prequalification.zip" `
+      + '--destination "${RUNNER_TEMP}/candidate-prequalification"',
+    `${RELEASE_QUALIFICATION_COMMAND} verify-run`,
     '--workflow-path "${workflow_path}"',
     '--head-branch "${bridge_default}"',
     'repos/${BRIDGE_REPO}/compare/${head_sha}...${bridge_default}',
@@ -1554,11 +1686,12 @@ function checkCandidateAndQualification({ candidate, qualification, publish }, e
     'actions/artifacts/${QUALIFICATION_ARTIFACT_ID}/zip',
     '?per_page=100',
     'run_attempt_args=(--run-attempt 1)',
-    '_extract_flat_artifact_archive',
-    'publication-policy/scripts/release_qualification.py verify-attestation',
-    'publication-policy/scripts/release_publication_state.py classify',
-    '--harness-dir',
-  ], 'prove both run identities on the default-branch line and download both artifacts by immutable id with the trusted validators');
+    `${POLICY_QUALIFICATION_COMMAND} verify-attestation`,
+    `${POLICY_PUBLICATION_STATE_COMMAND} classify`,
+    '--harness-dir bridge-source/scripts',
+    `${RELEASE_QUALIFICATION_COMMAND} harness-digest --harness-dir bridge-source/scripts`,
+    `${RELEASE_CONTRACT_COMMAND} validate-candidate-prequalification`,
+  ], 'prove both run identities on the default-branch line, download all three artifacts by immutable id, and extract and verify them with the trusted validators');
   const publishEnv = mapping(publish.data.env);
   check.require(
     publishEnv.CANDIDATE_WORKFLOW_PATH === '.github/workflows/bridge_candidate.yml'
@@ -1568,18 +1701,27 @@ function checkCandidateAndQualification({ candidate, qualification, publish }, e
     `${publish.path} must pin the candidate and qualification workflow paths and the exact artifact names`,
   );
   check.excludes(publish.path, publish.text, [
-    'scripts/build_bridge.sh', 'WEBGPU_BRIDGE_BUILD_MEM64', 'setup-emsdk', 'emsdk install', 'emsdk_env.sh', 'scripts/generate_release_manifest.py',
-    'bridge-source/scripts/release_qualification.py', 'bridge-source/scripts/release_publication_state.py',
+    'scripts/build/build_bridge.sh', 'WEBGPU_BRIDGE_BUILD_MEM64', 'setup-emsdk', 'emsdk install', 'emsdk_env.sh', RELEASE_MANIFEST_MODULE,
+    'bridge-source/scripts/release/',
   ], 'never rebuild the candidate or run a validator from the historical build source');
+  // The one command publish runs from the historical build source reads its
+  // Emscripten pin, the version the candidate was built against.
+  const historical = [...publish.runText.matchAll(/bridge-source\/scripts\/\S*/g)].map((match) => match[0]);
+  check.require(
+    sameList(historical, [`bridge-source/${EMSCRIPTEN_VERIFIER}`])
+      && publish.runText.includes(`EMSCRIPTEN_VERSION="$(node bridge-source/${EMSCRIPTEN_VERIFIER} --print-pin)"`),
+    `${publish.path} may run only node bridge-source/${EMSCRIPTEN_VERIFIER} --print-pin from the historical build source; found ${quoteAll(historical)}`,
+  );
   // Row 91: qualification accepts no hand-produced attestation, proves the
   // exact candidate before running the gates on its harness, and holds no PAT.
   check.excludes(qualification.path, qualification.text, [
     'attestation_base64:', 'attestation_json:', 'decode-attestation', PUBLICATION_PAT_NAME,
   ], 'never accept a transported attestation or hold the publication PAT');
-  check.includes(qualification.path, qualification.runText, [
-    'scripts/release_qualification.py verify-run',
-    'release_qualification.py qualify',
-    'scripts/release_qualification.py verify-attestation',
+  check.includes(qualification.path, shellCommands(qualification.runText), [
+    `${RELEASE_QUALIFICATION_COMMAND} verify-run`,
+    `${QUALIFY_COMMAND} --candidate-run-id "\${CANDIDATE_RUN_ID}"`,
+    `${RELEASE_QUALIFICATION_COMMAND} verify-attestation`,
+    `${RELEASE_QUALIFICATION_COMMAND} candidate-fingerprint`,
     '--harness-dir candidate-source/scripts',
     'candidate_correlation_id="$(jq -er',
     '"${candidate_correlation_id}" != "${ORCHESTRATOR_CORRELATION_ID}"',
@@ -1597,7 +1739,7 @@ function checkCandidateAndQualification({ candidate, qualification, publish }, e
 export function requireQualificationNodeHarness(text, errors, relativePath = WORKFLOWS.qualification) {
   const check = checker(errors);
   const qualification = new Workflow(relativePath, text, errors);
-  const qualifyIndex = qualification.steps.findIndex((step) => step.run.includes('release_qualification.py qualify'));
+  const qualifyIndex = qualification.steps.findIndex((step) => shellCommands(step.run).includes(QUALIFY_COMMAND));
   const before = (predicate) => qualification.steps.some((step, index) => index < qualifyIndex && predicate(step));
   const inCandidateSource = (step, command) => step.run.trim() === command && step.raw['working-directory'] === 'candidate-source';
   check.require(
@@ -1606,7 +1748,7 @@ export function requireQualificationNodeHarness(text, errors, relativePath = WOR
       && before((step) => inCandidateSource(step, 'npm ci --ignore-scripts'))
       && before((step) => inCandidateSource(step, 'npx --no-install playwright install --only-shell chromium')),
     `${relativePath} must set up Node.js 24, run npm ci --ignore-scripts and install the Playwright Chromium `
-      + 'in candidate-source before release_qualification.py qualify',
+      + `in candidate-source before ${QUALIFY_COMMAND}`,
   );
   check.excludes(relativePath, qualification.runText, ['pip install', '-m playwright'], 'never install Python Playwright');
   // Only the lockfile decides the gate dependencies: no other npm install.
@@ -1686,20 +1828,36 @@ function readTestFiles(errors) {
   }
 }
 
-export function collectErrors() {
+/**
+ * Runs every check over the repository tree. `overrides` maps a repository
+ * path to the text to check in its place (null reads as a missing file, or
+ * drops a tests/ file), so the tests can prove each check against a mutated
+ * copy of the real files.
+ */
+export function collectErrors(overrides = {}) {
   const errors = [];
+  const read = (relativePath) => {
+    if (!has(overrides, relativePath)) return readRequired(relativePath, errors);
+    if (overrides[relativePath] === null) {
+      errors.push(`required file is not readable: ${relativePath}: overridden as missing`);
+      return '';
+    }
+    return overrides[relativePath];
+  };
+  // EXPECTED_MODEL_PINS is read once, from the tree; parseExpectedModelPins
+  // is tested on its own.
   if (expectedModelPinsError) errors.push(expectedModelPinsError);
   const workflows = Object.fromEntries(Object.entries(WORKFLOWS).map(
-    ([key, relativePath]) => [key, new Workflow(relativePath, readRequired(relativePath, errors), errors)],
+    ([key, relativePath]) => [key, new Workflow(relativePath, read(relativePath), errors)],
   ));
   const files = Object.fromEntries([
     'package.json', 'llama_cpp.version', 'emsdk.version', 'README.md', 'AGENTS.md', 'CONTRIBUTING.md',
-    'scripts/verify_emscripten_version.py', 'scripts/build_bridge.sh', 'scripts/generate_release_manifest.py',
-  ].map((relativePath) => [relativePath, readRequired(relativePath, errors)]));
+    EMSCRIPTEN_VERIFIER, 'scripts/build/build_bridge.sh', RELEASE_MANIFEST_MODULE,
+  ].map((relativePath) => [relativePath, read(relativePath)]));
   const orchestratorSources = orchestratorModules(Object.fromEntries(
     listRequired(ORCHESTRATOR_DIRECTORY, /\.mjs$/, errors)
       .map((name) => `${ORCHESTRATOR_DIRECTORY}/${name}`)
-      .map((relativePath) => [relativePath, readRequired(relativePath, errors)]),
+      .map((relativePath) => [relativePath, read(relativePath)]),
   ), errors);
 
   const known = new Set(Object.values(WORKFLOWS));
@@ -1708,14 +1866,22 @@ export function collectErrors() {
     ...listRequired('.github/workflows', /\.ya?ml$/, errors)
       .map((name) => `.github/workflows/${name}`)
       .filter((relativePath) => !known.has(relativePath))
-      .map((relativePath) => new Workflow(relativePath, readRequired(relativePath, errors), errors)),
+      .map((relativePath) => new Workflow(relativePath, read(relativePath), errors)),
   ];
+  const testFiles = readTestFiles(errors);
+  for (const [relativePath, text] of Object.entries(overrides)) {
+    if (!relativePath.startsWith('tests/')) continue;
+    if (text === null) delete testFiles[relativePath];
+    else testFiles[relativePath] = text;
+  }
 
-  checkJsContractTestsRegistered(files['package.json'], readTestFiles(errors), errors);
+  checkJsContractTestsRegistered(files['package.json'], testFiles, errors);
   checkSecretReferences(allWorkflows, errors);
   checkPermissions(allWorkflows, errors);
   checkNoContinueOnError(allWorkflows, errors);
-  checkCiRunsContracts(workflows, errors);
+  checkNoPython(allWorkflows, errors);
+  checkCiRunsContracts(workflows, testFiles, errors);
+  checkNodeSetup(workflows, errors);
   checkToolchainPins(workflows, files, errors);
   checkOrchestration(workflows.autoUpdate, orchestratorSources, errors);
   checkPublication(workflows, errors);

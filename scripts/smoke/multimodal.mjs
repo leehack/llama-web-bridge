@@ -25,7 +25,7 @@ import {
   withServer,
   withTempDir,
   writeStdout,
-} from './browser_smoke_support.mjs';
+} from './support.mjs';
 
 const DESCRIPTION = 'Real-model browser smoke for multimodal bridge prompt ingestion.';
 const DEFAULT_MODEL_CACHE = '~/.cache/llama-web-bridge/multimodal-smoke-models';
@@ -224,7 +224,7 @@ export function renderHarness() {
 
 export function parseArgs(argv) {
   return parseSmokeArgs(argv, {
-    prog: 'multimodal_browser_smoke.mjs',
+    prog: 'multimodal.mjs',
     description: DESCRIPTION,
     options: [
       {

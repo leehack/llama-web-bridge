@@ -29,7 +29,7 @@ import {
   withServer,
   withTempDir,
   writeStdout,
-} from './browser_smoke_support.mjs';
+} from './support.mjs';
 
 const DESCRIPTION = `Browser smoke test for bridge state-persistence API wiring.
 
@@ -356,7 +356,7 @@ export function renderHarness(modelFilename) {
 
 export function parseArgs(argv) {
   return parseSmokeArgs(argv, {
-    prog: 'state_persistence_browser_smoke.mjs',
+    prog: 'state_persistence.mjs',
     description: DESCRIPTION,
     options: [
       {

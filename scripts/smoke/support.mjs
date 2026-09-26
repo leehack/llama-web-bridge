@@ -1,4 +1,4 @@
-// Shared helpers for the Playwright browser smokes (scripts/*_browser_smoke.mjs).
+// Shared helpers for the Playwright browser smokes (scripts/smoke/*.mjs).
 //
 // Ported from the helpers in scripts/state_persistence_browser_smoke.py and
 // kept behaviour-compatible with them: the same HTTP semantics and headers,

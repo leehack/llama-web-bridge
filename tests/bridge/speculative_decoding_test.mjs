@@ -7,7 +7,7 @@ import {
   SPECULATIVE_DECODING_STRATEGIES,
   resolveCompletionSamplingOptions,
 } from '../../js/src/internal/completion_options.ts';
-import * as smoke from '../../scripts/speculative_browser_smoke.mjs';
+import * as smoke from '../../scripts/smoke/speculative.mjs';
 import { createDirectBridge, createWorkerBridge } from './bridge_operation_queue_fixtures.mjs';
 import { readNativeCoreSource } from './native_core_source.mjs';
 

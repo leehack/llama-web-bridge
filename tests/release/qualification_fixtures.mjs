@@ -108,7 +108,7 @@ export const SCRIPTS_DIR = path.join(REPO, 'scripts');
 // Pinned in the fixture the speech gate reads, not restated here, so this
 // suite cannot pass against a transcript the real gate would reject.
 export const DEFAULT_EXPECTED_TEXT = JSON.parse(
-  fs.readFileSync(path.join(SCRIPTS_DIR, 'speech_to_text_fixture.json'), 'utf8'),
+  fs.readFileSync(path.join(SCRIPTS_DIR, 'smoke', 'speech_to_text_fixture.json'), 'utf8'),
 ).expected_text;
 
 export function makeTempDir(prefix = 'llama-web-bridge-qual-test-') {

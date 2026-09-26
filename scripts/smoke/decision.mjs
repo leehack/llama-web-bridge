@@ -40,7 +40,7 @@ import {
   withServer,
   withTempDir,
   writeStdout,
-} from './browser_smoke_support.mjs';
+} from './support.mjs';
 
 const DESCRIPTION = 'Real-model browser smoke for Laya decision heads on a ModernBERT encoder.';
 export const MEMORY_MODES = Object.freeze(['wasm32', 'wasm64']);
@@ -371,7 +371,7 @@ export function renderHarness({ fixture, configJson, memoryModes, runtimeModes, 
 
 export function parseArgs(argv) {
   return parseSmokeArgs(argv, {
-    prog: 'decision_browser_smoke.mjs',
+    prog: 'decision.mjs',
     description: DESCRIPTION,
     options: [
       { flag: '--dist-dir', type: 'path', default: () => 'dist' },

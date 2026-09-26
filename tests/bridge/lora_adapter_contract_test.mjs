@@ -9,7 +9,7 @@ import {
   workerDriver,
 } from './bridge_operation_queue_fixtures.mjs';
 import { readNativeCoreSource } from './native_core_source.mjs';
-import * as smoke from '../../scripts/lora_adapter_browser_smoke.mjs';
+import * as smoke from '../../scripts/smoke/lora_adapter.mjs';
 
 // A core that records LoRA calls and applies them as the C++ core does.
 function createLoraCore({ version = 1, exported = true, loadResult = null, loadError = '' } = {}) {
