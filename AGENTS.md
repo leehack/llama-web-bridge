@@ -71,7 +71,9 @@ applies:
   `release_qualification.py qualify` command is workflow-only because it
   requires GitHub Actions and `github-hosted` runner identity;
 - decision-head changes: `scripts/decision_browser_smoke.mjs` with a Laya
-  encoder GGUF, head and reference fixture.
+  encoder GGUF, head and reference fixture;
+- LoRA adapter changes: `scripts/lora_adapter_browser_smoke.mjs` with its
+  default base model and adapter.
 
 Keep the tiny model in a user cache or `/private/tmp`; do not commit downloaded
 GGUFs or smoke artifacts.
@@ -207,11 +209,13 @@ candidate and exact `candidate_run_id`/`attestation_run_id` pair.
 - Keep publishing logic in workflow only.
 - Do not edit assets repository files from here outside publish flow.
 - C++ exception catching is enabled only for
-  `llamadart_webgpu_grammar_sampler_init` (`EXCEPTION_CATCHING_ALLOWED` in
-  `CMakeLists.txt`), which turns llama.cpp's grammar parser throws into an
-  `(invalid grammar)` error. Do not widen it with `-fexceptions` or
-  `-fwasm-exceptions`: whole-TU catching puts `invoke_*` trampolines and their
-  ASYNCIFY instrumentation on hot paths, and Wasm EH conflicts with ASYNCIFY.
+  `llamadart_webgpu_grammar_sampler_init` and
+  `llamadart_webgpu_lora_adapter_init` (`EXCEPTION_CATCHING_ALLOWED` in
+  `CMakeLists.txt`), which turn llama.cpp's grammar parser and LoRA loader
+  throws into `(invalid grammar)` and `Failed to load LoRA adapter` errors. Do
+  not widen it with `-fexceptions` or `-fwasm-exceptions`: whole-TU catching
+  puts `invoke_*` trampolines and their ASYNCIFY instrumentation on hot paths,
+  and Wasm EH conflicts with ASYNCIFY.
   The link setting makes every other uncaught throw escape `ccall` as a
   `CppException`; `src/llama_webgpu_core_post.js` turns it back into
   `abort()` for `ccall`, the bridge's only entry into the core, so keep the two

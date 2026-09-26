@@ -15,6 +15,7 @@ import type {
   DecisionHeadOptions,
   DecisionSequence,
   LoadModelOptions,
+  LoraAdapterLoadOptions,
   TextToSpeechOptions,
 } from './llama_webgpu_bridge.d.ts';
 
@@ -318,6 +319,17 @@ export function installBridgeWorkerHost() {
           self.postMessage({ type: 'event', id, event: 'progress', payload: progress || {} });
         };
         const value = await bridge.loadDecisionHead(args[0] as string | ArrayBuffer | ArrayBufferView, options);
+        self.postMessage({ type: 'result', id, value });
+        return;
+      }
+
+      if (method === 'loadLoraAdapter') {
+        const options: LoraAdapterLoadOptions = (args[1] && typeof args[1] === 'object') ? { ...args[1] } : {};
+        delete options.signal;
+        options.progressCallback = (progress: unknown) => {
+          self.postMessage({ type: 'event', id, event: 'progress', payload: progress || {} });
+        };
+        const value = await bridge.loadLoraAdapter(args[0] as string | ArrayBuffer | ArrayBufferView, options);
         self.postMessage({ type: 'result', id, value });
         return;
       }

@@ -16,7 +16,6 @@ import { importCoreFactory } from './internal/core_loader.ts';
 import {
   DECISION_API_VERSION,
   decisionHandleFrom,
-  decisionHeadBytes,
   decodeDecisionOutputs,
   encodeDecisionSequences,
 } from './internal/decision.ts';
@@ -33,6 +32,12 @@ import {
 import { isCrossOriginIsolatedRuntime, isSafariUserAgent } from './internal/environment.ts';
 import { decodeImageBytesToRgb } from './internal/image.ts';
 import { logLevelForName, logThresholdForConfiguredLevel } from './internal/logging.ts';
+import {
+  LORA_API_VERSION,
+  LORA_LOAD_ABORT_MESSAGE,
+  loraHandleFrom,
+  loraScaleFrom,
+} from './internal/lora.ts';
 import {
   basenameFromUrl,
   cloneModelSource,
@@ -54,7 +59,7 @@ import {
   looksLikeCorruptedGeneration,
   trimUnstableUtf8Tail,
 } from './internal/text.ts';
-import { isInt32, toFloat32Array, toUint8Array } from './internal/typed_values.ts';
+import { bufferSourceBytes, isInt32, toFloat32Array, toUint8Array } from './internal/typed_values.ts';
 import type { ProgressCallback } from './internal/download.ts';
 import type { ModelSource } from './internal/model_source.ts';
 import type { CcallArgType, LlamaCoreModule, LogMethod } from './internal/types.ts';
@@ -68,6 +73,9 @@ import type {
   EmbedOptions,
   LlamaWebGpuBridgeConfig,
   LoadModelOptions,
+  LoraAdapterCapabilities,
+  LoraAdapterInfo,
+  LoraAdapterLoadOptions,
   NextTokenScoreOptions,
   TextToSpeechCapabilities,
   TextToSpeechOptions,
@@ -99,6 +107,12 @@ interface CachedModelResponseOptions extends RuntimeLoadModelOptions {
   requireReadableStream?: boolean;
   requestHeaders?: Record<string, string> | null;
 }
+
+// LoRA load options as the bridge passes them: a null signal means none, and
+// the fetch knobs a model load reads are honoured too.
+type RuntimeLoraAdapterLoadOptions = {
+  [K in keyof LoraAdapterLoadOptions as K extends 'signal' ? never : K]: LoraAdapterLoadOptions[K];
+} & { signal?: AbortSignal | null } & TransferOptions;
 
 // Per-request image downscale limits; they override the configured ones.
 interface MediaImageLimitOptions {
@@ -160,6 +174,8 @@ export class LlamaWebGpuBridgeRuntime {
   declare _mediaFileCounter: number;
   declare _stateFileCounter: number;
   declare _decisionFileCounter: number;
+  declare _loraFileCounter: number;
+  declare _loraAdaptersLoaded: boolean;
   declare _stagedMediaPaths: string[];
   declare _nCtx: number;
   declare _abortRequested: boolean;
@@ -218,6 +234,8 @@ export class LlamaWebGpuBridgeRuntime {
     this._mediaFileCounter = 0;
     this._stateFileCounter = 0;
     this._decisionFileCounter = 0;
+    this._loraFileCounter = 0;
+    this._loraAdaptersLoaded = false;
     this._stagedMediaPaths = [];
     this._nCtx = 4096;
     this._abortRequested = false;
@@ -546,6 +564,12 @@ export class LlamaWebGpuBridgeRuntime {
   async _recoverGenerationWithCpuFallback(options: RuntimeCompletionOptions = {}) {
     const modelUrl = cloneModelSource(this._loadedModelUrl);
     if (!hasModelSource(modelUrl)) {
+      return false;
+    }
+    // A reload frees the model's LoRA adapters, so the retry would silently
+    // generate without them.
+    if (this._loraAdaptersLoaded) {
+      this._runtimeNotes.push('generation_recovery_cpu_skipped_lora');
       return false;
     }
 
@@ -1340,6 +1364,7 @@ export class LlamaWebGpuBridgeRuntime {
       throw new Error(this._coreErrorMessage('Failed to release the loaded model', rc));
     }
 
+    this._loraAdaptersLoaded = false;
     this._clearStagedMediaFiles();
     this._deleteFsFile(projectorPath);
     this._releaseModelFiles();
@@ -2895,7 +2920,7 @@ export class LlamaWebGpuBridgeRuntime {
         throw new Error('Decision head URL is empty.');
       }
     } else {
-      bytes = decisionHeadBytes(source);
+      bytes = bufferSourceBytes(source);
       if (!bytes) {
         throw new TypeError('Decision head source must be a URL string, an ArrayBuffer or a typed array.');
       }
@@ -2996,6 +3021,212 @@ export class LlamaWebGpuBridgeRuntime {
       ['number'],
       [nativeHandle],
       { async: true },
+    );
+  }
+
+  getLoraAdapterCapabilities(): LoraAdapterCapabilities {
+    const unsupported = (reason: string) => ({
+      apiVersion: LORA_API_VERSION,
+      supported: false,
+      reason,
+    });
+    const core = this._core;
+    if (!core) {
+      return unsupported('WebGPU core is not initialized');
+    }
+    if (typeof core._llamadart_webgpu_lora_api_version !== 'function') {
+      return unsupported('This WebGPU core build does not include LoRA adapters.');
+    }
+    const coreVersion = Number(
+      core.ccall('llamadart_webgpu_lora_api_version', 'number', [], []),
+    );
+    if (coreVersion !== LORA_API_VERSION) {
+      return unsupported(
+        `The WebGPU core implements LoRA API version ${coreVersion}; `
+        + `this bridge needs version ${LORA_API_VERSION}.`,
+      );
+    }
+    return { apiVersion: LORA_API_VERSION, supported: true };
+  }
+
+  _requireLoraCore() {
+    if (!this._core || this._modelBytes <= 0) {
+      throw new Error('No model loaded. Call loadModelFromUrl first.');
+    }
+    const capabilities = this.getLoraAdapterCapabilities();
+    if (capabilities.supported !== true) {
+      throw new Error(capabilities.reason || 'This bridge cannot load LoRA adapters.');
+    }
+    return this._core;
+  }
+
+  /**
+   * Downloads a URL adapter into `adapterPath`, through the Cache API unless
+   * `options.useCache` is false. A cache miss stores the response while it is
+   * written, so progress starts with the first chunk.
+   */
+  async _stageLoraAdapterFromUrl(
+    url: string,
+    adapterPath: string,
+    options: RuntimeLoraAdapterLoadOptions,
+  ) {
+    const core = this._core!;
+    const signal = options.signal || null;
+    const progressCallback = typeof options.progressCallback === 'function'
+      ? options.progressCallback
+      : null;
+    const fetchTimeoutMs = this._resolveFetchTimeoutMs(options, 180000);
+    const chunkTimeoutMs = this._resolveStreamChunkTimeoutMs(options, 90000);
+    const fetchInit: RequestInit = signal ? { signal } : {};
+    const cacheKey = normalizeAbsoluteUrl(url);
+    let cache: Cache | null = null;
+    if (options.useCache !== false && typeof globalThis.caches?.open === 'function') {
+      try {
+        cache = await globalThis.caches.open(this._resolveCacheName(options));
+      } catch (_) {
+        this._runtimeNotes.push('lora_cache_error');
+      }
+    }
+    for (let attempt = 0; ; attempt += 1) {
+      throwIfAborted(signal, LORA_LOAD_ABORT_MESSAGE);
+      try {
+        let response: Response | null = null;
+        if (cache) {
+          try {
+            response = (await cache.match(cacheKey)) || null;
+          } catch (_) {
+            this._runtimeNotes.push('lora_cache_error');
+          }
+        }
+        let stored: Promise<void> | null = null;
+        if (!response) {
+          response = await this._fetchWithTimeout(
+            url,
+            cache ? fetchInit : { cache: 'no-store', ...fetchInit },
+            fetchTimeoutMs,
+          );
+          if (!response.ok) {
+            throw new Error(
+              `Failed to fetch LoRA adapter: ${response.status} ${response.statusText}`,
+            );
+          }
+          if (cache) {
+            stored = cache.put(cacheKey, response.clone()).then(
+              () => {
+                this._runtimeNotes.push('lora_cache_stored');
+              },
+              () => {
+                this._runtimeNotes.push('lora_cache_store_failed');
+              },
+            );
+          }
+        }
+        await writeResponseToFsFileWithProgress(
+          response,
+          core.FS,
+          adapterPath,
+          progressCallback,
+          {
+            useBigIntPosition: this._coreVariant === 'wasm64',
+            chunkTimeoutMs,
+            signal,
+            abortMessage: LORA_LOAD_ABORT_MESSAGE,
+          },
+        );
+        await stored;
+        return;
+      } catch (error) {
+        this._deleteFsFile(adapterPath);
+        throwIfAborted(signal, LORA_LOAD_ABORT_MESSAGE);
+        if (!isRetryableStreamNetworkError(error) || attempt >= 1) {
+          throw error;
+        }
+        this._runtimeNotes.push(`lora_fetch_retry:${attempt + 1}`);
+      }
+    }
+  }
+
+  async loadLoraAdapter(
+    source: string | ArrayBuffer | ArrayBufferView,
+    options: RuntimeLoraAdapterLoadOptions = {},
+  ): Promise<LoraAdapterInfo> {
+    let bytes = null;
+    if (typeof source === 'string') {
+      if (source.length === 0) {
+        throw new Error('LoRA adapter URL is empty.');
+      }
+    } else {
+      bytes = bufferSourceBytes(source);
+      if (!bytes) {
+        throw new TypeError('LoRA adapter source must be a URL string, an ArrayBuffer or a typed array.');
+      }
+      if (bytes.byteLength === 0) {
+        throw new Error('LoRA adapter bytes are empty.');
+      }
+    }
+    const core = this._requireLoraCore();
+    const signal = options.signal || null;
+    throwIfAborted(signal, LORA_LOAD_ABORT_MESSAGE);
+    ensureFsDirectory(core.FS, '/lora');
+    const adapterPath = `/lora/adapter_${++this._loraFileCounter}.gguf`;
+    try {
+      if (bytes) {
+        core.FS.writeFile(adapterPath, bytes);
+      } else {
+        await this._stageLoraAdapterFromUrl(source as string, adapterPath, options);
+      }
+      throwIfAborted(signal, LORA_LOAD_ABORT_MESSAGE);
+      const handle = Number(
+        await core.ccall(
+          'llamadart_webgpu_lora_load',
+          'number',
+          ['string'],
+          [adapterPath],
+          { async: true },
+        ),
+      );
+      if (handle <= 0) {
+        throw new Error(this._coreErrorMessage('Failed to load LoRA adapter', handle));
+      }
+      this._loraAdaptersLoaded = true;
+      return { handle };
+    } finally {
+      this._deleteFsFile(adapterPath);
+    }
+  }
+
+  async _callLoraCore(name: string, argTypes: CcallArgType[], args: number[], failure: string) {
+    const core = this._requireLoraCore();
+    const rc = Number(await core.ccall(name, 'number', argTypes, args, { async: true }));
+    if (rc !== 0) {
+      throw new Error(this._coreErrorMessage(failure, rc));
+    }
+  }
+
+  async setLoraAdapter(handle: number, scale = 1) {
+    await this._callLoraCore(
+      'llamadart_webgpu_lora_set',
+      ['number', 'number'],
+      [loraHandleFrom(handle), loraScaleFrom(scale)],
+      'Failed to apply LoRA adapter',
+    );
+  }
+
+  async removeLoraAdapter(handle: number) {
+    await this._callLoraCore(
+      'llamadart_webgpu_lora_remove',
+      ['number'],
+      [loraHandleFrom(handle)],
+      'Failed to remove LoRA adapter',
+    );
+  }
+
+  async clearLoraAdapters() {
+    await this._callLoraCore(
+      'llamadart_webgpu_lora_clear',
+      [],
+      [],
+      'Failed to clear LoRA adapters',
     );
   }
 
@@ -3891,6 +4122,7 @@ export class LlamaWebGpuBridgeRuntime {
     this._mmProjSourceUrl = null;
     this._mmSupportsVision = false;
     this._mmSupportsAudio = false;
+    this._loraAdaptersLoaded = false;
     this._abortRequested = false;
     this._textToSpeechActive = false;
     this._textToSpeechDone = null;

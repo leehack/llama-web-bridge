@@ -64,4 +64,6 @@ export interface LlamaCoreModule {
   _llamadart_webgpu_decision_capabilities_json?: unknown;
   // Present only in builds that apply presence penalty and Min-P.
   _llamadart_webgpu_completion_capabilities_json?: unknown;
+  // Present only in builds that include LoRA adapters.
+  _llamadart_webgpu_lora_api_version?: unknown;
 }

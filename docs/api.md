@@ -85,8 +85,11 @@ both worker and direct runtime modes:
 
 `loadModelFromUrl`, `loadMultimodalProjector`, `unloadMultimodalProjector`,
 `getTextToSpeechCapabilities`, `synthesizeSpeech`, `getDecisionCapabilities`,
-`loadDecisionHead`, `runDecision`, `freeDecisionHead`, `createCompletion`,
-`getCompletionCapabilities`, `tokenize`, `detokenize`, `stateSaveFile`, `stateLoadFile`, `stateSaveBytes`,
+`loadDecisionHead`, `runDecision`, `freeDecisionHead`,
+`getLoraAdapterCapabilities`, `loadLoraAdapter`, `setLoraAdapter`,
+`removeLoraAdapter`, `clearLoraAdapters`, `createCompletion`,
+`getCompletionCapabilities`, `tokenize`, `detokenize`, `stateSaveFile`,
+`stateLoadFile`, `stateSaveBytes`,
 `stateLoadBytes`, `embed`, `embedBatch`, `scoreNextToken`, `applyChatTemplate`.
 
 Overlapping calls wait their turn and run in call order. A failing operation
@@ -231,7 +234,8 @@ projector and their filesystem copies, then downloads the new model, so both
 never occupy the WASM heap at once. If the download or native load then
 fails, no model stays loaded; call `loadModelFromUrl()` again. The core refuses
 the release while a generation or speech synthesis is active, and the current
-model stays loaded. Load a projector again after switching models.
+model stays loaded. Load a projector and LoRA adapters again after switching
+models.
 
 ### `prefetchModelToCache(url, options?)`
 
@@ -683,6 +687,95 @@ then fails, free every head, and a later
 again. When the worker fails during `runDecision()`, the bridge reloads the
 model on the main thread and rejects the run; heads must then be loaded again.
 Handles are never reused within one bridge instance.
+
+## LoRA adapters
+
+LoRA adapters change the loaded model's output without reloading it, through
+llama.cpp's `llama_adapter_lora_init_from_file_ptr` and
+`llama_set_adapters_lora`, with native llamadart's `setLora`, `removeLora` and
+`clearLoras` semantics. An
+adapter is a GGUF LoRA file made for the loaded base model. Several adapters
+apply at once, each at its own scale, to completions, embeddings and
+next-token scores; decision heads use their own contexts and are unaffected.
+Changing the applied set drops the cached prompt, so the next call evaluates
+its whole prompt.
+
+### `getLoraAdapterCapabilities()`
+
+```ts
+getLoraAdapterCapabilities(): Promise<LoraAdapterCapabilities>
+```
+
+Returns `{ apiVersion, supported, reason? }`. `supported` is true when the
+core build implements the bridge's LoRA API version. Before the first model
+load the core has not started, so it is false with `reason` `WebGPU core is not
+initialized`. Gate LoRA support on this probe rather than on the asset tag.
+
+### `loadLoraAdapter(source, options?)`
+
+```ts
+loadLoraAdapter(
+  source: string | ArrayBuffer | ArrayBufferView,
+  options?: LoraAdapterLoadOptions,
+): Promise<LoraAdapterInfo>
+```
+
+Loads an adapter from a URL or from bytes and returns its `handle`. Loading
+does not apply it; `setLoraAdapter()` does.
+
+| Option | Description |
+| --- | --- |
+| `progressCallback(progress)` | Receives `{ loaded, total }` download events for a URL adapter. |
+| `signal` | Cancels the download. A load whose adapter already reached the runtime still completes. |
+| `useCache` | Reads and stores a URL adapter in Cache Storage, as models are. Defaults to true. |
+| `cacheName` | Cache Storage cache for a URL adapter; defaults to the bridge's `cacheName`. |
+
+The adapter is staged in the runtime's in-memory WASMFS and deleted after
+loading. Worker mode resolves a relative URL against the page and sends the
+worker a copy of byte sources, so caller buffers are not detached. A worker
+adapter load fails after 10 minutes without download progress.
+
+The load rejects, and the runtime stays usable, for a file llama.cpp rejects,
+including an adapter made for another base model (for example `tensor
+'blk.0.attn_k.weight' has incorrect shape (hint: maybe wrong base model?)`),
+and for an aLoRA adapter, which must activate only once its invocation tokens
+appear in the prompt. Errors never include the adapter URL.
+
+### `setLoraAdapter(handle, scale?)`
+
+```ts
+setLoraAdapter(handle: number, scale?: number): Promise<void>
+```
+
+Applies the adapter at `scale`, 1 by default. Setting an applied adapter again
+changes its scale. A scale of 0 gives the same output as not applying the
+adapter. `scale` must be a finite number and `handle` a positive integer, or
+the call rejects with a `TypeError`. The core applies `scale` as a 32-bit
+float, so a finite scale outside that range rejects with a `RangeError`.
+
+### `removeLoraAdapter(handle)` and `clearLoraAdapters()`
+
+```ts
+removeLoraAdapter(handle: number): Promise<void>
+clearLoraAdapters(): Promise<void>
+```
+
+`removeLoraAdapter()` stops applying one adapter and `clearLoraAdapters()`
+stops applying all of them. Adapters stay loaded and can be set again.
+
+Handles belong to the loaded model. `dispose()` and any model load that reaches
+the core, even one that then fails, free every adapter, and a later call with
+such a handle rejects and asks for the adapter to be loaded again. There is no
+per-adapter free. Handles are never reused within one bridge instance.
+
+When the bridge reloads the model itself, after a worker restart, a fallback
+to the main-thread runtime or a switch to multimodal CPU mode, it then reloads
+the applied adapters and applies them at their scales; the others reload when
+next set. If this fails in the worker, the call rejects and the next call
+tries again. With the worker enabled, the bridge keeps a copy of byte sources
+for this. While an adapter is loaded, a generation that fails on
+WebGPU is not retried by reloading the model on the CPU, since the reload would
+free the adapters; the generation error is returned instead.
 
 ## Runtime metadata and diagnostics
 

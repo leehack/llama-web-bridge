@@ -242,6 +242,22 @@ node scripts/decision_browser_smoke.mjs \
   --artifacts-dir /tmp/llama-web-bridge-decision-smoke
 ```
 
+For LoRA adapter changes, run a base model and a LoRA adapter trained on it
+through both runtimes and memory modes. The smoke defaults to a checksum-pinned
+stories15M base and Shakespeare adapter and loads the adapter onto the
+state-persistence model to check the mismatch error. The default
+`--gpu-layers 0` runs on the CPU. A nonzero value enables WebGPU and skips the
+model reload check, because reloading a model on one bridge aborts in headless
+Chromium with WebGPU enabled, with or without adapters:
+
+```bash
+node scripts/lora_adapter_browser_smoke.mjs \
+  --dist-dir /private/tmp/llama_web_bridge_dist \
+  --mismatch-model-url "$LLAMA_WEBGPU_SMOKE_MODEL_URL" \
+  --mismatch-model-sha256 "$LLAMA_WEBGPU_SMOKE_MODEL_SHA256" \
+  --artifacts-dir /tmp/llama-web-bridge-lora-smoke
+```
+
 If the smoke downloads from a URL, errors and diagnostics must redact userinfo,
 query strings, and fragments before printing the location.
 

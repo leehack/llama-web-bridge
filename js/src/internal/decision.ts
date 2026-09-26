@@ -24,16 +24,6 @@ export function decisionHandleFrom(handle: unknown): number {
   return handle as number;
 }
 
-export function decisionHeadBytes(source: unknown): Uint8Array | null {
-  if (source instanceof ArrayBuffer) {
-    return new Uint8Array(source);
-  }
-  if (ArrayBuffer.isView(source)) {
-    return new Uint8Array(source.buffer, source.byteOffset, source.byteLength);
-  }
-  return null;
-}
-
 function decisionIntegerList(value: unknown, label: string): Int32Array {
   const isList = Array.isArray(value)
     || (ArrayBuffer.isView(value) && !(value instanceof DataView));

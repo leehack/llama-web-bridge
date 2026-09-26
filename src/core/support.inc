@@ -138,6 +138,14 @@ void free_decision_heads() {
   g_decision_json = "{}";
 }
 
+void free_lora_adapters() {
+  for (auto & entry : g_lora_adapters) {
+    llama_adapter_lora_free(entry.second);
+  }
+  g_lora_adapters.clear();
+  g_active_loras.clear();
+}
+
 bool read_binary_file(
     const char * path,
     std::vector<unsigned char> & output) {
@@ -195,6 +203,10 @@ void free_runtime() {
     llama_free(g_state.ctx);
     g_state.ctx = nullptr;
   }
+
+  // The context applies these adapters and llama_model_free deletes any still
+  // registered, so they are freed between the two.
+  free_lora_adapters();
 
   if (g_state.model != nullptr) {
     llama_model_free(g_state.model);
