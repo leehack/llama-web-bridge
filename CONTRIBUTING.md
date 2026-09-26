@@ -161,9 +161,10 @@ node scripts/multimodal_browser_smoke.mjs \
   --artifacts-dir /tmp/llama-web-bridge-multimodal-smoke
 ```
 
-For sampler or grammar changes, run grammar-constrained completion through
-direct and worker runtimes on both memory modes. CI runs it twice: with the
-state-persistence model, then with the multimodal model. Pass each model's
+For sampler or grammar changes, run grammar-constrained completion and the
+seeded `minP`/`presencePenalty` checks through direct and worker runtimes on
+both memory modes. CI runs it twice: with the state-persistence model, then
+with the multimodal model. Pass each model's
 `--model-url` (or `--model-path`) and `--model-sha256` pin from the commands
 above; the smoke defaults to the `LLAMA_WEBGPU_SMOKE_MODEL_URL` and
 `LLAMA_WEBGPU_SMOKE_MODEL_SHA256` environment variables:

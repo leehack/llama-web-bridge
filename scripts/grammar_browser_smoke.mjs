@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Browser smoke for grammar-constrained completion.
+// Browser smoke for grammar-constrained completion and sampler options.
 //
 // Ported from grammar_browser_smoke.py with the same flags, environment
 // variables, harness page and output.
@@ -34,7 +34,7 @@ import {
   writeStdout,
 } from './browser_smoke_support.mjs';
 
-const DESCRIPTION = `Browser smoke for grammar-constrained completion.
+const DESCRIPTION = `Browser smoke for grammar-constrained completion and sampler options.
 
 Runs grammar-constrained \`\`createCompletion\`\` calls through the direct and
 worker runtimes of the wasm32 and wasm64 cores with a checksum-pinned GGUF and checks that every result is
@@ -45,7 +45,16 @@ JSON grammar. It first sends invalid grammars, which used to abort the core
 from the parser's throw: each must reject with an \`\`(invalid grammar)\`\` error
 and leave the runtime usable for the valid cases that follow. The worker
 runtime must still own the model afterwards: an abort there used to move the
-bridge to the main thread for the rest of the session.`;
+bridge to the main thread for the rest of the session.
+
+It then checks \`\`minP\`\` and \`\`presencePenalty\`\` with a fixed seed. Every
+compared completion reuses the same cached prompt, so each run starts from the
+same logits. \`\`minP: 1\`\` keeps only the most probable token and so matches
+greedy decoding, which plain sampling does not; explicit zeros match the
+defaults; a presence penalty changes greedy output; an invalid value rejects,
+and the same seeded sample repeats exactly afterwards.
+\`\`getCompletionCapabilities\`\` reports no option before a model load and
+every option after it.`;
 
 const MODEL_FILENAME = 'grammar-smoke-model.gguf';
 // The issue #115 repro prompt. Its ChatML markers are plain text to a model
@@ -115,8 +124,31 @@ export const CASES = Object.freeze([
     options: { nPredict: 64, temp: 0.7, topK: 0, topP: 0.1, seed: 7 },
   },
 ]);
+const SAMPLER_PROMPT = 'Here is a long list of animals, colors, and cities:';
+const SAMPLED = { nPredict: 20, temp: 1, topK: 0, topP: 1, penalty: 1, seed: 11 };
+const GREEDY = { nPredict: 20, temp: 0, topK: 1, penalty: 1, seed: 11 };
+// Each run's options; "first" warms the prompt cache and is not compared.
+export const SAMPLER_RUNS = Object.freeze([
+  ['first', { ...SAMPLED, nPredict: 1 }],
+  ['sampled', SAMPLED],
+  ['sampled-explicit-zeros', { ...SAMPLED, minP: 0, presencePenalty: 0 }],
+  ['greedy', GREEDY],
+  ['min-p-one', { ...SAMPLED, minP: 1 }],
+  ['greedy-presence', { ...GREEDY, presencePenalty: 20 }],
+]);
+const INVALID_SAMPLER_OPTIONS = Object.freeze([
+  { minP: 1.5 },
+  { minP: -0.1 },
+  { presencePenalty: Number.POSITIVE_INFINITY },
+]);
+export const COMPLETION_CAPABILITIES = Object.freeze(['presencePenalty', 'minP']);
 export const MEMORY_MODES = Object.freeze(['wasm32', 'wasm64']);
 const RUNTIME_MODES = Object.freeze(['direct', 'worker']);
+
+// JSON has no Infinity, so the invalid options are written as a JS literal.
+const invalidSamplerOptionsLiteral = () => `[${INVALID_SAMPLER_OPTIONS.map((options) => `{ ${
+  Object.entries(options).map(([key, value]) => `${key}: ${String(value)}`).join(', ')
+} }`).join(', ')}]`;
 
 export function renderHarness(nCtx, memoryModes) {
   const config = pyJson({
@@ -125,10 +157,13 @@ export function renderHarness(nCtx, memoryModes) {
     cases: CASES,
     invalidGrammarError: INVALID_GRAMMAR_ERROR,
     nonThrowingRejection: NON_THROWING_REJECTION,
+    samplerPrompt: SAMPLER_PROMPT,
+    samplerRuns: SAMPLER_RUNS,
     nCtx,
     memoryModes,
     runtimeModes: RUNTIME_MODES,
   });
+  const invalidSamplerOptions = invalidSamplerOptionsLiteral();
   return `
 <!doctype html>
 <meta charset="utf-8">
@@ -185,7 +220,10 @@ export function renderHarness(nCtx, memoryModes) {
         wasmUrlMem64: useMemory64 ? '/llama_webgpu_core_mem64.wasm' : undefined,
       });
       const cases = [];
+      const samplerRuns = {};
+      const invalidSamplerErrors = [];
       try {
+        const capabilitiesBeforeLoad = await bridge.getCompletionCapabilities();
         await bridge.loadModelFromUrl(config.modelUrl, {
           nCtx: config.nCtx,
           nThreads: 2,
@@ -234,10 +272,37 @@ export function renderHarness(nCtx, memoryModes) {
           plainError = errorText(caught);
         }
 
+        const capabilitiesAfterLoad = await bridge.getCompletionCapabilities();
+        for (const [name, options] of config.samplerRuns) {
+          samplerRuns[name] = await bridge.createCompletion(config.samplerPrompt, {
+            ...options,
+            tokenEventEncoding: 'text',
+          });
+        }
+        const sampled = Object.fromEntries(config.samplerRuns)['sampled'];
+        for (const options of ${invalidSamplerOptions}) {
+          try {
+            await bridge.createCompletion(config.samplerPrompt, { ...sampled, ...options });
+            invalidSamplerErrors.push(null);
+          } catch (caught) {
+            invalidSamplerErrors.push(\`\${caught && caught.name}: \${errorText(caught)}\`);
+          }
+        }
+        // Repeats "sampled" after the rejections.
+        const samplerAfterInvalid = await bridge.createCompletion(config.samplerPrompt, {
+          ...sampled,
+          tokenEventEncoding: 'text',
+        });
+
         const metadata = bridge.getModelMetadata();
         return {
           mode,
           cases,
+          capabilitiesBeforeLoad,
+          capabilitiesAfterLoad,
+          samplerRuns,
+          invalidSamplerErrors,
+          samplerAfterInvalid,
           plainCompletionError: plainError,
           execution: metadata['llamadart.webgpu.execution'] || null,
           coreVariant: metadata['llamadart.webgpu.core_variant'] || null,
@@ -296,6 +361,7 @@ export function validatePayload(payload, memoryModes) {
         );
       }
     }
+    failures.push(...validateSampler(entry).map((failure) => `${mode}: ${failure}`));
     if (pyGet(entry, 'plainCompletionError') !== null) {
       failures.push(`${mode}: completion after the grammar runs failed: ${pyRepr(pyGet(entry, 'plainCompletionError'))}`);
     }
@@ -304,6 +370,44 @@ export function validatePayload(payload, memoryModes) {
   if (pyGet(payload, 'globalWorkerFallbackReason') !== null) {
     failures.push(`worker fell back to the main thread: ${pyRepr(pyGet(payload, 'globalWorkerFallbackReason'))}`);
   }
+  return failures;
+}
+
+const capabilities = (supported) => Object.fromEntries(COMPLETION_CAPABILITIES.map((name) => [name, supported]));
+
+export function validateSampler(entry) {
+  const failures = [];
+  const before = pyGet(entry, 'capabilitiesBeforeLoad');
+  if (!pyEquals(before, capabilities(false))) {
+    failures.push(`capabilities before the load: expected none, got ${pyRepr(before)}`);
+  }
+  const after = pyGet(entry, 'capabilitiesAfterLoad');
+  if (!pyEquals(after, capabilities(true))) {
+    failures.push(`capabilities after the load: expected all, got ${pyRepr(after)}`);
+  }
+  const runs = pyGet(entry, 'samplerRuns');
+  const names = SAMPLER_RUNS.map(([name]) => name);
+  if (!isDict(runs) || !names.every((name) => typeof runs[name] === 'string' && runs[name].length > 0)) {
+    return [...failures, `sampler runs missing or empty: ${pyRepr(runs)}`];
+  }
+  const expect = (condition, message) => {
+    if (!condition) failures.push(message);
+  };
+  expect(runs['sampled-explicit-zeros'] === runs.sampled, 'minP: 0 and presencePenalty: 0 changed the default output');
+  expect(runs.sampled !== runs.greedy, 'plain sampling matched greedy, so min-p-one proves nothing');
+  expect(runs['min-p-one'] === runs.greedy, 'minP: 1 did not reduce sampling to the most probable token');
+  expect(runs['greedy-presence'] !== runs.greedy, 'presencePenalty did not change greedy output');
+  const errors = pyGet(entry, 'invalidSamplerErrors');
+  if (!Array.isArray(errors) || errors.length !== INVALID_SAMPLER_OPTIONS.length || !errors.every(
+    (error) => typeof error === 'string' && error.startsWith('RangeError: CompletionOptions.'),
+  )) {
+    failures.push(`invalid sampler options: expected RangeErrors, got ${pyRepr(errors)}`);
+  }
+  expect(
+    pyGet(entry, 'samplerAfterInvalid') === runs.sampled,
+    'a seeded sample after the rejected options did not repeat the earlier one',
+  );
+  if (failures.length > 0) failures.push(`sampler outputs: ${pyRepr(runs)}`);
   return failures;
 }
 

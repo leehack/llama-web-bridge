@@ -6,6 +6,12 @@ import {
   GENERATION_ALREADY_ACTIVE_RC,
   defaultModelCacheName,
 } from './internal/constants.ts';
+import {
+  NO_COMPLETION_CAPABILITIES,
+  completionCapabilitiesFrom,
+  requireCompletionCapabilities,
+  resolveCompletionSamplingOptions,
+} from './internal/completion_options.ts';
 import { importCoreFactory } from './internal/core_loader.ts';
 import {
   DECISION_API_VERSION,
@@ -53,6 +59,7 @@ import type { ProgressCallback } from './internal/download.ts';
 import type { ModelSource } from './internal/model_source.ts';
 import type { CcallArgType, LlamaCoreModule, LogMethod } from './internal/types.ts';
 import type {
+  CompletionCapabilities,
   CompletionFinishReason,
   CompletionOptions,
   DecisionCapabilities,
@@ -3263,10 +3270,22 @@ export class LlamaWebGpuBridgeRuntime {
     }
   }
 
+  getCompletionCapabilities(): CompletionCapabilities {
+    const core = this._core;
+    if (!core || typeof core._llamadart_webgpu_completion_capabilities_json !== 'function') {
+      return { ...NO_COMPLETION_CAPABILITIES };
+    }
+    return completionCapabilitiesFrom(
+      core.ccall('llamadart_webgpu_completion_capabilities_json', 'string', [], []),
+    );
+  }
+
   async createCompletion(prompt: string, options: RuntimeCompletionOptions = {}): Promise<string> {
     if (this._modelBytes <= 0) {
       throw new Error('No model loaded. Call loadModelFromUrl first.');
     }
+    const sampling = resolveCompletionSamplingOptions(options);
+    requireCompletionCapabilities(sampling, this.getCompletionCapabilities());
 
     this._abortRequested = false;
     const startedAt = performance.now();
@@ -3304,7 +3323,7 @@ export class LlamaWebGpuBridgeRuntime {
         await this._core!.ccall(
           'llamadart_webgpu_begin_generation',
           'number',
-          ['string', 'number', 'number', 'number', 'number', 'string', 'number'],
+          ['string', 'number', 'number', 'number', 'number', 'string', 'number', 'number', 'number'],
           [
             String(prompt),
             temp,
@@ -3313,6 +3332,8 @@ export class LlamaWebGpuBridgeRuntime {
             penalty,
             grammar,
             seed >>> 0,
+            sampling.minP,
+            sampling.presencePenalty,
           ],
           { async: true },
         ),

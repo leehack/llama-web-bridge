@@ -1,6 +1,7 @@
 // Public bridge facade: picks the worker or direct runtime and owns the operation queue.
 
 import { createAbortError } from './internal/abort.ts';
+import { NO_COMPLETION_CAPABILITIES, resolveCompletionSamplingOptions } from './internal/completion_options.ts';
 import { BRIDGE_DISPOSED_MESSAGE, INVALID_GRAMMAR_ERROR_TEXT } from './internal/constants.ts';
 import {
   DECISION_API_VERSION,
@@ -18,6 +19,7 @@ import type { ModelSource } from './internal/model_source.ts';
 import type { LogMethod } from './internal/types.ts';
 import type {
   BridgeProgressEvent,
+  CompletionCapabilities,
   CompletionOptions,
   CompletionUsage,
   DecisionCapabilities,
@@ -1807,6 +1809,7 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
   }
 
   async createCompletion(prompt: string, options: CompletionOptions = {}) {
+    resolveCompletionSamplingOptions(options);
     const onUsage = options?.onUsage;
     if (typeof onUsage !== 'function') {
       return this._runExclusive(
@@ -1845,6 +1848,32 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
       onUsage(usage);
     }
     return text;
+  }
+
+  async getCompletionCapabilities() {
+    return this._runExclusive(
+      () => this._getCompletionCapabilitiesUnlocked(),
+      { kind: 'completion-capabilities' },
+    );
+  }
+
+  async _getCompletionCapabilitiesUnlocked(): Promise<CompletionCapabilities> {
+    if (!this._workerProxy) {
+      return this._runtime?.getCompletionCapabilities() ?? { ...NO_COMPLETION_CAPABILITIES };
+    }
+    try {
+      await this._restoreWorkerModelIfMissing();
+      return await this._callWorker<CompletionCapabilities>('getCompletionCapabilities', []);
+    } catch (error) {
+      this._throwIfOperationCancelled(error, 'Completion capability probe was cancelled.');
+      if (!this._isWorkerUnusableError(error)) {
+        throw error;
+      }
+      this._disableWorkerFallback(error);
+      await this._waitForWorkerDisposal();
+      await this._ensureRuntimeReadyAfterWorkerFallback({}, error);
+      return this._runtime!.getCompletionCapabilities();
+    }
   }
 
   async _createCompletionUnlocked(
