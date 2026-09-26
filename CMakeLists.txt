@@ -17,7 +17,7 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/artifacts")
 
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 
-set(LLAMA_BUILD_COMMON OFF CACHE BOOL "" FORCE)
+set(LLAMA_BUILD_COMMON ON CACHE BOOL "" FORCE)
 set(LLAMA_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(LLAMA_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(LLAMA_BUILD_SERVER OFF CACHE BOOL "" FORCE)
@@ -156,7 +156,7 @@ target_include_directories(llama_webgpu_core PRIVATE
     "${LLAMA_CPP_DIR}/vendor"
 )
 
-target_link_libraries(llama_webgpu_core PRIVATE llama llamadart_mtmd)
+target_link_libraries(llama_webgpu_core PRIVATE llama llama-common llamadart_mtmd)
 
 set(LLAMADART_WEBGPU_LINK_OPTIONS
     "-sWASMFS=1"

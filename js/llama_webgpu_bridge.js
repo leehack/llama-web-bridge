@@ -19,8 +19,10 @@ function throwIfAborted(signal, message = "Bridge operation was cancelled.") {
 // js/src/internal/completion_options.ts
 var NO_COMPLETION_CAPABILITIES = Object.freeze({
   presencePenalty: false,
-  minP: false
+  minP: false,
+  thinkingBudget: false
 });
+var MAX_THINKING_BUDGET_TOKENS = 2147483647;
 function optionalNumber(value, name, isValid, range) {
   if (value == null) {
     return null;
@@ -30,10 +32,46 @@ function optionalNumber(value, name, isValid, range) {
   }
   return value;
 }
+function tag(budget, name) {
+  const value = budget[name];
+  if (typeof value !== "string" || value.trim().length === 0) {
+    throw new TypeError(`CompletionOptions.thinkingBudget.${name} must be a non-empty string.`);
+  }
+  return value;
+}
+function thinkingBudget(value, hasMediaParts) {
+  if (value == null) {
+    return null;
+  }
+  if (typeof value !== "object") {
+    throw new TypeError("CompletionOptions.thinkingBudget must be an object.");
+  }
+  const budget = value;
+  const maxTokens = budget.maxTokens;
+  if (!Number.isInteger(maxTokens) || maxTokens < 0 || maxTokens > MAX_THINKING_BUDGET_TOKENS) {
+    throw new RangeError(
+      `CompletionOptions.thinkingBudget.maxTokens must be an integer from 0 to ${MAX_THINKING_BUDGET_TOKENS}; got ${String(maxTokens)}.`
+    );
+  }
+  const startTag = tag(budget, "startTag");
+  const endTag = tag(budget, "endTag");
+  const forcedMessage = budget.forcedMessage ?? "";
+  if (typeof forcedMessage !== "string") {
+    throw new TypeError("CompletionOptions.thinkingBudget.forcedMessage must be a string.");
+  }
+  if (hasMediaParts) {
+    throw new Error("CompletionOptions.thinkingBudget supports text-only prompts; remove the media parts.");
+  }
+  return { maxTokens, startTag, endTag, forcedMessage };
+}
 function resolveCompletionSamplingOptions(options) {
   return {
     minP: optionalNumber(options?.minP, "minP", (value) => value >= 0 && value <= 1, " from 0 to 1") ?? 0,
-    presencePenalty: optionalNumber(options?.presencePenalty, "presencePenalty", () => true, "") ?? 0
+    presencePenalty: optionalNumber(options?.presencePenalty, "presencePenalty", () => true, "") ?? 0,
+    thinkingBudget: thinkingBudget(
+      options?.thinkingBudget,
+      Array.isArray(options?.parts) && options.parts.length > 0
+    )
   };
 }
 function completionCapabilitiesFrom(raw) {
@@ -45,13 +83,15 @@ function completionCapabilitiesFrom(raw) {
   }
   return {
     presencePenalty: parsed?.presencePenalty === true,
-    minP: parsed?.minP === true
+    minP: parsed?.minP === true,
+    thinkingBudget: parsed?.thinkingBudget === true
   };
 }
 function requireCompletionCapabilities(sampling, capabilities) {
   const missing = [
     sampling.minP !== 0 && !capabilities.minP ? "minP" : null,
-    sampling.presencePenalty !== 0 && !capabilities.presencePenalty ? "presencePenalty" : null
+    sampling.presencePenalty !== 0 && !capabilities.presencePenalty ? "presencePenalty" : null,
+    sampling.thinkingBudget != null && !capabilities.thinkingBudget ? "thinkingBudget" : null
   ].filter((name) => name != null);
   if (missing.length > 0) {
     throw new Error(
@@ -3619,7 +3659,21 @@ var LlamaWebGpuBridgeRuntime = class {
         await this._core.ccall(
           "llamadart_webgpu_begin_generation",
           "number",
-          ["string", "number", "number", "number", "number", "string", "number", "number", "number"],
+          [
+            "string",
+            "number",
+            "number",
+            "number",
+            "number",
+            "string",
+            "number",
+            "number",
+            "number",
+            "number",
+            "string",
+            "string",
+            "string"
+          ],
           [
             String(prompt),
             temp,
@@ -3629,7 +3683,11 @@ var LlamaWebGpuBridgeRuntime = class {
             grammar,
             seed >>> 0,
             sampling.minP,
-            sampling.presencePenalty
+            sampling.presencePenalty,
+            sampling.thinkingBudget?.maxTokens ?? 0,
+            sampling.thinkingBudget?.startTag ?? null,
+            sampling.thinkingBudget?.endTag ?? null,
+            sampling.thinkingBudget?.forcedMessage ?? null
           ],
           { async: true }
         )

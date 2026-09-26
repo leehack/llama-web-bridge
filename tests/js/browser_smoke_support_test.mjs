@@ -286,6 +286,17 @@ assert.deepEqual(webGpuLaunchArgs('linux'), [
     'greedy-presence': 'p',
   });
   assert.deepEqual(Object.keys(samplerRuns()), grammarSmoke.SAMPLER_RUNS.map(([name]) => name));
+  const thinkingRuns = () => ({
+    'open-first': 'T',
+    'open-prefix': 'T',
+    'open-budget': 'T </think>x',
+    'open-budget-zero': ' Done.</think>x',
+    'open-budget-grammar': 'T</think>yes',
+    'closed-first': 'c',
+    'closed-plain': 'c',
+    'closed-budget-zero': 'c',
+  });
+  assert.deepEqual(Object.keys(thinkingRuns()), grammarSmoke.THINKING_RUNS.map(([name]) => name));
   const capabilities = (supported) => Object.fromEntries(
     grammarSmoke.COMPLETION_CAPABILITIES.map((name) => [name, supported]),
   );
@@ -302,6 +313,8 @@ assert.deepEqual(webGpuLaunchArgs('linux'), [
         'RangeError: CompletionOptions.presencePenalty must be a finite number; got Infinity.',
       ],
       samplerAfterInvalid: 's',
+      thinkingRuns: thinkingRuns(),
+      invalidThinkingBudgetError: 'RangeError: CompletionOptions.thinkingBudget.maxTokens must be an integer from 0 to 2147483647; got -1.',
       plainCompletionError: null,
     })),
     globalWorkerFallbackReason: null,
@@ -340,7 +353,38 @@ assert.deepEqual(webGpuLaunchArgs('linux'), [
       ["wasm32 worker: expected worker execution, got 'main-thread' (worker fallback reason: 'why')"]],
     [mutate(grammarPayload(), (p) => { p.globalWorkerFallbackReason = 'gone'; }), both, ["worker fell back to the main thread: 'gone'"]],
     ...samplerCases(),
+    ...thinkingCases(),
   ];
+  function thinkingCases() {
+    const outputs = (runs) => `wasm32 direct: thinking-budget outputs: {${
+      Object.entries(runs).map(([name, text]) => `'${name}': '${text}'`).join(', ')
+    }}`;
+    const runsCase = (change, message) => {
+      const runs = { ...thinkingRuns(), ...change };
+      return [
+        mutate(grammarPayload(), (p) => { p.modeResults[0].thinkingRuns = runs; }),
+        both,
+        [`wasm32 direct: ${message}`, outputs(runs)],
+      ];
+    };
+    return [
+      runsCase(
+        { 'open-prefix': 'T</think>', 'open-budget': 'T</think></think>', 'open-budget-grammar': 'T</think></think>yes' },
+        'the model closed the block itself, so the budget proves nothing',
+      ),
+      runsCase({ 'open-budget': 'T more' }, "maxTokens 8 did not force '</think>' after the unbudgeted prefix"),
+      runsCase({ 'open-budget-zero': '</think>Done.' }, "maxTokens 0 did not start with the forced 'Done.</think>'"),
+      runsCase({ 'open-budget-grammar': 'T</think>maybe' }, 'the grammar did not pause inside the block and constrain the text after it'),
+      runsCase({ 'closed-budget-zero': 'd' }, 'a budget changed output after the prompt closed the block'),
+      [mutate(grammarPayload(), (p) => { p.modeResults[0].invalidThinkingBudgetError = null; }), both, [
+        'wasm32 direct: invalid thinking budget: expected a RangeError, got None',
+        outputs(thinkingRuns()),
+      ]],
+      [mutate(grammarPayload(), (p) => { delete p.modeResults[0].thinkingRuns; }), both, [
+        'wasm32 direct: thinking-budget runs missing: None',
+      ]],
+    ];
+  }
   function samplerCases() {
     const outputs = (runs) => `wasm32 direct: sampler outputs: {${
       Object.entries(runs).map(([name, text]) => `'${name}': '${text}'`).join(', ')
@@ -376,7 +420,7 @@ assert.deepEqual(webGpuLaunchArgs('linux'), [
         p.modeResults[3].capabilitiesBeforeLoad.minP = true;
         p.modeResults[3].capabilitiesAfterLoad = null;
       }), both, [
-        "wasm64 worker: capabilities before the load: expected none, got {'presencePenalty': False, 'minP': True}",
+        "wasm64 worker: capabilities before the load: expected none, got {'presencePenalty': False, 'minP': True, 'thinkingBudget': False}",
         'wasm64 worker: capabilities after the load: expected all, got None',
         `wasm64 worker: sampler outputs: {${Object.entries(samplerRuns()).map(([n, t]) => `'${n}': '${t}'`).join(', ')}}`,
       ]],

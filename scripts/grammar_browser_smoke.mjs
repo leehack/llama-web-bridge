@@ -54,7 +54,14 @@ greedy decoding, which plain sampling does not; explicit zeros match the
 defaults; a presence penalty changes greedy output; an invalid value rejects,
 and the same seeded sample repeats exactly afterwards.
 \`\`getCompletionCapabilities\`\` reports no option before a model load and
-every option after it.`;
+every option after it.
+
+Last, it checks \`\`thinkingBudget\`\` with greedy decoding and a prompt that
+leaves a reasoning block open. With \`\`maxTokens: 8\`\` the output is the
+unbudgeted 8-token output, then the forced end tag. With \`\`maxTokens: 0\`\` it
+starts with the forced message and end tag. A grammar pauses inside the block
+and constrains the text after the forced end. A budget has no effect when the
+prompt closes the block.`;
 
 const MODEL_FILENAME = 'grammar-smoke-model.gguf';
 // The issue #115 repro prompt. Its ChatML markers are plain text to a model
@@ -141,7 +148,45 @@ const INVALID_SAMPLER_OPTIONS = Object.freeze([
   { minP: -0.1 },
   { presencePenalty: Number.POSITIVE_INFINITY },
 ]);
-export const COMPLETION_CAPABILITIES = Object.freeze(['presencePenalty', 'minP']);
+export const COMPLETION_CAPABILITIES = Object.freeze(['presencePenalty', 'minP', 'thinkingBudget']);
+// Each tag follows a space: SentencePiece vocabularies tokenize a tag at the
+// start of text with a space prefix, so only a spaced tag in the prompt
+// matches the tokenized start and end tags.
+const THINK_PROMPT = '<|im_start|>user\nWhat is 17 times 23?<|im_end|>\n<|im_start|>assistant\n <think>\n';
+const CLOSED_THINK_PROMPT = `${THINK_PROMPT}\n </think>\n\n`;
+const THINK_GREEDY = { temp: 0, topK: 1, penalty: 1, seed: 3 };
+const THINK_TAGS = { startTag: '<think>', endTag: '</think>' };
+const THINK_BUDGET_TOKENS = 8;
+const FORCED_MESSAGE = 'Done.';
+// Each run's prompt and options; each "-first" run warms the prompt cache.
+export const THINKING_RUNS = Object.freeze([
+  ['open-first', THINK_PROMPT, { ...THINK_GREEDY, nPredict: 1 }],
+  ['open-prefix', THINK_PROMPT, { ...THINK_GREEDY, nPredict: THINK_BUDGET_TOKENS }],
+  ['open-budget', THINK_PROMPT, {
+    ...THINK_GREEDY,
+    nPredict: 12,
+    thinkingBudget: { ...THINK_TAGS, maxTokens: THINK_BUDGET_TOKENS },
+  }],
+  ['open-budget-zero', THINK_PROMPT, {
+    ...THINK_GREEDY,
+    nPredict: 6,
+    thinkingBudget: { ...THINK_TAGS, maxTokens: 0, forcedMessage: FORCED_MESSAGE },
+  }],
+  ['open-budget-grammar', THINK_PROMPT, {
+    ...THINK_GREEDY,
+    nPredict: 16,
+    grammar: YES_NO_GRAMMAR,
+    thinkingBudget: { ...THINK_TAGS, maxTokens: THINK_BUDGET_TOKENS },
+  }],
+  ['closed-first', CLOSED_THINK_PROMPT, { ...THINK_GREEDY, nPredict: 1 }],
+  ['closed-plain', CLOSED_THINK_PROMPT, { ...THINK_GREEDY, nPredict: 4 }],
+  ['closed-budget-zero', CLOSED_THINK_PROMPT, {
+    ...THINK_GREEDY,
+    nPredict: 4,
+    thinkingBudget: { ...THINK_TAGS, maxTokens: 0 },
+  }],
+]);
+const INVALID_THINKING_BUDGET = { ...THINK_TAGS, maxTokens: -1 };
 export const MEMORY_MODES = Object.freeze(['wasm32', 'wasm64']);
 const RUNTIME_MODES = Object.freeze(['direct', 'worker']);
 
@@ -159,6 +204,8 @@ export function renderHarness(nCtx, memoryModes) {
     nonThrowingRejection: NON_THROWING_REJECTION,
     samplerPrompt: SAMPLER_PROMPT,
     samplerRuns: SAMPLER_RUNS,
+    thinkingRuns: THINKING_RUNS,
+    invalidThinkingBudget: INVALID_THINKING_BUDGET,
     nCtx,
     memoryModes,
     runtimeModes: RUNTIME_MODES,
@@ -294,6 +341,23 @@ export function renderHarness(nCtx, memoryModes) {
           tokenEventEncoding: 'text',
         });
 
+        const thinkingRuns = {};
+        for (const [name, prompt, options] of config.thinkingRuns) {
+          thinkingRuns[name] = await bridge.createCompletion(prompt, {
+            ...options,
+            tokenEventEncoding: 'text',
+          });
+        }
+        let invalidThinkingBudgetError = null;
+        try {
+          await bridge.createCompletion(config.thinkingRuns[0][1], {
+            ...config.thinkingRuns[0][2],
+            thinkingBudget: config.invalidThinkingBudget,
+          });
+        } catch (caught) {
+          invalidThinkingBudgetError = \`\${caught && caught.name}: \${errorText(caught)}\`;
+        }
+
         const metadata = bridge.getModelMetadata();
         return {
           mode,
@@ -303,6 +367,8 @@ export function renderHarness(nCtx, memoryModes) {
           samplerRuns,
           invalidSamplerErrors,
           samplerAfterInvalid,
+          thinkingRuns,
+          invalidThinkingBudgetError,
           plainCompletionError: plainError,
           execution: metadata['llamadart.webgpu.execution'] || null,
           coreVariant: metadata['llamadart.webgpu.core_variant'] || null,
@@ -408,6 +474,42 @@ export function validateSampler(entry) {
     'a seeded sample after the rejected options did not repeat the earlier one',
   );
   if (failures.length > 0) failures.push(`sampler outputs: ${pyRepr(runs)}`);
+  return [...failures, ...validateThinkingBudget(entry)];
+}
+
+export function validateThinkingBudget(entry) {
+  const runs = pyGet(entry, 'thinkingRuns');
+  const names = THINKING_RUNS.map(([name]) => name);
+  if (!isDict(runs) || !names.every((name) => typeof runs[name] === 'string')) {
+    return [`thinking-budget runs missing: ${pyRepr(runs)}`];
+  }
+  const failures = [];
+  const expect = (condition, message) => {
+    if (!condition) failures.push(message);
+  };
+  const endTag = THINK_TAGS.endTag;
+  const prefix = runs['open-prefix'];
+  const afterPrefix = (text) => (text.startsWith(prefix) ? text.slice(prefix.length).trimStart() : null);
+  expect(prefix.length > 0, 'the unbudgeted reasoning prefix is empty');
+  expect(!prefix.includes(endTag), 'the model closed the block itself, so the budget proves nothing');
+  expect(
+    afterPrefix(runs['open-budget'])?.startsWith(endTag) === true,
+    `maxTokens ${THINK_BUDGET_TOKENS} did not force ${pyRepr(endTag)} after the unbudgeted prefix`,
+  );
+  expect(
+    runs['open-budget-zero'].trimStart().startsWith(FORCED_MESSAGE + endTag),
+    `maxTokens 0 did not start with the forced ${pyRepr(FORCED_MESSAGE + endTag)}`,
+  );
+  expect(
+    [`${endTag}yes`, `${endTag}no`].includes(afterPrefix(runs['open-budget-grammar'])),
+    'the grammar did not pause inside the block and constrain the text after it',
+  );
+  expect(runs['closed-budget-zero'] === runs['closed-plain'], 'a budget changed output after the prompt closed the block');
+  const error = pyGet(entry, 'invalidThinkingBudgetError');
+  if (typeof error !== 'string' || !error.startsWith('RangeError: CompletionOptions.thinkingBudget.maxTokens')) {
+    failures.push(`invalid thinking budget: expected a RangeError, got ${pyRepr(error)}`);
+  }
+  if (failures.length > 0) failures.push(`thinking-budget outputs: ${pyRepr(runs)}`);
   return failures;
 }
 

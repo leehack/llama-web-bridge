@@ -89,6 +89,7 @@ jobs:
       LLAMA_WEBGPU_MULTIMODAL_MODEL_CACHE: ~/.cache/llama-web-bridge/multimodal-smoke-models
       LLAMA_WEBGPU_MULTIMODAL_ARTIFACTS_DIR: /tmp/multimodal-smoke-artifacts
       LLAMA_WEBGPU_MULTIMODAL_TIMEOUT_MS: 420000
+      LLAMA_WEBGPU_GRAMMAR_MULTIMODAL_TIMEOUT_MS: 900000
       LLAMA_WEBGPU_SPEECH_MODEL_URL: https://huggingface.co/ggml-org/Qwen3-ASR-0.6B-GGUF/resolve/928ab958557df9aa2ef1c93e0e83c7ad0933fae2/Qwen3-ASR-0.6B-Q8_0.gguf?download=true
       LLAMA_WEBGPU_SPEECH_MODEL_SHA256: bca259818b50ca7c4c05e9bdb35a5dc04fa039653a6d6f3f0f331f96f6aa1971
       LLAMA_WEBGPU_SPEECH_MMPROJ_URL: https://huggingface.co/ggml-org/Qwen3-ASR-0.6B-GGUF/resolve/928ab958557df9aa2ef1c93e0e83c7ad0933fae2/mmproj-Qwen3-ASR-0.6B-Q8_0.gguf?download=true
@@ -242,7 +243,7 @@ jobs:
             --model-url "$LLAMA_WEBGPU_MULTIMODAL_MODEL_URL" \
             --model-sha256 "$LLAMA_WEBGPU_MULTIMODAL_MODEL_SHA256" \
             --model-cache-dir "$LLAMA_WEBGPU_MULTIMODAL_MODEL_CACHE" \
-            --timeout-ms "$LLAMA_WEBGPU_MULTIMODAL_TIMEOUT_MS" \
+            --timeout-ms "$LLAMA_WEBGPU_GRAMMAR_MULTIMODAL_TIMEOUT_MS" \
             --artifacts-dir "$LLAMA_WEBGPU_GRAMMAR_ARTIFACTS_DIR/multimodal-model"
 
       - name: Run next-token scores browser smoke

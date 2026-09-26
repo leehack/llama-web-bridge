@@ -25,6 +25,7 @@
 #include "llama.h"
 #include "mtmd-helper.h"
 #include "mtmd.h"
+#include "reasoning-budget.h"
 
 #include "llama_webgpu_decision.h"
 #include "llama_webgpu_embedding_json.h"

@@ -25,6 +25,8 @@ llama_sampler * g_active_sampler = nullptr;
 // Kept out of g_active_sampler's chain so sample_next_token() can apply it
 // before or after truncation, as llama.cpp's common_sampler does.
 llama_sampler * g_active_grammar = nullptr;
+// Borrowed from g_active_sampler's chain, which owns and frees it.
+llama_sampler * g_active_reasoning_budget = nullptr;
 std::vector<llama_token_data> g_sampler_candidates;
 std::atomic<int32_t> g_log_level{3};
 std::atomic<int32_t> g_last_non_cont_level{GGML_LOG_LEVEL_NONE};
