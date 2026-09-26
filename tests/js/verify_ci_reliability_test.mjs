@@ -18,6 +18,7 @@ import {
   requirePairedModelUrlsAndPins,
   requirePinnedModelUrlRevisions,
   requireQualificationModelShaPinRoles,
+  requireQualificationNodeHarness,
   validatePublicationPatContract,
 } from '../../scripts/verify_ci_reliability.mjs';
 
@@ -107,7 +108,7 @@ function workflow(roles, { urls = {}, pins = {} } = {}) {
 
 function markdown({ pins = {}, roles = DOCUMENTED_ROLES } = {}) {
   const resolved = { ...EXPECTED_MODEL_PINS, ...pins };
-  const lines = ['```bash', 'python3 scripts/example_browser_smoke.py \\'];
+  const lines = ['```bash', 'node scripts/example_browser_smoke.mjs \\'];
   for (const [roleFlag, value, pinFlag, name] of roles) {
     lines.push(`  ${roleFlag} ${value} \\`);
     lines.push(`  ${pinFlag} ${resolved[name]} \\`);
@@ -319,6 +320,42 @@ assertRejected(
   collectErrors({ contributing: markdown().replace('/path/to/Qwen3-ASR-0.6B-Q8_0.gguf', '/path/to/Qwen3-ASR-0.6B-Q4_K_M.gguf') }),
   'Qwen3-ASR-0.6B-Q4_K_M.gguf, which',
 );
+
+// --- Qualification harness setup --------------------------------------------
+
+// qualify runs the candidate's Node smokes: Node.js 24, npm ci and the
+// Playwright Chromium in candidate-source come first, and pip Playwright never.
+{
+  const qualificationErrors = (text) => {
+    const errors = [];
+    requireQualificationNodeHarness(text, errors);
+    return errors;
+  };
+  const real = read(QUALIFICATION_PATH);
+  assert.deepEqual(qualificationErrors(real), []);
+  const setupNode = '        uses: actions/setup-node@v4\n        with:\n          node-version: 24\n';
+  const npmCi = '      - name: Install the candidate\'s locked npm dependencies\n        working-directory: candidate-source\n        run: npm ci --ignore-scripts\n';
+  const chromium = '        working-directory: candidate-source\n        run: npx --no-install playwright install --only-shell chromium\n';
+  for (const needle of [setupNode, npmCi, chromium]) assert.ok(real.includes(needle), needle);
+  const qualifyStep = real.slice(real.indexOf('      - name: Run the heavy Qwen3-ASR and Qwen3-TTS gates'), real.indexOf('      - name: Re-verify the attestation'));
+  const setupMessage = 'must set up Node.js 24, run npm ci --ignore-scripts and install the Playwright Chromium in candidate-source';
+  for (const [label, text] of [
+    ['no setup-node', real.replace(setupNode, '        uses: actions/cache@v4\n        with:\n          node-version: 24\n')],
+    ['Node 22', real.replace(setupNode, setupNode.replace('24', '22'))],
+    ['npm ci in the trusted checkout', real.replace(npmCi, npmCi.replace('        working-directory: candidate-source\n', ''))],
+    ['npm ci with lifecycle scripts', real.replace(npmCi, npmCi.replace('npm ci --ignore-scripts', 'npm ci'))],
+    ['Chromium from the trusted checkout', real.replace(chromium, chromium.replace('        working-directory: candidate-source\n', ''))],
+    ['setup after qualify', real.replace(qualifyStep, '').replace('      - name: Re-verify the attestation', `${qualifyStep}      - name: Re-verify the attestation`)
+      .replace(npmCi, '').replace('      - name: Upload verified', `${npmCi}\n      - name: Upload verified`)],
+    ['no qualify', real.replace('release_qualification.py qualify', 'release_qualification.py run-gates')],
+  ]) {
+    assert.ok(qualificationErrors(text).some((error) => error.includes(setupMessage)), label);
+  }
+  assertRejected(
+    qualificationErrors(real.replace(chromium, `${chromium}      - run: python3 -m pip install --user playwright==1.63.0\n`)),
+    'must never install Python Playwright; found: "pip install"',
+  );
+}
 
 // --- Publication PAT contract ------------------------------------------------
 

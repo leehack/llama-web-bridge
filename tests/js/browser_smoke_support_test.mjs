@@ -22,16 +22,25 @@ import {
   env,
   expandHome,
   parseSmokeArgs,
+  pyFloat,
   pyInt,
+  pyIter,
   pyJson,
+  pyJsonLoads,
+  pyLen,
+  pyLessEqual,
   pyRepr,
+  pyStrip,
+  pyTruthy,
   redactLocation,
   resolvePath,
   resolvePinnedFile,
   resolvePinnedModel,
   serveIsolated,
+  stageFile,
   translatePath,
   validateHash,
+  webGpuLaunchArgs,
 } from '../../scripts/browser_smoke_support.mjs';
 import * as grammarSmoke from '../../scripts/grammar_browser_smoke.mjs';
 import * as multimodalSmoke from '../../scripts/multimodal_browser_smoke.mjs';
@@ -62,6 +71,41 @@ process.on('exit', () => fs.rmSync(tmp, { recursive: true, force: true }));
   assert.equal(pyJson({ missing: undefined }, { indent: 2, sortKeys: true }), '{\n  "missing": null\n}');
   assert.throws(() => pyJson(new Date(0)), /Object of type datetime is not JSON serializable/);
 }
+
+// pyJsonLoads keeps what json.loads keeps: float literals stay floats, big ints
+// stay exact, -0 is the int 0 and a duplicate key keeps its last value, so
+// pyJson writes the text json.dumps(json.loads(text)) writes.
+{
+  const text = '{"n": [1.0, -0, -0.0, 1e2, 1E-7, 12345678901234567890, 9007199254740993, 2.5e16, 0.1, 100, -3], '
+    + '"b": {"z": 1e400, "y": 1}, "a": 1, "a": "dup"}';
+  assert.equal(pyJson(pyJsonLoads(text)), '{"n": [1.0, 0, -0.0, 100.0, 1e-07, 12345678901234567890, 9007199254740993, '
+    + '2.5e+16, 0.1, 100, -3], "b": {"z": Infinity, "y": 1}, "a": "dup"}');
+  assert.equal(pyRepr(pyJsonLoads('[2.0, 12345678901234567890]')), '[2.0, 12345678901234567890]');
+  assert.throws(() => pyJsonLoads('[NaN]'));
+  // float(), str.strip(), bool(), len(), iter() and `<=` as the smokes use them.
+  assert.deepEqual(['1', ' 2_5 ', '.5', '-1e-3', '+inf', 'NaN'].map(pyFloat).map(String), ['1', '25', '0.5', '-0.001', 'Infinity', 'NaN']);
+  assert.throws(() => pyFloat('1__0'), { message: "could not convert string to float: '1__0'" });
+  assert.equal(pyStrip(' 　x\x1c\x85 '), 'x');
+  assert.equal(pyStrip('﻿z'), '﻿z');
+  assert.deepEqual([null, 0, '', [], {}, false, 0n].map(pyTruthy), [false, false, false, false, false, false, false]);
+  assert.deepEqual([1, 'a', [0], { a: 0 }, true].map(pyTruthy), [true, true, true, true, true]);
+  assert.deepEqual([[1, 2], { a: 1 }, 'hé😀'].map(pyLen), [2, 1, 3]);
+  assert.throws(() => pyLen(null), { message: "object of type 'NoneType' has no len()" });
+  assert.deepEqual(pyIter({ a: 1, b: 2 }), ['a', 'b']);
+  assert.throws(() => pyIter(3.5), { message: "'float' object is not iterable" });
+  assert.equal(pyLessEqual(true, 1), true);
+  assert.equal(pyLessEqual(NaN, 1), false);
+  assert.throws(() => pyLessEqual(null, 0.25), { message: "'<=' not supported between instances of 'NoneType' and 'float'" });
+}
+
+// The text-to-speech and decision smokes launch Chromium with WebGPU enabled.
+assert.deepEqual(webGpuLaunchArgs('darwin'), [
+  '--no-sandbox', '--disable-dev-shm-usage', '--enable-unsafe-webgpu', '--use-angle=metal', '--enable-features=SharedArrayBuffer',
+]);
+assert.deepEqual(webGpuLaunchArgs('linux'), [
+  '--no-sandbox', '--disable-dev-shm-usage', '--enable-unsafe-webgpu', '--disable-vulkan-surface',
+  '--enable-features=SharedArrayBuffer,Vulkan',
+]);
 
 // repr() for failure messages.
 {
@@ -897,6 +941,21 @@ function parseResponse(buffer) {
   assert.equal(noBridge.stdout, '');
   assert.equal(noBridge.stderr,
     `multimodal browser smoke failed: missing bridge artifact: ${path.join(resolvePath(emptyDist), 'llama_webgpu_bridge.js')}\n`);
+}
+
+// stageFile hard-links when it can, like os.link, and copies otherwise (here
+// because the target exists, as os.link raised FileExistsError).
+{
+  const source = path.join(tmp, 'stage-source.bin');
+  fs.writeFileSync(source, 'stage');
+  const linked = path.join(tmp, 'stage-linked.bin');
+  await stageFile(source, linked);
+  assert.equal(fs.statSync(linked).ino, fs.statSync(source).ino);
+  const copied = path.join(tmp, 'stage-copied.bin');
+  fs.writeFileSync(copied, 'old');
+  await stageFile(source, copied);
+  assert.equal(fs.readFileSync(copied, 'utf8'), 'stage');
+  assert.notEqual(fs.statSync(copied).ino, fs.statSync(source).ino);
 }
 
 console.log('Browser smoke support contract passed');

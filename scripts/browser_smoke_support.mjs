@@ -302,6 +302,15 @@ export async function copyMemory64Artifacts(distDir, webRoot) {
   }
 }
 
+// Stage a large input without copying when the filesystem allows a hard link.
+export async function stageFile(source, target) {
+  try {
+    await fsp.link(source, target);
+  } catch {
+    await fsp.copyFile(source, target);
+  }
+}
+
 // tempfile.TemporaryDirectory: removed afterwards, even on failure.
 export async function withTempDir(prefix, fn) {
   const dir = await fsp.mkdtemp(path.join(os.tmpdir(), prefix));
@@ -494,10 +503,22 @@ export async function withServer(webRoot, fn) {
 
 // --- Python-compatible JSON and repr ------------------------------------------
 
+// A float that json.loads read from a literal with a fraction or exponent, such
+// as `1.0`, which a JS number cannot tell apart from the int 1. pyJsonLoads
+// returns these so pyJson writes such a value back as Python did.
+export class PyFloat {
+  constructor(value) {
+    this.value = value;
+    Object.freeze(this);
+  }
+}
+
 // Playwright's Python client turns a JS number into an int when its JSON text
-// has no fraction or exponent, and into a float otherwise; -0 is a float.
+// has no fraction or exponent, and into a float otherwise; -0 is a float. A
+// bigint (an int json.loads read past 2**53) is an int.
 function isPyInt(value) {
-  return Number.isFinite(value) && !Object.is(value, -0) && !/[.e]/.test(String(value));
+  if (typeof value === 'bigint') return true;
+  return typeof value === 'number' && Number.isFinite(value) && !Object.is(value, -0) && !/[.e]/.test(String(value));
 }
 
 // float.__repr__: the shortest round-trip digits, with an exponent when the
@@ -522,10 +543,12 @@ export function pyFloatRepr(value) {
 }
 
 function pyNumberJson(value) {
+  if (value instanceof PyFloat) value = value.value;
+  else if (isPyInt(value)) return String(value);
   if (Number.isNaN(value)) return 'NaN';
   if (value === Infinity) return 'Infinity';
   if (value === -Infinity) return '-Infinity';
-  return isPyInt(value) ? String(value) : pyFloatRepr(value);
+  return pyFloatRepr(value);
 }
 
 const JSON_ESCAPES = new Map([
@@ -557,7 +580,8 @@ function isPlainObject(value) {
 function pyTypeName(value) {
   if (value === null || value === undefined) return 'NoneType';
   if (typeof value === 'boolean') return 'bool';
-  if (typeof value === 'number') return isPyInt(value) ? 'int' : 'float';
+  if (typeof value === 'number' || typeof value === 'bigint') return isPyInt(value) ? 'int' : 'float';
+  if (value instanceof PyFloat) return 'float';
   if (typeof value === 'string') return 'str';
   if (Array.isArray(value)) return 'list';
   if (value instanceof Date) return 'datetime';
@@ -574,7 +598,7 @@ export function pyJson(value, { indent = null, sortKeys = false } = {}) {
     if (item === null || item === undefined) return 'null';
     if (item === true) return 'true';
     if (item === false) return 'false';
-    if (typeof item === 'number') return pyNumberJson(item);
+    if (typeof item === 'number' || typeof item === 'bigint' || item instanceof PyFloat) return pyNumberJson(item);
     if (typeof item === 'string') return pyJsonString(item);
     let entries;
     let open;
@@ -624,7 +648,8 @@ export function pyRepr(value) {
   if (value === null || value === undefined) return 'None';
   if (value === true) return 'True';
   if (value === false) return 'False';
-  if (typeof value === 'number') return isPyInt(value) ? String(value) : pyFloatRepr(value);
+  if (typeof value === 'number' || typeof value === 'bigint') return isPyInt(value) ? String(value) : pyFloatRepr(value);
+  if (value instanceof PyFloat) return pyFloatRepr(value.value);
   if (typeof value === 'string') return pyStrRepr(value);
   if (Array.isArray(value)) return `[${Array.from(value, pyRepr).join(', ')}]`;
   if (isPlainObject(value)) {
@@ -648,7 +673,12 @@ export function pyGet(value, key) {
 
 // Python equality for JSON-shaped values (1 == 1.0, True == 1, lists by item).
 export function pyEquals(left, right) {
-  const scalar = (value) => (typeof value === 'boolean' ? Number(value) : value);
+  const scalar = (value) => {
+    if (typeof value === 'boolean') return Number(value);
+    if (value instanceof PyFloat) return value.value;
+    if (typeof value === 'bigint' && Number.isSafeInteger(Number(value))) return Number(value);
+    return value;
+  };
   if (Array.isArray(left) || Array.isArray(right)) {
     return Array.isArray(left) && Array.isArray(right) && left.length === right.length
       && left.every((item, index) => pyEquals(item, right[index]));
@@ -662,6 +692,116 @@ export function pyEquals(left, right) {
   const a = left === undefined ? null : scalar(left);
   const b = right === undefined ? null : scalar(right);
   return a === b;
+}
+
+// json.loads(text) with the int/float distinction kept: a number literal with
+// a fraction or exponent is a PyFloat, an int past 2**53 is a bigint, and -0 is
+// the int 0. Duplicate keys keep the last value, as in Python. Python's
+// NaN/Infinity literals are not JSON and are rejected here, and a JS object
+// lists integer-like keys ("1") first where a dict keeps insertion order.
+export function pyJsonLoads(text) {
+  return JSON.parse(text, (key, value, context) => {
+    if (typeof value !== 'number') return value;
+    const source = context?.source;
+    if (typeof source !== 'string') throw new Error('JSON.parse source text access is required (Node.js 22.18 or newer)');
+    if (/[.eE]/.test(source)) return new PyFloat(value);
+    if (Number.isSafeInteger(value)) return value === 0 ? 0 : value;
+    return BigInt(source);
+  });
+}
+
+// Path.read_text(encoding="utf-8"): strict UTF-8 that keeps a BOM, with
+// universal newlines (\r\n and \r read as \n).
+export async function readPyText(file) {
+  const bytes = await fsp.readFile(file);
+  let text;
+  try {
+    text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes);
+  } catch {
+    throw new Error(`'utf-8' codec can't decode the file ${file}`);
+  }
+  return text.replace(/\r\n?/g, '\n');
+}
+
+// The characters str.split() and str.strip() treat as whitespace.
+const PY_WHITESPACE = '\t\n\v\f\r\x1c-\x1f \x85\xa0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000';
+
+// str.strip().
+export function pyStrip(text) {
+  return text.replace(new RegExp(`^[${PY_WHITESPACE}]+|[${PY_WHITESPACE}]+$`, 'g'), '');
+}
+
+// bool(value).
+export function pyTruthy(value) {
+  if (value === null || value === undefined || value === false) return false;
+  if (typeof value === 'number') return value !== 0;
+  if (typeof value === 'bigint') return value !== 0n;
+  if (value instanceof PyFloat) return value.value !== 0;
+  if (typeof value === 'string' || Array.isArray(value)) return value.length > 0;
+  if (isPlainObject(value)) return Object.keys(value).length > 0;
+  return true;
+}
+
+// dict.get(key, default): the default only when the key is absent. A key
+// holding undefined holds None, as the Python client read it.
+export function pyGetDefault(value, key, fallback) {
+  if (!isPlainObject(value)) throw new Error(`'${pyTypeName(value)}' object has no attribute 'get'`);
+  if (!Object.hasOwn(value, key)) return fallback;
+  return value[key] === undefined ? null : value[key];
+}
+
+// dict[key], which raises KeyError (str() of it is the key's repr).
+export function pyIndex(value, key) {
+  if (!isPlainObject(value)) throw new Error(`'${pyTypeName(value)}' object is not subscriptable`);
+  if (!Object.hasOwn(value, key)) throw new Error(pyRepr(key));
+  return value[key] === undefined ? null : value[key];
+}
+
+// dict.pop(key, default).
+export function pyPop(value, key, fallback) {
+  const popped = pyGetDefault(value, key, fallback);
+  delete value[key];
+  return popped;
+}
+
+// iter(value) over a JSON-shaped value: a dict yields its keys and a str its
+// characters; anything else that is not a list is not iterable.
+export function pyIter(value) {
+  if (Array.isArray(value)) return value;
+  if (isPlainObject(value)) return Object.keys(value);
+  if (typeof value === 'string') return Array.from(value);
+  throw new Error(`'${pyTypeName(value)}' object is not iterable`);
+}
+
+// len(value) over a JSON-shaped value; a str counts code points.
+export function pyLen(value) {
+  if (Array.isArray(value)) return value.length;
+  if (isPlainObject(value)) return Object.keys(value).length;
+  if (typeof value === 'string') return Array.from(value).length;
+  throw new Error(`object of type '${pyTypeName(value)}' has no len()`);
+}
+
+// `value <= limit` for a float limit, which raises for a value that is not a
+// number (bool counts as an int).
+export function pyLessEqual(value, limit) {
+  if (typeof value === 'boolean') return Number(value) <= limit;
+  if (typeof value === 'number') return value <= limit;
+  if (typeof value === 'bigint') return Number(value) <= limit;
+  if (value instanceof PyFloat) return value.value <= limit;
+  throw new Error(`'<=' not supported between instances of '${pyTypeName(value)}' and 'float'`);
+}
+
+// base64.b64decode(str) for the canonical base64 a page's btoa() writes. A
+// value that is not a str, or not canonical base64, fails; Python would
+// decode some non-canonical forms, which no harness produces.
+export function pyB64Decode(value) {
+  if (typeof value !== 'string') {
+    throw new Error(`argument should be a bytes-like object or ASCII string, not '${pyTypeName(value)}'`);
+  }
+  if (value.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/.test(value)) {
+    throw new Error('base64 data is not canonical');
+  }
+  return Buffer.from(value, 'base64');
 }
 
 // --- Mode results ----------------------------------------------------------------
@@ -768,6 +908,80 @@ export async function runPlaywright(url, timeoutMs, artifactsDir, artifactPrefix
   return payload;
 }
 
+// The Chromium flags of the text-to-speech and decision smokes, which enable
+// WebGPU (Metal through ANGLE on macOS, Vulkan elsewhere).
+export function webGpuLaunchArgs(platform = process.platform) {
+  const args = ['--no-sandbox', '--disable-dev-shm-usage', '--enable-unsafe-webgpu'];
+  const features = ['SharedArrayBuffer'];
+  if (platform === 'darwin') {
+    args.push('--use-angle=metal');
+  } else {
+    args.push('--disable-vulkan-surface');
+    features.push('Vulkan');
+  }
+  args.push(`--enable-features=${features.join(',')}`);
+  return args;
+}
+
+// Load the harness in headless Chromium with WebGPU enabled and poll every 2 s
+// until window.__smokeResult is an object with an `ok` key, for at most
+// `timeoutMs` after the page loads. Console lines containing `stageMarker` are
+// echoed to stderr, and with `stagePrefix` every change of window.__smokeStage
+// is reported as `<stagePrefix>: <stage>`. A full-page screenshot is written
+// only when this fails. `transform(payload)` runs before the console lines are
+// added and the console log and result are written to `artifactsDir`.
+export async function runPollingPlaywright(url, timeoutMs, artifactsDir, {
+  artifactPrefix, stageMarker, stagePrefix = null, transform = async () => {},
+}) {
+  const chromium = await loadChromium();
+  const consoleLines = [];
+  let payload = null;
+  const browser = await chromium.launch({ args: webGpuLaunchArgs() });
+  try {
+    const page = await browser.newPage();
+    page.on('console', (message) => {
+      const line = `${message.type()}: ${message.text()}`;
+      consoleLines.push(line);
+      if (line.includes(stageMarker)) process.stderr.write(`${line}\n`);
+    });
+    page.on('pageerror', (error) => consoleLines.push(`pageerror: ${error.message}`));
+    try {
+      await page.goto(url, { waitUntil: 'load', timeout: timeoutMs });
+      const deadline = performance.now() + timeoutMs;
+      let previousStage = null;
+      let finished = false;
+      while (performance.now() < deadline) {
+        payload = await page.evaluate(() => window.__smokeResult || null);
+        if (isPlainObject(payload) && Object.hasOwn(payload, 'ok')) {
+          finished = true;
+          break;
+        }
+        const stage = await page.evaluate(() => window.__smokeStage || 'starting');
+        if (!pyEquals(stage, previousStage)) {
+          if (stagePrefix !== null) process.stderr.write(`${stagePrefix}: ${pyStr(stage)}\n`);
+          previousStage = stage;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 2000));
+      }
+      if (!finished) throw new Error(`browser smoke timed out at stage: ${pyStr(previousStage)}`);
+    } catch (error) {
+      if (artifactsDir !== null) {
+        await fsp.mkdir(artifactsDir, { recursive: true });
+        await page.screenshot({ path: path.join(artifactsDir, `${artifactPrefix}-page.png`), fullPage: true });
+      }
+      throw error;
+    }
+  } finally {
+    await browser.close();
+  }
+  if (!isPlainObject(payload)) throw new Error(`unexpected smoke result payload: ${pyRepr(payload)}`);
+  await transform(payload);
+  payload.console = consoleLines.slice(-200);
+  await writeTextArtifact(artifactsDir, `${artifactPrefix}-console.log`, `${consoleLines.join('\n')}\n`);
+  await writeJsonArtifact(artifactsDir, `${artifactPrefix}-result.json`, payload);
+  return payload;
+}
+
 // --- Command line ----------------------------------------------------------------
 
 export class UsageError extends Error {}
@@ -780,6 +994,21 @@ export function pyInt(text) {
     throw new Error(`invalid literal for int() with base 10: ${pyRepr(String(text))}`);
   }
   return Number(trimmed.replaceAll('_', ''));
+}
+
+// float(text): surrounding whitespace, a sign, digit-group underscores, and
+// inf, infinity and nan in any case.
+export function pyFloat(text) {
+  const digits = '[0-9](?:_?[0-9])*';
+  const trimmed = pyStrip(String(text));
+  const number = new RegExp(`^[+-]?(?:${digits}(?:\\.(?:${digits})?)?|\\.${digits})(?:[eE][+-]?${digits})?$`);
+  if (number.test(trimmed)) return Number(trimmed.replaceAll('_', ''));
+  const special = /^([+-]?)(inf|infinity|nan)$/i.exec(trimmed);
+  if (special) {
+    if (special[2].toLowerCase() === 'nan') return NaN;
+    return special[1] === '-' ? -Infinity : Infinity;
+  }
+  throw new Error(`could not convert string to float: ${pyRepr(String(text))}`);
 }
 
 // Path(text): an empty path is the current directory.
@@ -798,16 +1027,21 @@ export const env = {
 
 // argparse-compatible parsing of `--flag value` and `--flag=value` options,
 // with unique-prefix abbreviations, choices, and exit status 2 on misuse.
-// `options` is a list of {flag, type: 'string' | 'path' | 'int', default:
-// () => value, choices?, help}; defaults are evaluated in declaration order.
+// `options` is a list of {flag, type: 'string' | 'path' | 'int' | 'float' |
+// 'flag', default: () => value, choices?, required?, help?}; 'flag' is
+// action="store_true", and defaults are evaluated in declaration order.
 export function parseSmokeArgs(argv, { prog, description, options }) {
   const dest = (flag) => flag.slice(2).replace(/-([a-z0-9])/g, (_, char) => char.toUpperCase());
   const metavar = (option) => option.choices
     ? `{${option.choices.join(',')}}`
     : option.flag.slice(2).toUpperCase().replaceAll('-', '_');
-  const usage = `usage: ${prog} [-h] ${options.map((option) => `[${option.flag} ${metavar(option)}]`).join(' ')}`;
+  const invocation = (option) => (option.type === 'flag' ? option.flag : `${option.flag} ${metavar(option)}`);
+  const usage = `usage: ${prog} [-h] ${options.map((option) => (option.required
+    ? invocation(option)
+    : `[${invocation(option)}]`)).join(' ')}`;
   const values = {};
-  for (const option of options) values[dest(option.flag)] = option.default();
+  const seen = new Set();
+  for (const option of options) values[dest(option.flag)] = option.default ? option.default() : null;
   const fail = (message) => {
     const error = new UsageError(message);
     error.usage = usage;
@@ -839,13 +1073,19 @@ export function parseSmokeArgs(argv, { prog, description, options }) {
     }
     if (option === help) {
       if (equals >= 0) fail(`argument -h/--help: ignored explicit argument ${pyRepr(arg.slice(equals + 1))}`);
-      const lines = options.map((option) => `  ${option.flag} ${metavar(option)}\n                        ${option.help}`);
+      const lines = options.map((option) => `  ${invocation(option)}${option.help ? `\n                        ${option.help}` : ''}`);
       const error = new HelpRequested();
       error.text = `${usage}\n\n${description}\n\noptions:\n  -h, --help            show this help message and exit\n${lines.join('\n')}\n`;
       throw error;
     }
     if (!option) {
       unrecognized.push(arg);
+      continue;
+    }
+    seen.add(option);
+    if (option.type === 'flag') {
+      if (equals >= 0) fail(`argument ${option.flag}: ignored explicit argument ${pyRepr(arg.slice(equals + 1))}`);
+      values[dest(option.flag)] = true;
       continue;
     }
     let raw;
@@ -864,6 +1104,12 @@ export function parseSmokeArgs(argv, { prog, description, options }) {
       } catch {
         fail(`argument ${option.flag}: invalid int value: ${pyRepr(raw)}`);
       }
+    } else if (option.type === 'float') {
+      try {
+        value = pyFloat(raw);
+      } catch {
+        fail(`argument ${option.flag}: invalid float value: ${pyRepr(raw)}`);
+      }
     } else if (option.type === 'path') {
       value = pyPath(raw);
     }
@@ -872,6 +1118,8 @@ export function parseSmokeArgs(argv, { prog, description, options }) {
     }
     values[dest(option.flag)] = value;
   }
+  const missing = options.filter((option) => option.required && !seen.has(option));
+  if (missing.length) fail(`the following arguments are required: ${missing.map((option) => option.flag).join(', ')}`);
   if (unrecognized.length) fail(`unrecognized arguments: ${unrecognized.join(' ')}`);
   return values;
 }

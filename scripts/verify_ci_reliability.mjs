@@ -1395,6 +1395,32 @@ function checkCandidateAndQualification({ candidate, qualification, publish }, e
     'actions/artifacts/${CANDIDATE_ARTIFACT_ID}/zip',
     'repos/${BRIDGE_REPO}/compare/${head_sha}...${bridge_default}',
   ], 'prove the candidate run, first attempt, artifact id and correlation before running the gates on its exact harness');
+  requireQualificationNodeHarness(qualification.text, errors);
+}
+
+// qualify runs the candidate's Node smokes, so Node.js 24 and the candidate's
+// locked npm dependencies (with their Playwright Chromium) are installed in
+// candidate-source before it, and no Python Playwright is.
+export function requireQualificationNodeHarness(text, errors, relativePath = WORKFLOWS.qualification) {
+  const check = checker(errors);
+  const qualification = new Workflow(relativePath, text, errors);
+  const qualifyIndex = qualification.steps.findIndex((step) => step.run.includes('release_qualification.py qualify'));
+  const before = (predicate) => qualification.steps.some((step, index) => index < qualifyIndex && predicate(step));
+  const inCandidateSource = (step, command) => step.run.trim() === command && step.raw['working-directory'] === 'candidate-source';
+  check.require(
+    qualifyIndex >= 0
+      && before((step) => /^actions\/setup-node@/.test(step.uses) && String(step.with['node-version']) === '24')
+      && before((step) => inCandidateSource(step, 'npm ci --ignore-scripts'))
+      && before((step) => inCandidateSource(step, 'npx --no-install playwright install --only-shell chromium')),
+    `${relativePath} must set up Node.js 24, run npm ci --ignore-scripts and install the Playwright Chromium `
+      + 'in candidate-source before release_qualification.py qualify',
+  );
+  check.excludes(relativePath, qualification.runText, ['pip install', '-m playwright'], 'never install Python Playwright');
+  // Only the lockfile decides the gate dependencies: no other npm install.
+  check.require(
+    !/\bnpm\s+(?:install|i|add|update|up)\b|\bnpx\s+(?!--no-install\b)/.test(qualification.runText),
+    `${relativePath} must install gate dependencies only with npm ci --ignore-scripts and run npx only with --no-install`,
+  );
 }
 
 function checkModelPins(files, workflows, errors) {

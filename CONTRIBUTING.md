@@ -125,23 +125,16 @@ Before opening or updating a PR, run the lightweight contracts:
 
 ```bash
 npm run check:js
-python3 -m py_compile scripts/state_persistence_browser_smoke.py scripts/multimodal_browser_smoke.py scripts/speech_to_text_browser_smoke.py scripts/text_to_speech_browser_smoke.py scripts/decision_browser_smoke.py
+python3 -m unittest discover -s scripts -p '*_test.py'
 node scripts/verify_ci_reliability.mjs
 ```
 
-The state-persistence, multimodal, grammar and next-token smokes run on Node
-with the locked `playwright` dev dependency, in CI and in the candidate's state
-and multimodal gates. After `npm ci --ignore-scripts`, install its browser once
-with `npx --no-install playwright install --only-shell chromium`. Node's
-`fetch` ignores `HTTP(S)_PROXY` unless `NODE_USE_ENV_PROXY=1` is set. The
-speech, text-to-speech and decision smokes still use Python Playwright 1.63.0
-(`python3 -m pip install playwright==1.63.0` and
-`python3 -m playwright install chromium`). Until the qualification harness
-moves to Node, `scripts/state_persistence_browser_smoke.py` and
-`scripts/multimodal_browser_smoke.py` stay as its sources, and
-`tests/js/state_persistence_harness_parity_test.mjs` and
-`tests/js/multimodal_harness_parity_test.mjs` keep their pages identical to the
-Node ports.
+Every browser smoke runs on Node with the locked `playwright` dev dependency:
+in CI, in the candidate's state and multimodal gates, and in the automated
+qualification's speech and text-to-speech gates. After
+`npm ci --ignore-scripts`, install its browser once with
+`npx --no-install playwright install --only-shell chromium`. Node's `fetch`
+ignores `HTTP(S)_PROXY` unless `NODE_USE_ENV_PROXY=1` is set.
 
 For state-persistence, worker, or workflow changes, also run the browser smoke
 against a built dist directory. Use a checksum-pinned tiny model and keep caches
@@ -200,16 +193,17 @@ qualification workflow, not in ordinary CI or the candidate build. Before
 publishing, `.github/workflows/bridge_qualification.yml` runs them against the
 exact candidate artifact built by `.github/workflows/bridge_candidate.yml`.
 The workflow proves the candidate's workflow/run/source identity and unique
-artifact ID, verifies every downloaded input checksum, requires GitHub Actions
-`github-hosted` runner identity, and emits one canonical attestation. That
-attestation binds the candidate artifact ID/run/attempt/workflow/digest and the
+artifact ID, verifies every downloaded input checksum, installs Node.js 24 with
+the candidate source's locked npm dependencies and Playwright Chromium, requires
+GitHub Actions `github-hosted` runner identity, and emits one canonical
+attestation. That attestation binds the candidate artifact ID/run/attempt/workflow/digest and the
 producing qualification run ID/attempt/workflow/source SHA. The combined
 `release_qualification.py qualify` command is therefore workflow-only.
 
 For local reproduction, run the individual smokes directly:
 
 ```bash
-python3 scripts/speech_to_text_browser_smoke.py \
+node scripts/speech_to_text_browser_smoke.mjs \
   --dist-dir /private/tmp/llama_web_bridge_dist \
   --model-path /path/to/Qwen3-ASR-0.6B-Q8_0.gguf \
   --model-sha256 bca259818b50ca7c4c05e9bdb35a5dc04fa039653a6d6f3f0f331f96f6aa1971 \
@@ -219,7 +213,7 @@ python3 scripts/speech_to_text_browser_smoke.py \
 ```
 
 ```bash
-python3 scripts/text_to_speech_browser_smoke.py \
+node scripts/text_to_speech_browser_smoke.mjs \
   --dist-dir /private/tmp/llama_web_bridge_dist \
   --model-path /path/to/Qwen3-TTS-12Hz-1.7B-Base-Q4_K_M.gguf \
   --model-sha256 8d18c94acb2addd042f97da63c98be144eafa76d0d9495177eab65130cf85129 \
@@ -239,7 +233,7 @@ without `laya.config` metadata, such as the official `model.safetensors`, and
 `--gpu-layers 0` to check the CPU path:
 
 ```bash
-python3 scripts/decision_browser_smoke.py \
+node scripts/decision_browser_smoke.mjs \
   --dist-dir /private/tmp/llama_web_bridge_dist \
   --model-path /path/to/laya-Q8_0.gguf \
   --head-path /path/to/laya-head.safetensors \
@@ -274,9 +268,11 @@ query strings, and fragments before printing the location.
   ASR audio fixture, and every attestation must match them exactly.
   `.github/workflows/bridge_qualification.yml` hand-copies a 5-pin speech, TTS,
   and ASR audio subset, so rotate it with the rest.
-  `scripts/speech_to_text_browser_smoke.py` defaults the same ASR audio URL and
-  SHA-256 in `DEFAULT_AUDIO_URL` / `DEFAULT_AUDIO_SHA256`; no check compares that
-  copy, so rotate it by hand.
+  `scripts/speech_to_text_fixture.json` holds the same ASR audio URL and
+  SHA-256, which the speech smoke uses as defaults, with the expected
+  transcript that `scripts/release_qualification.py` also reads.
+  `scripts/release_qualification_test.py` requires its SHA-256 to equal the
+  pin; nothing compares its URL, so rotate that by hand.
 - The script maps every workflow `<ROLE>_SHA256` env key to its canonical name in
   `EXPECTED_MODEL_PINS` and requires equality in all three workflows, so a role
   swap fails even when applied identically to every one of them. It requires

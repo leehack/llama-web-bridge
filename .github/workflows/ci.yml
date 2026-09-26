@@ -57,17 +57,12 @@ jobs:
       - name: Validate release qualification contract
         run: python3 scripts/release_qualification_test.py
 
-      - name: Validate Python smoke syntax
+      - name: Validate Python syntax
         run: |
           python3 -m py_compile \
             scripts/verify_emscripten_version.py \
             scripts/release_qualification.py \
-            scripts/release_qualification_test.py \
-            scripts/state_persistence_browser_smoke.py \
-            scripts/multimodal_browser_smoke.py \
-            scripts/speech_to_text_browser_smoke.py \
-            scripts/text_to_speech_browser_smoke.py \
-            scripts/decision_browser_smoke.py
+            scripts/release_qualification_test.py
 
       - name: Verify CI reliability contract
         run: node scripts/verify_ci_reliability.mjs

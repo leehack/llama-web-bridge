@@ -156,7 +156,7 @@ functional but substantially slower. This generated-audio support is
 experimental upstream and stays out of default CI.
 
 Run the checksum-pinned real-model gate,
-`scripts/text_to_speech_browser_smoke.py`, before publishing TTS-capable
+`scripts/text_to_speech_browser_smoke.mjs`, before publishing TTS-capable
 assets; the invocation and pins are in [CONTRIBUTING.md](CONTRIBUTING.md#validate-outputs).
 
 ## Decision heads
@@ -168,7 +168,7 @@ logits for pre-tokenized sequences. Each head gets a private encoder context and
 runs on WebGPU when the model was loaded with GPU layers, in both direct and
 worker runtimes and in wasm32 and memory64. See [docs/api.md](docs/api.md#decision-heads).
 
-The real-model smoke, `scripts/decision_browser_smoke.py`, compares every
+The real-model smoke, `scripts/decision_browser_smoke.mjs`, compares every
 fixture row with a Laya reference and stays out of default CI; the invocation is
 in [CONTRIBUTING.md](CONTRIBUTING.md#validate-outputs). No qualification gate
 runs it, so release manifests list no decision capability; probe support with
@@ -265,9 +265,11 @@ Qwen3-TTS gates on `ubuntu-latest`. It downloads the candidate by immutable
 artifact ID only after proving the exact successful first-attempt candidate
 workflow/run/source identity and unique complete artifact inventory. It then
 checks out the candidate source, downloads every model/projector/fixture with a
-pinned SHA-256, verifies that the harness bytes match that source, and runs with
-GitHub's hosted-runner markers present. Each gate has a bounded timeout and
-terminates its full process group on timeout or cancellation. Smoke children
+pinned SHA-256, installs Node.js 24 with that source's locked npm dependencies
+and Playwright Chromium, verifies that the harness bytes match that source, and
+runs the source's Node smokes with GitHub's hosted-runner markers present. Each
+gate has a bounded timeout and terminates its full process group on timeout or
+cancellation. Smoke children
 receive only a narrow, non-secret environment allowlist; ambient
 `LLAMA_WEBGPU_*`, token, secret, and credential variables cannot redirect a
 gate or reach the browser process.
@@ -300,17 +302,19 @@ artifact. The orchestrator advances publication only after that exact
 first-attempt qualification run succeeds. No maintainer creates, transports, or
 submits an attestation, and the qualification workflow holds no publication PAT.
 
-`scripts/speech_to_text_browser_smoke.py` and
-`scripts/text_to_speech_browser_smoke.py` remain runnable on their own while
+`scripts/speech_to_text_browser_smoke.mjs` and
+`scripts/text_to_speech_browser_smoke.mjs` remain runnable on their own while
 iterating locally. The combined `release_qualification.py qualify` command is
 reserved for the hosted workflow because it requires GitHub Actions and
 `github-hosted` runner identity. Both invocations are in
 [CONTRIBUTING.md](CONTRIBUTING.md#validate-outputs).
 
-The default audio is Qwen's official English example fixture. The script pins
-its SHA-256 and the exact normalized transcript observed through the Web
-runtime, so an upstream fixture replacement fails loudly. Use `--memory-mode
-wasm32` or `--memory-mode wasm64` to classify one variant; the default validates
+The default audio is Qwen's official English example fixture.
+`scripts/speech_to_text_fixture.json` pins its URL, its SHA-256 and the exact
+normalized transcript observed through the Web runtime, for both the speech
+smoke and `release_qualification.py`, so an upstream fixture replacement fails
+loudly. Use `--memory-mode wasm32` or `--memory-mode wasm64` to classify one
+variant; the default validates
 both. Diagnostics land in `speech-to-text-smoke-artifacts` and
 `text-to-speech-smoke-artifacts`.
 

@@ -16,7 +16,7 @@ const API_DOCS_FLAT = API_DOCS
   .split(/[\t\n\v\f\r\x1c-\x1f \x85\xa0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]+/)
   .filter(Boolean)
   .join(' ');
-const SMOKE = readRepoText('scripts/text_to_speech_browser_smoke.py');
+const SMOKE = readRepoText('scripts/text_to_speech_browser_smoke.mjs');
 const RECOVERY_TEST = readRepoText('tests/js/text_to_speech_recovery_test.mjs');
 
 const NATIVE_EXPORTS = [
@@ -134,18 +134,18 @@ require(
   'public API docs must document TTS and its memory64 requirement',
 );
 require(
-  includesAll(README, 'Text-to-speech', 'text_to_speech_browser_smoke.py'),
+  includesAll(README, 'Text-to-speech', 'text_to_speech_browser_smoke.mjs'),
   'README must document TTS and its real-model smoke',
 );
 require(
   includesAll(
     SMOKE,
-    'RUNTIME_MODES = ("direct", "worker")',
-    '"wasm64" in memory_modes',
-    'model_sha256',
-    'mmproj_sha256',
-    'parser.add_argument("--gpu-layers"',
-    'parser.add_argument("--speaker-audio-path"',
+    "RUNTIME_MODES = Object.freeze(['direct', 'worker'])",
+    "memoryModes.includes('wasm64')",
+    'sha256File(modelPath)',
+    'sha256File(mmprojPath)',
+    "flag: '--gpu-layers'",
+    "flag: '--speaker-audio-path'",
     'speakerReferenceTested',
     'output.pcm instanceof Float32Array',
   ),

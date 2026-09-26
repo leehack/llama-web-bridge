@@ -17,7 +17,7 @@ const API_DOCS_FLAT = API_DOCS
   .filter(Boolean)
   .join(' ');
 const PACKAGE = readRepoText('package.json');
-const SMOKE = readRepoText('scripts/decision_browser_smoke.py');
+const SMOKE = readRepoText('scripts/decision_browser_smoke.mjs');
 const CONTRACT_TEST = readRepoText('tests/js/decision_bridge_contract_test.mjs');
 
 const NATIVE_EXPORTS = [
@@ -261,17 +261,17 @@ require(
   'public API docs must document decision heads, their encoder requirement, and handle lifetime',
 );
 require(
-  README.includes('Decision heads') && README.includes('decision_browser_smoke.py'),
+  README.includes('Decision heads') && README.includes('decision_browser_smoke.mjs'),
   'README must document decision heads and their real-model smoke',
 );
 require(
   includesAll(
     SMOKE,
-    'RUNTIME_MODES = ("direct", "worker")',
-    '"--fixture-path",',
-    '"--config-path",',
-    'parser.add_argument("--gpu-layers"',
-    'check_parity(payload, args)',
+    "RUNTIME_MODES = Object.freeze(['direct', 'worker'])",
+    "flag: '--fixture-path'",
+    "flag: '--config-path'",
+    "flag: '--gpu-layers'",
+    'checkParity(payload, args);',
     'worstLogitDiff',
     'argmaxChanges',
     'oversizedLength',
@@ -281,12 +281,12 @@ require(
   'real-model smoke must compare direct/worker outputs with the reference fixture, '
     + 'reject oversized sequences and invalid heads, and free heads',
 );
-const parityStart = SMOKE.indexOf('def check_parity(');
+const parityStart = SMOKE.indexOf('export function checkParity(');
 const parity = parityStart >= 0
-  ? SMOKE.slice(parityStart, SMOKE.indexOf('\ndef ', parityStart + 1))
+  ? SMOKE.slice(parityStart, SMOKE.indexOf('\n}\n', parityStart + 1))
   : '';
 require(
-  parity.includes('args.max_act_relative_diff') && parity.includes('worstActRelativeDiff'),
+  parity.includes("within('worstActRelativeDiff', args.maxActRelativeDiff)"),
   'real-model smoke must gate raw act logits, which saturated act probabilities cannot',
 );
 for (const stage of [
@@ -295,7 +295,9 @@ for (const stage of [
   'large-config',
   'reject-excess-markers',
 ]) {
-  require(SMOKE.includes(`:${stage}\``), `real-model smoke must run the ${stage} stage`);
+  // The harness page is a template literal, so its own template's closing
+  // backtick is escaped.
+  require(SMOKE.includes(`:${stage}\\\``), `real-model smoke must run the ${stage} stage`);
 }
 
 if (errors.length > 0) {

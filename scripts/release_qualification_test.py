@@ -22,7 +22,6 @@ from pathlib import Path
 import release_qualification as rq
 from generate_release_manifest import ARTIFACTS, generate
 from release_contract import BRIDGE_REPOSITORY, ContractError
-from speech_to_text_browser_smoke import DEFAULT_EXPECTED_TEXT
 
 
 BRIDGE_SHA = "565c8396597ea7c0fb4e8d5d966da8d884b156d8"
@@ -42,8 +41,13 @@ DEFAULT_HEAD_BRANCH = "main"
 DEFAULT_HEAD_SHA = "a" * 40
 
 
-# Pinned by the speech gate that produces it, not restated here, so this suite
+SCRIPTS_DIR = Path(__file__).resolve().parent
+
+# Pinned in the fixture the speech gate reads, not restated here, so this suite
 # cannot pass against a transcript the real gate would reject.
+DEFAULT_EXPECTED_TEXT = json.loads(
+    (SCRIPTS_DIR / "speech_to_text_fixture.json").read_text(encoding="utf-8")
+)["expected_text"]
 EXPECTED_SPEECH_TRANSCRIPT_RAW = DEFAULT_EXPECTED_TEXT
 
 
@@ -2504,6 +2508,248 @@ class QualificationTest(unittest.TestCase):
                 (scripts_dir / name).read_bytes() + b"\n# drift\n"
             )
             self.assertNotEqual(baseline, rq.harness_source_sha256(mirror))
+
+    def test_speech_fixture_holds_the_pinned_audio_and_transcript(self) -> None:
+        fixture = json.loads(
+            (SCRIPTS_DIR / rq.SPEECH_FIXTURE_FILE).read_text(encoding="utf-8")
+        )
+        self.assertEqual(rq.SPEECH_FIXTURE, fixture)
+        # The smoke's default audio is the fixture qualification pins.
+        self.assertEqual(fixture["audio_sha256"], rq.SPEECH_AUDIO_SHA256)
+        self.assertEqual(
+            rq.EXPECTED_MODEL_PINS["speech_audio_sha256"], fixture["audio_sha256"]
+        )
+        self.assertEqual(
+            rq.EXPECTED_SPEECH_TRANSCRIPT,
+            rq.normalize_transcript(fixture["expected_text"]),
+        )
+        self.assertTrue(rq.EXPECTED_SPEECH_TRANSCRIPT)
+
+    def test_speech_fixture_fails_closed(self) -> None:
+        good = {
+            "audio_sha256": "a" * 64,
+            "audio_url": "https://example.com/a.wav",
+            "expected_text": "hello",
+        }
+        path = self.tmp / rq.SPEECH_FIXTURE_FILE
+        path.write_text(json.dumps(good), encoding="utf-8")
+        self.assertEqual(rq.load_speech_fixture(path), good)
+        for label, raw in (
+            ("missing", json.dumps({k: v for k, v in good.items() if k != "expected_text"})),
+            ("extra", json.dumps({**good, "extra": "x"})),
+            ("empty", json.dumps({**good, "expected_text": " "})),
+            ("not a string", json.dumps({**good, "audio_url": 1})),
+            ("duplicate", json.dumps(good)[:-1] + ', "expected_text": "x"}'),
+            ("nan", json.dumps(good)[:-1] + ', "n": NaN}'),
+            ("list", "[]"),
+            ("malformed", "{"),
+        ):
+            with self.subTest(label=label):
+                path.write_text(raw, encoding="utf-8")
+                with self.assertRaises(ContractError):
+                    rq.load_speech_fixture(path)
+        path.unlink()
+        with self.assertRaises(ContractError):
+            rq.load_speech_fixture(path)
+
+    def test_harness_sources_are_exactly_what_the_gates_execute_or_read(self) -> None:
+        import ast
+        import re
+
+        def python_closure(name: str, seen: set[str]) -> None:
+            if name in seen:
+                return
+            seen.add(name)
+            tree = ast.parse((SCRIPTS_DIR / name).read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    modules = [alias.name for alias in node.names]
+                elif isinstance(node, ast.ImportFrom) and node.level == 0:
+                    modules = [node.module or ""]
+                else:
+                    continue
+                for module in modules:
+                    candidate = f"{module.split('.')[0]}.py"
+                    if (SCRIPTS_DIR / candidate).is_file():
+                        python_closure(candidate, seen)
+
+        # Static and dynamic imports and re-exports; a relative specifier is a
+        # file beside the importer. Harness page code imports '/...' URLs from
+        # the web root, which are not scripts/ files.
+        specifier = re.compile(
+            r"""(?:\bfrom\s*|\bimport\s*\(?\s*)(['"])([^'"]+)\1"""
+        )
+
+        def node_closure(name: str, seen: set[str]) -> None:
+            if name in seen:
+                return
+            seen.add(name)
+            if not name.endswith(".mjs"):
+                return
+            text = (SCRIPTS_DIR / name).read_text(encoding="utf-8")
+            # Any other file a module reads would have to be located through
+            # import.meta; only the entry-point check may use it.
+            self.assertEqual(
+                re.findall(r"import\.meta\.(?!main\b)\w+", text), [], name
+            )
+            self.assertNotIn("__dirname", text, name)
+            for _, spec in specifier.findall(text):
+                if spec.startswith(("./", "../")):
+                    target = (SCRIPTS_DIR / name).parent / spec
+                    self.assertEqual(target.resolve().parent, SCRIPTS_DIR, spec)
+                    node_closure(target.name, seen)
+                else:
+                    self.assertTrue(
+                        spec.startswith(("node:", "/")) or spec == "playwright",
+                        f"{name} imports {spec!r}",
+                    )
+
+        workflow = (
+            SCRIPTS_DIR.parent / ".github" / "workflows" / "bridge_candidate.yml"
+        ).read_text(encoding="utf-8")
+        candidate_gates = re.findall(r"run: node scripts/(\S+\.mjs)\s*$", workflow, re.M)
+        self.assertEqual(
+            sorted(candidate_gates),
+            ["multimodal_browser_smoke.mjs", "state_persistence_browser_smoke.mjs"],
+        )
+        closure: set[str] = set()
+        python_closure("release_qualification.py", closure)
+        closure.add(rq.SPEECH_FIXTURE_FILE)
+        for smoke in (*rq.QUALIFICATION_SMOKES, *candidate_gates):
+            node_closure(smoke, closure)
+        self.assertEqual(sorted(closure), sorted(rq.HARNESS_SOURCES))
+        self.assertEqual(len(set(rq.HARNESS_SOURCES)), len(rq.HARNESS_SOURCES))
+
+    def test_harness_version_moves_with_the_harness_sources(self) -> None:
+        # A new harness file list is a new harness: bump HARNESS_VERSION with it,
+        # so an attestation from the old list fails on its version too.
+        self.assertEqual(
+            (rq.HARNESS_VERSION, tuple(sorted(rq.HARNESS_SOURCES))),
+            (
+                "4.0.0",
+                (
+                    "browser_smoke_support.mjs",
+                    "generate_release_manifest.py",
+                    "multimodal_browser_smoke.mjs",
+                    "release_contract.py",
+                    "release_publication_state.py",
+                    "release_qualification.py",
+                    "speech_to_text_browser_smoke.mjs",
+                    "speech_to_text_fixture.json",
+                    "state_persistence_browser_smoke.mjs",
+                    "text_to_speech_browser_smoke.mjs",
+                ),
+            ),
+        )
+
+    def test_node_executable_fails_closed_without_node(self) -> None:
+        with mock.patch.object(rq.shutil, "which", return_value=None):
+            with self.assertRaises(ContractError) as ctx:
+                rq.node_executable()
+        self.assertIn("node is required", str(ctx.exception))
+        fake = self.tmp / "bin" / "node"
+        fake.parent.mkdir()
+        link = self.tmp / "node-link"
+        link.symlink_to(fake)
+        for version, accepted in (("v24.2.0", True), ("v22.18.0", True), ("v22.17.1", False), ("v20.19.0", False), ("", False)):
+            fake.write_text(f"#!/bin/sh\necho '{version}'\n", encoding="utf-8")
+            fake.chmod(0o755)
+            with mock.patch.object(rq.shutil, "which", return_value=str(link)):
+                if accepted:
+                    self.assertEqual(rq.node_executable(), str(fake.resolve()))
+                else:
+                    with self.assertRaises(ContractError) as ctx:
+                        rq.node_executable()
+                    self.assertIn("too old", str(ctx.exception))
+
+    def test_qualify_runs_the_node_smokes_with_the_pinned_inputs(self) -> None:
+        inputs = {}
+        for name in ("sm", "sp", "sa", "tm", "tp"):
+            inputs[name] = self.tmp / f"{name}.bin"
+            inputs[name].write_bytes(b"x")
+        args = rq._build_parser().parse_args(
+            [
+                "qualify",
+                "--candidate-run-id", CANDIDATE_RUN_ID,
+                "--speech-model-path", str(inputs["sm"]),
+                "--speech-mmproj-path", str(inputs["sp"]),
+                "--speech-audio-path", str(inputs["sa"]),
+                "--tts-model-path", str(inputs["tm"]),
+                "--tts-mmproj-path", str(inputs["tp"]),
+                "--tts-max-frames", "24",
+                "--speech-timeout-seconds", "7",
+                "--tts-timeout-seconds", "8",
+                "--diagnostics-dir", str(self.tmp / "diag"),
+                "--output-attestation", str(self.tmp / "attestation.json"),
+            ]
+        )
+        calls = []
+
+        class Stop(Exception):
+            pass
+
+        def run_smoke(command, label, diagnostics_dir, *, timeout_seconds):
+            calls.append((command, label, timeout_seconds))
+            if len(calls) == 2:
+                raise Stop()
+            return {"ok": True}
+
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(contextlib.redirect_stderr(io.StringIO()))
+            patch = lambda name, **kw: stack.enter_context(mock.patch.object(rq, name, **kw))
+            patch("node_executable", return_value="/opt/node/bin/node")
+            patch("qualification_environment", return_value={})
+            patch("qualification_run_identity", return_value={})
+            patch("fetch_candidate", return_value=(7, 1))
+            patch("load_candidate", return_value=({"bridge_commit": BRIDGE_SHA}, "f"))
+            harness = patch("require_harness_matches_bridge_source", return_value="d")
+            patch("_run_smoke", side_effect=run_smoke)
+            patch("_speech_phase", return_value={})
+            with self.assertRaises(Stop):
+                rq.qualify_cmd(args)
+        harness.assert_called_once_with(SCRIPTS_DIR, BRIDGE_SHA)
+        (speech, speech_label, speech_timeout), (tts, tts_label, tts_timeout) = calls
+        self.assertEqual(
+            (speech_label, speech_timeout, tts_label, tts_timeout),
+            ("speech-to-text", 67, "text-to-speech", 68),
+        )
+        diagnostics = self.tmp / "diag"
+        self.assertEqual(
+            speech,
+            [
+                "/opt/node/bin/node", str(SCRIPTS_DIR / "speech_to_text_browser_smoke.mjs"),
+                "--dist-dir", speech[3],
+                "--model-path", str(inputs["sm"].resolve()),
+                "--model-sha256", rq.SPEECH_MODEL_SHA256,
+                "--mmproj-path", str(inputs["sp"].resolve()),
+                "--mmproj-sha256", rq.SPEECH_MMPROJ_SHA256,
+                "--audio-path", str(inputs["sa"].resolve()),
+                "--audio-sha256", rq.SPEECH_AUDIO_SHA256,
+                "--memory-mode", "all",
+                "--timeout-ms", "7000",
+                "--artifacts-dir", str(diagnostics.resolve() / "speech-to-text"),
+            ],
+        )
+        self.assertEqual(
+            tts,
+            [
+                "/opt/node/bin/node", str(SCRIPTS_DIR / "text_to_speech_browser_smoke.mjs"),
+                "--dist-dir", speech[3],
+                "--model-path", str(inputs["tm"].resolve()),
+                "--model-sha256", rq.TTS_MODEL_SHA256,
+                "--mmproj-path", str(inputs["tp"].resolve()),
+                "--mmproj-sha256", rq.TTS_MMPROJ_SHA256,
+                "--memory-mode", "wasm64",
+                "--runtime-mode", "all",
+                "--max-frames", "24",
+                "--timeout-ms", "8000",
+                "--artifacts-dir", str(diagnostics.resolve() / "text-to-speech"),
+            ],
+        )
+        self.assertEqual(
+            [Path(command[1]).name for command in (speech, tts)],
+            list(rq.QUALIFICATION_SMOKES),
+        )
 
     def test_local_harness_must_match_the_exact_bridge_source(self) -> None:
         import subprocess
