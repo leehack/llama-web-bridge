@@ -239,7 +239,6 @@ jobs:
           python3 scripts/generate_release_manifest_test.py
           python3 scripts/release_publication_state_test.py
           python3 scripts/release_qualification_test.py
-          python3 scripts/wasm64_runtime_patch_contract_test.py
           node scripts/verify_ci_reliability.mjs
 
       - name: Resolve immutable upstream and native release tag commits

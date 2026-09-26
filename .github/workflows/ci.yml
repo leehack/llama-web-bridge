@@ -28,10 +28,13 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
       - id: scope
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
-        run: python3 scripts/ci_scope.py
+        run: node scripts/ci_scope.mjs
 
   checks:
     name: JS and workflow contracts
@@ -51,12 +54,6 @@ jobs:
           git ls-files --error-unmatch js/llama_webgpu_bridge.js js/llama_webgpu_bridge_worker.js js/llama_webgpu_bridge.d.ts
           git diff --exit-code -- js/llama_webgpu_bridge.js js/llama_webgpu_bridge_worker.js js/llama_webgpu_bridge.d.ts
 
-      - name: Validate media helper compatibility
-        run: python3 scripts/mtmd_compat_contract_test.py
-
-      - name: Validate wasm64 runtime patch contract
-        run: python3 scripts/wasm64_runtime_patch_contract_test.py
-
       - name: Validate release qualification contract
         run: python3 scripts/release_qualification_test.py
 
@@ -64,8 +61,6 @@ jobs:
         run: |
           python3 -m py_compile \
             scripts/verify_emscripten_version.py \
-            scripts/patch_wasm64_runtime.py \
-            scripts/wasm64_runtime_patch_contract_test.py \
             scripts/release_qualification.py \
             scripts/release_qualification_test.py \
             scripts/state_persistence_browser_smoke.py \
@@ -177,9 +172,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ runner.temp }}/webgpu-ccache
-          key: webgpu-ccache-v1-${{ runner.os }}-${{ runner.arch }}-${{ env.EMSCRIPTEN_VERSION }}-${{ steps.compiler-cache.outputs.upstream }}-${{ hashFiles('CMakeLists.txt', 'scripts/build_bridge.sh', 'scripts/patch_*.py') }}-${{ github.sha }}
+          key: webgpu-ccache-v1-${{ runner.os }}-${{ runner.arch }}-${{ env.EMSCRIPTEN_VERSION }}-${{ steps.compiler-cache.outputs.upstream }}-${{ hashFiles('CMakeLists.txt', 'scripts/build_bridge.sh', 'scripts/patch_*.mjs') }}-${{ github.sha }}
           restore-keys: |
-            webgpu-ccache-v1-${{ runner.os }}-${{ runner.arch }}-${{ env.EMSCRIPTEN_VERSION }}-${{ steps.compiler-cache.outputs.upstream }}-${{ hashFiles('CMakeLists.txt', 'scripts/build_bridge.sh', 'scripts/patch_*.py') }}-
+            webgpu-ccache-v1-${{ runner.os }}-${{ runner.arch }}-${{ env.EMSCRIPTEN_VERSION }}-${{ steps.compiler-cache.outputs.upstream }}-${{ hashFiles('CMakeLists.txt', 'scripts/build_bridge.sh', 'scripts/patch_*.mjs') }}-
 
       - name: Build bridge artifacts
         env:
@@ -293,7 +288,10 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
       - name: Validate selected job results
         env:
           NEEDS_JSON: ${{ toJSON(needs) }}
-        run: python3 scripts/ci_scope.py --check-results
+        run: node scripts/ci_scope.mjs --check-results

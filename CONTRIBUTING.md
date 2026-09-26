@@ -14,6 +14,8 @@ Published artifacts are consumed from `llama-web-bridge-assets`.
   type-checking; the tests run the `.ts` sources through Node's built-in type
   stripping
 - CMake toolchain
+- A host C++17 compiler (`c++`, or `$CXX`): `npm run check:js` compiles the
+  media-helper compatibility contract with it
 - Access to a llama.cpp checkout matching `llama_cpp.version`
 
 ## Setup
@@ -44,7 +46,10 @@ runs the same generator plus TypeScript and syntax checks, so commit any updated
 `js/` outputs after source changes. It also runs the JS contract tests,
 including the static state-persistence, text-to-speech, and decision API
 contracts (`npm run test:api-state-persistence`, `npm run test:api-tts`, and
-`npm run test:api-decision`).
+`npm run test:api-decision`), the media-helper compatibility contract
+(`npm run test:mtmd-compat`), the wasm64 runtime patch contract for
+`scripts/patch_wasm64_runtime.mjs` (`npm run test:wasm64-runtime-patch`), and
+the CI change selector (`npm run test:ci-scope`).
 
 `js/src/llama_webgpu_bridge.js` is the public entry. It re-exports the API and
 owns the only load-time side effects (worker host auto-boot and the
@@ -81,8 +86,7 @@ exported `llamadart_webgpu_*` functions grouped by feature; the remaining parts
 hold the state and internal helpers they use. A part is not a standalone file:
 it relies on everything included before it, so keep the include order. The
 static contract checks read the core with its parts expanded
-(`scripts/native_core_source.py` and its JS twin
-`tests/js/native_core_source.mjs`), which is how the compiler sees it. Both fail
+(`tests/js/native_core_source.mjs`), which is how the compiler sees it. It fails
 if a part is not included exactly once as a plain `#include` line. The JS API
 contract tests read the bridge the same way: `tests/js/bridge_js_source.mjs`
 joins every `js/src` module in the order the former single-file source declared
@@ -122,7 +126,6 @@ Before opening or updating a PR, run the lightweight contracts:
 ```bash
 npm run check:js
 python3 -m py_compile scripts/state_persistence_browser_smoke.py scripts/multimodal_browser_smoke.py scripts/grammar_browser_smoke.py scripts/next_token_scores_browser_smoke.py scripts/speech_to_text_browser_smoke.py scripts/text_to_speech_browser_smoke.py scripts/decision_browser_smoke.py
-python3 scripts/mtmd_compat_contract_test.py
 node scripts/verify_ci_reliability.mjs
 ```
 
@@ -452,7 +455,7 @@ Transport dispatch inputs through `env` and use quoted shell expansions.
 ## CI change selection and compiler cache
 
 CI always runs the shared JS and workflow contracts. An explicit allowlist in
-`scripts/ci_scope.py` lets known documentation and tooling-only changes avoid the
+`scripts/ci_scope.mjs` lets known documentation and tooling-only changes avoid the
 WASM builds. Runtime JS, C++, browser harnesses, build inputs, workflows, pins,
 and unknown paths retain the pinned build/smoke lane. Rename and
 deletion comparisons include both paths. The `CI validation` result always
@@ -464,7 +467,7 @@ OS/architecture, exact Emscripten version, resolved llama.cpp commit, and build
 script/CMake/patch inputs. ccache also checks compiler contents, source inputs,
 and compile flags. Every selected build still links fresh artifacts and runs
 every CI browser smoke. Candidate and publication workflows do not consume
-this cache or this change selector, so `scripts/ci_scope.py` is listed in
+this cache or this change selector, so `scripts/ci_scope.mjs` is listed in
 `_ORCHESTRATION_ONLY_PATHS` in `scripts/stable_release_orchestrator.py`. List any
 new CI-only script there too: an unclassified path is governed by default and
 advances the release build identity. Track follow-up work in

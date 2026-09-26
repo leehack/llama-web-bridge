@@ -192,7 +192,7 @@ tested in CI.
 To run the media-helper and static CI contracts locally:
 
 ```bash
-python3 scripts/mtmd_compat_contract_test.py
+npm run test:mtmd-compat
 node scripts/verify_ci_reliability.mjs
 ```
 

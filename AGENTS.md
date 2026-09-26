@@ -86,7 +86,7 @@ GGUFs or smoke artifacts.
     `src/llama_webgpu_mtmd_compat.h` shim and its static contract remain.
   - Verifies the active `emcc` identity against `emsdk.version` and
     contract-tests all five required wasm64 WASMFS patches.
-  - `scripts/ci_scope.py` lets `README.md`, `CONTRIBUTING.md`, `LICENSE`, and
+  - `scripts/ci_scope.mjs` lets `README.md`, `CONTRIBUTING.md`, `LICENSE`, and
     `docs/*.md` changes skip the build lane; `AGENTS.md` is not in that
     allowlist, so editing it still runs it.
 - Candidate build: `.github/workflows/bridge_candidate.yml`
@@ -202,7 +202,7 @@ candidate and exact `candidate_run_id`/`attestation_run_id` pair.
   state machine lives in the `scripts/release_orchestrator_<concern>.py` modules
   it imports, tested by `scripts/release_orchestrator_<concern>_test.py`
   suites that share `release_orchestrator_fixtures_test.py`. List a new module in
-  `_ORCHESTRATION_ONLY_PATHS` and in `TOOLING` in `scripts/ci_scope.py`.
+  `_ORCHESTRATION_ONLY_PATHS` and in `TOOLING` in `scripts/ci_scope.mjs`.
 - Keep publishing logic in workflow only.
 - Do not edit assets repository files from here outside publish flow.
 - C++ exception catching is enabled only for

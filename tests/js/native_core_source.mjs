@@ -1,9 +1,8 @@
-// C++ core source text for the JS contract tests; the JS twin of
-// scripts/native_core_source.py. src/llama_webgpu_core.cpp includes its parts
-// from src/core/, so read it with each `#include "core/<part>.inc"` line
-// replaced by that part, as the compiler sees it. A part that is missing,
-// included in another form, or not included exactly once throws instead of
-// silently narrowing a check.
+// C++ core source text for the JS contract tests. src/llama_webgpu_core.cpp
+// includes its parts from src/core/, so read it with each
+// `#include "core/<part>.inc"` line replaced by that part, as the compiler
+// sees it. A part that is missing, included in another form, or not included
+// exactly once throws instead of silently narrowing a check.
 import { readFileSync, readdirSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';

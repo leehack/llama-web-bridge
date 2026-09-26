@@ -82,7 +82,14 @@ _ORCHESTRATION_ONLY_PATHS = frozenset(
         "scripts/bridge_operation_queue_fixtures.mjs",
         "scripts/bridge_operation_queue_lifecycle_contract_cases.mjs",
         "scripts/bridge_operation_queue_worker_proxy_cases.mjs",
+        # Ported to scripts/ci_scope.mjs. Keep the .py entry: the commit that
+        # ported it deletes that path, and history must not classify that
+        # commit as a build input.
+        "scripts/ci_scope.mjs",
         "scripts/ci_scope.py",
+        # Deleted with the Node port of mtmd_compat_contract_test.py, its last
+        # importer; tests/js/native_core_source.mjs is its twin. Keep it: history
+        # must not classify the deleting commit as a build input.
         "scripts/native_core_source.py",
         # Deleted with the Node port of verify_ci_reliability; see above.
         "scripts/orchestrator_source.py",
