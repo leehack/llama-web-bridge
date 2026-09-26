@@ -351,6 +351,100 @@ const CASES = [
     assert.match(warnings.join('\n'), /draft model reload failed .*404 Not Found.*call loadDraftModel again/);
   }],
 
+  ['a worker restart and a CPU fallback restore both the draft model and the applied LoRA adapters', async () => {
+    const workerCalls = [];
+    const runtimeCalls = [];
+    const runtime = {
+      _modelBytes: 0,
+      _runtimeNotes: [],
+      _draftModel: null,
+      nextHandle: 90,
+      async loadModelFromUrl(url) {
+        runtimeCalls.push(['loadModelFromUrl', url]);
+        this._modelBytes = 1;
+        this._draftModel = null;
+      },
+      async loadDraftModel(url, options) {
+        runtimeCalls.push(['loadDraftModel', url, options.useCache]);
+        this._draftModel = { url };
+        return { architecture: 'llama' };
+      },
+      getLoraAdapterCapabilities: () => ({ apiVersion: 1, supported: true, from: 'runtime' }),
+      async loadLoraAdapter(source) {
+        runtimeCalls.push(['loadLoraAdapter', source]);
+        return { handle: this.nextHandle++ };
+      },
+      async setLoraAdapter(handle, scale) {
+        runtimeCalls.push(['setLoraAdapter', handle, scale]);
+      },
+      async clearLoraAdapters() {
+        runtimeCalls.push(['clearLoraAdapters']);
+      },
+      async tokenize(text) {
+        runtimeCalls.push(['tokenize', text]);
+        return [1];
+      },
+    };
+    let workerDies = false;
+    const bridge = createWorkerBridge({
+      _loadedMmProjUrl: null,
+      _createRuntime: () => runtime,
+      _callWorker: async (method, args) => {
+        if (workerDies) throw new Error('Bridge worker request failed: worker terminated');
+        workerCalls.push([method, ...args]);
+        if (method === 'loadLoraAdapter') return { handle: 70 + workerCalls.length };
+        if (method === 'loadDraftModel') return { architecture: 'llama' };
+        return undefined;
+      },
+    });
+    await bridge.loadDraftModel('https://example.invalid/draft.gguf', { useCache: false });
+    const adapter = await bridge.loadLoraAdapter('https://example.invalid/a.gguf');
+    await bridge.setLoraAdapter(adapter.handle, 0.5);
+
+    workerCalls.length = 0;
+    bridge._workerProxy = { dispose: async () => {} };
+    bridge._workerModelMissing = true;
+    await bridge.tokenize('x');
+    assert.deepEqual(workerCalls.map(([method]) => method), [
+      'loadModelFromUrl',
+      'loadDraftModel',
+      'clearLoraAdapters',
+      'loadLoraAdapter',
+      'setLoraAdapter',
+      'tokenize',
+    ], 'a restarted worker gets the model, the draft and the applied adapter back');
+    assert.deepEqual(workerCalls[1].slice(1), ['https://example.invalid/draft.gguf', { useCache: false }]);
+    assert.deepEqual(workerCalls[4].slice(2), [0.5]);
+
+    workerDies = true;
+    await bridge.tokenize('y');
+    assert.equal(bridge._workerProxy, null);
+    const restored = [
+      ['loadModelFromUrl', 'model.gguf'],
+      ['clearLoraAdapters'],
+      ['loadLoraAdapter', 'https://example.invalid/a.gguf'],
+      ['setLoraAdapter', 90, 0.5],
+      ['loadDraftModel', 'https://example.invalid/draft.gguf', false],
+    ];
+    assert.deepEqual(runtimeCalls, [...restored, ['tokenize', 'y']],
+      'the main-thread runtime gets the model, the applied adapter and the draft before the retried call');
+    assert.deepEqual(bridge._loadedDraftModel, { url: 'https://example.invalid/draft.gguf', options: { useCache: false } });
+
+    runtimeCalls.length = 0;
+    await bridge._ensureRuntimeReadyAfterWorkerFallback({ _llamadartForceRuntimeReload: true }, null);
+    assert.deepEqual(runtimeCalls, [
+      ['loadModelFromUrl', 'model.gguf'],
+      ['clearLoraAdapters'],
+      ['loadLoraAdapter', 'https://example.invalid/a.gguf'],
+      ['setLoraAdapter', 91, 0.5],
+      ['loadDraftModel', 'https://example.invalid/draft.gguf', false],
+    ], 'a forced CPU reload restores both again');
+
+    runtimeCalls.length = 0;
+    await bridge._ensureRuntimeReadyAfterWorkerFallback({}, null);
+    assert.deepEqual(runtimeCalls, [], 'a runtime that still holds both reloads neither');
+  }],
+
   ['unloading a draft forgets it', async () => {
     const calls = [];
     const bridge = createWorkerBridge({
