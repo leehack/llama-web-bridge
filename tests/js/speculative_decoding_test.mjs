@@ -211,6 +211,18 @@ const CASES = [
     assert.deepEqual(written, [[...view]]);
   }],
 
+  ['the generation ends through an async core call', async () => {
+    const { bridge, core } = directBridge();
+    const ends = [];
+    const ccall = core.ccall;
+    core.ccall = (name, returnType, argTypes, args, opts) => {
+      if (name === 'llamadart_webgpu_end_generation') ends.push(opts);
+      return ccall(name, returnType, argTypes, args, opts);
+    };
+    await bridge.createCompletion('hello', { speculativeDecoding: { strategies: ['ngram-mod'] } });
+    assert.deepEqual(ends, [{ async: true }]);
+  }],
+
   ['a completion without speculative decoding reports no speculative usage and never calls the setter', async () => {
     const { bridge, calls } = directBridge();
     let usage = null;
@@ -437,9 +449,11 @@ const CASES = [
       smoke.validatePayload({ ok: true, modeResults: [] }, ['tiny'], ['wasm32'], ['direct'])[0],
       /mode results missing/,
     );
-    const html = smoke.renderHarness([{ name: 'tiny', ...smoke.GROUPS.tiny }], 256, ['wasm32'], ['direct']);
+    const html = smoke.renderHarness([{ name: 'tiny', ...smoke.GROUPS.tiny }], 256, ['wasm32'], ['direct'], 99);
     assert.match(html, /speculativeDecoding\[strategy\] === true/);
+    assert.match(html, /"gpuLayers":99/);
     assert.equal(smoke.parseArgs([]).group, 'tiny');
+    assert.equal(smoke.parseArgs([]).gpuLayers, 0);
   }],
 
   ['the declared strategies, capability flags and core strategy names agree', () => {

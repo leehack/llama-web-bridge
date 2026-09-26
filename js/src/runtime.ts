@@ -2673,7 +2673,9 @@ export class LlamaWebGpuBridgeRuntime {
     const abortMessage = 'Draft model load was cancelled.';
     throwIfAborted(options.signal || null, abortMessage);
 
-    const rc = Number(core.ccall('llamadart_webgpu_draft_model_free', 'number', [], []));
+    // Async: freeing a draft context waits for the WebGPU device, which
+    // suspends the core under ASYNCIFY.
+    const rc = Number(await core.ccall('llamadart_webgpu_draft_model_free', 'number', [], [], { async: true }));
     if (rc !== 0) {
       throw new Error(this._coreErrorMessage('Failed to release the draft model', rc));
     }
@@ -2766,7 +2768,9 @@ export class LlamaWebGpuBridgeRuntime {
       this._draftModel = null;
       return;
     }
-    const rc = Number(this._core.ccall('llamadart_webgpu_draft_model_free', 'number', [], []));
+    const rc = Number(
+      await this._core.ccall('llamadart_webgpu_draft_model_free', 'number', [], [], { async: true }),
+    );
     if (rc !== 0) {
       throw new Error(this._coreErrorMessage('Failed to unload the draft model', rc));
     }
@@ -3978,7 +3982,10 @@ export class LlamaWebGpuBridgeRuntime {
       return text;
     } finally {
       if (generationStarted) {
-        this._core!.ccall('llamadart_webgpu_end_generation', null, [], []);
+        // Async: ending a speculative generation frees its draft context,
+        // which waits for the WebGPU device and suspends the core under
+        // ASYNCIFY. A synchronous ccall would return before the free ends.
+        await this._core!.ccall('llamadart_webgpu_end_generation', null, [], [], { async: true });
       }
       for (const path of speculativePaths) {
         this._deleteFsFile(path);

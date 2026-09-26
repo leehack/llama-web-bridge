@@ -20,6 +20,7 @@ import {
   resolvePinnedFile,
   runMain,
   runPlaywright,
+  runPollingPlaywright,
   withServer,
   withTempDir,
   writeStdout,
@@ -205,12 +206,13 @@ export function groupFiles(group) {
   return [...keys];
 }
 
-export function renderHarness(groups, nCtx, memoryModes, runtimeModes) {
+export function renderHarness(groups, nCtx, memoryModes, runtimeModes, gpuLayers = 0) {
   const config = JSON.stringify({
     groups,
     prompts: { ngram: NGRAM_PROMPT, draft: DRAFT_PROMPT },
     nPredict: N_PREDICT,
     nCtx,
+    gpuLayers,
     memoryModes,
     runtimeModes,
   });
@@ -284,7 +286,7 @@ export function renderHarness(groups, nCtx, memoryModes, runtimeModes) {
         await bridge.loadModelFromUrl('/' + group.target, {
           nCtx: config.nCtx,
           nThreads: 2,
-          nGpuLayers: 0,
+          nGpuLayers: config.gpuLayers,
           useCache: false,
           forceRemoteFetchBackend: false,
           ...(group.loadOptions || {}),
@@ -354,12 +356,15 @@ export function renderHarness(groups, nCtx, memoryModes, runtimeModes) {
         const after = await complete(bridge, config.prompts.draft, null);
         check(after.text === (baselines.draft || after).text, 'the runtime changed its output after the speculative runs');
         const metadata = bridge.getModelMetadata();
+        const backend = bridge.getBackendName();
+        check(config.gpuLayers === 0 || backend.includes('WebGPU'), 'expected a WebGPU backend, got ' + backend);
         return {
           mode,
           group: group.name,
           failures,
           runs,
           rejections,
+          backend,
           execution: metadata['llamadart.webgpu.execution'] || null,
           coreVariant: metadata['llamadart.webgpu.core_variant'] || null,
           workerFallbackReason: metadata['llamadart.webgpu.worker_fallback_reason'] || null,
@@ -481,6 +486,12 @@ export function parseArgs(argv) {
         help: 'Runtime mode to run.',
       },
       {
+        flag: '--gpu-layers',
+        type: 'int',
+        default: () => 0,
+        help: 'nGpuLayers for the target and draft models; above 0 launches Chromium with WebGPU enabled.',
+      },
+      {
         flag: '--n-ctx',
         type: 'int',
         default: () => 2048,
@@ -548,12 +559,17 @@ export async function main(argv = process.argv.slice(2)) {
     const groups = groupNames.map((name) => ({ name, ...GROUPS[name] }));
     await fsp.writeFile(
       path.join(webRoot, 'index.html'),
-      renderHarness(groups, args.nCtx, memoryModes, runtimeModes),
+      renderHarness(groups, args.nCtx, memoryModes, runtimeModes, args.gpuLayers),
       'utf8',
     );
     return withServer(
       webRoot,
-      (url) => runPlaywright(url, args.timeoutMs, artifactsDir, 'speculative-smoke'),
+      (url) => (args.gpuLayers > 0
+        ? runPollingPlaywright(url, args.timeoutMs, artifactsDir, {
+          artifactPrefix: 'speculative-smoke',
+          stageMarker: '[speculative-smoke]',
+        })
+        : runPlaywright(url, args.timeoutMs, artifactsDir, 'speculative-smoke')),
     );
   });
 

@@ -3061,7 +3061,7 @@ var LlamaWebGpuBridgeRuntime = class {
     const core = this._core;
     const abortMessage = "Draft model load was cancelled.";
     throwIfAborted(options.signal || null, abortMessage);
-    const rc = Number(core.ccall("llamadart_webgpu_draft_model_free", "number", [], []));
+    const rc = Number(await core.ccall("llamadart_webgpu_draft_model_free", "number", [], [], { async: true }));
     if (rc !== 0) {
       throw new Error(this._coreErrorMessage("Failed to release the draft model", rc));
     }
@@ -3147,7 +3147,9 @@ var LlamaWebGpuBridgeRuntime = class {
       this._draftModel = null;
       return;
     }
-    const rc = Number(this._core.ccall("llamadart_webgpu_draft_model_free", "number", [], []));
+    const rc = Number(
+      await this._core.ccall("llamadart_webgpu_draft_model_free", "number", [], [], { async: true })
+    );
     if (rc !== 0) {
       throw new Error(this._coreErrorMessage("Failed to unload the draft model", rc));
     }
@@ -4207,7 +4209,7 @@ var LlamaWebGpuBridgeRuntime = class {
       return text;
     } finally {
       if (generationStarted) {
-        this._core.ccall("llamadart_webgpu_end_generation", null, [], []);
+        await this._core.ccall("llamadart_webgpu_end_generation", null, [], [], { async: true });
       }
       for (const path of speculativePaths) {
         this._deleteFsFile(path);
