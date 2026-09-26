@@ -345,8 +345,36 @@ export class FakeGateway {
 
   apiJson(apiPath, { paginate: _paginate = false, privileged: _privileged = false } = {}) {
     this.apiPaths.push(apiPath);
-    if (!Object.hasOwn(this.jsonRoutes, apiPath)) throw new ContractError(`unmapped API path in test gateway: ${apiPath}`);
+    if (!Object.hasOwn(this.jsonRoutes, apiPath)) {
+      const recent = this.recentRuns(apiPath);
+      if (recent !== null) return recent;
+      throw new ContractError(`unmapped API path in test gateway: ${apiPath}`);
+    }
     return this.jsonRoutes[apiPath];
+  }
+
+  // Node-only: the dispatch guard's unfiltered newest page of a workflow's
+  // runs (workflowRuns.recentWorkflowRunsPath), when a test does not map it,
+  // answers as a consistent server would: every run the test's filtered
+  // listings of that workflow hold, newest (highest id) first. A test that
+  // needs the two query shapes to disagree maps the path explicitly. Null
+  // for any other path, or a workflow with no filtered listing.
+  recentRuns(apiPath) {
+    const match = /^repos\/[^/]+\/[^/]+\/actions\/workflows\/([^/?]+)\/runs\?per_page=100$/u.exec(apiPath);
+    if (match === null || apiPath !== workflowRuns.recentWorkflowRunsPath(match[1])) return null;
+    const prefix = `repos/${BRIDGE_REPOSITORY}/actions/workflows/${match[1]}/runs?`;
+    const runs = new Map();
+    let listed = false;
+    for (const [key, value] of Object.entries(this.jsonRoutes)) {
+      if (!key.startsWith(prefix) || !Array.isArray(value?.workflow_runs)) continue;
+      listed = true;
+      for (const run of value.workflow_runs) {
+        if (!runs.has(run.id)) runs.set(run.id, run);
+      }
+    }
+    if (!listed) return null;
+    const newest = [...runs.values()].sort((left, right) => Number(BigInt(right.id) - BigInt(left.id))).slice(0, 100);
+    return { total_count: runs.size, workflow_runs: newest };
   }
 
   downloadBytes(apiPath, { accept: _accept, privileged: _privileged = false } = {}) {

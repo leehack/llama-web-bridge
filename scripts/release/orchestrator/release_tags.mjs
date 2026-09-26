@@ -147,3 +147,47 @@ export function claimedReleaseTags(candidateRuns, {
   }
   return claimed;
 }
+
+// The claimed stable tags at or above `releaseTag`, sorted.
+//
+// selectNextReleaseTarget picks a tag above every published tag and live
+// claim it was shown, so a claim this returns for a freshly selected tag is
+// one the selection never saw: the tag itself, a rebuild of it, or a higher
+// version, each of which would have moved the selection.
+export function claimsNotBelow(releaseTag, claimed) {
+  const target = parseReleaseTag(releaseTag);
+  const floor = [...target.versionParts, target.rebuild];
+  const conflicting = [];
+  for (const tag of claimed) {
+    let claim;
+    try {
+      claim = parseReleaseTag(tag, { allowLegacy: true });
+    } catch (error) {
+      if (error instanceof ContractError) continue;
+      throw error;
+    }
+    if (claim.channel === Channel.STABLE && pyCompareIntTuples([...claim.versionParts, claim.rebuild], floor) >= 0) {
+      conflicting.push(tag);
+    }
+  }
+  return conflicting.sort(compareCodePoints);
+}
+
+// The correlation a candidate run name claims an output tag for, and that
+// tag, or null for a name that is not a candidate run name.
+export function candidateTagClaim(runName) {
+  const match = typeof runName === 'string' ? CANDIDATE_RUN_NAME_RE.exec(runName) : null;
+  return match === null ? null : { correlationId: match.groups.correlation_id, releaseTag: match.groups.release_tag };
+}
+
+// namesOtherBuild, for the dispatch guard's claim check.
+export function claimNamesOtherBuild(correlationId, bridgeBuildSha) {
+  return namesOtherBuild(correlationId, bridgeBuildSha);
+}
+
+// The correlation a stage run name belongs to (its second field), or null.
+export function runNameCorrelationId(runName) {
+  if (typeof runName !== 'string') return null;
+  const fields = pyStrSplit(runName);
+  return fields.length > 1 ? fields[1] : null;
+}

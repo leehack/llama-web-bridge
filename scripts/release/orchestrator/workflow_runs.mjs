@@ -384,3 +384,111 @@ export function findNamedRun(gateway, {
   });
   return selection.inFlightRunId || selection.succeededRunId;
 }
+
+// The newest page of a workflow's runs, with no server-side filter at all.
+//
+// The filtered search that fetchRuns pages through is the planner's complete
+// history, but it can answer from a stale view: in scan 36232509530 it omitted
+// a candidate run completed 26 minutes earlier, which the same query listed
+// again seconds later. This listing takes a different server path (no
+// created, actor, event or branch filter, newest run first), so the dispatch
+// guard does not depend on one query shape. It is recency evidence, never a
+// completeness proof: a run older than the newest page is left to fetchRuns.
+export function recentWorkflowRunsPath(workflowFile) {
+  return `repos/${BRIDGE_REPOSITORY}/actions/workflows/${workflowFile}/runs?${pyUrlencode([
+    ['per_page', String(MAX_FILTERED_WORKFLOW_RUNS)],
+  ])}`;
+}
+
+// The records of the newest unfiltered page that belong to a pipeline, each
+// parsed with parseRunRecord's full strictness. The page legitimately carries
+// push, bot and topic-branch runs, so a run is kept when:
+//
+// - `correlated` accepts its display_title: the guarded pipeline's own run.
+//   It must be what the server filter of workflowRunsPath selects (a
+//   workflow_dispatch run by the repository owner on the default branch);
+//   anything else claiming the pipeline fails closed.
+// - `select` accepts its display_title and the server filter would select it
+//   (other pipelines' runs, for claims). Other runs are skipped unparsed, as
+//   the server filter drops them.
+export function fetchRecentRuns(gateway, {
+  workflowFile, workflowPath, defaultBranch, correlated, select = () => false,
+}) {
+  requireStr(defaultBranch, 'default branch');
+  const payload = gateway.apiJson(recentWorkflowRunsPath(workflowFile));
+  if (!isDict(payload)) throw new ContractError('workflow runs response must be an object containing workflow_runs');
+  const totalCount = pyGet(payload, 'total_count');
+  if (!isPyInt(totalCount) || big(totalCount) < 0n) {
+    throw new ContractError('workflow runs total_count must be a non-negative integer');
+  }
+  const runs = pyGet(payload, 'workflow_runs');
+  if (!Array.isArray(runs)) throw new ContractError('workflow runs response is missing workflow_runs');
+  if (runs.length > MAX_FILTERED_WORKFLOW_RUNS) throw new ContractError('workflow runs page exceeds the requested page size');
+  const expectedPage = big(totalCount) < BigInt(MAX_FILTERED_WORKFLOW_RUNS) ? big(totalCount) : BigInt(MAX_FILTERED_WORKFLOW_RUNS);
+  if (BigInt(runs.length) !== expectedPage) {
+    throw new ContractError(
+      `newest workflow run page for ${workflowPath} has ${runs.length} records, expected ${expectedPage}`,
+    );
+  }
+  const records = new Map();
+  for (const run of runs) {
+    if (!isDict(run)) throw new ContractError('workflow run record must be a JSON object');
+    const title = pyGet(run, 'display_title');
+    const actor = pyGet(run, 'actor');
+    const serverSelected = (
+      pyEquals(pyGet(run, 'event'), 'workflow_dispatch')
+      && pyEquals(pyGet(run, 'head_branch'), defaultBranch)
+      && isDict(actor)
+      && pyEquals(pyGet(actor, 'login'), REPOSITORY_OWNER)
+    );
+    if (correlated(title)) {
+      if (!serverSelected) {
+        throw new ContractError(
+          `workflow run ${pyRepr(pyGet(run, 'id'))} is named for this pipeline but is not a `
+          + `workflow_dispatch run by ${REPOSITORY_OWNER} on ${pyRepr(defaultBranch)}`,
+        );
+      }
+    } else if (!serverSelected || !select(title)) {
+      continue;
+    }
+    const record = parseRunRecord(run, { workflowPath });
+    if (records.has(record.runId)) throw new ContractError(`workflow run ${record.runId} is listed more than once`);
+    records.set(record.runId, record);
+  }
+  return [...records.values()];
+}
+
+// Reconcile records of one workflow from reads taken at different moments,
+// keyed by run id. A run keeps its name, branch and commit, and only moves
+// forward (a new attempt, then completion), so the later state wins: a higher
+// run_attempt, else a completed run over a live one. Views that disagree on a
+// fixed field, or two completed views of one attempt that differ, cannot both
+// be true and fail closed.
+export function mergeRunRecords(...lists) {
+  const merged = new Map();
+  for (const records of lists) {
+    for (const record of records) {
+      const known = merged.get(record.runId);
+      if (known === undefined) {
+        merged.set(record.runId, record);
+        continue;
+      }
+      if (known.equals(record)) continue;
+      if (
+        known.runName !== record.runName
+        || known.headBranch !== record.headBranch
+        || known.headSha !== record.headSha
+      ) {
+        throw new ContractError(`workflow run ${record.runId} has contradictory identities across fresh reads`);
+      }
+      const attempts = BigInt(record.runAttempt) - BigInt(known.runAttempt);
+      if (attempts < 0n) continue;
+      if (attempts === 0n && !known.inFlight) {
+        if (record.inFlight) continue;
+        throw new ContractError(`workflow run ${record.runId} has contradictory outcomes across fresh reads`);
+      }
+      merged.set(record.runId, record);
+    }
+  }
+  return [...merged.values()];
+}
