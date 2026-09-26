@@ -13,6 +13,7 @@ import process from 'node:process';
 // Only paths with no compiled-runtime dependency may avoid native jobs.
 export const TOOLING = new Set([
   'scripts/release_publication_state.py', 'scripts/release_publication_state_test.py',
+  'scripts/release/publication_state.mjs',
   'scripts/stable_release_orchestrator.py', 'scripts/stable_release_orchestrator_test.py',
   'scripts/release_orchestrator_asset_releases.py', 'scripts/release_orchestrator_asset_releases_test.py',
   'scripts/release_orchestrator_driver.py', 'scripts/release_orchestrator_driver_test.py',
@@ -47,8 +48,12 @@ export const TOOLING = new Set([
 
 const DOCUMENTATION = new Set(['README.md', 'CONTRIBUTING.md', 'LICENSE']);
 
+// The release tooling's Node tests and fixtures load no compiled runtime.
+const TOOLING_PREFIXES = ['tests/release/'];
+
 export function nativeRequired(paths) {
-  return paths.length === 0 || paths.some((path) => !TOOLING.has(path) && !(
+  return paths.length === 0 || paths.some((path) => !TOOLING.has(path)
+    && !TOOLING_PREFIXES.some((prefix) => path.startsWith(prefix)) && !(
     DOCUMENTATION.has(path) || (path.startsWith('docs/') && path.endsWith('.md'))
   ));
 }

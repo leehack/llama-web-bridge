@@ -41,6 +41,8 @@ const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../.
     'tests/js/worker_runtime_state_test.mjs',
     'tests/js/declared_class_fields_test.mjs',
     'scripts/verify_ci_reliability.mjs', 'tests/js/verify_ci_reliability_test.mjs',
+    'tests/release/contract_test.mjs', 'tests/release/fixtures/attestation.json',
+    'scripts/release/publication_state.mjs',
   ]) {
     assert.equal(nativeRequired([file]), false, file);
   }
@@ -62,6 +64,8 @@ const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../.
     'scripts/new_test.py', 'llama_cpp.version', 'emsdk.version',
     '.github/workflows/ci.yml', '.github/workflows/bridge_candidate.yml',
     'CMakeLists.txt', 'docs/native.cpp', 'unknown.lock',
+    // Only the release tests are exempt; the release modules keep the lanes.
+    'scripts/release/contract.mjs', 'scripts/release/qualification.mjs', 'tests/releases/x_test.mjs',
   ]) {
     assert.equal(nativeRequired(['README.md', file]), true, file);
   }

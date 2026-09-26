@@ -187,6 +187,16 @@ class BridgeSourceIdentityTest(unittest.TestCase):
             "tests/js/verify_ci_reliability_test.mjs",
             "tests/js/wasm64_runtime_patch_contract_test.mjs",
             "tests/js/worker_runtime_state_test.mjs",
+            "tests/js/nested/new_contract_test.mjs",
+            "tests/new_suite/new_contract_test.mjs",
+            "tests/release/contract_test.mjs",
+            "scripts/release/archive.mjs",
+            "scripts/release/publication_state.mjs",
+            "scripts/release/qualification.mjs",
+            "scripts/release/qualify.mjs",
+            "scripts/release/wav.mjs",
+            "tests/release/zip_fixture.mjs",
+            "tests/release/fixtures/attestation.json",
         ):
             with self.subTest(path=path):
                 self.assertFalse(sro.is_governed_bridge_path(path))
@@ -215,6 +225,16 @@ class BridgeSourceIdentityTest(unittest.TestCase):
             "src/core/new_part.inc",
             "tests/js/new_fixture.mjs",
             "tests/new_build_input.mjs",
+            # Only tests/release/ is exempt as a whole.
+            "tests/releases/new_fixture.mjs",
+            "scripts/release/contract.mjs",
+            "scripts/release/errors.mjs",
+            "scripts/release/json.mjs",
+            "scripts/release/cli.mjs",
+            "scripts/release/manifest.mjs",
+            "scripts/release/python_compat.mjs",
+            "scripts/release/unlisted.mjs",
+            "scripts/build/verify_emscripten_version.mjs",
             "unknown/new-build-input.cfg",
         ):
             with self.subTest(path=path):
