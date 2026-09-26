@@ -359,10 +359,10 @@ strategy. The other keys are optional; omitted ones keep llama.cpp's defaults:
 
 | Key | Description |
 | --- | --- |
-| `draftTokenMax` | Maximum draft tokens per step, an integer from `0`. `draft-*` strategies use it or 3, `ngram-simple`/`ngram-map-k`/`ngram-map-k4v` use `ngramSizeM` or 48, `ngram-mod` uses `ngramTokenMax`, then it, then 64, and `ngram-cache` uses it or 8. The largest applies; 0 becomes 64. |
+| `draftTokenMax` | Maximum draft tokens per step, an integer from `0`. `draft-*` strategies use it or 3, `ngram-simple`/`ngram-map-k`/`ngram-map-k4v` use `ngramSizeM` or 48, `ngram-mod` uses `ngramTokenMax`, then it, then 64, and `ngram-cache` uses it or 8. The largest applies; 0 becomes 64. The resolved value must not exceed the context size. |
 | `draftTokenMin`, `minProbability`, `draftSplitProbability` | Draft-model minimum length, minimum token probability and split probability. They need a `draft-*` strategy. |
 | `ngramSizeN`, `ngramSizeM`, `ngramMinHits` | Lookup size, draft size and minimum hits of `ngram-simple`, `ngram-map-k` and `ngram-map-k4v`, from `1` to `65535`. |
-| `ngramMatch`, `ngramTokenMin`, `ngramTokenMax` | Lookup length and draft length bounds of `ngram-mod`. `ngramTokenMax` defaults to `draftTokenMax`. |
+| `ngramMatch`, `ngramTokenMin`, `ngramTokenMax` | Lookup length (`1` to `65535`) and draft length bounds of `ngram-mod`. `ngramTokenMax` defaults to `draftTokenMax` and must not exceed the context size. |
 | `ngramCacheStatic`, `ngramCacheDynamic` | `ngram-cache` files as a URL string, `ArrayBuffer` or typed array. The dynamic cache is read, never written back. A malformed file rejects. |
 
 The rules are those of native llamadart's `SpeculativeDecodingConfig`, and an

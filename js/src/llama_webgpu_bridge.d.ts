@@ -154,7 +154,7 @@ export type NgramCacheSource = string | ArrayBuffer | ArrayBufferView;
 export interface SpeculativeDecodingOptions {
   /** Strategies to combine: any n-gram strategies plus at most one `draft-*` strategy. */
   strategies: readonly SpeculativeDecodingStrategy[];
-  /** Maximum draft tokens per step, from 0, resolved as native llamadart resolves it: `draft-*` strategies use this or 3, `ngram-simple`/`ngram-map-k`/`ngram-map-k4v` use `ngramSizeM` or 48, `ngram-mod` uses `ngramTokenMax`, then this, then 64, and `ngram-cache` uses this or 8. The largest applies; 0 becomes 64. */
+  /** Maximum draft tokens per step, from 0, resolved as native llamadart resolves it: `draft-*` strategies use this or 3, `ngram-simple`/`ngram-map-k`/`ngram-map-k4v` use `ngramSizeM` or 48, `ngram-mod` uses `ngramTokenMax`, then this, then 64, and `ngram-cache` uses this or 8. The largest applies; 0 becomes 64. The resolved value must not exceed the context size. */
   draftTokenMax?: number;
   /** Minimum draft tokens a draft model must propose, from 0 to the resolved `draftTokenMax`. Needs a `draft-*` strategy. */
   draftTokenMin?: number;
@@ -168,11 +168,11 @@ export interface SpeculativeDecodingOptions {
   ngramSizeM?: number;
   /** Minimum lookup hits before `ngram-map-k`/`ngram-map-k4v` propose an m-gram, from 1 to 65535. */
   ngramMinHits?: number;
-  /** Lookup length for `ngram-mod`, from 1. */
+  /** Lookup length for `ngram-mod`, from 1 to 65535. */
   ngramMatch?: number;
   /** Minimum draft length for `ngram-mod`, from 0. */
   ngramTokenMin?: number;
-  /** Maximum draft length for `ngram-mod`, from 0; defaults to `draftTokenMax` when `ngram-mod` is enabled. */
+  /** Maximum draft length for `ngram-mod`, from 0 to the context size; defaults to `draftTokenMax` when `ngram-mod` is enabled. */
   ngramTokenMax?: number;
   /** Static n-gram cache for `ngram-cache`. */
   ngramCacheStatic?: NgramCacheSource;

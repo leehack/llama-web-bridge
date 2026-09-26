@@ -197,7 +197,7 @@ function speculativeDecoding(
   const ngramSizeN = speculativeInteger(config, 'ngramSizeN', 1, MAX_NGRAM_SIZE);
   const ngramSizeM = speculativeInteger(config, 'ngramSizeM', 1, MAX_NGRAM_SIZE);
   const ngramMinHits = speculativeInteger(config, 'ngramMinHits', 1, MAX_NGRAM_SIZE);
-  const ngramMatch = speculativeInteger(config, 'ngramMatch', 1, MAX_INT32);
+  const ngramMatch = speculativeInteger(config, 'ngramMatch', 1, MAX_NGRAM_SIZE);
   const ngramTokenMin = speculativeInteger(config, 'ngramTokenMin', 0, MAX_INT32);
   const ngramTokenMax = speculativeInteger(config, 'ngramTokenMax', 0, MAX_INT32);
   const ngramCacheStatic = ngramCacheSource(config, 'ngramCacheStatic');

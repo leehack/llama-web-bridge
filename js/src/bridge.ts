@@ -2005,6 +2005,18 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
       delete workerOptions.onUsage;
       delete workerOptions.signal;
       delete workerOptions.__llamadartEmptyRetryAttempted;
+      const speculative = options.speculativeDecoding;
+      if (speculative != null && typeof speculative === 'object' && !Array.isArray(speculative)) {
+        // The worker resolves relative URLs against its own script URL.
+        const resolveCache = (source: unknown) => (
+          typeof source === 'string' && source.length > 0 ? normalizeAbsoluteUrl(source) : source
+        );
+        workerOptions.speculativeDecoding = {
+          ...speculative,
+          ngramCacheStatic: resolveCache(speculative.ngramCacheStatic),
+          ngramCacheDynamic: resolveCache(speculative.ngramCacheDynamic),
+        } as typeof speculative;
+      }
 
       const stallTimeoutMs = this._workerCompletionStallTimeoutMs(options);
       let timeoutHandle: ReturnType<typeof setTimeout> | null = null;

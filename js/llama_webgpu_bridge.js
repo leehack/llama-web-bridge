@@ -157,7 +157,7 @@ function speculativeDecoding(value, conflicts) {
   const ngramSizeN = speculativeInteger(config, "ngramSizeN", 1, MAX_NGRAM_SIZE);
   const ngramSizeM = speculativeInteger(config, "ngramSizeM", 1, MAX_NGRAM_SIZE);
   const ngramMinHits = speculativeInteger(config, "ngramMinHits", 1, MAX_NGRAM_SIZE);
-  const ngramMatch = speculativeInteger(config, "ngramMatch", 1, MAX_INT32);
+  const ngramMatch = speculativeInteger(config, "ngramMatch", 1, MAX_NGRAM_SIZE);
   const ngramTokenMin = speculativeInteger(config, "ngramTokenMin", 0, MAX_INT32);
   const ngramTokenMax = speculativeInteger(config, "ngramTokenMax", 0, MAX_INT32);
   const ngramCacheStatic = ngramCacheSource(config, "ngramCacheStatic");
@@ -6261,6 +6261,15 @@ var LlamaWebGpuBridge = class {
       delete workerOptions.onUsage;
       delete workerOptions.signal;
       delete workerOptions.__llamadartEmptyRetryAttempted;
+      const speculative = options.speculativeDecoding;
+      if (speculative != null && typeof speculative === "object" && !Array.isArray(speculative)) {
+        const resolveCache = (source) => typeof source === "string" && source.length > 0 ? normalizeAbsoluteUrl(source) : source;
+        workerOptions.speculativeDecoding = {
+          ...speculative,
+          ngramCacheStatic: resolveCache(speculative.ngramCacheStatic),
+          ngramCacheDynamic: resolveCache(speculative.ngramCacheDynamic)
+        };
+      }
       const stallTimeoutMs = this._workerCompletionStallTimeoutMs(options);
       let timeoutHandle = null;
       let rejectOnStall = null;

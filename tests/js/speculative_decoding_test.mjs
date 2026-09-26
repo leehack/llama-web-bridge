@@ -119,6 +119,7 @@ const CASES = [
       [{ strategies: ['draft-simple'], minProbability: 1.5 }, RangeError, /minProbability must be a number from 0 to 1/],
       [{ strategies: ['draft-simple'], draftSplitProbability: Number.NaN }, RangeError, /draftSplitProbability/],
       [{ strategies: ['ngram-simple'], ngramSizeN: 65536 }, RangeError, /ngramSizeN must be an integer from 1 to 65535/],
+      [{ strategies: ['ngram-mod'], ngramMatch: 65536 }, RangeError, /ngramMatch must be an integer from 1 to 65535/],
       [{ strategies: ['ngram-mod'], ngramTokenMin: 9, ngramTokenMax: 8 }, RangeError, /ngramTokenMin \(9\) must not exceed ngramTokenMax \(8\)/],
       [{ strategies: ['draft-simple'], draftTokenMin: 4 }, RangeError, /draftTokenMin \(4\) must not exceed the draft token maximum \(3\)/],
       [{ strategies: ['ngram-cache'], ngramCacheStatic: 3 }, TypeError, /ngramCacheStatic must be a URL string/],
@@ -290,6 +291,18 @@ const CASES = [
     });
     assert.equal(calls[0][0], 'createCompletion');
     assert.deepEqual([...calls[0][1][1].speculativeDecoding.ngramCacheStatic], [1, 2, 3]);
+
+    globalThis.window = { location: { href: 'https://app.example/page/index.html' } };
+    try {
+      await bridge.createCompletion('hello', {
+        speculativeDecoding: { strategies: ['ngram-cache'], ngramCacheStatic: 'caches/a.lcs', ngramCacheDynamic: '/b.lcs' },
+      });
+    } finally {
+      delete globalThis.window;
+    }
+    const forwarded = calls[1][1][1].speculativeDecoding;
+    assert.equal(forwarded.ngramCacheStatic, 'https://app.example/page/caches/a.lcs', 'relative to the page, not the worker');
+    assert.equal(forwarded.ngramCacheDynamic, 'https://app.example/b.lcs');
   }],
 
   ['a worker draft load sends an absolute URL, forwards progress and is remembered until the model changes', async () => {
@@ -496,6 +509,10 @@ const CASES = [
     const firstSideEffect = body.indexOf('end_generation_state();');
     assert.ok(consume >= 0 && consume < activeCheck, 'a rejected begin still consumes the request');
     assert.ok(validate > 0 && validate < firstSideEffect);
+    const validation = functionBody('bool validate_speculative_request(');
+    assert.match(validation, /request\.draft_n_max > n_ctx \|\| request\.ngram_n_max > n_ctx/,
+      'upstream allocates draft buffers of these sizes and aborts on bad_alloc');
+    assert.match(validation, /!is_ngram_size\(request\.ngram_match\)/, 'upstream narrows ngram_match to uint16_t');
     const draftLoad = functionBody('EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_draft_model_load(');
     assert.ok(
       draftLoad.indexOf('if (g_draft_model_architecture == "dflash") {')

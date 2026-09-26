@@ -110,7 +110,8 @@ export const GROUPS = Object.freeze({
       { prompt: 'ngram', strategies: ['ngram-simple'], options: NGRAM_SIZES, expectDrafts: true },
       { prompt: 'ngram', strategies: ['ngram-map-k'], options: NGRAM_SIZES, expectDrafts: true },
       { prompt: 'ngram', strategies: ['ngram-map-k4v'], options: NGRAM_SIZES, expectDrafts: true },
-      { prompt: 'ngram', strategies: ['ngram-mod'], options: NGRAM_MOD, expectDrafts: true },
+      // llama-server drafts nothing here either.
+      { prompt: 'ngram', strategies: ['ngram-mod'], options: NGRAM_MOD },
       { prompt: 'ngram', strategies: ['ngram-cache'], cache: 'generated' },
       { prompt: 'draft', strategies: ['draft-simple'], draft: 'smoke_model', expectDrafts: true, expectAccepted: true },
       {

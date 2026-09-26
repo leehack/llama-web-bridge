@@ -196,6 +196,13 @@ bool validate_speculative_request(
     set_error("speculative draft token limits are out of range");
     return false;
   }
+  const int64_t n_ctx = llama_n_ctx(g_state.ctx);
+  if (request.draft_n_max > n_ctx || request.ngram_n_max > n_ctx) {
+    set_error(
+        "speculative draft token limits exceed the context size of " +
+        std::to_string(n_ctx) + " tokens");
+    return false;
+  }
   const auto is_probability = [](const float value) {
     return value == -1.0f || (value >= 0.0f && value <= 1.0f);
   };
@@ -208,7 +215,8 @@ bool validate_speculative_request(
   };
   if (!is_ngram_size(request.ngram_size_n) ||
       !is_ngram_size(request.ngram_size_m) ||
-      !is_ngram_size(request.ngram_min_hits) || request.ngram_match < 0 ||
+      !is_ngram_size(request.ngram_min_hits) ||
+      !is_ngram_size(request.ngram_match) ||
       request.ngram_n_min < -1 || request.ngram_n_max < 0 ||
       (request.ngram_n_min >= 0 && request.ngram_n_max > 0 &&
        request.ngram_n_min > request.ngram_n_max)) {
