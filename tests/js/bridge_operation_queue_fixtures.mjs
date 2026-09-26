@@ -147,6 +147,7 @@ export function createStubCore(scripts = {}) {
     beginRejections: 0,
     activePrompt: null,
     lastOutput: '',
+    usage: { promptTokens: 0, cachedPromptTokens: 0, completionTokens: 0 },
     lastTokensJson: '[]',
     lastDetokenized: '',
     lastEmbeddingJson: '[]',
@@ -176,6 +177,7 @@ export function createStubCore(scripts = {}) {
           core.trace.push(['begin', args[0]]);
           core.activePrompt = args[0];
           core.lastOutput = '';
+          core.usage = { promptTokens: tokensFor(args[0]).length, cachedPromptTokens: 0, completionTokens: 0 };
           core.pending = [...(core.scripts[args[0]] || [])];
           return 0;
         }
@@ -194,11 +196,16 @@ export function createStubCore(scripts = {}) {
             return -1;
           }
           core.lastOutput += piece;
+          core.usage.completionTokens += 1;
           return 1;
         }
 
         case 'llamadart_webgpu_last_output':
           return core.lastOutput;
+
+        case 'llamadart_webgpu_last_generation_usage_json':
+          core.trace.push(['usage', null]);
+          return JSON.stringify(core.usage);
 
         case 'llamadart_webgpu_end_generation':
           core.trace.push(['end', core.activePrompt]);

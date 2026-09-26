@@ -11,6 +11,7 @@ import {
 import type { WorkerRequest } from './worker_protocol.ts';
 import type {
   CompletionOptions,
+  CompletionUsage,
   DecisionHeadOptions,
   DecisionSequence,
   LoadModelOptions,
@@ -91,6 +92,10 @@ export function installBridgeWorkerHost() {
         const prompt = args[0] as string;
         const options: CompletionOptions = (args[1] && typeof args[1] === 'object') ? { ...args[1] } : {};
         delete options.signal;
+        let usage = null as CompletionUsage | null;
+        options.onUsage = (value: CompletionUsage) => {
+          usage = value;
+        };
         const tokenEventEncoding = typeof options.tokenEventEncoding === 'string'
           ? String(options.tokenEventEncoding || '').toLowerCase()
           : 'bytes';
@@ -277,6 +282,9 @@ export function installBridgeWorkerHost() {
           flushTokenPayload();
         }
         flushTokenTextPayload();
+        if (usage != null) {
+          self.postMessage({ type: 'event', id, event: 'usage', payload: usage });
+        }
         self.postMessage({ type: 'result', id, value, state: snapshotBridgeState(bridge) });
         return;
       }

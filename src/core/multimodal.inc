@@ -62,7 +62,7 @@ std::string normalize_media_markers(const std::string & prompt, const size_t med
   return marker_block + "\n" + normalized;
 }
 
-bool decode_multimodal_prompt(const std::string & prompt) {
+bool decode_multimodal_prompt(const std::string & prompt, llama_pos * n_past) {
   if (g_state.mm_ctx == nullptr) {
     set_error(
         "Multimodal projector is not loaded. Call loadMultimodalProjector first.");
@@ -140,5 +140,6 @@ bool decode_multimodal_prompt(const std::string & prompt) {
     return false;
   }
 
+  *n_past = new_n_past;
   return true;
 }
