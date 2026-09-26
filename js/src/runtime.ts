@@ -53,6 +53,7 @@ import type { ProgressCallback } from './internal/download.ts';
 import type { ModelSource } from './internal/model_source.ts';
 import type { CcallArgType, LlamaCoreModule, LogMethod } from './internal/types.ts';
 import type {
+  CompletionFinishReason,
   CompletionOptions,
   DecisionCapabilities,
   DecisionHeadInfo,
@@ -3268,6 +3269,8 @@ export class LlamaWebGpuBridgeRuntime {
     }
 
     this._abortRequested = false;
+    const startedAt = performance.now();
+    let firstTokenAt: number | null = null;
 
     let nPredict = Number(options.nPredict) > 0 ? Number(options.nPredict) : 256;
     const hasMediaParts = Array.isArray(options.parts) && options.parts.length > 0;
@@ -3337,9 +3340,11 @@ export class LlamaWebGpuBridgeRuntime {
       const yieldInterval = 4;
       let streamed = '';
       let emittedStableText = '';
+      let finishReason: CompletionFinishReason = 'length';
 
       while (generated < nPredict) {
         if (this._abortRequested || options.signal?.aborted) {
+          finishReason = 'cancelled';
           break;
         }
 
@@ -3353,6 +3358,9 @@ export class LlamaWebGpuBridgeRuntime {
           ),
         );
         if (stepRc === 0) {
+          finishReason = this._abortRequested || options.signal?.aborted
+            ? 'cancelled'
+            : 'stop';
           break;
         }
 
@@ -3406,6 +3414,7 @@ export class LlamaWebGpuBridgeRuntime {
           continue;
         }
         emittedStableText = stableText;
+        firstTokenAt ??= performance.now();
 
         if (typeof options.onToken === 'function') {
           const piecePayload = emitTokenText
@@ -3420,16 +3429,30 @@ export class LlamaWebGpuBridgeRuntime {
       }
 
       const text = this._core!.ccall('llamadart_webgpu_last_output', 'string', [], []) || streamed || '';
-      if (typeof options.onToken === 'function') {
-        const tailText = text.startsWith(emittedStableText)
-          ? text.slice(emittedStableText.length)
-          : '';
-        if (tailText.length > 0) {
+      const tailText = text.startsWith(emittedStableText)
+        ? text.slice(emittedStableText.length)
+        : '';
+      if (tailText.length > 0) {
+        firstTokenAt ??= performance.now();
+        if (typeof options.onToken === 'function') {
           const piecePayload = emitTokenText
             ? tailText
             : textEncoder.encode(tailText);
           options.onToken(piecePayload, shouldEmitCurrentText ? text : null);
         }
+      }
+      if (typeof options.onUsage === 'function') {
+        const counts = JSON.parse(
+          this._core!.ccall('llamadart_webgpu_last_generation_usage_json', 'string', [], []) || '{}',
+        );
+        options.onUsage({
+          promptTokens: Number(counts?.promptTokens) || 0,
+          cachedPromptTokens: Number(counts?.cachedPromptTokens) || 0,
+          completionTokens: Number(counts?.completionTokens) || 0,
+          timeToFirstTokenMs: firstTokenAt == null ? null : firstTokenAt - startedAt,
+          durationMs: performance.now() - startedAt,
+          finishReason,
+        });
       }
       return text;
     } finally {

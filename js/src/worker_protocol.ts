@@ -12,7 +12,7 @@ export interface BridgeStateSnapshot {
   supportsAudio: boolean;
 }
 
-// A message from the worker host: a result, an error, or a progress/token event.
+// A message from the worker host: a result, an error, or a progress, token or usage event.
 export interface WorkerResponse {
   type: string;
   id?: number;

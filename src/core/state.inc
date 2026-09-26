@@ -40,6 +40,11 @@ std::string g_backend_json = "[]";
 std::string g_model_meta_json = "{}";
 bool g_model_uses_gpu_ops = false;
 std::vector<llama_token> g_cached_prompt_tokens;
+// Token counts of the latest generation, reset when it begins.
+int32_t g_usage_prompt_tokens = 0;
+int32_t g_usage_cached_prompt_tokens = 0;
+int32_t g_usage_completion_tokens = 0;
+std::string g_generation_usage_json = "{}";
 bool g_model_is_qwen3_asr = false;
 bool g_generation_has_qwen3_asr_audio = false;
 bool g_qwen3_asr_prefix_seed_attempted = false;

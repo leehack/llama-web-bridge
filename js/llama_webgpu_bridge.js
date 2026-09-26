@@ -3320,6 +3320,8 @@ var LlamaWebGpuBridgeRuntime = class {
       throw new Error("No model loaded. Call loadModelFromUrl first.");
     }
     this._abortRequested = false;
+    const startedAt = performance.now();
+    let firstTokenAt = null;
     let nPredict = Number(options.nPredict) > 0 ? Number(options.nPredict) : 256;
     const hasMediaParts = Array.isArray(options.parts) && options.parts.length > 0;
     if (hasMediaParts) {
@@ -3370,8 +3372,10 @@ var LlamaWebGpuBridgeRuntime = class {
       const yieldInterval = 4;
       let streamed = "";
       let emittedStableText = "";
+      let finishReason = "length";
       while (generated < nPredict) {
         if (this._abortRequested || options.signal?.aborted) {
+          finishReason = "cancelled";
           break;
         }
         const stepRc = Number(
@@ -3384,6 +3388,7 @@ var LlamaWebGpuBridgeRuntime = class {
           )
         );
         if (stepRc === 0) {
+          finishReason = this._abortRequested || options.signal?.aborted ? "cancelled" : "stop";
           break;
         }
         if (stepRc < 0) {
@@ -3428,6 +3433,7 @@ var LlamaWebGpuBridgeRuntime = class {
           continue;
         }
         emittedStableText = stableText;
+        firstTokenAt ??= performance.now();
         if (typeof options.onToken === "function") {
           const piecePayload = emitTokenText ? deltaText : textEncoder.encode(deltaText);
           options.onToken(piecePayload, shouldEmitCurrentText ? fullText : null);
@@ -3437,12 +3443,26 @@ var LlamaWebGpuBridgeRuntime = class {
         }
       }
       const text = this._core.ccall("llamadart_webgpu_last_output", "string", [], []) || streamed || "";
-      if (typeof options.onToken === "function") {
-        const tailText = text.startsWith(emittedStableText) ? text.slice(emittedStableText.length) : "";
-        if (tailText.length > 0) {
+      const tailText = text.startsWith(emittedStableText) ? text.slice(emittedStableText.length) : "";
+      if (tailText.length > 0) {
+        firstTokenAt ??= performance.now();
+        if (typeof options.onToken === "function") {
           const piecePayload = emitTokenText ? tailText : textEncoder.encode(tailText);
           options.onToken(piecePayload, shouldEmitCurrentText ? text : null);
         }
+      }
+      if (typeof options.onUsage === "function") {
+        const counts = JSON.parse(
+          this._core.ccall("llamadart_webgpu_last_generation_usage_json", "string", [], []) || "{}"
+        );
+        options.onUsage({
+          promptTokens: Number(counts?.promptTokens) || 0,
+          cachedPromptTokens: Number(counts?.cachedPromptTokens) || 0,
+          completionTokens: Number(counts?.completionTokens) || 0,
+          timeToFirstTokenMs: firstTokenAt == null ? null : firstTokenAt - startedAt,
+          durationMs: performance.now() - startedAt,
+          finishReason
+        });
       }
       return text;
     } finally {
@@ -5178,7 +5198,7 @@ var LlamaWebGpuBridge = class {
       this._recordWorkerGeneration(operation, proxy);
     }
     const guardedEvent = typeof onEvent === "function" ? (event) => {
-      if (!operation || this._isOperationCallbackCurrent(operation, proxy)) {
+      if (!operation || this._isOperationCallbackCurrent(operation, proxy) || event.event === "usage" && proxy === this._workerProxy) {
         onEvent(event);
       }
     } : void 0;
@@ -5352,14 +5372,43 @@ var LlamaWebGpuBridge = class {
     }
   }
   async createCompletion(prompt, options = {}) {
-    return this._runExclusive(
-      () => this._createCompletionUnlocked(prompt, options),
-      {
-        signal: options?.signal,
-        abortMessage: "Generation was cancelled.",
-        kind: "generation"
+    const onUsage = options?.onUsage;
+    if (typeof onUsage !== "function") {
+      return this._runExclusive(
+        () => this._createCompletionUnlocked(prompt, options),
+        {
+          signal: options?.signal,
+          abortMessage: "Generation was cancelled.",
+          kind: "generation"
+        }
+      );
+    }
+    let usage = null;
+    let text;
+    try {
+      text = await this._runExclusive(
+        () => this._createCompletionUnlocked(prompt, {
+          ...options,
+          onUsage: (value) => {
+            usage = value;
+          }
+        }),
+        {
+          signal: options.signal,
+          abortMessage: "Generation was cancelled.",
+          kind: "generation"
+        }
+      );
+    } catch (error) {
+      if (usage != null && error?.name === "AbortError") {
+        onUsage(usage);
       }
-    );
+      throw error;
+    }
+    if (usage != null) {
+      onUsage(usage);
+    }
+    return text;
   }
   async _createCompletionUnlocked(prompt, options = {}) {
     const isWarmup = options?.warmup === true;
@@ -5406,6 +5455,7 @@ var LlamaWebGpuBridge = class {
       await this._restoreWorkerModelIfMissing();
       const workerOptions = { ...options };
       delete workerOptions.onToken;
+      delete workerOptions.onUsage;
       delete workerOptions.signal;
       delete workerOptions.__llamadartEmptyRetryAttempted;
       const stallTimeoutMs = this._workerCompletionStallTimeoutMs(options);
@@ -5442,6 +5492,12 @@ var LlamaWebGpuBridge = class {
             "createCompletion",
             [prompt, workerOptions],
             (event) => {
+              if (event.event === "usage") {
+                if (typeof options.onUsage === "function") {
+                  options.onUsage(event.payload);
+                }
+                return;
+              }
               if (event.event !== "token") {
                 return;
               }
@@ -6290,6 +6346,10 @@ function installBridgeWorkerHost() {
         const prompt = args[0];
         const options = args[1] && typeof args[1] === "object" ? { ...args[1] } : {};
         delete options.signal;
+        let usage = null;
+        options.onUsage = (value3) => {
+          usage = value3;
+        };
         const tokenEventEncoding = typeof options.tokenEventEncoding === "string" ? String(options.tokenEventEncoding || "").toLowerCase() : "bytes";
         const flushMsRaw = Number(options.tokenEventFlushMs);
         const tokenEventFlushMs = Number.isFinite(flushMsRaw) && flushMsRaw >= 0 ? Math.max(0, Math.min(200, Math.trunc(flushMsRaw))) : 0;
@@ -6441,6 +6501,9 @@ function installBridgeWorkerHost() {
           flushTokenPayload();
         }
         flushTokenTextPayload();
+        if (usage != null) {
+          self.postMessage({ type: "event", id, event: "usage", payload: usage });
+        }
         self.postMessage({ type: "result", id, value: value2, state: snapshotBridgeState(bridge) });
         return;
       }

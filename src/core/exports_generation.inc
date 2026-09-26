@@ -82,6 +82,16 @@ EMSCRIPTEN_KEEPALIVE const char * llamadart_webgpu_last_output() {
   return g_last_output.c_str();
 }
 
+EMSCRIPTEN_KEEPALIVE const char * llamadart_webgpu_last_generation_usage_json() {
+  g_generation_usage_json =
+      "{\"promptTokens\":" + std::to_string(g_usage_prompt_tokens) +
+      ",\"cachedPromptTokens\":" +
+      std::to_string(g_usage_cached_prompt_tokens) +
+      ",\"completionTokens\":" +
+      std::to_string(g_usage_completion_tokens) + "}";
+  return g_generation_usage_json.c_str();
+}
+
 EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_get_context_size() {
   if (g_state.ctx == nullptr) {
     return 0;

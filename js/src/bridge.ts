@@ -19,6 +19,7 @@ import type { LogMethod } from './internal/types.ts';
 import type {
   BridgeProgressEvent,
   CompletionOptions,
+  CompletionUsage,
   DecisionCapabilities,
   DecisionHeadInfo,
   DecisionHeadOptions,
@@ -1590,9 +1591,15 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
     if (operation) {
       this._recordWorkerGeneration(operation, proxy);
     }
+    // A cancelled operation still runs until its worker call returns, so the
+    // usage of its cancelled generation is accepted from the proxy that ran it.
     const guardedEvent = typeof onEvent === 'function'
       ? (event: WorkerResponse) => {
-        if (!operation || this._isOperationCallbackCurrent(operation, proxy)) {
+        if (
+          !operation
+          || this._isOperationCallbackCurrent(operation, proxy)
+          || (event.event === 'usage' && proxy === this._workerProxy)
+        ) {
           onEvent(event);
         }
       }
@@ -1798,14 +1805,44 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
   }
 
   async createCompletion(prompt: string, options: CompletionOptions = {}) {
-    return this._runExclusive(
-      () => this._createCompletionUnlocked(prompt, options),
-      {
-        signal: options?.signal,
-        abortMessage: 'Generation was cancelled.',
-        kind: 'generation',
-      },
-    );
+    const onUsage = options?.onUsage;
+    if (typeof onUsage !== 'function') {
+      return this._runExclusive(
+        () => this._createCompletionUnlocked(prompt, options),
+        {
+          signal: options?.signal,
+          abortMessage: 'Generation was cancelled.',
+          kind: 'generation',
+        },
+      );
+    }
+
+    let usage = null as CompletionUsage | null;
+    let text: string;
+    try {
+      text = await this._runExclusive(
+        () => this._createCompletionUnlocked(prompt, {
+          ...options,
+          onUsage: (value: CompletionUsage) => {
+            usage = value;
+          },
+        }),
+        {
+          signal: options.signal,
+          abortMessage: 'Generation was cancelled.',
+          kind: 'generation',
+        },
+      );
+    } catch (error) {
+      if (usage != null && (error as Error | null)?.name === 'AbortError') {
+        onUsage(usage);
+      }
+      throw error;
+    }
+    if (usage != null) {
+      onUsage(usage);
+    }
+    return text;
   }
 
   async _createCompletionUnlocked(
@@ -1866,6 +1903,7 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
       await this._restoreWorkerModelIfMissing();
       const workerOptions = { ...options };
       delete workerOptions.onToken;
+      delete workerOptions.onUsage;
       delete workerOptions.signal;
       delete workerOptions.__llamadartEmptyRetryAttempted;
 
@@ -1910,6 +1948,13 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
             'createCompletion',
             [prompt, workerOptions],
             (event) => {
+              if (event.event === 'usage') {
+                if (typeof options.onUsage === 'function') {
+                  options.onUsage(event.payload as CompletionUsage);
+                }
+                return;
+              }
+
               if (event.event !== 'token') {
                 return;
               }

@@ -172,6 +172,26 @@ def write_harness(web_root: Path, model_filename: str | None) -> None:
       && left.length === right.length
       && left.every((value, index) => value === right[index])
   );
+  const assertCompletionUsage = (usages, promptTokens, label) => {{
+    assert(usages.length === 1, `${{label}} reported usage ${{usages.length}} times`);
+    const [usage] = usages;
+    assert(usage.promptTokens === promptTokens, `${{label}} reported ${{usage.promptTokens}} prompt tokens, expected ${{promptTokens}}`);
+    assert(
+      Number.isInteger(usage.cachedPromptTokens) && usage.cachedPromptTokens >= 0 && usage.cachedPromptTokens < promptTokens,
+      `${{label}} reported ${{usage.cachedPromptTokens}} cached prompt tokens`,
+    );
+    assert(usage.completionTokens >= 0 && usage.completionTokens <= 1, `${{label}} reported ${{usage.completionTokens}} completion tokens`);
+    assert(
+      usage.finishReason === (usage.completionTokens === 1 ? 'length' : 'stop'),
+      `${{label}} finished with ${{usage.finishReason}} after ${{usage.completionTokens}} tokens`,
+    );
+    assert(Number.isFinite(usage.durationMs) && usage.durationMs >= 0, `${{label}} reported duration ${{usage.durationMs}}`);
+    assert(
+      usage.timeToFirstTokenMs === null
+        || (usage.timeToFirstTokenMs >= 0 && usage.timeToFirstTokenMs <= usage.durationMs),
+      `${{label}} reported time to first token ${{usage.timeToFirstTokenMs}}`,
+    );
+  }};
   try {{
     if (!window.crossOriginIsolated) {{
       throw new Error('test page is not cross-origin isolated');
@@ -238,6 +258,7 @@ def write_harness(web_root: Path, model_filename: str | None) -> None:
       )), `${{mode}} embedding batch contained invalid vectors`);
       assert(arraysEqual(embeddingBatch[0], embedding), `${{mode}} batch embedding differed from the single embedding`);
 
+      const usages = [];
       const firstText = await bridge.createCompletion(prompt, {{
         nPredict: 1,
         temp: 0,
@@ -245,8 +266,11 @@ def write_harness(web_root: Path, model_filename: str | None) -> None:
         topP: 1,
         seed: 1,
         tokenEventEncoding: 'text',
+        onUsage: (usage) => usages.push(usage),
       }});
       assert(typeof firstText === 'string', `${{mode}} initial completion did not return text`);
+      assertCompletionUsage(usages, tokens.length, `${{mode}} initial completion`);
+      const initialUsage = usages[0];
 
       const snapshot = await bridge.stateSaveBytes(tokens);
       assert(snapshot instanceof Uint8Array, `${{mode}} stateSaveBytes did not return Uint8Array`);
@@ -278,6 +302,7 @@ def write_harness(web_root: Path, model_filename: str | None) -> None:
 
       assert(restored && arraysEqual(restored.tokens, tokens), `${{mode}} restored tokens did not match saved prompt tokens`);
 
+      usages.length = 0;
       const afterRestoreText = await bridge.createCompletion(prompt, {{
         nPredict: 1,
         temp: 0,
@@ -285,8 +310,75 @@ def write_harness(web_root: Path, model_filename: str | None) -> None:
         topP: 1,
         seed: 3,
         tokenEventEncoding: 'text',
+        onUsage: (usage) => usages.push(usage),
       }});
       assert(typeof afterRestoreText === 'string', `${{mode}} completion after state restore did not return text`);
+      assertCompletionUsage(usages, tokens.length, `${{mode}} completion after state restore`);
+      assert(
+        usages[0].cachedPromptTokens === tokens.length - 1,
+        `${{mode}} completion after state restore reused ${{usages[0].cachedPromptTokens}} of ${{tokens.length}} prompt tokens`,
+      );
+      const restoredUsage = usages[0];
+
+      // A repeated prompt keeps all but its last token.
+      const longPrompt = 'The quick brown fox jumps over the lazy dog';
+      const longTokens = await bridge.tokenize(longPrompt, true);
+      const longOptions = {{
+        nPredict: 1,
+        temp: 0,
+        topK: 1,
+        topP: 1,
+        seed: 5,
+        tokenEventEncoding: 'text',
+        onUsage: (usage) => usages.push(usage),
+      }};
+      usages.length = 0;
+      await bridge.createCompletion(longPrompt, longOptions);
+      await bridge.createCompletion(longPrompt, longOptions);
+      assert(usages.length === 2, `${{mode}} repeated prompt reported usage ${{usages.length}} times`);
+      assert(
+        usages.every((usage) => usage.promptTokens === longTokens.length),
+        `${{mode}} repeated prompt reported ${{usages.map((usage) => usage.promptTokens)}} prompt tokens, expected ${{longTokens.length}}`,
+      );
+      assert(
+        longTokens.length > 2 && usages[1].cachedPromptTokens === longTokens.length - 1,
+        `${{mode}} repeated prompt reused ${{usages[1].cachedPromptTokens}} of ${{longTokens.length}} prompt tokens`,
+      );
+      const repeatedUsage = usages[1];
+
+      // Stop sequences abort the signal mid-generation: the direct runtime
+      // resolves with the partial text, worker mode rejects, and both report
+      // the cancelled generation's usage.
+      usages.length = 0;
+      const abortController = new AbortController();
+      let abortOutcome;
+      try {{
+        await bridge.createCompletion(prompt, {{
+          nPredict: 8,
+          temp: 0,
+          topK: 1,
+          topP: 1,
+          seed: 4,
+          tokenEventEncoding: 'text',
+          signal: abortController.signal,
+          onToken: () => abortController.abort(),
+          onUsage: (usage) => usages.push(usage),
+        }});
+        abortOutcome = 'resolved';
+      }} catch (error) {{
+        abortOutcome = error?.name === 'AbortError' ? 'rejected' : `failed: ${{error}}`;
+      }}
+      assert(
+        abortOutcome === (mode === 'worker runtime' ? 'rejected' : 'resolved'),
+        `${{mode}} aborted completion ${{abortOutcome}}`,
+      );
+      assert(usages.length === 1, `${{mode}} aborted completion reported usage ${{usages.length}} times`);
+      assert(usages[0].finishReason === 'cancelled', `${{mode}} aborted completion finished with ${{usages[0].finishReason}}`);
+      assert(
+        usages[0].completionTokens >= 1 && usages[0].completionTokens < 8,
+        `${{mode}} aborted completion reported ${{usages[0].completionTokens}} completion tokens`,
+      );
+      const abortedUsage = usages[0];
 
       // A second load replaces the model in place. WASMFS analyzePath('/models')
       // used to throw a bare "FS error" here, which restarted the worker.
@@ -314,6 +406,11 @@ def write_harness(web_root: Path, model_filename: str | None) -> None:
         embeddingBatchSize: embeddingBatch.length,
         savedBytes: snapshot.byteLength,
         restoredTokens: restored.tokens.length,
+        initialUsage,
+        restoredUsage,
+        repeatedUsage,
+        abortOutcome,
+        abortedUsage,
         detachedAfterLoadTransfer,
         workerSaveSnapshotReturned,
       }};

@@ -114,11 +114,13 @@ llama_token sample_next_token() {
 
 // Decodes prompt_tokens into sequence 0, keeping the longest prefix shared
 // with the previous prompt when reuse_prefix is true. At least one token is
-// decoded, so the last position always has logits. Returns false after
-// decode_tokens() records the error.
+// decoded, so the last position always has logits. Sets *reused_tokens, when
+// given, to the number of leading tokens kept rather than decoded. Returns
+// false after decode_tokens() records the error.
 bool evaluate_prompt_tokens(
     const std::vector<llama_token> & prompt_tokens,
-    const bool reuse_prefix) {
+    const bool reuse_prefix,
+    size_t * reused_tokens = nullptr) {
   size_t prefix = 0;
   if (reuse_prefix) {
     const size_t max_prefix =
@@ -158,6 +160,9 @@ bool evaluate_prompt_tokens(
   }
 
   g_cached_prompt_tokens = prompt_tokens;
+  if (reused_tokens != nullptr) {
+    *reused_tokens = prefix;
+  }
   return true;
 }
 
@@ -180,6 +185,9 @@ int32_t begin_generation_impl(
   clear_error();
   g_last_output.clear();
   g_last_piece.clear();
+  g_usage_prompt_tokens = 0;
+  g_usage_cached_prompt_tokens = 0;
+  g_usage_completion_tokens = 0;
 
   if (!ensure_loaded()) {
     return -1;
@@ -241,18 +249,23 @@ int32_t begin_generation_impl(
     llama_memory_clear(llama_get_memory(g_state.ctx), false);
     g_cached_prompt_tokens.clear();
 
-    if (!decode_multimodal_prompt(prompt_text)) {
+    llama_pos n_past = 0;
+    if (!decode_multimodal_prompt(prompt_text, &n_past)) {
       return -3;
     }
+    g_usage_prompt_tokens = static_cast<int32_t>(n_past);
   } else {
     std::vector<llama_token> prompt_tokens;
     if (!tokenize_text(prompt_text, true, prompt_tokens)) {
       return -3;
     }
 
-    if (!evaluate_prompt_tokens(prompt_tokens, true)) {
+    size_t reused_tokens = 0;
+    if (!evaluate_prompt_tokens(prompt_tokens, true, &reused_tokens)) {
       return -4;
     }
+    g_usage_prompt_tokens = static_cast<int32_t>(prompt_tokens.size());
+    g_usage_cached_prompt_tokens = static_cast<int32_t>(reused_tokens);
   }
 
   g_active_sampler =
@@ -322,6 +335,7 @@ int32_t next_token_impl() {
     g_last_piece = is_prefix_token ? "" : token_to_piece(token, true);
     if (!is_prefix_token) {
       g_last_output += g_last_piece;
+      g_usage_completion_tokens++;
     }
 
     llama_token token_for_decode = token;

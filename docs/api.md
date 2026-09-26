@@ -269,6 +269,7 @@ Common `options` keys:
 | `penalty` | Repetition penalty. Defaults to `1.1`. |
 | `grammar` | Optional llama.cpp GBNF grammar with a `root` rule. An invalid grammar rejects before generation starts with an error containing `(invalid grammar)`; worker mode rethrows it without falling back to the main thread. Each rejection leaks the partly parsed grammar (a few KiB at most for typical grammars), so validate generated grammars before sending them in a loop. |
 | `seed` | Integer seed; random when omitted. |
+| `onUsage(usage)` | Called at most once, with the `CompletionUsage` of the last attempt whose generation returned, before the promise resolves or rejects with an `AbortError`. Not called when no generation returned: other rejections, a skipped multimodal warmup, or a worker failure after a cancel. |
 | `onToken(piece, currentText)` | Token callback. By default `piece` is a `Uint8Array` containing stable UTF-8 bytes. Direct runtime mode provides the current full text by default; worker mode provides `''` unless `emitCurrentTextOnToken: true` is set. |
 | `signal` | `AbortSignal`; aborting cancels this operation and rejects with `AbortError`. |
 | `warmup` | Marks a warmup generation. Some multimodal worker setup failures return an empty string instead of failing warmup. |
@@ -280,6 +281,25 @@ Common `options` keys:
 | `mediaMaxPredict` | Cap for multimodal generation token count. |
 
 Call `cancel()` or abort the supplied signal to request a best-effort stop.
+
+`CompletionUsage` fields:
+
+| Field | Description |
+| --- | --- |
+| `promptTokens` | Prompt tokens in the context when generation started, including `cachedPromptTokens`. For a multimodal prompt, the context positions it filled. |
+| `cachedPromptTokens` | Leading prompt tokens kept from the previous prompt or a loaded state instead of being evaluated again; `0` for a multimodal prompt. |
+| `completionTokens` | Generated tokens in the returned text. The end-of-generation token is not counted. |
+| `timeToFirstTokenMs` | Milliseconds from the runtime starting the completion to its first streamed text, or `null` when it streamed none. |
+| `durationMs` | Milliseconds from the runtime starting the completion to its end. |
+| `finishReason` | `stop` at an end-of-generation token, `length` at `nPredict` or the context limit, `cancelled` after `cancel()` or an abort during generation. |
+
+Both times are measured by the runtime that generates, inside the worker in
+worker mode. They include staging media and evaluating the prompt, and exclude
+time queued behind another operation. After an internal retry or main-thread
+fallback, the usage is that of the last attempt whose generation returned. In
+worker mode an abort during generation rejects the promise, while the direct
+runtime resolves it with the partial text; in both, `onUsage` reports the
+cancelled generation once it returns.
 
 ## Tokenization and chat templates
 

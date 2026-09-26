@@ -77,8 +77,29 @@ export type CompletionAudioPart = {
 
 export type CompletionMediaPart = CompletionImagePart | CompletionAudioPart;
 
+/** Why a completion stopped. */
+export type CompletionFinishReason = 'stop' | 'length' | 'cancelled';
+
+/** Token counts and timings of one completion. */
+export interface CompletionUsage {
+  /** Prompt tokens in the context when generation started, including `cachedPromptTokens`; context positions for a multimodal prompt. */
+  promptTokens: number;
+  /** Leading prompt tokens kept from the previous prompt or a loaded state instead of being evaluated again; 0 for a multimodal prompt. */
+  cachedPromptTokens: number;
+  /** Generated tokens in the returned text; the end-of-generation token is not counted. */
+  completionTokens: number;
+  /** Milliseconds from the runtime starting the completion to its first streamed text; null when it streamed none. */
+  timeToFirstTokenMs: number | null;
+  /** Milliseconds from the runtime starting the completion to its end. */
+  durationMs: number;
+  /** `stop` at an end-of-generation token, `length` at `nPredict` or the context limit, `cancelled` after `cancel()` or an abort. */
+  finishReason: CompletionFinishReason;
+}
+
 export interface CompletionOptions {
   onToken?: (piece: string | Uint8Array, currentText: string | null) => void;
+  /** Called at most once, with the usage of the last attempt whose generation returned, before `createCompletion` resolves or rejects with an `AbortError`. Not called when no generation returned: other rejections, a skipped multimodal warmup, or a worker failure after a cancel. */
+  onUsage?: (usage: CompletionUsage) => void;
   signal?: AbortSignal;
   warmup?: boolean;
   emitCurrentTextOnToken?: boolean;

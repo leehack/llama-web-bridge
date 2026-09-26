@@ -100,6 +100,15 @@ try {
       );
       return '🙂';
     }
+    if (prompt === 'usage-order') {
+      options.onToken(encoder.encode('ab'), 'ab');
+      options.onUsage({ promptTokens: 3, completionTokens: 1 });
+      return 'ab';
+    }
+    if (prompt === 'usage-then-error') {
+      options.onUsage({ promptTokens: 3, completionTokens: 1 });
+      throw new Error('expected generation failure');
+    }
     throw new Error(`Unexpected prompt: ${prompt}`);
   };
 
@@ -288,6 +297,31 @@ try {
   ]);
   assert.equal(decoder.decode(boundaryBytes), '🙂');
   assert.equal(boundaryMessages[1].payload.currentText, '🙂');
+
+  await globalThis.self.onmessage({
+    data: {
+      type: 'call',
+      id: 10,
+      method: 'createCompletion',
+      args: ['usage-order', {
+        tokenEventEncoding: 'bytes',
+        tokenEventFlushMs: 100,
+        tokenEventFlushChars: 100,
+      }],
+    },
+  });
+  const usageMessages = messagesFor(10);
+  assert.deepEqual(
+    usageMessages.map(({ type, event }) => event ?? type),
+    ['token', 'usage', 'result'],
+    'usage follows the flushed tokens and precedes the result',
+  );
+  assert.deepEqual(usageMessages[1].payload, { promptTokens: 3, completionTokens: 1 });
+
+  await globalThis.self.onmessage({
+    data: { type: 'call', id: 11, method: 'createCompletion', args: ['usage-then-error', {}] },
+  });
+  assert.deepEqual(messagesFor(11).map(({ type }) => type), ['error'], 'a failed completion posts no usage');
 } finally {
   globalThis.self = originalSelf;
   LlamaWebGpuBridge.prototype.createCompletion = originalCreateCompletion;
