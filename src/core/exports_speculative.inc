@@ -94,6 +94,17 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_draft_model_load(const char * path
           model, "general.architecture", architecture, sizeof(architecture)) < 0) {
     architecture[0] = '\0';
   }
+  const int64_t draft_hidden_size = draft_target_hidden_size(model, architecture);
+  const int64_t target_hidden_size = llama_model_n_embd(g_state.model);
+  if (draft_hidden_size >= 0 && draft_hidden_size != target_hidden_size) {
+    llama_model_free(model);
+    set_error(
+        std::string("The ") + architecture +
+        " draft model reads target hidden states of size " +
+        std::to_string(draft_hidden_size) + ", but the loaded model's hidden size is " +
+        std::to_string(target_hidden_size));
+    return -5;
+  }
   g_draft_model = model;
   g_draft_model_architecture = architecture;
   // common_speculative_types_from_gguf asserts on a non-DFlash GGUF without

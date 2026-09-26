@@ -146,7 +146,13 @@ export const GROUPS = Object.freeze({
         expectAccepted: true,
       },
     ],
-    rejections: [],
+    rejections: [
+      {
+        label: 'a DSpark draft for a wider target',
+        draft: 'dspark_qwen3_5_0_8b',
+        error: "reads target hidden states of size 1024, but the loaded model's hidden size is 960",
+      },
+    ],
   },
   eagle3: {
     target: 'qwen3_0_6b',
@@ -203,6 +209,9 @@ export function groupFiles(group) {
   for (const run of group.runs) {
     if (run.draft) keys.add(run.draft);
     if (run.cache && FILES[run.cache]) keys.add(run.cache);
+  }
+  for (const rejection of group.rejections) {
+    if (rejection.draft) keys.add(rejection.draft);
   }
   return [...keys];
 }
@@ -346,7 +355,11 @@ export function renderHarness(groups, nCtx, memoryModes, runtimeModes, gpuLayers
           }
           let error = null;
           try {
-            await complete(bridge, config.prompts.draft, speculativeDecoding);
+            if (rejection.draft) {
+              await bridge.loadDraftModel('/' + rejection.draft, { useCache: false });
+            } else {
+              await complete(bridge, config.prompts.draft, speculativeDecoding);
+            }
           } catch (caught) {
             error = errorText(caught);
           }

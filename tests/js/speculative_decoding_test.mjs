@@ -433,6 +433,39 @@ const CASES = [
     assert.deepEqual(bridge._loadedDraftModel, { url: 'https://example.invalid/models/draft.gguf', options: { useCache: false } });
   }],
 
+  ['an EAGLE3 or DFlash draft for another hidden size is rejected at load', async () => {
+    const load = functionBody('EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_draft_model_load(');
+    const gate = load.indexOf('if (draft_hidden_size >= 0 && draft_hidden_size != target_hidden_size) {');
+    assert.ok(gate > 0 && gate < load.indexOf('g_draft_model = model;'), 'the draft is never kept');
+    assert.match(load.slice(gate), /^[^}]*llama_model_free\(model\);[^}]*return -5;/);
+    const width = functionBody('int64_t draft_target_hidden_size(');
+    assert.match(width, /architecture == "dflash"\) \{\s*return llama_model_n_embd\(draft_model\);/);
+    assert.match(width, /"eagle3\.target_hidden_size"/);
+    assert.ok(
+      smoke.GROUPS.smollm2.rejections.some((rejection) => rejection.draft && /hidden size is 960/.test(rejection.error)),
+      'the smoke loads a 1024-wide draft for the 960-wide SmolLM2 target',
+    );
+
+    const { bridge, core } = directBridge();
+    const runtime = bridge._runtime;
+    const message = "The dflash draft model reads target hidden states of size 1024, but the loaded model's hidden size is 960";
+    const ccall = core.ccall;
+    core.ccall = (name, returnType, argTypes, args, ...rest) => {
+      if (name === 'llamadart_webgpu_heap_headroom_bytes') return 1 << 30;
+      if (name === 'llamadart_webgpu_draft_model_free') return 0;
+      if (name === 'llamadart_webgpu_draft_model_load') return Promise.resolve(-5);
+      if (name === 'llamadart_webgpu_last_error') return message;
+      return ccall(name, returnType, argTypes, args, ...rest);
+    };
+    runtime._getCachedModelResponse = async () => new Response(new Uint8Array(16), { headers: { 'content-length': '16' } });
+    await assert.rejects(
+      bridge.loadDraftModel('https://example.invalid/draft.gguf'),
+      (error) => error.message === `Failed to load draft model: ${message}`,
+    );
+    assert.equal(runtime._draftModel, null);
+    assert.equal(bridge._loadedDraftModel, null);
+  }],
+
   ['the browser smoke covers every strategy with pinned files and fails a mismatch', () => {
     const covered = new Set(Object.values(smoke.GROUPS).flatMap((group) => group.runs.flatMap((run) => run.strategies)));
     assert.deepEqual([...covered].sort(), [...SPECULATIVE_DECODING_STRATEGIES].sort());

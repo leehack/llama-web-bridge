@@ -34,6 +34,27 @@ bool target_has_mtp_head() {
       llama_model_n_layer_nextn(g_state.model) > 0;
 }
 
+// Width of each target hidden state an EAGLE3 or DFlash draft reads: EAGLE3
+// stores the target's hidden size, and DFlash uses its own. -1 for other
+// architectures. llama.cpp does not check it against the target and reads
+// past the hidden states when they differ.
+int64_t draft_target_hidden_size(
+    const llama_model * draft_model,
+    const std::string & architecture) {
+  if (architecture == "dflash") {
+    return llama_model_n_embd(draft_model);
+  }
+  if (architecture != "eagle3") {
+    return -1;
+  }
+  char value[32] = {0};
+  if (llama_model_meta_val_str(
+          draft_model, "eagle3.target_hidden_size", value, sizeof(value)) < 0) {
+    return 0;
+  }
+  return std::strtoll(value, nullptr, 10);
+}
+
 // Upstream enables extraction of these target layers, and llama.cpp asserts
 // that each is at most the target's layer count.
 bool draft_layer_ids_fit_target(const llama_model * draft_model) {

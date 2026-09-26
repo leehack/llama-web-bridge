@@ -393,7 +393,9 @@ Downloads a draft GGUF and loads it with the target model's load settings,
 replacing any draft. `options` takes `progressCallback`, `signal`, `useCache`
 and `force`, as `loadModelFromUrl()` does. Resolves to `{ architecture,
 strategy? }`: the GGUF's `general.architecture`, and `draft-dflash` or
-`draft-dspark` for a DFlash-architecture draft. A target model load unloads the
+`draft-dspark` for a DFlash-architecture draft. An EAGLE3 or DFlash draft built
+for a different hidden size than the loaded model's rejects, naming both sizes.
+A target model load unloads the
 draft; the bridge reloads it after it reloads the target on its own, such as
 after a worker restart, and warns and forgets it when that reload fails.
 
