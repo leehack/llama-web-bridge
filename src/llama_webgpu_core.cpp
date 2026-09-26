@@ -16,16 +16,22 @@
 
 #include <unistd.h>
 
+#include <malloc.h>
+
 #include <emscripten/emscripten.h>
+#include <emscripten/heap.h>
 #include <emscripten/threading.h>
 #include <emscripten/wasmfs.h>
 
 #include "ggml-backend.h"
 #include "llama-cpp.h"
+#include "llama-ext.h"
 #include "llama.h"
 #include "mtmd-helper.h"
 #include "mtmd.h"
+#include "ngram-cache.h"
 #include "reasoning-budget.h"
+#include "speculative.h"
 
 #include "llama_webgpu_decision.h"
 #include "llama_webgpu_embedding_json.h"
@@ -33,6 +39,7 @@
 #include "llama_webgpu_lora.h"
 #include "llama_webgpu_mtmd_compat.h"
 #include "llama_webgpu_next_token_scores.h"
+#include "llama_webgpu_speculative.h"
 #include "llama_webgpu_tts.h"
 
 namespace {
@@ -46,6 +53,8 @@ namespace {
 #include "core/tokens.inc"
 
 #include "core/multimodal.inc"
+
+#include "core/speculative.inc"
 
 #include "core/generation.inc"
 
@@ -66,6 +75,8 @@ extern "C" {
 #include "core/exports_context.inc"
 
 #include "core/exports_generation.inc"
+
+#include "core/exports_speculative.inc"
 
 #include "core/exports_tts.inc"
 

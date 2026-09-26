@@ -148,6 +148,7 @@ const INVALID_SAMPLER_OPTIONS = Object.freeze([
   { minP: -0.1 },
   { presencePenalty: Number.POSITIVE_INFINITY },
 ]);
+// speculative_browser_smoke.mjs checks the speculativeDecoding capabilities.
 export const COMPLETION_CAPABILITIES = Object.freeze(['presencePenalty', 'minP', 'thinkingBudget']);
 // Each tag follows a space: SentencePiece vocabularies tokenize a tag at the
 // start of text with a space prefix, so only a spaced tag in the prompt
@@ -206,6 +207,7 @@ export function renderHarness(nCtx, memoryModes) {
     samplerRuns: SAMPLER_RUNS,
     thinkingRuns: THINKING_RUNS,
     invalidThinkingBudget: INVALID_THINKING_BUDGET,
+    completionCapabilities: COMPLETION_CAPABILITIES,
     nCtx,
     memoryModes,
     runtimeModes: RUNTIME_MODES,
@@ -255,6 +257,9 @@ export function renderHarness(nCtx, memoryModes) {
     const LlamaWebGpuBridge = module.LlamaWebGpuBridge || window.LlamaWebGpuBridge;
     assert(typeof LlamaWebGpuBridge === 'function', 'LlamaWebGpuBridge export was not registered');
     const config = ${config};
+    const samplerCapabilities = (capabilities) => Object.fromEntries(
+      config.completionCapabilities.map((name) => [name, capabilities[name]]),
+    );
     const modeResults = [];
 
     const runMode = async (memoryMode, runtimeMode) => {
@@ -270,7 +275,7 @@ export function renderHarness(nCtx, memoryModes) {
       const samplerRuns = {};
       const invalidSamplerErrors = [];
       try {
-        const capabilitiesBeforeLoad = await bridge.getCompletionCapabilities();
+        const capabilitiesBeforeLoad = samplerCapabilities(await bridge.getCompletionCapabilities());
         await bridge.loadModelFromUrl(config.modelUrl, {
           nCtx: config.nCtx,
           nThreads: 2,
@@ -319,7 +324,7 @@ export function renderHarness(nCtx, memoryModes) {
           plainError = errorText(caught);
         }
 
-        const capabilitiesAfterLoad = await bridge.getCompletionCapabilities();
+        const capabilitiesAfterLoad = samplerCapabilities(await bridge.getCompletionCapabilities());
         for (const [name, options] of config.samplerRuns) {
           samplerRuns[name] = await bridge.createCompletion(config.samplerPrompt, {
             ...options,

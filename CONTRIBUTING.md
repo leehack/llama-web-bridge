@@ -188,6 +188,21 @@ node scripts/next_token_scores_browser_smoke.mjs \
   --artifacts-dir /tmp/llama-web-bridge-next-token-scores-smoke
 ```
 
+For speculative decoding changes, run greedy completions with and without each
+strategy through direct and worker runtimes on both memory modes. The `tiny`
+group runs the n-gram strategies and `draft-simple` on the state-persistence
+model; `--group all` adds real-weight groups for every strategy, read from
+`--models-dir` at the paths in the script's `FILES` table. The EAGLE3 and DFlash
+drafts and the n-gram cache have no download URL, so place them there first:
+
+```bash
+node scripts/speculative_browser_smoke.mjs \
+  --dist-dir /private/tmp/llama_web_bridge_dist \
+  --group all \
+  --models-dir ~/.cache/llama-web-bridge/speculative-smoke-models \
+  --artifacts-dir /tmp/llama-web-bridge-speculative-smoke
+```
+
 Heavy Qwen3-ASR and Qwen3-TTS gates run in the hosted automated
 qualification workflow, not in ordinary CI or the candidate build. Before
 publishing, `.github/workflows/bridge_qualification.yml` runs them against the

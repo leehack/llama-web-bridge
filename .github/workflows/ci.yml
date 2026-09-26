@@ -82,6 +82,7 @@ jobs:
       LLAMA_WEBGPU_SMOKE_ARTIFACTS_DIR: /tmp/state-persistence-smoke-artifacts
       LLAMA_WEBGPU_GRAMMAR_ARTIFACTS_DIR: /tmp/grammar-smoke-artifacts
       LLAMA_WEBGPU_NEXT_TOKEN_SCORES_ARTIFACTS_DIR: /tmp/next-token-scores-smoke-artifacts
+      LLAMA_WEBGPU_SPECULATIVE_ARTIFACTS_DIR: /tmp/speculative-smoke-artifacts
       LLAMA_WEBGPU_MULTIMODAL_MODEL_URL: https://huggingface.co/unsloth/Qwen3.5-0.8B-GGUF/resolve/main/Qwen3.5-0.8B-Q4_K_M.gguf
       LLAMA_WEBGPU_MULTIMODAL_MODEL_SHA256: bd258782e35f7f458f8aced1adc053e6e92e89bc735ba3be89d38a06121dc517
       LLAMA_WEBGPU_MULTIMODAL_MMPROJ_URL: https://huggingface.co/unsloth/Qwen3.5-0.8B-GGUF/resolve/main/mmproj-F16.gguf
@@ -251,6 +252,11 @@ jobs:
           BRIDGE_DIST_DIR: ${{ runner.temp }}/webgpu_bridge_dist
         run: node scripts/next_token_scores_browser_smoke.mjs
 
+      - name: Run speculative decoding browser smoke
+        env:
+          BRIDGE_DIST_DIR: ${{ runner.temp }}/webgpu_bridge_dist
+        run: node scripts/speculative_browser_smoke.mjs --group tiny
+
       - name: Upload state persistence smoke diagnostics
         if: failure()
         uses: actions/upload-artifact@v4
@@ -281,6 +287,14 @@ jobs:
         with:
           name: next-token-scores-smoke-artifacts
           path: ${{ env.LLAMA_WEBGPU_NEXT_TOKEN_SCORES_ARTIFACTS_DIR }}
+          if-no-files-found: ignore
+
+      - name: Upload speculative decoding smoke diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: speculative-smoke-artifacts
+          path: ${{ env.LLAMA_WEBGPU_SPECULATIVE_ARTIFACTS_DIR }}
           if-no-files-found: ignore
 
       - name: Upload bridge artifacts

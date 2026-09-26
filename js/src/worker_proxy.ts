@@ -283,7 +283,7 @@ export class BridgeWorkerProxy {
       return Math.max(5000, Math.min(3600000, Math.trunc(value)));
     };
 
-    if (method === 'loadModelFromUrl') {
+    if (method === 'loadModelFromUrl' || method === 'loadDraftModel') {
       return clamp(Number(this._config.workerModelLoadTimeoutMs), clamp(explicitGlobal, 3 * 60 * 1000));
     }
 

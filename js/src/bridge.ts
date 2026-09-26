@@ -33,6 +33,8 @@ import type {
   DecisionHeadOptions,
   DecisionOutput,
   DecisionSequence,
+  DraftModelInfo,
+  DraftModelLoadOptions,
   EmbedOptions,
   LlamaWebGpuBridgeConfig,
   LoadModelOptions,
@@ -156,6 +158,13 @@ interface LoraAdapterEntry {
 // The runtime and worker LoRA calls that take only numbers.
 type LoraOwnerMethod = 'setLoraAdapter' | 'removeLoraAdapter' | 'clearLoraAdapters';
 
+// The draft model to reload after the facade reloads its target model: its
+// absolute URL and the cache options it was loaded with.
+interface RememberedDraftModel {
+  url: string;
+  options: { useCache?: boolean };
+}
+
 // A decision head download's progress, as `DecisionHeadOptions.onProgress` takes it.
 type DecisionHeadProgress = Parameters<NonNullable<DecisionHeadOptions['onProgress']>>[0];
 
@@ -182,6 +191,7 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
   declare _loadedModelUrl: ModelSource | null;
   declare _loadedModelOptions: LoadModelOptions | null;
   declare _loadedMmProjUrl: string | null;
+  declare _loadedDraftModel: RememberedDraftModel | null;
   declare _multimodalWorkerCpuMode: boolean;
   declare _workerModelMissing: boolean;
   declare _bridgeWarnRecent: Map<string, number>;
@@ -224,6 +234,7 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
     this._loadedModelUrl = null;
     this._loadedModelOptions = null;
     this._loadedMmProjUrl = null;
+    this._loadedDraftModel = null;
     this._multimodalWorkerCpuMode = false;
     // True while the current worker is a replacement that has not yet loaded
     // _loadedModelUrl. A replacement worker always starts without a model.
@@ -820,6 +831,7 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
     this._loadedModelOptions = this._sanitizeModelLoadOptions(options);
     this._loadedMmProjUrl = null;
     this._forgetLoraAdapters();
+    this._loadedDraftModel = null;
     this._multimodalWorkerCpuMode = this._workerProxy != null;
     this._workerModelMissing = false;
     if (this._activeOperation) {
@@ -834,6 +846,7 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
     this._loadedModelOptions = null;
     this._loadedMmProjUrl = null;
     this._forgetLoraAdapters();
+    this._loadedDraftModel = null;
     this._multimodalWorkerCpuMode = false;
     this._workerModelMissing = false;
   }
@@ -1032,6 +1045,15 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
     if (typeof this._loadedMmProjUrl === 'string' && this._loadedMmProjUrl.length > 0) {
       await this._callWorker('loadMultimodalProjector', [this._loadedMmProjUrl]);
     }
+    const draft = this._loadedDraftModel;
+    if (draft) {
+      try {
+        await this._callWorker('loadDraftModel', [draft.url, draft.options]);
+      } catch (error) {
+        this._throwIfOperationCancelled(error, 'Draft model reload was cancelled.');
+        this._forgetDraftModelAfterReloadFailure(error);
+      }
+    }
     this._throwIfDisposed();
     await this._restoreLoraAdapters();
     this._throwIfDisposed();
@@ -1209,6 +1231,7 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
         && !forceReloadRequested
         && !shouldUseCpuMultimodalFallback
       ) {
+        await this._ensureRuntimeDraftModel();
         if (shouldEnsureMultimodalInRuntime) {
           const runtimeSupportsMedia =
             (typeof this._runtime.supportsVision === 'function' && this._runtime.supportsVision())
@@ -1289,6 +1312,7 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
       }
       await this._restoreLoraAdapters();
       this._throwIfDisposed();
+      await this._ensureRuntimeDraftModel();
     } catch (error) {
       if (this._disposed || this._lifecycleState === 'disposing') {
         throw new Error(BRIDGE_DISPOSED_MESSAGE);
@@ -1321,6 +1345,7 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
       this._loadedModelOptions = null;
       this._loadedMmProjUrl = null;
       this._forgetLoraAdapters();
+      this._loadedDraftModel = null;
       if (!this._disposed && this._lifecycleState === 'open' && !this._workerProxy) {
         this._runtime = this._createRuntime();
         operation?.runtimes?.add(this._runtime);
@@ -1980,6 +2005,18 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
       delete workerOptions.onUsage;
       delete workerOptions.signal;
       delete workerOptions.__llamadartEmptyRetryAttempted;
+      const speculative = options.speculativeDecoding;
+      if (speculative != null && typeof speculative === 'object' && !Array.isArray(speculative)) {
+        // The worker resolves relative URLs against its own script URL.
+        const resolveCache = (source: unknown) => (
+          typeof source === 'string' && source.length > 0 ? normalizeAbsoluteUrl(source) : source
+        );
+        workerOptions.speculativeDecoding = {
+          ...speculative,
+          ngramCacheStatic: resolveCache(speculative.ngramCacheStatic),
+          ngramCacheDynamic: resolveCache(speculative.ngramCacheDynamic),
+        } as typeof speculative;
+      }
 
       const stallTimeoutMs = this._workerCompletionStallTimeoutMs(options);
       let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
@@ -2226,6 +2263,126 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
       this._supportsVision = this._runtime!.supportsVision();
       this._supportsAudio = this._runtime!.supportsAudio();
       return result;
+    }
+  }
+
+  // Loads the remembered draft model into the direct runtime when that
+  // runtime does not hold it.
+  async _ensureRuntimeDraftModel() {
+    const draft = this._loadedDraftModel;
+    const runtime = this._runtime;
+    if (!draft || !runtime || runtime._draftModel?.url === draft.url) {
+      return;
+    }
+    this._throwIfDisposed();
+    try {
+      await runtime.loadDraftModel(draft.url, {
+        ...draft.options,
+        signal: this._operationSignal() || undefined,
+      });
+    } catch (error) {
+      this._throwIfOperationCancelled(error, 'Draft model reload was cancelled.');
+      this._forgetDraftModelAfterReloadFailure(error);
+    }
+    this._throwIfDisposed();
+  }
+
+  // A reloaded target starts without its draft model. A failed draft reload
+  // leaves none, so draft-* strategies then reject until loadDraftModel runs.
+  _forgetDraftModelAfterReloadFailure(error: unknown) {
+    this._loadedDraftModel = null;
+    this._emitBridgeWarn(
+      `llamadart: draft model reload failed after the model was reloaded (${serializeWorkerError(error)}); `
+      + 'call loadDraftModel again.',
+    );
+  }
+
+  async loadDraftModel(url: string, options: DraftModelLoadOptions = {}): Promise<DraftModelInfo> {
+    return this._runExclusive(
+      () => this._loadDraftModelUnlocked(url, options),
+      {
+        signal: options?.signal,
+        abortMessage: 'Draft model load was cancelled.',
+        kind: 'draft-model-load',
+      },
+    );
+  }
+
+  async _loadDraftModelUnlocked(url: string, options: DraftModelLoadOptions = {}): Promise<DraftModelInfo> {
+    // The worker resolves relative URLs against its own script URL.
+    const absoluteUrl = typeof url === 'string' && url.length > 0 ? normalizeAbsoluteUrl(url) : url;
+    const remembered: RememberedDraftModel = {
+      url: absoluteUrl,
+      options: typeof options?.useCache === 'boolean' ? { useCache: options.useCache } : {},
+    };
+    const loadInRuntime = async () => {
+      this._loadedDraftModel = null;
+      const info = await this._runtime!.loadDraftModel(absoluteUrl, {
+        ...options,
+        signal: this._operationSignal() || options.signal || undefined,
+      });
+      this._loadedDraftModel = remembered;
+      return info;
+    };
+    if (!this._workerProxy) {
+      return loadInRuntime();
+    }
+
+    const workerOptions: DraftModelLoadOptions = { ...options };
+    delete workerOptions.progressCallback;
+    delete workerOptions.signal;
+    try {
+      await this._restoreWorkerModelIfMissing();
+      this._loadedDraftModel = null;
+      const info = await this._callWorker<DraftModelInfo>(
+        'loadDraftModel',
+        [absoluteUrl, workerOptions],
+        (event) => {
+          if (event.event === 'progress' && typeof options.progressCallback === 'function') {
+            options.progressCallback((event.payload || {}) as BridgeProgressEvent);
+          }
+        },
+      );
+      this._throwIfCallerCancelled('Draft model load was cancelled.');
+      this._loadedDraftModel = remembered;
+      return info;
+    } catch (error) {
+      this._throwIfOperationCancelled(error, 'Draft model load was cancelled.');
+      if (!this._isWorkerUnusableError(error)) {
+        throw error;
+      }
+      this._disableWorkerFallback(error);
+      await this._waitForWorkerDisposal();
+      await this._ensureRuntimeReadyAfterWorkerFallback({}, error);
+      return loadInRuntime();
+    }
+  }
+
+  async unloadDraftModel(): Promise<void> {
+    return this._runExclusive(
+      () => this._unloadDraftModelUnlocked(),
+      { kind: 'draft-model-unload' },
+    );
+  }
+
+  async _unloadDraftModelUnlocked(): Promise<void> {
+    if (!this._workerProxy) {
+      await this._runtime?.unloadDraftModel();
+      this._loadedDraftModel = null;
+      return;
+    }
+    try {
+      await this._callWorker('unloadDraftModel', []);
+      this._loadedDraftModel = null;
+    } catch (error) {
+      this._throwIfOperationCancelled(error, 'Draft model unload was cancelled.');
+      if (!this._isWorkerUnusableError(error)) {
+        throw error;
+      }
+      this._loadedDraftModel = null;
+      this._disableWorkerFallback(error);
+      await this._waitForWorkerDisposal();
+      await this._runtime?.unloadDraftModel();
     }
   }
 
@@ -3247,6 +3404,7 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
       this._loadedModelUrl = null;
       this._loadedModelOptions = null;
       this._loadedMmProjUrl = null;
+      this._loadedDraftModel = null;
       this._workerFallbackReason = null;
       this._multimodalWorkerCpuMode = false;
       this._workerModelMissing = false;

@@ -43,11 +43,14 @@ int32_t load_model_internal(
     double rope_freq_base,
     double rope_freq_scale,
     int32_t split_mode,
-    int32_t main_gpu) {
+    int32_t main_gpu,
+    bool load_mtp,
+    int32_t n_rs_seq) {
   llama_model_params mparams = llama_model_default_params();
   mparams.n_gpu_layers = n_gpu_layers;
   mparams.load_mode = resolve_load_mode(use_mmap, use_mlock);
   mparams.vocab_only = false;
+  mparams.load_mtp = load_mtp;
   if (split_mode >= LLAMA_SPLIT_MODE_NONE &&
       split_mode <= LLAMA_SPLIT_MODE_TENSOR) {
     mparams.split_mode = static_cast<llama_split_mode>(split_mode);
@@ -69,6 +72,10 @@ int32_t load_model_internal(
 
   if (n_seq_max > 0) {
     cparams.n_seq_max = static_cast<uint32_t>(n_seq_max);
+  }
+
+  if (n_rs_seq > 0) {
+    cparams.n_rs_seq = static_cast<uint32_t>(n_rs_seq);
   }
 
   if (n_threads > 0) {
@@ -133,6 +140,9 @@ int32_t load_model_internal(
 
   g_state.vocab = llama_model_get_vocab(g_state.model);
   g_state.n_ctx = llama_n_ctx(g_state.ctx);
+  g_model_params = mparams;
+  g_context_params = cparams;
+  g_model_loaded_mtp = load_mtp;
   llama_set_abort_callback(g_state.ctx, should_abort_callback, nullptr);
 
   rebuild_model_metadata_json();

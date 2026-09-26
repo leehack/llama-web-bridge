@@ -85,8 +85,42 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_begin_generation(
       thinking_forced_message);
 }
 
+// Strategy flags report what the loaded models can run: draft-mtp needs the
+// target's MTP head, and draft-model strategies a matching draft model.
 EMSCRIPTEN_KEEPALIVE const char * llamadart_webgpu_completion_capabilities_json() {
-  return "{\"presencePenalty\":true,\"minP\":true,\"thinkingBudget\":true}";
+  const bool has_draft = g_draft_model != nullptr && g_state.model != nullptr;
+  const bool is_dflash = g_draft_model_architecture == "dflash";
+  const bool fits = has_draft && draft_layer_ids_fit_target(g_draft_model);
+  const std::pair<const char *, bool> strategies[] = {
+      {"draft-simple",
+       has_draft && !is_dflash && g_draft_model_architecture != "eagle3" &&
+           !model_has_recurrent_state(g_draft_model)},
+      {"draft-eagle3", fits && g_draft_model_architecture == "eagle3"},
+      {"draft-mtp", target_has_mtp_head()},
+      {"draft-dflash",
+       fits && g_draft_model_block_type == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH},
+      {"draft-dspark",
+       fits && g_draft_model_block_type == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK},
+      {"ngram-simple", true},
+      {"ngram-map-k", true},
+      {"ngram-map-k4v", true},
+      {"ngram-mod", true},
+      {"ngram-cache", true},
+  };
+  g_completion_capabilities_json =
+      "{\"presencePenalty\":true,\"minP\":true,\"thinkingBudget\":true,"
+      "\"speculativeDecoding\":{";
+  bool first = true;
+  for (const auto & strategy : strategies) {
+    if (!first) {
+      g_completion_capabilities_json += ",";
+    }
+    first = false;
+    g_completion_capabilities_json += std::string("\"") + strategy.first +
+        "\":" + (strategy.second ? "true" : "false");
+  }
+  g_completion_capabilities_json += "}}";
+  return g_completion_capabilities_json.c_str();
 }
 
 EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_next_token() {
@@ -116,7 +150,21 @@ EMSCRIPTEN_KEEPALIVE const char * llamadart_webgpu_last_generation_usage_json() 
       ",\"cachedPromptTokens\":" +
       std::to_string(g_usage_cached_prompt_tokens) +
       ",\"completionTokens\":" +
-      std::to_string(g_usage_completion_tokens) + "}";
+      std::to_string(g_usage_completion_tokens);
+  if (g_speculative_usage.ran) {
+    g_generation_usage_json +=
+        ",\"speculative\":{\"draftTokens\":" +
+        std::to_string(g_speculative_usage.draft_tokens) +
+        ",\"acceptedDraftTokens\":" +
+        std::to_string(g_speculative_usage.accepted_draft_tokens) +
+        ",\"draftAttempts\":" +
+        std::to_string(g_speculative_usage.draft_attempts) +
+        ",\"verifyTokens\":" +
+        std::to_string(g_speculative_usage.verify_tokens) +
+        ",\"replayTokens\":" +
+        std::to_string(g_speculative_usage.replay_tokens) + "}";
+  }
+  g_generation_usage_json += "}";
   return g_generation_usage_json.c_str();
 }
 

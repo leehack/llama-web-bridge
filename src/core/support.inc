@@ -102,7 +102,54 @@ void ensure_backend_initialized() {
   apply_log_level_callback();
 }
 
+// Frees the speculative session and its draft context, and turns off the
+// target-context extraction that a draft implementation switched on.
+void free_speculative_session() {
+  speculative_session * session = g_speculative;
+  if (session == nullptr) {
+    return;
+  }
+  g_speculative = nullptr;
+
+  if (session->spec != nullptr) {
+    common_speculative_free(session->spec);
+  }
+  if (session->ctx_dft != nullptr) {
+    llama_free(session->ctx_dft);
+    if (g_state.ctx != nullptr) {
+      llama_set_embeddings_nextn(g_state.ctx, false, false);
+      if (session->draft_model != nullptr && g_state.model != nullptr) {
+        const int32_t * layer_ids = llama_model_target_layer_ids(session->draft_model);
+        const uint32_t n_layer_ids = llama_model_target_layer_ids_n(session->draft_model);
+        const int32_t n_layer = llama_model_n_layer(g_state.model);
+        for (uint32_t i = 0; i < n_layer_ids; ++i) {
+          if (layer_ids[i] >= 0 && layer_ids[i] <= n_layer) {
+            llama_set_embeddings_layer_inp(
+                g_state.ctx, static_cast<uint32_t>(layer_ids[i]), false);
+          }
+        }
+      }
+    }
+  }
+  if (session->batch.token != nullptr) {
+    llama_batch_free(session->batch);
+  }
+  delete session;
+}
+
+void free_draft_model() {
+  free_speculative_session();
+  if (g_draft_model != nullptr) {
+    llama_model_free(g_draft_model);
+    g_draft_model = nullptr;
+  }
+  g_draft_model_architecture.clear();
+  g_draft_model_block_type = COMMON_SPECULATIVE_TYPE_NONE;
+  g_draft_model_json = "{}";
+}
+
 void end_generation_state() {
+  free_speculative_session();
   g_active_reasoning_budget = nullptr;
   if (g_active_sampler != nullptr) {
     llama_sampler_free(g_active_sampler);
@@ -192,6 +239,8 @@ void free_runtime() {
   free_tts();
   // Heads hold contexts on the model, so they go before llama_model_free.
   free_decision_heads();
+  free_draft_model();
+  g_next_speculative = speculative_request();
 
   clear_pending_media();
 
@@ -224,6 +273,9 @@ void free_runtime() {
   g_last_next_token_scores_json = "{}";
   g_model_meta_json = "{}";
   g_model_uses_gpu_ops = false;
+  g_model_loaded_mtp = false;
+  g_model_params = llama_model_default_params();
+  g_context_params = llama_context_default_params();
   g_model_is_qwen3_asr = false;
   g_cached_prompt_tokens.clear();
 }

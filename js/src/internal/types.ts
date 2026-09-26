@@ -52,6 +52,13 @@ export interface LlamaCoreModule {
     returnType: null,
     argTypes: readonly CcallArgType[],
     args: readonly CcallArg[],
+    opts: { async: true },
+  ): Promise<void>;
+  ccall(
+    ident: string,
+    returnType: null,
+    argTypes: readonly CcallArgType[],
+    args: readonly CcallArg[],
   ): void;
   FS: LlamaCoreFs;
   HEAP8?: Int8Array;
