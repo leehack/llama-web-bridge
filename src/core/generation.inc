@@ -70,12 +70,14 @@ bool grammar_accepts_token(const llama_token token) {
   return single_token_array.data[0].logit != -INFINITY;
 }
 
-// Fills cur_p from the last logits and runs the samplers over it. Returns
-// false after set_error() when the logits are missing or nothing is selected.
+// Fills cur_p from the logits of batch_index (-1: the last output) and runs
+// the samplers over it. Returns false after set_error() when the logits are
+// missing or nothing is selected.
 bool apply_generation_samplers(
     const bool grammar_first,
-    llama_token_data_array & cur_p) {
-  const float * logits = llama_get_logits_ith(g_state.ctx, -1);
+    llama_token_data_array & cur_p,
+    const int32_t batch_index) {
+  const float * logits = llama_get_logits_ith(g_state.ctx, batch_index);
   if (logits == nullptr) {
     set_error("Failed to read logits for sampling");
     return false;
@@ -112,16 +114,16 @@ bool apply_generation_samplers(
 // grammar applied before truncation. Running the grammar after top-k/top-p
 // can leave only rejected tokens, and llama_grammar_accept on a rejected
 // token aborts the Wasm core. Returns LLAMA_TOKEN_NULL after set_error().
-llama_token sample_next_token() {
+llama_token sample_next_token(const int32_t batch_index = -1) {
   const bool use_grammar = grammar_is_active();
   llama_token_data_array cur_p = {};
-  if (!apply_generation_samplers(false, cur_p)) {
+  if (!apply_generation_samplers(false, cur_p, batch_index)) {
     return LLAMA_TOKEN_NULL;
   }
   llama_token token = cur_p.data[cur_p.selected].id;
 
   if (use_grammar && !grammar_accepts_token(token)) {
-    if (!apply_generation_samplers(true, cur_p)) {
+    if (!apply_generation_samplers(true, cur_p, batch_index)) {
       return LLAMA_TOKEN_NULL;
     }
     token = cur_p.data[cur_p.selected].id;
@@ -278,6 +280,9 @@ int32_t begin_generation_impl(
   // touching any shared state, so a stray second begin cannot destroy the
   // in-flight generation's output, sampler, or g_last_error. The caller maps
   // -7 to a fixed message instead of reading g_last_error.
+  // The speculative request belongs to this call, even a rejected one.
+  const speculative_request speculative = std::move(g_next_speculative);
+  g_next_speculative = speculative_request();
   if (g_generation_active) {
     return -7;
   }
@@ -288,6 +293,7 @@ int32_t begin_generation_impl(
   g_usage_prompt_tokens = 0;
   g_usage_cached_prompt_tokens = 0;
   g_usage_completion_tokens = 0;
+  g_speculative_usage = speculative_usage();
 
   if (!ensure_loaded()) {
     return -1;
@@ -346,6 +352,14 @@ int32_t begin_generation_impl(
     }
   }
 
+  if (speculative.active &&
+      !validate_speculative_request(
+          speculative,
+          grammar != nullptr && grammar[0] != '\0',
+          has_reasoning_budget)) {
+    return -2;
+  }
+
   end_generation_state();
 
   // Parse the grammar before the prompt touches the KV cache, so an invalid
@@ -382,6 +396,30 @@ int32_t begin_generation_impl(
       return -3;
     }
     g_usage_prompt_tokens = static_cast<int32_t>(n_past);
+  } else if (speculative.active) {
+    // As native llamadart does, speculative generation evaluates the whole
+    // prompt, so every draft state sees it.
+    llama_memory_clear(llama_get_memory(g_state.ctx), false);
+    g_cached_prompt_tokens.clear();
+
+    std::vector<llama_token> prompt_tokens;
+    if (!tokenize_text(prompt_text, true, prompt_tokens)) {
+      return -3;
+    }
+    if (prompt_tokens.empty()) {
+      set_error("Prompt produced no tokens");
+      return -3;
+    }
+    if (!begin_speculative_session(speculative)) {
+      return -5;
+    }
+    if (!evaluate_speculative_prompt(prompt_tokens)) {
+      free_speculative_session();
+      return -4;
+    }
+    g_cached_prompt_tokens = prompt_tokens;
+    g_usage_prompt_tokens = static_cast<int32_t>(prompt_tokens.size());
+    g_speculative_usage.ran = true;
   } else {
     std::vector<llama_token> prompt_tokens;
     if (!tokenize_text(prompt_text, true, prompt_tokens)) {
@@ -421,6 +459,7 @@ int32_t begin_generation_impl(
       seed,
       reasoning_budget_sampler.release());
   if (g_active_sampler == nullptr) {
+    free_speculative_session();
     set_error("Failed to initialize sampler chain");
     return -5;
   }
@@ -429,6 +468,252 @@ int32_t begin_generation_impl(
   g_active_grammar = grammar_sampler.release();
   g_generation_active = true;
   return 0;
+}
+
+// Decodes [id_last, draft...] at the end of the target memory and returns the
+// target's picks, as llama.cpp's common_sampler_sample_and_accept_n does: one
+// sample per position until a pick differs from the draft, plus one after a
+// fully accepted draft. Returns false after set_error(); *rc is the decode
+// result when decoding failed.
+bool verify_speculative_draft(
+    std::vector<llama_token> & accepted,
+    int32_t * rc) {
+  speculative_session & session = *g_speculative;
+  const llama_pos n_past = static_cast<llama_pos>(session.history.size());
+  common_batch_clear(session.batch);
+  common_batch_add(session.batch, session.id_last, n_past, {0}, true);
+  for (size_t i = 0; i < session.draft.size(); ++i) {
+    common_batch_add(
+        session.batch,
+        session.draft[i],
+        n_past + 1 + static_cast<llama_pos>(i),
+        {0},
+        true);
+  }
+  *rc = decode_speculative_batch();
+  if (*rc != 0) {
+    return false;
+  }
+  g_speculative_usage.verify_tokens += session.batch.n_tokens;
+
+  accepted.clear();
+  for (size_t i = 0; i <= session.draft.size(); ++i) {
+    const llama_token token = sample_next_token(static_cast<int32_t>(i));
+    if (token == LLAMA_TOKEN_NULL) {
+      return false;
+    }
+    accepted.push_back(token);
+    if (i < session.draft.size() && token != session.draft[i]) {
+      break;
+    }
+  }
+  return true;
+}
+
+// Drops the rejected draft tokens from the target memory. A recurrent target
+// without rollback snapshots restores the state saved before verification and
+// decodes the accepted tokens again, as native llamadart does. Returns false
+// after set_error(); *rc is the decode result when replaying failed.
+bool roll_back_speculative_target(
+    const std::vector<llama_token> & accepted,
+    int32_t * rc) {
+  speculative_session & session = *g_speculative;
+  const llama_pos n_past = static_cast<llama_pos>(session.history.size());
+  const llama_pos keep = n_past + static_cast<llama_pos>(accepted.size());
+  llama_memory_t memory = llama_get_memory(g_state.ctx);
+  if (llama_memory_seq_rm(memory, 0, keep, -1)) {
+    return true;
+  }
+  if (!session.needs_checkpoint || session.checkpoint.empty()) {
+    set_error(
+        "Speculative decoding could not roll back the target memory; reload "
+        "the model with speculativeRollbackTokenMax of at least the draft "
+        "length");
+    return false;
+  }
+  const size_t restored = llama_state_seq_set_data_ext(
+      g_state.ctx,
+      session.checkpoint.data(),
+      session.checkpoint.size(),
+      0,
+      LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+  if (restored != session.checkpoint.size() ||
+      !llama_memory_seq_rm(memory, 0, n_past, -1)) {
+    set_error("Speculative decoding could not restore the target state");
+    return false;
+  }
+
+  common_batch_clear(session.batch);
+  common_batch_add(session.batch, session.id_last, n_past, {0}, false);
+  for (size_t i = 0; i + 1 < accepted.size(); ++i) {
+    common_batch_add(
+        session.batch,
+        accepted[i],
+        n_past + 1 + static_cast<llama_pos>(i),
+        {0},
+        false);
+  }
+  *rc = decode_speculative_batch();
+  if (*rc != 0) {
+    return false;
+  }
+  g_speculative_usage.replay_tokens += session.batch.n_tokens;
+  return true;
+}
+
+// Samples at least one token into the session output: the first token after
+// the prompt, or id_last decoded with a verified draft. Returns 1, 0 when the
+// generation was cancelled, or a negative code after set_error().
+int32_t speculative_step() {
+  speculative_session & session = *g_speculative;
+  const auto decode_failure = [](const int32_t rc) -> int32_t {
+    if (rc == -100) {
+      return -4;
+    }
+    if (g_cancel_requested) {
+      return 0;
+    }
+    set_error("llama_decode failed while generating tokens");
+    return -4;
+  };
+
+  if (session.id_last == LLAMA_TOKEN_NULL) {
+    const llama_token token = sample_next_token();
+    if (token == LLAMA_TOKEN_NULL) {
+      return -3;
+    }
+    session.id_last = token;
+    session.output.push_back(token);
+    return 1;
+  }
+
+  const int32_t n_past = static_cast<int32_t>(session.history.size());
+  int32_t n_draft_max = std::min(
+      session.draft_max,
+      std::min(
+          static_cast<int32_t>(g_state.n_ctx) - n_past - 2,
+          session.batch_capacity - 1));
+  const int32_t n_rs_seq = static_cast<int32_t>(llama_n_rs_seq(g_state.ctx));
+  if (n_rs_seq > 0) {
+    n_draft_max = std::min(n_draft_max, n_rs_seq);
+  }
+  if (session.max_tokens > 0) {
+    n_draft_max = std::min(
+        n_draft_max,
+        session.max_tokens - static_cast<int32_t>(session.output.size()) - 1);
+  }
+
+  session.draft.clear();
+  if (n_draft_max > 0) {
+    g_speculative_usage.draft_attempts++;
+    common_speculative_get_draft_params(session.spec, 0) = {
+        /* .drafting = */ true,
+        /* .n_max    = */ n_draft_max,
+        /* .pos0     = */ n_past,
+        /* .id_last  = */ session.id_last,
+        /* .prompt   = */ &session.history,
+        /* .result   = */ &session.draft,
+    };
+    common_speculative_draft(session.spec);
+    if (session.ctx_dft != nullptr &&
+        !llama_memory_seq_rm(llama_get_memory(session.ctx_dft), 0, n_past, -1)) {
+      set_error("Speculative decoding could not roll back the draft context");
+      return -4;
+    }
+    // A draft vocabulary may be larger than the target's.
+    const int32_t n_vocab = llama_vocab_n_tokens(g_state.vocab);
+    for (size_t i = 0; i < session.draft.size(); ++i) {
+      if (session.draft[i] < 0 || session.draft[i] >= n_vocab) {
+        session.draft.resize(i);
+        break;
+      }
+    }
+    g_speculative_usage.draft_tokens +=
+        static_cast<int64_t>(session.draft.size());
+  }
+
+  if (session.draft.empty()) {
+    common_batch_clear(session.batch);
+    common_batch_add(session.batch, session.id_last, n_past, {0}, true);
+    const int32_t rc = decode_speculative_batch();
+    if (rc != 0) {
+      return decode_failure(rc);
+    }
+    session.history.push_back(session.id_last);
+    const llama_token token = sample_next_token();
+    if (token == LLAMA_TOKEN_NULL) {
+      return -3;
+    }
+    session.id_last = token;
+    session.output.push_back(token);
+    return 1;
+  }
+
+  if (session.needs_checkpoint) {
+    llama_synchronize(g_state.ctx);
+    session.checkpoint.resize(llama_state_seq_get_size_ext(
+        g_state.ctx, 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
+    const size_t written = llama_state_seq_get_data_ext(
+        g_state.ctx,
+        session.checkpoint.data(),
+        session.checkpoint.size(),
+        0,
+        LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+    if (written != session.checkpoint.size()) {
+      set_error("Speculative decoding could not save the target state");
+      return -4;
+    }
+  }
+
+  std::vector<llama_token> accepted;
+  int32_t rc = 0;
+  if (!verify_speculative_draft(accepted, &rc)) {
+    return rc != 0 ? decode_failure(rc) : -3;
+  }
+  const size_t n_accepted = accepted.size() - 1;
+  if (n_accepted < session.draft.size() &&
+      !roll_back_speculative_target(accepted, &rc)) {
+    return rc != 0 ? decode_failure(rc) : -4;
+  }
+  common_speculative_accept(session.spec, 0, static_cast<uint16_t>(n_accepted));
+  g_speculative_usage.accepted_draft_tokens += static_cast<int64_t>(n_accepted);
+
+  const llama_pos keep = static_cast<llama_pos>(n_past) +
+      static_cast<llama_pos>(accepted.size());
+  if (session.ctx_dft != nullptr &&
+      !llama_memory_seq_rm(llama_get_memory(session.ctx_dft), 0, keep, -1)) {
+    set_error("Speculative decoding could not roll back the draft context");
+    return -4;
+  }
+
+  session.history.push_back(session.id_last);
+  session.history.insert(
+      session.history.end(), accepted.begin(), accepted.end() - 1);
+  session.id_last = accepted.back();
+  session.output.insert(session.output.end(), accepted.begin(), accepted.end());
+  return 1;
+}
+
+// Returns the session's next sampled token as next_token_impl() does.
+int32_t speculative_next_token() {
+  speculative_session & session = *g_speculative;
+  if (session.output_index == session.output.size()) {
+    const int32_t rc = speculative_step();
+    if (rc <= 0) {
+      end_generation_state();
+      return rc;
+    }
+  }
+
+  const llama_token token = session.output[session.output_index++];
+  if (llama_vocab_is_eog(g_state.vocab, token)) {
+    end_generation_state();
+    return 0;
+  }
+  g_last_piece = token_to_piece(token, true);
+  g_last_output += g_last_piece;
+  g_usage_completion_tokens++;
+  return 1;
 }
 
 int32_t next_token_impl() {
@@ -446,6 +731,10 @@ int32_t next_token_impl() {
   if (g_cancel_requested) {
     end_generation_state();
     return 0;
+  }
+
+  if (g_speculative != nullptr) {
+    return speculative_next_token();
   }
 
   while (true) {

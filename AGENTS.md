@@ -208,14 +208,17 @@ candidate and exact `candidate_run_id`/`attestation_run_id` pair.
   `_ORCHESTRATION_ONLY_PATHS` and in `TOOLING` in `scripts/ci_scope.mjs`.
 - Keep publishing logic in workflow only.
 - Do not edit assets repository files from here outside publish flow.
-- C++ exception catching is enabled only for
+- C++ exception catching is enabled only for the functions listed in
+  `EXCEPTION_CATCHING_ALLOWED` (`CMakeLists.txt`):
   `llamadart_webgpu_grammar_sampler_init` and
-  `llamadart_webgpu_lora_adapter_init` (`EXCEPTION_CATCHING_ALLOWED` in
-  `CMakeLists.txt`), which turn llama.cpp's grammar parser and LoRA loader
-  throws into `(invalid grammar)` and `Failed to load LoRA adapter` errors. Do
-  not widen it with `-fexceptions` or `-fwasm-exceptions`: whole-TU catching
-  puts `invoke_*` trampolines and their ASYNCIFY instrumentation on hot paths,
-  and Wasm EH conflicts with ASYNCIFY.
+  `llamadart_webgpu_lora_adapter_init`, which turn llama.cpp's grammar parser
+  and LoRA loader throws into `(invalid grammar)` and `Failed to load LoRA
+  adapter` errors, and the speculative wrappers in
+  `src/llama_webgpu_speculative.cpp`, which turn draft model, draft context and
+  speculative setup throws into load or generation errors. Do not widen it with
+  `-fexceptions` or `-fwasm-exceptions`: whole-TU catching puts `invoke_*`
+  trampolines and their ASYNCIFY instrumentation on hot paths, and Wasm EH
+  conflicts with ASYNCIFY.
   The link setting makes every other uncaught throw escape `ccall` as a
   `CppException`; `src/llama_webgpu_core_post.js` turns it back into
   `abort()` for `ccall`, the bridge's only entry into the core, so keep the two

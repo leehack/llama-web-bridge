@@ -125,19 +125,21 @@ add_executable(llama_webgpu_core
     src/llama_webgpu_decision.cpp
     src/llama_webgpu_grammar.cpp
     src/llama_webgpu_lora.cpp
+    src/llama_webgpu_speculative.cpp
     src/llama_webgpu_tts.cpp
 )
 
-# llama.cpp throws on invalid GBNF and on a LoRA adapter it rejects. Catch
-# those in these two extern "C" wrappers only: Emscripten keeps catching
-# disabled in every other function, so upstream code and the grammar sampling
-# hot path stay free of invoke_* trampolines and the ASYNCIFY instrumentation
-# they would pull in. The link setting also changes how every other throw
-# surfaces; llama_webgpu_core_post.js turns those back into aborts.
+# llama.cpp throws on invalid GBNF and on a LoRA adapter it rejects, and draft
+# model loading, draft context creation and speculative setup throw on rejected
+# drafts or allocation failures. Catch them in these extern "C" wrappers only:
+# Emscripten keeps catching disabled in every other function, so upstream code
+# and the sampling hot paths stay free of invoke_* trampolines and the ASYNCIFY
+# instrumentation they would pull in. The link setting also changes how every
+# other throw surfaces; llama_webgpu_core_post.js turns those back into aborts.
 set(LLAMADART_WEBGPU_EXCEPTION_CATCHING_ALLOWED
-    "-sEXCEPTION_CATCHING_ALLOWED=['llamadart_webgpu_grammar_sampler_init','llamadart_webgpu_lora_adapter_init']")
+    "-sEXCEPTION_CATCHING_ALLOWED=['llamadart_webgpu_grammar_sampler_init','llamadart_webgpu_lora_adapter_init','llamadart_webgpu_draft_model_load_file','llamadart_webgpu_draft_context_init','llamadart_webgpu_speculative_init']")
 set(LLAMADART_WEBGPU_CORE_POST_JS "${CMAKE_CURRENT_SOURCE_DIR}/src/llama_webgpu_core_post.js")
-set_source_files_properties(src/llama_webgpu_grammar.cpp src/llama_webgpu_lora.cpp PROPERTIES
+set_source_files_properties(src/llama_webgpu_grammar.cpp src/llama_webgpu_lora.cpp src/llama_webgpu_speculative.cpp PROPERTIES
     COMPILE_OPTIONS "${LLAMADART_WEBGPU_EXCEPTION_CATCHING_ALLOWED}")
 set_target_properties(llama_webgpu_core PROPERTIES
     LINK_DEPENDS "${LLAMADART_WEBGPU_CORE_POST_JS}")
@@ -154,6 +156,7 @@ target_include_directories(llama_webgpu_core PRIVATE
     "${LLAMA_CPP_DIR}/ggml/include"
     "${LLAMA_CPP_DIR}/tools/mtmd"
     "${LLAMA_CPP_DIR}/vendor"
+    "${LLAMA_CPP_DIR}/src"
 )
 
 target_link_libraries(llama_webgpu_core PRIVATE llama llama-common llamadart_mtmd)
@@ -169,7 +172,7 @@ set(LLAMADART_WEBGPU_LINK_OPTIONS
     "-sEXPORT_NAME=createLlamaWebGpuCoreModule"
     "-sENVIRONMENT=web,worker"
     "-sEXPORTED_RUNTIME_METHODS=['FS','ccall','UTF8ToString']"
-    "-sEXPORTED_FUNCTIONS=['_main','_llamadart_webgpu_probe','_llamadart_webgpu_supports_pthreads','_llamadart_webgpu_pthread_pool_size','_llamadart_webgpu_backends_json','_llamadart_webgpu_last_error','_llamadart_webgpu_set_log_level','_llamadart_webgpu_load_model','_llamadart_webgpu_load_model_from_url','_llamadart_webgpu_free_model','_llamadart_webgpu_mmproj_load','_llamadart_webgpu_mmproj_free','_llamadart_webgpu_mmproj_supports_vision','_llamadart_webgpu_mmproj_supports_audio','_llamadart_webgpu_media_clear_pending','_llamadart_webgpu_media_add_file','_llamadart_webgpu_media_add_encoded','_llamadart_webgpu_media_add_rgb','_llamadart_webgpu_media_add_audio_f32','_llamadart_webgpu_tokenize_to_json','_llamadart_webgpu_last_tokens_json','_llamadart_webgpu_state_save_file','_llamadart_webgpu_state_load_file','_llamadart_webgpu_detokenize_from_json','_llamadart_webgpu_last_detokenized','_llamadart_webgpu_embed_to_json','_llamadart_webgpu_last_embedding_json','_llamadart_webgpu_score_next_token_to_json','_llamadart_webgpu_last_next_token_scores_json','_llamadart_webgpu_generate','_llamadart_webgpu_begin_generation','_llamadart_webgpu_next_token','_llamadart_webgpu_last_piece','_llamadart_webgpu_end_generation','_llamadart_webgpu_request_cancel','_llamadart_webgpu_last_output','_llamadart_webgpu_last_generation_usage_json','_llamadart_webgpu_completion_capabilities_json','_llamadart_webgpu_get_context_size','_llamadart_webgpu_model_meta_json','_llamadart_webgpu_tts_api_version','_llamadart_webgpu_tts_info_json','_llamadart_webgpu_tts_start','_llamadart_webgpu_tts_step','_llamadart_webgpu_tts_progress_json','_llamadart_webgpu_tts_write_pcm','_llamadart_webgpu_tts_reset','_llamadart_webgpu_decision_api_version','_llamadart_webgpu_decision_capabilities_json','_llamadart_webgpu_decision_load','_llamadart_webgpu_decision_head_info_json','_llamadart_webgpu_decision_run','_llamadart_webgpu_decision_free','_llamadart_webgpu_lora_api_version','_llamadart_webgpu_lora_load','_llamadart_webgpu_lora_set','_llamadart_webgpu_lora_remove','_llamadart_webgpu_lora_clear','_llamadart_webgpu_shutdown']"
+    "-sEXPORTED_FUNCTIONS=['_main','_llamadart_webgpu_probe','_llamadart_webgpu_supports_pthreads','_llamadart_webgpu_pthread_pool_size','_llamadart_webgpu_backends_json','_llamadart_webgpu_last_error','_llamadart_webgpu_set_log_level','_llamadart_webgpu_load_model','_llamadart_webgpu_load_model_from_url','_llamadart_webgpu_free_model','_llamadart_webgpu_mmproj_load','_llamadart_webgpu_mmproj_free','_llamadart_webgpu_mmproj_supports_vision','_llamadart_webgpu_mmproj_supports_audio','_llamadart_webgpu_media_clear_pending','_llamadart_webgpu_media_add_file','_llamadart_webgpu_media_add_encoded','_llamadart_webgpu_media_add_rgb','_llamadart_webgpu_media_add_audio_f32','_llamadart_webgpu_tokenize_to_json','_llamadart_webgpu_last_tokens_json','_llamadart_webgpu_state_save_file','_llamadart_webgpu_state_load_file','_llamadart_webgpu_detokenize_from_json','_llamadart_webgpu_last_detokenized','_llamadart_webgpu_embed_to_json','_llamadart_webgpu_last_embedding_json','_llamadart_webgpu_score_next_token_to_json','_llamadart_webgpu_last_next_token_scores_json','_llamadart_webgpu_generate','_llamadart_webgpu_begin_generation','_llamadart_webgpu_next_token','_llamadart_webgpu_last_piece','_llamadart_webgpu_end_generation','_llamadart_webgpu_request_cancel','_llamadart_webgpu_last_output','_llamadart_webgpu_last_generation_usage_json','_llamadart_webgpu_completion_capabilities_json','_llamadart_webgpu_set_next_speculative','_llamadart_webgpu_draft_model_load','_llamadart_webgpu_draft_model_free','_llamadart_webgpu_draft_model_info_json','_llamadart_webgpu_heap_headroom_bytes','_llamadart_webgpu_get_context_size','_llamadart_webgpu_model_meta_json','_llamadart_webgpu_tts_api_version','_llamadart_webgpu_tts_info_json','_llamadart_webgpu_tts_start','_llamadart_webgpu_tts_step','_llamadart_webgpu_tts_progress_json','_llamadart_webgpu_tts_write_pcm','_llamadart_webgpu_tts_reset','_llamadart_webgpu_decision_api_version','_llamadart_webgpu_decision_capabilities_json','_llamadart_webgpu_decision_load','_llamadart_webgpu_decision_head_info_json','_llamadart_webgpu_decision_run','_llamadart_webgpu_decision_free','_llamadart_webgpu_lora_api_version','_llamadart_webgpu_lora_load','_llamadart_webgpu_lora_set','_llamadart_webgpu_lora_remove','_llamadart_webgpu_lora_clear','_llamadart_webgpu_shutdown']"
     "-lwasmfs_fetch.js"
     "${LLAMADART_WEBGPU_EXCEPTION_CATCHING_ALLOWED}"
     "--post-js=${LLAMADART_WEBGPU_CORE_POST_JS}"
