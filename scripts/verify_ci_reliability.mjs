@@ -790,6 +790,8 @@ export const TEST_COMMAND = "node --test 'tests/**/*_test.mjs'";
 
 // Static imports, re-exports, bare imports and literal dynamic imports.
 const RELATIVE_IMPORT = /(?:\bfrom|\bimport)\s*\(?\s*(['"`])(\.\.?\/[^'"`$]+)\1/g;
+// Every literal module specifier, relative or not.
+const IMPORT_SPECIFIER = /(?:\bfrom|\bimport)\s*\(?\s*(['"`])([^'"`$]+)\1/g;
 
 function relativeImports(from, text) {
   return [...String(text).matchAll(RELATIVE_IMPORT)]
@@ -1027,6 +1029,17 @@ export function orchestratorModules(files, errors) {
     if (/\bimport\s*\(\s*(?!['"`][^'"`$]*['"`]\s*\))/.test(text)) {
       errors.push(`${from} has an import() whose target is not a string literal, so the orchestrator source cannot be resolved`);
     }
+    // Only node: builtins and relative modules, never a package, a subpath
+    // import, an absolute path or URL, or CommonJS loading, which would all
+    // load code this walk never reads.
+    for (const [, , specifier] of text.matchAll(IMPORT_SPECIFIER)) {
+      if (!/^(?:node:|\.\.?\/)/.test(specifier)) {
+        errors.push(`${from} imports ${specifier}; the orchestrator may import only node: builtins and relative modules`);
+      }
+    }
+    if (/\bcreateRequire\b|(?<![\w$.])require\s*\(/.test(text)) {
+      errors.push(`${from} loads modules through require, which the orchestrator import walk cannot follow`);
+    }
     for (const target of relativeImports(from, text)) {
       if (path.posix.dirname(target) === ORCHESTRATOR_DIRECTORY) {
         if (!has(files, target)) {
@@ -1054,12 +1067,15 @@ export function orchestratorModules(files, errors) {
 // `inputs['key'] = 'true'`) and a Map entry or set (`['key', 'true']`,
 // `.set('key', 'true')`), with any quote.
 export const LIVE_PROOF_DISPATCH_BOOLEANS = ['assets_immutable_releases_enabled', 'publish_approved'];
-// The one sanctioned literal: the approval is asserted only right after the
-// live publication-environment proof.
-export const SANCTIONED_APPROVAL = /requirePublicationEnvironment\(gateway\);\s*inputs\.publish_approved = 'true';/g;
+// The one sanctioned literal: in the driver, the approval is asserted only on
+// the statement right after the live publication-environment proof. Both
+// statements must open their own lines, so a commented-out or conditional
+// proof does not sanction the assignment.
+export const SANCTIONED_APPROVAL_MODULE = 'scripts/release/orchestrator/driver.mjs';
+export const SANCTIONED_APPROVAL = /^[ \t]*requirePublicationEnvironment\(gateway\);[ \t]*\r?\n[ \t]*inputs\.publish_approved = 'true';/gm;
 
-export function literalDispatchBooleans(source) {
-  const text = String(source).replace(SANCTIONED_APPROVAL, '');
+export function literalDispatchBooleans(source, { sanctioned = false } = {}) {
+  const text = sanctioned ? String(source).replace(SANCTIONED_APPROVAL, '') : String(source);
   const found = [];
   for (const key of LIVE_PROOF_DISPATCH_BOOLEANS) {
     // The key, bare or quoted, then the literal 'true' in any quote.
@@ -1145,9 +1161,9 @@ function checkOrchestration(autoUpdate, orchestratorSources, errors) {
     check.require(
       setups.length > 0
         && setups[0].index < firstNode.index
-        && setups.every((step) => String(step.with['node-version']) === '24'
+        && setups.every((step) => step.uses === 'actions/setup-node@v4' && String(step.with['node-version']) === '24'
           && !has(step.with, 'cache') && !has(step.with, 'cache-dependency-path')),
-      `${autoUpdate.path} job ${name} must set up Node.js 24 with actions/setup-node before its first node command, without a package cache`,
+      `${autoUpdate.path} job ${name} must set up Node.js 24 with actions/setup-node@v4 before its first node command, without a package cache`,
     );
   }
   check.require(
@@ -1195,12 +1211,16 @@ function checkOrchestration(autoUpdate, orchestratorSources, errors) {
     `the orchestrator source must start at ${ORCHESTRATOR_ENTRY}`,
   );
   for (const [relativePath, source] of Object.entries(orchestratorSources)) {
-    const literals = literalDispatchBooleans(source);
+    const literals = literalDispatchBooleans(source, { sanctioned: relativePath === SANCTIONED_APPROVAL_MODULE });
     check.require(
       literals.length === 0,
       `${relativePath} must derive the governance and approval booleans only from live proofs, never a literal; found: ${quoteAll(literals)}`,
     );
   }
+  check.require(
+    (String(orchestratorSources[SANCTIONED_APPROVAL_MODULE] ?? '').match(SANCTIONED_APPROVAL) ?? []).length === 1,
+    `${SANCTIONED_APPROVAL_MODULE} must assert publish_approved exactly once, on the statement right after requirePublicationEnvironment(gateway)`,
+  );
 }
 
 export { checkOrchestration };

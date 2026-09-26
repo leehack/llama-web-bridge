@@ -616,7 +616,9 @@ assertRejected(validatePublicationPatContract('jobs: [unterminated', EXPECTED_ST
   assertRejected(orchestrationErrors(mutate(`${setupNode}\n      - name: Prove the exact workflow continuation before environment use\n`,
     '      - name: Prove the exact workflow continuation before environment use\n')
     .replace('      - name: Resolve native-aligned candidate\n', `${setupNode}\n      - name: Resolve native-aligned candidate\n`)),
-  'job prepare_release_candidate must set up Node.js 24 with actions/setup-node before its first node command');
+  'job prepare_release_candidate must set up Node.js 24 with actions/setup-node@v4 before its first node command');
+  // Another major version could turn on package caching without a cache input.
+  assertRejected(orchestrationErrors(mutate('actions/setup-node@v4', 'actions/setup-node@v5')), 'with actions/setup-node@v4');
   for (const install of ['npm ci', 'npm install', 'npx --no-install playwright', 'pip install yaml', 'corepack enable']) {
     assertRejected(orchestrationErrors(mutate('set -euo pipefail\n          dry_run_flag=()', `set -euo pipefail\n          ${install}\n          dry_run_flag=()`)),
       'must never install or run packages');
@@ -678,12 +680,45 @@ assertRejected(validatePublicationPatContract('jobs: [unterminated', EXPECTED_ST
       assert.deepEqual(literalDispatchBooleans(allowed), [], allowed);
     }
   }
-  // The approval is sanctioned only right after the live environment proof.
-  assert.deepEqual(literalDispatchBooleans(sourceFiles[driver]), []);
-  assert.match(sourceFiles[driver], SANCTIONED_APPROVAL);
-  const unproven = sourceFiles[driver].replace('    requirePublicationEnvironment(gateway);\n    inputs.publish_approved', '    inputs.publish_approved');
-  assert.notEqual(unproven, sourceFiles[driver]);
-  assert.deepEqual(literalDispatchBooleans(unproven), [".publish_approved = 'true'"]);
+  // The approval is sanctioned only in the driver, exactly once, on the
+  // statement right after the live environment proof.
+  const proof = "    requirePublicationEnvironment(gateway);\n    inputs.publish_approved = 'true';";
+  assert.ok(sourceFiles[driver].includes(proof));
+  assert.equal(sourceFiles[driver].match(SANCTIONED_APPROVAL).length, 1);
+  assert.deepEqual(literalDispatchBooleans(sourceFiles[driver], { sanctioned: true }), []);
+  assert.deepEqual(literalDispatchBooleans(sourceFiles[driver]), [".publish_approved = 'true'"]);
+  assert.deepEqual(orchestrationErrors(workflowText, sources().modules), []);
+  const unproven = sourceFiles[driver].replace(proof, "    inputs.publish_approved = 'true';");
+  assert.deepEqual(literalDispatchBooleans(unproven, { sanctioned: true }), [".publish_approved = 'true'"]);
+  for (const [label, driverText, expected] of [
+    ['a commented-out proof', sourceFiles[driver].replace(proof, "    // requirePublicationEnvironment(gateway);\n    inputs.publish_approved = 'true';"),
+      'must derive the governance and approval booleans only from live proofs'],
+    ['a conditional proof', sourceFiles[driver].replace(proof, "    if (false) requirePublicationEnvironment(gateway);\n    inputs.publish_approved = 'true';"),
+      'must derive the governance and approval booleans only from live proofs'],
+    ['a second sanctioned approval', `${sourceFiles[driver]}\n${proof}\n`, 'must assert publish_approved exactly once'],
+    ['no approval at all', sourceFiles[driver].replace(proof, '    requirePublicationEnvironment(gateway);'), 'must assert publish_approved exactly once'],
+  ]) {
+    assert.notEqual(driverText, sourceFiles[driver], label);
+    assertRejected(orchestrationErrors(workflowText, { ...sources().modules, [driver]: driverText }), expected);
+  }
+  // The same two statements in any other module are not sanctioned.
+  const planner = 'scripts/release/orchestrator/planner.mjs';
+  assertRejected(
+    orchestrationErrors(workflowText, { ...sources().modules, [planner]: `${sourceFiles[planner]}\n${proof}\n` }),
+    `${planner} must derive the governance and approval booleans only from live proofs`,
+  );
+  // The import walk reads every module the orchestrator can load.
+  for (const [label, line, expected] of [
+    ['a package import', "import yaml from 'yaml';", 'may import only node: builtins and relative modules'],
+    ['a subpath import', "import x from '#internal';", 'may import only node: builtins and relative modules'],
+    ['an absolute URL import', "const x = await import('file:///tmp/x.mjs');", 'may import only node: builtins and relative modules'],
+    ['createRequire', "import { createRequire } from 'node:module';\nconst load = createRequire(import.meta.url);", 'loads modules through require'],
+    ['a bare require', "const x = require('./x.cjs');", 'loads modules through require'],
+  ]) {
+    const { errors } = sources({ ...sourceFiles, [planner]: `${sourceFiles[planner]}\n${line}\n` });
+    assertRejected(errors, expected);
+    assert.ok(errors.every((error) => error.startsWith(planner)), label);
+  }
 }
 
 console.log('CI reliability verifier tests passed');

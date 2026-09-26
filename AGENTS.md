@@ -118,7 +118,7 @@ GGUFs or smoke artifacts.
     so docs-only commits never advance the build identity; every unclassified
     new path is governed by default.
   - Every dispatch sends exactly the target workflow's declared
-    `workflow_dispatch` inputs (`require_exact_dispatch_inputs`) at the exact
+    `workflow_dispatch` inputs (`requireExactDispatchInputs`) at the exact
     default-branch `--ref` after a live `immutable-releases` governance read;
     duplicate in-flight or successful runs for one stage fail closed, and a
     run-name readback follows each dispatch.
