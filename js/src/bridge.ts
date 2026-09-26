@@ -176,6 +176,8 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
   static supportsSafariAdaptiveGpu =
     LlamaWebGpuBridgeRuntime.supportsSafariAdaptiveGpu === true;
 
+  static supportsCompletionUsage = true;
+
   constructor(config: LlamaWebGpuBridgeConfig = {}) {
     this._config = config;
     this._runtime = null;

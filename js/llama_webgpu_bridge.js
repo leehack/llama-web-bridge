@@ -4114,6 +4114,7 @@ var BridgeWorkerProxy = class {
 // js/src/bridge.ts
 var LlamaWebGpuBridge = class {
   static supportsSafariAdaptiveGpu = LlamaWebGpuBridgeRuntime.supportsSafariAdaptiveGpu === true;
+  static supportsCompletionUsage = true;
   constructor(config = {}) {
     this._config = config;
     this._runtime = null;
