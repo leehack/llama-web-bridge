@@ -299,7 +299,7 @@ export class BridgeWorkerProxy {
       return clamp(Number(this._config.workerTextToSpeechTimeoutMs), clamp(explicitGlobal, 20 * 60 * 1000));
     }
 
-    if (method === 'loadDecisionHead') {
+    if (method === 'loadDecisionHead' || method === 'loadLoraAdapter') {
       // Download progress events re-arm this timer, so it bounds a stall.
       return clamp(explicitGlobal, 10 * 60 * 1000);
     }

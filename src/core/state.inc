@@ -59,5 +59,11 @@ std::string g_tts_progress_json = "{}";
 std::map<int32_t, llama_webgpu_decision_head *> g_decision_heads;
 int32_t g_next_decision_handle = 1;
 std::string g_decision_json = "{}";
+// LoRA adapters loaded on g_state.model. Handles are never reused within one
+// runtime, so a stale handle cannot reach a newer adapter.
+std::map<int32_t, llama_adapter_lora *> g_lora_adapters;
+int32_t g_next_lora_handle = 1;
+// The adapters applied to g_state.ctx and their scales, in the order first set.
+std::vector<std::pair<int32_t, float>> g_active_loras;
 
 std::vector<pending_media> g_pending_media;

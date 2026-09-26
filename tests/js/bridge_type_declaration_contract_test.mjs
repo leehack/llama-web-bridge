@@ -31,7 +31,7 @@ try {
   writeFileSync(
     path.join(temporaryDir, 'consumer.ts'),
     [
-      "import type { CompletionOptions, DecisionHeadOptions, DecisionSequence, EmbedOptions } from './bridge.js';",
+      "import type { CompletionOptions, DecisionHeadOptions, DecisionSequence, EmbedOptions, LoraAdapterLoadOptions } from './bridge.js';",
       '',
       'export const accepted: CompletionOptions = {',
       '  nPredict: 64,',
@@ -71,6 +71,15 @@ try {
       'export const rejectedTokens: DecisionSequence = { tokens: new Float32Array(1), markers: [0], questionType: 0 };',
       '// @ts-expect-error configJson is the config text, not a parsed object.',
       'export const rejectedHeadConfig: DecisionHeadOptions = { configJson: { max_len: 512 } };',
+      '',
+      'export const acceptedLoraOptions: LoraAdapterLoadOptions = {',
+      '  progressCallback: (progress) => progress.loaded,',
+      '  signal: new AbortController().signal,',
+      '  useCache: false,',
+      "  cacheName: 'adapters',",
+      '};',
+      '// @ts-expect-error the adapter scale is passed to setLoraAdapter, not the load.',
+      'export const rejectedLoraScale: LoraAdapterLoadOptions = { scale: 1 };',
       '',
     ].join('\n'),
   );

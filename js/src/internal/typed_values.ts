@@ -24,6 +24,18 @@ export function toUint8Array(value: unknown): Uint8Array | null {
   return null;
 }
 
+// A view of an ArrayBuffer or typed array's bytes, without copying; null for
+// anything else.
+export function bufferSourceBytes(source: unknown): Uint8Array | null {
+  if (source instanceof ArrayBuffer) {
+    return new Uint8Array(source);
+  }
+  if (ArrayBuffer.isView(source)) {
+    return new Uint8Array(source.buffer, source.byteOffset, source.byteLength);
+  }
+  return null;
+}
+
 export function toFloat32Array(value: unknown): Float32Array | null {
   if (!value) {
     return null;

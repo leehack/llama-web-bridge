@@ -241,6 +241,29 @@ export interface DecisionOutput {
   actLogits: Float32Array;
 }
 
+export interface LoraAdapterCapabilities {
+  apiVersion: number;
+  supported: boolean;
+  /** Why this bridge cannot load LoRA adapters; absent when supported. */
+  reason?: string;
+}
+
+export interface LoraAdapterLoadOptions {
+  /** Download progress of a URL adapter, in bytes. */
+  progressCallback?: (progress: BridgeProgressEvent) => void;
+  /** Cancels the download of a URL adapter. A load whose adapter already reached the runtime still completes. */
+  signal?: AbortSignal;
+  /** Read and store a URL adapter in the Cache API, as models are. Defaults to true. */
+  useCache?: boolean;
+  /** Cache API cache name for a URL adapter; defaults to the bridge's `cacheName`. */
+  cacheName?: string;
+}
+
+export interface LoraAdapterInfo {
+  /** Identifies the adapter until its model is unloaded or replaced. */
+  handle: number;
+}
+
 export type ModelMetadata = Record<string, unknown>;
 
 export interface StateLoadResult {
@@ -298,6 +321,14 @@ export class LlamaWebGpuBridge {
   ): Promise<DecisionHeadInfo>;
   runDecision(handle: number, sequences: readonly DecisionSequence[]): Promise<DecisionOutput[]>;
   freeDecisionHead(handle: number): Promise<void>;
+  getLoraAdapterCapabilities(): Promise<LoraAdapterCapabilities>;
+  loadLoraAdapter(
+    source: string | ArrayBuffer | ArrayBufferView,
+    options?: LoraAdapterLoadOptions,
+  ): Promise<LoraAdapterInfo>;
+  setLoraAdapter(handle: number, scale?: number): Promise<void>;
+  removeLoraAdapter(handle: number): Promise<void>;
+  clearLoraAdapters(): Promise<void>;
 
   getModelMetadata(): ModelMetadata | null;
   getContextSize(): number;

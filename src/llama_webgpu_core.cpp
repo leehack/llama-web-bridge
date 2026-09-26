@@ -29,6 +29,7 @@
 #include "llama_webgpu_decision.h"
 #include "llama_webgpu_embedding_json.h"
 #include "llama_webgpu_grammar.h"
+#include "llama_webgpu_lora.h"
 #include "llama_webgpu_mtmd_compat.h"
 #include "llama_webgpu_next_token_scores.h"
 #include "llama_webgpu_tts.h"
@@ -49,6 +50,8 @@ namespace {
 
 #include "core/model_load.inc"
 
+#include "core/lora.inc"
+
 }  // namespace
 
 extern "C" {
@@ -66,6 +69,8 @@ extern "C" {
 #include "core/exports_tts.inc"
 
 #include "core/exports_decision.inc"
+
+#include "core/exports_lora.inc"
 
 EMSCRIPTEN_KEEPALIVE void llamadart_webgpu_shutdown() {
   free_runtime();

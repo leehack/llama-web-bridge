@@ -86,6 +86,15 @@ function toUint8Array(value) {
   }
   return null;
 }
+function bufferSourceBytes(source) {
+  if (source instanceof ArrayBuffer) {
+    return new Uint8Array(source);
+  }
+  if (ArrayBuffer.isView(source)) {
+    return new Uint8Array(source.buffer, source.byteOffset, source.byteLength);
+  }
+  return null;
+}
 function toFloat32Array(value) {
   if (!value) {
     return null;
@@ -120,15 +129,6 @@ function decisionHandleFrom(handle) {
     throw new TypeError(`Decision head handle must be a positive integer, got ${String(handle)}.`);
   }
   return handle;
-}
-function decisionHeadBytes(source) {
-  if (source instanceof ArrayBuffer) {
-    return new Uint8Array(source);
-  }
-  if (ArrayBuffer.isView(source)) {
-    return new Uint8Array(source.buffer, source.byteOffset, source.byteLength);
-  }
-  return null;
 }
 function decisionIntegerList(value, label) {
   const isList = Array.isArray(value) || ArrayBuffer.isView(value) && !(value instanceof DataView);
@@ -251,6 +251,30 @@ function logThresholdForConfiguredLevel(level) {
     default:
       return 1;
   }
+}
+
+// js/src/internal/lora.ts
+var LORA_API_VERSION = 1;
+var LORA_LOAD_ABORT_MESSAGE = "LoRA adapter load was cancelled.";
+function loraHandleFrom(handle) {
+  if (!isInt32(handle) || handle <= 0) {
+    throw new TypeError(`LoRA adapter handle must be a positive integer, got ${String(handle)}.`);
+  }
+  return handle;
+}
+function loraScaleFrom(scale) {
+  if (typeof scale !== "number" || !Number.isFinite(scale)) {
+    throw new TypeError(`LoRA adapter scale must be a finite number, got ${String(scale)}.`);
+  }
+  if (!Number.isFinite(Math.fround(scale))) {
+    throw new RangeError(`LoRA adapter scale ${String(scale)} is outside the 32-bit float range.`);
+  }
+  return scale;
+}
+function staleLoraAdapterError(handle) {
+  return new Error(
+    `LoRA adapter ${handle} is not loaded; its model was unloaded or replaced. Load the adapter again.`
+  );
 }
 
 // js/src/internal/model_source.ts
@@ -874,6 +898,8 @@ var LlamaWebGpuBridgeRuntime = class {
     this._mediaFileCounter = 0;
     this._stateFileCounter = 0;
     this._decisionFileCounter = 0;
+    this._loraFileCounter = 0;
+    this._loraAdaptersLoaded = false;
     this._stagedMediaPaths = [];
     this._nCtx = 4096;
     this._abortRequested = false;
@@ -1112,6 +1138,10 @@ var LlamaWebGpuBridgeRuntime = class {
   async _recoverGenerationWithCpuFallback(options = {}) {
     const modelUrl = cloneModelSource(this._loadedModelUrl);
     if (!hasModelSource(modelUrl)) {
+      return false;
+    }
+    if (this._loraAdaptersLoaded) {
+      this._runtimeNotes.push("generation_recovery_cpu_skipped_lora");
       return false;
     }
     this._runtimeNotes.push("generation_recovery_cpu_attempt");
@@ -1742,6 +1772,7 @@ var LlamaWebGpuBridgeRuntime = class {
     if (rc !== 0) {
       throw new Error(this._coreErrorMessage("Failed to release the loaded model", rc));
     }
+    this._loraAdaptersLoaded = false;
     this._clearStagedMediaFiles();
     this._deleteFsFile(projectorPath);
     this._releaseModelFiles();
@@ -3044,7 +3075,7 @@ var LlamaWebGpuBridgeRuntime = class {
         throw new Error("Decision head URL is empty.");
       }
     } else {
-      bytes = decisionHeadBytes(source);
+      bytes = bufferSourceBytes(source);
       if (!bytes) {
         throw new TypeError("Decision head source must be a URL string, an ArrayBuffer or a typed array.");
       }
@@ -3140,6 +3171,194 @@ var LlamaWebGpuBridgeRuntime = class {
       ["number"],
       [nativeHandle],
       { async: true }
+    );
+  }
+  getLoraAdapterCapabilities() {
+    const unsupported = (reason) => ({
+      apiVersion: LORA_API_VERSION,
+      supported: false,
+      reason
+    });
+    const core = this._core;
+    if (!core) {
+      return unsupported("WebGPU core is not initialized");
+    }
+    if (typeof core._llamadart_webgpu_lora_api_version !== "function") {
+      return unsupported("This WebGPU core build does not include LoRA adapters.");
+    }
+    const coreVersion = Number(
+      core.ccall("llamadart_webgpu_lora_api_version", "number", [], [])
+    );
+    if (coreVersion !== LORA_API_VERSION) {
+      return unsupported(
+        `The WebGPU core implements LoRA API version ${coreVersion}; this bridge needs version ${LORA_API_VERSION}.`
+      );
+    }
+    return { apiVersion: LORA_API_VERSION, supported: true };
+  }
+  _requireLoraCore() {
+    if (!this._core || this._modelBytes <= 0) {
+      throw new Error("No model loaded. Call loadModelFromUrl first.");
+    }
+    const capabilities = this.getLoraAdapterCapabilities();
+    if (capabilities.supported !== true) {
+      throw new Error(capabilities.reason || "This bridge cannot load LoRA adapters.");
+    }
+    return this._core;
+  }
+  /**
+   * Downloads a URL adapter into `adapterPath`, through the Cache API unless
+   * `options.useCache` is false. A cache miss stores the response while it is
+   * written, so progress starts with the first chunk.
+   */
+  async _stageLoraAdapterFromUrl(url, adapterPath, options) {
+    const core = this._core;
+    const signal = options.signal || null;
+    const progressCallback = typeof options.progressCallback === "function" ? options.progressCallback : null;
+    const fetchTimeoutMs = this._resolveFetchTimeoutMs(options, 18e4);
+    const chunkTimeoutMs = this._resolveStreamChunkTimeoutMs(options, 9e4);
+    const fetchInit = signal ? { signal } : {};
+    const cacheKey = normalizeAbsoluteUrl(url);
+    let cache = null;
+    if (options.useCache !== false && typeof globalThis.caches?.open === "function") {
+      try {
+        cache = await globalThis.caches.open(this._resolveCacheName(options));
+      } catch (_) {
+        this._runtimeNotes.push("lora_cache_error");
+      }
+    }
+    for (let attempt = 0; ; attempt += 1) {
+      throwIfAborted(signal, LORA_LOAD_ABORT_MESSAGE);
+      try {
+        let response = null;
+        if (cache) {
+          try {
+            response = await cache.match(cacheKey) || null;
+          } catch (_) {
+            this._runtimeNotes.push("lora_cache_error");
+          }
+        }
+        let stored = null;
+        if (!response) {
+          response = await this._fetchWithTimeout(
+            url,
+            cache ? fetchInit : { cache: "no-store", ...fetchInit },
+            fetchTimeoutMs
+          );
+          if (!response.ok) {
+            throw new Error(
+              `Failed to fetch LoRA adapter: ${response.status} ${response.statusText}`
+            );
+          }
+          if (cache) {
+            stored = cache.put(cacheKey, response.clone()).then(
+              () => {
+                this._runtimeNotes.push("lora_cache_stored");
+              },
+              () => {
+                this._runtimeNotes.push("lora_cache_store_failed");
+              }
+            );
+          }
+        }
+        await writeResponseToFsFileWithProgress(
+          response,
+          core.FS,
+          adapterPath,
+          progressCallback,
+          {
+            useBigIntPosition: this._coreVariant === "wasm64",
+            chunkTimeoutMs,
+            signal,
+            abortMessage: LORA_LOAD_ABORT_MESSAGE
+          }
+        );
+        await stored;
+        return;
+      } catch (error) {
+        this._deleteFsFile(adapterPath);
+        throwIfAborted(signal, LORA_LOAD_ABORT_MESSAGE);
+        if (!isRetryableStreamNetworkError(error) || attempt >= 1) {
+          throw error;
+        }
+        this._runtimeNotes.push(`lora_fetch_retry:${attempt + 1}`);
+      }
+    }
+  }
+  async loadLoraAdapter(source, options = {}) {
+    let bytes = null;
+    if (typeof source === "string") {
+      if (source.length === 0) {
+        throw new Error("LoRA adapter URL is empty.");
+      }
+    } else {
+      bytes = bufferSourceBytes(source);
+      if (!bytes) {
+        throw new TypeError("LoRA adapter source must be a URL string, an ArrayBuffer or a typed array.");
+      }
+      if (bytes.byteLength === 0) {
+        throw new Error("LoRA adapter bytes are empty.");
+      }
+    }
+    const core = this._requireLoraCore();
+    const signal = options.signal || null;
+    throwIfAborted(signal, LORA_LOAD_ABORT_MESSAGE);
+    ensureFsDirectory(core.FS, "/lora");
+    const adapterPath = `/lora/adapter_${++this._loraFileCounter}.gguf`;
+    try {
+      if (bytes) {
+        core.FS.writeFile(adapterPath, bytes);
+      } else {
+        await this._stageLoraAdapterFromUrl(source, adapterPath, options);
+      }
+      throwIfAborted(signal, LORA_LOAD_ABORT_MESSAGE);
+      const handle = Number(
+        await core.ccall(
+          "llamadart_webgpu_lora_load",
+          "number",
+          ["string"],
+          [adapterPath],
+          { async: true }
+        )
+      );
+      if (handle <= 0) {
+        throw new Error(this._coreErrorMessage("Failed to load LoRA adapter", handle));
+      }
+      this._loraAdaptersLoaded = true;
+      return { handle };
+    } finally {
+      this._deleteFsFile(adapterPath);
+    }
+  }
+  async _callLoraCore(name, argTypes, args, failure) {
+    const core = this._requireLoraCore();
+    const rc = Number(await core.ccall(name, "number", argTypes, args, { async: true }));
+    if (rc !== 0) {
+      throw new Error(this._coreErrorMessage(failure, rc));
+    }
+  }
+  async setLoraAdapter(handle, scale = 1) {
+    await this._callLoraCore(
+      "llamadart_webgpu_lora_set",
+      ["number", "number"],
+      [loraHandleFrom(handle), loraScaleFrom(scale)],
+      "Failed to apply LoRA adapter"
+    );
+  }
+  async removeLoraAdapter(handle) {
+    await this._callLoraCore(
+      "llamadart_webgpu_lora_remove",
+      ["number"],
+      [loraHandleFrom(handle)],
+      "Failed to remove LoRA adapter"
+    );
+  }
+  async clearLoraAdapters() {
+    await this._callLoraCore(
+      "llamadart_webgpu_lora_clear",
+      [],
+      [],
+      "Failed to clear LoRA adapters"
     );
   }
   _clearStagedMediaFiles() {
@@ -3852,6 +4071,7 @@ var LlamaWebGpuBridgeRuntime = class {
     this._mmProjSourceUrl = null;
     this._mmSupportsVision = false;
     this._mmSupportsAudio = false;
+    this._loraAdaptersLoaded = false;
     this._abortRequested = false;
     this._textToSpeechActive = false;
     this._textToSpeechDone = null;
@@ -4130,7 +4350,7 @@ var BridgeWorkerProxy = class {
     if (method === "synthesizeSpeech") {
       return clamp(Number(this._config.workerTextToSpeechTimeoutMs), clamp(explicitGlobal, 20 * 60 * 1e3));
     }
-    if (method === "loadDecisionHead") {
+    if (method === "loadDecisionHead" || method === "loadLoraAdapter") {
       return clamp(explicitGlobal, 10 * 60 * 1e3);
     }
     if (method === "runDecision") {
@@ -4204,6 +4424,9 @@ var LlamaWebGpuBridge = class {
     this._disposalWaiters = /* @__PURE__ */ new Set();
     this._decisionHeads = /* @__PURE__ */ new Map();
     this._nextDecisionHandle = 1;
+    this._loraAdapters = /* @__PURE__ */ new Map();
+    this._activeLoraScales = /* @__PURE__ */ new Map();
+    this._nextLoraHandle = 1;
     if (this._shouldUseWorker()) {
       try {
         this._workerProxy = this._createWorkerProxy();
@@ -4676,6 +4899,7 @@ var LlamaWebGpuBridge = class {
     this._loadedModelUrl = normalizedUrl;
     this._loadedModelOptions = this._sanitizeModelLoadOptions(options);
     this._loadedMmProjUrl = null;
+    this._forgetLoraAdapters();
     this._multimodalWorkerCpuMode = this._workerProxy != null;
     this._workerModelMissing = false;
     if (this._activeOperation) {
@@ -4688,6 +4912,7 @@ var LlamaWebGpuBridge = class {
     this._loadedModelUrl = null;
     this._loadedModelOptions = null;
     this._loadedMmProjUrl = null;
+    this._forgetLoraAdapters();
     this._multimodalWorkerCpuMode = false;
     this._workerModelMissing = false;
   }
@@ -4835,21 +5060,26 @@ var LlamaWebGpuBridge = class {
   }
   async _loadRememberedModelIntoWorker(selectedOptions) {
     this._throwIfDisposed();
+    this._dropLoraAdaptersOf(this._workerProxy);
     await this._callWorker("loadModelFromUrl", [this._loadedModelUrl, selectedOptions]);
     this._throwIfDisposed();
-    this._workerModelMissing = false;
     if (typeof this._loadedMmProjUrl === "string" && this._loadedMmProjUrl.length > 0) {
       await this._callWorker("loadMultimodalProjector", [this._loadedMmProjUrl]);
     }
     this._throwIfDisposed();
+    await this._restoreLoraAdapters();
+    this._throwIfDisposed();
+    this._workerModelMissing = false;
     this._loadedModelOptions = selectedOptions;
     this._multimodalWorkerCpuMode = true;
   }
   /**
    * Multimodal recovery can replace the worker and then fail to reload the
-   * model into it. The facade still holds that model, but the fresh worker
-   * would answer every request with "No model loaded". Reload it first. A
-   * failure here reaches the caller's own worker-error handling.
+   * model, its projector or its applied LoRA adapters into it. The facade
+   * still holds that model, but the fresh worker would answer every request
+   * with "No model loaded" or without the adapters. Reload them first, and
+   * again on the next call if this fails. A failure here reaches the caller's
+   * own worker-error handling.
    */
   async _restoreWorkerModelIfMissing() {
     if (!this._workerProxy || this._workerModelMissing !== true || !hasModelSource(this._loadedModelUrl)) {
@@ -4954,6 +5184,8 @@ var LlamaWebGpuBridge = class {
             }
           }
         }
+        await this._restoreLoraAdapters();
+        this._throwIfDisposed();
         return;
       }
       if (!hasModelSource(this._loadedModelUrl)) {
@@ -4985,6 +5217,7 @@ var LlamaWebGpuBridge = class {
         );
       }
       this._throwIfDisposed();
+      this._dropLoraAdaptersOf(this._runtime);
       await this._runtime.loadModelFromUrl(this._loadedModelUrl, loadOptions);
       this._throwIfDisposed();
       if (Array.isArray(this._runtime._runtimeNotes)) {
@@ -5007,6 +5240,8 @@ var LlamaWebGpuBridge = class {
         await this._runtime.loadMultimodalProjector(this._loadedMmProjUrl);
         this._throwIfDisposed();
       }
+      await this._restoreLoraAdapters();
+      this._throwIfDisposed();
     } catch (error) {
       if (this._disposed || this._lifecycleState === "disposing") {
         throw new Error(BRIDGE_DISPOSED_MESSAGE);
@@ -5028,6 +5263,7 @@ var LlamaWebGpuBridge = class {
       this._loadedModelUrl = null;
       this._loadedModelOptions = null;
       this._loadedMmProjUrl = null;
+      this._forgetLoraAdapters();
       if (!this._disposed && this._lifecycleState === "open" && !this._workerProxy) {
         this._runtime = this._createRuntime();
         operation?.runtimes?.add(this._runtime);
@@ -5885,10 +6121,11 @@ var LlamaWebGpuBridge = class {
     return this._runtime;
   }
   /**
-   * Moves a failed worker's work to the main-thread runtime. Heads the worker
-   * held are gone with it; the model is reloaded so later calls keep working.
+   * Moves a failed worker's work to the main-thread runtime. Decision heads
+   * the worker held are gone with it; the model, its projector and the applied
+   * LoRA adapters are restored so later calls keep working.
    */
-  async _recoverDecisionWorker(error) {
+  async _recoverWorkerOnMainThread(error) {
     this._disableWorkerFallback(error);
     await this._waitForWorkerDisposal();
     await this._ensureRuntimeReadyAfterWorkerFallback({}, error);
@@ -5910,7 +6147,7 @@ var LlamaWebGpuBridge = class {
       if (!this._shouldFallbackToMainThread(error)) {
         throw error;
       }
-      await this._recoverDecisionWorker(error);
+      await this._recoverWorkerOnMainThread(error);
       return this._requireDecisionRuntime().getDecisionCapabilities();
     }
   }
@@ -5937,7 +6174,7 @@ var LlamaWebGpuBridge = class {
     if (typeof source === "string") {
       workerSource = source.length > 0 ? normalizeAbsoluteUrl(source) : source;
     } else {
-      const bytes = decisionHeadBytes(source);
+      const bytes = bufferSourceBytes(source);
       if (bytes) {
         const copy = new Uint8Array(bytes);
         workerSource = copy;
@@ -5963,7 +6200,7 @@ var LlamaWebGpuBridge = class {
       if (!this._shouldFallbackToMainThread(error)) {
         throw error;
       }
-      await this._recoverDecisionWorker(error);
+      await this._recoverWorkerOnMainThread(error);
       return loadInRuntime();
     }
   }
@@ -5990,7 +6227,7 @@ var LlamaWebGpuBridge = class {
         throw error;
       }
       this._decisionHeadMap().delete(handle);
-      await this._recoverDecisionWorker(error);
+      await this._recoverWorkerOnMainThread(error);
       throw new Error(
         `Decision head ${handle} was lost when the bridge worker failed (${serializeWorkerError(error)}). Load the decision head again.`
       );
@@ -6019,8 +6256,264 @@ var LlamaWebGpuBridge = class {
       if (!this._shouldFallbackToMainThread(error)) {
         throw error;
       }
-      await this._recoverDecisionWorker(error);
+      await this._recoverWorkerOnMainThread(error);
     }
+  }
+  // Test doubles skip the constructor, so the LoRA state starts on first use.
+  _loraAdapterMap() {
+    if (!(this._loraAdapters instanceof Map)) {
+      this._loraAdapters = /* @__PURE__ */ new Map();
+      this._activeLoraScales = /* @__PURE__ */ new Map();
+      this._nextLoraHandle = 1;
+    }
+    return this._loraAdapters;
+  }
+  _activeLoraScaleMap() {
+    this._loraAdapterMap();
+    return this._activeLoraScales;
+  }
+  _forgetLoraAdapters() {
+    this._loraAdapterMap().clear();
+    this._activeLoraScaleMap().clear();
+  }
+  /**
+   * Marks the adapters `owner` holds as lost before it loads the model again,
+   * which frees them. An adapter with a retained source reloads on the next
+   * restore or set; one without is forgotten.
+   */
+  _dropLoraAdaptersOf(owner) {
+    for (const [handle, entry] of this._loraAdapterMap()) {
+      if (owner === null || entry.owner !== owner) {
+        continue;
+      }
+      if (entry.source === null) {
+        this._loraAdapterMap().delete(handle);
+        this._activeLoraScaleMap().delete(handle);
+      } else {
+        entry.owner = null;
+      }
+    }
+  }
+  _loraOwner() {
+    return this._workerProxy || this._runtime || null;
+  }
+  _requireLoraRuntime() {
+    if (!this._runtime) {
+      throw new Error("No model loaded. Call loadModelFromUrl first.");
+    }
+    return this._runtime;
+  }
+  _loraAdapterEntry(handle) {
+    const entry = this._loraAdapterMap().get(handle);
+    if (!entry) {
+      throw staleLoraAdapterError(handle);
+    }
+    return entry;
+  }
+  // Loads an adapter into the current owner: the worker, or the direct runtime.
+  async _loadLoraAdapterIntoOwner(source, options) {
+    if (!this._workerProxy) {
+      const runtime = this._requireLoraRuntime();
+      const info2 = await runtime.loadLoraAdapter(source, {
+        ...options,
+        signal: this._operationSignal() || options.signal || null
+      });
+      return { owner: runtime, handle: info2.handle };
+    }
+    const workerOptions = {};
+    if (options.useCache !== void 0) {
+      workerOptions.useCache = options.useCache;
+    }
+    if (options.cacheName !== void 0) {
+      workerOptions.cacheName = options.cacheName;
+    }
+    let workerSource = source;
+    const transferList = [];
+    if (typeof source !== "string") {
+      workerSource = new Uint8Array(source);
+      transferList.push(workerSource.buffer);
+    }
+    const proxy = this._workerProxy;
+    const info = await this._callWorker(
+      "loadLoraAdapter",
+      [workerSource, workerOptions],
+      (event) => {
+        if (event.event === "progress") {
+          options.progressCallback?.(event.payload || {});
+        }
+      },
+      transferList
+    );
+    return { owner: proxy, handle: Number(info?.handle) };
+  }
+  // Reloads an adapter its owner lost, into the current owner.
+  async _ensureLoraAdapterOnOwner(handle, entry) {
+    if (entry.owner === this._loraOwner()) {
+      return;
+    }
+    if (entry.source === null) {
+      this._loraAdapterMap().delete(handle);
+      this._activeLoraScaleMap().delete(handle);
+      throw staleLoraAdapterError(handle);
+    }
+    const loaded = await this._loadLoraAdapterIntoOwner(entry.source, entry.cacheOptions);
+    entry.owner = loaded.owner;
+    entry.handle = loaded.handle;
+  }
+  async _callLoraOwner(method, args) {
+    if (this._workerProxy) {
+      await this._callWorker(method, args);
+      return;
+    }
+    const runtime = this._requireLoraRuntime();
+    if (method === "setLoraAdapter") {
+      await runtime.setLoraAdapter(args[0], args[1]);
+    } else if (method === "removeLoraAdapter") {
+      await runtime.removeLoraAdapter(args[0]);
+    } else {
+      await runtime.clearLoraAdapters();
+    }
+  }
+  /**
+   * Makes the current owner apply exactly the facade's active adapters after a
+   * worker restart or a fallback to the main thread. The owner's own set is
+   * cleared first, since a runtime that held the model earlier may still apply
+   * adapters from then. Inactive adapters reload when next set.
+   */
+  async _restoreLoraAdapters() {
+    const owner = this._loraOwner();
+    if (![...this._loraAdapterMap().values()].some((entry) => entry.owner !== owner)) {
+      return;
+    }
+    await this._callLoraOwner("clearLoraAdapters", []);
+    for (const [handle, scale] of [...this._activeLoraScaleMap()]) {
+      const entry = this._loraAdapterEntry(handle);
+      await this._ensureLoraAdapterOnOwner(handle, entry);
+      await this._callLoraOwner("setLoraAdapter", [entry.handle, scale]);
+    }
+  }
+  // Runs a LoRA call on the current owner, moving to the main-thread runtime
+  // and running it there once if the worker fails.
+  async _runLoraCall(call, cancelMessage) {
+    if (!this._workerProxy) {
+      return call();
+    }
+    try {
+      await this._restoreWorkerModelIfMissing();
+      return await call();
+    } catch (error) {
+      this._throwIfOperationCancelled(error, cancelMessage);
+      if (!this._shouldFallbackToMainThread(error)) {
+        throw error;
+      }
+      await this._recoverWorkerOnMainThread(error);
+      return call();
+    }
+  }
+  async getLoraAdapterCapabilities() {
+    return this._runExclusive(
+      () => this._getLoraAdapterCapabilitiesUnlocked(),
+      { kind: "lora-capabilities" }
+    );
+  }
+  async _getLoraAdapterCapabilitiesUnlocked() {
+    if (!this._workerProxy && !this._runtime) {
+      return { apiVersion: LORA_API_VERSION, supported: false, reason: "WebGPU core is not initialized" };
+    }
+    return this._runLoraCall(
+      () => this._workerProxy ? this._callWorker("getLoraAdapterCapabilities", []) : Promise.resolve(this._requireLoraRuntime().getLoraAdapterCapabilities()),
+      "LoRA capability probe was cancelled."
+    );
+  }
+  async loadLoraAdapter(source, options = {}) {
+    return this._runExclusive(
+      () => this._loadLoraAdapterUnlocked(source, options || {}),
+      {
+        signal: options?.signal,
+        abortMessage: LORA_LOAD_ABORT_MESSAGE,
+        kind: "lora-adapter-load"
+      }
+    );
+  }
+  async _loadLoraAdapterUnlocked(source, options) {
+    let normalized;
+    if (typeof source === "string") {
+      if (source.length === 0) {
+        throw new Error("LoRA adapter URL is empty.");
+      }
+      normalized = normalizeAbsoluteUrl(source);
+    } else {
+      const bytes = bufferSourceBytes(source);
+      if (!bytes) {
+        throw new TypeError("LoRA adapter source must be a URL string, an ArrayBuffer or a typed array.");
+      }
+      if (bytes.byteLength === 0) {
+        throw new Error("LoRA adapter bytes are empty.");
+      }
+      normalized = bytes;
+    }
+    let retained = null;
+    if (this._config?.disableWorker !== true) {
+      retained = typeof normalized === "string" ? normalized : new Uint8Array(normalized);
+    }
+    const loaded = await this._runLoraCall(
+      () => this._loadLoraAdapterIntoOwner(retained ?? normalized, options),
+      LORA_LOAD_ABORT_MESSAGE
+    );
+    this._loraAdapterMap();
+    const handle = this._nextLoraHandle++;
+    this._loraAdapterMap().set(handle, {
+      owner: loaded.owner,
+      handle: loaded.handle,
+      source: retained,
+      cacheOptions: { useCache: options.useCache, cacheName: options.cacheName }
+    });
+    return { handle };
+  }
+  async setLoraAdapter(handle, scale = 1) {
+    const facadeHandle = loraHandleFrom(handle);
+    const checkedScale = loraScaleFrom(scale);
+    return this._runExclusive(
+      () => this._setLoraAdapterUnlocked(facadeHandle, checkedScale),
+      { kind: "lora-adapter-set" }
+    );
+  }
+  async _setLoraAdapterUnlocked(handle, scale) {
+    const entry = this._loraAdapterEntry(handle);
+    await this._runLoraCall(async () => {
+      await this._ensureLoraAdapterOnOwner(handle, entry);
+      await this._callLoraOwner("setLoraAdapter", [entry.handle, scale]);
+    }, "LoRA adapter update was cancelled.");
+    this._activeLoraScaleMap().set(handle, scale);
+  }
+  async removeLoraAdapter(handle) {
+    const facadeHandle = loraHandleFrom(handle);
+    return this._runExclusive(
+      () => this._removeLoraAdapterUnlocked(facadeHandle),
+      { kind: "lora-adapter-remove" }
+    );
+  }
+  async _removeLoraAdapterUnlocked(handle) {
+    const entry = this._loraAdapterEntry(handle);
+    await this._runLoraCall(async () => {
+      if (entry.owner === this._loraOwner()) {
+        await this._callLoraOwner("removeLoraAdapter", [entry.handle]);
+      }
+    }, "LoRA adapter update was cancelled.");
+    this._activeLoraScaleMap().delete(handle);
+  }
+  async clearLoraAdapters() {
+    return this._runExclusive(
+      () => this._clearLoraAdaptersUnlocked(),
+      { kind: "lora-adapters-clear" }
+    );
+  }
+  async _clearLoraAdaptersUnlocked() {
+    await this._runLoraCall(
+      () => this._callLoraOwner("clearLoraAdapters", []),
+      "LoRA adapter update was cancelled."
+    );
+    this._activeLoraScaleMap().clear();
   }
   async tokenize(text, addSpecial = true) {
     return this._runExclusive(
@@ -6342,6 +6835,7 @@ var LlamaWebGpuBridge = class {
       this._multimodalWorkerCpuMode = false;
       this._workerModelMissing = false;
       this._decisionHeads?.clear();
+      this._forgetLoraAdapters();
       this._lifecycleState = "disposed";
     }
   }
@@ -6615,6 +7109,16 @@ function installBridgeWorkerHost() {
           self.postMessage({ type: "event", id, event: "progress", payload: progress || {} });
         };
         const value2 = await bridge.loadDecisionHead(args[0], options);
+        self.postMessage({ type: "result", id, value: value2 });
+        return;
+      }
+      if (method === "loadLoraAdapter") {
+        const options = args[1] && typeof args[1] === "object" ? { ...args[1] } : {};
+        delete options.signal;
+        options.progressCallback = (progress) => {
+          self.postMessage({ type: "event", id, event: "progress", payload: progress || {} });
+        };
+        const value2 = await bridge.loadLoraAdapter(args[0], options);
         self.postMessage({ type: "result", id, value: value2 });
         return;
       }

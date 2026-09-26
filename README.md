@@ -19,8 +19,8 @@ Applications that consume the browser assets directly should start with the
 [`LlamaWebGpuBridge` public API reference](docs/api.md). The generated
 `llama_webgpu_bridge.d.ts` file is published with the JS/WASM assets; the API
 reference explains the runtime behavior for model loading, generation,
-tokenization, embeddings, next-token scoring, multimodal projector support, state persistence,
-metadata, cancellation, disposal, and worker-host bootstrap.
+tokenization, embeddings, next-token scoring, multimodal projector support, LoRA adapters,
+state persistence, metadata, cancellation, disposal, and worker-host bootstrap.
 
 ## Build
 
@@ -173,6 +173,18 @@ fixture row with a Laya reference and stays out of default CI; the invocation is
 in [CONTRIBUTING.md](CONTRIBUTING.md#validate-outputs). No qualification gate
 runs it, so release manifests list no decision capability; probe support with
 `getDecisionCapabilities()`.
+
+## LoRA adapters
+
+`loadLoraAdapter()` loads a GGUF LoRA adapter from a URL or bytes, and
+`setLoraAdapter()`, `removeLoraAdapter()` and `clearLoraAdapters()` change the
+applied set and scales at runtime, in direct and worker runtimes and in wasm32
+and memory64. aLoRA adapters are rejected. Probe support with
+`getLoraAdapterCapabilities()`. See [docs/api.md](docs/api.md#lora-adapters).
+
+The real-model smoke, `scripts/lora_adapter_browser_smoke.mjs`, stays out of
+default CI; the invocation is in
+[CONTRIBUTING.md](CONTRIBUTING.md#validate-outputs).
 
 ## CI
 
