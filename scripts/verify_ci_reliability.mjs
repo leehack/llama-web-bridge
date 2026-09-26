@@ -777,7 +777,20 @@ function environmentValidationMissing(run, validator) {
 // Checks
 // ---------------------------------------------------------------------------
 
-// R1: every JS contract test in tests/js is run by `npm run check:js`.
+// R1: `npm run check:js` runs every contract test. `npm test` hands Node's
+// test runner one glob over tests/, so a new *_test.mjs runs without being
+// registered. Every other file under tests/ must be a helper that a test
+// reaches through relative imports, so a misnamed test cannot sit there unrun.
+export const TEST_COMMAND = "node --test 'tests/**/*_test.mjs'";
+
+// Static imports, re-exports, bare imports and literal dynamic imports.
+const RELATIVE_IMPORT = /(?:\bfrom|\bimport)\s*\(?\s*(['"`])(\.\.?\/[^'"`$]+)\1/g;
+
+function relativeImports(from, text) {
+  return [...String(text).matchAll(RELATIVE_IMPORT)]
+    .map((match) => path.posix.normalize(path.posix.join(path.posix.dirname(from), match[2])));
+}
+
 export function checkJsContractTestsRegistered(packageJson, testFiles, errors) {
   let scripts = {};
   try {
@@ -785,15 +798,29 @@ export function checkJsContractTestsRegistered(packageJson, testFiles, errors) {
   } catch (error) {
     errors.push(`package.json is not valid JSON: ${error.message}`);
   }
-  const commands = new Set();
-  for (const step of String(scripts['check:js'] ?? '').split(' && ')) {
-    const match = /^npm run (\S+)$/.exec(step);
-    if (match && typeof scripts[match[1]] === 'string') commands.add(scripts[match[1]]);
+  if (scripts.test !== TEST_COMMAND) {
+    errors.push(`npm test must be exactly "${TEST_COMMAND}"`);
   }
-  if (testFiles.length === 0) errors.push('tests/js has no *_test.mjs contract tests');
-  for (const file of testFiles) {
-    if (!commands.has(`node tests/js/${file}`)) {
-      errors.push(`npm run check:js must run tests/js/${file} through an npm script that is exactly "node tests/js/${file}"`);
+  const steps = String(scripts['check:js'] ?? '').split(' && ');
+  if (!steps.includes('npm test') && !steps.includes('npm run test')) {
+    errors.push('npm run check:js must run npm test');
+  }
+  const paths = Object.keys(testFiles).sort();
+  const pending = paths.filter((relativePath) => relativePath.endsWith('_test.mjs'));
+  if (pending.length === 0) errors.push('tests/ has no *_test.mjs contract tests');
+  const reached = new Set(pending);
+  while (pending.length > 0) {
+    const from = pending.pop();
+    for (const target of relativeImports(from, testFiles[from])) {
+      if (Object.hasOwn(testFiles, target) && !reached.has(target)) {
+        reached.add(target);
+        pending.push(target);
+      }
+    }
+  }
+  for (const relativePath of paths) {
+    if (!reached.has(relativePath)) {
+      errors.push(`${relativePath} is neither a *_test.mjs test nor a helper a test imports, so npm test never runs it`);
     }
   }
 }
@@ -1480,6 +1507,19 @@ function listRequired(relativeDirectory, pattern, errors) {
   }
 }
 
+function readTestFiles(errors) {
+  try {
+    const paths = fs.readdirSync(path.join(ROOT, 'tests'), { recursive: true })
+      .filter((name) => !String(name).split(path.sep).some((part) => part.startsWith('.')))
+      .map((name) => `tests/${String(name).split(path.sep).join('/')}`)
+      .filter((relativePath) => fs.statSync(path.join(ROOT, relativePath)).isFile());
+    return Object.fromEntries(paths.map((relativePath) => [relativePath, readRequired(relativePath, errors)]));
+  } catch (error) {
+    errors.push(`required directory is not readable: tests: ${error.message}`);
+    return {};
+  }
+}
+
 export function collectErrors() {
   const errors = [];
   if (expectedModelPinsError) errors.push(expectedModelPinsError);
@@ -1504,7 +1544,7 @@ export function collectErrors() {
       .map((relativePath) => new Workflow(relativePath, readRequired(relativePath, errors), errors)),
   ];
 
-  checkJsContractTestsRegistered(files['package.json'], listRequired('tests/js', /_test\.mjs$/, errors), errors);
+  checkJsContractTestsRegistered(files['package.json'], readTestFiles(errors), errors);
   checkSecretReferences(allWorkflows, errors);
   checkPermissions(allWorkflows, errors);
   checkNoContinueOnError(allWorkflows, errors);

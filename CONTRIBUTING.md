@@ -43,13 +43,12 @@ list.
 Bridge wrapper source lives under `js/src/`; `npm run build:js` regenerates the
 checked-in browser ESM outputs and declarations under `js/`. `npm run check:js`
 runs the same generator plus TypeScript and syntax checks, so commit any updated
-`js/` outputs after source changes. It also runs the JS contract tests,
+`js/` outputs after source changes. It ends with `npm test`, which runs every
+`tests/**/*_test.mjs` contract test in parallel through Node's test runner,
 including the static state-persistence, text-to-speech, and decision API
-contracts (`npm run test:api-state-persistence`, `npm run test:api-tts`, and
-`npm run test:api-decision`), the media-helper compatibility contract
-(`npm run test:mtmd-compat`), the wasm64 runtime patch contract for
-`scripts/patch_wasm64_runtime.mjs` (`npm run test:wasm64-runtime-patch`), and
-the CI change selector (`npm run test:ci-scope`).
+contracts, the media-helper compatibility contract, the wasm64 runtime patch
+contract for `scripts/patch_wasm64_runtime.mjs`, and the CI change selector.
+Run one test file directly with `node tests/js/<name>_test.mjs`.
 
 `js/src/llama_webgpu_bridge.js` is the public entry. It re-exports the API and
 owns the only load-time side effects (worker host auto-boot and the
@@ -256,7 +255,8 @@ query strings, and fragments before printing the location.
   `scripts/release_qualification.py`. It checks permissions, environment gates,
   PAT handling, pins, fail-closed guards, and that CI runs the contract tests;
   it does not check wording, step names it does not anchor on, or docs prose.
-  Every new `tests/js/*_test.mjs` must be run by `npm run check:js`.
+  A new test in `tests/js/` runs once it is named `*_test.mjs`; any other file
+  under `tests/` must be a helper that a test imports.
 - Rotate all 7 model/projector SHA-256 pins in the three files that hard-code
   them together: `CONTRIBUTING.md`, `.github/workflows/ci.yml`,
   `.github/workflows/bridge_candidate.yml`.

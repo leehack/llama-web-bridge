@@ -1,6 +1,7 @@
 // Static API contract checks for versioned Web decision-head support.
 import { bridgeJsSource, methodBody, readRepoText } from './bridge_js_source.mjs';
 import { readNativeCoreSource } from './native_core_source.mjs';
+import { TEST_COMMAND } from '../../scripts/verify_ci_reliability.mjs';
 
 const CORE = readNativeCoreSource();
 const DECISION = readRepoText('src/llama_webgpu_decision.cpp');
@@ -234,9 +235,11 @@ require(
   ),
   'TypeScript declarations must expose decision capabilities, head info, sequences and outputs',
 );
+// npm test globs tests/**/*_test.mjs, so the contract test above runs once it
+// exists under that name.
 require(
-  PACKAGE.includes('"test:decision"') && PACKAGE.includes('npm run test:decision'),
-  'check:js must define and run the decision bridge contract test',
+  JSON.parse(PACKAGE).scripts?.test === TEST_COMMAND,
+  'npm test must run the decision bridge contract test',
 );
 require(
   includesAll(
