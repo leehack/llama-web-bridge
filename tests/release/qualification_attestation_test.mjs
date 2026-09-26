@@ -11,13 +11,14 @@ import { test } from 'node:test';
 
 import { ContractError } from '../../scripts/release/contract.mjs';
 import {
-  PyFloat, pyDict, pyEquals, pyItems, pyJsonDumps, pyJsonLoads,
+  PyFloat, pyDict, pyEquals, pyItems, pyJsonDumps, pyJsonLoads, pyRepr,
 } from '../../scripts/release/json.mjs';
 import { ARTIFACTS, generate } from '../../scripts/release/manifest.mjs';
 import {
   ATTESTATION_CANONICAL_NESTING,
   ATTESTATION_KEYS,
   EXPECTED_MODEL_PINS,
+  HARNESS_VERSION,
   HEAVY_GATES,
   MAX_ATTESTATION_BYTES,
   MAX_QUALIFICATION_CPU_COUNT,
@@ -274,6 +275,21 @@ qualificationTest('test_wrong_attestation_type_or_schema_rejected', (t) => {
     const bad = copy(t.attestation);
     bad[key] = value;
     raises(() => t.verify(bad), `${key}=${String(value)}`);
+  }
+});
+
+// The Node harness cutover is a hard cut: a 5.0.0 attestation, which the
+// Node qualify writes over the Node harness, verifies, and one written by the
+// 4.0.0 Python harness (or any other version) is rejected on its version
+// before anything else, whatever it binds.
+qualificationTest('the verifier accepts only harness 5.0.0 attestations', (t) => {
+  assert.equal(HARNESS_VERSION, '5.0.0');
+  assert.equal(t.attestation.harness_version, '5.0.0');
+  assert.equal(t.verify(t.attestation).verified, true);
+  for (const version of ['4.0.0', '3.0.0', '5.0.1', '5.0', '']) {
+    const old = copy(t.attestation);
+    old.harness_version = version;
+    assert.equal(raises(() => t.verify(old)), `harness_version must be '5.0.0', got ${pyRepr(version)}`);
   }
 });
 
@@ -737,8 +753,8 @@ qualificationTest('attestation floats, ints and error text follow Python', (t) =
   assert.equal(t.verify(attestation).verified, true);
   // Python repr in messages.
   const bad = copy(t.attestation);
-  bad.harness_version = new PyFloat(4.0);
-  assert.equal(raises(() => t.verify(bad)), "harness_version must be '4.0.0', got 4.0");
+  bad.harness_version = new PyFloat(5.0);
+  assert.equal(raises(() => t.verify(bad)), "harness_version must be '5.0.0', got 5.0");
   const phase = copy(t.attestation);
   phase.phases.speech_to_text.modes.splice(0, 1);
   assert.equal(

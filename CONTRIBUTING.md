@@ -124,7 +124,6 @@ Before opening or updating a PR, run the lightweight contracts:
 
 ```bash
 npm run check:js
-python3 -m unittest discover -s scripts -p '*_test.py'
 node scripts/ci/verify_ci_reliability.mjs
 ```
 
@@ -213,7 +212,7 @@ the candidate source's locked npm dependencies and Playwright Chromium, requires
 GitHub Actions `github-hosted` runner identity, and emits one canonical
 attestation. That attestation binds the candidate artifact ID/run/attempt/workflow/digest and the
 producing qualification run ID/attempt/workflow/source SHA. The combined
-`release_qualification.py qualify` command is therefore workflow-only.
+`scripts/release/qualification.mjs qualify` command is therefore workflow-only.
 
 For local reproduction, run the individual smokes directly:
 
@@ -284,8 +283,9 @@ query strings, and fragments before printing the location.
   `.github/workflows/publish_assets.yml`,
   `.github/workflows/auto_llama_cpp_update.yml`,
   `.github/workflows/bridge_qualification.yml`, or the model pins in
-  `scripts/release_qualification.py`. It checks permissions, environment gates,
-  PAT handling, pins, fail-closed guards, and that CI runs the contract tests;
+  `scripts/release/qualification.mjs`. It checks permissions, environment gates,
+  PAT handling, pins, fail-closed guards, that CI runs the contract tests, and
+  that no workflow runs Python, `pip`, `py_compile` or a `*.py` script;
   it does not check wording, step names it does not anchor on, or docs prose.
   A new test under `tests/` runs once it is named `*_test.mjs`; any other file
   under `tests/` must be a helper that a test imports.
@@ -296,14 +296,14 @@ query strings, and fragments before printing the location.
   exactly 7 pins each; a stale `bridge_candidate.yml` breaks the candidate job,
   not just CI. `README.md` and `AGENTS.md` hold no pins and link here.
   `publish_assets.yml` holds no pins because it neither builds nor
-  smokes. `scripts/release_qualification.py` carries the same 7 plus the pinned
+  smokes. `scripts/release/qualification.mjs` carries the same 7 plus the pinned
   ASR audio fixture, and every attestation must match them exactly.
   `.github/workflows/bridge_qualification.yml` hand-copies a 5-pin speech, TTS,
   and ASR audio subset, so rotate it with the rest.
   `scripts/smoke/speech_to_text_fixture.json` holds the same ASR audio URL and
   SHA-256, which the speech smoke uses as defaults, with the expected
-  transcript that `scripts/release_qualification.py` also reads.
-  `scripts/release_qualification_test.py` requires its SHA-256 to equal the
+  transcript that `scripts/release/qualification.mjs` also reads.
+  `tests/release/qualification_pins_test.mjs` requires its SHA-256 to equal the
   pin; nothing compares its URL, so rotate that by hand.
 - The script maps every workflow `<ROLE>_SHA256` env key to its canonical name in
   `EXPECTED_MODEL_PINS` and requires equality in all three workflows, so a role
@@ -324,8 +324,8 @@ query strings, and fragments before printing the location.
 - Keep `scripts/smoke/multimodal.mjs` in normal CI for every llama.cpp
   pin update; build-only validation does not cover mtmd prompt ingestion.
 - Heavy real-model ASR and TTS gates run through
-  `scripts/release_qualification.py` in automated qualification. Keep the
-  candidate manifest honest: `generate_release_manifest.py` must record those
+  `scripts/release/qualification.mjs` in automated qualification. Keep the
+  candidate manifest honest: `scripts/release/manifest.mjs` must record those
   two gates as `required-automated-qualification`, never as a candidate-build
   pass, and must
   keep real-device playback, intelligibility, and speaker-reference fidelity in
@@ -478,8 +478,8 @@ also require a successful stage run on the default branch with owner actor and
 triggering actor before either job starts.
 
 New bridge asset tags are npm-shaped `vMAJOR.MINOR.PATCH` with rebuild `0`:
-`select_next_release_target` skips a published or claimed version by taking
-the next free patch version, and `release_contract.py validate-release` rejects
+`selectNextReleaseTarget` skips a published or claimed version by taking
+the next free patch version, and `scripts/release/contract.mjs validate-release` rejects
 a new `-N` tag in the candidate and publish workflows, because npm orders
 `vMAJOR.MINOR.PATCH-N` as a prerelease. Earlier `-N` bridge tags, the native
 forms `vMAJOR.MINOR.PATCH-N`, `bNNNN` and `bNNNN-N`, historical

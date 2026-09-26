@@ -67,8 +67,8 @@ function commitRepository(repository, files) {
 }
 
 test('test_harness_digest_covers_every_heavy_gate_source', () => withTmp((tmp) => {
-  assert.ok(HARNESS_SOURCES.includes('release_contract.py'));
-  assert.ok(HARNESS_SOURCES.includes('release_publication_state.py'));
+  assert.ok(HARNESS_SOURCES.includes('release/contract.mjs'));
+  assert.ok(HARNESS_SOURCES.includes('release/publication_state.mjs'));
   const baseline = harnessSourceSha256(SCRIPTS_DIR);
   for (const name of HARNESS_SOURCES) {
     const mirror = path.join(tmp, `mirror-${name.replaceAll('/', '-')}`);
@@ -116,73 +116,159 @@ test('test_speech_fixture_fails_closed', () => withTmp((tmp) => {
   raises(() => loadSpeechFixture(file));
 }));
 
-test('test_harness_sources_are_exactly_what_the_gates_execute_or_read', () => {
-  // The Python import closure of release_qualification.py: every top-level
-  // `import x` / `from x import` (at any indentation, as ast.walk sees them)
-  // that names a scripts/*.py file.
-  const pythonClosure = (name, seen) => {
-    if (seen.has(name)) return;
-    seen.add(name);
-    const text = fs.readFileSync(path.join(SCRIPTS_DIR, name), 'utf8');
-    const modules = [];
-    for (const match of text.matchAll(/^[ \t]*import[ \t]+([\w.]+(?:[ \t]+as[ \t]+\w+)?(?:[ \t]*,[ \t]*[\w.]+(?:[ \t]+as[ \t]+\w+)?)*)/gm)) {
-      for (const part of match[1].split(',')) modules.push(part.trim().split(/\s+/)[0]);
-    }
-    for (const match of text.matchAll(/^[ \t]*from[ \t]+(\w[\w.]*)[ \t]+import\b/gm)) modules.push(match[1]);
-    for (const module of modules) {
-      const candidate = `${module.split('.')[0]}.py`;
-      if (fs.existsSync(path.join(SCRIPTS_DIR, candidate)) && fs.statSync(path.join(SCRIPTS_DIR, candidate)).isFile()) {
-        pythonClosure(candidate, seen);
-      }
-    }
-  };
+// The module specifiers of `text`: static imports and re-exports (which
+// may span lines), bare imports, and dynamic import() calls, whose target
+// must be a plain string literal. Comment lines are prose, not code.
+const STATIC_SPECIFIER = /^[ \t]*(?:import|export)\b[^;'"`]*?\bfrom\s*(['"])([^'"]+)\1/gm;
+const BARE_SPECIFIER = /^[ \t]*import\s*(['"])([^'"]+)\1/gm;
+const DYNAMIC_IMPORT = /(?<![\w$.])import\s*\(/g;
+const LITERAL_ARGUMENT = /^\s*(['"])([^'"`$\\]+)\1\s*\)/;
 
-  // Static and dynamic imports and re-exports; a relative specifier is a
-  // file relative to the importer, inside scripts/. Harness page code imports
-  // '/...' URLs from the web root, which are not scripts/ files.
-  const specifier = /(?:\bfrom\s*|\bimport\s*\(?\s*)(['"])([^'"]+)\1/g;
-  const nodeClosure = (name, seen) => {
+function moduleSpecifiers(name, text) {
+  const specifiers = [...text.matchAll(STATIC_SPECIFIER), ...text.matchAll(BARE_SPECIFIER)].map((match) => match[2]);
+  for (const match of text.matchAll(DYNAMIC_IMPORT)) {
+    const lineStart = text.lastIndexOf('\n', match.index) + 1;
+    if (/^\s*(?:\/\/|\*|\/\*)/.test(text.slice(lineStart, match.index))) continue;
+    const literal = LITERAL_ARGUMENT.exec(text.slice(match.index + match[0].length));
+    assert.ok(literal, `${name} has an import() whose target is not a string literal, which the closure cannot follow`);
+    specifiers.push(literal[2]);
+  }
+  return specifiers;
+}
+
+// Parse the imports of the harness entries and return the sorted closure of
+// scripts/ files they reach, plus `extraFiles` (the speech fixture, which
+// qualification.mjs reads by path). Only node: builtins, the smokes'
+// 'playwright' (the candidate's locked dependency) and the '/...' web-root
+// URLs the smokes' page code imports may be non-relative.
+export function harnessClosure(scriptsDir, entries, extraFiles = []) {
+  const seen = new Set();
+  const visit = (name) => {
     if (seen.has(name)) return;
     seen.add(name);
     if (!name.endsWith('.mjs')) return;
-    const text = fs.readFileSync(path.join(SCRIPTS_DIR, name), 'utf8');
-    // Any other file a module reads would have to be located through
-    // import.meta; only the entry-point check may use it.
-    assert.deepEqual([...text.matchAll(/import\.meta\.(?!main\b)\w+/g)].map((match) => match[0]), [], name);
-    assert.ok(!text.includes('__dirname'), name);
-    for (const [, , spec] of text.matchAll(specifier)) {
+    const text = fs.readFileSync(path.join(scriptsDir, name), 'utf8');
+    assert.ok(!/\bcreateRequire\b|(?<![\w$.])require\s*\(/.test(text), `${name} loads modules through require`);
+    for (const spec of moduleSpecifiers(name, text)) {
       if (spec.startsWith('./') || spec.startsWith('../')) {
-        const target = path.resolve(SCRIPTS_DIR, path.dirname(name), spec);
-        const relative = path.relative(SCRIPTS_DIR, target);
-        assert.ok(!relative.startsWith('..') && !path.isAbsolute(relative), spec);
-        nodeClosure(relative.split(path.sep).join('/'), seen);
+        const target = path.posix.normalize(path.posix.join(path.posix.dirname(name), spec));
+        assert.ok(!target.startsWith('../'), `${name} imports ${spec} from outside scripts/`);
+        visit(target);
       } else {
         assert.ok(spec.startsWith('node:') || spec.startsWith('/') || spec === 'playwright', `${name} imports ${JSON.stringify(spec)}`);
       }
     }
   };
+  for (const entry of entries) visit(entry);
+  for (const file of extraFiles) seen.add(file);
+  return [...seen].sort();
+}
 
+// The harness entries: the qualification CLI and the module it runs the
+// gates from, the smokes qualify runs, and the candidate build's hosted gate
+// smokes (read from bridge_candidate.yml).
+function harnessEntries() {
   const workflow = fs.readFileSync(path.join(SCRIPTS_DIR, '..', '.github', 'workflows', 'bridge_candidate.yml'), 'utf8');
   const candidateGates = [...workflow.matchAll(/run: node scripts\/(\S+\.mjs)\s*$/gm)].map((match) => match[1]);
   assert.deepEqual([...candidateGates].sort(), ['smoke/multimodal.mjs', 'smoke/state_persistence.mjs']);
-  const closure = new Set();
-  pythonClosure('release_qualification.py', closure);
-  closure.add(SPEECH_FIXTURE_FILE);
-  for (const smoke of [...QUALIFICATION_SMOKES, ...candidateGates]) nodeClosure(smoke, closure);
-  assert.deepEqual([...closure].sort(), [...HARNESS_SOURCES].sort());
+  return ['release/qualification.mjs', 'release/qualify.mjs', ...QUALIFICATION_SMOKES, ...candidateGates];
+}
+
+test('test_harness_sources_are_exactly_what_the_gates_execute_or_read', () => {
+  const closure = harnessClosure(SCRIPTS_DIR, harnessEntries(), [SPEECH_FIXTURE_FILE]);
+  assert.deepEqual([...HARNESS_SOURCES].sort(), closure);
+  assert.deepEqual([...HARNESS_SOURCES], closure, 'HARNESS_SOURCES must be listed sorted');
   assert.equal(new Set(HARNESS_SOURCES).size, HARNESS_SOURCES.length);
+  // The release modules the entries import are harness code, as their .py
+  // originals were.
+  for (const name of ['release/contract.mjs', 'release/manifest.mjs', 'release/publication_state.mjs']) {
+    assert.ok(closure.includes(name), name);
+  }
+  // Nothing outside the closure locates a file through import.meta: only the
+  // entry-point checks, the program name, and the two reviewed paths into
+  // scripts/ (qualify's scripts directory and the speech fixture), which
+  // both resolve inside the digested tree.
+  const reviewed = new Set([
+    'release/qualify.mjs:export const SCRIPTS_DIR = path.dirname(path.dirname(fs.realpathSync(fileURLToPath(import.meta.url))));',
+    "release/qualification.mjs:export const SPEECH_FIXTURE = Object.freeze(loadSpeechFixture(path.join(import.meta.dirname, '..', SPEECH_FIXTURE_FILE)));",
+  ]);
+  for (const name of closure.filter((file) => file.endsWith('.mjs'))) {
+    const text = fs.readFileSync(path.join(SCRIPTS_DIR, name), 'utf8');
+    assert.ok(!text.includes('__dirname') && !text.includes('__filename'), name);
+    for (const line of text.split('\n')) {
+      const uses = [...line.matchAll(/import\.meta\.(\w+)/g)].map((match) => match[1]);
+      if (uses.length === 0 || uses.every((use) => use === 'main')) continue;
+      if (/progName\(import\.meta\.url\)/.test(line) && uses.every((use) => use === 'url')) continue;
+      assert.ok(reviewed.has(`${name}:${line.trim()}`), `${name} uses import.meta outside the reviewed paths: ${line.trim()}`);
+    }
+  }
 });
+
+test('the harness closure follows every relative import form and fails on a new one', () => withTmp((tmp) => {
+  const files = {
+    'release/entry.mjs': [
+      "import { a } from './a.mjs';",
+      "export { b } from './b.mjs';",
+      "import './side.mjs';",
+      "const lazy = await import('./lazy.mjs');",
+      "import fs from 'node:fs';",
+      "import data from '../smoke/data.json' with { type: 'json' };",
+      'import {',
+      '  multi,',
+      "} from './multi.mjs';",
+      "// A comment naming import('./commented.mjs') or from './commented.mjs' is prose.",
+    ].join('\n'),
+    'release/a.mjs': "import { c } from '../smoke/c.mjs';",
+    'release/b.mjs': '',
+    'release/multi.mjs': '',
+    'release/side.mjs': '',
+    'release/lazy.mjs': '',
+    'release/unlisted.mjs': '',
+    'smoke/c.mjs': "const page = () => import('/llama_webgpu_bridge.js');\nimport('playwright');",
+    'smoke/data.json': '{}',
+  };
+  for (const [name, text] of Object.entries(files)) {
+    fs.mkdirSync(path.dirname(path.join(tmp, name)), { recursive: true });
+    fs.writeFileSync(path.join(tmp, name), text);
+  }
+  assert.deepEqual(harnessClosure(tmp, ['release/entry.mjs'], ['fixture.json']), [
+    'fixture.json', 'release/a.mjs', 'release/b.mjs', 'release/entry.mjs', 'release/lazy.mjs', 'release/multi.mjs', 'release/side.mjs',
+    'smoke/c.mjs', 'smoke/data.json',
+  ]);
+  // A new relative import widens the closure, so HARNESS_SOURCES no longer
+  // equals it.
+  fs.appendFileSync(path.join(tmp, 'release/b.mjs'), "\nimport './unlisted.mjs';\n");
+  assert.ok(harnessClosure(tmp, ['release/entry.mjs']).includes('release/unlisted.mjs'));
+  for (const [label, text] of [
+    ['a package', "import yaml from 'yaml';"],
+    ['a computed import()', 'const m = await import(name);'],
+    ['a template literal import()', 'const m = await import(`./x.mjs`);'],
+    ['require', "const x = require('./x.cjs');"],
+    ['an import from outside scripts/', "import '../../x.mjs';"],
+  ]) {
+    fs.writeFileSync(path.join(tmp, 'release/b.mjs'), text);
+    assert.throws(() => harnessClosure(tmp, ['release/entry.mjs']), assert.AssertionError, label);
+  }
+}));
 
 test('test_harness_version_moves_with_the_harness_sources', () => {
   // A new harness file list is a new harness: bump HARNESS_VERSION with it,
   // so an attestation from the old list fails on its version too.
   assert.deepEqual([HARNESS_VERSION, [...HARNESS_SOURCES].sort()], [
-    '4.0.0',
+    '5.0.0',
     [
-      'generate_release_manifest.py',
-      'release_contract.py',
-      'release_publication_state.py',
-      'release_qualification.py',
+      'release/archive.mjs',
+      'release/cli.mjs',
+      'release/contract.mjs',
+      'release/errors.mjs',
+      'release/json.mjs',
+      'release/manifest.mjs',
+      'release/publication_state.mjs',
+      'release/python_compat.mjs',
+      'release/qualification.mjs',
+      'release/qualify.mjs',
+      'release/unicode15.mjs',
+      'release/wav.mjs',
       'smoke/multimodal.mjs',
       'smoke/speech_to_text.mjs',
       'smoke/speech_to_text_fixture.json',
@@ -218,11 +304,11 @@ function referenceDigest(entries) {
 }
 
 test('harness digests take source names with sub-paths', () => withTmp((tmp) => {
-  const sources = ['release/qualification.mjs', 'smoke/support.mjs', 'release_contract.py', 'release.mjs', 'fixture.json'];
+  const sources = ['release/qualification.mjs', 'smoke/support.mjs', 'release_contract.txt', 'release.mjs', 'fixture.json'];
   const files = {
     'scripts/release/qualification.mjs': 'q',
     'scripts/smoke/support.mjs': 's',
-    'scripts/release_contract.py': 'c',
+    'scripts/release_contract.txt': 'c',
     'scripts/release.mjs': 'r',
     'scripts/fixture.json': '{}',
   };

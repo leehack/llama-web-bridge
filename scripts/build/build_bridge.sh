@@ -37,7 +37,7 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
 Build llama-web-bridge wasm/js artifacts.
 
 Requirements:
-  node, npm         JS bridge bundling/type-checking and the wasm64 runtime patch
+  node, npm         JS bridge bundling/type-checking, the emsdk.version check and the wasm64 runtime patch
   c++, git          Host C++17 compiler and git for the npm run check:js contracts
   emcmake, emcc     Emscripten SDK matching emsdk.version in PATH
   cmake             CMake configure/build driver
@@ -74,8 +74,19 @@ if ! command -v emcc >/dev/null 2>&1; then
   exit 1
 fi
 
+# The Node tools run their main only under import.meta.main (Node 22.18+ or
+# 24.2+); on an older Node they would exit 0 without checking anything.
+if ! node -e '
+const [major, minor] = process.versions.node.split(".").map(Number);
+if (!(major > 24 || (major === 24 && minor >= 2) || (major === 22 && minor >= 18))) {
+  console.error(`error: Node.js ${process.versions.node} is too old; the build tools need Node.js 22.18+ or 24.2+`);
+  process.exit(1);
+}'; then
+  exit 1
+fi
+
 echo "[bridge] verifying Emscripten SDK pin"
-python3 "$BRIDGE_DIR/scripts/verify_emscripten_version.py"
+node "$BRIDGE_DIR/scripts/build/verify_emscripten_version.mjs"
 
 if ! command -v cmake >/dev/null 2>&1; then
   echo "error: cmake not found in PATH"

@@ -107,6 +107,13 @@ jobs:
           ref: ${{ github.sha }}
           persist-credentials: false
 
+      # The trusted contract CLIs are zero-dependency Node modules: they need
+      # Node.js and nothing from npm.
+      - name: Setup Node.js for the trusted contract
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
       - name: Prove the candidate run identity and artifact uniqueness
         env:
           GH_TOKEN: ${{ github.token }}
@@ -118,7 +125,7 @@ jobs:
             > "${RUNNER_TEMP}/candidate-run/run.json"
           gh api "repos/${BRIDGE_REPO}/actions/runs/${CANDIDATE_RUN_ID}/artifacts?per_page=100" \
             > "${RUNNER_TEMP}/candidate-run/artifacts.json"
-          verification="$(python3 scripts/release_qualification.py verify-run \
+          verification="$(node scripts/release/qualification.mjs verify-run \
             --run-json "${RUNNER_TEMP}/candidate-run/run.json" \
             --artifacts-json "${RUNNER_TEMP}/candidate-run/artifacts.json" \
             --run-id "${CANDIDATE_RUN_ID}" \
@@ -146,13 +153,8 @@ jobs:
           gh api -H "Accept: application/vnd.github+json" \
             "repos/${BRIDGE_REPO}/actions/artifacts/${CANDIDATE_ARTIFACT_ID}/zip" \
             > "${RUNNER_TEMP}/candidate.zip"
-          python3 - "${RUNNER_TEMP}/candidate.zip" "${RUNNER_TEMP}/candidate" <<'PY'
-          import sys
-          from pathlib import Path
-          sys.path.insert(0, "scripts")
-          from release_qualification import _extract_flat_artifact_archive
-          _extract_flat_artifact_archive(Path(sys.argv[1]), Path(sys.argv[2]), artifact_type="candidate")
-          PY
+          node scripts/release/qualification.mjs extract-artifact --type candidate \
+            --archive "${RUNNER_TEMP}/candidate.zip" --destination "${RUNNER_TEMP}/candidate"
 
       - name: Resolve and validate the exact candidate source identity
         id: candidate
@@ -160,7 +162,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          fingerprint="$(python3 scripts/release_qualification.py candidate-fingerprint \
+          fingerprint="$(node scripts/release/qualification.mjs candidate-fingerprint \
             --candidate-dist "${RUNNER_TEMP}/candidate")"
           bridge_source_sha="$(jq -er '.bridge_commit | select(test("^[0-9a-f]{40}$"))' \
             "${RUNNER_TEMP}/candidate/manifest.json")"
@@ -264,7 +266,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "${RUNNER_TEMP}/attestation"
-          python3 candidate-source/scripts/release_qualification.py qualify \
+          node candidate-source/scripts/release/qualification.mjs qualify \
             --candidate-run-id "${CANDIDATE_RUN_ID}" \
             --speech-model-path "${{ steps.models.outputs.speech_model }}" \
             --speech-mmproj-path "${{ steps.models.outputs.speech_mmproj }}" \
@@ -283,7 +285,7 @@ jobs:
           CANDIDATE_BRIDGE_SOURCE_SHA: ${{ steps.candidate.outputs.bridge_source_sha }}
         run: |
           set -euo pipefail
-          python3 scripts/release_qualification.py verify-attestation \
+          node scripts/release/qualification.mjs verify-attestation \
             --attestation "${RUNNER_TEMP}/attestation/qualification-attestation.json" \
             --candidate-dist "${RUNNER_TEMP}/candidate" \
             --candidate-run-id "${CANDIDATE_RUN_ID}" \

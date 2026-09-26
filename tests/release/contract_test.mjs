@@ -140,6 +140,42 @@ test('test_correlation_id_rejects_injection_and_ambiguity', () => {
   }
 });
 
+// The workflows' input checks, which replaced `python3 - <<PY from
+// scripts.release_contract import require_correlation_id / require_repository`
+// heredocs: silent on success (as the heredocs were), and the ContractError
+// text as `error: <message>` with exit status 1 otherwise.
+test('require-correlation-id and require-repository check workflow inputs silently', () => {
+  const ok = { returncode: 0, stdout: '', stderr: '' };
+  assert.deepEqual(runCli(['require-correlation-id', '--orchestrator-correlation-id', 'auto-stable-v0.5.0-1ded54a5b3d687df']), ok);
+  for (const invalid of ['', ' leading', 'two words', 'line\nbreak', 'x'.repeat(129), '../escape', 'a;b']) {
+    assert.deepEqual(runCli(['require-correlation-id', `--orchestrator-correlation-id=${invalid}`]), {
+      returncode: 1,
+      stdout: '',
+      stderr: 'error: orchestrator_correlation_id must be 1-128 safe identifier characters\n',
+    }, JSON.stringify(invalid));
+  }
+  assert.deepEqual(runCli(['require-repository', '--repository', 'leehack/llama-web-bridge-assets', '--field', 'assets_repo']), ok);
+  assert.deepEqual(runCli(['require-repository', '--repository', 'leehack/llamadart-native', '--field', 'native_repo']), ok);
+  for (const invalid of ['', 'leehack', 'a/b/c', 'owner/repo name', '/repo', 'owner/', 'owner/repo\n']) {
+    assert.deepEqual(runCli(['require-repository', `--repository=${invalid}`, '--field', 'native_repo']), {
+      returncode: 1,
+      stdout: '',
+      stderr: 'error: native_repo must use owner/repository syntax\n',
+    }, JSON.stringify(invalid));
+  }
+  // Both options are required; a value starting with '-' is not taken as one.
+  for (const argv of [
+    ['require-correlation-id'],
+    ['require-correlation-id', '--orchestrator-correlation-id', '-x'],
+    ['require-repository', '--repository', 'leehack/x'],
+    ['require-repository', '--field', 'assets_repo'],
+  ]) {
+    const result = runCli(argv);
+    assert.equal(result.returncode, 2, argv.join(' '));
+    assert.equal(result.stdout, '');
+  }
+});
+
 test('test_publication_environment_requires_fail_closed_policy', () => {
   const configured = {
     name: 'bridge-assets-publication',

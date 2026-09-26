@@ -78,6 +78,13 @@ export const CANDIDATE_ALLOWED_MEMBERS = Object.freeze(new Set(PUBLICATION_FILES
 export const MAX_ATTESTATION_MEMBER_BYTES = MAX_ATTESTATION_BYTES;
 export const MAX_ATTESTATION_TOTAL_BYTES = MAX_ATTESTATION_BYTES;
 export const ATTESTATION_ALLOWED_MEMBERS = Object.freeze(new Set(['qualification-attestation.json']));
+// The candidate build's prequalification record (bridge-candidate-prequalification),
+// which publication binds. The bounds are those of the inline extractor it
+// replaces: a 1 MiB archive holding one regular file of at most 128 KiB.
+export const MAX_PREQUALIFICATION_MEMBER_BYTES = 128 * 1024;
+export const MAX_PREQUALIFICATION_TOTAL_BYTES = MAX_PREQUALIFICATION_MEMBER_BYTES;
+export const MAX_PREQUALIFICATION_ARCHIVE_BYTES = 1024 * 1024;
+export const PREQUALIFICATION_ALLOWED_MEMBERS = Object.freeze(new Set(['candidate-prequalification.json']));
 
 const ZIP_STORED = 0;
 const ZIP_DEFLATED = 8;
@@ -135,7 +142,17 @@ export function artifactArchiveBounds(artifactType) {
   if (artifactType === 'attestation') {
     return [ATTESTATION_ALLOWED_MEMBERS, MAX_ATTESTATION_MEMBER_BYTES, MAX_ATTESTATION_TOTAL_BYTES];
   }
+  if (artifactType === 'prequalification') {
+    return [PREQUALIFICATION_ALLOWED_MEMBERS, MAX_PREQUALIFICATION_MEMBER_BYTES, MAX_PREQUALIFICATION_TOTAL_BYTES];
+  }
   throw new ContractError(`unknown artifact type: ${pyRepr(artifactType)}`);
+}
+
+// The size bound on the archive file itself, or null when only its members
+// are bounded.
+export function artifactArchiveSizeBound(artifactType) {
+  artifactArchiveBounds(artifactType);
+  return artifactType === 'prequalification' ? MAX_PREQUALIFICATION_ARCHIVE_BYTES : null;
 }
 
 // A positioned reader over the open archive, like Python's seek() + read().
@@ -646,7 +663,9 @@ function validateLocalHeader(reader, member, archiveSize, centralDirectoryOffset
 // Prove the whole inventory, then stream each member under hard byte caps.
 // Returns the sorted member names. `zipFile` is the dependency-injection seam
 // for zipfile.ZipFile.
-function stageArtifactArchive(archivePath, staging, { allowedMembers, perMemberCap, totalCap, zipFile }) {
+function stageArtifactArchive(archivePath, staging, {
+  allowedMembers, perMemberCap, totalCap, maxArchiveBytes, zipFile,
+}) {
   const archive = pyPath(String(archivePath));
   try {
     const fd = withFilename(archive, () => fs.openSync(archive, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW));
@@ -655,6 +674,9 @@ function stageArtifactArchive(archivePath, staging, { allowedMembers, perMemberC
       if (!archiveStat.isFile()) throw new ContractError(`artifact archive must be a regular file: ${archive}`);
       const archiveSize = archiveStat.size;
       if (archiveSize <= 0) throw new ContractError(`artifact archive is empty: ${archive}`);
+      if (maxArchiveBytes !== null && archiveSize > maxArchiveBytes) {
+        throw new ContractError(`artifact archive size ${archiveSize} exceeds bound ${maxArchiveBytes}: ${archive}`);
+      }
       const reader = new ArchiveReader(fd);
       const preflightCentralDirectoryOffset = preflightZipEndRecord(reader, archiveSize, allowedMembers.size);
       const parsed = zipFile(reader);
@@ -958,7 +980,7 @@ class PinnedDirectory {
 // written files behind.
 //
 // options:
-//   artifactType: 'candidate' (default) or 'attestation'
+//   artifactType: 'candidate' (default), 'attestation' or 'prequalification'
 //   replace(source, target): the rename primitive (os.replace); a seam for
 //     injecting placement failures and destination swaps
 //   zipFile(reader): the central directory reader (zipfile.ZipFile); a seam
@@ -977,6 +999,7 @@ export function extractFlatArtifactArchive(archivePath, destination, options = {
     procFdRoot = '/proc/self/fd',
   } = options;
   const [allowedMembers, perMemberCap, totalCap] = artifactArchiveBounds(artifactType);
+  const maxArchiveBytes = artifactArchiveSizeBound(artifactType);
   const destinationPath = pyPath(String(destination));
 
   let fd;
@@ -1017,7 +1040,9 @@ export function extractFlatArtifactArchive(archivePath, destination, options = {
   const placed = [];
   const stagedIdentities = new Map();
   try {
-    const names = stageArtifactArchive(archivePath, staging, { allowedMembers, perMemberCap, totalCap, zipFile });
+    const names = stageArtifactArchive(archivePath, staging, {
+      allowedMembers, perMemberCap, totalCap, maxArchiveBytes, zipFile,
+    });
     for (const name of names) stagedIdentities.set(name, identityOf(fs.lstatSync(path.join(staging, name), { bigint: true })));
     let current = null;
     try {
@@ -1067,7 +1092,7 @@ export function extractFlatArtifactArchive(archivePath, destination, options = {
 export const internals = { PinnedDirectory, pyPathParent, pyFixed1 };
 
 if (import.meta.main) {
-  // Diagnostic entry: node archive.mjs <archive> <destination> [candidate|attestation]
+  // Diagnostic entry: node archive.mjs <archive> <destination> [candidate|attestation|prequalification]
   const [archive, destination, artifactType = 'candidate'] = process.argv.slice(2);
   try {
     extractFlatArtifactArchive(archive, destination, { artifactType });

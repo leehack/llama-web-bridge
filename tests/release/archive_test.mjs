@@ -19,17 +19,23 @@ import {
   CANDIDATE_ALLOWED_MEMBERS,
   MAX_ATTESTATION_MEMBER_BYTES,
   MAX_CANDIDATE_MEMBER_BYTES,
+  MAX_PREQUALIFICATION_ARCHIVE_BYTES,
+  MAX_PREQUALIFICATION_MEMBER_BYTES,
+  MAX_PREQUALIFICATION_TOTAL_BYTES,
+  PREQUALIFICATION_ALLOWED_MEMBERS,
   PUBLICATION_FILES,
   artifactArchiveBounds,
+  artifactArchiveSizeBound,
   extractFlatArtifactArchive,
   internals,
 } from '../../scripts/release/archive.mjs';
+import { ARTIFACTS as MANIFEST_ARTIFACTS } from '../../scripts/release/manifest.mjs';
+import { PUBLICATION_FILES as STATE_PUBLICATION_FILES } from '../../scripts/release/publication_state.mjs';
 import { ContractError } from '../../scripts/release/errors.mjs';
 import { PyException, isPyException } from '../../scripts/release/json.mjs';
 import { osErrorString, pyDecodeCp437, pyReprBytes } from '../../scripts/release/python_compat.mjs';
 import { ZIP_BZIP2, ZIP_DEFLATED, buildZip, writeZip } from './zip_fixture.mjs';
 
-const REPO = path.resolve(import.meta.dirname, '..', '..');
 const ARTIFACTS = PUBLICATION_FILES.slice(0, -2);
 const S_IFLNK = 0o120000;
 const HAS_PROC_FD = fs.existsSync('/proc/self/fd');
@@ -523,15 +529,40 @@ test('test_unknown_artifact_type_rejected', () => {
 
 // --- Node port only ----------------------------------------------------------
 
-test('the candidate allowlist is release_publication_state.PUBLICATION_FILES', () => {
-  const manifest = fs.readFileSync(path.join(REPO, 'scripts', 'generate_release_manifest.py'), 'utf8');
-  const artifacts = /^ARTIFACTS = \(\n((?: {4}"[^"]+",\n)+)\)/m.exec(manifest);
-  assert.ok(artifacts, 'ARTIFACTS tuple not found in generate_release_manifest.py');
-  const state = fs.readFileSync(path.join(REPO, 'scripts', 'release_publication_state.py'), 'utf8');
-  assert.match(state, /^PUBLICATION_FILES = \(\*ARTIFACTS, "manifest\.json", "sha256sums\.txt"\)$/m);
-  const expected = [...artifacts[1].matchAll(/"([^"]+)"/g)].map((match) => match[1]);
-  assert.deepEqual(PUBLICATION_FILES, [...expected, 'manifest.json', 'sha256sums.txt']);
+test('the candidate allowlist is publication_state.PUBLICATION_FILES', () => {
+  // manifest.mjs's ARTIFACTS plus the two generated files, in that order.
+  assert.deepEqual(PUBLICATION_FILES, [...MANIFEST_ARTIFACTS, 'manifest.json', 'sha256sums.txt']);
+  assert.deepEqual(PUBLICATION_FILES, STATE_PUBLICATION_FILES);
   assert.deepEqual([...CANDIDATE_ALLOWED_MEMBERS], PUBLICATION_FILES);
+});
+
+test('the prequalification record has its own bounds', () => {
+  assert.deepEqual(artifactArchiveBounds('prequalification'), [
+    PREQUALIFICATION_ALLOWED_MEMBERS, MAX_PREQUALIFICATION_MEMBER_BYTES, MAX_PREQUALIFICATION_TOTAL_BYTES,
+  ]);
+  assert.deepEqual([...PREQUALIFICATION_ALLOWED_MEMBERS], ['candidate-prequalification.json']);
+  assert.equal(MAX_PREQUALIFICATION_MEMBER_BYTES, 128 * 1024);
+  assert.equal(MAX_PREQUALIFICATION_TOTAL_BYTES, 128 * 1024);
+  assert.equal(MAX_PREQUALIFICATION_ARCHIVE_BYTES, 1024 * 1024);
+  // Only the prequalification archive is bounded as a file.
+  assert.equal(artifactArchiveSizeBound('prequalification'), MAX_PREQUALIFICATION_ARCHIVE_BYTES);
+  assert.equal(artifactArchiveSizeBound('candidate'), null);
+  assert.equal(artifactArchiveSizeBound('attestation'), null);
+  assert.throws(() => artifactArchiveSizeBound('x'), { message: "unknown artifact type: 'x'" });
+  const archive = writeZip(path.join(tmp, 'prequalification.zip'), [['candidate-prequalification.json', '{}\n']]);
+  extract(archive, path.join(tmp, 'out'), 'prequalification');
+  assert.deepEqual(listDir(path.join(tmp, 'out')), ['candidate-prequalification.json']);
+  // An archive one byte over its bound is refused before it is read.
+  const padded = writeZip(path.join(tmp, 'padded.zip'), [['candidate-prequalification.json', Buffer.alloc(MAX_PREQUALIFICATION_ARCHIVE_BYTES)]]);
+  const size = fs.statSync(padded).size;
+  assert.ok(size > MAX_PREQUALIFICATION_ARCHIVE_BYTES);
+  let reads = 0;
+  assertContractError(
+    () => extract(padded, path.join(tmp, 'padded'), 'prequalification', { zipFile: () => { reads += 1; } }),
+    `artifact archive size ${size} exceeds bound ${MAX_PREQUALIFICATION_ARCHIVE_BYTES}`,
+  );
+  assert.equal(reads, 0);
+  assert.deepEqual(listDir(path.join(tmp, 'padded')), []);
 });
 
 test('unknown artifact types render as Python repr()', () => {

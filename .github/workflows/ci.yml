@@ -54,21 +54,8 @@ jobs:
           git ls-files --error-unmatch js/llama_webgpu_bridge.js js/llama_webgpu_bridge_worker.js js/llama_webgpu_bridge.d.ts
           git diff --exit-code -- js/llama_webgpu_bridge.js js/llama_webgpu_bridge_worker.js js/llama_webgpu_bridge.d.ts
 
-      - name: Validate release qualification contract
-        run: python3 scripts/release_qualification_test.py
-
-      - name: Validate Python syntax
-        run: |
-          python3 -m py_compile \
-            scripts/verify_emscripten_version.py \
-            scripts/release_qualification.py \
-            scripts/release_qualification_test.py
-
       - name: Verify CI reliability contract
         run: node scripts/ci/verify_ci_reliability.mjs
-
-      - name: Validate release orchestration and CI selection
-        run: python3 -m unittest discover -s scripts -p '*_test.py'
 
   build-webgpu-bridge:
     needs: [changes, checks]
@@ -125,7 +112,7 @@ jobs:
 
       - name: Resolve Emscripten SDK pin
         run: |
-          EMSCRIPTEN_VERSION="$(python3 scripts/verify_emscripten_version.py --print-pin)"
+          EMSCRIPTEN_VERSION="$(node scripts/build/verify_emscripten_version.mjs --print-pin)"
           echo "EMSCRIPTEN_VERSION=${EMSCRIPTEN_VERSION}" >> "$GITHUB_ENV"
           echo "Using Emscripten ${EMSCRIPTEN_VERSION}"
 
@@ -164,7 +151,7 @@ jobs:
           } >> "$GITHUB_ENV"
 
       - name: Verify resolved Emscripten compiler
-        run: python3 scripts/verify_emscripten_version.py --emit-github-env "$GITHUB_ENV"
+        run: node scripts/build/verify_emscripten_version.mjs --emit-github-env "$GITHUB_ENV"
 
       - name: Resolve compiler cache identity
         id: compiler-cache

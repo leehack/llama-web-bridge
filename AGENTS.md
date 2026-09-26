@@ -68,7 +68,7 @@ applies:
   `scripts/smoke/next_token_scores.mjs` with the state-persistence model;
 - speech changes: `scripts/smoke/speech_to_text.mjs` and
   `scripts/smoke/text_to_speech.mjs` individually. The combined
-  `release_qualification.py qualify` command is workflow-only because it
+  `scripts/release/qualification.mjs qualify` command is workflow-only because it
   requires GitHub Actions and `github-hosted` runner identity;
 - decision-head changes: `scripts/smoke/decision.mjs` with a Laya
   encoder GGUF, head and reference fixture;
@@ -200,10 +200,15 @@ candidate and exact `candidate_run_id`/`attestation_run_id` pair.
   and their fixtures live in `tests/bridge/`; tooling tests live in
   `tests/build/`, `tests/ci/`, `tests/smoke/`, and `tests/release/`. Build, CI,
   smoke, and release tooling lives in `scripts/build/`, `scripts/ci/`,
-  `scripts/smoke/`, and `scripts/release/`, and the Python release harness and
-  its tests in `scripts/`: the qualification harness digest and the
-  candidate/publication checkouts address harness files by their `scripts/`
-  path at older commits, so moving one breaks in-flight candidates.
+  `scripts/smoke/`, and `scripts/release/`. The qualification harness digest
+  covers `HARNESS_SOURCES` in `scripts/release/qualification.mjs` (harness
+  `5.0.0`, the Node harness), and the candidate/publication checkouts address
+  harness files by their `scripts/` path at the candidate's commit, so moving
+  or adding a harness module changes the digest and needs a new candidate.
+  `tests/release/qualification_harness_test.mjs` requires that list to equal
+  the harness's import closure. No workflow runs Python;
+  `scripts/ci/verify_ci_reliability.mjs` fails on any `python`, `pip`,
+  `py_compile` or `*.py` command.
 - `scripts/release/orchestrator/cli.mjs` is the orchestrator's CLI entry; the
   state machine lives in the `scripts/release/orchestrator/<concern>.mjs`
   modules it imports, tested by `tests/release/orchestrator/<concern>_test.mjs`

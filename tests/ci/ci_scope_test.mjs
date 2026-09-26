@@ -210,7 +210,10 @@ const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../.
   assert.equal(buildSteps['Build bridge artifacts'].env.EM_COMPILER_WRAPPER, 'ccache');
   assert.ok(workflow.concurrency['cancel-in-progress'].includes("github.event_name == 'pull_request'"));
   for (const trigger of ['pull_request', 'push']) assert.equal('paths' in workflow.on[trigger], false, trigger);
-  assert.ok(checks.steps.some((step) => (step.run ?? '').includes("unittest discover -s scripts -p '*_test.py'")));
+  assert.ok(checks.steps.some((step) => (step.run ?? '').includes('node scripts/ci/verify_ci_reliability.mjs')));
+  for (const job of Object.values(workflow.jobs)) {
+    for (const step of job.steps ?? []) assert.doesNotMatch(step.run ?? '', /\bpython[0-9.]*\b|unittest|py_compile/, step.name);
+  }
 }
 
 console.log('CI scope contract passed');

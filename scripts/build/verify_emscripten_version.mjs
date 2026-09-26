@@ -1,6 +1,6 @@
 #!/usr/bin/env node
-// Resolve and verify the checked-in Emscripten SDK version: the port of
-// scripts/verify_emscripten_version.py with the same output and exit codes. It
+// Resolve and verify the checked-in Emscripten SDK version, with the output
+// and exit codes of the deleted scripts/verify_emscripten_version.py. It
 // reads the emsdk.version of the checkout it lives in (two levels up), runs
 // `emcc --version` from that checkout's root, and compares.
 //

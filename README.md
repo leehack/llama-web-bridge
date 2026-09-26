@@ -216,9 +216,10 @@ comments never fails it:
 - CI, candidate, and publish workflows install dependencies with
   `npm ci --ignore-scripts`, run `npm run check:js`, and fail on stale checked-in
   generated output via `git diff --exit-code`; `check:js` ends with `npm test`,
-  which runs every `tests/**/*_test.mjs` contract test; CI runs every
-  `scripts/*_test.py` suite; and the candidate and publish workflows run the
-  release contract suites and this contract themselves;
+  which runs every `tests/**/*_test.mjs` contract test, including the release
+  contract suites; the candidate and publish workflows run `check:js` and this
+  contract themselves; and no workflow runs Python, `pip`, `py_compile` or a
+  `*.py` script;
 - `llama_cpp.version` holds one exact upstream tag in either channel (stable
   `vMAJOR.MINOR.PATCH` or development `bNNNN`) and CI builds it;
   `emsdk.version` holds one exact Emscripten version, which CI and the candidate
@@ -226,7 +227,7 @@ comments never fails it:
   `emscripten_version` in `manifest.json`;
 - all 7 model/projector SHA-256 pins are identical across `CONTRIBUTING.md`,
   `ci.yml`, and `bridge_candidate.yml`, every role's pin and URL match
-  `release_qualification.py` and each other across workflows, and `README.md`
+  `scripts/release/qualification.mjs` and each other across workflows, and `README.md`
   and `AGENTS.md` hold no pins;
 - every workflow and job keeps the job token read-only, and no guard step or
   job may `continue-on-error` (only the publication ref mutation, whose outcome
@@ -295,10 +296,10 @@ The harness:
   lifecycle and verifying each generated file is a readable PCM16 mono 24 kHz
   WAV with a recorded SHA-256, byte length, frame count, and non-silent
   peak/RMS waveform evidence;
-- records per-phase and per-mode timing plus peak RSS, normalized to bytes on
-  both the Linux (kibibyte) and macOS (byte) `ru_maxrss` conventions; the value
-  is cumulative across harness children up to the end of each phase, because
-  `RUSAGE_CHILDREN` cannot be reset;
+- records per-phase and per-mode timing plus peak RSS, measured for each smoke
+  through `/usr/bin/time` and normalized to bytes on both the Linux (kibibyte)
+  and macOS (byte) `ru_maxrss` conventions; the value is the largest peak of
+  any smoke run up to the end of each phase;
 - pins every model, projector, and audio fixture SHA-256, and digests its own
   harness sources so the attestation names the code that produced it;
 - leaves real-device playback, intelligibility, and speaker-reference fidelity
@@ -316,7 +317,7 @@ submits an attestation, and the qualification workflow holds no publication PAT.
 
 `scripts/smoke/speech_to_text.mjs` and
 `scripts/smoke/text_to_speech.mjs` remain runnable on their own while
-iterating locally. The combined `release_qualification.py qualify` command is
+iterating locally. The combined `scripts/release/qualification.mjs qualify` command is
 reserved for the hosted workflow because it requires GitHub Actions and
 `github-hosted` runner identity. Both invocations are in
 [CONTRIBUTING.md](CONTRIBUTING.md#validate-outputs).
@@ -324,7 +325,7 @@ reserved for the hosted workflow because it requires GitHub Actions and
 The default audio is Qwen's official English example fixture.
 `scripts/smoke/speech_to_text_fixture.json` pins its URL, its SHA-256 and the exact
 normalized transcript observed through the Web runtime, for both the speech
-smoke and `release_qualification.py`, so an upstream fixture replacement fails
+smoke and `scripts/release/qualification.mjs`, so an upstream fixture replacement fails
 loudly. Use `--memory-mode wasm32` or `--memory-mode wasm64` to classify one
 variant; the default validates
 both. Diagnostics land in `speech-to-text-smoke-artifacts` and
@@ -486,7 +487,7 @@ an unfinished pipeline, the orchestrator takes the next free patch version; it
 never appends `-N`, which npm orders as a prerelease below the plain version.
 A new tag is never lower than a published tag or a live claim; a claim released
 without publication stops counting, so its version may be taken again or stay
-unused. `release_contract.py validate-release`, which the candidate and publish
+unused. `scripts/release/contract.mjs validate-release`, which the candidate and publish
 workflows run, rejects a new tag with a rebuild suffix.
 
 Tags published before this rule, such as `v0.1.47-1`, and the shared native
