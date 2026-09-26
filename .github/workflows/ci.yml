@@ -178,13 +178,20 @@ jobs:
       - name: Install compiler cache
         run: sudo apt-get update && sudo apt-get install -y ccache
 
-      - name: Cache compiler objects
-        uses: actions/cache@v4
+      # Every run restores the newest cache from its branch or main; only
+      # pushes to main save one, so pull requests do not grow the cache. The
+      # last prefix still warms a build that changes the build inputs or the
+      # llama.cpp pin: CCACHE_COMPILERCHECK=content makes a stale entry a miss,
+      # never a wrong hit.
+      - name: Restore compiler objects
+        id: ccache
+        uses: actions/cache/restore@v4
         with:
           path: ${{ runner.temp }}/webgpu-ccache
           key: webgpu-ccache-v2-${{ runner.os }}-${{ runner.arch }}-${{ env.EMSCRIPTEN_VERSION }}-${{ steps.compiler-cache.outputs.upstream }}-${{ hashFiles('CMakeLists.txt', 'scripts/build_bridge.sh', 'scripts/patch_*.mjs') }}-${{ github.sha }}
           restore-keys: |
             webgpu-ccache-v2-${{ runner.os }}-${{ runner.arch }}-${{ env.EMSCRIPTEN_VERSION }}-${{ steps.compiler-cache.outputs.upstream }}-${{ hashFiles('CMakeLists.txt', 'scripts/build_bridge.sh', 'scripts/patch_*.mjs') }}-
+            webgpu-ccache-v2-${{ runner.os }}-${{ runner.arch }}-${{ env.EMSCRIPTEN_VERSION }}-
 
       - name: Build bridge artifacts
         env:
@@ -200,6 +207,13 @@ jobs:
           ccache --zero-stats
           trap 'ccache --show-stats' EXIT
           ./scripts/build_bridge.sh
+
+      - name: Save compiler objects
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/webgpu-ccache
+          key: ${{ steps.ccache.outputs.cache-primary-key }}
 
       - name: Verify outputs
         run: |

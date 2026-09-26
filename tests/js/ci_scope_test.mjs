@@ -143,7 +143,15 @@ const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../.
   for (const name of ['Run state persistence browser smoke', 'Run multimodal browser smoke', 'Build bridge artifacts', 'Verify outputs']) {
     assert.equal('if' in buildSteps[name], false, name);
   }
-  const cache = buildSteps['Cache compiler objects'].with;
+  const cache = buildSteps['Restore compiler objects'].with;
+  assert.match(buildSteps['Restore compiler objects'].uses, /^actions\/cache\/restore@/);
+  const save = buildSteps['Save compiler objects'];
+  assert.equal(save.if, "github.event_name == 'push' && github.ref == 'refs/heads/main'");
+  assert.equal(save.with.path, cache.path);
+  assert.equal(save.with.key, '${{ steps.ccache.outputs.cache-primary-key }}');
+  const order = build.steps.map((step) => step.name);
+  assert.ok(order.indexOf('Build bridge artifacts') < order.indexOf('Save compiler objects'));
+  assert.ok(order.indexOf('Save compiler objects') < order.indexOf('Verify outputs'));
   assert.equal(cache.path, '${{ runner.temp }}/webgpu-ccache');
   for (const token of ['runner.arch', 'env.EMSCRIPTEN_VERSION', 'steps.compiler-cache.outputs.upstream', 'hashFiles']) {
     assert.ok(cache.key.includes(token), token);
