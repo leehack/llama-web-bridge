@@ -1,8 +1,8 @@
-// While the candidate's state gate and the qualification harness still run
-// scripts/state_persistence_browser_smoke.py, CI runs the Node port. Both must
-// serve the same harness page, so a change to one without the other fails
-// here instead of in a first-attempt-only candidate. Delete this test with the
-// Python smoke.
+// scripts/state_persistence_browser_smoke.py stays only as a qualification
+// harness source (the speech, text-to-speech and decision smokes import it)
+// while CI and the candidate's state gate run the Node port. Both must serve
+// the same harness page, so a change to one without the other fails here
+// instead of after the cutover. Delete this test with the Python smoke.
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';

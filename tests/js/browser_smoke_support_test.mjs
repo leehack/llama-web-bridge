@@ -26,12 +26,14 @@ import {
   pyRepr,
   redactLocation,
   resolvePath,
+  resolvePinnedFile,
   resolvePinnedModel,
   serveIsolated,
   translatePath,
   validateHash,
 } from '../../scripts/browser_smoke_support.mjs';
 import * as grammarSmoke from '../../scripts/grammar_browser_smoke.mjs';
+import * as multimodalSmoke from '../../scripts/multimodal_browser_smoke.mjs';
 import * as nextTokenSmoke from '../../scripts/next_token_scores_browser_smoke.mjs';
 import * as stateSmoke from '../../scripts/state_persistence_browser_smoke.mjs';
 
@@ -190,6 +192,29 @@ process.on('exit', () => fs.rmSync(tmp, { recursive: true, force: true }));
     assert.deepEqual(nextTokenSmoke.parseArgs(['--memory-mode', 'wasm64', '--n-ctx', '64']), {
       ...shared, timeoutMs: 300000, memoryMode: 'wasm64', nCtx: 64, artifactsDir: '/a/nts',
     });
+
+    // The multimodal smoke reads its own LLAMA_WEBGPU_MULTIMODAL_* variables.
+    for (const key of Object.keys(process.env)) if (key.startsWith('LLAMA_WEBGPU_MULTIMODAL_')) delete process.env[key];
+    assert.deepEqual(multimodalSmoke.parseArgs([]), {
+      distDir: '/d', timeoutMs: 420000, modelUrl: '', modelPath: null, modelSha256: '', mmprojUrl: '', mmprojPath: null,
+      mmprojSha256: '', modelCacheDir: '~/.cache/llama-web-bridge/multimodal-smoke-models', artifactsDir: null,
+    });
+    Object.assign(process.env, {
+      LLAMA_WEBGPU_MULTIMODAL_TIMEOUT_MS: '9',
+      LLAMA_WEBGPU_MULTIMODAL_MODEL_URL: 'https://h/q.gguf',
+      LLAMA_WEBGPU_MULTIMODAL_MODEL_PATH: '/m/q.gguf',
+      LLAMA_WEBGPU_MULTIMODAL_MODEL_SHA256: 'cd',
+      LLAMA_WEBGPU_MULTIMODAL_MMPROJ_URL: 'https://h/p.gguf',
+      LLAMA_WEBGPU_MULTIMODAL_MMPROJ_PATH: '/m/p.gguf',
+      LLAMA_WEBGPU_MULTIMODAL_MMPROJ_SHA256: 'ef',
+      LLAMA_WEBGPU_MULTIMODAL_MODEL_CACHE: '~/mm',
+      LLAMA_WEBGPU_MULTIMODAL_ARTIFACTS_DIR: '/a/mm',
+    });
+    assert.deepEqual(multimodalSmoke.parseArgs(['--mmproj-path', '/x/p.gguf', '--timeout-ms=3']), {
+      distDir: '/d', timeoutMs: 3, modelUrl: 'https://h/q.gguf', modelPath: '/m/q.gguf', modelSha256: 'cd',
+      mmprojUrl: 'https://h/p.gguf', mmprojPath: '/x/p.gguf', mmprojSha256: 'ef', modelCacheDir: '~/mm',
+      artifactsDir: '/a/mm',
+    });
   } finally {
     for (const key of Object.keys(process.env)) if (!(key in saved)) delete process.env[key];
     Object.assign(process.env, saved);
@@ -297,6 +322,26 @@ process.on('exit', () => fs.rmSync(tmp, { recursive: true, force: true }));
     if (message === null) stateSmoke.checkPayload(payload, modelBacked);
     else assert.throws(() => stateSmoke.checkPayload(payload, modelBacked), { message });
   }
+
+  const multimodalPayload = () => ({
+    ok: true,
+    modes: ['direct runtime', 'worker runtime'],
+    modeResults: [
+      { mode: 'direct runtime', elapsedMs: 1, output: 'HELLO', imageResizeDiagnostic: 'media_image_resized:320x180->298x168' },
+      { mode: 'worker runtime', elapsedMs: 1, output: 'HELLO', imageResizeDiagnostic: undefined },
+    ],
+  });
+  const multimodalCases = [
+    [multimodalPayload(), null],
+    [{ ...multimodalPayload(), modes: ['direct runtime'] }, 'multimodal smoke modes payload mismatch'],
+    [{ ...multimodalPayload(), modes: undefined }, 'multimodal smoke modes payload mismatch'],
+    [mutate(multimodalPayload(), (p) => p.modeResults.pop()), 'multimodal mode results missing'],
+    [{ ...multimodalPayload(), modeResults: { length: 2 } }, 'multimodal mode results missing'],
+  ];
+  for (const [payload, message] of multimodalCases) {
+    if (message === null) multimodalSmoke.checkPayload(payload);
+    else assert.throws(() => multimodalSmoke.checkPayload(payload), { message });
+  }
 }
 
 // The harness pages embed their configuration as Python's json.dumps did.
@@ -312,7 +357,11 @@ process.on('exit', () => fs.rmSync(tmp, { recursive: true, force: true }));
   assert.ok(grammar.includes('"nCtx": 1024, "memoryModes": ["wasm64"], "runtimeModes": ["direct", "worker"]}'));
   const scores = nextTokenSmoke.renderHarness(64, ['wasm32', 'wasm64']);
   assert.ok(scores.includes('"topK": 8, "tolerance": 0.001, '));
-  for (const page of [state, grammar, scores]) {
+  const multimodal = multimodalSmoke.renderHarness();
+  assert.ok(multimodal.includes("await bridge.loadModelFromUrl('/multimodal-model.gguf', {"));
+  assert.ok(multimodal.includes("await bridge.loadMultimodalProjector('/multimodal-mmproj.gguf');"));
+  assert.ok(multimodal.includes('assert(bridge.supportsVision(), `${mode} did not report vision support`);'));
+  for (const page of [state, grammar, scores, multimodal]) {
     assert.ok(page.startsWith('\n<!doctype html>\n<meta charset="utf-8">\n'));
     assert.ok(page.endsWith('})();\n</script>\n'));
   }
@@ -476,6 +525,29 @@ function parseResponse(buffer) {
     await resolvePinnedModel({ modelPath: path.join(origin, 'model.gguf'), modelUrl: '', modelSha256: sha, modelCacheDir: cacheDir }),
     resolvePath(path.join(origin, 'model.gguf')),
   );
+
+  // The multimodal smoke's resolve_file: the same rules, failures named by label.
+  const pinned = (fields) => resolvePinnedFile({ filePath: null, url: '', expectedSha256: sha, cacheDir, label: 'multimodal projector', ...fields });
+  await assert.rejects(pinned({ url: 'x', expectedSha256: '' }), { message: 'multimodal projector SHA-256 is required' });
+  await assert.rejects(pinned({}), { message: 'multimodal projector URL or local path is required' });
+  await assert.rejects(pinned({ filePath: '~/definitely-missing.gguf' }),
+    { message: `multimodal projector path does not exist: ${resolvePath(path.join(process.env.HOME, 'definitely-missing.gguf'))}` });
+  await assert.rejects(pinned({ filePath: path.join(origin, 'model.gguf'), expectedSha256: '0'.repeat(64) }),
+    { message: `model checksum mismatch for ${resolvePath(path.join(origin, 'model.gguf'))}: expected ${'0'.repeat(64)}, got ${sha}` });
+  assert.equal(await pinned({ filePath: path.join(origin, 'model.gguf'), url: 'ignored' }), resolvePath(path.join(origin, 'model.gguf')));
+  // A --mmproj-url goes through the cache (`~`-expanded), where a hit is checked
+  // and never downloaded again.
+  const mmprojUrl = `${base}/mmproj.gguf`;
+  const homeCache = path.join(tmp, 'home', 'mm-cache');
+  fs.mkdirSync(homeCache, { recursive: true });
+  fs.writeFileSync(path.join(homeCache, cachedModelName(mmprojUrl)), body);
+  const savedHome = process.env.HOME;
+  process.env.HOME = path.join(tmp, 'home');
+  try {
+    assert.equal(await pinned({ url: mmprojUrl, cacheDir: '~/mm-cache' }), path.join(resolvePath(homeCache), cachedModelName(mmprojUrl)));
+  } finally {
+    process.env.HOME = savedHome;
+  }
 }
 
 // --- Exit status and stdout ----------------------------------------------------
@@ -520,6 +592,7 @@ function parseResponse(buffer) {
     ['state_persistence_browser_smoke.mjs', 'state persistence'],
     ['grammar_browser_smoke.mjs', 'grammar'],
     ['next_token_scores_browser_smoke.mjs', 'next-token scores'],
+    ['multimodal_browser_smoke.mjs', 'multimodal'],
   ]) {
     const result = smoke(name, ['--dist-dir', missingDist]);
     assert.equal(result.status, 1, name);
@@ -538,6 +611,25 @@ function parseResponse(buffer) {
   const badEnv = smoke('next_token_scores_browser_smoke.mjs', [], { LLAMA_WEBGPU_NEXT_TOKEN_SCORES_TIMEOUT_MS: 'soon' });
   assert.equal(badEnv.status, 1);
   assert.equal(badEnv.stderr, "next-token scores browser smoke failed: invalid literal for int() with base 10: 'soon'\n");
+  // The multimodal smoke checks the model, then the projector, before the dist files.
+  const modelFile = path.join(tmp, 'origin', 'model.gguf');
+  const modelSha = createHash('sha256').update(fs.readFileSync(modelFile)).digest('hex');
+  const multimodal = (args, extraEnv) => smoke('multimodal_browser_smoke.mjs', ['--dist-dir', emptyDist, ...args], extraEnv);
+  assert.equal(multimodal([]).stderr, 'multimodal browser smoke failed: multimodal model SHA-256 is required\n');
+  assert.equal(multimodal(['--model-sha256', modelSha]).stderr,
+    'multimodal browser smoke failed: multimodal model URL or local path is required\n');
+  assert.equal(multimodal(['--model-sha256', modelSha, '--model-path', modelFile]).stderr,
+    'multimodal browser smoke failed: multimodal projector SHA-256 is required\n');
+  assert.equal(multimodal(['--model-sha256', modelSha, '--model-path', modelFile, '--mmproj-sha256', modelSha]).stderr,
+    'multimodal browser smoke failed: multimodal projector URL or local path is required\n');
+  const noBridge = multimodal([], {
+    LLAMA_WEBGPU_MULTIMODAL_MODEL_PATH: modelFile, LLAMA_WEBGPU_MULTIMODAL_MODEL_SHA256: modelSha,
+    LLAMA_WEBGPU_MULTIMODAL_MMPROJ_PATH: modelFile, LLAMA_WEBGPU_MULTIMODAL_MMPROJ_SHA256: modelSha,
+  });
+  assert.equal(noBridge.status, 1);
+  assert.equal(noBridge.stdout, '');
+  assert.equal(noBridge.stderr,
+    `multimodal browser smoke failed: missing bridge artifact: ${path.join(resolvePath(emptyDist), 'llama_webgpu_bridge.js')}\n`);
 }
 
 console.log('Browser smoke support contract passed');

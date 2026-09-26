@@ -129,16 +129,19 @@ python3 -m py_compile scripts/state_persistence_browser_smoke.py scripts/multimo
 node scripts/verify_ci_reliability.mjs
 ```
 
-The state-persistence, grammar and next-token smokes run on Node with the
-locked `playwright` dev dependency. After `npm ci --ignore-scripts`, install its
-browser once with `npx --no-install playwright install --only-shell chromium`.
-Node's `fetch` ignores `HTTP(S)_PROXY` unless `NODE_USE_ENV_PROXY=1` is set.
-The other smokes still use Python Playwright 1.63.0 (`python3 -m pip install
-playwright==1.63.0` and `python3 -m playwright install chromium`). Until the
-qualification harness moves to Node, the candidate's state gate still runs
-`scripts/state_persistence_browser_smoke.py`;
-`tests/js/state_persistence_harness_parity_test.mjs` keeps its page identical
-to the Node port.
+The state-persistence, multimodal, grammar and next-token smokes run on Node
+with the locked `playwright` dev dependency, in CI and in the candidate's state
+and multimodal gates. After `npm ci --ignore-scripts`, install its browser once
+with `npx --no-install playwright install --only-shell chromium`. Node's
+`fetch` ignores `HTTP(S)_PROXY` unless `NODE_USE_ENV_PROXY=1` is set. The
+speech, text-to-speech and decision smokes still use Python Playwright 1.63.0
+(`python3 -m pip install playwright==1.63.0` and
+`python3 -m playwright install chromium`). Until the qualification harness
+moves to Node, `scripts/state_persistence_browser_smoke.py` and
+`scripts/multimodal_browser_smoke.py` stay as its sources, and
+`tests/js/state_persistence_harness_parity_test.mjs` and
+`tests/js/multimodal_harness_parity_test.mjs` keep their pages identical to the
+Node ports.
 
 For state-persistence, worker, or workflow changes, also run the browser smoke
 against a built dist directory. Use a checksum-pinned tiny model and keep caches
@@ -157,7 +160,7 @@ For llama.cpp pin or multimodal changes, run checksum-pinned real image
 inference through both direct and worker runtimes:
 
 ```bash
-python3 scripts/multimodal_browser_smoke.py \
+node scripts/multimodal_browser_smoke.mjs \
   --dist-dir /private/tmp/llama_web_bridge_dist \
   --model-path /path/to/Qwen3.5-0.8B-Q4_K_M.gguf \
   --model-sha256 bd258782e35f7f458f8aced1adc053e6e92e89bc735ba3be89d38a06121dc517 \
@@ -290,7 +293,7 @@ query strings, and fragments before printing the location.
   `resolve/main` ref rather than an immutable 40-hex revision, and the ASR audio
   fixture is not a Hugging Face object and carries no revision segment at all;
   the script lists both sets and fails when a role joins or leaves them.
-- Keep `scripts/multimodal_browser_smoke.py` in normal CI for every llama.cpp
+- Keep `scripts/multimodal_browser_smoke.mjs` in normal CI for every llama.cpp
   pin update; build-only validation does not cover mtmd prompt ingestion.
 - Heavy real-model ASR and TTS gates run through
   `scripts/release_qualification.py` in automated qualification. Keep the

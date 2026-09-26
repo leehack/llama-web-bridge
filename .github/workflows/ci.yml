@@ -209,13 +209,9 @@ jobs:
           test -f "${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_core_mem64.js"
           test -f "${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_core_mem64.wasm"
 
-      # The Node smokes use the locked playwright package; the multimodal smoke
-      # still runs on Python Playwright.
+      # The smokes use the locked playwright package.
       - name: Install Playwright Chromium
-        run: |
-          npx --no-install playwright install --only-shell chromium
-          python3 -m pip install --user playwright==1.63.0
-          python3 -m playwright install chromium
+        run: npx --no-install playwright install --only-shell chromium
 
       - name: Run state persistence browser smoke
         env:
@@ -225,7 +221,7 @@ jobs:
       - name: Run multimodal browser smoke
         env:
           BRIDGE_DIST_DIR: ${{ runner.temp }}/webgpu_bridge_dist
-        run: python3 scripts/multimodal_browser_smoke.py
+        run: node scripts/multimodal_browser_smoke.mjs
 
       - name: Run grammar browser smoke
         env:

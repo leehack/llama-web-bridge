@@ -60,7 +60,7 @@ applies:
 
 - state-persistence or workflow changes:
   `scripts/state_persistence_browser_smoke.mjs` against a built `OUT_DIR`;
-- llama.cpp pin or multimodal changes: `scripts/multimodal_browser_smoke.py`
+- llama.cpp pin or multimodal changes: `scripts/multimodal_browser_smoke.mjs`
   through both direct and worker runtimes;
 - sampler or grammar changes: `scripts/grammar_browser_smoke.mjs` with the
   state-persistence model and the multimodal model;

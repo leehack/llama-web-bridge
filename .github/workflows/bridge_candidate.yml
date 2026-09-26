@@ -305,22 +305,21 @@ jobs:
             ~/.cache/llama-web-bridge/multimodal-smoke-models
           key: release-smoke-${{ env.LLAMA_WEBGPU_SMOKE_MODEL_SHA256 }}-${{ env.LLAMA_WEBGPU_MULTIMODAL_MODEL_SHA256 }}-${{ env.LLAMA_WEBGPU_MULTIMODAL_MMPROJ_SHA256 }}
 
+      # The gates use the locked playwright package that npm ci installed above.
       - name: Install Playwright Chromium
-        run: |
-          python3 -m pip install --user playwright==1.63.0
-          python3 -m playwright install chromium
+        run: npx --no-install playwright install --only-shell chromium
 
       - name: Run durable state persistence gate
         id: state_gate
         env:
           BRIDGE_DIST_DIR: ${{ runner.temp }}/webgpu_bridge_dist
-        run: python3 scripts/state_persistence_browser_smoke.py
+        run: node scripts/state_persistence_browser_smoke.mjs
 
       - name: Run durable multimodal gate
         id: multimodal_gate
         env:
           BRIDGE_DIST_DIR: ${{ runner.temp }}/webgpu_bridge_dist
-        run: python3 scripts/multimodal_browser_smoke.py
+        run: node scripts/multimodal_browser_smoke.mjs
 
       - name: Generate schema-v2 manifest and checksums
         env:

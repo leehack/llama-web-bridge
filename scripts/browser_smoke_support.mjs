@@ -14,7 +14,6 @@ import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
-import { fileURLToPath } from 'node:url';
 
 export const REQUIRED_ARTIFACTS = Object.freeze([
   'llama_webgpu_bridge.js',
@@ -269,6 +268,20 @@ export async function resolvePinnedModel({ modelPath, modelUrl, modelSha256, mod
   }
   ensure(Boolean(modelUrl), '--model-url or --model-path is required');
   return downloadToCache(modelUrl, resolvePath(expandHome(modelCacheDir)), modelSha256);
+}
+
+// resolve_file from the multimodal smoke: the same rules as resolvePinnedModel
+// for any pinned input, with `label` naming it in the failures.
+export async function resolvePinnedFile({ filePath, url, expectedSha256, cacheDir, label }) {
+  ensure(Boolean(expectedSha256), `${label} SHA-256 is required`);
+  if (filePath !== null) {
+    const resolved = resolvePath(expandHome(filePath));
+    ensure(isFile(resolved), `${label} path does not exist: ${resolved}`);
+    await validateHash(resolved, expectedSha256);
+    return resolved;
+  }
+  ensure(Boolean(url), `${label} URL or local path is required`);
+  return downloadToCache(url, resolvePath(expandHome(cacheDir)), expectedSha256);
 }
 
 // --- Web root ----------------------------------------------------------------
@@ -880,15 +893,6 @@ export async function runMain(label, main) {
       process.stderr.write(`${label} browser smoke failed: ${error instanceof Error ? error.message : String(error)}\n`);
       process.exitCode = 1;
     }
-  }
-}
-
-export function invokedAsEntry(moduleUrl) {
-  try {
-    return Boolean(process.argv[1])
-      && fs.realpathSync(process.argv[1]) === fs.realpathSync(fileURLToPath(moduleUrl));
-  } catch {
-    return false;
   }
 }
 

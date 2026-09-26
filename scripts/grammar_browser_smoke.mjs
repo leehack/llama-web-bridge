@@ -15,7 +15,6 @@ import {
   ensure,
   env,
   expectedModes,
-  invokedAsEntry,
   isDict,
   isDirectory,
   modeOf,
@@ -398,6 +397,6 @@ export async function main(argv = process.argv.slice(2)) {
   return failures.length ? 1 : 0;
 }
 
-if (invokedAsEntry(import.meta.url)) {
+if (import.meta.main) {
   await runMain('grammar', main);
 }

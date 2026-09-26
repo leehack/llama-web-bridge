@@ -9,7 +9,6 @@
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import process from 'node:process';
-import { fileURLToPath } from 'node:url';
 
 // Only paths with no compiled-runtime dependency may avoid native jobs.
 export const TOOLING = new Set([
@@ -189,15 +188,6 @@ export function main(argv = process.argv.slice(2)) {
   }
 }
 
-function invokedAsEntry() {
-  try {
-    return Boolean(process.argv[1])
-      && fs.realpathSync(process.argv[1]) === fs.realpathSync(fileURLToPath(import.meta.url));
-  } catch {
-    return false;
-  }
-}
-
-if (invokedAsEntry()) {
+if (import.meta.main) {
   process.exitCode = main();
 }

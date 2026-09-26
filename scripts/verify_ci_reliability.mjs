@@ -892,7 +892,7 @@ function checkCiRunsContracts({ ci, candidate, publish }, errors) {
   check.includes(ci.path, ci.runText, [
     'node scripts/next_token_scores_browser_smoke.mjs',
     'node scripts/state_persistence_browser_smoke.mjs',
-    'python3 scripts/multimodal_browser_smoke.py',
+    'node scripts/multimodal_browser_smoke.mjs',
   ], 'run the next-token scores, state persistence and multimodal browser smokes');
   // Row 57: CI builds the llama.cpp pin.
   check.includes(ci.path, ci.runText, ["tr -d '[:space:]' < llama_cpp.version"], 'resolve the llama.cpp tag from llama_cpp.version');
@@ -1289,8 +1289,8 @@ function checkCandidateAndQualification({ candidate, qualification, publish }, e
   const multimodalGate = candidate.steps.find((step) => step.id === 'multimodal_gate');
   check.require(
     build !== undefined && String(build.env.WEBGPU_BRIDGE_BUILD_MEM64) === '1'
-      && stateGate?.run.includes('python3 scripts/state_persistence_browser_smoke.py')
-      && multimodalGate?.run.includes('python3 scripts/multimodal_browser_smoke.py')
+      && stateGate?.run.trim() === 'node scripts/state_persistence_browser_smoke.mjs'
+      && multimodalGate?.run.trim() === 'node scripts/multimodal_browser_smoke.mjs'
       && candidate.steps.some((step) => step.env.STATE_CONCLUSION === '${{ steps.state_gate.outcome }}'
         && step.env.MULTIMODAL_CONCLUSION === '${{ steps.multimodal_gate.outcome }}'),
     `${candidate.path} must build the memory64 core and record the outcomes of its state persistence and multimodal gates`,
@@ -1502,15 +1502,6 @@ function main() {
   return 0;
 }
 
-function invokedAsEntry() {
-  try {
-    return Boolean(process.argv[1])
-      && fs.realpathSync(process.argv[1]) === fs.realpathSync(fileURLToPath(import.meta.url));
-  } catch {
-    return false;
-  }
-}
-
-if (invokedAsEntry()) {
+if (import.meta.main) {
   process.exitCode = main();
 }

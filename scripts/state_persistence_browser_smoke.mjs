@@ -18,7 +18,6 @@ import {
   isDirectory,
   isFile,
   isPyInt,
-  invokedAsEntry,
   parseSmokeArgs,
   pyEquals,
   pyGet,
@@ -370,6 +369,6 @@ export async function main(argv = process.argv.slice(2)) {
   return 0;
 }
 
-if (invokedAsEntry(import.meta.url)) {
+if (import.meta.main) {
   await runMain('state persistence', main);
 }

@@ -245,7 +245,7 @@ comments never fails it:
 
 Run `scripts/state_persistence_browser_smoke.mjs` locally after building the
 bridge if a change touches state persistence, workers, browser smoke, or
-workflow diagnostics, and `scripts/multimodal_browser_smoke.py` for llama.cpp
+workflow diagnostics, and `scripts/multimodal_browser_smoke.mjs` for llama.cpp
 pin or multimodal changes. Both invocations, with their pinned models, are in
 [CONTRIBUTING.md](CONTRIBUTING.md#validate-outputs).
 
