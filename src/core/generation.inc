@@ -6,7 +6,9 @@ llama_sampler * create_sampler(
     const float temp,
     const int32_t top_k,
     const float top_p,
+    const float min_p,
     const float repeat_penalty,
+    const float presence_penalty,
     const uint32_t seed) {
   llama_sampler_chain_params sparams = llama_sampler_chain_default_params();
   llama_sampler * sampler = llama_sampler_chain_init(sparams);
@@ -14,12 +16,12 @@ llama_sampler * create_sampler(
     return nullptr;
   }
 
-  if (repeat_penalty != 1.0f) {
+  if (repeat_penalty != 1.0f || presence_penalty != 0.0f) {
     const int32_t vocab_size = llama_vocab_n_tokens(g_state.vocab);
     llama_sampler_chain_add(
         sampler,
         llama_sampler_init_penalties(
-            vocab_size, 64, repeat_penalty, 0.0f, 0.0f));
+            vocab_size, 64, repeat_penalty, 0.0f, presence_penalty));
   }
 
   if (top_k > 0) {
@@ -28,6 +30,10 @@ llama_sampler * create_sampler(
 
   if (top_p < 1.0f) {
     llama_sampler_chain_add(sampler, llama_sampler_init_top_p(top_p, 1));
+  }
+
+  if (min_p > 0.0f) {
+    llama_sampler_chain_add(sampler, llama_sampler_init_min_p(min_p, 1));
   }
 
   llama_sampler_chain_add(sampler, llama_sampler_init_temp(temp));
@@ -173,7 +179,9 @@ int32_t begin_generation_impl(
     float top_p,
     float repeat_penalty,
     const char * grammar,
-    uint32_t seed) {
+    uint32_t seed,
+    const float min_p,
+    const float presence_penalty) {
   // Defence in depth behind the bridge's single-writer queue: reject before
   // touching any shared state, so a stray second begin cannot destroy the
   // in-flight generation's output, sampler, or g_last_error. The caller maps
@@ -217,6 +225,16 @@ int32_t begin_generation_impl(
 
   if (repeat_penalty <= 0.0f) {
     repeat_penalty = 1.0f;
+  }
+
+  if (!std::isfinite(min_p) || min_p < 0.0f || min_p > 1.0f) {
+    set_error("min_p must be a finite number from 0 to 1");
+    return -2;
+  }
+
+  if (!std::isfinite(presence_penalty)) {
+    set_error("presence_penalty must be a finite number");
+    return -2;
   }
 
   end_generation_state();
@@ -269,7 +287,8 @@ int32_t begin_generation_impl(
   }
 
   g_active_sampler =
-      create_sampler(temp, top_k, top_p, repeat_penalty, seed);
+      create_sampler(
+          temp, top_k, top_p, min_p, repeat_penalty, presence_penalty, seed);
   if (g_active_sampler == nullptr) {
     set_error("Failed to initialize sampler chain");
     return -5;

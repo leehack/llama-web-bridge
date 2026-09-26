@@ -110,9 +110,21 @@ export interface CompletionOptions {
   temp?: number;
   topK?: number;
   topP?: number;
+  /** Min-P threshold from 0 to 1, applied after top-p; 0, the default, disables it. A value outside that range rejects. */
+  minP?: number;
   penalty?: number;
+  /** Subtracted once from the logit of each token among this completion's last 64 tokens; prompt tokens do not count. 0, the default, disables it. A value that is not finite as a 32-bit float rejects. */
+  presencePenalty?: number;
   grammar?: string;
   seed?: number;
+}
+
+/** Completion options the loaded core applies. Every flag is false until a model load initializes the core. */
+export interface CompletionCapabilities {
+  /** `CompletionOptions.presencePenalty` is applied. */
+  presencePenalty: boolean;
+  /** `CompletionOptions.minP` is applied. */
+  minP: boolean;
 }
 
 export interface EmbedOptions {
@@ -253,6 +265,7 @@ export class LlamaWebGpuBridge {
   evictModelFromCache(url: string | string[], options?: Record<string, unknown>): Promise<unknown>;
 
   createCompletion(prompt: string, options?: CompletionOptions): Promise<string>;
+  getCompletionCapabilities(): Promise<CompletionCapabilities>;
   tokenize(text: string, addSpecial?: boolean): Promise<number[]>;
   detokenize(tokens: number[] | ArrayLike<number>, special?: boolean): Promise<string>;
   applyChatTemplate(

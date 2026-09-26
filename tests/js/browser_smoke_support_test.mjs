@@ -277,10 +277,31 @@ assert.deepEqual(webGpuLaunchArgs('linux'), [
     workerFallbackReason: null,
     ...extra,
   });
+  const samplerRuns = () => ({
+    first: 'f',
+    sampled: 's',
+    'sampled-explicit-zeros': 's',
+    greedy: 'g',
+    'min-p-one': 'g',
+    'greedy-presence': 'p',
+  });
+  assert.deepEqual(Object.keys(samplerRuns()), grammarSmoke.SAMPLER_RUNS.map(([name]) => name));
+  const capabilities = (supported) => Object.fromEntries(
+    grammarSmoke.COMPLETION_CAPABILITIES.map((name) => [name, supported]),
+  );
   const grammarPayload = (modes = MODES) => ({
     ok: true,
     modeResults: modes.map((mode) => modeEntry(mode, {
       cases: GRAMMAR_CASES.map((name) => ({ name, valid: true, text: name.startsWith('invalid-') ? null : 'yes', error: null })),
+      capabilitiesBeforeLoad: capabilities(false),
+      capabilitiesAfterLoad: capabilities(true),
+      samplerRuns: samplerRuns(),
+      invalidSamplerErrors: [
+        'RangeError: CompletionOptions.minP must be a finite number from 0 to 1; got 1.5.',
+        'RangeError: CompletionOptions.minP must be a finite number from 0 to 1; got -0.1.',
+        'RangeError: CompletionOptions.presencePenalty must be a finite number; got Infinity.',
+      ],
+      samplerAfterInvalid: 's',
       plainCompletionError: null,
     })),
     globalWorkerFallbackReason: null,
@@ -318,7 +339,49 @@ assert.deepEqual(webGpuLaunchArgs('linux'), [
     [mutate(grammarPayload(), (p) => Object.assign(p.modeResults[1], { execution: 'main-thread', workerFallbackReason: 'why' })), both,
       ["wasm32 worker: expected worker execution, got 'main-thread' (worker fallback reason: 'why')"]],
     [mutate(grammarPayload(), (p) => { p.globalWorkerFallbackReason = 'gone'; }), both, ["worker fell back to the main thread: 'gone'"]],
+    ...samplerCases(),
   ];
+  function samplerCases() {
+    const outputs = (runs) => `wasm32 direct: sampler outputs: {${
+      Object.entries(runs).map(([name, text]) => `'${name}': '${text}'`).join(', ')
+    }}`;
+    const runsCase = (change, message) => {
+      const runs = { ...samplerRuns(), ...change };
+      return [
+        mutate(grammarPayload(), (p) => { p.modeResults[0].samplerRuns = runs; }),
+        both,
+        [`wasm32 direct: ${message}`, outputs(runs)],
+      ];
+    };
+    return [
+      runsCase({ 'sampled-explicit-zeros': 'z' }, 'minP: 0 and presencePenalty: 0 changed the default output'),
+      runsCase({ greedy: 's', 'min-p-one': 's' }, 'plain sampling matched greedy, so min-p-one proves nothing'),
+      runsCase({ 'min-p-one': 's' }, 'minP: 1 did not reduce sampling to the most probable token'),
+      runsCase({ 'greedy-presence': 'g' }, 'presencePenalty did not change greedy output'),
+      [mutate(grammarPayload(), (p) => { p.modeResults[0].samplerAfterInvalid = 't'; }), both, [
+        'wasm32 direct: a seeded sample after the rejected options did not repeat the earlier one',
+        outputs(samplerRuns()),
+      ]],
+      [mutate(grammarPayload(), (p) => { p.modeResults[1].samplerRuns.greedy = ''; }), both, [
+        "wasm32 worker: sampler runs missing or empty: {'first': 'f', 'sampled': 's', 'sampled-explicit-zeros': 's', "
+          + "'greedy': '', 'min-p-one': 'g', 'greedy-presence': 'p'}",
+      ]],
+      [mutate(grammarPayload(), (p) => { p.modeResults[2].invalidSamplerErrors[1] = null; }), both, [
+        'wasm64 direct: invalid sampler options: expected RangeErrors, got '
+          + "['RangeError: CompletionOptions.minP must be a finite number from 0 to 1; got 1.5.', None, "
+          + "'RangeError: CompletionOptions.presencePenalty must be a finite number; got Infinity.']",
+        `wasm64 direct: sampler outputs: {${Object.entries(samplerRuns()).map(([n, t]) => `'${n}': '${t}'`).join(', ')}}`,
+      ]],
+      [mutate(grammarPayload(), (p) => {
+        p.modeResults[3].capabilitiesBeforeLoad.minP = true;
+        p.modeResults[3].capabilitiesAfterLoad = null;
+      }), both, [
+        "wasm64 worker: capabilities before the load: expected none, got {'presencePenalty': False, 'minP': True}",
+        'wasm64 worker: capabilities after the load: expected all, got None',
+        `wasm64 worker: sampler outputs: {${Object.entries(samplerRuns()).map(([n, t]) => `'${n}': '${t}'`).join(', ')}}`,
+      ]],
+    ];
+  }
   for (const [payload, memoryModes, expected] of grammarCases) {
     assert.deepEqual(grammarSmoke.validatePayload(payload, memoryModes), expected, expected.join('\n'));
   }

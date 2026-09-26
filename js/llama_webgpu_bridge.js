@@ -16,6 +16,50 @@ function throwIfAborted(signal, message = "Bridge operation was cancelled.") {
   }
 }
 
+// js/src/internal/completion_options.ts
+var NO_COMPLETION_CAPABILITIES = Object.freeze({
+  presencePenalty: false,
+  minP: false
+});
+function optionalNumber(value, name, isValid, range) {
+  if (value == null) {
+    return null;
+  }
+  if (typeof value !== "number" || !Number.isFinite(Math.fround(value)) || !isValid(value)) {
+    throw new RangeError(`CompletionOptions.${name} must be a finite number${range}; got ${String(value)}.`);
+  }
+  return value;
+}
+function resolveCompletionSamplingOptions(options) {
+  return {
+    minP: optionalNumber(options?.minP, "minP", (value) => value >= 0 && value <= 1, " from 0 to 1") ?? 0,
+    presencePenalty: optionalNumber(options?.presencePenalty, "presencePenalty", () => true, "") ?? 0
+  };
+}
+function completionCapabilitiesFrom(raw) {
+  let parsed = null;
+  try {
+    parsed = JSON.parse(raw || "{}");
+  } catch (_) {
+    return { ...NO_COMPLETION_CAPABILITIES };
+  }
+  return {
+    presencePenalty: parsed?.presencePenalty === true,
+    minP: parsed?.minP === true
+  };
+}
+function requireCompletionCapabilities(sampling, capabilities) {
+  const missing = [
+    sampling.minP !== 0 && !capabilities.minP ? "minP" : null,
+    sampling.presencePenalty !== 0 && !capabilities.presencePenalty ? "presencePenalty" : null
+  ].filter((name) => name != null);
+  if (missing.length > 0) {
+    throw new Error(
+      `The loaded WebGPU core does not support CompletionOptions.${missing.join(" or CompletionOptions.")}.`
+    );
+  }
+}
+
 // js/src/internal/constants.ts
 var defaultModelCacheName = "llamadart-webgpu-model-cache-v1";
 var BRIDGE_DISPOSED_MESSAGE = "Bridge has been disposed.";
@@ -3315,10 +3359,21 @@ var LlamaWebGpuBridgeRuntime = class {
       }
     }
   }
+  getCompletionCapabilities() {
+    const core = this._core;
+    if (!core || typeof core._llamadart_webgpu_completion_capabilities_json !== "function") {
+      return { ...NO_COMPLETION_CAPABILITIES };
+    }
+    return completionCapabilitiesFrom(
+      core.ccall("llamadart_webgpu_completion_capabilities_json", "string", [], [])
+    );
+  }
   async createCompletion(prompt, options = {}) {
     if (this._modelBytes <= 0) {
       throw new Error("No model loaded. Call loadModelFromUrl first.");
     }
+    const sampling = resolveCompletionSamplingOptions(options);
+    requireCompletionCapabilities(sampling, this.getCompletionCapabilities());
     this._abortRequested = false;
     const startedAt = performance.now();
     let firstTokenAt = null;
@@ -3345,7 +3400,7 @@ var LlamaWebGpuBridgeRuntime = class {
         await this._core.ccall(
           "llamadart_webgpu_begin_generation",
           "number",
-          ["string", "number", "number", "number", "number", "string", "number"],
+          ["string", "number", "number", "number", "number", "string", "number", "number", "number"],
           [
             String(prompt),
             temp,
@@ -3353,7 +3408,9 @@ var LlamaWebGpuBridgeRuntime = class {
             topP,
             penalty,
             grammar,
-            seed >>> 0
+            seed >>> 0,
+            sampling.minP,
+            sampling.presencePenalty
           ],
           { async: true }
         )
@@ -5373,6 +5430,7 @@ var LlamaWebGpuBridge = class {
     }
   }
   async createCompletion(prompt, options = {}) {
+    resolveCompletionSamplingOptions(options);
     const onUsage = options?.onUsage;
     if (typeof onUsage !== "function") {
       return this._runExclusive(
@@ -5410,6 +5468,30 @@ var LlamaWebGpuBridge = class {
       onUsage(usage);
     }
     return text;
+  }
+  async getCompletionCapabilities() {
+    return this._runExclusive(
+      () => this._getCompletionCapabilitiesUnlocked(),
+      { kind: "completion-capabilities" }
+    );
+  }
+  async _getCompletionCapabilitiesUnlocked() {
+    if (!this._workerProxy) {
+      return this._runtime?.getCompletionCapabilities() ?? { ...NO_COMPLETION_CAPABILITIES };
+    }
+    try {
+      await this._restoreWorkerModelIfMissing();
+      return await this._callWorker("getCompletionCapabilities", []);
+    } catch (error) {
+      this._throwIfOperationCancelled(error, "Completion capability probe was cancelled.");
+      if (!this._isWorkerUnusableError(error)) {
+        throw error;
+      }
+      this._disableWorkerFallback(error);
+      await this._waitForWorkerDisposal();
+      await this._ensureRuntimeReadyAfterWorkerFallback({}, error);
+      return this._runtime.getCompletionCapabilities();
+    }
   }
   async _createCompletionUnlocked(prompt, options = {}) {
     const isWarmup = options?.warmup === true;

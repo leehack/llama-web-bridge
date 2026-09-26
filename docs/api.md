@@ -86,7 +86,7 @@ both worker and direct runtime modes:
 `loadModelFromUrl`, `loadMultimodalProjector`, `unloadMultimodalProjector`,
 `getTextToSpeechCapabilities`, `synthesizeSpeech`, `getDecisionCapabilities`,
 `loadDecisionHead`, `runDecision`, `freeDecisionHead`, `createCompletion`,
-`tokenize`, `detokenize`, `stateSaveFile`, `stateLoadFile`, `stateSaveBytes`,
+`getCompletionCapabilities`, `tokenize`, `detokenize`, `stateSaveFile`, `stateLoadFile`, `stateSaveBytes`,
 `stateLoadBytes`, `embed`, `embedBatch`, `scoreNextToken`, `applyChatTemplate`.
 
 Overlapping calls wait their turn and run in call order. A failing operation
@@ -272,7 +272,9 @@ Common `options` keys:
 | `temp` | Sampling temperature. Defaults to `0.8`. |
 | `topK` | Top-k sampling. Defaults to `40`. |
 | `topP` | Top-p sampling. Defaults to `0.95`. |
+| `minP` | Min-P threshold from `0` to `1`, applied after top-p. Defaults to `0`, which disables it. |
 | `penalty` | Repetition penalty. Defaults to `1.1`. |
+| `presencePenalty` | Subtracted once from the logit of each token among this completion's last 64 tokens; prompt tokens do not count. Defaults to `0`, which disables it. |
 | `grammar` | Optional llama.cpp GBNF grammar with a `root` rule. An invalid grammar rejects before generation starts with an error containing `(invalid grammar)`; worker mode rethrows it without falling back to the main thread. Each rejection leaks the partly parsed grammar (a few KiB at most for typical grammars), so validate generated grammars before sending them in a loop. |
 | `seed` | Integer seed; random when omitted. |
 | `onUsage(usage)` | Called at most once, with the `CompletionUsage` of the last attempt whose generation returned, before the promise resolves or rejects with an `AbortError`. Not called when no generation returned: other rejections, a skipped multimodal warmup, or a worker failure after a cancel. |
@@ -287,6 +289,11 @@ Common `options` keys:
 | `mediaMaxPredict` | Cap for multimodal generation token count. |
 
 Call `cancel()` or abort the supplied signal to request a best-effort stop.
+
+An invalid `minP` or a `presencePenalty` that is not finite as a 32-bit float
+rejects with a `RangeError`
+before generation starts. A nonzero value rejects when the loaded core does not
+apply that option.
 
 `CompletionUsage` fields:
 
@@ -306,6 +313,16 @@ fallback, the usage is that of the last attempt whose generation returned. In
 worker mode an abort during generation rejects the promise, while the direct
 runtime resolves it with the partial text; in both, `onUsage` reports the
 cancelled generation once it returns.
+
+### `getCompletionCapabilities()`
+
+```ts
+getCompletionCapabilities(): Promise<CompletionCapabilities>
+```
+
+Returns `{ presencePenalty, minP }`: whether the loaded core applies each
+`createCompletion` option. Every flag is `false` until a model load initializes
+the core.
 
 ## Tokenization and chat templates
 

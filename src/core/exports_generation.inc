@@ -10,7 +10,9 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_generate(
     float top_p,
     float repeat_penalty,
     const char * grammar,
-    uint32_t seed) {
+    uint32_t seed,
+    float min_p,
+    float presence_penalty) {
   if (n_predict <= 0) {
     n_predict = 128;
   }
@@ -22,7 +24,9 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_generate(
       top_p,
       repeat_penalty,
       grammar,
-      seed);
+      seed,
+      min_p,
+      presence_penalty);
   if (begin_rc != 0) {
     return begin_rc;
   }
@@ -50,7 +54,9 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_begin_generation(
     float top_p,
     float repeat_penalty,
     const char * grammar,
-    uint32_t seed) {
+    uint32_t seed,
+    float min_p,
+    float presence_penalty) {
   return begin_generation_impl(
       prompt,
       temp,
@@ -58,7 +64,13 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_begin_generation(
       top_p,
       repeat_penalty,
       grammar,
-      seed);
+      seed,
+      min_p,
+      presence_penalty);
+}
+
+EMSCRIPTEN_KEEPALIVE const char * llamadart_webgpu_completion_capabilities_json() {
+  return "{\"presencePenalty\":true,\"minP\":true}";
 }
 
 EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_next_token() {
