@@ -82,6 +82,9 @@ _ORCHESTRATION_ONLY_PATHS = frozenset(
         "scripts/bridge_operation_queue_fixtures.mjs",
         "scripts/bridge_operation_queue_lifecycle_contract_cases.mjs",
         "scripts/bridge_operation_queue_worker_proxy_cases.mjs",
+        # Shared by the scripts/*_browser_smoke.mjs harnesses, which the
+        # _browser_smoke.mjs suffix covers.
+        "scripts/browser_smoke_support.mjs",
         # Ported to scripts/ci_scope.mjs. Keep the .py entry: the commit that
         # ported it deletes that path, and history must not classify that
         # commit as a build input.
@@ -132,6 +135,10 @@ _ORCHESTRATION_ONLY_PATHS = frozenset(
 )
 _ORCHESTRATION_ONLY_PREFIXES = ("docs/",)
 _ORCHESTRATION_ONLY_SCRIPT_SUFFIXES = (
+    # Node ports of the Python browser smokes. Keep the .py suffix: the
+    # commits that port a smoke delete its .py path, and history must not
+    # classify those commits as build inputs.
+    "_browser_smoke.mjs",
     "_browser_smoke.py",
     "_test.mjs",
     "_test.py",

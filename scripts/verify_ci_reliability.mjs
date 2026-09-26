@@ -885,13 +885,13 @@ function checkCiRunsContracts({ ci, candidate, publish }, errors) {
   }
   // Rows 21, 22, 101, 103: CI runs the checksum-pinned browser smokes.
   check.require(
-    (ci.runText.match(/python3 scripts\/grammar_browser_smoke\.py\b/g) ?? []).length === 2
+    (ci.runText.match(/node scripts\/grammar_browser_smoke\.mjs\b/g) ?? []).length === 2
       && ci.runText.includes('--model-sha256 "$LLAMA_WEBGPU_MULTIMODAL_MODEL_SHA256"'),
     `${ci.path} must run the grammar smoke twice, once with the checksum-pinned multimodal model`,
   );
   check.includes(ci.path, ci.runText, [
-    'python3 scripts/next_token_scores_browser_smoke.py',
-    'python3 scripts/state_persistence_browser_smoke.py',
+    'node scripts/next_token_scores_browser_smoke.mjs',
+    'node scripts/state_persistence_browser_smoke.mjs',
     'python3 scripts/multimodal_browser_smoke.py',
   ], 'run the next-token scores, state persistence and multimodal browser smokes');
   // Row 57: CI builds the llama.cpp pin.

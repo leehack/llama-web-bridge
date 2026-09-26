@@ -65,8 +65,6 @@ jobs:
             scripts/release_qualification_test.py \
             scripts/state_persistence_browser_smoke.py \
             scripts/multimodal_browser_smoke.py \
-            scripts/grammar_browser_smoke.py \
-            scripts/next_token_scores_browser_smoke.py \
             scripts/speech_to_text_browser_smoke.py \
             scripts/text_to_speech_browser_smoke.py \
             scripts/decision_browser_smoke.py
@@ -211,15 +209,18 @@ jobs:
           test -f "${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_core_mem64.js"
           test -f "${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_core_mem64.wasm"
 
+      # The Node smokes use the locked playwright package; the multimodal smoke
+      # still runs on Python Playwright.
       - name: Install Playwright Chromium
         run: |
-          python3 -m pip install --user playwright
+          npx --no-install playwright install --only-shell chromium
+          python3 -m pip install --user playwright==1.63.0
           python3 -m playwright install chromium
 
       - name: Run state persistence browser smoke
         env:
           BRIDGE_DIST_DIR: ${{ runner.temp }}/webgpu_bridge_dist
-        run: python3 scripts/state_persistence_browser_smoke.py
+        run: node scripts/state_persistence_browser_smoke.mjs
 
       - name: Run multimodal browser smoke
         env:
@@ -230,9 +231,9 @@ jobs:
         env:
           BRIDGE_DIST_DIR: ${{ runner.temp }}/webgpu_bridge_dist
         run: |
-          python3 scripts/grammar_browser_smoke.py \
+          node scripts/grammar_browser_smoke.mjs \
             --artifacts-dir "$LLAMA_WEBGPU_GRAMMAR_ARTIFACTS_DIR/state-smoke-model"
-          python3 scripts/grammar_browser_smoke.py \
+          node scripts/grammar_browser_smoke.mjs \
             --model-url "$LLAMA_WEBGPU_MULTIMODAL_MODEL_URL" \
             --model-sha256 "$LLAMA_WEBGPU_MULTIMODAL_MODEL_SHA256" \
             --model-cache-dir "$LLAMA_WEBGPU_MULTIMODAL_MODEL_CACHE" \
@@ -242,7 +243,7 @@ jobs:
       - name: Run next-token scores browser smoke
         env:
           BRIDGE_DIST_DIR: ${{ runner.temp }}/webgpu_bridge_dist
-        run: python3 scripts/next_token_scores_browser_smoke.py
+        run: node scripts/next_token_scores_browser_smoke.mjs
 
       - name: Upload state persistence smoke diagnostics
         if: failure()

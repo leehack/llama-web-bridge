@@ -125,16 +125,27 @@ Before opening or updating a PR, run the lightweight contracts:
 
 ```bash
 npm run check:js
-python3 -m py_compile scripts/state_persistence_browser_smoke.py scripts/multimodal_browser_smoke.py scripts/grammar_browser_smoke.py scripts/next_token_scores_browser_smoke.py scripts/speech_to_text_browser_smoke.py scripts/text_to_speech_browser_smoke.py scripts/decision_browser_smoke.py
+python3 -m py_compile scripts/state_persistence_browser_smoke.py scripts/multimodal_browser_smoke.py scripts/speech_to_text_browser_smoke.py scripts/text_to_speech_browser_smoke.py scripts/decision_browser_smoke.py
 node scripts/verify_ci_reliability.mjs
 ```
+
+The state-persistence, grammar and next-token smokes run on Node with the
+locked `playwright` dev dependency. After `npm ci --ignore-scripts`, install its
+browser once with `npx --no-install playwright install --only-shell chromium`.
+Node's `fetch` ignores `HTTP(S)_PROXY` unless `NODE_USE_ENV_PROXY=1` is set.
+The other smokes still use Python Playwright 1.63.0 (`python3 -m pip install
+playwright==1.63.0` and `python3 -m playwright install chromium`). Until the
+qualification harness moves to Node, the candidate's state gate still runs
+`scripts/state_persistence_browser_smoke.py`;
+`tests/js/state_persistence_harness_parity_test.mjs` keeps its page identical
+to the Node port.
 
 For state-persistence, worker, or workflow changes, also run the browser smoke
 against a built dist directory. Use a checksum-pinned tiny model and keep caches
 and artifacts outside the repository:
 
 ```bash
-python3 scripts/state_persistence_browser_smoke.py \
+node scripts/state_persistence_browser_smoke.mjs \
   --dist-dir /private/tmp/llama_web_bridge_dist \
   --model-url https://huggingface.co/aladar/llama-2-tiny-random-GGUF/resolve/main/llama-2-tiny-random.gguf \
   --model-sha256 81f226c62d28ed4a1a9b9fa080fcd9f0cc40e0f9d5680036583ff98fbcd035cb \
@@ -163,7 +174,7 @@ above; the smoke defaults to the `LLAMA_WEBGPU_SMOKE_MODEL_URL` and
 `LLAMA_WEBGPU_SMOKE_MODEL_SHA256` environment variables:
 
 ```bash
-python3 scripts/grammar_browser_smoke.py \
+node scripts/grammar_browser_smoke.mjs \
   --dist-dir /private/tmp/llama_web_bridge_dist \
   --model-url "$LLAMA_WEBGPU_SMOKE_MODEL_URL" \
   --model-sha256 "$LLAMA_WEBGPU_SMOKE_MODEL_SHA256" \
@@ -174,7 +185,7 @@ For next-token scoring changes, run `scoreNextToken` through direct and worker
 runtimes on both memory modes with the state-persistence model:
 
 ```bash
-python3 scripts/next_token_scores_browser_smoke.py \
+node scripts/next_token_scores_browser_smoke.mjs \
   --dist-dir /private/tmp/llama_web_bridge_dist \
   --model-url "$LLAMA_WEBGPU_SMOKE_MODEL_URL" \
   --model-sha256 "$LLAMA_WEBGPU_SMOKE_MODEL_SHA256" \

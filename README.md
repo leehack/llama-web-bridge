@@ -243,7 +243,7 @@ comments never fails it:
 - CI runs the state-persistence, multimodal, grammar, and next-token-score
   browser smokes.
 
-Run `scripts/state_persistence_browser_smoke.py` locally after building the
+Run `scripts/state_persistence_browser_smoke.mjs` locally after building the
 bridge if a change touches state persistence, workers, browser smoke, or
 workflow diagnostics, and `scripts/multimodal_browser_smoke.py` for llama.cpp
 pin or multimodal changes. Both invocations, with their pinned models, are in

@@ -307,7 +307,7 @@ jobs:
 
       - name: Install Playwright Chromium
         run: |
-          python3 -m pip install --user playwright
+          python3 -m pip install --user playwright==1.63.0
           python3 -m playwright install chromium
 
       - name: Run durable state persistence gate
