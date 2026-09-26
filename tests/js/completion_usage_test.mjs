@@ -41,6 +41,9 @@ function workerCrash() {
 }
 
 const CASES = [
+  ['bridge instances advertise onUsage through their constructor', async () => {
+    assert.equal(createDirectBridge().bridge.constructor.supportsCompletionUsage, true);
+  }],
   ['a completion that stops reports its counts and timings once, before it resolves', async () => {
     const { bridge } = createDirectBridge({ hello: ['a', 'b', 'c'] });
     const events = [];

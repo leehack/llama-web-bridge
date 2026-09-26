@@ -189,6 +189,12 @@ internals.
 `boolean` flag indicating that the bridge applies Safari-specific GPU layer
 capping logic when Safari is detected.
 
+#### `LlamaWebGpuBridge.supportsCompletionUsage`
+
+`true` when `createCompletion` accepts `onUsage`. Bridges before v0.1.54 lack
+the flag; through v0.1.52 their worker mode rejects a function option with a
+`DataCloneError`. Check it before passing `onUsage`.
+
 ## Model loading and cache helpers
 
 ### `loadModelFromUrl(url, options?)`

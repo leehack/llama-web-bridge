@@ -243,6 +243,8 @@ export function enableBridgeWorkerHost(): void;
  */
 export class LlamaWebGpuBridge {
   static supportsSafariAdaptiveGpu: boolean;
+  /** `true` when `createCompletion` accepts `onUsage`. Bridges before v0.1.54 lack it; through v0.1.52 their worker mode rejects a function option with a `DataCloneError`. */
+  static supportsCompletionUsage: boolean;
 
   constructor(config?: LlamaWebGpuBridgeConfig);
 
