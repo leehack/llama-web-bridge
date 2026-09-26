@@ -48,6 +48,17 @@ const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../.
     'src/core.cpp', 'src/core/exports_tts.inc', 'src/core/new_part.inc', 'js/llama_webgpu_bridge.ts', 'package-lock.json',
     'scripts/build_bridge.sh', 'scripts/patch_wasm64_runtime.mjs', 'scripts/state_persistence_browser_smoke.py',
     'scripts/multimodal_browser_smoke.py', 'scripts/ci_scope.py', 'scripts/ci_scope.mjs',
+    // Browser harnesses keep the build and smoke lanes, as their .py originals did.
+    'scripts/state_persistence_browser_smoke.mjs', 'scripts/grammar_browser_smoke.mjs',
+    'scripts/next_token_scores_browser_smoke.mjs', 'scripts/multimodal_browser_smoke.mjs',
+    'scripts/browser_smoke_support.mjs', 'tests/js/browser_smoke_support_test.mjs',
+    'tests/js/multimodal_harness_parity_test.mjs',
+    'scripts/speech_to_text_browser_smoke.mjs', 'scripts/text_to_speech_browser_smoke.mjs',
+    'scripts/decision_browser_smoke.mjs', 'scripts/speech_to_text_browser_smoke.py',
+    'scripts/text_to_speech_browser_smoke.py', 'scripts/decision_browser_smoke.py',
+    'tests/js/heavy_browser_smokes_test.mjs',
+    // Read by the speech smoke, like release_qualification.py, which also keeps the lanes.
+    'scripts/speech_to_text_fixture.json', 'scripts/release_qualification.py',
     'scripts/new_test.py', 'llama_cpp.version', 'emsdk.version',
     '.github/workflows/ci.yml', '.github/workflows/bridge_candidate.yml',
     'CMakeLists.txt', 'docs/native.cpp', 'unknown.lock',

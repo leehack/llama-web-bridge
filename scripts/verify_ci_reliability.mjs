@@ -885,14 +885,14 @@ function checkCiRunsContracts({ ci, candidate, publish }, errors) {
   }
   // Rows 21, 22, 101, 103: CI runs the checksum-pinned browser smokes.
   check.require(
-    (ci.runText.match(/python3 scripts\/grammar_browser_smoke\.py\b/g) ?? []).length === 2
+    (ci.runText.match(/node scripts\/grammar_browser_smoke\.mjs\b/g) ?? []).length === 2
       && ci.runText.includes('--model-sha256 "$LLAMA_WEBGPU_MULTIMODAL_MODEL_SHA256"'),
     `${ci.path} must run the grammar smoke twice, once with the checksum-pinned multimodal model`,
   );
   check.includes(ci.path, ci.runText, [
-    'python3 scripts/next_token_scores_browser_smoke.py',
-    'python3 scripts/state_persistence_browser_smoke.py',
-    'python3 scripts/multimodal_browser_smoke.py',
+    'node scripts/next_token_scores_browser_smoke.mjs',
+    'node scripts/state_persistence_browser_smoke.mjs',
+    'node scripts/multimodal_browser_smoke.mjs',
   ], 'run the next-token scores, state persistence and multimodal browser smokes');
   // Row 57: CI builds the llama.cpp pin.
   check.includes(ci.path, ci.runText, ["tr -d '[:space:]' < llama_cpp.version"], 'resolve the llama.cpp tag from llama_cpp.version');
@@ -1289,8 +1289,8 @@ function checkCandidateAndQualification({ candidate, qualification, publish }, e
   const multimodalGate = candidate.steps.find((step) => step.id === 'multimodal_gate');
   check.require(
     build !== undefined && String(build.env.WEBGPU_BRIDGE_BUILD_MEM64) === '1'
-      && stateGate?.run.includes('python3 scripts/state_persistence_browser_smoke.py')
-      && multimodalGate?.run.includes('python3 scripts/multimodal_browser_smoke.py')
+      && stateGate?.run.trim() === 'node scripts/state_persistence_browser_smoke.mjs'
+      && multimodalGate?.run.trim() === 'node scripts/multimodal_browser_smoke.mjs'
       && candidate.steps.some((step) => step.env.STATE_CONCLUSION === '${{ steps.state_gate.outcome }}'
         && step.env.MULTIMODAL_CONCLUSION === '${{ steps.multimodal_gate.outcome }}'),
     `${candidate.path} must build the memory64 core and record the outcomes of its state persistence and multimodal gates`,
@@ -1395,6 +1395,32 @@ function checkCandidateAndQualification({ candidate, qualification, publish }, e
     'actions/artifacts/${CANDIDATE_ARTIFACT_ID}/zip',
     'repos/${BRIDGE_REPO}/compare/${head_sha}...${bridge_default}',
   ], 'prove the candidate run, first attempt, artifact id and correlation before running the gates on its exact harness');
+  requireQualificationNodeHarness(qualification.text, errors);
+}
+
+// qualify runs the candidate's Node smokes, so Node.js 24 and the candidate's
+// locked npm dependencies (with their Playwright Chromium) are installed in
+// candidate-source before it, and no Python Playwright is.
+export function requireQualificationNodeHarness(text, errors, relativePath = WORKFLOWS.qualification) {
+  const check = checker(errors);
+  const qualification = new Workflow(relativePath, text, errors);
+  const qualifyIndex = qualification.steps.findIndex((step) => step.run.includes('release_qualification.py qualify'));
+  const before = (predicate) => qualification.steps.some((step, index) => index < qualifyIndex && predicate(step));
+  const inCandidateSource = (step, command) => step.run.trim() === command && step.raw['working-directory'] === 'candidate-source';
+  check.require(
+    qualifyIndex >= 0
+      && before((step) => /^actions\/setup-node@/.test(step.uses) && String(step.with['node-version']) === '24')
+      && before((step) => inCandidateSource(step, 'npm ci --ignore-scripts'))
+      && before((step) => inCandidateSource(step, 'npx --no-install playwright install --only-shell chromium')),
+    `${relativePath} must set up Node.js 24, run npm ci --ignore-scripts and install the Playwright Chromium `
+      + 'in candidate-source before release_qualification.py qualify',
+  );
+  check.excludes(relativePath, qualification.runText, ['pip install', '-m playwright'], 'never install Python Playwright');
+  // Only the lockfile decides the gate dependencies: no other npm install.
+  check.require(
+    !/\bnpm\s+(?:install|i|add|update|up)\b|\bnpx\s+(?!--no-install\b)/.test(qualification.runText),
+    `${relativePath} must install gate dependencies only with npm ci --ignore-scripts and run npx only with --no-install`,
+  );
 }
 
 function checkModelPins(files, workflows, errors) {
@@ -1502,15 +1528,6 @@ function main() {
   return 0;
 }
 
-function invokedAsEntry() {
-  try {
-    return Boolean(process.argv[1])
-      && fs.realpathSync(process.argv[1]) === fs.realpathSync(fileURLToPath(import.meta.url));
-  } catch {
-    return false;
-  }
-}
-
-if (invokedAsEntry()) {
+if (import.meta.main) {
   process.exitCode = main();
 }

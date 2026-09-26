@@ -241,10 +241,22 @@ jobs:
             echo "tts_mmproj=${tts_mmproj}"
           } >> "${GITHUB_OUTPUT}"
 
+      # The gates are the candidate's Node smokes, run with its locked
+      # playwright package and the Chromium that version pins.
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: candidate-source/package-lock.json
+
+      - name: Install the candidate's locked npm dependencies
+        working-directory: candidate-source
+        run: npm ci --ignore-scripts
+
       - name: Install Playwright Chromium
-        run: |
-          python3 -m pip install --user playwright
-          python3 -m playwright install chromium
+        working-directory: candidate-source
+        run: npx --no-install playwright install --only-shell chromium
 
       - name: Run the heavy Qwen3-ASR and Qwen3-TTS gates
         env:

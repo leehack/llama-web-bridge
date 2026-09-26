@@ -59,18 +59,18 @@ Validate Outputs. Run them from there; do not copy them here. Which smoke
 applies:
 
 - state-persistence or workflow changes:
-  `scripts/state_persistence_browser_smoke.py` against a built `OUT_DIR`;
-- llama.cpp pin or multimodal changes: `scripts/multimodal_browser_smoke.py`
+  `scripts/state_persistence_browser_smoke.mjs` against a built `OUT_DIR`;
+- llama.cpp pin or multimodal changes: `scripts/multimodal_browser_smoke.mjs`
   through both direct and worker runtimes;
-- sampler or grammar changes: `scripts/grammar_browser_smoke.py` with the
+- sampler or grammar changes: `scripts/grammar_browser_smoke.mjs` with the
   state-persistence model and the multimodal model;
 - next-token scoring or prompt-evaluation changes:
-  `scripts/next_token_scores_browser_smoke.py` with the state-persistence model;
-- speech changes: `scripts/speech_to_text_browser_smoke.py` and
-  `scripts/text_to_speech_browser_smoke.py` individually. The combined
+  `scripts/next_token_scores_browser_smoke.mjs` with the state-persistence model;
+- speech changes: `scripts/speech_to_text_browser_smoke.mjs` and
+  `scripts/text_to_speech_browser_smoke.mjs` individually. The combined
   `release_qualification.py qualify` command is workflow-only because it
   requires GitHub Actions and `github-hosted` runner identity;
-- decision-head changes: `scripts/decision_browser_smoke.py` with a Laya
+- decision-head changes: `scripts/decision_browser_smoke.mjs` with a Laya
   encoder GGUF, head and reference fixture.
 
 Keep the tiny model in a user cache or `/private/tmp`; do not commit downloaded

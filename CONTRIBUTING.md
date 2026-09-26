@@ -125,16 +125,23 @@ Before opening or updating a PR, run the lightweight contracts:
 
 ```bash
 npm run check:js
-python3 -m py_compile scripts/state_persistence_browser_smoke.py scripts/multimodal_browser_smoke.py scripts/grammar_browser_smoke.py scripts/next_token_scores_browser_smoke.py scripts/speech_to_text_browser_smoke.py scripts/text_to_speech_browser_smoke.py scripts/decision_browser_smoke.py
+python3 -m unittest discover -s scripts -p '*_test.py'
 node scripts/verify_ci_reliability.mjs
 ```
+
+Every browser smoke runs on Node with the locked `playwright` dev dependency:
+in CI, in the candidate's state and multimodal gates, and in the automated
+qualification's speech and text-to-speech gates. After
+`npm ci --ignore-scripts`, install its browser once with
+`npx --no-install playwright install --only-shell chromium`. Node's `fetch`
+ignores `HTTP(S)_PROXY` unless `NODE_USE_ENV_PROXY=1` is set.
 
 For state-persistence, worker, or workflow changes, also run the browser smoke
 against a built dist directory. Use a checksum-pinned tiny model and keep caches
 and artifacts outside the repository:
 
 ```bash
-python3 scripts/state_persistence_browser_smoke.py \
+node scripts/state_persistence_browser_smoke.mjs \
   --dist-dir /private/tmp/llama_web_bridge_dist \
   --model-url https://huggingface.co/aladar/llama-2-tiny-random-GGUF/resolve/main/llama-2-tiny-random.gguf \
   --model-sha256 81f226c62d28ed4a1a9b9fa080fcd9f0cc40e0f9d5680036583ff98fbcd035cb \
@@ -146,7 +153,7 @@ For llama.cpp pin or multimodal changes, run checksum-pinned real image
 inference through both direct and worker runtimes:
 
 ```bash
-python3 scripts/multimodal_browser_smoke.py \
+node scripts/multimodal_browser_smoke.mjs \
   --dist-dir /private/tmp/llama_web_bridge_dist \
   --model-path /path/to/Qwen3.5-0.8B-Q4_K_M.gguf \
   --model-sha256 bd258782e35f7f458f8aced1adc053e6e92e89bc735ba3be89d38a06121dc517 \
@@ -163,7 +170,7 @@ above; the smoke defaults to the `LLAMA_WEBGPU_SMOKE_MODEL_URL` and
 `LLAMA_WEBGPU_SMOKE_MODEL_SHA256` environment variables:
 
 ```bash
-python3 scripts/grammar_browser_smoke.py \
+node scripts/grammar_browser_smoke.mjs \
   --dist-dir /private/tmp/llama_web_bridge_dist \
   --model-url "$LLAMA_WEBGPU_SMOKE_MODEL_URL" \
   --model-sha256 "$LLAMA_WEBGPU_SMOKE_MODEL_SHA256" \
@@ -174,7 +181,7 @@ For next-token scoring changes, run `scoreNextToken` through direct and worker
 runtimes on both memory modes with the state-persistence model:
 
 ```bash
-python3 scripts/next_token_scores_browser_smoke.py \
+node scripts/next_token_scores_browser_smoke.mjs \
   --dist-dir /private/tmp/llama_web_bridge_dist \
   --model-url "$LLAMA_WEBGPU_SMOKE_MODEL_URL" \
   --model-sha256 "$LLAMA_WEBGPU_SMOKE_MODEL_SHA256" \
@@ -186,16 +193,17 @@ qualification workflow, not in ordinary CI or the candidate build. Before
 publishing, `.github/workflows/bridge_qualification.yml` runs them against the
 exact candidate artifact built by `.github/workflows/bridge_candidate.yml`.
 The workflow proves the candidate's workflow/run/source identity and unique
-artifact ID, verifies every downloaded input checksum, requires GitHub Actions
-`github-hosted` runner identity, and emits one canonical attestation. That
-attestation binds the candidate artifact ID/run/attempt/workflow/digest and the
+artifact ID, verifies every downloaded input checksum, installs Node.js 24 with
+the candidate source's locked npm dependencies and Playwright Chromium, requires
+GitHub Actions `github-hosted` runner identity, and emits one canonical
+attestation. That attestation binds the candidate artifact ID/run/attempt/workflow/digest and the
 producing qualification run ID/attempt/workflow/source SHA. The combined
 `release_qualification.py qualify` command is therefore workflow-only.
 
 For local reproduction, run the individual smokes directly:
 
 ```bash
-python3 scripts/speech_to_text_browser_smoke.py \
+node scripts/speech_to_text_browser_smoke.mjs \
   --dist-dir /private/tmp/llama_web_bridge_dist \
   --model-path /path/to/Qwen3-ASR-0.6B-Q8_0.gguf \
   --model-sha256 bca259818b50ca7c4c05e9bdb35a5dc04fa039653a6d6f3f0f331f96f6aa1971 \
@@ -205,7 +213,7 @@ python3 scripts/speech_to_text_browser_smoke.py \
 ```
 
 ```bash
-python3 scripts/text_to_speech_browser_smoke.py \
+node scripts/text_to_speech_browser_smoke.mjs \
   --dist-dir /private/tmp/llama_web_bridge_dist \
   --model-path /path/to/Qwen3-TTS-12Hz-1.7B-Base-Q4_K_M.gguf \
   --model-sha256 8d18c94acb2addd042f97da63c98be144eafa76d0d9495177eab65130cf85129 \
@@ -225,7 +233,7 @@ without `laya.config` metadata, such as the official `model.safetensors`, and
 `--gpu-layers 0` to check the CPU path:
 
 ```bash
-python3 scripts/decision_browser_smoke.py \
+node scripts/decision_browser_smoke.mjs \
   --dist-dir /private/tmp/llama_web_bridge_dist \
   --model-path /path/to/laya-Q8_0.gguf \
   --head-path /path/to/laya-head.safetensors \
@@ -260,9 +268,11 @@ query strings, and fragments before printing the location.
   ASR audio fixture, and every attestation must match them exactly.
   `.github/workflows/bridge_qualification.yml` hand-copies a 5-pin speech, TTS,
   and ASR audio subset, so rotate it with the rest.
-  `scripts/speech_to_text_browser_smoke.py` defaults the same ASR audio URL and
-  SHA-256 in `DEFAULT_AUDIO_URL` / `DEFAULT_AUDIO_SHA256`; no check compares that
-  copy, so rotate it by hand.
+  `scripts/speech_to_text_fixture.json` holds the same ASR audio URL and
+  SHA-256, which the speech smoke uses as defaults, with the expected
+  transcript that `scripts/release_qualification.py` also reads.
+  `scripts/release_qualification_test.py` requires its SHA-256 to equal the
+  pin; nothing compares its URL, so rotate that by hand.
 - The script maps every workflow `<ROLE>_SHA256` env key to its canonical name in
   `EXPECTED_MODEL_PINS` and requires equality in all three workflows, so a role
   swap fails even when applied identically to every one of them. It requires
@@ -279,7 +289,7 @@ query strings, and fragments before printing the location.
   `resolve/main` ref rather than an immutable 40-hex revision, and the ASR audio
   fixture is not a Hugging Face object and carries no revision segment at all;
   the script lists both sets and fails when a role joins or leaves them.
-- Keep `scripts/multimodal_browser_smoke.py` in normal CI for every llama.cpp
+- Keep `scripts/multimodal_browser_smoke.mjs` in normal CI for every llama.cpp
   pin update; build-only validation does not cover mtmd prompt ingestion.
 - Heavy real-model ASR and TTS gates run through
   `scripts/release_qualification.py` in automated qualification. Keep the

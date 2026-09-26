@@ -10,7 +10,6 @@
 
 import fs from 'node:fs';
 import process from 'node:process';
-import { fileURLToPath } from 'node:url';
 
 // Python's `re` \s for str patterns (str.isspace()); JavaScript's \s lacks
 // U+001C-U+001F and U+0085 and adds U+FEFF.
@@ -181,15 +180,6 @@ export function main(argv = process.argv.slice(2)) {
   return 0;
 }
 
-function invokedAsEntry() {
-  try {
-    return Boolean(process.argv[1])
-      && fs.realpathSync(process.argv[1]) === fs.realpathSync(fileURLToPath(import.meta.url));
-  } catch {
-    return false;
-  }
-}
-
-if (invokedAsEntry()) {
+if (import.meta.main) {
   process.exitCode = main();
 }

@@ -47,7 +47,6 @@ from release_contract import (
     require_correlation_id,
     require_sha256,
 )
-from speech_to_text_browser_smoke import DEFAULT_EXPECTED_TEXT
 from release_publication_state import (
     PUBLICATION_FILES,
     CandidateIdentity,
@@ -58,7 +57,8 @@ from release_publication_state import (
 
 QUALIFICATION_SCHEMA_VERSION = 2
 ATTESTATION_TYPE = "llama-web-bridge-automated-qualification"
-HARNESS_VERSION = "3.0.0"
+# 4.0.0: the heavy gates run the Node smokes (scripts/*_browser_smoke.mjs).
+HARNESS_VERSION = "4.0.0"
 
 # The attestation only ever travels as a workflow artifact, so this ceiling is a
 # bound on the archived member rather than a transport limit. It stays far above
@@ -110,10 +110,6 @@ def normalize_transcript(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", " ", text).strip()
 
 
-# The fixture transcript belongs to the speech gate that produces it. A second
-# pinned copy here could drift into silently disagreeing with the gate about
-# what a passing transcript is.
-EXPECTED_SPEECH_TRANSCRIPT = normalize_transcript(DEFAULT_EXPECTED_TEXT)
 MAX_CANCELLATION_OUTPUT_CHARACTERS = 1_000_000
 _CANCELLATION_RESULT_RE = re.compile(
     r"^cancel:(resolved|rejected):(0|[1-9][0-9]*)$"
@@ -235,17 +231,33 @@ EXPECTED_MODEL_PINS = {
     "tts_model_sha256": TTS_MODEL_SHA256,
 }
 
-# Every source file whose behaviour the heavy gates depend on. The digest binds
-# an attestation to the exact harness that produced it, so publication can prove
-# the harness that ran is the exact bridge source being published.
+# The Node smokes qualify runs with the candidate's locked Playwright.
+SPEECH_SMOKE = "speech_to_text_browser_smoke.mjs"
+TTS_SMOKE = "text_to_speech_browser_smoke.mjs"
+QUALIFICATION_SMOKES = (SPEECH_SMOKE, TTS_SMOKE)
+
+# Every scripts/ file the gates execute or read at the candidate source: the
+# qualification command itself with its Python import closure
+# (release_publication_state.py imports generate_release_manifest.py), the
+# speech and text-to-speech smokes it runs, the state-persistence and
+# multimodal smokes the candidate build runs as its hosted gates, the module
+# all four import, and the speech fixture the speech smoke and this file read.
+# The Playwright package is not listed: it is pinned by package-lock.json,
+# which the bridge source SHA already binds. The digest binds an attestation to
+# the exact harness that produced it, so publication can prove the harness that
+# ran is the exact bridge source being published. release_qualification_test.py
+# requires this list to equal that closure.
 HARNESS_SOURCES = (
-    "multimodal_browser_smoke.py",
+    "browser_smoke_support.mjs",
+    "generate_release_manifest.py",
+    "multimodal_browser_smoke.mjs",
     "release_contract.py",
     "release_publication_state.py",
     "release_qualification.py",
-    "speech_to_text_browser_smoke.py",
-    "state_persistence_browser_smoke.py",
-    "text_to_speech_browser_smoke.py",
+    "speech_to_text_browser_smoke.mjs",
+    "speech_to_text_fixture.json",
+    "state_persistence_browser_smoke.mjs",
+    "text_to_speech_browser_smoke.mjs",
 )
 
 _COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -300,6 +312,37 @@ def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
 
 def _reject_nonstandard_json_constant(value: str) -> Any:
     raise ContractError(f"non-standard JSON numeric constant: {value}")
+
+
+# The speech gate's fixture pin and transcript, which the speech smoke reads as
+# its defaults. One file for both, because a second pinned copy here could
+# drift into silently disagreeing with the gate about what a passing transcript
+# is.
+SPEECH_FIXTURE_FILE = "speech_to_text_fixture.json"
+SPEECH_FIXTURE_KEYS = ("audio_sha256", "audio_url", "expected_text")
+
+
+def load_speech_fixture(path: Path) -> dict[str, str]:
+    try:
+        fixture = json.loads(
+            path.read_text(encoding="utf-8"),
+            object_pairs_hook=_reject_duplicate_keys,
+            parse_constant=_reject_nonstandard_json_constant,
+        )
+    except (ContractError, OSError, ValueError) as exc:
+        raise ContractError(f"could not read {path.name}: {exc}") from None
+    if not isinstance(fixture, dict) or tuple(sorted(fixture)) != SPEECH_FIXTURE_KEYS:
+        raise ContractError(
+            f"{path.name} must hold exactly {', '.join(SPEECH_FIXTURE_KEYS)}"
+        )
+    for key in SPEECH_FIXTURE_KEYS:
+        if not isinstance(fixture[key], str) or not fixture[key].strip():
+            raise ContractError(f"{path.name} {key} must be a non-empty string")
+    return fixture
+
+
+SPEECH_FIXTURE = load_speech_fixture(Path(__file__).resolve().parent / SPEECH_FIXTURE_FILE)
+EXPECTED_SPEECH_TRANSCRIPT = normalize_transcript(SPEECH_FIXTURE["expected_text"])
 
 
 def parse_attestation_json(raw_json: str) -> dict[str, Any]:
@@ -2379,6 +2422,31 @@ def fetch_candidate(run_id: str, destination: Path) -> tuple[int, int]:
     return artifact_id, run_attempt
 
 
+def node_executable() -> str:
+    """Resolve the Node.js that runs the browser smokes, failing closed.
+
+    The qualification workflow installs Node.js 24 and the candidate's locked
+    npm dependencies before qualify runs; a missing node never falls back to
+    another interpreter.
+    """
+    found = shutil.which("node")
+    if found is None:
+        raise ContractError(
+            "node is required to run the qualification gates; install Node.js "
+            "and run npm ci --ignore-scripts in the candidate source"
+        )
+    node = str(Path(found).resolve())
+    # The smokes start main() through import.meta.main (Node.js 22.18+); an
+    # older node would exit 0 without running a gate.
+    version = subprocess.run(
+        [node, "--version"], capture_output=True, text=True, timeout=30, check=False
+    ).stdout.strip()
+    match = re.fullmatch(r"v(\d+)\.(\d+)\.\d+", version)
+    if match is None or (int(match.group(1)), int(match.group(2))) < (22, 18):
+        raise ContractError(f"node {version or '(unknown version)'} is too old; the qualification gates need Node.js 22.18 or newer")
+    return node
+
+
 def _require_input_file(path: Path, label: str) -> Path:
     resolved = path.expanduser().resolve()
     if not resolved.is_file():
@@ -2388,6 +2456,7 @@ def _require_input_file(path: Path, label: str) -> Path:
 
 def qualify_cmd(args: argparse.Namespace) -> int:
     scripts_dir = Path(__file__).resolve().parent
+    node = node_executable()
     environment = qualification_environment()
     qualification_identity = qualification_run_identity()
     if args.tts_max_frames <= 0:
@@ -2434,8 +2503,8 @@ def qualify_cmd(args: argparse.Namespace) -> int:
         print("Running Qwen3-ASR wasm32+wasm64 direct+worker gate", file=sys.stderr)
         speech_payload = _run_smoke(
             [
-                sys.executable,
-                str(scripts_dir / "speech_to_text_browser_smoke.py"),
+                node,
+                str(scripts_dir / SPEECH_SMOKE),
                 "--dist-dir", str(candidate_dir),
                 "--model-path", str(speech_model),
                 "--model-sha256", SPEECH_MODEL_SHA256,
@@ -2456,8 +2525,8 @@ def qualify_cmd(args: argparse.Namespace) -> int:
         print("Running Qwen3-TTS wasm64 direct+worker gate", file=sys.stderr)
         tts_payload = _run_smoke(
             [
-                sys.executable,
-                str(scripts_dir / "text_to_speech_browser_smoke.py"),
+                node,
+                str(scripts_dir / TTS_SMOKE),
                 "--dist-dir", str(candidate_dir),
                 "--model-path", str(tts_model),
                 "--model-sha256", TTS_MODEL_SHA256,
