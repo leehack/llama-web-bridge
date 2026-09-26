@@ -347,7 +347,7 @@ class ReleaseContractTest(unittest.TestCase):
                 parse_upstream_tag(tag)
 
     def test_ordinary_pin_accepts_either_upstream_channel(self) -> None:
-        """scripts/verify_ci_reliability.mjs gates llama_cpp.version with the same form."""
+        """scripts/ci/verify_ci_reliability.mjs gates llama_cpp.version with the same form."""
         pin_path = Path(__file__).resolve().parents[1] / "llama_cpp.version"
         pin_contents = pin_path.read_text(encoding="utf-8")
         self.assertEqual(pin_contents, "v0.5.0\n")

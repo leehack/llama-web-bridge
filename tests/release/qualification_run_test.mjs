@@ -245,7 +245,7 @@ test('the CLI subcommands print Python bytes and errors', async () => {
     const mismatch = await cli(['verify-attestation', '--attestation', attestation, '--release-rebuild', '2']);
     assert.deepEqual(mismatch, { stdout: '', stderr: 'error: attestation release_rebuild mismatch: expected 2, got 1\n', status: 1 });
     const missingHarness = await cli(['verify-attestation', '--attestation', attestation, '--harness-dir', tmp]);
-    assert.deepEqual(missingHarness, { stdout: '', stderr: 'error: harness source is missing: browser_smoke_support.mjs\n', status: 1 });
+    assert.deepEqual(missingHarness, { stdout: '', stderr: 'error: harness source is missing: generate_release_manifest.py\n', status: 1 });
 
     assert.deepEqual(await cli(['candidate-fingerprint', '--candidate-dist', context.candidate]), {
       stdout: `${context.fingerprint}\n`, stderr: '', status: 0,

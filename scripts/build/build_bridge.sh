@@ -59,7 +59,7 @@ Environment variables:
   WEBGPU_BRIDGE_INITIAL_MEMORY  Fixed wasm memory bytes when growth disabled
 
 Example:
-  LLAMA_CPP_DIR="$PWD/../llama.cpp" ./scripts/build_bridge.sh
+  LLAMA_CPP_DIR="$PWD/../llama.cpp" ./scripts/build/build_bridge.sh
 USAGE
   exit 0
 fi
@@ -173,7 +173,7 @@ if [[ "$BUILD_MEM64" == "1" ]]; then
   cp "$CORE_MEM64_WASM" "$OUT_DIR/llama_webgpu_core_mem64.wasm"
 
   echo "[bridge] applying wasm64 runtime bigint interop patch"
-  patch_summary="$(node "$BRIDGE_DIR/scripts/patch_wasm64_runtime.mjs" \
+  patch_summary="$(node "$BRIDGE_DIR/scripts/build/patch_wasm64_runtime.mjs" \
     "$OUT_DIR/llama_webgpu_core_mem64.js")"
   echo "$patch_summary"
   # Fail closed if the patcher returned without patching.

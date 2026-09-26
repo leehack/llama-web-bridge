@@ -1,4 +1,4 @@
-// Contract tests for the browser smoke helpers (scripts/browser_smoke_support.mjs)
+// Contract tests for the browser smoke helpers (scripts/smoke/support.mjs)
 // and the checks the Node smokes run on their result, including the in-page
 // checks of the state and multimodal harnesses, run against fake bridges.
 // Expected values were produced by the Python smokes and Python's json/repr,
@@ -41,14 +41,14 @@ import {
   translatePath,
   validateHash,
   webGpuLaunchArgs,
-} from '../../scripts/browser_smoke_support.mjs';
-import * as grammarSmoke from '../../scripts/grammar_browser_smoke.mjs';
-import * as multimodalSmoke from '../../scripts/multimodal_browser_smoke.mjs';
-import * as nextTokenSmoke from '../../scripts/next_token_scores_browser_smoke.mjs';
-import * as stateSmoke from '../../scripts/state_persistence_browser_smoke.mjs';
+} from '../../scripts/smoke/support.mjs';
+import * as grammarSmoke from '../../scripts/smoke/grammar.mjs';
+import * as multimodalSmoke from '../../scripts/smoke/multimodal.mjs';
+import * as nextTokenSmoke from '../../scripts/smoke/next_token_scores.mjs';
+import * as stateSmoke from '../../scripts/smoke/state_persistence.mjs';
 
 const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
-const supportUrl = pathToFileURL(path.join(rootDir, 'scripts/browser_smoke_support.mjs')).href;
+const supportUrl = pathToFileURL(path.join(rootDir, 'scripts/smoke/support.mjs')).href;
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'browser-smoke-support-test-'));
 process.on('exit', () => fs.rmSync(tmp, { recursive: true, force: true }));
 
@@ -986,31 +986,31 @@ function parseResponse(buffer) {
   assert.equal(failed.stdout, '');
   assert.equal(failed.stderr, 'grammar browser smoke failed: dist directory does not exist: /x\n');
   const usage = run(`await runMain('grammar', async () => parseSmokeArgs(['--bad'], {
-    prog: 'grammar_browser_smoke.mjs', description: 'd',
+    prog: 'grammar.mjs', description: 'd',
     options: [{ flag: '--n-ctx', type: 'int', default: () => 1, help: 'h' }],
   }));`);
   assert.equal(usage.status, 2);
-  assert.equal(usage.stderr, 'usage: grammar_browser_smoke.mjs [-h] [--n-ctx N_CTX]\ngrammar_browser_smoke.mjs: error: unrecognized arguments: --bad\n');
+  assert.equal(usage.stderr, 'usage: grammar.mjs [-h] [--n-ctx N_CTX]\ngrammar.mjs: error: unrecognized arguments: --bad\n');
   const help = run(`await runMain('grammar', async () => parseSmokeArgs(['--he'], {
-    prog: 'grammar_browser_smoke.mjs', description: 'd',
+    prog: 'grammar.mjs', description: 'd',
     options: [{ flag: '--n-ctx', type: 'int', default: () => 1, help: 'h' }],
   }));`);
   assert.equal(help.status, 0);
-  assert.ok(help.stdout.startsWith('usage: grammar_browser_smoke.mjs [-h] [--n-ctx N_CTX]\n'));
+  assert.ok(help.stdout.startsWith('usage: grammar.mjs [-h] [--n-ctx N_CTX]\n'));
 }
 
 // The smokes fail before the browser for bad inputs, with the Python messages.
 {
-  const smoke = (name, args, extraEnv = {}) => spawnSync(process.execPath, [path.join(rootDir, 'scripts', name), ...args], {
+  const smoke = (name, args, extraEnv = {}) => spawnSync(process.execPath, [path.join(rootDir, 'scripts', 'smoke', name), ...args], {
     encoding: 'utf8',
     env: { PATH: process.env.PATH, HOME: process.env.HOME, ...extraEnv },
   });
   const missingDist = path.join(tmp, 'no-dist');
   for (const [name, label] of [
-    ['state_persistence_browser_smoke.mjs', 'state persistence'],
-    ['grammar_browser_smoke.mjs', 'grammar'],
-    ['next_token_scores_browser_smoke.mjs', 'next-token scores'],
-    ['multimodal_browser_smoke.mjs', 'multimodal'],
+    ['state_persistence.mjs', 'state persistence'],
+    ['grammar.mjs', 'grammar'],
+    ['next_token_scores.mjs', 'next-token scores'],
+    ['multimodal.mjs', 'multimodal'],
   ]) {
     const result = smoke(name, ['--dist-dir', missingDist]);
     assert.equal(result.status, 1, name);
@@ -1020,19 +1020,19 @@ function parseResponse(buffer) {
   }
   const emptyDist = path.join(tmp, 'empty-dist');
   fs.mkdirSync(emptyDist);
-  const noArtifacts = smoke('state_persistence_browser_smoke.mjs', ['--dist-dir', emptyDist]);
+  const noArtifacts = smoke('state_persistence.mjs', ['--dist-dir', emptyDist]);
   assert.equal(noArtifacts.status, 1);
   assert.equal(noArtifacts.stderr,
     `state persistence browser smoke failed: missing bridge artifact: ${path.join(resolvePath(emptyDist), 'llama_webgpu_bridge.js')}\n`);
-  const noSha = smoke('grammar_browser_smoke.mjs', ['--dist-dir', emptyDist]);
+  const noSha = smoke('grammar.mjs', ['--dist-dir', emptyDist]);
   assert.equal(noSha.stderr, 'grammar browser smoke failed: model SHA-256 is required\n');
-  const badEnv = smoke('next_token_scores_browser_smoke.mjs', [], { LLAMA_WEBGPU_NEXT_TOKEN_SCORES_TIMEOUT_MS: 'soon' });
+  const badEnv = smoke('next_token_scores.mjs', [], { LLAMA_WEBGPU_NEXT_TOKEN_SCORES_TIMEOUT_MS: 'soon' });
   assert.equal(badEnv.status, 1);
   assert.equal(badEnv.stderr, "next-token scores browser smoke failed: invalid literal for int() with base 10: 'soon'\n");
   // The multimodal smoke checks the model, then the projector, before the dist files.
   const modelFile = path.join(tmp, 'origin', 'model.gguf');
   const modelSha = createHash('sha256').update(fs.readFileSync(modelFile)).digest('hex');
-  const multimodal = (args, extraEnv) => smoke('multimodal_browser_smoke.mjs', ['--dist-dir', emptyDist, ...args], extraEnv);
+  const multimodal = (args, extraEnv) => smoke('multimodal.mjs', ['--dist-dir', emptyDist, ...args], extraEnv);
   assert.equal(multimodal([]).stderr, 'multimodal browser smoke failed: multimodal model SHA-256 is required\n');
   assert.equal(multimodal(['--model-sha256', modelSha]).stderr,
     'multimodal browser smoke failed: multimodal model URL or local path is required\n');

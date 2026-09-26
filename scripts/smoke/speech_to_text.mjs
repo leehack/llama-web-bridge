@@ -30,7 +30,7 @@ import {
   withServer,
   withTempDir,
   writeStdout,
-} from './browser_smoke_support.mjs';
+} from './support.mjs';
 import SPEECH_FIXTURE from './speech_to_text_fixture.json' with { type: 'json' };
 
 for (const key of ['audio_url', 'audio_sha256', 'expected_text']) {
@@ -298,7 +298,7 @@ export function renderHarness({ expectedText, audioSha256, memoryModes }) {
 
 export function parseArgs(argv) {
   return parseSmokeArgs(argv, {
-    prog: 'speech_to_text_browser_smoke.mjs',
+    prog: 'speech_to_text.mjs',
     description: DESCRIPTION,
     options: [
       {

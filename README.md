@@ -38,15 +38,15 @@ Build command:
 ```bash
 npm ci
 npm run check:js
-./scripts/build_bridge.sh
+./scripts/build/build_bridge.sh
 ```
 
-`./scripts/build_bridge.sh` also runs the JS bridge build before copying wrapper
+`./scripts/build/build_bridge.sh` also runs the JS bridge build before copying wrapper
 assets, but running `npm run check:js` explicitly is useful before PRs because it
 performs TypeScript `checkJs`, regenerates the checked-in browser ESM wrapper and
 declaration files with esbuild, and syntax-checks the generated bridge files.
 
-`./scripts/build_bridge.sh --help` lists every environment variable the build
+`./scripts/build/build_bridge.sh --help` lists every environment variable the build
 reads (source, build, and output directories, wasm64, stack, memory, and
 pthread settings) with its default.
 
@@ -156,7 +156,7 @@ functional but substantially slower. This generated-audio support is
 experimental upstream and stays out of default CI.
 
 Run the checksum-pinned real-model gate,
-`scripts/text_to_speech_browser_smoke.mjs`, before publishing TTS-capable
+`scripts/smoke/text_to_speech.mjs`, before publishing TTS-capable
 assets; the invocation and pins are in [CONTRIBUTING.md](CONTRIBUTING.md#validate-outputs).
 
 ## Decision heads
@@ -168,7 +168,7 @@ logits for pre-tokenized sequences. Each head gets a private encoder context and
 runs on WebGPU when the model was loaded with GPU layers, in both direct and
 worker runtimes and in wasm32 and memory64. See [docs/api.md](docs/api.md#decision-heads).
 
-The real-model smoke, `scripts/decision_browser_smoke.mjs`, compares every
+The real-model smoke, `scripts/smoke/decision.mjs`, compares every
 fixture row with a Laya reference and stays out of default CI; the invocation is
 in [CONTRIBUTING.md](CONTRIBUTING.md#validate-outputs). No qualification gate
 runs it, so release manifests list no decision capability; probe support with
@@ -182,7 +182,7 @@ applied set and scales at runtime, in direct and worker runtimes and in wasm32
 and memory64. aLoRA adapters are rejected. Probe support with
 `getLoraAdapterCapabilities()`. See [docs/api.md](docs/api.md#lora-adapters).
 
-The real-model smoke, `scripts/lora_adapter_browser_smoke.mjs`, stays out of
+The real-model smoke, `scripts/smoke/lora_adapter.mjs`, stays out of
 default CI; the invocation is in
 [CONTRIBUTING.md](CONTRIBUTING.md#validate-outputs).
 
@@ -204,8 +204,8 @@ tested in CI.
 To run the media-helper and static CI contracts locally:
 
 ```bash
-node tests/js/mtmd_compat_contract_test.mjs
-node scripts/verify_ci_reliability.mjs
+node tests/bridge/mtmd_compat_contract_test.mjs
+node scripts/ci/verify_ci_reliability.mjs
 ```
 
 The reliability contract checks the publication-safety invariants of the CI,
@@ -255,9 +255,9 @@ comments never fails it:
 - CI runs the state-persistence, multimodal, grammar, and next-token-score
   browser smokes.
 
-Run `scripts/state_persistence_browser_smoke.mjs` locally after building the
+Run `scripts/smoke/state_persistence.mjs` locally after building the
 bridge if a change touches state persistence, workers, browser smoke, or
-workflow diagnostics, and `scripts/multimodal_browser_smoke.mjs` for llama.cpp
+workflow diagnostics, and `scripts/smoke/multimodal.mjs` for llama.cpp
 pin or multimodal changes. Both invocations, with their pinned models, are in
 [CONTRIBUTING.md](CONTRIBUTING.md#validate-outputs).
 
@@ -314,15 +314,15 @@ artifact. The orchestrator advances publication only after that exact
 first-attempt qualification run succeeds. No maintainer creates, transports, or
 submits an attestation, and the qualification workflow holds no publication PAT.
 
-`scripts/speech_to_text_browser_smoke.mjs` and
-`scripts/text_to_speech_browser_smoke.mjs` remain runnable on their own while
+`scripts/smoke/speech_to_text.mjs` and
+`scripts/smoke/text_to_speech.mjs` remain runnable on their own while
 iterating locally. The combined `release_qualification.py qualify` command is
 reserved for the hosted workflow because it requires GitHub Actions and
 `github-hosted` runner identity. Both invocations are in
 [CONTRIBUTING.md](CONTRIBUTING.md#validate-outputs).
 
 The default audio is Qwen's official English example fixture.
-`scripts/speech_to_text_fixture.json` pins its URL, its SHA-256 and the exact
+`scripts/smoke/speech_to_text_fixture.json` pins its URL, its SHA-256 and the exact
 normalized transcript observed through the Web runtime, for both the speech
 smoke and `release_qualification.py`, so an upstream fixture replacement fails
 loudly. Use `--memory-mode wasm32` or `--memory-mode wasm64` to classify one

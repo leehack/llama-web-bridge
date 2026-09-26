@@ -187,6 +187,33 @@ const ORCHESTRATION_ONLY_CASES = Object.freeze([
   'tests/release/zip_fixture.mjs',
   'tests/release/orchestrator/fixtures.mjs',
   'tests/release/fixtures/attestation.json',
+  // The CI tooling, smokes and test helpers at their paths after the move
+  // into scripts/ci/, scripts/smoke/ and tests/<area>/.
+  'scripts/ci/ci_scope.mjs',
+  'scripts/ci/verify_ci_reliability.mjs',
+  'scripts/smoke/decision.mjs',
+  'scripts/smoke/grammar.mjs',
+  'scripts/smoke/lora_adapter.mjs',
+  'scripts/smoke/multimodal.mjs',
+  'scripts/smoke/next_token_scores.mjs',
+  'scripts/smoke/speculative.mjs',
+  'scripts/smoke/speech_to_text.mjs',
+  'scripts/smoke/speech_to_text_fixture.json',
+  'scripts/smoke/state_persistence.mjs',
+  'scripts/smoke/support.mjs',
+  'scripts/smoke/text_to_speech.mjs',
+  'tests/bridge/bridge_js_source.mjs',
+  'tests/bridge/bridge_operation_queue_direct_cases.mjs',
+  'tests/bridge/bridge_operation_queue_fixtures.mjs',
+  'tests/bridge/bridge_operation_queue_lifecycle_contract_cases.mjs',
+  'tests/bridge/bridge_operation_queue_worker_proxy_cases.mjs',
+  'tests/bridge/native_core_source.mjs',
+  'tests/bridge/decision_api_contract_test.mjs',
+  'tests/build/wasm64_runtime_patch_contract_test.mjs',
+  'tests/ci/ci_scope_test.mjs',
+  'tests/ci/verify_ci_reliability_test.mjs',
+  'tests/smoke/browser_smoke_support_test.mjs',
+  'tests/smoke/heavy_browser_smokes_test.mjs',
   // Every other listed path, so the lists pin ORCHESTRATION_ONLY_PATHS.
   '.gitignore',
   '.github/workflows/bridge_qualification.yml',
@@ -234,6 +261,18 @@ const GOVERNED_CASES = Object.freeze([
   'scripts/release/unlisted.mjs',
   'scripts/release/orchestrator/unlisted.mjs',
   'scripts/build/verify_emscripten_version.mjs',
+  // The build scripts stay build inputs after the move into scripts/build/.
+  'scripts/build/build_bridge.sh',
+  'scripts/build/build_js_bridge.mjs',
+  'scripts/build/patch_wasm64_runtime.mjs',
+  // The new directories are not exempt by prefix.
+  'scripts/build/unlisted.mjs',
+  'scripts/ci/unlisted.mjs',
+  'scripts/smoke/unlisted.mjs',
+  'scripts/smoke/text_to_speech_fixture.json',
+  'tests/bridge/new_fixture.mjs',
+  'tests/ci/new_fixture.mjs',
+  'tests/smoke/new_fixture.mjs',
   'unknown/new-build-input.cfg',
 ]);
 
@@ -355,6 +394,42 @@ test('the deleted Python orchestrator stays orchestration-only', () => {
     assert.equal(fs.existsSync(path.join(ROOT, file)), false, file);
     assert.ok(ORCHESTRATION_ONLY_CASES.includes(file), file);
     assert.equal(sro.isGovernedBridgePath(file), false, file);
+  }
+});
+
+// The layout move into scripts/build/, scripts/ci/, scripts/smoke/ and
+// tests/<area>/ keeps every file's classification, and its old path stays
+// classified as before, so history does not change.
+test('moved files keep the classification of their old paths', () => {
+  const smokes = [
+    'decision', 'grammar', 'lora_adapter', 'multimodal', 'next_token_scores', 'speculative', 'speech_to_text',
+    'state_persistence', 'text_to_speech',
+  ];
+  const bridgeTests = fs.readdirSync(path.join(ROOT, 'tests', 'bridge')).map((name) => [`tests/js/${name}`, `tests/bridge/${name}`]);
+  const moves = [
+    ['scripts/build_bridge.sh', 'scripts/build/build_bridge.sh'],
+    ['scripts/build_js_bridge.mjs', 'scripts/build/build_js_bridge.mjs'],
+    ['scripts/patch_wasm64_runtime.mjs', 'scripts/build/patch_wasm64_runtime.mjs'],
+    ['scripts/ci_scope.mjs', 'scripts/ci/ci_scope.mjs'],
+    ['scripts/verify_ci_reliability.mjs', 'scripts/ci/verify_ci_reliability.mjs'],
+    ['scripts/browser_smoke_support.mjs', 'scripts/smoke/support.mjs'],
+    ['scripts/speech_to_text_fixture.json', 'scripts/smoke/speech_to_text_fixture.json'],
+    ...smokes.map((name) => [`scripts/${name}_browser_smoke.mjs`, `scripts/smoke/${name}.mjs`]),
+    ...bridgeTests,
+    ['tests/js/ci_scope_test.mjs', 'tests/ci/ci_scope_test.mjs'],
+    ['tests/js/verify_ci_reliability_test.mjs', 'tests/ci/verify_ci_reliability_test.mjs'],
+    ['tests/js/wasm64_runtime_patch_contract_test.mjs', 'tests/build/wasm64_runtime_patch_contract_test.mjs'],
+    ['tests/js/browser_smoke_support_test.mjs', 'tests/smoke/browser_smoke_support_test.mjs'],
+    ['tests/js/heavy_browser_smokes_test.mjs', 'tests/smoke/heavy_browser_smokes_test.mjs'],
+  ];
+  assert.ok(bridgeTests.length > 0);
+  for (const [before, after] of moves) {
+    assert.ok(fs.existsSync(path.join(ROOT, after)), after);
+    assert.equal(fs.existsSync(path.join(ROOT, before)), false, before);
+    assert.equal(sro.isGovernedBridgePath(after), sro.isGovernedBridgePath(before), `${before} -> ${after}`);
+  }
+  for (const governed of ['scripts/build/build_bridge.sh', 'scripts/build/build_js_bridge.mjs', 'scripts/build/patch_wasm64_runtime.mjs']) {
+    assert.equal(sro.isGovernedBridgePath(governed), true, governed);
   }
 });
 

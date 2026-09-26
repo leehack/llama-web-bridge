@@ -232,8 +232,8 @@ EXPECTED_MODEL_PINS = {
 }
 
 # The Node smokes qualify runs with the candidate's locked Playwright.
-SPEECH_SMOKE = "speech_to_text_browser_smoke.mjs"
-TTS_SMOKE = "text_to_speech_browser_smoke.mjs"
+SPEECH_SMOKE = "smoke/speech_to_text.mjs"
+TTS_SMOKE = "smoke/text_to_speech.mjs"
 QUALIFICATION_SMOKES = (SPEECH_SMOKE, TTS_SMOKE)
 
 # Every scripts/ file the gates execute or read at the candidate source: the
@@ -248,16 +248,16 @@ QUALIFICATION_SMOKES = (SPEECH_SMOKE, TTS_SMOKE)
 # ran is the exact bridge source being published. release_qualification_test.py
 # requires this list to equal that closure.
 HARNESS_SOURCES = (
-    "browser_smoke_support.mjs",
     "generate_release_manifest.py",
-    "multimodal_browser_smoke.mjs",
     "release_contract.py",
     "release_publication_state.py",
     "release_qualification.py",
-    "speech_to_text_browser_smoke.mjs",
-    "speech_to_text_fixture.json",
-    "state_persistence_browser_smoke.mjs",
-    "text_to_speech_browser_smoke.mjs",
+    "smoke/multimodal.mjs",
+    "smoke/speech_to_text.mjs",
+    "smoke/speech_to_text_fixture.json",
+    "smoke/state_persistence.mjs",
+    "smoke/support.mjs",
+    "smoke/text_to_speech.mjs",
 )
 
 _COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -318,7 +318,7 @@ def _reject_nonstandard_json_constant(value: str) -> Any:
 # its defaults. One file for both, because a second pinned copy here could
 # drift into silently disagreeing with the gate about what a passing transcript
 # is.
-SPEECH_FIXTURE_FILE = "speech_to_text_fixture.json"
+SPEECH_FIXTURE_FILE = "smoke/speech_to_text_fixture.json"
 SPEECH_FIXTURE_KEYS = ("audio_sha256", "audio_url", "expected_text")
 
 

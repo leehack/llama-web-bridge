@@ -16,7 +16,7 @@ import { fileURLToPath } from 'node:url';
 
 import { isMap, isScalar, parse as parseYaml, parseDocument } from 'yaml';
 
-export const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+export const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 
 const WORKFLOWS = {
   ci: '.github/workflows/ci.yml',
@@ -190,7 +190,7 @@ export function extractModelShaPins(relativePath, content, errors) {
     errors.push(
       `${relativePath} declares ${pins.length} model SHA-256 pins, expected `
       + `${EXPECTED_MODEL_SHA_PIN_COUNT}; update EXPECTED_MODEL_SHA_PIN_COUNT in `
-      + 'scripts/verify_ci_reliability.mjs when the pinned model set changes',
+      + 'scripts/ci/verify_ci_reliability.mjs when the pinned model set changes',
     );
   }
   return new Set(pins);
@@ -904,7 +904,7 @@ function checkCiRunsContracts({ ci, candidate, publish }, errors) {
   // R2 and row 105: CI runs every Python contract suite and this contract.
   check.includes(ci.path, ci.runText, [
     "python3 -m unittest discover -s scripts -p '*_test.py'",
-    'node scripts/verify_ci_reliability.mjs',
+    'node scripts/ci/verify_ci_reliability.mjs',
   ], 'run every Python contract suite and the CI reliability contract');
   // R3: the privileged workflows run the release contract suites from their
   // own checkout.
@@ -914,19 +914,19 @@ function checkCiRunsContracts({ ci, candidate, publish }, errors) {
       'python3 scripts/generate_release_manifest_test.py',
       'python3 scripts/release_publication_state_test.py',
       'python3 scripts/release_qualification_test.py',
-      'node scripts/verify_ci_reliability.mjs',
+      'node scripts/ci/verify_ci_reliability.mjs',
     ], 'run the release contract suites and the CI reliability contract');
   }
   // Rows 21, 22, 101, 103: CI runs the checksum-pinned browser smokes.
   check.require(
-    (ci.runText.match(/node scripts\/grammar_browser_smoke\.mjs\b/g) ?? []).length === 2
+    (ci.runText.match(/node scripts\/smoke\/grammar\.mjs\b/g) ?? []).length === 2
       && ci.runText.includes('--model-sha256 "$LLAMA_WEBGPU_MULTIMODAL_MODEL_SHA256"'),
     `${ci.path} must run the grammar smoke twice, once with the checksum-pinned multimodal model`,
   );
   check.includes(ci.path, ci.runText, [
-    'node scripts/next_token_scores_browser_smoke.mjs',
-    'node scripts/state_persistence_browser_smoke.mjs',
-    'node scripts/multimodal_browser_smoke.mjs',
+    'node scripts/smoke/next_token_scores.mjs',
+    'node scripts/smoke/state_persistence.mjs',
+    'node scripts/smoke/multimodal.mjs',
   ], 'run the next-token scores, state persistence and multimodal browser smokes');
   // Row 57: CI builds the llama.cpp pin.
   check.includes(ci.path, ci.runText, ["tr -d '[:space:]' < llama_cpp.version"], 'resolve the llama.cpp tag from llama_cpp.version');
@@ -973,7 +973,7 @@ function checkToolchainPins({ ci, candidate, publish }, files, errors) {
   }
   // Row 45: the verifier compares emcc with emsdk.version and gates direct builds.
   const verifier = files['scripts/verify_emscripten_version.py'];
-  const build = files['scripts/build_bridge.sh'];
+  const build = files['scripts/build/build_bridge.sh'];
   check.require(
     verifier.includes('emsdk.version')
       && verifier.includes('["emcc", "--version"]')
@@ -1469,7 +1469,7 @@ function checkCandidateAndQualification({ candidate, qualification, publish }, e
     `${candidate.path} must refuse any run attempt other than 1`,
   );
   check.require(
-    (candidate.runText.match(/\.\/scripts\/build_bridge\.sh\b/g) ?? []).length === 1,
+    (candidate.runText.match(/\.\/scripts\/build\/build_bridge\.sh\b/g) ?? []).length === 1,
     `${candidate.path} must build the candidate exactly once`,
   );
   check.require(
@@ -1477,13 +1477,13 @@ function checkCandidateAndQualification({ candidate, qualification, publish }, e
       && Object.keys(candidate.jobs).every((name) => candidate.job(name).environment === undefined),
     `${candidate.path} must stay unprivileged: no publication PAT and no environment`,
   );
-  const build = candidate.steps.find((step) => /\.\/scripts\/build_bridge\.sh\b/.test(step.run));
+  const build = candidate.steps.find((step) => /\.\/scripts\/build\/build_bridge\.sh\b/.test(step.run));
   const stateGate = candidate.steps.find((step) => step.id === 'state_gate');
   const multimodalGate = candidate.steps.find((step) => step.id === 'multimodal_gate');
   check.require(
     build !== undefined && String(build.env.WEBGPU_BRIDGE_BUILD_MEM64) === '1'
-      && stateGate?.run.trim() === 'node scripts/state_persistence_browser_smoke.mjs'
-      && multimodalGate?.run.trim() === 'node scripts/multimodal_browser_smoke.mjs'
+      && stateGate?.run.trim() === 'node scripts/smoke/state_persistence.mjs'
+      && multimodalGate?.run.trim() === 'node scripts/smoke/multimodal.mjs'
       && candidate.steps.some((step) => step.env.STATE_CONCLUSION === '${{ steps.state_gate.outcome }}'
         && step.env.MULTIMODAL_CONCLUSION === '${{ steps.multimodal_gate.outcome }}'),
     `${candidate.path} must build the memory64 core and record the outcomes of its state persistence and multimodal gates`,
@@ -1568,7 +1568,7 @@ function checkCandidateAndQualification({ candidate, qualification, publish }, e
     `${publish.path} must pin the candidate and qualification workflow paths and the exact artifact names`,
   );
   check.excludes(publish.path, publish.text, [
-    'scripts/build_bridge.sh', 'WEBGPU_BRIDGE_BUILD_MEM64', 'setup-emsdk', 'emsdk install', 'emsdk_env.sh', 'scripts/generate_release_manifest.py',
+    'scripts/build/build_bridge.sh', 'WEBGPU_BRIDGE_BUILD_MEM64', 'setup-emsdk', 'emsdk install', 'emsdk_env.sh', 'scripts/generate_release_manifest.py',
     'bridge-source/scripts/release_qualification.py', 'bridge-source/scripts/release_publication_state.py',
   ], 'never rebuild the candidate or run a validator from the historical build source');
   // Row 91: qualification accepts no hand-produced attestation, proves the
@@ -1694,7 +1694,7 @@ export function collectErrors() {
   ));
   const files = Object.fromEntries([
     'package.json', 'llama_cpp.version', 'emsdk.version', 'README.md', 'AGENTS.md', 'CONTRIBUTING.md',
-    'scripts/verify_emscripten_version.py', 'scripts/build_bridge.sh', 'scripts/generate_release_manifest.py',
+    'scripts/verify_emscripten_version.py', 'scripts/build/build_bridge.sh', 'scripts/generate_release_manifest.py',
   ].map((relativePath) => [relativePath, readRequired(relativePath, errors)]));
   const orchestratorSources = orchestratorModules(Object.fromEntries(
     listRequired(ORCHESTRATOR_DIRECTORY, /\.mjs$/, errors)

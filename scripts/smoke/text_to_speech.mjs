@@ -34,7 +34,7 @@ import {
   withServer,
   withTempDir,
   writeStdout,
-} from './browser_smoke_support.mjs';
+} from './support.mjs';
 
 const DESCRIPTION = 'Real-model browser smoke for Qwen3-TTS audio generation.';
 export const MEMORY_MODES = Object.freeze(['wasm32', 'wasm64']);
@@ -304,7 +304,7 @@ export function renderHarness({
 
 export function parseArgs(argv) {
   return parseSmokeArgs(argv, {
-    prog: 'text_to_speech_browser_smoke.mjs',
+    prog: 'text_to_speech.mjs',
     description: DESCRIPTION,
     options: [
       { flag: '--dist-dir', type: 'path', default: () => 'dist' },

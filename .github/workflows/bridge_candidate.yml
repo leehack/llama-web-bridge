@@ -275,7 +275,7 @@ jobs:
           python3 scripts/generate_release_manifest_test.py
           python3 scripts/release_publication_state_test.py
           python3 scripts/release_qualification_test.py
-          node scripts/verify_ci_reliability.mjs
+          node scripts/ci/verify_ci_reliability.mjs
 
       - name: Resolve Emscripten SDK pin
         id: emscripten
@@ -295,7 +295,7 @@ jobs:
           WEBGPU_BRIDGE_BUILD_MEM64: 1
         run: |
           python3 scripts/verify_emscripten_version.py --emit-github-env "$GITHUB_ENV"
-          ./scripts/build_bridge.sh
+          ./scripts/build/build_bridge.sh
 
       - name: Cache release smoke models
         uses: actions/cache@v4
@@ -313,13 +313,13 @@ jobs:
         id: state_gate
         env:
           BRIDGE_DIST_DIR: ${{ runner.temp }}/webgpu_bridge_dist
-        run: node scripts/state_persistence_browser_smoke.mjs
+        run: node scripts/smoke/state_persistence.mjs
 
       - name: Run durable multimodal gate
         id: multimodal_gate
         env:
           BRIDGE_DIST_DIR: ${{ runner.temp }}/webgpu_bridge_dist
-        run: node scripts/multimodal_browser_smoke.mjs
+        run: node scripts/smoke/multimodal.mjs
 
       - name: Generate schema-v2 manifest and checksums
         env:

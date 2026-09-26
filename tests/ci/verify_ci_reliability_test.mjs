@@ -32,7 +32,7 @@ import {
   requireQualificationModelShaPinRoles,
   requireQualificationNodeHarness,
   validatePublicationPatContract,
-} from '../../scripts/verify_ci_reliability.mjs';
+} from '../../scripts/ci/verify_ci_reliability.mjs';
 
 // Contract tests for the CI reliability verifier: the role-aware model pin,
 // URL and revision parity checks, and the publication PAT validator's
@@ -120,7 +120,7 @@ function workflow(roles, { urls = {}, pins = {} } = {}) {
 
 function markdown({ pins = {}, roles = DOCUMENTED_ROLES } = {}) {
   const resolved = { ...EXPECTED_MODEL_PINS, ...pins };
-  const lines = ['```bash', 'node scripts/example_browser_smoke.mjs \\'];
+  const lines = ['```bash', 'node scripts/smoke/example.mjs \\'];
   for (const [roleFlag, value, pinFlag, name] of roles) {
     lines.push(`  ${roleFlag} ${value} \\`);
     lines.push(`  ${pinFlag} ${resolved[name]} \\`);
@@ -479,11 +479,11 @@ assertRejected(validatePublicationPatContract('jobs: [unterminated', EXPECTED_ST
   const packageJson = (scripts) => JSON.stringify({ scripts });
   const good = { 'check:js': 'npm run typecheck:js && npm test', test: TEST_COMMAND };
   const files = {
-    'tests/js/a_test.mjs': "import { x } from './helper.mjs';\nconst late = await import(`./late.mjs`);",
-    'tests/js/helper.mjs': "export { y as x } from './nested/deep_helper.mjs';",
-    'tests/js/late.mjs': 'export {};',
-    'tests/js/nested/deep_helper.mjs': "import '../../shared/bare.mjs';\nexport const y = 1;",
-    'tests/js/nested/b_test.mjs': '',
+    'tests/bridge/a_test.mjs': "import { x } from './helper.mjs';\nconst late = await import(`./late.mjs`);",
+    'tests/bridge/helper.mjs': "export { y as x } from './nested/deep_helper.mjs';",
+    'tests/bridge/late.mjs': 'export {};',
+    'tests/bridge/nested/deep_helper.mjs': "import '../../shared/bare.mjs';\nexport const y = 1;",
+    'tests/bridge/nested/b_test.mjs': '',
     'tests/shared/bare.mjs': '',
   };
   const errorsFor = (json, testFiles) => {
@@ -493,7 +493,7 @@ assertRejected(validatePublicationPatContract('jobs: [unterminated', EXPECTED_ST
   };
   assert.deepEqual(errorsFor(packageJson(good), files), []);
   assert.deepEqual(errorsFor(packageJson({ ...good, 'check:js': 'npm run test' }), files), []);
-  assert.match(errorsFor(packageJson({ ...good, test: "node --test 'tests/js/*_test.mjs'" }), files).join('\n'), /npm test must be exactly/);
+  assert.match(errorsFor(packageJson({ ...good, test: "node --test 'tests/bridge/*_test.mjs'" }), files).join('\n'), /npm test must be exactly/);
   assert.match(errorsFor(packageJson({ ...good, test: `${TEST_COMMAND} || true` }), files).join('\n'), /npm test must be exactly/);
   assert.match(errorsFor(packageJson({ ...good, 'check:js': 'npm run typecheck:js' }), files).join('\n'), /check:js must run npm test/);
   assert.match(errorsFor(packageJson({ ...good, 'check:js': 'npm test || true' }), files).join('\n'), /check:js must run npm test/);
@@ -503,21 +503,21 @@ assertRejected(validatePublicationPatContract('jobs: [unterminated', EXPECTED_ST
     .map((error) => /^(\S+) is neither/.exec(error)?.[1]);
   // A misnamed test, and a helper imported only by an unrun file, never run.
   assert.deepEqual(unreached({
-    'tests/js/c.test.mjs': "import './orphan_helper.mjs';",
-    'tests/js/orphan_helper.mjs': '',
-  }), ['tests/js/c.test.mjs', 'tests/js/orphan_helper.mjs']);
+    'tests/bridge/c.test.mjs': "import './orphan_helper.mjs';",
+    'tests/bridge/orphan_helper.mjs': '',
+  }), ['tests/bridge/c.test.mjs', 'tests/bridge/orphan_helper.mjs']);
   // Naming a file in a string or path list, or importing a same-named file in
   // another directory, does not reach it.
   assert.deepEqual(unreached({
-    'tests/js/d_test.mjs': "const listed = ['tests/js/e.test.mjs', './e.test.mjs'];",
-    'tests/js/e.test.mjs': '',
+    'tests/bridge/d_test.mjs': "const listed = ['tests/bridge/e.test.mjs', './e.test.mjs'];",
+    'tests/bridge/e.test.mjs': '',
     'tests/other/helper.mjs': '',
-  }), ['tests/js/e.test.mjs', 'tests/other/helper.mjs']);
+  }), ['tests/bridge/e.test.mjs', 'tests/other/helper.mjs']);
   // An interpolated dynamic import cannot be resolved statically.
   assert.deepEqual(unreached({
-    'tests/js/f_test.mjs': 'await import(`./${name}.mjs`);',
-    'tests/js/g.mjs': '',
-  }), ['tests/js/g.mjs']);
+    'tests/bridge/f_test.mjs': 'await import(`./${name}.mjs`);',
+    'tests/bridge/g.mjs': '',
+  }), ['tests/bridge/g.mjs']);
 }
 
 // --- Orchestration ---------------------------------------------------------
@@ -632,8 +632,8 @@ assertRejected(validatePublicationPatContract('jobs: [unterminated', EXPECTED_ST
   const driver = `${ORCHESTRATOR_DIRECTORY}/driver.mjs`;
   assertRejected(sources({ ...sourceFiles, [driver]: `import './missing.mjs';\n${sourceFiles[driver]}` }).errors,
     `imports ${ORCHESTRATOR_DIRECTORY}/missing.mjs, which does not exist`);
-  assertRejected(sources({ ...sourceFiles, [driver]: `import '../../ci_scope.mjs';\n${sourceFiles[driver]}` }).errors,
-    'imports scripts/ci_scope.mjs, which is neither');
+  assertRejected(sources({ ...sourceFiles, [driver]: `import '../../ci/ci_scope.mjs';\n${sourceFiles[driver]}` }).errors,
+    'imports scripts/ci/ci_scope.mjs, which is neither');
   assertRejected(sources({ ...sourceFiles, [driver]: `import '../qualify.mjs';\n${sourceFiles[driver]}` }).errors,
     'imports scripts/release/qualify.mjs, which is neither');
   assertRejected(sources({ ...sourceFiles, [driver]: `const m = await import(name);\n${sourceFiles[driver]}` }).errors,

@@ -3,8 +3,8 @@
 // unchanged. Ported from scripts/ci_scope.py with identical classification,
 // stdout and GITHUB_OUTPUT.
 //
-//   node scripts/ci_scope.mjs                   BASE_SHA -> native=true|false
-//   node scripts/ci_scope.mjs --check-results   NEEDS_JSON -> exit 0|1
+//   node scripts/ci/ci_scope.mjs                   BASE_SHA -> native=true|false
+//   node scripts/ci/ci_scope.mjs --check-results   NEEDS_JSON -> exit 0|1
 
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
@@ -50,6 +50,22 @@ export const TOOLING = new Set([
   'tests/js/bridge_operation_lifecycle_test.mjs', 'tests/js/text_to_speech_recovery_test.mjs',
   'tests/js/bridge_type_declaration_contract_test.mjs', 'tests/js/worker_runtime_state_test.mjs',
   'tests/js/worker_token_coalescing_test.mjs', 'tests/js/workflow_input_transport_test.mjs',
+  // The same files at their current paths; the tests/js/ and scripts/ paths
+  // above were moved here.
+  'tests/bridge/native_core_source.mjs',
+  'tests/bridge/bridge_js_source.mjs', 'tests/bridge/state_persistence_api_contract_test.mjs',
+  'tests/bridge/text_to_speech_api_contract_test.mjs', 'tests/bridge/decision_api_contract_test.mjs',
+  'tests/bridge/decision_bridge_contract_test.mjs',
+  'scripts/ci/verify_ci_reliability.mjs', 'tests/ci/verify_ci_reliability_test.mjs',
+  'tests/bridge/mtmd_compat_contract_test.mjs',
+  'tests/build/wasm64_runtime_patch_contract_test.mjs',
+  'tests/bridge/embedding_json_contract_test.mjs', 'tests/bridge/declared_class_fields_test.mjs',
+  'tests/bridge/native_load_option_arity_test.mjs',
+  'tests/bridge/model_reload_contract_test.mjs',
+  'tests/bridge/bridge_operation_queue_test.mjs',
+  'tests/bridge/bridge_operation_lifecycle_test.mjs', 'tests/bridge/text_to_speech_recovery_test.mjs',
+  'tests/bridge/bridge_type_declaration_contract_test.mjs', 'tests/bridge/worker_runtime_state_test.mjs',
+  'tests/bridge/worker_token_coalescing_test.mjs', 'tests/bridge/workflow_input_transport_test.mjs',
 ]);
 
 const DOCUMENTATION = new Set(['README.md', 'CONTRIBUTING.md', 'LICENSE']);

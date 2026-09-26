@@ -46,7 +46,7 @@ SCRIPTS_DIR = Path(__file__).resolve().parent
 # Pinned in the fixture the speech gate reads, not restated here, so this suite
 # cannot pass against a transcript the real gate would reject.
 DEFAULT_EXPECTED_TEXT = json.loads(
-    (SCRIPTS_DIR / "speech_to_text_fixture.json").read_text(encoding="utf-8")
+    (SCRIPTS_DIR / "smoke" / "speech_to_text_fixture.json").read_text(encoding="utf-8")
 )["expected_text"]
 EXPECTED_SPEECH_TRANSCRIPT_RAW = DEFAULT_EXPECTED_TEXT
 
@@ -2500,9 +2500,10 @@ class QualificationTest(unittest.TestCase):
         self.assertIn("release_publication_state.py", rq.HARNESS_SOURCES)
         baseline = rq.harness_source_sha256(scripts_dir)
         for name in rq.HARNESS_SOURCES:
-            mirror = self.tmp / f"mirror-{name}"
+            mirror = self.tmp / f"mirror-{name.replace('/', '-')}"
             mirror.mkdir()
             for other in rq.HARNESS_SOURCES:
+                (mirror / other).parent.mkdir(parents=True, exist_ok=True)
                 shutil.copyfile(scripts_dir / other, mirror / other)
             (mirror / name).write_bytes(
                 (scripts_dir / name).read_bytes() + b"\n# drift\n"
@@ -2532,6 +2533,7 @@ class QualificationTest(unittest.TestCase):
             "expected_text": "hello",
         }
         path = self.tmp / rq.SPEECH_FIXTURE_FILE
+        path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(good), encoding="utf-8")
         self.assertEqual(rq.load_speech_fixture(path), good)
         for label, raw in (
@@ -2574,8 +2576,8 @@ class QualificationTest(unittest.TestCase):
                         python_closure(candidate, seen)
 
         # Static and dynamic imports and re-exports; a relative specifier is a
-        # file beside the importer. Harness page code imports '/...' URLs from
-        # the web root, which are not scripts/ files.
+        # file relative to the importer, inside scripts/. Harness page code
+        # imports '/...' URLs from the web root, which are not scripts/ files.
         specifier = re.compile(
             r"""(?:\bfrom\s*|\bimport\s*\(?\s*)(['"])([^'"]+)\1"""
         )
@@ -2595,9 +2597,9 @@ class QualificationTest(unittest.TestCase):
             self.assertNotIn("__dirname", text, name)
             for _, spec in specifier.findall(text):
                 if spec.startswith(("./", "../")):
-                    target = (SCRIPTS_DIR / name).parent / spec
-                    self.assertEqual(target.resolve().parent, SCRIPTS_DIR, spec)
-                    node_closure(target.name, seen)
+                    target = ((SCRIPTS_DIR / name).parent / spec).resolve()
+                    self.assertTrue(target.is_relative_to(SCRIPTS_DIR), spec)
+                    node_closure(target.relative_to(SCRIPTS_DIR).as_posix(), seen)
                 else:
                     self.assertTrue(
                         spec.startswith(("node:", "/")) or spec == "playwright",
@@ -2610,7 +2612,7 @@ class QualificationTest(unittest.TestCase):
         candidate_gates = re.findall(r"run: node scripts/(\S+\.mjs)\s*$", workflow, re.M)
         self.assertEqual(
             sorted(candidate_gates),
-            ["multimodal_browser_smoke.mjs", "state_persistence_browser_smoke.mjs"],
+            ["smoke/multimodal.mjs", "smoke/state_persistence.mjs"],
         )
         closure: set[str] = set()
         python_closure("release_qualification.py", closure)
@@ -2628,16 +2630,16 @@ class QualificationTest(unittest.TestCase):
             (
                 "4.0.0",
                 (
-                    "browser_smoke_support.mjs",
                     "generate_release_manifest.py",
-                    "multimodal_browser_smoke.mjs",
                     "release_contract.py",
                     "release_publication_state.py",
                     "release_qualification.py",
-                    "speech_to_text_browser_smoke.mjs",
-                    "speech_to_text_fixture.json",
-                    "state_persistence_browser_smoke.mjs",
-                    "text_to_speech_browser_smoke.mjs",
+                    "smoke/multimodal.mjs",
+                    "smoke/speech_to_text.mjs",
+                    "smoke/speech_to_text_fixture.json",
+                    "smoke/state_persistence.mjs",
+                    "smoke/support.mjs",
+                    "smoke/text_to_speech.mjs",
                 ),
             ),
         )
@@ -2717,7 +2719,7 @@ class QualificationTest(unittest.TestCase):
         self.assertEqual(
             speech,
             [
-                "/opt/node/bin/node", str(SCRIPTS_DIR / "speech_to_text_browser_smoke.mjs"),
+                "/opt/node/bin/node", str(SCRIPTS_DIR / "smoke" / "speech_to_text.mjs"),
                 "--dist-dir", speech[3],
                 "--model-path", str(inputs["sm"].resolve()),
                 "--model-sha256", rq.SPEECH_MODEL_SHA256,
@@ -2733,7 +2735,7 @@ class QualificationTest(unittest.TestCase):
         self.assertEqual(
             tts,
             [
-                "/opt/node/bin/node", str(SCRIPTS_DIR / "text_to_speech_browser_smoke.mjs"),
+                "/opt/node/bin/node", str(SCRIPTS_DIR / "smoke" / "text_to_speech.mjs"),
                 "--dist-dir", speech[3],
                 "--model-path", str(inputs["tm"].resolve()),
                 "--model-sha256", rq.TTS_MODEL_SHA256,
@@ -2747,7 +2749,7 @@ class QualificationTest(unittest.TestCase):
             ],
         )
         self.assertEqual(
-            [Path(command[1]).name for command in (speech, tts)],
+            [Path(command[1]).relative_to(SCRIPTS_DIR).as_posix() for command in (speech, tts)],
             list(rq.QUALIFICATION_SMOKES),
         )
 
@@ -2759,6 +2761,7 @@ class QualificationTest(unittest.TestCase):
         scripts_dir.mkdir(parents=True)
         source_scripts = Path(__file__).resolve().parent
         for name in rq.HARNESS_SOURCES:
+            (scripts_dir / name).parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(source_scripts / name, scripts_dir / name)
         subprocess.run(["git", "-C", str(repository), "init", "-q"], check=True)
         subprocess.run(["git", "-C", str(repository), "add", "scripts"], check=True)

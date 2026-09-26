@@ -10,7 +10,7 @@ import { fileURLToPath } from 'node:url';
 
 import { parse as parseYaml } from 'yaml';
 
-import { changedPaths, nativeRequired, validateResults } from '../../scripts/ci_scope.mjs';
+import { changedPaths, nativeRequired, validateResults } from '../../scripts/ci/ci_scope.mjs';
 
 const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 
@@ -49,6 +49,20 @@ const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../.
     'scripts/release/orchestrator/workflow_runs.mjs', 'tests/release/orchestrator/fixtures.mjs',
     'scripts/release/orchestrator/asset_releases.mjs', 'scripts/release/orchestrator/cli.mjs',
     'scripts/release/orchestrator/driver.mjs', 'scripts/release/orchestrator/stage_proofs.mjs',
+    // The tooling-only files moved from tests/js/ and scripts/ keep skipping the lane.
+    'tests/bridge/native_core_source.mjs', 'tests/bridge/bridge_js_source.mjs',
+    'tests/bridge/state_persistence_api_contract_test.mjs',
+    'tests/bridge/text_to_speech_api_contract_test.mjs',
+    'tests/bridge/decision_api_contract_test.mjs', 'tests/bridge/decision_bridge_contract_test.mjs',
+    'tests/bridge/mtmd_compat_contract_test.mjs',
+    'tests/build/wasm64_runtime_patch_contract_test.mjs',
+    'tests/bridge/embedding_json_contract_test.mjs', 'tests/bridge/declared_class_fields_test.mjs',
+    'tests/bridge/native_load_option_arity_test.mjs', 'tests/bridge/model_reload_contract_test.mjs',
+    'tests/bridge/bridge_operation_queue_test.mjs', 'tests/bridge/bridge_operation_lifecycle_test.mjs',
+    'tests/bridge/text_to_speech_recovery_test.mjs', 'tests/bridge/bridge_type_declaration_contract_test.mjs',
+    'tests/bridge/worker_runtime_state_test.mjs', 'tests/bridge/worker_token_coalescing_test.mjs',
+    'tests/bridge/workflow_input_transport_test.mjs',
+    'scripts/ci/verify_ci_reliability.mjs', 'tests/ci/verify_ci_reliability_test.mjs',
   ]) {
     assert.equal(nativeRequired([file]), false, file);
   }
@@ -74,6 +88,19 @@ const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../.
     'scripts/release/contract.mjs', 'scripts/release/qualification.mjs', 'tests/releases/x_test.mjs',
     // A new orchestrator module is listed explicitly, never by prefix.
     'scripts/release/orchestrator/unlisted.mjs',
+    // The files moved into scripts/build/, scripts/ci/, scripts/smoke/ and
+    // tests/ keep the lanes their old paths kept.
+    'scripts/build/build_bridge.sh', 'scripts/build/build_js_bridge.mjs', 'scripts/build/patch_wasm64_runtime.mjs',
+    'scripts/ci/ci_scope.mjs', 'tests/ci/ci_scope_test.mjs',
+    'scripts/smoke/state_persistence.mjs', 'scripts/smoke/grammar.mjs', 'scripts/smoke/next_token_scores.mjs',
+    'scripts/smoke/multimodal.mjs', 'scripts/smoke/speech_to_text.mjs', 'scripts/smoke/text_to_speech.mjs',
+    'scripts/smoke/decision.mjs', 'scripts/smoke/lora_adapter.mjs', 'scripts/smoke/speculative.mjs',
+    'scripts/smoke/support.mjs', 'scripts/smoke/speech_to_text_fixture.json',
+    'tests/smoke/browser_smoke_support_test.mjs', 'tests/smoke/heavy_browser_smokes_test.mjs',
+    'tests/bridge/completion_usage_test.mjs', 'tests/bridge/lora_adapter_contract_test.mjs',
+    'tests/bridge/speculative_decoding_test.mjs', 'tests/bridge/bridge_operation_queue_fixtures.mjs',
+    // An unlisted file in a new directory is not tooling by its directory.
+    'scripts/smoke/unlisted.mjs', 'tests/bridge/new_contract_test.mjs',
   ]) {
     assert.equal(nativeRequired(['README.md', file]), true, file);
   }
@@ -132,7 +159,7 @@ const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../.
     git('commit', '-m', 'delete');
     assert.equal(nativeRequired(changedPaths(base)), true);
     assert.equal(nativeRequired(changedPaths('0'.repeat(40))), true);
-    assert.throws(() => execFileSync(process.execPath, [path.join(rootDir, 'scripts/ci_scope.mjs')], {
+    assert.throws(() => execFileSync(process.execPath, [path.join(rootDir, 'scripts/ci/ci_scope.mjs')], {
       env: { ...process.env, BASE_SHA: 'missing-ref', GITHUB_OUTPUT: path.join(temp, 'output') },
       stdio: 'ignore',
     }));
@@ -156,8 +183,8 @@ const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../.
   assert.equal(build.if, "needs.changes.outputs.native == 'true'");
   assert.equal(jobs['ci-result'].if, 'always()');
   assert.deepEqual(new Set(jobs['ci-result'].needs), new Set(['changes', 'checks', 'build-webgpu-bridge']));
-  assert.ok(jobs['ci-result'].steps.some((step) => step.run === 'node scripts/ci_scope.mjs --check-results'));
-  assert.ok(jobs.changes.steps.some((step) => step.run === 'node scripts/ci_scope.mjs'));
+  assert.ok(jobs['ci-result'].steps.some((step) => step.run === 'node scripts/ci/ci_scope.mjs --check-results'));
+  assert.ok(jobs.changes.steps.some((step) => step.run === 'node scripts/ci/ci_scope.mjs'));
   assert.equal(
     Object.values(jobs).flatMap((job) => job.steps).filter((step) => (step.run ?? '').includes('npm run check:js')).length,
     1,

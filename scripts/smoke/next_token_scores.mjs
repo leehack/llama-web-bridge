@@ -32,7 +32,7 @@ import {
   withServer,
   withTempDir,
   writeStdout,
-} from './browser_smoke_support.mjs';
+} from './support.mjs';
 
 const DESCRIPTION = `Browser smoke for next-token scoring.
 
@@ -278,7 +278,7 @@ export function validatePayload(payload, memoryModes) {
 
 export function parseArgs(argv) {
   return parseSmokeArgs(argv, {
-    prog: 'next_token_scores_browser_smoke.mjs',
+    prog: 'next_token_scores.mjs',
     description: DESCRIPTION,
     options: [
       {

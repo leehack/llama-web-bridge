@@ -16,8 +16,8 @@ const API_DOCS_FLAT = API_DOCS
   .split(/[\t\n\v\f\r\x1c-\x1f \x85\xa0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]+/)
   .filter(Boolean)
   .join(' ');
-const SMOKE = readRepoText('scripts/text_to_speech_browser_smoke.mjs');
-const RECOVERY_TEST = readRepoText('tests/js/text_to_speech_recovery_test.mjs');
+const SMOKE = readRepoText('scripts/smoke/text_to_speech.mjs');
+const RECOVERY_TEST = readRepoText('tests/bridge/text_to_speech_recovery_test.mjs');
 
 const NATIVE_EXPORTS = [
   'llamadart_webgpu_tts_api_version',
@@ -134,7 +134,7 @@ require(
   'public API docs must document TTS and its memory64 requirement',
 );
 require(
-  includesAll(README, 'Text-to-speech', 'text_to_speech_browser_smoke.mjs'),
+  includesAll(README, 'Text-to-speech', 'scripts/smoke/text_to_speech.mjs'),
   'README must document TTS and its real-model smoke',
 );
 require(

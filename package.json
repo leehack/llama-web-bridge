@@ -7,7 +7,7 @@
     "node": ">=22.18.0"
   },
   "scripts": {
-    "build:js": "node scripts/build_js_bridge.mjs",
+    "build:js": "node scripts/build/build_js_bridge.mjs",
     "check:js": "npm run typecheck:js && npm run build:js && npm run syntax:js && npm test",
     "syntax:js": "node --check js/llama_webgpu_bridge.js && node --check js/llama_webgpu_bridge_worker.js",
     "test": "node --test 'tests/**/*_test.mjs'",

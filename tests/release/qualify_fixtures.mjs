@@ -41,7 +41,7 @@ export const REPO_SCRIPTS_DIR = path.resolve(path.dirname(fs.realpathSync(fileUR
 // The pinned transcript the speech gate reads, as release_qualification_test.py
 // reads it, so a transcript the real gate would reject cannot pass here.
 export const DEFAULT_EXPECTED_TEXT = JSON.parse(
-  fs.readFileSync(path.join(REPO_SCRIPTS_DIR, 'speech_to_text_fixture.json'), 'utf8'),
+  fs.readFileSync(path.join(REPO_SCRIPTS_DIR, 'smoke', 'speech_to_text_fixture.json'), 'utf8'),
 ).expected_text;
 
 // A fresh directory in the system temp root; parallel test files never share one.
@@ -79,7 +79,7 @@ export function writeWav(filePath, { sampleRate = 24000, channels = 1 } = {}) {
   return filePath;
 }
 
-// One speech smoke mode result, as speech_to_text_browser_smoke.mjs reports it.
+// One speech smoke mode result, as smoke/speech_to_text.mjs reports it.
 export function speechModeResult(memoryMode, runtimeMode, overrides = {}) {
   return {
     memoryMode,

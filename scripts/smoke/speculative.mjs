@@ -24,7 +24,7 @@ import {
   withServer,
   withTempDir,
   writeStdout,
-} from './browser_smoke_support.mjs';
+} from './support.mjs';
 
 const DESCRIPTION = `Browser smoke for speculative decoding.
 
@@ -439,7 +439,7 @@ export function validatePayload(payload, groupNames, memoryModes, runtimeModes) 
 
 export function parseArgs(argv) {
   return parseSmokeArgs(argv, {
-    prog: 'speculative_browser_smoke.mjs',
+    prog: 'speculative.mjs',
     description: DESCRIPTION,
     options: [
       {

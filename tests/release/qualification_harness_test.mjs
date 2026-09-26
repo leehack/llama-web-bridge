@@ -71,9 +71,12 @@ test('test_harness_digest_covers_every_heavy_gate_source', () => withTmp((tmp) =
   assert.ok(HARNESS_SOURCES.includes('release_publication_state.py'));
   const baseline = harnessSourceSha256(SCRIPTS_DIR);
   for (const name of HARNESS_SOURCES) {
-    const mirror = path.join(tmp, `mirror-${name}`);
+    const mirror = path.join(tmp, `mirror-${name.replaceAll('/', '-')}`);
     fs.mkdirSync(mirror);
-    for (const other of HARNESS_SOURCES) fs.copyFileSync(path.join(SCRIPTS_DIR, other), path.join(mirror, other));
+    for (const other of HARNESS_SOURCES) {
+      fs.mkdirSync(path.dirname(path.join(mirror, other)), { recursive: true });
+      fs.copyFileSync(path.join(SCRIPTS_DIR, other), path.join(mirror, other));
+    }
     fs.writeFileSync(path.join(mirror, name), Buffer.concat([fs.readFileSync(path.join(SCRIPTS_DIR, name)), Buffer.from('\n# drift\n')]));
     assert.notEqual(baseline, harnessSourceSha256(mirror), name);
   }
@@ -92,6 +95,7 @@ test('test_speech_fixture_holds_the_pinned_audio_and_transcript', () => {
 test('test_speech_fixture_fails_closed', () => withTmp((tmp) => {
   const good = { audio_sha256: 'a'.repeat(64), audio_url: 'https://example.com/a.wav', expected_text: 'hello' };
   const file = path.join(tmp, SPEECH_FIXTURE_FILE);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.writeFileSync(file, pyJsonDumps(good));
   assert.deepEqual(loadSpeechFixture(file), good);
   const { expected_text: _dropped, ...missing } = good;
@@ -134,8 +138,8 @@ test('test_harness_sources_are_exactly_what_the_gates_execute_or_read', () => {
   };
 
   // Static and dynamic imports and re-exports; a relative specifier is a
-  // file beside the importer. Harness page code imports '/...' URLs from the
-  // web root, which are not scripts/ files.
+  // file relative to the importer, inside scripts/. Harness page code imports
+  // '/...' URLs from the web root, which are not scripts/ files.
   const specifier = /(?:\bfrom\s*|\bimport\s*\(?\s*)(['"])([^'"]+)\1/g;
   const nodeClosure = (name, seen) => {
     if (seen.has(name)) return;
@@ -148,9 +152,10 @@ test('test_harness_sources_are_exactly_what_the_gates_execute_or_read', () => {
     assert.ok(!text.includes('__dirname'), name);
     for (const [, , spec] of text.matchAll(specifier)) {
       if (spec.startsWith('./') || spec.startsWith('../')) {
-        const target = path.resolve(SCRIPTS_DIR, spec);
-        assert.equal(path.dirname(target), SCRIPTS_DIR, spec);
-        nodeClosure(path.basename(target), seen);
+        const target = path.resolve(SCRIPTS_DIR, path.dirname(name), spec);
+        const relative = path.relative(SCRIPTS_DIR, target);
+        assert.ok(!relative.startsWith('..') && !path.isAbsolute(relative), spec);
+        nodeClosure(relative.split(path.sep).join('/'), seen);
       } else {
         assert.ok(spec.startsWith('node:') || spec.startsWith('/') || spec === 'playwright', `${name} imports ${JSON.stringify(spec)}`);
       }
@@ -159,7 +164,7 @@ test('test_harness_sources_are_exactly_what_the_gates_execute_or_read', () => {
 
   const workflow = fs.readFileSync(path.join(SCRIPTS_DIR, '..', '.github', 'workflows', 'bridge_candidate.yml'), 'utf8');
   const candidateGates = [...workflow.matchAll(/run: node scripts\/(\S+\.mjs)\s*$/gm)].map((match) => match[1]);
-  assert.deepEqual([...candidateGates].sort(), ['multimodal_browser_smoke.mjs', 'state_persistence_browser_smoke.mjs']);
+  assert.deepEqual([...candidateGates].sort(), ['smoke/multimodal.mjs', 'smoke/state_persistence.mjs']);
   const closure = new Set();
   pythonClosure('release_qualification.py', closure);
   closure.add(SPEECH_FIXTURE_FILE);
@@ -174,16 +179,16 @@ test('test_harness_version_moves_with_the_harness_sources', () => {
   assert.deepEqual([HARNESS_VERSION, [...HARNESS_SOURCES].sort()], [
     '4.0.0',
     [
-      'browser_smoke_support.mjs',
       'generate_release_manifest.py',
-      'multimodal_browser_smoke.mjs',
       'release_contract.py',
       'release_publication_state.py',
       'release_qualification.py',
-      'speech_to_text_browser_smoke.mjs',
-      'speech_to_text_fixture.json',
-      'state_persistence_browser_smoke.mjs',
-      'text_to_speech_browser_smoke.mjs',
+      'smoke/multimodal.mjs',
+      'smoke/speech_to_text.mjs',
+      'smoke/speech_to_text_fixture.json',
+      'smoke/state_persistence.mjs',
+      'smoke/support.mjs',
+      'smoke/text_to_speech.mjs',
     ],
   ]);
 });
@@ -236,7 +241,7 @@ test('harness digests take source names with sub-paths', () => withTmp((tmp) => 
   const missing = raises(() => harnessSourceSha256AtCommit(repository, bridgeSha, { sources: ['absent/x.mjs'] }));
   assert.ok(missing.startsWith(`could not read harness source 'absent/x.mjs' at ${bridgeSha}: fatal: path 'scripts/absent/x.mjs' does not exist`), missing);
   assert.equal(raises(() => harnessSourceSha256AtCommit(repository, 'HEAD')), 'candidate bridge source must be a lowercase 40-hex SHA');
-  // The flat list digests today's scripts/ exactly as the scheme says.
+  // The real list digests today's scripts/ exactly as the scheme says.
   assert.equal(
     harnessSourceSha256(SCRIPTS_DIR),
     referenceDigest(HARNESS_SOURCES.map((name) => [name, fs.readFileSync(path.join(SCRIPTS_DIR, name))])),

@@ -34,7 +34,7 @@ jobs:
       - id: scope
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
-        run: node scripts/ci_scope.mjs
+        run: node scripts/ci/ci_scope.mjs
 
   checks:
     name: JS and workflow contracts
@@ -65,7 +65,7 @@ jobs:
             scripts/release_qualification_test.py
 
       - name: Verify CI reliability contract
-        run: node scripts/verify_ci_reliability.mjs
+        run: node scripts/ci/verify_ci_reliability.mjs
 
       - name: Validate release orchestration and CI selection
         run: python3 -m unittest discover -s scripts -p '*_test.py'
@@ -183,9 +183,9 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: ${{ runner.temp }}/webgpu-ccache
-          key: webgpu-ccache-v2-${{ runner.os }}-${{ runner.arch }}-${{ env.EMSCRIPTEN_VERSION }}-${{ steps.compiler-cache.outputs.upstream }}-${{ hashFiles('CMakeLists.txt', 'scripts/build_bridge.sh', 'scripts/patch_*.mjs') }}-${{ github.sha }}
+          key: webgpu-ccache-v2-${{ runner.os }}-${{ runner.arch }}-${{ env.EMSCRIPTEN_VERSION }}-${{ steps.compiler-cache.outputs.upstream }}-${{ hashFiles('CMakeLists.txt', 'scripts/build/build_bridge.sh', 'scripts/build/patch_*.mjs') }}-${{ github.sha }}
           restore-keys: |
-            webgpu-ccache-v2-${{ runner.os }}-${{ runner.arch }}-${{ env.EMSCRIPTEN_VERSION }}-${{ steps.compiler-cache.outputs.upstream }}-${{ hashFiles('CMakeLists.txt', 'scripts/build_bridge.sh', 'scripts/patch_*.mjs') }}-
+            webgpu-ccache-v2-${{ runner.os }}-${{ runner.arch }}-${{ env.EMSCRIPTEN_VERSION }}-${{ steps.compiler-cache.outputs.upstream }}-${{ hashFiles('CMakeLists.txt', 'scripts/build/build_bridge.sh', 'scripts/build/patch_*.mjs') }}-
             webgpu-ccache-v2-${{ runner.os }}-${{ runner.arch }}-${{ env.EMSCRIPTEN_VERSION }}-
 
       - name: Build bridge artifacts
@@ -201,7 +201,7 @@ jobs:
         run: |
           ccache --zero-stats
           trap 'ccache --show-stats' EXIT
-          ./scripts/build_bridge.sh
+          ./scripts/build/build_bridge.sh
 
       - name: Save compiler objects
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
@@ -227,20 +227,20 @@ jobs:
       - name: Run state persistence browser smoke
         env:
           BRIDGE_DIST_DIR: ${{ runner.temp }}/webgpu_bridge_dist
-        run: node scripts/state_persistence_browser_smoke.mjs
+        run: node scripts/smoke/state_persistence.mjs
 
       - name: Run multimodal browser smoke
         env:
           BRIDGE_DIST_DIR: ${{ runner.temp }}/webgpu_bridge_dist
-        run: node scripts/multimodal_browser_smoke.mjs
+        run: node scripts/smoke/multimodal.mjs
 
       - name: Run grammar browser smoke
         env:
           BRIDGE_DIST_DIR: ${{ runner.temp }}/webgpu_bridge_dist
         run: |
-          node scripts/grammar_browser_smoke.mjs \
+          node scripts/smoke/grammar.mjs \
             --artifacts-dir "$LLAMA_WEBGPU_GRAMMAR_ARTIFACTS_DIR/state-smoke-model"
-          node scripts/grammar_browser_smoke.mjs \
+          node scripts/smoke/grammar.mjs \
             --model-url "$LLAMA_WEBGPU_MULTIMODAL_MODEL_URL" \
             --model-sha256 "$LLAMA_WEBGPU_MULTIMODAL_MODEL_SHA256" \
             --model-cache-dir "$LLAMA_WEBGPU_MULTIMODAL_MODEL_CACHE" \
@@ -250,12 +250,12 @@ jobs:
       - name: Run next-token scores browser smoke
         env:
           BRIDGE_DIST_DIR: ${{ runner.temp }}/webgpu_bridge_dist
-        run: node scripts/next_token_scores_browser_smoke.mjs
+        run: node scripts/smoke/next_token_scores.mjs
 
       - name: Run speculative decoding browser smoke
         env:
           BRIDGE_DIST_DIR: ${{ runner.temp }}/webgpu_bridge_dist
-        run: node scripts/speculative_browser_smoke.mjs --group tiny
+        run: node scripts/smoke/speculative.mjs --group tiny
 
       - name: Upload state persistence smoke diagnostics
         if: failure()
@@ -325,4 +325,4 @@ jobs:
       - name: Validate selected job results
         env:
           NEEDS_JSON: ${{ toJSON(needs) }}
-        run: node scripts/ci_scope.mjs --check-results
+        run: node scripts/ci/ci_scope.mjs --check-results

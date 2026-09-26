@@ -246,7 +246,7 @@ test('test_upstream_channels_are_exact', () => {
   }
 });
 
-// scripts/verify_ci_reliability.mjs gates llama_cpp.version with the same form.
+// scripts/ci/verify_ci_reliability.mjs gates llama_cpp.version with the same form.
 test('test_ordinary_pin_accepts_either_upstream_channel', () => {
   const pinContents = readFileSync(path.join(rootDir, 'llama_cpp.version'), 'utf8');
   assert.equal(pinContents, 'v0.5.0\n');

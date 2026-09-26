@@ -153,7 +153,7 @@ test('test_qualify_runs_the_node_smokes_with_the_pinned_inputs', async () => {
   assert.deepEqual([speechLabel, speechTimeout, ttsLabel, ttsTimeout], ['speech-to-text', 67, 'text-to-speech', 68]);
   const diagnostics = fs.realpathSync(path.join(tmp, 'diag'));
   assert.deepEqual(speech, [
-    '/opt/node/bin/node', path.join(REPO_SCRIPTS_DIR, 'speech_to_text_browser_smoke.mjs'),
+    '/opt/node/bin/node', path.join(REPO_SCRIPTS_DIR, 'smoke', 'speech_to_text.mjs'),
     '--dist-dir', speech[3],
     '--model-path', fs.realpathSync(inputs.sm),
     '--model-sha256', SPEECH_MODEL_SHA256,
@@ -166,7 +166,7 @@ test('test_qualify_runs_the_node_smokes_with_the_pinned_inputs', async () => {
     '--artifacts-dir', path.join(diagnostics, 'speech-to-text'),
   ]);
   assert.deepEqual(tts, [
-    '/opt/node/bin/node', path.join(REPO_SCRIPTS_DIR, 'text_to_speech_browser_smoke.mjs'),
+    '/opt/node/bin/node', path.join(REPO_SCRIPTS_DIR, 'smoke', 'text_to_speech.mjs'),
     '--dist-dir', speech[3],
     '--model-path', fs.realpathSync(inputs.tm),
     '--model-sha256', TTS_MODEL_SHA256,
@@ -178,7 +178,7 @@ test('test_qualify_runs_the_node_smokes_with_the_pinned_inputs', async () => {
     '--timeout-ms', '8000',
     '--artifacts-dir', path.join(diagnostics, 'text-to-speech'),
   ]);
-  assert.deepEqual([speech, tts].map((command) => path.basename(command[1])), [...QUALIFICATION_SMOKES]);
+  assert.deepEqual([speech, tts].map((command) => path.relative(REPO_SCRIPTS_DIR, command[1])), [...QUALIFICATION_SMOKES]);
 });
 
 // --- qualifyCmd -----------------------------------------------------------------------

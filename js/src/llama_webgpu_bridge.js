@@ -1,4 +1,4 @@
-// Public entry point of the WebGPU bridge. Bundled by scripts/build_js_bridge.mjs.
+// Public entry point of the WebGPU bridge. Bundled by scripts/build/build_js_bridge.mjs.
 // Modules under js/src/ are side-effect free; this file owns the load-time effects.
 
 import { LlamaWebGpuBridge } from './bridge.ts';
