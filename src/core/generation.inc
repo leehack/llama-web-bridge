@@ -480,14 +480,13 @@ bool verify_speculative_draft(
     int32_t * rc) {
   speculative_session & session = *g_speculative;
   const llama_pos n_past = static_cast<llama_pos>(session.history.size());
-  common_batch_clear(session.batch);
-  common_batch_add(session.batch, session.id_last, n_past, {0}, true);
+  llama_webgpu_batch_clear(session.batch);
+  llama_webgpu_batch_add(session.batch, session.id_last, n_past, true);
   for (size_t i = 0; i < session.draft.size(); ++i) {
-    common_batch_add(
+    llama_webgpu_batch_add(
         session.batch,
         session.draft[i],
         n_past + 1 + static_cast<llama_pos>(i),
-        {0},
         true);
   }
   *rc = decode_speculative_batch();
@@ -543,14 +542,13 @@ bool roll_back_speculative_target(
     return false;
   }
 
-  common_batch_clear(session.batch);
-  common_batch_add(session.batch, session.id_last, n_past, {0}, false);
+  llama_webgpu_batch_clear(session.batch);
+  llama_webgpu_batch_add(session.batch, session.id_last, n_past, false);
   for (size_t i = 0; i + 1 < accepted.size(); ++i) {
-    common_batch_add(
+    llama_webgpu_batch_add(
         session.batch,
         accepted[i],
         n_past + 1 + static_cast<llama_pos>(i),
-        {0},
         false);
   }
   *rc = decode_speculative_batch();
@@ -633,8 +631,8 @@ int32_t speculative_step() {
   }
 
   if (session.draft.empty()) {
-    common_batch_clear(session.batch);
-    common_batch_add(session.batch, session.id_last, n_past, {0}, true);
+    llama_webgpu_batch_clear(session.batch);
+    llama_webgpu_batch_add(session.batch, session.id_last, n_past, true);
     const int32_t rc = decode_speculative_batch();
     if (rc != 0) {
       return decode_failure(rc);
