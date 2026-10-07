@@ -193,14 +193,17 @@ This repo includes a wasm build gate in:
 - `.github/workflows/ci.yml`
 
 After the JS/compatibility contracts pass, it builds wasm32 and memory64 against
-the pinned `llama.cpp` tag in `llama_cpp.version` and runs real
+the pinned `llama.cpp` tag in `llama_cpp.version` and the exact v0.6.0
+candidate in separate lanes. Both run real
 state-persistence, multimodal, grammar and next-token-score browser smokes. A
 successful run uploads its seven built files as `webgpu-bridge-dist`; a failed
 run uploads no dist and instead the smoke diagnostics that exist
 (`state-persistence-smoke-artifacts`, `multimodal-smoke-artifacts`,
-`grammar-smoke-artifacts`, `next-token-scores-smoke-artifacts`). CI never
-changes a pin or publishes assets. Builds against llama.cpp v0.4.0 are no longer
-tested in CI.
+`grammar-smoke-artifacts`, `next-token-scores-smoke-artifacts`). Candidate checks and artifacts use the `v0.6.0` suffix;
+the pinned identities remain unchanged. CI never changes a pin or publishes
+assets. Builds against llama.cpp v0.4.0 are no longer tested in CI. See
+[the v0.6.0 preparation evidence](docs/v060_qualification.md) for validation
+and qualification limits.
 To run the media-helper and static CI contracts locally:
 
 ```bash

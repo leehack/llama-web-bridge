@@ -388,7 +388,7 @@ int32_t decode_speculative_batch() {
   if (rc != 0) {
     return rc;
   }
-  if (!common_speculative_process(session.spec, session.batch)) {
+  if (!llama_webgpu_speculative_process(session.spec, session.batch)) {
     set_error("The speculative draft state failed to process a target batch");
     return -100;
   }
@@ -402,14 +402,13 @@ bool evaluate_speculative_prompt(const std::vector<llama_token> & tokens) {
   const size_t n_batch = static_cast<size_t>(session.batch_capacity);
   for (size_t offset = 0; offset < tokens.size(); offset += n_batch) {
     const size_t count = std::min(tokens.size() - offset, n_batch);
-    common_batch_clear(session.batch);
+    llama_webgpu_batch_clear(session.batch);
     for (size_t i = 0; i < count; ++i) {
       const size_t index = offset + i;
-      common_batch_add(
+      llama_webgpu_batch_add(
           session.batch,
           tokens[index],
           static_cast<llama_pos>(index),
-          {0},
           index + 1 == tokens.size());
     }
     const int32_t rc = decode_speculative_batch();

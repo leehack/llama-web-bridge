@@ -170,15 +170,16 @@ const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../.
   }
 }
 
-// CI builds one native lane behind the selector and reports a truthful
+// CI builds pinned and candidate native lanes behind the selector and reports a truthful
 // aggregate.
 {
   const workflow = parseYaml(readFileSync(path.join(rootDir, '.github/workflows/ci.yml'), 'utf8'));
   const { jobs } = workflow;
   const build = jobs['build-webgpu-bridge'];
   const { checks } = jobs;
-  assert.equal(build.name, 'Build WebGPU Bridge (WASM)');
-  assert.equal('strategy' in build, false);
+  assert.equal(build.name, "${{ matrix.upstream == 'pinned' && 'Build WebGPU Bridge (WASM)' || 'Build WebGPU Bridge (WASM v0.6.0)' }}");
+  assert.deepEqual(build.strategy.matrix.upstream, ['pinned', 'v0.6.0']);
+  assert.equal(build.strategy['fail-fast'], false);
   assert.deepEqual(build.needs, ['changes', 'checks']);
   assert.equal(build.if, "needs.changes.outputs.native == 'true'");
   assert.equal(jobs['ci-result'].if, 'always()');
@@ -189,6 +190,17 @@ const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../.
     Object.values(jobs).flatMap((job) => job.steps).filter((step) => (step.run ?? '').includes('npm run check:js')).length,
     1,
   );
+  const clone = build.steps.find((step) => step.name === 'Clone llama.cpp source').run;
+  assert.match(clone, /d81235049384534c167caea52b85a694f6103d14/);
+  assert.match(clone, /git -C third_party\/llama_cpp rev-parse HEAD/);
+  const resolver = build.steps.find((step) => step.name === 'Resolve llama.cpp pin').run;
+  assert.match(resolver, /llama_cpp.version/);
+  assert.match(resolver, /matrix.upstream/);
+  assert.match(resolver, /LLAMA_CPP_TAG=v0.6.0/);
+  for (const step of build.steps.filter((step) => step.uses?.startsWith('actions/upload-artifact@'))) {
+    assert.match(step.with.name, /matrix.upstream == 'pinned'/);
+    assert.match(step.with.name, /-v0.6.0'/);
+  }
   const buildSteps = Object.fromEntries(build.steps.map((step) => [step.name, step]));
   for (const name of ['Run state persistence browser smoke', 'Run multimodal browser smoke', 'Build bridge artifacts', 'Verify outputs']) {
     assert.equal('if' in buildSteps[name], false, name);

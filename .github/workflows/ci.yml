@@ -60,7 +60,11 @@ jobs:
   build-webgpu-bridge:
     needs: [changes, checks]
     if: needs.changes.outputs.native == 'true'
-    name: Build WebGPU Bridge (WASM)
+    name: ${{ matrix.upstream == 'pinned' && 'Build WebGPU Bridge (WASM)' || 'Build WebGPU Bridge (WASM v0.6.0)' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        upstream: [pinned, v0.6.0]
     runs-on: ubuntu-latest
     env:
       LLAMA_WEBGPU_SMOKE_MODEL_URL: https://huggingface.co/aladar/llama-2-tiny-random-GGUF/resolve/main/llama-2-tiny-random.gguf
@@ -107,6 +111,9 @@ jobs:
             echo "error: llama_cpp.version is empty"
             exit 1
           fi
+          if [ "${{ matrix.upstream }}" = "v0.6.0" ]; then
+            LLAMA_CPP_TAG=v0.6.0
+          fi
           echo "LLAMA_CPP_TAG=$LLAMA_CPP_TAG" >> "$GITHUB_ENV"
           echo "Using llama.cpp ${LLAMA_CPP_TAG}"
 
@@ -131,6 +138,9 @@ jobs:
       - name: Clone llama.cpp source
         run: |
           git clone --depth 1 --branch "$LLAMA_CPP_TAG" https://github.com/ggml-org/llama.cpp.git third_party/llama_cpp
+          if [ "${{ matrix.upstream }}" = "v0.6.0" ]; then
+            test "$(git -C third_party/llama_cpp rev-parse HEAD)" = d81235049384534c167caea52b85a694f6103d14
+          fi
 
       # Installed at a fixed path, not with setup-emsdk: its random temp
       # directory changes the compiler and sysroot paths on every run, so
@@ -248,7 +258,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: state-persistence-smoke-artifacts
+          name: ${{ matrix.upstream == 'pinned' && 'state-persistence-smoke-artifacts' || 'state-persistence-smoke-artifacts-v0.6.0' }}
           path: ${{ env.LLAMA_WEBGPU_SMOKE_ARTIFACTS_DIR }}
           if-no-files-found: ignore
 
@@ -256,7 +266,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: multimodal-smoke-artifacts
+          name: ${{ matrix.upstream == 'pinned' && 'multimodal-smoke-artifacts' || 'multimodal-smoke-artifacts-v0.6.0' }}
           path: ${{ env.LLAMA_WEBGPU_MULTIMODAL_ARTIFACTS_DIR }}
           if-no-files-found: ignore
 
@@ -264,7 +274,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: grammar-smoke-artifacts
+          name: ${{ matrix.upstream == 'pinned' && 'grammar-smoke-artifacts' || 'grammar-smoke-artifacts-v0.6.0' }}
           path: ${{ env.LLAMA_WEBGPU_GRAMMAR_ARTIFACTS_DIR }}
           if-no-files-found: ignore
 
@@ -272,7 +282,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: next-token-scores-smoke-artifacts
+          name: ${{ matrix.upstream == 'pinned' && 'next-token-scores-smoke-artifacts' || 'next-token-scores-smoke-artifacts-v0.6.0' }}
           path: ${{ env.LLAMA_WEBGPU_NEXT_TOKEN_SCORES_ARTIFACTS_DIR }}
           if-no-files-found: ignore
 
@@ -280,14 +290,14 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: speculative-smoke-artifacts
+          name: ${{ matrix.upstream == 'pinned' && 'speculative-smoke-artifacts' || 'speculative-smoke-artifacts-v0.6.0' }}
           path: ${{ env.LLAMA_WEBGPU_SPECULATIVE_ARTIFACTS_DIR }}
           if-no-files-found: ignore
 
       - name: Upload bridge artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: webgpu-bridge-dist
+          name: ${{ matrix.upstream == 'pinned' && 'webgpu-bridge-dist' || 'webgpu-bridge-dist-v0.6.0' }}
           path: |
             ${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_bridge.js
             ${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_bridge_worker.js

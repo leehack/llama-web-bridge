@@ -33,6 +33,7 @@
 #include "reasoning-budget.h"
 #include "speculative.h"
 
+#include "llama_webgpu_batch_compat.h"
 #include "llama_webgpu_decision.h"
 #include "llama_webgpu_embedding_json.h"
 #include "llama_webgpu_grammar.h"

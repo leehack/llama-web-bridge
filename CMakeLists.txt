@@ -77,6 +77,22 @@ int main() { return sizeof(decltype(mtmd_helper_init_opt_default())) == 0; }
 " LLAMADART_MTMD_HELPER_HAS_OPTIONS)
 cmake_pop_check_state()
 
+cmake_push_check_state(RESET)
+set(CMAKE_REQUIRED_INCLUDES
+    "${LLAMA_CPP_DIR}/include"
+    "${LLAMA_CPP_DIR}/ggml/include"
+    "${LLAMA_CPP_DIR}/common")
+set(CMAKE_REQUIRED_FLAGS "-std=c++17")
+unset(LLAMADART_WEBGPU_SPECULATIVE_HAS_COMMON_BATCH CACHE)
+check_cxx_source_compiles("
+#include <speculative.h>
+#include <type_traits>
+static_assert(std::is_same<decltype(&common_speculative_process),
+    bool (*)(common_speculative *, const common_batch &)>::value);
+int main() { return 0; }
+" LLAMADART_WEBGPU_SPECULATIVE_HAS_COMMON_BATCH)
+cmake_pop_check_state()
+
 find_package(Threads REQUIRED)
 
 set(MTMD_AUDIO_SRC "${LLAMA_CPP_DIR}/tools/mtmd/mtmd-audio.cpp")
@@ -148,6 +164,7 @@ target_compile_features(llama_webgpu_core PRIVATE cxx_std_17)
 
 target_compile_definitions(llama_webgpu_core PRIVATE
     LLAMADART_MTMD_HELPER_HAS_OPTIONS=$<BOOL:${LLAMADART_MTMD_HELPER_HAS_OPTIONS}>
+    LLAMADART_WEBGPU_SPECULATIVE_HAS_COMMON_BATCH=$<BOOL:${LLAMADART_WEBGPU_SPECULATIVE_HAS_COMMON_BATCH}>
     LLAMADART_WEBGPU_PTHREAD_POOL_SIZE=${LLAMADART_WEBGPU_PTHREAD_POOL_SIZE}
 )
 
