@@ -60,11 +60,11 @@ jobs:
   build-webgpu-bridge:
     needs: [changes, checks]
     if: needs.changes.outputs.native == 'true'
-    name: ${{ matrix.upstream == 'pinned' && 'Build WebGPU Bridge (WASM)' || 'Build WebGPU Bridge (WASM v0.6.0)' }}
+    name: ${{ matrix.upstream == 'pinned' && 'Build WebGPU Bridge (WASM)' || 'Build WebGPU Bridge (WASM v0.7.0)' }}
     strategy:
       fail-fast: false
       matrix:
-        upstream: [pinned, v0.6.0]
+        upstream: [pinned, v0.7.0]
     runs-on: ubuntu-latest
     env:
       LLAMA_WEBGPU_SMOKE_MODEL_URL: https://huggingface.co/aladar/llama-2-tiny-random-GGUF/resolve/main/llama-2-tiny-random.gguf
@@ -111,8 +111,8 @@ jobs:
             echo "error: llama_cpp.version is empty"
             exit 1
           fi
-          if [ "${{ matrix.upstream }}" = "v0.6.0" ]; then
-            LLAMA_CPP_TAG=v0.6.0
+          if [ "${{ matrix.upstream }}" = "v0.7.0" ]; then
+            LLAMA_CPP_TAG=v0.7.0
           fi
           echo "LLAMA_CPP_TAG=$LLAMA_CPP_TAG" >> "$GITHUB_ENV"
           echo "Using llama.cpp ${LLAMA_CPP_TAG}"
@@ -138,8 +138,8 @@ jobs:
       - name: Clone llama.cpp source
         run: |
           git clone --depth 1 --branch "$LLAMA_CPP_TAG" https://github.com/ggml-org/llama.cpp.git third_party/llama_cpp
-          if [ "${{ matrix.upstream }}" = "v0.6.0" ]; then
-            test "$(git -C third_party/llama_cpp rev-parse HEAD)" = d81235049384534c167caea52b85a694f6103d14
+          if [ "${{ matrix.upstream }}" = "v0.7.0" ]; then
+            test "$(git -C third_party/llama_cpp rev-parse HEAD)" = 620d2225cc436ab0b001e3200e590e3b286ef9ab
           fi
 
       # Installed at a fixed path, not with setup-emsdk: its random temp
@@ -180,9 +180,9 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: ${{ runner.temp }}/webgpu-ccache
-          key: webgpu-ccache-v2-${{ runner.os }}-${{ runner.arch }}-${{ env.EMSCRIPTEN_VERSION }}-${{ steps.compiler-cache.outputs.upstream }}-${{ hashFiles('CMakeLists.txt', 'scripts/build/build_bridge.sh', 'scripts/build/patch_*.mjs') }}-${{ github.sha }}
+          key: webgpu-ccache-v2-${{ runner.os }}-${{ runner.arch }}-${{ env.EMSCRIPTEN_VERSION }}-${{ steps.compiler-cache.outputs.upstream }}-${{ hashFiles('CMakeLists.txt', 'cmake/*.cmake', 'scripts/build/build_bridge.sh', 'scripts/build/patch_*.mjs') }}-${{ github.sha }}
           restore-keys: |
-            webgpu-ccache-v2-${{ runner.os }}-${{ runner.arch }}-${{ env.EMSCRIPTEN_VERSION }}-${{ steps.compiler-cache.outputs.upstream }}-${{ hashFiles('CMakeLists.txt', 'scripts/build/build_bridge.sh', 'scripts/build/patch_*.mjs') }}-
+            webgpu-ccache-v2-${{ runner.os }}-${{ runner.arch }}-${{ env.EMSCRIPTEN_VERSION }}-${{ steps.compiler-cache.outputs.upstream }}-${{ hashFiles('CMakeLists.txt', 'cmake/*.cmake', 'scripts/build/build_bridge.sh', 'scripts/build/patch_*.mjs') }}-
             webgpu-ccache-v2-${{ runner.os }}-${{ runner.arch }}-${{ env.EMSCRIPTEN_VERSION }}-
 
       - name: Build bridge artifacts
@@ -226,6 +226,12 @@ jobs:
           BRIDGE_DIST_DIR: ${{ runner.temp }}/webgpu_bridge_dist
         run: node scripts/smoke/state_persistence.mjs
 
+      - name: Run memory64 extraction and state regression smoke
+        id: state_mem64_gate
+        env:
+          BRIDGE_DIST_DIR: ${{ runner.temp }}/webgpu_bridge_dist
+        run: node scripts/smoke/state_persistence.mjs --memory-mode wasm64
+
       - name: Run multimodal browser smoke
         env:
           BRIDGE_DIST_DIR: ${{ runner.temp }}/webgpu_bridge_dist
@@ -258,7 +264,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.upstream == 'pinned' && 'state-persistence-smoke-artifacts' || 'state-persistence-smoke-artifacts-v0.6.0' }}
+          name: ${{ matrix.upstream == 'pinned' && 'state-persistence-smoke-artifacts' || 'state-persistence-smoke-artifacts-v0.7.0' }}
           path: ${{ env.LLAMA_WEBGPU_SMOKE_ARTIFACTS_DIR }}
           if-no-files-found: ignore
 
@@ -266,7 +272,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.upstream == 'pinned' && 'multimodal-smoke-artifacts' || 'multimodal-smoke-artifacts-v0.6.0' }}
+          name: ${{ matrix.upstream == 'pinned' && 'multimodal-smoke-artifacts' || 'multimodal-smoke-artifacts-v0.7.0' }}
           path: ${{ env.LLAMA_WEBGPU_MULTIMODAL_ARTIFACTS_DIR }}
           if-no-files-found: ignore
 
@@ -274,7 +280,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.upstream == 'pinned' && 'grammar-smoke-artifacts' || 'grammar-smoke-artifacts-v0.6.0' }}
+          name: ${{ matrix.upstream == 'pinned' && 'grammar-smoke-artifacts' || 'grammar-smoke-artifacts-v0.7.0' }}
           path: ${{ env.LLAMA_WEBGPU_GRAMMAR_ARTIFACTS_DIR }}
           if-no-files-found: ignore
 
@@ -282,7 +288,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.upstream == 'pinned' && 'next-token-scores-smoke-artifacts' || 'next-token-scores-smoke-artifacts-v0.6.0' }}
+          name: ${{ matrix.upstream == 'pinned' && 'next-token-scores-smoke-artifacts' || 'next-token-scores-smoke-artifacts-v0.7.0' }}
           path: ${{ env.LLAMA_WEBGPU_NEXT_TOKEN_SCORES_ARTIFACTS_DIR }}
           if-no-files-found: ignore
 
@@ -290,14 +296,14 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.upstream == 'pinned' && 'speculative-smoke-artifacts' || 'speculative-smoke-artifacts-v0.6.0' }}
+          name: ${{ matrix.upstream == 'pinned' && 'speculative-smoke-artifacts' || 'speculative-smoke-artifacts-v0.7.0' }}
           path: ${{ env.LLAMA_WEBGPU_SPECULATIVE_ARTIFACTS_DIR }}
           if-no-files-found: ignore
 
       - name: Upload bridge artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.upstream == 'pinned' && 'webgpu-bridge-dist' || 'webgpu-bridge-dist-v0.6.0' }}
+          name: ${{ matrix.upstream == 'pinned' && 'webgpu-bridge-dist' || 'webgpu-bridge-dist-v0.7.0' }}
           path: |
             ${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_bridge.js
             ${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_bridge_worker.js

@@ -82,11 +82,11 @@ GGUFs or smoke artifacts.
 
 - CI build gate: `.github/workflows/ci.yml`
   - Builds wasm32/memory64 against the `llama_cpp.version` pin and exact
-    v0.6.0 candidate in separate lanes. Its exact SHA lives in the workflow.
+    v0.7.0 candidate in separate lanes. Its exact SHA lives in the workflow.
     Preserve its check/artifact identities (`Build WebGPU Bridge (WASM)`,
     `webgpu-bridge-dist`). Neither lane publishes or changes the source pin; candidate check
-    and artifact identities use the `v0.6.0` suffix. See
-    `docs/v060_qualification.md` for the preparation evidence and limits.
+    and artifact identities use the `v0.7.0` suffix. See
+    `docs/v070_qualification.md` for the preparation evidence and limits.
     Builds against llama.cpp v0.4.0 are no longer tested in CI; the
     `src/llama_webgpu_mtmd_compat.h` shim and its static contract remain.
   - Verifies the active `emcc` identity against `emsdk.version` and
@@ -205,7 +205,7 @@ candidate and exact `candidate_run_id`/`attestation_run_id` pair.
   smoke, and release tooling lives in `scripts/build/`, `scripts/ci/`,
   `scripts/smoke/`, and `scripts/release/`. The qualification harness digest
   covers `HARNESS_SOURCES` in `scripts/release/qualification.mjs` (harness
-  `5.0.0`, the Node harness), and the candidate/publication checkouts address
+  `5.1.0`, the Node harness), and the candidate/publication checkouts address
   harness files by their `scripts/` path at the candidate's commit, so moving
   or adding a harness module changes the digest and needs a new candidate.
   `tests/release/qualification_harness_test.mjs` requires that list to equal

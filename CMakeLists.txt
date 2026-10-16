@@ -61,6 +61,8 @@ set(GGML_BLAS OFF CACHE BOOL "" FORCE)
 
 add_subdirectory("${LLAMA_CPP_DIR}" "${CMAKE_BINARY_DIR}/llama_cpp")
 
+include(cmake/embedding_mode_reserve.cmake)
+
 include(CheckCXXSourceCompiles)
 include(CMakePushCheckState)
 cmake_push_check_state(RESET)

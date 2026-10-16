@@ -1610,6 +1610,9 @@ function checkCandidateAndQualification({ candidate, qualification, publish }, e
   check.require(
     build !== undefined && String(build.env.WEBGPU_BRIDGE_BUILD_MEM64) === '1'
       && stateGate?.run.trim() === 'node scripts/smoke/state_persistence.mjs'
+      && candidate.steps.some((step) => step.id === 'state_mem64_gate'
+        && step.run.trim() === 'node scripts/smoke/state_persistence.mjs --memory-mode wasm64'
+        && step.if === undefined && step['continue-on-error'] === undefined)
       && multimodalGate?.run.trim() === 'node scripts/smoke/multimodal.mjs'
       && candidate.steps.some((step) => step.env.STATE_CONCLUSION === '${{ steps.state_gate.outcome }}'
         && step.env.MULTIMODAL_CONCLUSION === '${{ steps.multimodal_gate.outcome }}'),

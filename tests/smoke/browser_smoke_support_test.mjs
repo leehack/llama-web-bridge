@@ -230,7 +230,7 @@ assert.deepEqual(webGpuLaunchArgs('linux'), [
       distDir: '/d', modelUrl: 'https://h/m.gguf', modelPath: null, modelSha256: 'ab',
       modelCacheDir: '~/.cache/llama-web-bridge/state-smoke-models',
     };
-    assert.deepEqual(stateSmoke.parseArgs([]), { ...shared, timeoutMs: 120000, artifactsDir: '/a/state' });
+    assert.deepEqual(stateSmoke.parseArgs([]), { ...shared, memoryMode: 'wasm32', timeoutMs: 120000, artifactsDir: '/a/state' });
     assert.deepEqual(grammarSmoke.parseArgs([]), {
       ...shared, timeoutMs: 7, memoryMode: 'all', nCtx: 1024, artifactsDir: '/a/grammar',
     });
@@ -550,12 +550,20 @@ const fakeTokenize = (text) => [1, ...text.split(/\s+/).filter(Boolean).map((wor
 // during generation resolves in the direct runtime and rejects in the worker.
 // `tweak.usage(context)` returns the usages to report for one completion.
 const stateBridge = (tweak = {}) => class FakeStateBridge {
-  constructor({ disableWorker }) {
+  constructor({ disableWorker, preferMemory64 }) {
     this.mode = disableWorker ? 'direct runtime' : 'worker runtime';
+    this.coreVariant = preferMemory64 ? 'wasm64' : 'wasm32';
     this.loaded = false;
     this.cache = [];
     this.calls = 0;
     if (!disableWorker) this._workerProxy = {};
+  }
+
+  getModelMetadata() {
+    return {
+      'llamadart.webgpu.core_variant': tweak.coreVariant || this.coreVariant,
+      'llamadart.webgpu.execution': tweak.execution || (this.mode === 'worker runtime' ? 'worker' : 'main-thread'),
+    };
   }
 
   async loadModelFromUrl(url, options) {
@@ -643,6 +651,13 @@ const stateBridge = (tweak = {}) => class FakeStateBridge {
   });
   const passed = await runHarnessPage(page, stateBridge());
   assert.equal(passed.ok, true, passed.error);
+  const memory64Page = stateSmoke.renderHarness('state-smoke-model.gguf', 'wasm64');
+  const memory64Passed = await runHarnessPage(memory64Page, stateBridge());
+  assert.equal(memory64Passed.ok, true, memory64Passed.error);
+  assert.match(firstErrorLine(await runHarnessPage(memory64Page, stateBridge({ coreVariant: 'wasm32' }))),
+    /did not use the requested wasm64 core/);
+  assert.match(firstErrorLine(await runHarnessPage(page, stateBridge({ execution: 'main-thread' }))),
+    /worker runtime silently changed execution path/);
   stateSmoke.checkPayload(passed, true);
   const [direct, worker] = passed.modeResults;
   assert.deepEqual(direct.initialUsage,
