@@ -147,6 +147,16 @@ node scripts/smoke/state_persistence.mjs \
   --artifacts-dir /tmp/llama-web-bridge-state-smoke
 ```
 
+Run the same state smoke with `--memory-mode wasm64` as well. Both runs
+exercise extraction toggles, generation and state restore through direct and
+worker paths; metadata assertions reject memory-mode or worker fallback. CI
+and candidate qualification require both runs.
+
+For the v0.7.0 embedding scheduler repair and its exact source fingerprint, see
+[the qualification notes](docs/v070_qualification.md). The build compiles a
+corrected copy under `BUILD_DIR/generated` and leaves the upstream checkout
+unchanged. A changed affected source fails configuration pending a new audit.
+
 For llama.cpp pin or multimodal changes, run checksum-pinned real image
 inference through both direct and worker runtimes:
 

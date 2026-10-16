@@ -11,6 +11,7 @@ import process from 'node:process';
 import {
   DEFAULT_MODEL_CACHE,
   copyBridgeArtifacts,
+  copyMemory64Artifacts,
   downloadToCache,
   ensure,
   env,
@@ -50,7 +51,7 @@ export const REQUIRED_METHODS = Object.freeze([
 const MODES = Object.freeze(['direct runtime', 'worker runtime']);
 const MODEL_FILENAME = 'state-smoke-model.gguf';
 
-export function renderHarness(modelFilename) {
+export function renderHarness(modelFilename, memoryMode = 'wasm32') {
   const methodsJson = pyJson(REQUIRED_METHODS);
   const modelUrlJson = pyJson(modelFilename ? `/${modelFilename}` : null);
   return `
@@ -141,6 +142,12 @@ export function renderHarness(modelFilename) {
         forceRemoteFetchBackend: false,
         progressCallback: (event) => progress.push(event || {}),
       });
+
+      const metadata = bridge.getModelMetadata();
+      assert(metadata['llamadart.webgpu.core_variant'] === ${pyJson(memoryMode)},
+        \`\${mode} did not use the requested ${memoryMode} core\`);
+      assert(metadata['llamadart.webgpu.execution'] === (mode === 'worker runtime' ? 'worker' : 'main-thread'),
+        \`\${mode} silently changed execution path\`);
 
       const prompt = 'Hello';
       const mutationPrompt = 'Completely different prompt';
@@ -332,8 +339,13 @@ export function renderHarness(modelFilename) {
       }
     };
 
-    await verifyBridgeStateApi(new LlamaWebGpuBridge({ disableWorker: true }), 'direct runtime');
-    await verifyBridgeStateApi(new LlamaWebGpuBridge({ disableWorker: false }), 'worker runtime');
+    const memoryOptions = ${pyJson(memoryMode === 'wasm64' ? {
+    preferMemory64: true,
+    coreModuleUrlMem64: '/llama_webgpu_core_mem64.js',
+    wasmUrlMem64: '/llama_webgpu_core_mem64.wasm',
+  } : { preferMemory64: false })};
+    await verifyBridgeStateApi(new LlamaWebGpuBridge({ ...memoryOptions, disableWorker: true }), 'direct runtime');
+    await verifyBridgeStateApi(new LlamaWebGpuBridge({ ...memoryOptions, disableWorker: false }), 'worker runtime');
 
     if (modelUrl) {
       const direct = modeResults.find((entry) => entry.mode === 'direct runtime');
@@ -364,6 +376,13 @@ export function parseArgs(argv) {
         type: 'path',
         default: () => env.path('BRIDGE_DIST_DIR', 'dist'),
         help: 'Directory containing built bridge artifacts.',
+      },
+      {
+        flag: '--memory-mode',
+        type: 'string',
+        default: () => 'wasm32',
+        choices: ['wasm32', 'wasm64'],
+        help: 'Core memory mode to test; wasm64 requires the memory64 artifacts.',
       },
       {
         flag: '--timeout-ms',
@@ -447,12 +466,13 @@ export async function main(argv = process.argv.slice(2)) {
   const modelPath = await resolveModel(args);
   const payload = await withTempDir('llama-web-bridge-smoke-', async (webRoot) => {
     await copyBridgeArtifacts(distDir, webRoot);
+    if (args.memoryMode === 'wasm64') await copyMemory64Artifacts(distDir, webRoot);
     let modelFilename = null;
     if (modelPath !== null) {
       await fsp.copyFile(modelPath, path.join(webRoot, MODEL_FILENAME));
       modelFilename = MODEL_FILENAME;
     }
-    await fsp.writeFile(path.join(webRoot, 'index.html'), renderHarness(modelFilename), 'utf8');
+    await fsp.writeFile(path.join(webRoot, 'index.html'), renderHarness(modelFilename, args.memoryMode), 'utf8');
     if (artifactsDir !== null) {
       await fsp.mkdir(artifactsDir, { recursive: true });
       await fsp.copyFile(path.join(webRoot, 'index.html'), path.join(artifactsDir, 'index.html'));

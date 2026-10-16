@@ -308,6 +308,12 @@ jobs:
           BRIDGE_DIST_DIR: ${{ runner.temp }}/webgpu_bridge_dist
         run: node scripts/smoke/state_persistence.mjs
 
+      - name: Run memory64 extraction and state regression smoke
+        id: state_mem64_gate
+        env:
+          BRIDGE_DIST_DIR: ${{ runner.temp }}/webgpu_bridge_dist
+        run: node scripts/smoke/state_persistence.mjs --memory-mode wasm64
+
       - name: Run durable multimodal gate
         id: multimodal_gate
         env:

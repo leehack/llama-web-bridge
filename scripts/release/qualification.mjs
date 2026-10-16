@@ -100,7 +100,8 @@ export const ATTESTATION_TYPE = 'llama-web-bridge-automated-qualification';
 // 4.0.0: the heavy gates run the Node smokes (scripts/*_browser_smoke.mjs).
 // 5.0.0: the harness itself is Node (scripts/release/*.mjs); the Python
 // release_*.py harness is gone.
-export const HARNESS_VERSION = '5.0.0';
+// 5.1.0: candidate extraction/state gates cover both memory modes and reject fallback.
+export const HARNESS_VERSION = '5.1.0';
 
 // --- small Python helpers ---------------------------------------------------
 
