@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { LlamaWebGpuBridge } from '../../js/src/llama_webgpu_bridge.js';
+import { LlamaWebGpuBridgeRuntime } from '../../js/src/runtime.ts';
 import { EmbeddingError, snapshotEmbedInput } from '../../js/src/internal/embedding.ts';
 import { withStubWorkerEnvironment, createRealWorkerBridge, workerDriver } from './bridge_operation_queue_fixtures.mjs';
 import { installBridgeWorkerHost } from '../../js/src/worker_host.ts';
@@ -444,3 +445,177 @@ for(const variant of ['wasm32','wasm64']) {
     });
   });
 }
+
+
+// Recovery starts from a GPU-loaded worker and a fresh direct runtime. The
+// fake core still runs the real bridge/runtime embedding and preflight paths.
+function recoveryFixture(error, { rejectProjector = false } = {}) {
+  const f = fixture();
+  const { bridge, runtime } = f;
+  const loads = [], warnings = [], projectors = [];
+  runtime._modelBytes = 0;
+  runtime._mmProjPath = null;
+  runtime.supportsVision = () => !!runtime._mmProjPath;
+  runtime.supportsAudio = () => !!runtime._mmProjPath;
+  runtime.loadModelFromUrl = async (url, options) => {
+    loads.push({ url, options });
+    runtime._modelBytes = 1;
+  };
+  runtime.loadMultimodalProjector = async (url) => {
+    projectors.push(url);
+    if (rejectProjector) throw new Error('projector fetch failed');
+    runtime._mmProjPath = '/restored';
+  };
+  bridge._loadedModelUrl = 'https://example.invalid/model.gguf';
+  bridge._loadedModelOptions = { nGpuLayers: 99, nCtx: 8192, nBatch: 2048, nUbatch: 1024 };
+  bridge._loadedMmProjUrl = 'https://example.invalid/projector.gguf';
+  bridge._restoreWorkerModelIfMissing = async () => {};
+  bridge._ensureRuntimeDraftModel = async () => {};
+  bridge._restoreLoraAdapters = async () => {};
+  bridge._disableWorkerFallback = () => { bridge._workerProxy = null; };
+  bridge._waitForWorkerDisposal = async () => {};
+  bridge._emitBridgeWarn = (message) => warnings.push(message);
+  bridge._workerProxy = { async call(method) {
+    if (method === 'getEmbeddingCapabilities')
+      return { value: { apiVersion: 1, text: true, image: true, audio: true } };
+    throw error;
+  } };
+  return { ...f, loads, warnings, projectors };
+}
+
+const recoveryImage = [{ type: 'image', bytes: new Uint8Array([1]), width: 1, height: 1 }];
+for (const method of ['embed', 'embedBatch']) {
+  for (const [label, input, message] of [
+    ['image parts + Aborted()', recoveryImage, 'RuntimeError: Aborted()'],
+    ['text-only parts + device error', [{ type: 'text', text: 'word '.repeat(100) }], 'ggml_webgpu: device error'],
+    ['string + device error', 'word '.repeat(100), 'ggml_webgpu: device error'],
+  ]) {
+    test(`${method} GPU fallback preserves embedding capacity: ${label}`, async () => {
+      const error = Object.assign(new Error(message), { llamadartWorkerCrash: true });
+      const { bridge, loads, warnings, projectors } = recoveryFixture(error);
+      const run = (value) => bridge[method](method === 'embed' ? value : [value]);
+      await run(input);
+      assert.equal(loads.length, 1);
+      const { signal, ...loadOptions } = loads[0].options;
+      assert.ok(signal instanceof AbortSignal);
+      assert.deepEqual(loadOptions, { nGpuLayers: 0, nCtx: 8192, nBatch: 2048, nUbatch: 1024 });
+      assert.equal(projectors.length, label.startsWith('image') ? 1 : 0);
+      assert.ok(warnings.some((message) => /embedding.*CPU fallback/.test(message)));
+      assert.ok(warnings.every((message) => !/generation/.test(message)));
+      // The fallback must not poison capacity for later requests either.
+      await run('word '.repeat(100));
+      assert.equal(loads.length, 1);
+    });
+  }
+
+  test(`${method} string fallback ignores a broken projector and later media restores it lazily`, async () => {
+    const { bridge, runtime, projectors, loads } = recoveryFixture(
+      Object.assign(new Error('worker crashed'), { llamadartWorkerCrash: true }),
+      { rejectProjector: true },
+    );
+    const run = (value) => bridge[method](method === 'embed' ? value : [value]);
+    assert.deepEqual(await run('hello'), method === 'embed' ? [0.6, 0.8] : [[0.6, 0.8]]);
+    assert.equal(projectors.length, 0);
+    assert.equal(loads.length, 1);
+    assert.ok(bridge._loadedModelUrl);
+    assert.ok(bridge._loadedMmProjUrl);
+    assert.equal(runtime._mmProjPath, null);
+    runtime.loadMultimodalProjector = async (url) => { projectors.push(url); runtime._mmProjPath = '/restored'; };
+    assert.deepEqual(await run(recoveryImage), method === 'embed' ? [0.6, 0.8] : [[0.6, 0.8]]);
+    assert.deepEqual(projectors, ['https://example.invalid/projector.gguf']);
+    assert.equal(loads.length, 1);
+    await run(recoveryImage);
+    assert.equal(projectors.length, 1);
+  });
+}
+
+test('text-only completion parts are not media', () => {
+  const { bridge } = fixture();
+  assert.equal(bridge._hasMediaParts({ parts: [{ type: 'text', text: 'x' }] }), false);
+  assert.equal(bridge._hasMediaParts({ parts: recoveryImage }), true);
+  assert.equal(bridge._hasMediaParts({ parts: [{ type: 'audio', samples: new Float32Array([0]) }] }), true);
+});
+
+test('direct capability RuntimeError propagates without entering worker recovery', async () => {
+  const { bridge, runtime } = fixture();
+  const error = new WebAssembly.RuntimeError('Aborted()');
+  let probes = 0;
+  runtime.getEmbeddingCapabilities = () => { probes++; throw error; };
+  bridge._disableWorkerFallback = () => assert.fail('direct runtime must not retire a worker');
+  bridge._ensureRuntimeReadyAfterWorkerFallback = () => assert.fail('direct runtime must not recover');
+  await assert.rejects(bridge.getEmbeddingCapabilities(), (actual) => actual === error);
+  assert.equal(probes, 1);
+});
+
+test('native -20 preserves capability-unavailable classification and active asset version', async () => {
+  const { bridge, runtime, calls } = fixture({ rc: -20 });
+  runtime._config.coreModuleUrl = 'https://user:secret@example.invalid/v0.1.39/core.js?token=private';
+  await assert.rejects(bridge.embed([{ type: 'text', text: 'x' }]), (error) => {
+    assert.ok(error instanceof EmbeddingError);
+    assert.equal(error.code, 'EMBEDDING_CAPABILITY_UNAVAILABLE');
+    assert.match(error.message, /v0\.1\.39/);
+    assert.doesNotMatch(error.message, /secret|private|user:/);
+    return true;
+  });
+  assert.equal(calls.at(-1)[0], 'clear');
+});
+
+
+for (const dimensions of [{}, { nBatch: 0, nUbatch: 0 }, { nBatch: 2048 }, { nUbatch: 512 },
+  { nCtx: 0, nBatch: Infinity, nUbatch: Infinity }]) {
+  test(`GPU recovery retains native batch defaults: ${JSON.stringify(dimensions)}`, async () => {
+    const { bridge, runtime, loads } = recoveryFixture(
+      Object.assign(new Error('ggml_webgpu: device error'), { llamadartWorkerCrash: true }),
+    );
+    bridge._loadedModelOptions = { nGpuLayers: 99, ...dimensions };
+    bridge._contextSize = 8192;
+    runtime._nCtx = 8192;
+    runtime._probeBackends = async () => {};
+    runtime._ensureCore = async () => runtime._core;
+    runtime._releaseLoadedModel = () => {};
+    runtime._syncThreadPoolSizeHintFromCore = () => {};
+    runtime._coreSupportsPthreads = () => false;
+    const resolved = new Error('stop before any model IO');
+    runtime._resolveNativeLoadOptions = () => { throw resolved; };
+    const resolve = async (options) => {
+      await assert.rejects(LlamaWebGpuBridgeRuntime.prototype.loadModelFromUrl.call(
+        runtime, 'https://example.invalid/model.gguf', options), (error) => error === resolved);
+      return { nCtx: runtime._nCtx, nBatch: runtime._nBatch, nUbatch: runtime._nUbatch };
+    };
+    const gpu = await resolve(bridge._loadedModelOptions);
+    // CPU loads normally choose smaller defaults; the recovery-only hint must
+    // preserve the zero sentinels that select the original native defaults.
+    const cpu = await resolve({ ...bridge._loadedModelOptions, nGpuLayers: 0 });
+    assert.ok(cpu.nUbatch > 0);
+    let recovered;
+    runtime.loadModelFromUrl = async (url, options) => {
+      loads.push({ url, options });
+      recovered = await resolve(options);
+      runtime._modelBytes = 1;
+    };
+    runtime._nCtx = 2048; // the replacement starts with a fresh runtime's context
+    await bridge.embed('word '.repeat(100));
+    assert.equal(loads[0].options.nGpuLayers, 0);
+    assert.deepEqual(recovered, gpu);
+    assert.equal(recovered.nCtx, 8192);
+  });
+}
+
+test('capability cancellation before recovery never retires the worker or reloads the model', async () => {
+  const { bridge, loads } = recoveryFixture(
+    Object.assign(new Error('worker crashed'), { llamadartWorkerCrash: true }),
+  );
+  bridge._workerProxy.call = async () => { throw Object.assign(new Error('worker crashed'), { llamadartWorkerCrash: true }); };
+  const probe = bridge._getEmbeddingCapabilitiesUnlocked.bind(bridge);
+  // Cancel at the boundary after the inner probe has rejected, before the
+  // public capability operation handles that rejection and attempts recovery.
+  bridge._getEmbeddingCapabilitiesUnlocked = async () => {
+    try { return await probe(); }
+    catch (error) { bridge.cancel(); throw error; }
+  };
+  let retirements = 0;
+  bridge._disableWorkerFallback = () => { retirements++; bridge._workerProxy = null; };
+  await assert.rejects(bridge.getEmbeddingCapabilities(), { name: 'AbortError' });
+  assert.equal(retirements, 0);
+  assert.equal(loads.length, 0);
+});

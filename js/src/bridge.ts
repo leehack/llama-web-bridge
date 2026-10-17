@@ -20,6 +20,7 @@ import {
 import { cloneModelSource, hasModelSource, normalizeAbsoluteUrl } from './internal/model_source.ts';
 import { bufferSourceBytes, toUint8Array } from './internal/typed_values.ts';
 import { LlamaWebGpuBridgeRuntime } from './runtime.ts';
+import type { RuntimeLoadModelOptions } from './runtime.ts';
 import { emptyBridgeState, serializeWorkerError } from './worker_protocol.ts';
 import { BridgeWorkerProxy } from './worker_proxy.ts';
 import type { ModelSource } from './internal/model_source.ts';
@@ -126,13 +127,14 @@ interface BridgeCompletionOptions extends CompletionOptions {
 }
 
 // What worker-fallback recovery reads: a completion's options, or the flags
-// text-to-speech recovery passes.
+// embedding and text-to-speech recovery pass.
 interface WorkerFallbackOptions {
   parts?: readonly unknown[];
   signal?: AbortSignal | null;
   _llamadartForceRuntimeReload?: boolean;
   _llamadartTextToSpeech?: boolean;
   _llamadartEnsureProjector?: boolean;
+  _llamadartEmbedding?: boolean;
 }
 
 // A worker token event's payload: text, or bytes when a piece splits UTF-8.
@@ -901,7 +903,9 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
   }
 
   _hasMediaParts(options: WorkerFallbackOptions = {}) {
-    return Array.isArray(options?.parts) && options.parts.length > 0;
+    return Array.isArray(options?.parts) && options.parts.some((part) =>
+      part != null && typeof part === 'object'
+      && ('type' in part) && (part.type === 'image' || part.type === 'audio'));
   }
 
   async _replaceWorkerProxyForMultimodalCpuMode() {
@@ -1212,7 +1216,10 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
     const forceReloadRequested = options?._llamadartForceRuntimeReload === true;
     const mediaPartsRequested = this._hasMediaParts(options);
     const textToSpeechRequested = options?._llamadartTextToSpeech === true;
-    const multimodalRuntimeRequired = mediaPartsRequested || textToSpeechRequested;
+    const embeddingRequested = options?._llamadartEmbedding === true;
+    // Embeddings opt into projector recovery explicitly and must never use
+    // generation's reduced context/batch/microbatch CPU load policy.
+    const multimodalRuntimeRequired = (!embeddingRequested && mediaPartsRequested) || textToSpeechRequested;
     const shouldEnsureMultimodalInRuntime =
       (multimodalRuntimeRequired || options?._llamadartEnsureProjector === true)
       && typeof this._loadedMmProjUrl === 'string'
@@ -1229,11 +1236,15 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
       && modelLoadedWithGpu
       && (dispatchWorkgroupFallback || workerTimedOut);
 
+    const shouldUseCpuEmbeddingFallback =
+      embeddingRequested && modelLoadedWithGpu && (dispatchWorkgroupFallback || workerTimedOut);
+
     try {
       if (
         Number(this._runtime?._modelBytes) > 0
         && !forceReloadRequested
         && !shouldUseCpuMultimodalFallback
+        && !shouldUseCpuEmbeddingFallback
       ) {
         await this._ensureRuntimeDraftModel();
         if (shouldEnsureMultimodalInRuntime) {
@@ -1260,9 +1271,22 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
         return;
       }
 
-      const loadOptions = shouldUseCpuMultimodalFallback
+      const loadOptions: RuntimeLoadModelOptions = shouldUseCpuMultimodalFallback
         ? this._createCpuSafeMultimodalLoadOptions(this._loadedModelOptions || {})
         : this._sanitizeModelLoadOptions(this._loadedModelOptions || {});
+      if (shouldUseCpuEmbeddingFallback) {
+        loadOptions.nGpuLayers = 0;
+        if (![loadOptions.nBatch, loadOptions.nUbatch].every((value) =>
+          Number.isFinite(Number(value)) && Number(value) > 0)) {
+          loadOptions._llamadartPreserveGpuBatchDefaults = true;
+        }
+        if (!(Number(loadOptions.nCtx) > 0) && this._contextSize > 0) {
+          loadOptions.nCtx = this._contextSize;
+        }
+        this._emitBridgeWarn(
+          `llamadart: retrying embedding with CPU fallback after ${workerTimedOut ? 'worker timeout' : 'WebGPU failure'}.`,
+        );
+      }
       const recoverySignal = this._operationSignal(operation) || options.signal || null;
       if (recoverySignal) {
         loadOptions.signal = recoverySignal;
@@ -1283,7 +1307,7 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
         }
       }
 
-      if (workerTimedOut) {
+      if (workerTimedOut && !embeddingRequested) {
         this._emitBridgeWarn(
           'llamadart: bridge worker completion stalled; restarting generation path on main-thread runtime.',
         );
@@ -1300,6 +1324,9 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
         }
         if (workerTimedOut) {
           this._runtime._runtimeNotes.push('worker_fallback_timeout');
+        }
+        if (shouldUseCpuEmbeddingFallback) {
+          this._runtime._runtimeNotes.push('worker_fallback_cpu_embedding');
         }
         if (shouldUseCpuMultimodalFallback) {
           this._runtime._runtimeNotes.push('worker_fallback_cpu_multimodal');
@@ -3207,8 +3234,26 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
     );
   }
 
+  _embeddingFallbackOptions(parts: readonly unknown[]): WorkerFallbackOptions {
+    return {
+      parts,
+      _llamadartEmbedding: true,
+      _llamadartEnsureProjector: this._hasMediaParts({ parts }),
+    };
+  }
+
+  async _ensureRememberedEmbeddingProjector(options: WorkerFallbackOptions) {
+    // A string-only worker fallback deliberately leaves the remembered
+    // projector unloaded. Restore it on the first subsequent media request.
+    if (options._llamadartEnsureProjector && this._loadedMmProjUrl && !this._runtime?._mmProjPath) {
+      await this._ensureRuntimeReadyAfterWorkerFallback(options);
+    }
+  }
+
   async _embedUnlocked(text: EmbedInput, options: EmbedOptions = {}) {
+    const fallbackOptions = this._embeddingFallbackOptions(Array.isArray(text) ? text : []);
     if (!this._workerProxy) {
+      await this._ensureRememberedEmbeddingProjector(fallbackOptions);
       return this._runtime!.embed(text, options);
     }
 
@@ -3223,7 +3268,7 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
       }
       this._disableWorkerFallback(error);
       await this._waitForWorkerDisposal();
-      await this._ensureRuntimeReadyAfterWorkerFallback({ _llamadartEnsureProjector: true, parts: Array.isArray(text) ? text : [] }, error);
+      await this._ensureRuntimeReadyAfterWorkerFallback(fallbackOptions, error);
       return this._runtime!.embed(text, options);
     }
   }
@@ -3240,7 +3285,11 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
     const normalized = Array.isArray(texts)
       ? texts
       : Array.from(texts || []) as EmbedInput[];
+    const fallbackOptions = this._embeddingFallbackOptions(
+      normalized.flatMap((input) => Array.isArray(input) ? input : []),
+    );
     if (!this._workerProxy) {
+      await this._ensureRememberedEmbeddingProjector(fallbackOptions);
       return this._runtime!.embedBatch(normalized, options);
     }
 
@@ -3255,7 +3304,7 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
       }
       this._disableWorkerFallback(error);
       await this._waitForWorkerDisposal();
-      await this._ensureRuntimeReadyAfterWorkerFallback({ _llamadartEnsureProjector: true, parts: normalized.flatMap((input) => Array.isArray(input) ? input : []) }, error);
+      await this._ensureRuntimeReadyAfterWorkerFallback(fallbackOptions, error);
       return this._runtime!.embedBatch(normalized, options);
     }
   }

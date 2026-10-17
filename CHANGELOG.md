@@ -16,3 +16,6 @@
 - Preserve worker recovery signals during embedding capability probing and core
   aborts, restore loaded projectors on fallback, marshal exact UTF-8 bytes, reject
   unsupported M-RoPE media, and retain legacy coercion/disposal behavior.
+- Preserve loaded embedding capacities during GPU-to-CPU worker recovery,
+  including native batch defaults; restore projectors only for media inputs,
+  lazily after string-only fallback, and identify embedding recovery in warnings.

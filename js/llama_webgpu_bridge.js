@@ -2592,10 +2592,11 @@ var LlamaWebGpuBridgeRuntime = class {
       this._nGpuLayers = Math.trunc(requestedGpuLayers);
     }
     const isCpuModelMode = this._nGpuLayers === 0;
+    const useCpuBatchDefaults = isCpuModelMode && options._llamadartPreserveGpuBatchDefaults !== true;
     const requestedBatch = Number(options.nBatch);
-    this._nBatch = Number.isFinite(requestedBatch) && requestedBatch > 0 ? Math.max(32, Math.trunc(requestedBatch)) : isCpuModelMode ? Math.min(this._nCtx, 512) : 0;
+    this._nBatch = Number.isFinite(requestedBatch) && requestedBatch > 0 ? Math.max(32, Math.trunc(requestedBatch)) : useCpuBatchDefaults ? Math.min(this._nCtx, 512) : 0;
     const requestedUbatch = Number(options.nUbatch);
-    this._nUbatch = Number.isFinite(requestedUbatch) && requestedUbatch > 0 ? Math.max(32, Math.trunc(requestedUbatch)) : isCpuModelMode ? Math.min(this._nBatch || 256, 256) : 0;
+    this._nUbatch = Number.isFinite(requestedUbatch) && requestedUbatch > 0 ? Math.max(32, Math.trunc(requestedUbatch)) : useCpuBatchDefaults ? Math.min(this._nBatch || 256, 256) : 0;
     if (this._nBatch > 0 && this._nBatch > this._nCtx) {
       this._nBatch = this._nCtx;
     }
@@ -5599,7 +5600,7 @@ var LlamaWebGpuBridge = class {
     }
   }
   _hasMediaParts(options = {}) {
-    return Array.isArray(options?.parts) && options.parts.length > 0;
+    return Array.isArray(options?.parts) && options.parts.some((part) => part != null && typeof part === "object" && "type" in part && (part.type === "image" || part.type === "audio"));
   }
   async _replaceWorkerProxyForMultimodalCpuMode() {
     this._throwIfDisposed();
@@ -5815,7 +5816,8 @@ var LlamaWebGpuBridge = class {
     const forceReloadRequested = options?._llamadartForceRuntimeReload === true;
     const mediaPartsRequested = this._hasMediaParts(options);
     const textToSpeechRequested = options?._llamadartTextToSpeech === true;
-    const multimodalRuntimeRequired = mediaPartsRequested || textToSpeechRequested;
+    const embeddingRequested = options?._llamadartEmbedding === true;
+    const multimodalRuntimeRequired = !embeddingRequested && mediaPartsRequested || textToSpeechRequested;
     const shouldEnsureMultimodalInRuntime = (multimodalRuntimeRequired || options?._llamadartEnsureProjector === true) && typeof this._loadedMmProjUrl === "string" && this._loadedMmProjUrl.length > 0;
     const workerTimedOut = this._isWorkerTimeoutError(fallbackError);
     const dispatchWorkgroupFallback = this._isDispatchWorkgroupLimitError(fallbackError);
@@ -5823,8 +5825,9 @@ var LlamaWebGpuBridge = class {
     const metadataGpuLayers = Number(this._metadata?.["llamadart.webgpu.n_gpu_layers"]);
     const modelLoadedWithGpu = Number.isFinite(loadedGpuLayers) ? loadedGpuLayers !== 0 : Number.isFinite(metadataGpuLayers) ? metadataGpuLayers !== 0 : true;
     const shouldUseCpuMultimodalFallback = multimodalRuntimeRequired && modelLoadedWithGpu && (dispatchWorkgroupFallback || workerTimedOut);
+    const shouldUseCpuEmbeddingFallback = embeddingRequested && modelLoadedWithGpu && (dispatchWorkgroupFallback || workerTimedOut);
     try {
-      if (Number(this._runtime?._modelBytes) > 0 && !forceReloadRequested && !shouldUseCpuMultimodalFallback) {
+      if (Number(this._runtime?._modelBytes) > 0 && !forceReloadRequested && !shouldUseCpuMultimodalFallback && !shouldUseCpuEmbeddingFallback) {
         await this._ensureRuntimeDraftModel();
         if (shouldEnsureMultimodalInRuntime) {
           const runtimeSupportsMedia = typeof this._runtime.supportsVision === "function" && this._runtime.supportsVision() || typeof this._runtime.supportsAudio === "function" && this._runtime.supportsAudio();
@@ -5845,6 +5848,18 @@ var LlamaWebGpuBridge = class {
         return;
       }
       const loadOptions = shouldUseCpuMultimodalFallback ? this._createCpuSafeMultimodalLoadOptions(this._loadedModelOptions || {}) : this._sanitizeModelLoadOptions(this._loadedModelOptions || {});
+      if (shouldUseCpuEmbeddingFallback) {
+        loadOptions.nGpuLayers = 0;
+        if (![loadOptions.nBatch, loadOptions.nUbatch].every((value) => Number.isFinite(Number(value)) && Number(value) > 0)) {
+          loadOptions._llamadartPreserveGpuBatchDefaults = true;
+        }
+        if (!(Number(loadOptions.nCtx) > 0) && this._contextSize > 0) {
+          loadOptions.nCtx = this._contextSize;
+        }
+        this._emitBridgeWarn(
+          `llamadart: retrying embedding with CPU fallback after ${workerTimedOut ? "worker timeout" : "WebGPU failure"}.`
+        );
+      }
       const recoverySignal = this._operationSignal(operation) || options.signal || null;
       if (recoverySignal) {
         loadOptions.signal = recoverySignal;
@@ -5864,7 +5879,7 @@ var LlamaWebGpuBridge = class {
           );
         }
       }
-      if (workerTimedOut) {
+      if (workerTimedOut && !embeddingRequested) {
         this._emitBridgeWarn(
           "llamadart: bridge worker completion stalled; restarting generation path on main-thread runtime."
         );
@@ -5880,6 +5895,9 @@ var LlamaWebGpuBridge = class {
         }
         if (workerTimedOut) {
           this._runtime._runtimeNotes.push("worker_fallback_timeout");
+        }
+        if (shouldUseCpuEmbeddingFallback) {
+          this._runtime._runtimeNotes.push("worker_fallback_cpu_embedding");
         }
         if (shouldUseCpuMultimodalFallback) {
           this._runtime._runtimeNotes.push("worker_fallback_cpu_multimodal");
@@ -7453,8 +7471,22 @@ var LlamaWebGpuBridge = class {
       { kind: "embedding" }
     );
   }
+  _embeddingFallbackOptions(parts) {
+    return {
+      parts,
+      _llamadartEmbedding: true,
+      _llamadartEnsureProjector: this._hasMediaParts({ parts })
+    };
+  }
+  async _ensureRememberedEmbeddingProjector(options) {
+    if (options._llamadartEnsureProjector && this._loadedMmProjUrl && !this._runtime?._mmProjPath) {
+      await this._ensureRuntimeReadyAfterWorkerFallback(options);
+    }
+  }
   async _embedUnlocked(text, options = {}) {
+    const fallbackOptions = this._embeddingFallbackOptions(Array.isArray(text) ? text : []);
     if (!this._workerProxy) {
+      await this._ensureRememberedEmbeddingProjector(fallbackOptions);
       return this._runtime.embed(text, options);
     }
     try {
@@ -7468,7 +7500,7 @@ var LlamaWebGpuBridge = class {
       }
       this._disableWorkerFallback(error);
       await this._waitForWorkerDisposal();
-      await this._ensureRuntimeReadyAfterWorkerFallback({ _llamadartEnsureProjector: true, parts: Array.isArray(text) ? text : [] }, error);
+      await this._ensureRuntimeReadyAfterWorkerFallback(fallbackOptions, error);
       return this._runtime.embed(text, options);
     }
   }
@@ -7481,7 +7513,11 @@ var LlamaWebGpuBridge = class {
   }
   async _embedBatchUnlocked(texts, options = {}) {
     const normalized = Array.isArray(texts) ? texts : Array.from(texts || []);
+    const fallbackOptions = this._embeddingFallbackOptions(
+      normalized.flatMap((input) => Array.isArray(input) ? input : [])
+    );
     if (!this._workerProxy) {
+      await this._ensureRememberedEmbeddingProjector(fallbackOptions);
       return this._runtime.embedBatch(normalized, options);
     }
     try {
@@ -7495,7 +7531,7 @@ var LlamaWebGpuBridge = class {
       }
       this._disableWorkerFallback(error);
       await this._waitForWorkerDisposal();
-      await this._ensureRuntimeReadyAfterWorkerFallback({ _llamadartEnsureProjector: true, parts: normalized.flatMap((input) => Array.isArray(input) ? input : []) }, error);
+      await this._ensureRuntimeReadyAfterWorkerFallback(fallbackOptions, error);
       return this._runtime.embedBatch(normalized, options);
     }
   }

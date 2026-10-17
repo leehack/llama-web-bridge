@@ -100,7 +100,12 @@ type BridgeLogger = Partial<Record<LogMethod, (message: unknown) => void>>;
 // Load options as the bridge passes them: a null signal means none.
 export type RuntimeLoadModelOptions = {
   [K in keyof LoadModelOptions as K extends 'signal' ? never : K]: LoadModelOptions[K];
-} & { signal?: AbortSignal | null };
+} & {
+  signal?: AbortSignal | null;
+  // Internal worker embedding recovery: keep native batch defaults selected
+  // by the original GPU load even when the replacement uses CPU layers.
+  _llamadartPreserveGpuBatchDefaults?: boolean;
+};
 
 interface TransferOptions {
   cacheName?: unknown;
@@ -1986,15 +1991,16 @@ export class LlamaWebGpuBridgeRuntime {
 
     const isCpuModelMode = this._nGpuLayers === 0;
 
+    const useCpuBatchDefaults = isCpuModelMode && options._llamadartPreserveGpuBatchDefaults !== true;
     const requestedBatch = Number(options.nBatch);
     this._nBatch = Number.isFinite(requestedBatch) && requestedBatch > 0
       ? Math.max(32, Math.trunc(requestedBatch))
-      : (isCpuModelMode ? Math.min(this._nCtx, 512) : 0);
+      : (useCpuBatchDefaults ? Math.min(this._nCtx, 512) : 0);
 
     const requestedUbatch = Number(options.nUbatch);
     this._nUbatch = Number.isFinite(requestedUbatch) && requestedUbatch > 0
       ? Math.max(32, Math.trunc(requestedUbatch))
-      : (isCpuModelMode ? Math.min(this._nBatch || 256, 256) : 0);
+      : (useCpuBatchDefaults ? Math.min(this._nBatch || 256, 256) : 0);
 
     if (this._nBatch > 0 && this._nBatch > this._nCtx) {
       this._nBatch = this._nCtx;
