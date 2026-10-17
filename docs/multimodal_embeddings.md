@@ -14,7 +14,7 @@ Worker requests use structured clone with no transfer list, retaining caller buf
 
 Embedding worker fallback uses main's existing string-embedding model recovery unchanged: the same sanitized load options and main-thread GPU policy, with no embedding CPU caps, context reconstruction or private batch-default hint. The shared fallback method is byte-for-byte identical to main. Generation retains main's nonempty-parts detection (including uppercase image/audio); embedding media detection is separate, so text-only embedding parts do not request a projector.
 
-Every embedding fallback (string, parts, batch and capability probe) eagerly attempts to restore a remembered projector after shared model recovery. This best-effort step is outside the shared dispose-on-failure catch. A failed projector load emits a payload-free warning, preserves the healthy model and remembered projector URL, and leaves actual media capabilities false. A subsequent media call or capability probe attempts one restore per bridge call if the projector remains unloaded; there is no bridge retry loop. Media preflight returns typed `EMBEDDING_PROJECTOR_MISSING` on failure. Strings and text-only parts remain usable and do not retry the projector. A successful restore is reused; explicitly unloading the projector clears its remembered source. Cancellation/disposal still propagate their existing lifecycle errors.
+Every embedding fallback (string, parts, batch and capability probe) eagerly attempts to restore a remembered projector after shared model recovery. This best-effort step is outside the shared dispose-on-failure catch. A failed projector load emits a payload-free warning, preserves the healthy model and remembered projector URL, and leaves actual media capabilities false. A subsequent media call or capability probe attempts one restore per bridge call if the projector remains unloaded; there is no bridge retry loop. Media preflight returns typed `EMBEDDING_PROJECTOR_MISSING` on failure. Strings and text-only parts remain usable and do not retry the projector. A successful restore is reused; explicitly unloading the projector clears its remembered source. Cancellation during a restore rejects with `AbortError`; a disposal racing a failed restore may surface `EMBEDDING_PROJECTOR_MISSING` to the media call.
 
 ## Source and inputs
 
@@ -43,7 +43,6 @@ Commands live in [CONTRIBUTING.md](../CONTRIBUTING.md#multimodal-embedding-quali
 - Round-4 Chromium state/extraction/generation: direct and worker on wasm32 and memory64, all four rows pass. Qwen3.5 image completion: direct and worker wasm32, both rows pass. These use the round-4 JS wrapper over existing round-2 WASM and existing pinned local weights; no downloads.
 - Local v0.7.0 round-2 builds: wasm32 and memory64, Emscripten 6.0.11; pins unchanged. No round-4 WASM rebuild or BF16 rerun: runtime embedding staging/execution and C/C++ are unchanged. The runtime load edit only removes round 3's private default override and restores the ordinary main behavior. BF16 evidence below is explicitly from round 2.
 - Round-1 actual v0.5.0 C++ core syntax check passed with mixed API disabled; current old-core executable contracts pass.
-- Independent round-4 review: no P1/P2 findings; shared fallback and generation detector verified byte-for-byte against local main.
 
 ### BF16 matrix
 

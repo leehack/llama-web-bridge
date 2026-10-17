@@ -20,7 +20,6 @@ import {
 import { cloneModelSource, hasModelSource, normalizeAbsoluteUrl } from './internal/model_source.ts';
 import { bufferSourceBytes, toUint8Array } from './internal/typed_values.ts';
 import { LlamaWebGpuBridgeRuntime } from './runtime.ts';
-import type { RuntimeLoadModelOptions } from './runtime.ts';
 import { emptyBridgeState, serializeWorkerError } from './worker_protocol.ts';
 import { BridgeWorkerProxy } from './worker_proxy.ts';
 import type { ModelSource } from './internal/model_source.ts';

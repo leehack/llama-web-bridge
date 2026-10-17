@@ -100,9 +100,7 @@ type BridgeLogger = Partial<Record<LogMethod, (message: unknown) => void>>;
 // Load options as the bridge passes them: a null signal means none.
 export type RuntimeLoadModelOptions = {
   [K in keyof LoadModelOptions as K extends 'signal' ? never : K]: LoadModelOptions[K];
-} & {
-  signal?: AbortSignal | null;
-};
+} & { signal?: AbortSignal | null };
 
 interface TransferOptions {
   cacheName?: unknown;

@@ -570,6 +570,20 @@ for (const rejectProjector of [false, true]) {
   });
 }
 
+test('cancellation during a failing eager restore rejects as cancelled and keeps the model', async () => {
+  const { bridge, runtime, warnings } = recoveryFixture(
+    Object.assign(new Error('worker crashed'), { llamadartWorkerCrash: true }));
+  runtime.loadMultimodalProjector = async () => {
+    bridge.cancel();
+    throw new Error('projector fetch failed');
+  };
+  await assert.rejects(bridge.embed('hello'), { name: 'AbortError' });
+  assert.equal(warnings.length, 0);
+  assert.equal(runtime._modelBytes, 1);
+  assert.ok(bridge._loadedModelUrl);
+  assert.ok(bridge._loadedMmProjUrl);
+});
+
 test('embedding fallback reuses an already loaded direct model like main', async () => {
   const { bridge, runtime, loads, projectors } = recoveryFixture(
     Object.assign(new Error('ggml_webgpu: device error'), { llamadartWorkerCrash: true }));

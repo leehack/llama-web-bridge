@@ -535,7 +535,9 @@ embedding or capability probe makes one further restoration attempt if the
 projector is still unloaded. A failed media attempt rejects with
 `EMBEDDING_PROJECTOR_MISSING`; strings and text-only parts remain usable without
 retrying the projector. An already loaded or explicitly unloaded projector is
-not retried. Cancellation and disposal retain their existing lifecycle errors.
+not retried. Cancellation during a restore rejects with `AbortError`; if the
+bridge is disposed while a restore fails, a media call may reject with
+`EMBEDDING_PROJECTOR_MISSING`.
 
 ### `embed(input, options?)`
 
