@@ -172,6 +172,10 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_embed_to_json(
     return -10;
   }
 
+  // A cancelled parts request can stop during JS media staging, before its
+  // native export runs. A fresh string request owns a fresh abort state too.
+  g_cancel_requested = false;
+
   if (text == nullptr) {
     set_error("Text is null");
     return -2;

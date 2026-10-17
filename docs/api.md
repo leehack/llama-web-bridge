@@ -506,24 +506,117 @@ Worker mode transfers an internal copy to the worker, so caller-owned
 
 ## Embeddings
 
-### `embed(text, options?)`
+### `getEmbeddingCapabilities()`
 
 ```ts
-embed(text: string, options?: { normalize?: boolean }): Promise<number[]>
+getEmbeddingCapabilities(): Promise<{
+  apiVersion: 1; text: boolean; image: boolean; audio: boolean;
+}>
 ```
 
-Generates an embedding vector for one string. Vectors are normalized unless
-`options.normalize === false`.
+Probes the loaded model, allocated context, projector and mixed-batch API in
+the active runtime. An unloaded model returns all false. Probe again after
+projector load/unload; completion vision/audio support alone does not enable
+media embeddings. Pooled embedding models support text; mixed media requires
+a noncausal decoder with MEAN pooling and the extended batch API. Audio also
+requires a 16 kHz projector. The production source pin lacks this mixed API;
+it reports image/audio false. There is no minimum published assets tag yet.
+An absent, malformed or unknown capability protocol throws a typed
+`EmbeddingError` with `code: 'EMBEDDING_CAPABILITY_UNAVAILABLE'`; legacy string
+embeddings remain available through their existing route.
 
-### `embedBatch(texts, options?)`
+After an unusable worker, embedding operations reload the model on the main
+thread with the same options and GPU policy as existing string embeddings.
+A remembered projector is restored eagerly for string, parts, batch and probe
+fallbacks. Restoration is best effort: failure logs a payload-free warning and
+keeps the model loaded and projector URL remembered. Capabilities report actual
+loaded support, so image/audio remain false after failure. Each subsequent media
+embedding or capability probe makes one further restoration attempt if the
+projector is still unloaded. A failed media attempt rejects with
+`EMBEDDING_PROJECTOR_MISSING`; strings and text-only parts remain usable without
+retrying the projector. An already loaded or explicitly unloaded projector is
+not retried. Cancellation during a restore rejects with `AbortError`; if the
+bridge is disposed while a restore fails, a media call may reject with
+`EMBEDDING_PROJECTOR_MISSING`.
+
+### `embed(input, options?)`
 
 ```ts
-embedBatch(texts: string[], options?: { normalize?: boolean }): Promise<number[][]>
+type EmbedPart =
+  | { type: 'text'; text: string }
+  | { type: 'image'; bytes?: Uint8Array; url?: string; width?: number; height?: number }
+  | { type: 'audio'; samples?: Float32Array; bytes?: Uint8Array; url?: string };
+type EmbedInput = string | EmbedPart[];
+embed(input: EmbedInput, options?: { normalize?: boolean }): Promise<number[]>
 ```
 
-Generates embeddings for multiple strings. Empty input resolves to `[]`. The
-direct runtime currently processes the batch sequentially; worker mode forwards
-the batch request to the worker runtime.
+One string or one ordered parts array produces one full pooled vector. Strings
+retain the existing execution route and defaults. Adjacent text is concatenated
+verbatim, including empty strings, whitespace and Unicode. No task prefix,
+separator, chat template, truncation or per-part averaging is added. Empty parts
+arrays and sparse arrays reject. The literal `<__media__>` marker is reserved
+in parts text, because it would make media ordering ambiguous.
+
+For each media part provide exactly one source. Encoded image/audio bytes and
+URLs use the completion media decoder and configured image downscaling limits;
+raw RGB bytes use `width * height * 3` as in completion input. PCM must be finite
+mono 16 kHz `Float32Array` samples. Browser filesystem paths and video parts are
+unsupported. URL inputs use the completion fetch behavior and require browser
+fetch/CORS access; support for a modality does not guarantee every codec/source.
+Caller buffers remain attached and unchanged; worker requests use structured
+clone without transferring the caller's buffers. Lists and part descriptors are
+snapshotted when queued. Keep buffers unchanged until the promise settles.
+
+The entire expanded parts input must fit the actual context, per-sequence
+context, logical batch and physical microbatch, with at least one sequence.
+Overflow rejects before media encoding or model inference; the bridge never
+chunks a parts input. Each mixed input uses one extended batch and one decode,
+copying each media row into the batch before mtmd reuses its output buffer. Output width comes from
+the pooled model output, which can differ from token embedding width.
+Vectors are L2-normalized unless `normalize === false`; zero/nonfinite handling
+matches the string path. Rank-pooled classifiers and encoder-decoder models
+are unsupported by the parts API. Media capabilities are false for M-RoPE
+projectors requiring multiple positions per embedding row.
+
+```js
+const capabilities = await bridge.getEmbeddingCapabilities();
+if (capabilities.apiVersion === 1 && capabilities.image) {
+  const vector = await bridge.embed([
+    { type: 'text', text: 'A document: ' },
+    { type: 'image', bytes: imageBytes },
+  ]);
+}
+```
+
+Parts failures are payload-free `EmbeddingError` instances with a stable code:
+
+| Code | Meaning |
+| --- | --- |
+| `INVALID_EMBEDDING_INPUT` | Empty/malformed parts, ambiguous media sources or reserved marker |
+| `EMBEDDING_CAPABILITY_UNAVAILABLE` | Missing/unknown bridge or mixed-batch API |
+| `MODEL_NOT_EMBEDDING` | Unsupported model, pooling or attention configuration |
+| `EMBEDDING_PROJECTOR_MISSING` | Media requires a loaded projector |
+| `EMBEDDING_MODALITY_UNSUPPORTED` | Unsupported part, projector modality or PCM rate |
+| `EMBEDDING_INPUT_TOO_LARGE` | Expanded input exceeds allocated capacity |
+| `EMBEDDING_FAILED` | Media preparation, format, batch construction or inference failure |
+
+Worker transport preserves these error types/codes. `cancel()` keeps the
+existing best-effort semantics: observed cancellation rejects with `AbortError`,
+and work that finishes before observing it can still resolve. Active work settles
+before cleanup, disposal or the next operation. Interrupt latency is not guaranteed.
+A subsequent text request can reuse the runtime.
+
+### `embedBatch(inputs, options?)`
+
+```ts
+embedBatch(inputs: EmbedInput[], options?: { normalize?: boolean }): Promise<number[][]>
+```
+
+Returns one vector per input, in input order. Empty input resolves to `[]`
+without inference. Part shapes and requested modalities across the batch are
+checked before the first embedding; expanded capacity/format is checked for
+each input before that input's inference. Execution is sequential; worker mode
+forwards the batch as one request. Each parts array is one vector.
 
 ## Next-token scoring
 

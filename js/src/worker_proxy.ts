@@ -1,6 +1,7 @@
 // Main-thread proxy that forwards bridge calls to a dedicated worker.
 
 import { DECISION_WORKER_TIMEOUT_PER_SEQUENCE_MS } from './internal/decision.ts';
+import { EmbeddingError } from './internal/embedding.ts';
 import type { LlamaWebGpuBridgeConfig } from './llama_webgpu_bridge.d.ts';
 import { bridgeWorkerModeParam } from './worker_protocol.ts';
 import type { WorkerEventHandler, WorkerResponse } from './worker_protocol.ts';
@@ -153,9 +154,9 @@ export class BridgeWorkerProxy {
 
       this._pending.delete(id);
       if (type === 'error') {
-        const workerError: Error & { state?: unknown } = new Error(
-          String(message.message || 'Worker request failed'),
-        );
+        const errorMessage = String(message.message || 'Worker request failed');
+        const workerError: Error & { state?: unknown } = message.embeddingErrorCode
+          ? new EmbeddingError(message.embeddingErrorCode, errorMessage) : new Error(errorMessage);
         if (message.state && typeof message.state === 'object') {
           workerError.state = message.state;
         }

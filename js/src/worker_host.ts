@@ -1,6 +1,7 @@
 // Worker-side message host that runs a bridge inside a dedicated worker.
 
 import { LlamaWebGpuBridge } from './bridge.ts';
+import { EmbeddingError } from './internal/embedding.ts';
 import { toUint8Array } from './internal/typed_values.ts';
 import {
   bridgeWorkerModeParam,
@@ -48,6 +49,7 @@ export function installBridgeWorkerHost() {
       type: 'error',
       id,
       message: serializeWorkerError(error),
+      ...(error instanceof EmbeddingError ? { embeddingErrorCode: error.code } : {}),
       state,
     });
   };

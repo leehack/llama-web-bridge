@@ -1,6 +1,7 @@
 // Public bridge facade: picks the worker or direct runtime and owns the operation queue.
 
 import { createAbortError } from './internal/abort.ts';
+import { embeddingAssetVersion, embeddingCapabilitiesFrom, missingEmbeddingCapability, snapshotEmbedInput } from './internal/embedding.ts';
 import { NO_COMPLETION_CAPABILITIES, resolveCompletionSamplingOptions } from './internal/completion_options.ts';
 import { BRIDGE_DISPOSED_MESSAGE, INVALID_GRAMMAR_ERROR_TEXT } from './internal/constants.ts';
 import {
@@ -36,6 +37,8 @@ import type {
   DraftModelInfo,
   DraftModelLoadOptions,
   EmbedOptions,
+  EmbedInput,
+  EmbeddingCapabilities,
   LlamaWebGpuBridgeConfig,
   LoadModelOptions,
   LoraAdapterCapabilities,
@@ -123,7 +126,7 @@ interface BridgeCompletionOptions extends CompletionOptions {
 }
 
 // What worker-fallback recovery reads: a completion's options, or the flags
-// text-to-speech recovery passes.
+// embedding and text-to-speech recovery pass.
 interface WorkerFallbackOptions {
   parts?: readonly unknown[];
   signal?: AbortSignal | null;
@@ -3163,59 +3166,121 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
     }
   }
 
-  async embed(text: string, options: EmbedOptions = {}) {
+  async getEmbeddingCapabilities(): Promise<EmbeddingCapabilities> {
+    return this._runExclusive(async () => {
+      try {
+        return await this._getEmbeddingCapabilitiesUnlocked();
+      } catch (error) {
+        this._throwIfOperationCancelled(error, 'Embedding capability probe was cancelled.');
+        if (!this._workerProxy || !this._isWorkerUnusableError(error)) throw error;
+        await this._recoverEmbeddingWorker(error);
+        return this._runtime!.getEmbeddingCapabilities();
+      }
+    }, { kind: 'embedding-capabilities' });
+  }
+
+  async _getEmbeddingCapabilitiesUnlocked(): Promise<EmbeddingCapabilities> {
+    if (!this._workerProxy) {
+      await this._ensureRememberedEmbeddingProjector();
+      return this._runtime!.getEmbeddingCapabilities();
+    }
+    try {
+      await this._restoreWorkerModelIfMissing();
+      return embeddingCapabilitiesFrom(await this._callWorker('getEmbeddingCapabilities', []),
+        embeddingAssetVersion(this._config.workerUrl));
+    } catch (error) {
+      this._throwIfOperationCancelled(error, 'Embedding capability probe was cancelled.');
+      // Older worker hosts dispatch an absent method through bridge[method].
+      // Only that specific missing-method signal means an old capability API.
+      if (error instanceof Error && /bridge\[method\] is not a function/.test(error.message)) {
+        throw missingEmbeddingCapability(embeddingAssetVersion(this._config.workerUrl));
+      }
+      throw error;
+    }
+  }
+
+  async embed(text: EmbedInput, options: EmbedOptions = {}) {
+    const input = typeof text === 'string' ? text : snapshotEmbedInput(text);
     return this._runExclusive(
-      () => this._embedUnlocked(text, options),
+      () => this._embedUnlocked(input, options),
       { kind: 'embedding' },
     );
   }
 
-  async _embedUnlocked(text: string, options: EmbedOptions = {}) {
+  _hasEmbeddingMediaParts(input: EmbedInput) {
+    return Array.isArray(input) && input.some((part) => part.type !== 'text');
+  }
+
+  async _recoverEmbeddingWorker(error: unknown) {
+    this._disableWorkerFallback(error);
+    await this._waitForWorkerDisposal();
+    // Keep main's string-embedding model reload policy for every embedding
+    // operation. Projector recovery is best effort and outside its atomic catch.
+    await this._ensureRuntimeReadyAfterWorkerFallback({}, error);
+    await this._ensureRememberedEmbeddingProjector();
+  }
+
+  async _ensureRememberedEmbeddingProjector() {
+    if (!this._loadedMmProjUrl || !this._runtime?._modelBytes || this._runtime._mmProjPath) return;
+    this._throwIfDisposed();
+    try {
+      await this._runtime.loadMultimodalProjector(this._loadedMmProjUrl);
+    } catch (error) {
+      this._throwIfOperationCancelled(error, 'Embedding projector restore was cancelled.');
+      // Preserve the healthy model and remembered source. The runtime probe
+      // reports actual modalities; media preflight returns PROJECTOR_MISSING.
+      this._emitBridgeWarn('llamadart: embedding projector restore failed; keeping the loaded model.');
+    }
+    this._throwIfDisposed();
+  }
+
+  async _embedUnlocked(text: EmbedInput, options: EmbedOptions = {}) {
     if (!this._workerProxy) {
+      if (this._hasEmbeddingMediaParts(text)) await this._ensureRememberedEmbeddingProjector();
       return this._runtime!.embed(text, options);
     }
 
     try {
       await this._restoreWorkerModelIfMissing();
+      if (Array.isArray(text)) await this._getEmbeddingCapabilitiesUnlocked();
       return await this._callWorker<number[]>('embed', [text, options]);
     } catch (error) {
       this._throwIfOperationCancelled(error, 'Embedding was cancelled.');
       if (!this._isWorkerUnusableError(error)) {
         throw error;
       }
-      this._disableWorkerFallback(error);
-      await this._waitForWorkerDisposal();
-      await this._ensureRuntimeReadyAfterWorkerFallback({}, error);
+      await this._recoverEmbeddingWorker(error);
       return this._runtime!.embed(text, options);
     }
   }
 
-  async embedBatch(texts: string[], options: EmbedOptions = {}) {
+  async embedBatch(texts: EmbedInput[], options: EmbedOptions = {}) {
+    const inputs = Array.from(texts || [], (input) => typeof input === 'string' ? input : snapshotEmbedInput(input));
     return this._runExclusive(
-      () => this._embedBatchUnlocked(texts, options),
+      () => this._embedBatchUnlocked(inputs, options),
       { kind: 'embedding-batch' },
     );
   }
 
-  async _embedBatchUnlocked(texts: string[], options: EmbedOptions = {}) {
+  async _embedBatchUnlocked(texts: EmbedInput[], options: EmbedOptions = {}) {
     const normalized = Array.isArray(texts)
       ? texts
-      : Array.from(texts || []) as string[];
+      : Array.from(texts || []) as EmbedInput[];
     if (!this._workerProxy) {
+      if (normalized.some((input) => this._hasEmbeddingMediaParts(input))) await this._ensureRememberedEmbeddingProjector();
       return this._runtime!.embedBatch(normalized, options);
     }
 
     try {
       await this._restoreWorkerModelIfMissing();
+      if (normalized.some(Array.isArray)) await this._getEmbeddingCapabilitiesUnlocked();
       return await this._callWorker<number[][]>('embedBatch', [normalized, options]);
     } catch (error) {
       this._throwIfOperationCancelled(error, 'Batch embedding was cancelled.');
       if (!this._isWorkerUnusableError(error)) {
         throw error;
       }
-      this._disableWorkerFallback(error);
-      await this._waitForWorkerDisposal();
-      await this._ensureRuntimeReadyAfterWorkerFallback({}, error);
+      await this._recoverEmbeddingWorker(error);
       return this._runtime!.embedBatch(normalized, options);
     }
   }

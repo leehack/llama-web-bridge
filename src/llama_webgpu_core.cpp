@@ -36,6 +36,7 @@
 #include "llama_webgpu_batch_compat.h"
 #include "llama_webgpu_decision.h"
 #include "llama_webgpu_embedding_json.h"
+#include "llama_webgpu_embedding.h"
 #include "llama_webgpu_grammar.h"
 #include "llama_webgpu_lora.h"
 #include "llama_webgpu_mtmd_compat.h"
@@ -74,6 +75,8 @@ extern "C" {
 #include "core/exports_multimodal.inc"
 
 #include "core/exports_context.inc"
+
+#include "core/exports_embedding.inc"
 
 #include "core/exports_generation.inc"
 

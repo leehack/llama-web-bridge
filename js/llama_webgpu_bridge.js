@@ -16,6 +16,122 @@ function throwIfAborted(signal, message = "Bridge operation was cancelled.") {
   }
 }
 
+// js/src/internal/embedding.ts
+var EmbeddingError = class extends Error {
+  constructor(code, message) {
+    super(message);
+    this.name = "EmbeddingError";
+    this.code = code;
+  }
+};
+var EMPTY_EMBEDDING_CAPABILITIES = {
+  apiVersion: 1,
+  text: false,
+  image: false,
+  audio: false
+};
+var EMBEDDING_MEDIA_MARKER = "<__media__>";
+function embeddingAssetVersion(...sources) {
+  for (const source of [...sources, import.meta.url]) {
+    try {
+      const version = new URL(source || "", import.meta.url).pathname.match(/(?:^|[/@])(v?\d+\.\d+\.\d+(?:-\d+)?)(?:[/]|$)/)?.[1];
+      if (version) return version;
+    } catch (_) {
+    }
+  }
+  return "unversioned/local";
+}
+function missingEmbeddingCapability(version = embeddingAssetVersion()) {
+  return new EmbeddingError(
+    "EMBEDDING_CAPABILITY_UNAVAILABLE",
+    `Loaded bridge/assets version ${version} has no known media-embedding capability API version 1. Upgrade the loaded bridge assets.`
+  );
+}
+function embeddingCapabilitiesFrom(value, version = embeddingAssetVersion()) {
+  let parsed = value;
+  if (typeof value === "string") {
+    try {
+      parsed = JSON.parse(value);
+    } catch (_) {
+      throw missingEmbeddingCapability(version);
+    }
+  }
+  const caps = parsed;
+  if (!caps || caps.apiVersion !== 1 || typeof caps.text !== "boolean" || typeof caps.image !== "boolean" || typeof caps.audio !== "boolean") {
+    throw missingEmbeddingCapability(version);
+  }
+  return { apiVersion: 1, text: caps.text, image: caps.image, audio: caps.audio };
+}
+function snapshotEmbedInput(input) {
+  if (!Array.isArray(input)) return String(input);
+  if (!Array.isArray(input) || input.length === 0) {
+    throw new EmbeddingError("INVALID_EMBEDDING_INPUT", "Embedding parts must be a nonempty array.");
+  }
+  const parts = Array.from(input, (part) => {
+    if (!part || typeof part !== "object") {
+      throw new EmbeddingError("INVALID_EMBEDDING_INPUT", "Invalid embedding part.");
+    }
+    if (part.type === "text") {
+      if (typeof part.text !== "string") {
+        throw new EmbeddingError("INVALID_EMBEDDING_INPUT", "Embedding text part must contain a string.");
+      }
+      return { type: "text", text: part.text };
+    }
+    if (part.type !== "image" && part.type !== "audio") {
+      throw new EmbeddingError("EMBEDDING_MODALITY_UNSUPPORTED", "Embedding part modality is unsupported.");
+    }
+    if ("path" in part) {
+      throw new EmbeddingError("EMBEDDING_MODALITY_UNSUPPORTED", "Browser embeddings require media bytes, URL or PCM; filesystem paths are unsupported.");
+    }
+    const sourceCount = Number(part.bytes != null) + Number(part.url != null) + Number("samples" in part && part.samples != null);
+    if (sourceCount !== 1 || part.bytes != null && (!(part.bytes instanceof Uint8Array) || part.bytes.length === 0) || part.url != null && (typeof part.url !== "string" || part.url.length === 0)) {
+      throw new EmbeddingError("INVALID_EMBEDDING_INPUT", "Embedding media requires exactly one nonempty supported source.");
+    }
+    if ("samples" in part && part.samples != null) {
+      if (part.type !== "audio" || !(part.samples instanceof Float32Array) || part.samples.length === 0 || !part.samples.every(Number.isFinite)) {
+        throw new EmbeddingError("INVALID_EMBEDDING_INPUT", "Embedding PCM must be finite mono 16 kHz Float32 samples.");
+      }
+    }
+    return { ...part };
+  });
+  const merged = [];
+  for (const part of parts) {
+    const previous = merged.at(-1);
+    if (part.type === "text" && previous?.type === "text") previous.text += part.text;
+    else merged.push(part);
+  }
+  if (merged.some((part) => part.type === "text" && part.text.includes(EMBEDDING_MEDIA_MARKER))) {
+    throw new EmbeddingError("INVALID_EMBEDDING_INPUT", "Reserved media marker in embedding text.");
+  }
+  return merged;
+}
+function requireEmbeddingModalities(input, caps, hasProjector) {
+  if (typeof input === "string") return;
+  if (!caps.text) {
+    throw new EmbeddingError("MODEL_NOT_EMBEDDING", "Loaded model does not support pooled embeddings.");
+  }
+  for (const part of input) {
+    if (part.type === "text") continue;
+    if (!hasProjector) {
+      throw new EmbeddingError("EMBEDDING_PROJECTOR_MISSING", "Media embeddings require a loaded projector.");
+    }
+    if (!caps[part.type]) {
+      throw new EmbeddingError("EMBEDDING_MODALITY_UNSUPPORTED", "Loaded projector/model does not support the requested embedding modality.");
+    }
+  }
+}
+function embeddingCoreError(rc, version = embeddingAssetVersion()) {
+  if (rc === -20) return missingEmbeddingCapability(version);
+  const errors = {
+    [-21]: ["MODEL_NOT_EMBEDDING", "Loaded model does not support this pooled embedding operation."],
+    [-22]: ["EMBEDDING_PROJECTOR_MISSING", "Media embeddings require a loaded projector."],
+    [-23]: ["EMBEDDING_INPUT_TOO_LARGE", "Expanded embedding input exceeds the allocated context, batch, sequence or single microbatch capacity."],
+    [-24]: ["EMBEDDING_MODALITY_UNSUPPORTED", "Loaded projector does not support the requested embedding modality or PCM rate."]
+  };
+  const [code, message] = errors[rc] || ["EMBEDDING_FAILED", "Embedding execution failed."];
+  return new EmbeddingError(code, message);
+}
+
 // js/src/internal/completion_options.ts
 var SPECULATIVE_DECODING_STRATEGIES = Object.freeze([
   "draft-simple",
@@ -4350,7 +4466,59 @@ var LlamaWebGpuBridgeRuntime = class {
     }
     return this._core.ccall("llamadart_webgpu_last_detokenized", "string", [], []) || "";
   }
+  _embeddingAssetVersion() {
+    return embeddingAssetVersion(this._coreVariant === "wasm64" ? this._config.coreModuleUrlMem64 : this._config.coreModuleUrl);
+  }
+  async getEmbeddingCapabilities() {
+    if (this._modelBytes <= 0) return { ...EMPTY_EMBEDDING_CAPABILITIES };
+    if (typeof this._core?._llamadart_webgpu_embedding_capabilities_json !== "function" || typeof this._core?._llamadart_webgpu_embed_parts_to_json !== "function") {
+      throw missingEmbeddingCapability(this._embeddingAssetVersion());
+    }
+    return embeddingCapabilitiesFrom(
+      this._core.ccall("llamadart_webgpu_embedding_capabilities_json", "string", [], []),
+      this._embeddingAssetVersion()
+    );
+  }
+  async _preflightEmbeddingInputs(inputs) {
+    if (!inputs.some(Array.isArray)) return;
+    const caps = await this.getEmbeddingCapabilities();
+    for (const input of inputs) requireEmbeddingModalities(input, caps, !!this._mmProjPath);
+  }
+  async _embedParts(parts, options) {
+    const prompt = parts.map((part) => part.type === "text" ? part.text : EMBEDDING_MEDIA_MARKER).join("");
+    const promptBytes = textEncoder.encode(prompt);
+    const media = parts.filter((part) => part.type !== "text");
+    try {
+      await this._stageMultimodalParts(media);
+      if (this._abortRequested) throw createAbortError("Embedding was cancelled.");
+      const rc = Number(await this._core.ccall(
+        "llamadart_webgpu_embed_parts_to_json",
+        "number",
+        ["array", "number", "number"],
+        [promptBytes, options?.normalize !== false ? 1 : 0, promptBytes.length],
+        { async: true }
+      ));
+      if (this._abortRequested) throw createAbortError("Embedding was cancelled.");
+      if (rc < 0) throw embeddingCoreError(rc, this._embeddingAssetVersion());
+      const raw = this._core.ccall("llamadart_webgpu_last_embedding_json", "string", [], []) || "[]";
+      const parsed = JSON.parse(raw);
+      return Array.isArray(parsed) ? parsed.map((v) => Number.isFinite(Number(v)) ? Number(v) : 0) : [];
+    } catch (error) {
+      if (error instanceof WebAssembly.RuntimeError) throw error;
+      if (error instanceof EmbeddingError || error?.name === "AbortError") throw error;
+      throw new EmbeddingError("EMBEDDING_FAILED", "Embedding media preparation or execution failed.");
+    } finally {
+      this._clearPendingMedia();
+    }
+  }
   async embed(text, options = {}) {
+    if (Array.isArray(text)) {
+      const parts = snapshotEmbedInput(text);
+      this._abortRequested = false;
+      await this._preflightEmbeddingInputs([parts]);
+      if (this._abortRequested) throw createAbortError("Embedding was cancelled.");
+      return this._embedParts(parts, options);
+    }
     if (this._modelBytes <= 0) {
       throw new Error("No model loaded. Call loadModelFromUrl first.");
     }
@@ -4379,10 +4547,14 @@ var LlamaWebGpuBridgeRuntime = class {
     if (normalized.length === 0) {
       return [];
     }
+    const inputs = normalized.map((input) => typeof input === "string" ? input : snapshotEmbedInput(input));
+    this._abortRequested = false;
+    await this._preflightEmbeddingInputs(inputs);
     const normalize = options?.normalize !== false;
     const vectors = [];
-    for (const text of normalized) {
-      vectors.push(await this.embed(String(text), { normalize }));
+    for (const text of inputs) {
+      if (this._abortRequested) throw createAbortError("Batch embedding was cancelled.");
+      vectors.push(await (typeof text === "string" ? this.embed(text, { normalize }) : this._embedParts(text, { normalize })));
     }
     return vectors;
   }
@@ -4704,9 +4876,8 @@ var BridgeWorkerProxy = class {
       }
       this._pending.delete(id);
       if (type === "error") {
-        const workerError = new Error(
-          String(message.message || "Worker request failed")
-        );
+        const errorMessage = String(message.message || "Worker request failed");
+        const workerError = message.embeddingErrorCode ? new EmbeddingError(message.embeddingErrorCode, errorMessage) : new Error(errorMessage);
         if (message.state && typeof message.state === "object") {
           workerError.state = message.state;
         }
@@ -7245,52 +7416,105 @@ var LlamaWebGpuBridge = class {
       return this._runtime.detokenize(normalized, special);
     }
   }
+  async getEmbeddingCapabilities() {
+    return this._runExclusive(async () => {
+      try {
+        return await this._getEmbeddingCapabilitiesUnlocked();
+      } catch (error) {
+        this._throwIfOperationCancelled(error, "Embedding capability probe was cancelled.");
+        if (!this._workerProxy || !this._isWorkerUnusableError(error)) throw error;
+        await this._recoverEmbeddingWorker(error);
+        return this._runtime.getEmbeddingCapabilities();
+      }
+    }, { kind: "embedding-capabilities" });
+  }
+  async _getEmbeddingCapabilitiesUnlocked() {
+    if (!this._workerProxy) {
+      await this._ensureRememberedEmbeddingProjector();
+      return this._runtime.getEmbeddingCapabilities();
+    }
+    try {
+      await this._restoreWorkerModelIfMissing();
+      return embeddingCapabilitiesFrom(
+        await this._callWorker("getEmbeddingCapabilities", []),
+        embeddingAssetVersion(this._config.workerUrl)
+      );
+    } catch (error) {
+      this._throwIfOperationCancelled(error, "Embedding capability probe was cancelled.");
+      if (error instanceof Error && /bridge\[method\] is not a function/.test(error.message)) {
+        throw missingEmbeddingCapability(embeddingAssetVersion(this._config.workerUrl));
+      }
+      throw error;
+    }
+  }
   async embed(text, options = {}) {
+    const input = typeof text === "string" ? text : snapshotEmbedInput(text);
     return this._runExclusive(
-      () => this._embedUnlocked(text, options),
+      () => this._embedUnlocked(input, options),
       { kind: "embedding" }
     );
   }
+  _hasEmbeddingMediaParts(input) {
+    return Array.isArray(input) && input.some((part) => part.type !== "text");
+  }
+  async _recoverEmbeddingWorker(error) {
+    this._disableWorkerFallback(error);
+    await this._waitForWorkerDisposal();
+    await this._ensureRuntimeReadyAfterWorkerFallback({}, error);
+    await this._ensureRememberedEmbeddingProjector();
+  }
+  async _ensureRememberedEmbeddingProjector() {
+    if (!this._loadedMmProjUrl || !this._runtime?._modelBytes || this._runtime._mmProjPath) return;
+    this._throwIfDisposed();
+    try {
+      await this._runtime.loadMultimodalProjector(this._loadedMmProjUrl);
+    } catch (error) {
+      this._throwIfOperationCancelled(error, "Embedding projector restore was cancelled.");
+      this._emitBridgeWarn("llamadart: embedding projector restore failed; keeping the loaded model.");
+    }
+    this._throwIfDisposed();
+  }
   async _embedUnlocked(text, options = {}) {
     if (!this._workerProxy) {
+      if (this._hasEmbeddingMediaParts(text)) await this._ensureRememberedEmbeddingProjector();
       return this._runtime.embed(text, options);
     }
     try {
       await this._restoreWorkerModelIfMissing();
+      if (Array.isArray(text)) await this._getEmbeddingCapabilitiesUnlocked();
       return await this._callWorker("embed", [text, options]);
     } catch (error) {
       this._throwIfOperationCancelled(error, "Embedding was cancelled.");
       if (!this._isWorkerUnusableError(error)) {
         throw error;
       }
-      this._disableWorkerFallback(error);
-      await this._waitForWorkerDisposal();
-      await this._ensureRuntimeReadyAfterWorkerFallback({}, error);
+      await this._recoverEmbeddingWorker(error);
       return this._runtime.embed(text, options);
     }
   }
   async embedBatch(texts, options = {}) {
+    const inputs = Array.from(texts || [], (input) => typeof input === "string" ? input : snapshotEmbedInput(input));
     return this._runExclusive(
-      () => this._embedBatchUnlocked(texts, options),
+      () => this._embedBatchUnlocked(inputs, options),
       { kind: "embedding-batch" }
     );
   }
   async _embedBatchUnlocked(texts, options = {}) {
     const normalized = Array.isArray(texts) ? texts : Array.from(texts || []);
     if (!this._workerProxy) {
+      if (normalized.some((input) => this._hasEmbeddingMediaParts(input))) await this._ensureRememberedEmbeddingProjector();
       return this._runtime.embedBatch(normalized, options);
     }
     try {
       await this._restoreWorkerModelIfMissing();
+      if (normalized.some(Array.isArray)) await this._getEmbeddingCapabilitiesUnlocked();
       return await this._callWorker("embedBatch", [normalized, options]);
     } catch (error) {
       this._throwIfOperationCancelled(error, "Batch embedding was cancelled.");
       if (!this._isWorkerUnusableError(error)) {
         throw error;
       }
-      this._disableWorkerFallback(error);
-      await this._waitForWorkerDisposal();
-      await this._ensureRuntimeReadyAfterWorkerFallback({}, error);
+      await this._recoverEmbeddingWorker(error);
       return this._runtime.embedBatch(normalized, options);
     }
   }
@@ -7490,6 +7714,7 @@ function installBridgeWorkerHost() {
       type: "error",
       id,
       message: serializeWorkerError(error),
+      ...error instanceof EmbeddingError ? { embeddingErrorCode: error.code } : {},
       state
     });
   };
@@ -7819,6 +8044,7 @@ if (typeof window !== "undefined") {
   }
 }
 export {
+  EmbeddingError,
   LlamaWebGpuBridge,
   enableBridgeWorkerHost
 };
