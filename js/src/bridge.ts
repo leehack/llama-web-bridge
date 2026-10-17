@@ -1,6 +1,7 @@
 // Public bridge facade: picks the worker or direct runtime and owns the operation queue.
 
 import { createAbortError } from './internal/abort.ts';
+import { EmbeddingError, embeddingCapabilitiesFrom, missingEmbeddingCapability, snapshotEmbedInput } from './internal/embedding.ts';
 import { NO_COMPLETION_CAPABILITIES, resolveCompletionSamplingOptions } from './internal/completion_options.ts';
 import { BRIDGE_DISPOSED_MESSAGE, INVALID_GRAMMAR_ERROR_TEXT } from './internal/constants.ts';
 import {
@@ -36,6 +37,8 @@ import type {
   DraftModelInfo,
   DraftModelLoadOptions,
   EmbedOptions,
+  EmbedInput,
+  EmbeddingCapabilities,
   LlamaWebGpuBridgeConfig,
   LoadModelOptions,
   LoraAdapterCapabilities,
@@ -3163,20 +3166,38 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
     }
   }
 
-  async embed(text: string, options: EmbedOptions = {}) {
+  async getEmbeddingCapabilities(): Promise<EmbeddingCapabilities> {
+    return this._runExclusive(() => this._getEmbeddingCapabilitiesUnlocked(), { kind: 'embedding-capabilities' });
+  }
+
+  async _getEmbeddingCapabilitiesUnlocked(): Promise<EmbeddingCapabilities> {
+    if (!this._workerProxy) return this._runtime!.getEmbeddingCapabilities();
+    try {
+      await this._restoreWorkerModelIfMissing();
+      return embeddingCapabilitiesFrom(await this._callWorker('getEmbeddingCapabilities', []));
+    } catch (error) {
+      this._throwIfOperationCancelled(error, 'Embedding capability probe was cancelled.');
+      if (error instanceof EmbeddingError) throw error;
+      throw missingEmbeddingCapability();
+    }
+  }
+
+  async embed(text: EmbedInput, options: EmbedOptions = {}) {
+    const input = typeof text === 'string' ? text : snapshotEmbedInput(text);
     return this._runExclusive(
-      () => this._embedUnlocked(text, options),
+      () => this._embedUnlocked(input, options),
       { kind: 'embedding' },
     );
   }
 
-  async _embedUnlocked(text: string, options: EmbedOptions = {}) {
+  async _embedUnlocked(text: EmbedInput, options: EmbedOptions = {}) {
     if (!this._workerProxy) {
       return this._runtime!.embed(text, options);
     }
 
     try {
       await this._restoreWorkerModelIfMissing();
+      if (Array.isArray(text)) await this._getEmbeddingCapabilitiesUnlocked();
       return await this._callWorker<number[]>('embed', [text, options]);
     } catch (error) {
       this._throwIfOperationCancelled(error, 'Embedding was cancelled.');
@@ -3190,23 +3211,26 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
     }
   }
 
-  async embedBatch(texts: string[], options: EmbedOptions = {}) {
+  async embedBatch(texts: EmbedInput[], options: EmbedOptions = {}) {
+    const inputs = Array.from(texts || [], (input) => typeof input === 'string' ? input : snapshotEmbedInput(input));
+    if (inputs.length === 0) return [];
     return this._runExclusive(
-      () => this._embedBatchUnlocked(texts, options),
+      () => this._embedBatchUnlocked(inputs, options),
       { kind: 'embedding-batch' },
     );
   }
 
-  async _embedBatchUnlocked(texts: string[], options: EmbedOptions = {}) {
+  async _embedBatchUnlocked(texts: EmbedInput[], options: EmbedOptions = {}) {
     const normalized = Array.isArray(texts)
       ? texts
-      : Array.from(texts || []) as string[];
+      : Array.from(texts || []) as EmbedInput[];
     if (!this._workerProxy) {
       return this._runtime!.embedBatch(normalized, options);
     }
 
     try {
       await this._restoreWorkerModelIfMissing();
+      if (normalized.some(Array.isArray)) await this._getEmbeddingCapabilitiesUnlocked();
       return await this._callWorker<number[][]>('embedBatch', [normalized, options]);
     } catch (error) {
       this._throwIfOperationCancelled(error, 'Batch embedding was cancelled.');

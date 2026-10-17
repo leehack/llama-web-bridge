@@ -157,6 +157,59 @@ For the v0.7.0 embedding scheduler repair and its exact source fingerprint, see
 corrected copy under `BUILD_DIR/generated` and leaves the upstream checkout
 unchanged. A changed affected source fails configuration pending a new audit.
 
+### Multimodal embedding qualification
+
+The opt-in embedding smoke uses existing local model/projector files and an
+independent upstream-only CPU reference. It never downloads weights. See
+[the embedding qualification record](docs/multimodal_embeddings.md) for source
+identity, model revision, checksums, tolerance and results. Export the checksum
+variables from that record. Keep all outputs outside the repository.
+
+Build the reference against that exact llama.cpp checkout (`LLAMA_CPP_DIR`):
+
+```bash
+cmake -S "$LLAMA_CPP_DIR" -B "$TMPDIR/embedding-native" \
+  -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF \
+  -DGGML_METAL=OFF -DGGML_BLAS=OFF -DGGML_OPENMP=OFF -DGGML_NATIVE=OFF \
+  -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF \
+  -DLLAMA_BUILD_SERVER=OFF -DLLAMA_BUILD_TOOLS=ON -DLLAMA_OPENSSL=OFF
+CCACHE_DIR="$TMPDIR/embedding-ccache" \
+  cmake --build "$TMPDIR/embedding-native" --target mtmd -j 8
+c++ -std=c++17 -O2 \
+  -I"$LLAMA_CPP_DIR/include" -I"$LLAMA_CPP_DIR/ggml/include" \
+  -I"$LLAMA_CPP_DIR/tools/mtmd" scripts/smoke/embedding_reference.cpp \
+  "$TMPDIR/embedding-native/tools/mtmd/libmtmd.a" \
+  "$TMPDIR/embedding-native/src/libllama.a" \
+  "$TMPDIR/embedding-native/ggml/src/libggml.a" \
+  "$TMPDIR/embedding-native/ggml/src/libggml-cpu.a" \
+  "$TMPDIR/embedding-native/ggml/src/libggml-base.a" \
+  "$TMPDIR/embedding-native/vendor/hash/libvendor-hash.a" \
+  -framework Accelerate -o "$TMPDIR/embedding-reference"
+"$TMPDIR/embedding-reference" \
+  ~/llamadart-qa-models/embeddinggemma-2/gguf/embeddinggemma-2-BF16.gguf \
+  ~/llamadart-qa-models/embeddinggemma-2/gguf/mmproj-embeddinggemma-2-BF16.gguf \
+  "$TMPDIR/embedding-reference.json"
+node scripts/smoke/multimodal_embeddings.mjs \
+  --dist-dir "$OUT_DIR" \
+  --model-path ~/llamadart-qa-models/embeddinggemma-2/gguf/embeddinggemma-2-BF16.gguf \
+  --model-sha256 "$EMBEDDING_MODEL_SHA256" \
+  --mmproj-path ~/llamadart-qa-models/embeddinggemma-2/gguf/mmproj-embeddinggemma-2-BF16.gguf \
+  --mmproj-sha256 "$EMBEDDING_PROJECTOR_SHA256" \
+  --reference-path "$TMPDIR/embedding-reference.json" \
+  --memory-mode wasm64 --artifacts-dir "$TMPDIR/embedding-browser"
+```
+
+The native commands above target macOS CPU. The qualification record also
+retains CPU precision controls and any failed numerical parity checks. The browser smoke checks both
+direct and worker paths, exact runtime selection, 768-wide raw/normalized
+outputs, synthetic media sensitivity, interleaving, batch order, adjacent text,
+overflow, projector unload/reload, cancellation and text reuse. It does not
+qualify retrieval quality or publish assets. If the supplied BF16 pair exceeds
+browser memory, record the runtime's exact limit and stop; do not substitute or
+download other weights.
+
+### Multimodal completion regression
+
 For llama.cpp pin or multimodal changes, run checksum-pinned real image
 inference through both direct and worker runtimes:
 

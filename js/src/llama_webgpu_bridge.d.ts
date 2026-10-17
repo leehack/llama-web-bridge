@@ -237,6 +237,25 @@ export interface EmbedOptions {
   normalize?: boolean;
 }
 
+export type EmbedPart =
+  | { type: 'text'; text: string }
+  | { type: 'image'; bytes?: Uint8Array; url?: string; width?: number; height?: number }
+  | { type: 'audio'; samples?: Float32Array; bytes?: Uint8Array; url?: string };
+export type EmbedInput = string | EmbedPart[];
+export interface EmbeddingCapabilities {
+  apiVersion: 1;
+  text: boolean;
+  image: boolean;
+  audio: boolean;
+}
+export type EmbeddingErrorCode = 'INVALID_EMBEDDING_INPUT' | 'EMBEDDING_CAPABILITY_UNAVAILABLE'
+  | 'MODEL_NOT_EMBEDDING' | 'EMBEDDING_PROJECTOR_MISSING' | 'EMBEDDING_MODALITY_UNSUPPORTED'
+  | 'EMBEDDING_INPUT_TOO_LARGE' | 'EMBEDDING_FAILED';
+export class EmbeddingError extends Error {
+  code: EmbeddingErrorCode;
+  constructor(code: EmbeddingErrorCode, message: string);
+}
+
 export interface NextTokenScoreOptions {
   /** Token ids to score, in the order the result lists them. */
   candidates?: ArrayLike<number>;
@@ -411,8 +430,10 @@ export class LlamaWebGpuBridge {
   stateSaveBytes(tokens?: number[] | ArrayLike<number>): Promise<Uint8Array>;
   stateLoadBytes(bytes: Uint8Array | ArrayBuffer | ArrayLike<number>, tokenCapacity?: number): Promise<StateLoadResult>;
 
-  embed(text: string, options?: EmbedOptions): Promise<number[]>;
-  embedBatch(texts: string[], options?: EmbedOptions): Promise<number[][]>;
+  getEmbeddingCapabilities(): Promise<EmbeddingCapabilities>;
+  /** A parts array produces one pooled vector. No template or task prefix is inserted. */
+  embed(input: EmbedInput, options?: EmbedOptions): Promise<number[]>;
+  embedBatch(inputs: EmbedInput[], options?: EmbedOptions): Promise<number[][]>;
   scoreNextToken(prompt: string, options?: NextTokenScoreOptions): Promise<NextTokenScores>;
 
   loadMultimodalProjector(url: string): Promise<unknown>;

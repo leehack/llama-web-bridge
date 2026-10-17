@@ -20,3 +20,4 @@ if (typeof window !== 'undefined') {
 }
 
 export { LlamaWebGpuBridge, enableBridgeWorkerHost };
+export { EmbeddingError } from './internal/embedding.ts';

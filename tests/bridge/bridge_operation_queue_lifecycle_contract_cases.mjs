@@ -185,6 +185,7 @@ export const LIFECYCLE_CONTRACT_CASES = [
         'stateSaveBytes',
         'stateLoadBytes',
         'detokenize',
+        'getEmbeddingCapabilities',
         'embed',
         'embedBatch',
         'scoreNextToken',

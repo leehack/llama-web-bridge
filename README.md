@@ -76,6 +76,25 @@ Optional outputs (when `WEBGPU_BRIDGE_BUILD_MEM64=1`):
 - `dist/llama_webgpu_core_mem64.js`
 - `dist/llama_webgpu_core_mem64.wasm`
 
+## Multimodal embeddings
+
+`embed(input)` and `embedBatch(inputs)` accept strings or ordered text/image/audio
+parts. Each parts array produces one pooled vector; strings retain their existing
+route and defaults. Use `getEmbeddingCapabilities()` after model/projector loading
+to check the active runtime. Media needs a compatible pooled embedding model,
+projector and mixed-batch upstream API; generation support does not imply embedding
+support. The current production source pin reports media embeddings unsupported.
+
+The parts path validates the whole expanded input against one physical microbatch
+and never chunks or averages separate parts. Direct and worker runtimes preserve
+part order and caller buffer ownership, expose typed failures and use the existing
+cancellation/serialization lifecycle. See [the API reference](docs/api.md#embeddings)
+and [local qualification commands](CONTRIBUTING.md#multimodal-embedding-qualification).
+This is unpublished experimental work: the supplied BF16 model fits memory64,
+but strict native CPU numerical parity remains unresolved. The
+[qualification record](docs/multimodal_embeddings.md) records the measured gaps;
+this change does not qualify a release or downstream pin adoption.
+
 ## State persistence
 
 The bridge exposes llama.cpp session/state persistence through both direct runtime
