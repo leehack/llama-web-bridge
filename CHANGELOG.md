@@ -16,6 +16,9 @@
 - Preserve worker recovery signals during embedding capability probing and core
   aborts, restore loaded projectors on fallback, marshal exact UTF-8 bytes, reject
   unsupported M-RoPE media, and retain legacy coercion/disposal behavior.
-- Preserve loaded embedding capacities during GPU-to-CPU worker recovery,
-  including native batch defaults; restore projectors only for media inputs,
-  lazily after string-only fallback, and identify embedding recovery in warnings.
+- Use the existing string-embedding model reload options and main-thread GPU
+  policy for every embedding fallback. Eagerly restore a remembered projector
+  best effort, including after string fallback; a failed restore warns and keeps
+  the model usable. Later media calls and capability probes retry once per call;
+  failed media calls return `EMBEDDING_PROJECTOR_MISSING` and probes report the
+  actual unavailable modalities. Generation fallback retains its existing policy.

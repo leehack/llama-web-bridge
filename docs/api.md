@@ -525,6 +525,18 @@ An absent, malformed or unknown capability protocol throws a typed
 `EmbeddingError` with `code: 'EMBEDDING_CAPABILITY_UNAVAILABLE'`; legacy string
 embeddings remain available through their existing route.
 
+After an unusable worker, embedding operations reload the model on the main
+thread with the same options and GPU policy as existing string embeddings.
+A remembered projector is restored eagerly for string, parts, batch and probe
+fallbacks. Restoration is best effort: failure logs a payload-free warning and
+keeps the model loaded and projector URL remembered. Capabilities report actual
+loaded support, so image/audio remain false after failure. Each subsequent media
+embedding or capability probe makes one further restoration attempt if the
+projector is still unloaded. A failed media attempt rejects with
+`EMBEDDING_PROJECTOR_MISSING`; strings and text-only parts remain usable without
+retrying the projector. An already loaded or explicitly unloaded projector is
+not retried. Cancellation and disposal retain their existing lifecycle errors.
+
 ### `embed(input, options?)`
 
 ```ts
