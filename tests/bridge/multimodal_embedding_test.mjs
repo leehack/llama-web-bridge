@@ -584,6 +584,63 @@ test('cancellation during a failing eager restore rejects as cancelled and keeps
   assert.ok(bridge._loadedMmProjUrl);
 });
 
+for (const method of ['embed', 'embedBatch']) {
+  test(`${method} direct cancellation during a failing projector restore keeps the model and sources`, async () => {
+    const { bridge, runtime, calls } = fixture();
+    const warnings = [];
+    runtime._mmProjPath = null;
+    bridge._loadedModelUrl = 'https://example.invalid/model.gguf';
+    bridge._loadedMmProjUrl = 'https://example.invalid/projector.gguf';
+    bridge._emitBridgeWarn = (message) => warnings.push(message);
+    runtime.dispose = async () => assert.fail('cancelled restore must not dispose the model');
+    let restores = 0;
+    runtime.loadMultimodalProjector = async (url) => {
+      restores++;
+      assert.equal(url, 'https://example.invalid/projector.gguf');
+      bridge.cancel();
+      throw new Error('projector fetch failed');
+    };
+
+    assert.equal(bridge._workerProxy, null);
+    await assert.rejects(bridge[method](method === 'embed' ? recoveryImage : [recoveryImage]), { name: 'AbortError' });
+    assert.equal(restores, 1);
+    assert.deepEqual(warnings, []);
+    assert.equal(runtime._modelBytes, 1);
+    assert.equal(runtime._mmProjPath, null);
+    assert.equal(bridge._loadedModelUrl, 'https://example.invalid/model.gguf');
+    assert.equal(bridge._loadedMmProjUrl, 'https://example.invalid/projector.gguf');
+    assert.ok(!calls.some(([name]) => name === 'stage' || name.includes('to_json')),
+      'cancelled restore must not stage media or run inference');
+  });
+
+  test(`${method} direct dispose during a failing projector restore rejects media before teardown`, async () => {
+    const { bridge, runtime, calls } = fixture();
+    runtime._mmProjPath = null;
+    bridge._loadedMmProjUrl = 'https://example.invalid/projector.gguf';
+    bridge._emitBridgeWarn = () => {};
+    let disposals = 0;
+    runtime.dispose = async () => { disposals++; };
+    let disposal;
+    let restores = 0;
+    runtime.loadMultimodalProjector = async () => {
+      restores++;
+      disposal = bridge.dispose();
+      assert.equal(disposals, 0, 'teardown must wait for the media operation');
+      throw new Error('projector fetch failed');
+    };
+
+    assert.equal(bridge._workerProxy, null);
+    await assert.rejects(bridge[method](method === 'embed' ? recoveryImage : [recoveryImage]),
+      { name: 'EmbeddingError', code: 'EMBEDDING_PROJECTOR_MISSING' });
+    assert.equal(restores, 1);
+    assert.ok(disposal instanceof Promise);
+    await disposal;
+    assert.equal(disposals, 1);
+    assert.equal(bridge._runtime, null);
+    assert.ok(!calls.some(([name]) => name === 'stage' || name.includes('to_json')));
+  });
+}
+
 test('embedding fallback reuses an already loaded direct model like main', async () => {
   const { bridge, runtime, loads, projectors } = recoveryFixture(
     Object.assign(new Error('ggml_webgpu: device error'), { llamadartWorkerCrash: true }));
