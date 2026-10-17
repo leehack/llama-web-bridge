@@ -1,7 +1,7 @@
 // Public bridge facade: picks the worker or direct runtime and owns the operation queue.
 
 import { createAbortError } from './internal/abort.ts';
-import { EmbeddingError, embeddingCapabilitiesFrom, missingEmbeddingCapability, snapshotEmbedInput } from './internal/embedding.ts';
+import { embeddingAssetVersion, embeddingCapabilitiesFrom, missingEmbeddingCapability, snapshotEmbedInput } from './internal/embedding.ts';
 import { NO_COMPLETION_CAPABILITIES, resolveCompletionSamplingOptions } from './internal/completion_options.ts';
 import { BRIDGE_DISPOSED_MESSAGE, INVALID_GRAMMAR_ERROR_TEXT } from './internal/constants.ts';
 import {
@@ -132,6 +132,7 @@ interface WorkerFallbackOptions {
   signal?: AbortSignal | null;
   _llamadartForceRuntimeReload?: boolean;
   _llamadartTextToSpeech?: boolean;
+  _llamadartEnsureProjector?: boolean;
 }
 
 // A worker token event's payload: text, or bytes when a piece splits UTF-8.
@@ -1213,7 +1214,7 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
     const textToSpeechRequested = options?._llamadartTextToSpeech === true;
     const multimodalRuntimeRequired = mediaPartsRequested || textToSpeechRequested;
     const shouldEnsureMultimodalInRuntime =
-      multimodalRuntimeRequired
+      (multimodalRuntimeRequired || options?._llamadartEnsureProjector === true)
       && typeof this._loadedMmProjUrl === 'string'
       && this._loadedMmProjUrl.length > 0;
     const workerTimedOut = this._isWorkerTimeoutError(fallbackError);
@@ -3167,18 +3168,34 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
   }
 
   async getEmbeddingCapabilities(): Promise<EmbeddingCapabilities> {
-    return this._runExclusive(() => this._getEmbeddingCapabilitiesUnlocked(), { kind: 'embedding-capabilities' });
+    return this._runExclusive(async () => {
+      try {
+        return await this._getEmbeddingCapabilitiesUnlocked();
+      } catch (error) {
+        this._throwIfOperationCancelled(error, 'Embedding capability probe was cancelled.');
+        if (!this._workerProxy || !this._isWorkerUnusableError(error)) throw error;
+        this._disableWorkerFallback(error);
+        await this._waitForWorkerDisposal();
+        await this._ensureRuntimeReadyAfterWorkerFallback({ _llamadartEnsureProjector: true }, error);
+        return this._runtime!.getEmbeddingCapabilities();
+      }
+    }, { kind: 'embedding-capabilities' });
   }
 
   async _getEmbeddingCapabilitiesUnlocked(): Promise<EmbeddingCapabilities> {
     if (!this._workerProxy) return this._runtime!.getEmbeddingCapabilities();
     try {
       await this._restoreWorkerModelIfMissing();
-      return embeddingCapabilitiesFrom(await this._callWorker('getEmbeddingCapabilities', []));
+      return embeddingCapabilitiesFrom(await this._callWorker('getEmbeddingCapabilities', []),
+        embeddingAssetVersion(this._config.workerUrl));
     } catch (error) {
       this._throwIfOperationCancelled(error, 'Embedding capability probe was cancelled.');
-      if (error instanceof EmbeddingError) throw error;
-      throw missingEmbeddingCapability();
+      // Older worker hosts dispatch an absent method through bridge[method].
+      // Only that specific missing-method signal means an old capability API.
+      if (error instanceof Error && /bridge\[method\] is not a function/.test(error.message)) {
+        throw missingEmbeddingCapability(embeddingAssetVersion(this._config.workerUrl));
+      }
+      throw error;
     }
   }
 
@@ -3206,14 +3223,13 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
       }
       this._disableWorkerFallback(error);
       await this._waitForWorkerDisposal();
-      await this._ensureRuntimeReadyAfterWorkerFallback({}, error);
+      await this._ensureRuntimeReadyAfterWorkerFallback({ _llamadartEnsureProjector: true, parts: Array.isArray(text) ? text : [] }, error);
       return this._runtime!.embed(text, options);
     }
   }
 
   async embedBatch(texts: EmbedInput[], options: EmbedOptions = {}) {
     const inputs = Array.from(texts || [], (input) => typeof input === 'string' ? input : snapshotEmbedInput(input));
-    if (inputs.length === 0) return [];
     return this._runExclusive(
       () => this._embedBatchUnlocked(inputs, options),
       { kind: 'embedding-batch' },
@@ -3239,7 +3255,7 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
       }
       this._disableWorkerFallback(error);
       await this._waitForWorkerDisposal();
-      await this._ensureRuntimeReadyAfterWorkerFallback({}, error);
+      await this._ensureRuntimeReadyAfterWorkerFallback({ _llamadartEnsureProjector: true, parts: normalized.flatMap((input) => Array.isArray(input) ? input : []) }, error);
       return this._runtime!.embedBatch(normalized, options);
     }
   }

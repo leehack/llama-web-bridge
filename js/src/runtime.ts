@@ -33,7 +33,7 @@ import { isCrossOriginIsolatedRuntime, isSafariUserAgent } from './internal/envi
 import { decodeImageBytesToRgb } from './internal/image.ts';
 import {
   EmbeddingError, EMPTY_EMBEDDING_CAPABILITIES, EMBEDDING_MEDIA_MARKER,
-  embeddingCapabilitiesFrom, embeddingCoreError, missingEmbeddingCapability,
+  embeddingAssetVersion, embeddingCapabilitiesFrom, embeddingCoreError, missingEmbeddingCapability,
   requireEmbeddingModalities, snapshotEmbedInput,
 } from './internal/embedding.ts';
 import { logLevelForName, logThresholdForConfiguredLevel } from './internal/logging.ts';
@@ -4174,14 +4174,20 @@ export class LlamaWebGpuBridgeRuntime {
     return this._core!.ccall('llamadart_webgpu_last_detokenized', 'string', [], []) || '';
   }
 
+  _embeddingAssetVersion() {
+    return embeddingAssetVersion(this._coreVariant === 'wasm64'
+      ? this._config.coreModuleUrlMem64 : this._config.coreModuleUrl);
+  }
+
   async getEmbeddingCapabilities(): Promise<EmbeddingCapabilities> {
     if (this._modelBytes <= 0) return { ...EMPTY_EMBEDDING_CAPABILITIES };
     if (typeof this._core?._llamadart_webgpu_embedding_capabilities_json !== 'function'
       || typeof this._core?._llamadart_webgpu_embed_parts_to_json !== 'function') {
-      throw missingEmbeddingCapability();
+      throw missingEmbeddingCapability(this._embeddingAssetVersion());
     }
     return embeddingCapabilitiesFrom(
       this._core.ccall('llamadart_webgpu_embedding_capabilities_json', 'string', [], []),
+      this._embeddingAssetVersion(),
     );
   }
 
@@ -4193,18 +4199,20 @@ export class LlamaWebGpuBridgeRuntime {
 
   async _embedParts(parts: Exclude<EmbedInput, string>, options: EmbedOptions) {
     const prompt = parts.map((part) => part.type === 'text' ? part.text : EMBEDDING_MEDIA_MARKER).join('');
+    const promptBytes = textEncoder.encode(prompt);
     const media = parts.filter((part) => part.type !== 'text');
     try {
       await this._stageMultimodalParts(media);
       if (this._abortRequested) throw createAbortError('Embedding was cancelled.');
       const rc = Number(await this._core!.ccall('llamadart_webgpu_embed_parts_to_json', 'number',
-        ['string', 'number', 'number'], [prompt, options?.normalize !== false ? 1 : 0, textEncoder.encode(prompt).length], { async: true }));
+        ['array', 'number', 'number'], [promptBytes, options?.normalize !== false ? 1 : 0, promptBytes.length], { async: true }));
       if (this._abortRequested) throw createAbortError('Embedding was cancelled.');
-      if (rc < 0) throw embeddingCoreError(rc);
+      if (rc < 0) throw embeddingCoreError(rc, this._embeddingAssetVersion());
       const raw = this._core!.ccall('llamadart_webgpu_last_embedding_json', 'string', [], []) || '[]';
       const parsed = JSON.parse(raw);
       return Array.isArray(parsed) ? parsed.map((v) => Number.isFinite(Number(v)) ? Number(v) : 0) : [];
     } catch (error) {
+      if (error instanceof WebAssembly.RuntimeError) throw error;
       if (error instanceof EmbeddingError || (error as Error)?.name === 'AbortError') throw error;
       // Decoders/fetchers can include URLs or paths; never expose those here.
       throw new EmbeddingError('EMBEDDING_FAILED', 'Embedding media preparation or execution failed.');
@@ -4214,7 +4222,7 @@ export class LlamaWebGpuBridgeRuntime {
   }
 
   async embed(text: EmbedInput, options: EmbedOptions = {}) {
-    if (typeof text !== 'string') {
+    if (Array.isArray(text)) {
       const parts = snapshotEmbedInput(text) as Exclude<EmbedInput, string>;
       this._abortRequested = false;
       await this._preflightEmbeddingInputs([parts]);

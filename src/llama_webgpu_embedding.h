@@ -66,8 +66,9 @@ inline int embed_text_parts(llama_context * ctx, llama_model * model,
 }
 
 #if LLAMADART_WEBGPU_HAS_MIXED_EMBEDDINGS
-inline bool supports_mixed_embeddings(llama_context * ctx, llama_model * model) {
+inline bool supports_mixed_embeddings(llama_context * ctx, llama_model * model, mtmd_context * projector) {
   return supports_pooled_embeddings(ctx, model) &&
+      projector && !mtmd_decode_use_mrope(projector) &&
       !llama_model_has_encoder(model) &&
       llama_pooling_type(ctx) == LLAMA_POOLING_TYPE_MEAN &&
       !llama_get_causal_attn(ctx);
@@ -76,7 +77,7 @@ inline bool supports_mixed_embeddings(llama_context * ctx, llama_model * model) 
 inline int embed_mixed_parts(llama_context * ctx, llama_model * model,
     mtmd_context * projector, const std::string & prompt,
     const std::vector<const mtmd_bitmap *> & bitmaps, std::vector<float> & output) {
-  if (!supports_mixed_embeddings(ctx, model)) return -21;
+  if (!supports_mixed_embeddings(ctx, model, projector)) return -21;
   for (const auto * bitmap : bitmaps) {
     if ((mtmd_bitmap_is_audio(bitmap) &&
           (!mtmd_support_audio(projector) || mtmd_get_audio_sample_rate(projector) != 16000)) ||
@@ -101,7 +102,6 @@ inline int embed_mixed_parts(llama_context * ctx, llama_model * model,
   std::unique_ptr<llama_batch_ext, decltype(&llama_batch_ext_free)>
       batch(llama_batch_ext_init(ctx), llama_batch_ext_free);
   if (!batch) return -25;
-  std::vector<std::vector<float>> encoded_media;
   llama_pos position = 0;
   const auto append = [&](const llama_token * tokens, const float * embeddings, size_t n) {
     for (size_t i = 0; i < n; ++i, ++position) {
@@ -123,9 +123,8 @@ inline int embed_mixed_parts(llama_context * ctx, llama_model * model,
       if (mtmd_encode_chunk(projector, chunk) != 0) return -25;
       const float * encoded = mtmd_get_output_embd(projector);
       if (!encoded || n > SIZE_MAX / size_t(width)) return -25;
-      // mtmd reuses this buffer on every encode; keep each chunk alive until process settles.
-      encoded_media.emplace_back(encoded, encoded + n * size_t(width));
-      if (!append(nullptr, encoded_media.back().data(), n)) return -25;
+      // add_embd copies each row before the next mtmd encode reuses its buffer.
+      if (!append(nullptr, encoded, n)) return -25;
     }
   }
   embedding_scope scope(ctx);

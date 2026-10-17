@@ -90,10 +90,12 @@ and never chunks or averages separate parts. Direct and worker runtimes preserve
 part order and caller buffer ownership, expose typed failures and use the existing
 cancellation/serialization lifecycle. See [the API reference](docs/api.md#embeddings)
 and [local qualification commands](CONTRIBUTING.md#multimodal-embedding-qualification).
-This is unpublished experimental work: the supplied BF16 model fits memory64,
-but strict native CPU numerical parity remains unresolved. The
-[qualification record](docs/multimodal_embeddings.md) records the measured gaps;
-this change does not qualify a release or downstream pin adoption.
+The supplied BF16 model passes local CPU wasm memory64 qualification against
+native CPU: cosine >= 0.9998 and relative L2 < 2% per input, exact direct/worker
+parity, and exact pre-task string-path parity. Max-absolute differences remain
+informational in the [qualification record](docs/multimodal_embeddings.md).
+WebGPU GPU-kernel qualification was not run. Asset publication and downstream
+pin adoption remain separate.
 
 ## State persistence
 

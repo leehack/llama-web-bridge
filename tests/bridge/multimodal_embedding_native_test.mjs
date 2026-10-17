@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
@@ -8,7 +8,10 @@ import { repoRoot } from './bridge_js_source.mjs';
 
 // A deterministic implementation of the upstream API, not a reimplementation of
 // the bridge algorithm. Its output is inspected only when llama_process runs.
-// In particular add_embd keeps pointers, and encode reuses the same buffer.
+// add_embd copies each row, and encode reuses the same buffer, as upstream does.
+const contextExports = readFileSync(path.join(repoRoot, 'src/core/exports_context.inc'), 'utf8');
+const legacyEmbed = contextExports.slice(contextExports.indexOf('EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_embed_to_json('),
+  contextExports.indexOf('EMSCRIPTEN_KEEPALIVE const char * llamadart_webgpu_last_embedding_json()'));
 const source = String.raw`
 #include <cassert>
 #include <cstdint>
@@ -21,13 +24,13 @@ enum llama_process_type { LLAMA_PROCESS_TYPE_ENCODE, LLAMA_PROCESS_TYPE_DECODE }
 struct llama_context { unsigned ctx=16, seq=16, batch=16, ubatch=16, seqmax=1; int pool=1; bool causal=false, extraction=false; };
 struct llama_model { bool encoder=false, decoder=true; int out=3, inp=2; };
 struct llama_vocab {};
-struct mtmd_context { bool vision=true, audio=true; int rate=16000; };
+struct mtmd_context { bool vision=true, audio=true; int rate=16000, positions=1; };
 struct mtmd_bitmap { bool audio=false; };
 struct mtmd_input_chunk { int type; std::vector<int> tokens; size_t n; float value; };
 struct mtmd_input_chunks { std::vector<mtmd_input_chunk> chunks; };
 struct mtmd_input_text { const char * text; size_t length; bool special, parse; };
 struct llama_embd { const float * data; size_t n_rows, n_embd; };
-struct entry { int token; const float * data; int position=-1; bool output=false; };
+struct entry { int token; std::vector<float> data; int position=-1; bool output=false; };
 struct llama_batch_ext { std::vector<entry> entries; };
 struct llama_batch { int n_tokens; int * token; int * pos; int * n_seq_id; int ** seq_id; char * logits; };
 constexpr int MTMD_INPUT_CHUNK_TYPE_TEXT = 0;
@@ -40,11 +43,12 @@ int llama_model_n_embd_out(llama_model * m) { return m->out; }
 int llama_model_n_embd_inp(llama_model * m) { return m->inp; }
 bool llama_model_has_encoder(llama_model * m) { return m->encoder; }
 bool llama_model_has_decoder(llama_model * m) { return m->decoder; }
-int llama_pooling_type(llama_context * c) { return c->pool; }
+enum llama_pooling_type llama_pooling_type(llama_context * c) { return static_cast<enum llama_pooling_type>(c->pool); }
 bool llama_get_causal_attn(llama_context * c) { return c->causal; }
 bool mtmd_bitmap_is_audio(const mtmd_bitmap * b) { return b->audio; }
 bool mtmd_support_audio(mtmd_context * p) { return p->audio; }
 bool mtmd_support_vision(mtmd_context * p) { return p->vision; }
+bool mtmd_decode_use_mrope(mtmd_context * p) { return p->positions > 1; }
 int mtmd_get_audio_sample_rate(mtmd_context * p) { return p->rate; }
 mtmd_input_chunks * mtmd_input_chunks_init() { if(fail==1) return nullptr; ++live_chunks; return new mtmd_input_chunks; }
 void mtmd_input_chunks_free(mtmd_input_chunks * c) { --live_chunks; delete c; }
@@ -73,8 +77,8 @@ unsigned llama_n_ubatch(llama_context * c) { return c->ubatch; }
 unsigned llama_n_seq_max(llama_context * c) { return c->seqmax; }
 llama_batch_ext * llama_batch_ext_init(llama_context *) { if(fail==8) return nullptr; ++live_batches; return new llama_batch_ext; }
 void llama_batch_ext_free(llama_batch_ext * b) { --live_batches; delete b; }
-int llama_batch_ext_add_token(llama_batch_ext * b,int seq,int token) { assert(seq==0); if(fail==9) return -1; b->entries.push_back({token,nullptr}); return b->entries.size()-1; }
-int llama_batch_ext_add_embd(llama_batch_ext * b,int seq,llama_embd e) { assert(seq==0 && e.n_rows==1 && e.n_embd==2); if(fail==10) return -1; b->entries.push_back({-1,e.data}); return b->entries.size()-1; }
+int llama_batch_ext_add_token(llama_batch_ext * b,int seq,int token) { assert(seq==0); if(fail==9) return -1; b->entries.push_back({token,{}}); return b->entries.size()-1; }
+int llama_batch_ext_add_embd(llama_batch_ext * b,int seq,llama_embd e) { assert(seq==0 && e.n_rows==1 && e.n_embd==2); if(fail==10) return -1; b->entries.push_back({-1,std::vector<float>(e.data,e.data+e.n_embd)}); return b->entries.size()-1; }
 bool llama_batch_ext_set_pos(llama_batch_ext * b,int i,const int * p) { b->entries.at(i).position=*p; return fail!=11; }
 bool llama_batch_ext_set_output_embd(llama_batch_ext * b,int i,bool output) { b->entries.at(i).output=output; return fail!=12; }
 void llama_synchronize(llama_context *) {}
@@ -90,7 +94,7 @@ int llama_process(llama_context * c,llama_process_type type,llama_batch_ext * b)
   if(fail==15) g_cancel_requested=true;
   return (fail==13 || fail==15)?1:0;
 }
-const float * llama_get_embeddings_seq(llama_context *,int seq) { assert(seq==0); return fail==14?nullptr:pooled; }
+float * llama_get_embeddings_seq(llama_context *,int seq) { assert(seq==0); return fail==14?nullptr:pooled; }
 llama_batch llama_batch_init(int n,int embd,int sequences) {
   assert(n>0 && embd==0 && sequences==1); ++live_batches;
   llama_batch b{n,new int[n],new int[n],new int[n],new int*[n],new char[n]};
@@ -103,7 +107,7 @@ void llama_batch_free(llama_batch b) {
   delete[] b.token; delete[] b.pos; delete[] b.n_seq_id; delete[] b.seq_id; delete[] b.logits; --live_batches;
 }
 int llama_decode(llama_context * c,llama_batch b) {
-  ++processed; assert(c->extraction);
+  ++processed; assert(c->extraction && !g_cancel_requested);
   assert(b.n_tokens==2 && b.token[0]==7 && b.token[1]==8);
   for(int i=0;i<b.n_tokens;++i) assert(b.pos[i]==i && b.logits[i]==1 && b.n_seq_id[i]==1 && b.seq_id[i][0]==0);
   if(fail==15) g_cancel_requested=true;
@@ -131,9 +135,19 @@ void normalize_embedding_inplace(std::vector<float> &) { ++normalized; }
 namespace llamadart_webgpu_detail { std::string serialize_embedding_json(const std::vector<float> &) { return "[1,2,3]"; } }
 #define EMSCRIPTEN_KEEPALIVE
 #include "src/core/exports_embedding.inc"
+int llama_model_n_embd(llama_model * m) { return m->out; }
+void set_error(const char *) {}
+bool tokenize_text(const std::string &,bool,std::vector<int> & out) { out={7,8}; return true; }
+float * llama_get_embeddings_ith(llama_context *,int) { return pooled; }
+float * llama_get_embeddings(llama_context *) { return pooled; }
+${legacyEmbed}
 int main() {
   llama_context c; llama_model m; mtmd_context p; mtmd_bitmap image, audio{true}; std::vector<float> out;
   int checks=0;
+  g_state={&c,&m,&p};
+  g_cancel_requested=true; // prior request cancelled in JS staging
+  assert(llamadart_webgpu_embed_to_json("fresh",0)==3 && !g_cancel_requested);
+  ++checks;
   const auto run=[&](int expected,bool media=true) {
     encoded=processed=0; out.clear();
     assert(embed_parts(&c,&m,&p,"x",media?std::vector<const mtmd_bitmap *>{&image,&audio}:std::vector<const mtmd_bitmap *>{},out)==expected);
@@ -162,6 +176,14 @@ int main() {
   run(3); assert(processed==1); // recovery after every failed path
   g_state={&c,&m,&p};
   assert(std::string(llamadart_webgpu_embedding_capabilities_json())=="{\"apiVersion\":1,\"text\":true,\"image\":true,\"audio\":true}");
+  p.audio=false;
+  assert(std::string(llamadart_webgpu_embedding_capabilities_json())=="{\"apiVersion\":1,\"text\":true,\"image\":true,\"audio\":false}"); ++checks;
+  p.audio=true; p.rate=48000;
+  assert(std::string(llamadart_webgpu_embedding_capabilities_json())=="{\"apiVersion\":1,\"text\":true,\"image\":true,\"audio\":false}"); ++checks;
+  p.rate=16000;
+  p.positions=4;
+  assert(std::string(llamadart_webgpu_embedding_capabilities_json())=="{\"apiVersion\":1,\"text\":true,\"image\":false,\"audio\":false}");
+  run(-21); assert(encoded==0 && processed==0); p.positions=1;
   g_state.mm_ctx=nullptr;
   assert(std::string(llamadart_webgpu_embedding_capabilities_json())=="{\"apiVersion\":1,\"text\":true,\"image\":false,\"audio\":false}");
   g_state.mm_ctx=&p;
@@ -183,7 +205,7 @@ int main() {
 }
 `;
 
-test('mixed native batch guards, retained media, output width, one process and cleanup', () => {
+test('mixed native batch guards, copied media, output width, one process and cleanup', () => {
   const dir = mkdtempSync(path.join(tmpdir(), 'embedding-native-'));
   try {
     writeFileSync(path.join(dir, 'llama.h'), '');
@@ -192,7 +214,7 @@ test('mixed native batch guards, retained media, output width, one process and c
     execFileSync(process.env.CXX || 'c++', ['-std=c++17', '-I', dir, '-I', repoRoot,
       path.join(dir, 'test.cpp'), '-o', path.join(dir, 'test')]);
     const output = execFileSync(path.join(dir, 'test'), { encoding: 'utf8' });
-    assert.match(output, /55 native cases passed/);
+    assert.match(output, /59 native cases passed/);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

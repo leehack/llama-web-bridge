@@ -7,6 +7,22 @@ import {
   resolvePinnedFile, runMain, runPollingPlaywright, withServer, withTempDir,
 } from './support.mjs';
 
+export function embeddingComparison(actual, reference) {
+  if (actual.length !== reference.length || actual.length === 0
+    || !actual.every(Number.isFinite) || !reference.every(Number.isFinite)) {
+    throw new Error('Invalid embedding comparison vectors');
+  }
+  let dot = 0, actual2 = 0, reference2 = 0, error2 = 0, maxAbs = 0;
+  for (let i = 0; i < actual.length; i++) {
+    dot += actual[i] * reference[i]; actual2 += actual[i] ** 2; reference2 += reference[i] ** 2;
+    error2 += (actual[i] - reference[i]) ** 2;
+    maxAbs = Math.max(maxAbs, Math.abs(actual[i] - reference[i]));
+  }
+  const cosine = dot / Math.sqrt(actual2 * reference2);
+  const relativeL2 = Math.sqrt(error2 / reference2);
+  return { cosine, relativeL2, maxAbs, pass: cosine >= 0.9998 && relativeL2 < 0.02 };
+}
+
 export function renderHarness(memoryMode) {
   return `<!doctype html><meta charset="utf-8"><pre id="result">pending</pre><script type="module">
 const finish = (payload) => { window.__smokeResult = payload; document.querySelector('pre').textContent = JSON.stringify(payload); };
@@ -17,11 +33,13 @@ const expectCode = async (operation, code) => {
   try { await operation(); } catch (error) { check(error.code === code, 'wrong embedding error code: '+error.code); return; }
   throw new Error('expected '+code);
 };
+const compare = ${embeddingComparison.toString()};
 const modeResults = [];
 try {
   check(crossOriginIsolated, 'cross-origin isolation required');
   const { LlamaWebGpuBridge } = await import('/llama_webgpu_bridge.js');
   const reference = await (await fetch('/reference.json')).json();
+  const baseline = await (await fetch('/baseline.json')).json();
   const pixels = new Uint8Array(224*224*3);
   const black = { type: 'image', width: 224, height: 224, bytes: pixels.slice() };
   for(let i=0;i<pixels.length;++i) pixels[i] = ((Math.floor(i/3/224/16)+Math.floor((Math.floor(i/3)%224)/16))%2)?255:0;
@@ -37,8 +55,8 @@ try {
     const mode = disableWorker?'direct':'worker';
     const bridge = new LlamaWebGpuBridge({disableWorker, logLevel:1, preferMemory64:${memoryMode === 'wasm64'},
       ${memoryMode === 'wasm64' ? "coreModuleUrlMem64:'/llama_webgpu_core_mem64.js'," : ''}});
-    const vectors = {}, differences = {};
-    const row = {mode,vectors,differences};
+    const vectors = {}, differences = {}, comparisons = {};
+    const row = {mode,vectors,differences,comparisons};
     modeResults.push(row);
     try {
       stage(mode+' model load');
@@ -58,11 +76,9 @@ try {
         const vector=await bridge.embed(input);
         check(vector.length===768 && vector.every(Number.isFinite),'finite full pooled output');
         check(Math.abs(vector.reduce((s,v)=>s+v*v,0)-1)<1e-5,'unit L2 norm');
-        const difference=delta(vector,reference[name].normalized);
-        // WASM SIMD and native scalar CPU reductions are different. These are
-        // component-wise absolute tolerances, not retrieval-quality claims.
-        if (difference >= (name==='text'?1e-5:2e-4)) parityFailures.push(mode+' native parity '+name+' delta '+difference);
-        vectors[name]=vector; differences[name]=difference;
+        const comparison=compare(vector,reference[name].normalized);
+        if (!comparison.pass) parityFailures.push(mode+' native parity '+name+' '+JSON.stringify(comparison));
+        vectors[name]=vector; differences[name]=comparison.maxAbs; comparisons[name]=comparison;
       }
       check(delta(vectors.black,vectors.checker)>1e-4,'image content sensitivity');
       check(delta(vectors.silence,vectors.tone)>1e-4,'audio content sensitivity');
@@ -71,14 +87,20 @@ try {
       row.rawVectors={black:raw};
       const rawDelta=delta(raw,reference.black.raw);
       row.rawDelta=rawDelta;
-      if(rawDelta>=2e-3) parityFailures.push(mode+' raw media parity '+rawDelta);
+      row.rawComparison=compare(raw,reference.black.raw);
+      if(!row.rawComparison.pass) parityFailures.push(mode+' raw media parity');
       const adjacent=await bridge.embed([{type:'text',text:'task: search result | title: Paris | text: '},{type:'text',text:''},{type:'text',text:'The Eiffel Tower is in Paris.'}]);
       check(delta(adjacent,vectors.text)<1e-6,'adjacent text equivalence');
       const textRaw=await bridge.embed(text,{normalize:false});
       row.rawVectors.text=textRaw;
       const textRawDelta=delta(textRaw,reference.text.raw);
       row.textRawDelta=textRawDelta;
-      if(textRawDelta>=1e-4) parityFailures.push(mode+' raw text parity '+textRawDelta);
+      row.textRawComparison=compare(textRaw,reference.text.raw);
+      if(!row.textRawComparison.pass) parityFailures.push(mode+' raw text parity');
+      const old=baseline.rows.find(row=>row.mode===mode);
+      check(!!old,'pre-task baseline runtime missing');
+      row.stringBaseline={normalized:delta(vectors.text,old.vector),raw:delta(textRaw,old.raw)};
+      check(row.stringBaseline.normalized===0 && row.stringBaseline.raw===0,'pre-task string-path parity');
       const batch=await bridge.embedBatch([inputs.black,text]);
       check(delta(batch[0],vectors.black)<1e-6 && delta(batch[1],vectors.text)<1e-6,'batch order and text reuse');
       check(black.bytes.byteLength===224*224*3 && tone.samples.byteLength===64000,'caller buffers detached');
@@ -108,8 +130,18 @@ try {
     } finally { await bridge.dispose(); }
   }
   const directWorker={};
-  for(const name of Object.keys(inputs)) { directWorker[name]=delta(modeResults[0].vectors[name],modeResults[1].vectors[name]); check(directWorker[name]<1e-6,'direct/worker parity'); }
-  finish({ok:parityFailures.length===0,parityFailures,memoryMode:${JSON.stringify(memoryMode)},modeResults,directWorker});
+  for(const name of Object.keys(inputs)) { directWorker[name]=delta(modeResults[0].vectors[name],modeResults[1].vectors[name]); check(directWorker[name]===0,'exact direct/worker parity'); }
+  const directWorkerRaw={};
+  for(const name of ['black','text']) { directWorkerRaw[name]=delta(modeResults[0].rawVectors[name],modeResults[1].rawVectors[name]); check(directWorkerRaw[name]===0,'exact raw direct/worker parity'); }
+  const crossInputCosines=[];
+  const names=Object.keys(inputs);
+  for(let i=0;i<names.length;i++) for(let j=i+1;j<names.length;j++) {
+    const [a,b]=[names[i],names[j]];
+    const native=compare(reference[a].normalized,reference[b].normalized).cosine;
+    const bridge=compare(modeResults[0].vectors[a],modeResults[0].vectors[b]).cosine;
+    crossInputCosines.push({a,b,native,bridge,difference:Math.abs(native-bridge)});
+  }
+  finish({ok:parityFailures.length===0,parityFailures,memoryMode:${JSON.stringify(memoryMode)},modeResults,directWorker,directWorkerRaw,crossInputCosines});
 } catch(error) { finish({ok:false,stage:window.__smokeStage,error:String(error?.message||error),modeResults}); }
 </script>`;
 }
@@ -121,12 +153,13 @@ export async function main(argv = process.argv.slice(2)) {
     {flag:'--model-sha256',type:'string',default:()=>''},
     {flag:'--mmproj-path',type:'path',default:()=>null},
     {flag:'--mmproj-sha256',type:'string',default:()=>''},
+    {flag:'--baseline-path',type:'path',default:()=>null},
     {flag:'--reference-path',type:'path',default:()=>null},
     {flag:'--memory-mode',type:'string',default:()=> 'wasm64',choices:['wasm32','wasm64']},
     {flag:'--artifacts-dir',type:'path',default:()=>null},
     {flag:'--timeout-ms',type:'int',default:()=>1800000},
   ]});
-  ensure(args.modelPath && args.mmprojPath && args.referencePath && args.artifactsDir, 'Local model, projector, reference and artifacts paths are required.');
+  ensure(args.modelPath && args.mmprojPath && args.referencePath && args.baselinePath && args.artifactsDir, 'Local model, projector, reference, baseline and artifacts paths are required.');
   const pinned = async (filePath, expectedSha256, label) => resolvePinnedFile({filePath,expectedSha256,label,cacheDir:args.artifactsDir,url:null});
   const model=await pinned(args.modelPath,args.modelSha256,'embedding model');
   const projector=await pinned(args.mmprojPath,args.mmprojSha256,'embedding projector');
@@ -137,6 +170,7 @@ export async function main(argv = process.argv.slice(2)) {
     await fsp.symlink(model,path.join(root,'model.gguf'));
     await fsp.symlink(projector,path.join(root,'projector.gguf'));
     await fsp.copyFile(args.referencePath,path.join(root,'reference.json'));
+    await fsp.copyFile(args.baselinePath,path.join(root,'baseline.json'));
     await fsp.writeFile(path.join(root,'index.html'),renderHarness(args.memoryMode));
     return withServer(root,(url)=>runPollingPlaywright(url,args.timeoutMs,args.artifactsDir,{
       artifactPrefix:'multimodal-embeddings',stageMarker:'EMBEDDING_STAGE',stagePrefix:'embedding',

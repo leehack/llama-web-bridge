@@ -196,11 +196,17 @@ node scripts/smoke/multimodal_embeddings.mjs \
   --mmproj-path ~/llamadart-qa-models/embeddinggemma-2/gguf/mmproj-embeddinggemma-2-BF16.gguf \
   --mmproj-sha256 "$EMBEDDING_PROJECTOR_SHA256" \
   --reference-path "$TMPDIR/embedding-reference.json" \
+  --baseline-path "$TMPDIR/baseline-text/baseline-text-result.json" \
   --memory-mode wasm64 --artifacts-dir "$TMPDIR/embedding-browser"
 ```
 
-The native commands above target macOS CPU. The qualification record also
-retains CPU precision controls and any failed numerical parity checks. The browser smoke checks both
+The native commands above target macOS CPU. The qualification record includes
+CPU precision controls and numerical comparisons. Pass criteria are cosine >=
+0.9998 and relative L2 < 2% per input against native CPU, exact direct/worker
+parity, and exact legacy string parity with pre-task baseline vectors. Set
+`--baseline-path` to the saved pre-task direct/worker JSON. Max-absolute
+differences are informational. WebGPU GPU-kernel qualification was not run.
+The browser smoke checks both
 direct and worker paths, exact runtime selection, 768-wide raw/normalized
 outputs, synthetic media sensitivity, interleaving, batch order, adjacent text,
 overflow, projector unload/reload, cancellation and text reuse. It does not

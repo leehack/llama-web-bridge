@@ -50,7 +50,7 @@ test('parts form one ordered vector with verbatim adjacent text and no prompt de
   assert.deepEqual(await bridge.embed(parts, { normalize: false }), [0.6, 0.8]);
   assert.deepEqual(calls.find(([n]) => n === 'stage')[1], [image, audio]);
   assert.deepEqual(calls.find(([n]) => n === 'llamadart_webgpu_embed_parts_to_json'),
-    ['llamadart_webgpu_embed_parts_to_json', ' a\n雪<__media__> z <__media__>', 0,
+    ['llamadart_webgpu_embed_parts_to_json', new TextEncoder().encode(' a\n雪<__media__> z <__media__>'), 0,
       new TextEncoder().encode(' a\n雪<__media__> z <__media__>').length]);
   assert.equal(calls.at(-1)[0], 'clear');
 });
@@ -154,7 +154,7 @@ test('parts preserve embedded NUL and UTF-8 byte length across the core boundary
   const { bridge, calls } = fixture();
   await bridge.embed([{type:'text',text:'a\0雪'}]);
   assert.deepEqual(calls.find(([name])=>name==='llamadart_webgpu_embed_parts_to_json'),
-    ['llamadart_webgpu_embed_parts_to_json', 'a\0雪', 1, 5]);
+    ['llamadart_webgpu_embed_parts_to_json', new TextEncoder().encode('a\0雪'), 1, 5]);
 });
 
 test('malformed capability payloads reject every unknown protocol shape', async () => {
@@ -263,7 +263,7 @@ test('old worker capability protocol fails closed without sending parts or retir
   const { bridge } = fixture();
   bridge._restoreWorkerModelIfMissing = async () => {};
   const methods = [];
-  bridge._workerProxy = { async call(method) { methods.push(method); throw new Error('unknown method'); } };
+  bridge._workerProxy = { async call(method) { methods.push(method); throw new TypeError('bridge[method] is not a function'); } };
   await assert.rejects(bridge.embed([{ type: 'text', text: 'x' }]), { code: 'EMBEDDING_CAPABILITY_UNAVAILABLE' });
   assert.deepEqual(methods, ['getEmbeddingCapabilities']);
   assert.ok(bridge._workerProxy);
@@ -298,3 +298,149 @@ test('capabilities are re-probed across projector unload/reload', async () => {
   runtime._mmProjPath = '/projector'; caps.image = caps.audio = true;
   assert.equal((await bridge.getEmbeddingCapabilities()).image, true);
 });
+
+
+for (const method of ['embed', 'embedBatch', 'getEmbeddingCapabilities']) {
+  for (const failure of ['crash', 'timeout', 'core abort']) {
+    test(`${method} recovers a worker ${failure} during capability probing and reloads its projector`, async () => {
+      const {bridge,runtime}=fixture();
+      runtime._mmProjPath=null;
+      runtime.supportsVision=()=>!!runtime._mmProjPath;
+      runtime.supportsAudio=()=>!!runtime._mmProjPath;
+      let loads=0;
+      runtime.loadMultimodalProjector=async()=>{ loads++; runtime._mmProjPath='/reloaded'; };
+      bridge._loadedMmProjUrl='https://example.invalid/projector.gguf';
+      bridge._restoreWorkerModelIfMissing=async()=>{};
+      bridge._ensureRuntimeDraftModel=async()=>{};
+      bridge._restoreLoraAdapters=async()=>{};
+      bridge._disableWorkerFallback=()=>{bridge._workerProxy=null;};
+      bridge._waitForWorkerDisposal=async()=>{};
+      const error=failure==='core abort'?new WebAssembly.RuntimeError('Aborted()'):new Error('worker '+failure);
+      if(failure==='crash') error.llamadartWorkerCrash=true;
+      if(failure==='timeout') error.llamadartWorkerTimeout=true;
+      bridge._loadedModelOptions={nGpuLayers:0};
+      bridge._workerProxy={async call(){throw error;}};
+      const input=[{type:'image',bytes:new Uint8Array([1])}];
+      const result=await (method==='getEmbeddingCapabilities'?bridge[method]():bridge[method](method==='embed'?input:[input]));
+      assert.deepEqual(result,method==='getEmbeddingCapabilities'?{apiVersion:1,text:true,image:true,audio:true}:method==='embed'?[0.6,0.8]:[[0.6,0.8]]);
+      assert.equal(bridge._workerProxy,null);
+      assert.equal(loads,1);
+    });
+  }
+}
+
+for (const method of ['embed','embedBatch']) {
+  test(`${method} restores projector after the worker embed itself crashes`, async()=>{
+    const {bridge,runtime}=fixture();
+    runtime._mmProjPath=null;
+    runtime.supportsVision=()=>!!runtime._mmProjPath;
+    runtime.supportsAudio=()=>!!runtime._mmProjPath;
+    let loads=0;
+    runtime.loadMultimodalProjector=async()=>{loads++;runtime._mmProjPath='/reloaded';};
+    bridge._loadedMmProjUrl='https://example.invalid/projector.gguf';
+    bridge._restoreWorkerModelIfMissing=async()=>{};
+    bridge._ensureRuntimeDraftModel=async()=>{};
+    bridge._restoreLoraAdapters=async()=>{};
+    bridge._disableWorkerFallback=()=>{bridge._workerProxy=null;};
+    bridge._waitForWorkerDisposal=async()=>{};
+    bridge._workerProxy={async call(name){
+      if(name==='getEmbeddingCapabilities') return {value:{apiVersion:1,text:true,image:true,audio:true}};
+      throw Object.assign(new Error('worker crashed'),{llamadartWorkerCrash:true});
+    }};
+    const input=[{type:'image',bytes:new Uint8Array([1])}];
+    await bridge[method](method==='embed'?input:[input]);
+    assert.equal(loads,1);
+  });
+}
+
+test('parts core abort retains the worker recovery signal while staging diagnostics remain private', async()=>{
+  const {bridge,runtime}=fixture();
+  const original=runtime._core.ccall;
+  const abort=new WebAssembly.RuntimeError('Aborted()');
+  runtime._core.ccall=(name,...args)=>{if(name==='llamadart_webgpu_embed_parts_to_json') throw abort; return original(name,...args);};
+  await assert.rejects(bridge.embed([{type:'text',text:'x'}]),error=>error===abort && bridge._isWorkerUnusableError(error));
+});
+
+test('parts marshal exact UTF-8 bytes for lone surrogates, surrogate before CJK and NUL', async()=>{
+  for(const text of ['x\uD800','\uDC00\uD800','\uD800雪雪',('\uD800雪').repeat(50),'a\0雪']) {
+    const {bridge,runtime}=fixture();
+    const original=runtime._core.ccall;
+    let checked=false;
+    runtime._core.ccall=(name,result,types,args)=>{
+      if(name==='llamadart_webgpu_embed_parts_to_json') {
+        assert.deepEqual(types,['array','number','number']);
+        assert.deepEqual(args[0],new TextEncoder().encode(text));
+        assert.equal(args[2],args[0].byteLength); checked=true;
+      }
+      return original(name,result,types,args);
+    };
+    await bridge.embed([{type:'text',text}]); assert.ok(checked);
+  }
+});
+
+test('fresh parts embed clears a prior runtime abort',async()=>{
+  const {runtime}=fixture();
+  runtime._abortRequested=true;
+  assert.deepEqual(await runtime.embed([{type:'text',text:'fresh'}]),[0.6,0.8]);
+});
+
+test('batch cancellation between legacy string items prevents the next inference',async()=>{
+  const {runtime,calls}=fixture();
+  const original=runtime._core.ccall;
+  runtime._core.ccall=(name,...args)=>{
+    if(name==='llamadart_webgpu_embed_to_json') runtime._abortRequested=true;
+    return original(name,...args);
+  };
+  await assert.rejects(runtime.embedBatch(['one','two']),{name:'AbortError'});
+  assert.equal(calls.filter(([name])=>name==='llamadart_webgpu_embed_to_json').length,1);
+});
+
+test('non-array embedding inputs retain legacy String coercion on facade and runtime',async()=>{
+  for(const owner of ['bridge','runtime']) {
+    const f=fixture();
+    for(const input of [42,null,undefined,true,{toString:()=> 'custom'}]) await f[owner].embed(input);
+    await f[owner].embedBatch([42,null,{toString:()=> 'custom'}]);
+    assert.deepEqual(f.calls.filter(([n])=>n==='llamadart_webgpu_embed_to_json').map(([,text])=>text),
+      ['42','null','undefined','true','custom','42','null','custom']);
+  }
+});
+
+test('empty batch still rejects on a disposed bridge',async()=>{
+  const {bridge}=fixture(); await bridge.dispose();
+  await assert.rejects(bridge.embedBatch([]),{message:'Bridge has been disposed.'});
+});
+
+test('missing embedding API reports loaded asset version without exposing URL secrets',async()=>{
+  const {bridge,runtime}=fixture();
+  runtime._config.coreModuleUrl='https://user:secret@example.invalid/pkg/v0.1.39/llama_webgpu_core.js?token=private';
+  delete runtime._core._llamadart_webgpu_embedding_capabilities_json;
+  await assert.rejects(bridge.getEmbeddingCapabilities(),error=>{
+    assert.equal(error.code,'EMBEDDING_CAPABILITY_UNAVAILABLE');
+    assert.match(error.message,/v0\.1\.39/); assert.doesNotMatch(error.message,/secret|private|user:/); return true;
+  });
+});
+
+
+test('unrelated capability probe failures propagate without claiming old assets',async()=>{
+  const {bridge}=fixture();
+  bridge._restoreWorkerModelIfMissing=async()=>{};
+  const error=new Error('unexpected probe failure');
+  bridge._workerProxy={async call(){throw error;}};
+  await assert.rejects(bridge.embed([{type:'text',text:'x'}]),e=>e===error);
+});
+
+
+for(const variant of ['wasm32','wasm64']) {
+  test(`embedding capability error reports the active ${variant} asset version`,async()=>{
+    const {bridge,runtime}=fixture();
+    runtime._config.coreModuleUrl='https://example.invalid/v0.1.39/core.js';
+    runtime._config.coreModuleUrlMem64='https://example.invalid/v0.1.40/core.js';
+    runtime._coreVariant=variant;
+    delete runtime._core._llamadart_webgpu_embedding_capabilities_json;
+    await assert.rejects(bridge.getEmbeddingCapabilities(),error=>{
+      assert.match(error.message,variant==='wasm64'?/v0\.1\.40/:/v0\.1\.39/);
+      assert.doesNotMatch(error.message,variant==='wasm64'?/v0\.1\.39/:/v0\.1\.40/);
+      return true;
+    });
+  });
+}

@@ -557,11 +557,12 @@ The entire expanded parts input must fit the actual context, per-sequence
 context, logical batch and physical microbatch, with at least one sequence.
 Overflow rejects before media encoding or model inference; the bridge never
 chunks a parts input. Each mixed input uses one extended batch and one decode,
-retaining every media encoding until decode settles. Output width comes from
+copying each media row into the batch before mtmd reuses its output buffer. Output width comes from
 the pooled model output, which can differ from token embedding width.
 Vectors are L2-normalized unless `normalize === false`; zero/nonfinite handling
 matches the string path. Rank-pooled classifiers and encoder-decoder models
-are unsupported by the parts API.
+are unsupported by the parts API. Media capabilities are false for M-RoPE
+projectors requiring multiple positions per embedding row.
 
 ```js
 const capabilities = await bridge.getEmbeddingCapabilities();

@@ -31,29 +31,39 @@ var EMPTY_EMBEDDING_CAPABILITIES = {
   audio: false
 };
 var EMBEDDING_MEDIA_MARKER = "<__media__>";
-function missingEmbeddingCapability() {
+function embeddingAssetVersion(...sources) {
+  for (const source of [...sources, import.meta.url]) {
+    try {
+      const version = new URL(source || "", import.meta.url).pathname.match(/(?:^|[/@])(v?\d+\.\d+\.\d+(?:-\d+)?)(?:[/]|$)/)?.[1];
+      if (version) return version;
+    } catch (_) {
+    }
+  }
+  return "unversioned/local";
+}
+function missingEmbeddingCapability(version = embeddingAssetVersion()) {
   return new EmbeddingError(
     "EMBEDDING_CAPABILITY_UNAVAILABLE",
-    "Loaded bridge/core has no known media-embedding capability API version 1. Upgrade the loaded bridge assets."
+    `Loaded bridge/assets version ${version} has no known media-embedding capability API version 1. Upgrade the loaded bridge assets.`
   );
 }
-function embeddingCapabilitiesFrom(value) {
+function embeddingCapabilitiesFrom(value, version = embeddingAssetVersion()) {
   let parsed = value;
   if (typeof value === "string") {
     try {
       parsed = JSON.parse(value);
     } catch (_) {
-      throw missingEmbeddingCapability();
+      throw missingEmbeddingCapability(version);
     }
   }
   const caps = parsed;
   if (!caps || caps.apiVersion !== 1 || typeof caps.text !== "boolean" || typeof caps.image !== "boolean" || typeof caps.audio !== "boolean") {
-    throw missingEmbeddingCapability();
+    throw missingEmbeddingCapability(version);
   }
   return { apiVersion: 1, text: caps.text, image: caps.image, audio: caps.audio };
 }
 function snapshotEmbedInput(input) {
-  if (typeof input === "string") return input;
+  if (!Array.isArray(input)) return String(input);
   if (!Array.isArray(input) || input.length === 0) {
     throw new EmbeddingError("INVALID_EMBEDDING_INPUT", "Embedding parts must be a nonempty array.");
   }
@@ -110,9 +120,9 @@ function requireEmbeddingModalities(input, caps, hasProjector) {
     }
   }
 }
-function embeddingCoreError(rc) {
+function embeddingCoreError(rc, version = embeddingAssetVersion()) {
+  if (rc === -20) return missingEmbeddingCapability(version);
   const errors = {
-    [-20]: ["EMBEDDING_CAPABILITY_UNAVAILABLE", "Loaded core lacks the mixed embedding batch API."],
     [-21]: ["MODEL_NOT_EMBEDDING", "Loaded model does not support this pooled embedding operation."],
     [-22]: ["EMBEDDING_PROJECTOR_MISSING", "Media embeddings require a loaded projector."],
     [-23]: ["EMBEDDING_INPUT_TOO_LARGE", "Expanded embedding input exceeds the allocated context, batch, sequence or single microbatch capacity."],
@@ -4456,13 +4466,17 @@ var LlamaWebGpuBridgeRuntime = class {
     }
     return this._core.ccall("llamadart_webgpu_last_detokenized", "string", [], []) || "";
   }
+  _embeddingAssetVersion() {
+    return embeddingAssetVersion(this._coreVariant === "wasm64" ? this._config.coreModuleUrlMem64 : this._config.coreModuleUrl);
+  }
   async getEmbeddingCapabilities() {
     if (this._modelBytes <= 0) return { ...EMPTY_EMBEDDING_CAPABILITIES };
     if (typeof this._core?._llamadart_webgpu_embedding_capabilities_json !== "function" || typeof this._core?._llamadart_webgpu_embed_parts_to_json !== "function") {
-      throw missingEmbeddingCapability();
+      throw missingEmbeddingCapability(this._embeddingAssetVersion());
     }
     return embeddingCapabilitiesFrom(
-      this._core.ccall("llamadart_webgpu_embedding_capabilities_json", "string", [], [])
+      this._core.ccall("llamadart_webgpu_embedding_capabilities_json", "string", [], []),
+      this._embeddingAssetVersion()
     );
   }
   async _preflightEmbeddingInputs(inputs) {
@@ -4472,6 +4486,7 @@ var LlamaWebGpuBridgeRuntime = class {
   }
   async _embedParts(parts, options) {
     const prompt = parts.map((part) => part.type === "text" ? part.text : EMBEDDING_MEDIA_MARKER).join("");
+    const promptBytes = textEncoder.encode(prompt);
     const media = parts.filter((part) => part.type !== "text");
     try {
       await this._stageMultimodalParts(media);
@@ -4479,16 +4494,17 @@ var LlamaWebGpuBridgeRuntime = class {
       const rc = Number(await this._core.ccall(
         "llamadart_webgpu_embed_parts_to_json",
         "number",
-        ["string", "number", "number"],
-        [prompt, options?.normalize !== false ? 1 : 0, textEncoder.encode(prompt).length],
+        ["array", "number", "number"],
+        [promptBytes, options?.normalize !== false ? 1 : 0, promptBytes.length],
         { async: true }
       ));
       if (this._abortRequested) throw createAbortError("Embedding was cancelled.");
-      if (rc < 0) throw embeddingCoreError(rc);
+      if (rc < 0) throw embeddingCoreError(rc, this._embeddingAssetVersion());
       const raw = this._core.ccall("llamadart_webgpu_last_embedding_json", "string", [], []) || "[]";
       const parsed = JSON.parse(raw);
       return Array.isArray(parsed) ? parsed.map((v) => Number.isFinite(Number(v)) ? Number(v) : 0) : [];
     } catch (error) {
+      if (error instanceof WebAssembly.RuntimeError) throw error;
       if (error instanceof EmbeddingError || error?.name === "AbortError") throw error;
       throw new EmbeddingError("EMBEDDING_FAILED", "Embedding media preparation or execution failed.");
     } finally {
@@ -4496,7 +4512,7 @@ var LlamaWebGpuBridgeRuntime = class {
     }
   }
   async embed(text, options = {}) {
-    if (typeof text !== "string") {
+    if (Array.isArray(text)) {
       const parts = snapshotEmbedInput(text);
       this._abortRequested = false;
       await this._preflightEmbeddingInputs([parts]);
@@ -5800,7 +5816,7 @@ var LlamaWebGpuBridge = class {
     const mediaPartsRequested = this._hasMediaParts(options);
     const textToSpeechRequested = options?._llamadartTextToSpeech === true;
     const multimodalRuntimeRequired = mediaPartsRequested || textToSpeechRequested;
-    const shouldEnsureMultimodalInRuntime = multimodalRuntimeRequired && typeof this._loadedMmProjUrl === "string" && this._loadedMmProjUrl.length > 0;
+    const shouldEnsureMultimodalInRuntime = (multimodalRuntimeRequired || options?._llamadartEnsureProjector === true) && typeof this._loadedMmProjUrl === "string" && this._loadedMmProjUrl.length > 0;
     const workerTimedOut = this._isWorkerTimeoutError(fallbackError);
     const dispatchWorkgroupFallback = this._isDispatchWorkgroupLimitError(fallbackError);
     const loadedGpuLayers = Number(this._loadedModelOptions?.nGpuLayers);
@@ -7401,17 +7417,33 @@ var LlamaWebGpuBridge = class {
     }
   }
   async getEmbeddingCapabilities() {
-    return this._runExclusive(() => this._getEmbeddingCapabilitiesUnlocked(), { kind: "embedding-capabilities" });
+    return this._runExclusive(async () => {
+      try {
+        return await this._getEmbeddingCapabilitiesUnlocked();
+      } catch (error) {
+        this._throwIfOperationCancelled(error, "Embedding capability probe was cancelled.");
+        if (!this._workerProxy || !this._isWorkerUnusableError(error)) throw error;
+        this._disableWorkerFallback(error);
+        await this._waitForWorkerDisposal();
+        await this._ensureRuntimeReadyAfterWorkerFallback({ _llamadartEnsureProjector: true }, error);
+        return this._runtime.getEmbeddingCapabilities();
+      }
+    }, { kind: "embedding-capabilities" });
   }
   async _getEmbeddingCapabilitiesUnlocked() {
     if (!this._workerProxy) return this._runtime.getEmbeddingCapabilities();
     try {
       await this._restoreWorkerModelIfMissing();
-      return embeddingCapabilitiesFrom(await this._callWorker("getEmbeddingCapabilities", []));
+      return embeddingCapabilitiesFrom(
+        await this._callWorker("getEmbeddingCapabilities", []),
+        embeddingAssetVersion(this._config.workerUrl)
+      );
     } catch (error) {
       this._throwIfOperationCancelled(error, "Embedding capability probe was cancelled.");
-      if (error instanceof EmbeddingError) throw error;
-      throw missingEmbeddingCapability();
+      if (error instanceof Error && /bridge\[method\] is not a function/.test(error.message)) {
+        throw missingEmbeddingCapability(embeddingAssetVersion(this._config.workerUrl));
+      }
+      throw error;
     }
   }
   async embed(text, options = {}) {
@@ -7436,13 +7468,12 @@ var LlamaWebGpuBridge = class {
       }
       this._disableWorkerFallback(error);
       await this._waitForWorkerDisposal();
-      await this._ensureRuntimeReadyAfterWorkerFallback({}, error);
+      await this._ensureRuntimeReadyAfterWorkerFallback({ _llamadartEnsureProjector: true, parts: Array.isArray(text) ? text : [] }, error);
       return this._runtime.embed(text, options);
     }
   }
   async embedBatch(texts, options = {}) {
     const inputs = Array.from(texts || [], (input) => typeof input === "string" ? input : snapshotEmbedInput(input));
-    if (inputs.length === 0) return [];
     return this._runExclusive(
       () => this._embedBatchUnlocked(inputs, options),
       { kind: "embedding-batch" }
@@ -7464,7 +7495,7 @@ var LlamaWebGpuBridge = class {
       }
       this._disableWorkerFallback(error);
       await this._waitForWorkerDisposal();
-      await this._ensureRuntimeReadyAfterWorkerFallback({}, error);
+      await this._ensureRuntimeReadyAfterWorkerFallback({ _llamadartEnsureProjector: true, parts: normalized.flatMap((input) => Array.isArray(input) ? input : []) }, error);
       return this._runtime.embedBatch(normalized, options);
     }
   }

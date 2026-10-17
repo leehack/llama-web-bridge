@@ -15,20 +15,32 @@ export const EMPTY_EMBEDDING_CAPABILITIES: EmbeddingCapabilities = {
 };
 export const EMBEDDING_MEDIA_MARKER = '<__media__>';
 
-export function missingEmbeddingCapability(): EmbeddingError {
-  return new EmbeddingError('EMBEDDING_CAPABILITY_UNAVAILABLE',
-    'Loaded bridge/core has no known media-embedding capability API version 1. Upgrade the loaded bridge assets.');
+// Versioned CDN paths identify the loaded assets. Never include URL credentials,
+// query strings, fragments or arbitrary path text in public diagnostics.
+export function embeddingAssetVersion(...sources: (string | undefined)[]): string {
+  for (const source of [...sources, import.meta.url]) {
+    try {
+      const version = new URL(source || '', import.meta.url).pathname.match(/(?:^|[/@])(v?\d+\.\d+\.\d+(?:-\d+)?)(?:[/]|$)/)?.[1];
+      if (version) return version;
+    } catch (_) { /* Local or unversioned assets. */ }
+  }
+  return 'unversioned/local';
 }
 
-export function embeddingCapabilitiesFrom(value: unknown): EmbeddingCapabilities {
+export function missingEmbeddingCapability(version = embeddingAssetVersion()): EmbeddingError {
+  return new EmbeddingError('EMBEDDING_CAPABILITY_UNAVAILABLE',
+    `Loaded bridge/assets version ${version} has no known media-embedding capability API version 1. Upgrade the loaded bridge assets.`);
+}
+
+export function embeddingCapabilitiesFrom(value: unknown, version = embeddingAssetVersion()): EmbeddingCapabilities {
   let parsed: unknown = value;
   if (typeof value === 'string') {
-    try { parsed = JSON.parse(value); } catch (_) { throw missingEmbeddingCapability(); }
+    try { parsed = JSON.parse(value); } catch (_) { throw missingEmbeddingCapability(version); }
   }
   const caps = parsed as Partial<EmbeddingCapabilities> | null;
   if (!caps || caps.apiVersion !== 1
     || typeof caps.text !== 'boolean' || typeof caps.image !== 'boolean' || typeof caps.audio !== 'boolean') {
-    throw missingEmbeddingCapability();
+    throw missingEmbeddingCapability(version);
   }
   return { apiVersion: 1, text: caps.text, image: caps.image, audio: caps.audio };
 }
@@ -36,7 +48,7 @@ export function embeddingCapabilitiesFrom(value: unknown): EmbeddingCapabilities
 // Snapshot the ordered list/part descriptors; caller media buffers remain owned
 // by the caller. Worker postMessage uses structured clone with no transfer list.
 export function snapshotEmbedInput(input: EmbedInput): EmbedInput {
-  if (typeof input === 'string') return input;
+  if (!Array.isArray(input)) return String(input);
   if (!Array.isArray(input) || input.length === 0) {
     throw new EmbeddingError('INVALID_EMBEDDING_INPUT', 'Embedding parts must be a nonempty array.');
   }
@@ -100,9 +112,9 @@ export function requireEmbeddingModalities(input: EmbedInput, caps: EmbeddingCap
   }
 }
 
-export function embeddingCoreError(rc: number): EmbeddingError {
+export function embeddingCoreError(rc: number, version = embeddingAssetVersion()): EmbeddingError {
+  if (rc === -20) return missingEmbeddingCapability(version);
   const errors: Record<number, [EmbeddingErrorCode, string]> = {
-    [-20]: ['EMBEDDING_CAPABILITY_UNAVAILABLE', 'Loaded core lacks the mixed embedding batch API.'],
     [-21]: ['MODEL_NOT_EMBEDDING', 'Loaded model does not support this pooled embedding operation.'],
     [-22]: ['EMBEDDING_PROJECTOR_MISSING', 'Media embeddings require a loaded projector.'],
     [-23]: ['EMBEDDING_INPUT_TOO_LARGE', 'Expanded embedding input exceeds the allocated context, batch, sequence or single microbatch capacity.'],

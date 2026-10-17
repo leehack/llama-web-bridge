@@ -7,7 +7,7 @@ EMSCRIPTEN_KEEPALIVE const char * llamadart_webgpu_embedding_capabilities_json()
   bool image = false;
   bool audio = false;
 #if LLAMADART_WEBGPU_HAS_MIXED_EMBEDDINGS
-  if (g_state.mm_ctx && llamadart_webgpu_detail::supports_mixed_embeddings(g_state.ctx, g_state.model)) {
+  if (g_state.mm_ctx && llamadart_webgpu_detail::supports_mixed_embeddings(g_state.ctx, g_state.model, g_state.mm_ctx)) {
     image = mtmd_support_vision(g_state.mm_ctx);
     audio = mtmd_support_audio(g_state.mm_ctx) && mtmd_get_audio_sample_rate(g_state.mm_ctx) == 16000;
   }
