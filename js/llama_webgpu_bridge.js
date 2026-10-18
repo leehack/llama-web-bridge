@@ -1484,6 +1484,7 @@ var LlamaWebGpuBridgeRuntime = class {
     const previousPreferMemory64 = this._preferMemory64;
     const previousMMProjSourceUrl = this._mmProjSourceUrl;
     const previousDraftModel = this._draftModel;
+    const resolvedLoadState = this._resolvedLoadState();
     try {
       this._preferMemory64 = false;
       await this.loadModelFromUrl(modelUrl, {
@@ -1495,7 +1496,7 @@ var LlamaWebGpuBridgeRuntime = class {
         remoteFetchChunkBytes: this._resolveRemoteFetchChunkBytes(options),
         safariGpuProbe: false,
         signal: options.signal
-      });
+      }, resolvedLoadState);
       if (typeof previousMMProjSourceUrl === "string" && previousMMProjSourceUrl.length > 0) {
         try {
           await this.loadMultimodalProjector(previousMMProjSourceUrl);
@@ -1789,6 +1790,28 @@ var LlamaWebGpuBridgeRuntime = class {
   }
   _nativeLoadOptionTypes() {
     return this._nativeLoadOptionValues().map(() => "number");
+  }
+  _resolvedLoadState() {
+    return {
+      _nCtx: this._nCtx,
+      _threads: this._threads,
+      _threadsBatch: this._threadsBatch,
+      _nBatch: this._nBatch,
+      _nUbatch: this._nUbatch,
+      _nSeqMax: this._nSeqMax,
+      _useMmap: this._useMmap,
+      _useMlock: this._useMlock,
+      _flashAttention: this._flashAttention,
+      _cacheTypeK: this._cacheTypeK,
+      _cacheTypeV: this._cacheTypeV,
+      _kvUnified: this._kvUnified,
+      _ropeFrequencyBase: this._ropeFrequencyBase,
+      _ropeFrequencyScale: this._ropeFrequencyScale,
+      _splitMode: this._splitMode,
+      _mainGpu: this._mainGpu,
+      _loadMtp: this._loadMtp,
+      _speculativeRollbackTokenMax: this._speculativeRollbackTokenMax
+    };
   }
   async _tryLoadModelFromRemoteFetchBackend(core, url, options = {}) {
     if (!this._canUseRemoteFetchBackend(options)) {
@@ -2546,7 +2569,7 @@ var LlamaWebGpuBridgeRuntime = class {
     }
     return this._gpuActive;
   }
-  async loadModelFromUrl(url, options = {}) {
+  async loadModelFromUrl(url, options = {}, resolvedLoadState = null) {
     const operationSignal = options?.signal || null;
     const abortMessage = "Model load was cancelled.";
     throwIfAborted(operationSignal, abortMessage);
@@ -2602,7 +2625,13 @@ var LlamaWebGpuBridgeRuntime = class {
     if (this._nUbatch > 0 && this._nBatch > 0 && this._nUbatch > this._nBatch) {
       this._nUbatch = this._nBatch;
     }
-    this._resolveNativeLoadOptions(options);
+    if (resolvedLoadState) {
+      Object.assign(this, resolvedLoadState);
+      this._threads = this._capThreadsToPool(this._threads);
+      this._threadsBatch = this._capThreadsToPool(this._threadsBatch, { noteTag: "threads_batch_capped_pool" });
+    } else {
+      this._resolveNativeLoadOptions(options);
+    }
     if (Number.isFinite(this._threadPoolSizeHint) && this._threadPoolSizeHint > 0) {
       this._pushRuntimeNote(`thread_pool_size:${this._threadPoolSizeHint}`);
     }
@@ -2625,7 +2654,7 @@ var LlamaWebGpuBridgeRuntime = class {
     if (this._nSeqMax > 0) {
       this._pushRuntimeNote(`n_seq_max:${this._nSeqMax}`);
     }
-    if (isCpuModelMode && !Number.isFinite(requestedBatch) && !Number.isFinite(requestedUbatch)) {
+    if (!resolvedLoadState && isCpuModelMode && !Number.isFinite(requestedBatch) && !Number.isFinite(requestedUbatch)) {
       this._runtimeNotes.push("cpu_batch_tuned_default");
     }
     if (this._isSafari && this._nGpuLayers > 0) {
