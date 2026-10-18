@@ -5962,6 +5962,13 @@ var LlamaWebGpuBridge = class {
   _workerConfig() {
     const config = this._config || {};
     return {
+      workerRequestTimeoutMs: config.workerRequestTimeoutMs,
+      workerInitTimeoutMs: config.workerInitTimeoutMs,
+      workerModelLoadTimeoutMs: config.workerModelLoadTimeoutMs,
+      workerMmprojLoadTimeoutMs: config.workerMmprojLoadTimeoutMs,
+      workerCompletionTimeoutMs: config.workerCompletionTimeoutMs,
+      workerTextToSpeechTimeoutMs: config.workerTextToSpeechTimeoutMs,
+      coreInitTimeoutMs: config.coreInitTimeoutMs,
       wasmUrl: typeof config.wasmUrl === "string" ? config.wasmUrl : void 0,
       wasmUrlMem64: typeof config.wasmUrlMem64 === "string" ? config.wasmUrlMem64 : void 0,
       coreModuleUrl: typeof config.coreModuleUrl === "string" ? config.coreModuleUrl : void 0,

@@ -185,6 +185,13 @@ it.
 Unknown config keys are accepted and may be consumed by current or future bridge
 internals.
 
+Worker timeout options are forwarded to the proxy, and `coreInitTimeoutMs` also
+reaches the runtime inside the worker. Positive request budgets are truncated
+and clamped to 5 seconds–1 hour; per-method settings override the global request
+budget. Non-positive or non-finite settings retain the existing fallback
+budgets. Worker initialization uses a 3-second–2-minute clamp (20-second
+default), and core initialization uses 10 seconds–10 minutes (90-second default).
+
 ### Static properties
 
 #### `LlamaWebGpuBridge.supportsSafariAdaptiveGpu`
