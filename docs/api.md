@@ -200,6 +200,14 @@ the flag; through v0.1.52 their worker mode rejects a function option with a
 
 ## Model loading and cache helpers
 
+When text generation on wasm64/WebGPU qualifies for CPU recovery, the reload
+preserves the model's resolved native load settings, including sequence count,
+batch sizes, memory mapping/locking, KV cache types, flash attention, RoPE and
+device split settings. It changes GPU placement to CPU and retains the existing
+memory32 preference and transfer safeguards for recovery. Thread counts remain
+subject to the replacement core's pool and browser isolation limits. Recovery
+continues to refuse active LoRA adapters and speculative generation.
+
 ### `loadModelFromUrl(url, options?)`
 
 ```ts
