@@ -3463,8 +3463,8 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
 
     try {
       // Avoid introducing an unnecessary async boundary for the common direct
-      // runtime path. Runtime.dispose() performs its synchronous native cleanup
-      // (including logger callbacks) before returning its promise; callers that
+      // runtime path. Runtime.dispose() runs its synchronous native cleanup
+      // (including logger callbacks) before its first await; callers that
       // re-enter dispose() during that cleanup must observe the promise reserved
       // by the public method above. Retiring workers still have to settle before
       // the direct runtime is torn down.

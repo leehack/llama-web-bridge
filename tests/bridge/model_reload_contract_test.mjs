@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 
 import { LlamaWebGpuBridge } from '../../js/src/llama_webgpu_bridge.js';
+import { bridgeJsSource } from './bridge_js_source.mjs';
 
 // Mirrors the generated WASMFS glue: every failure is an ErrnoError whose
 // message is the bare "FS error", and analyzePath() reads the entry it finds.
@@ -98,16 +99,53 @@ function createWasmFs() {
   return fs;
 }
 
-function createCore(fs, { freeModelRc = 0 } = {}) {
+// Freeing a WebGPU context synchronizes the device, which suspends the core
+// under ASYNCIFY. Like the release build (no ASSERTIONS), a suspending call
+// returns a promise whether or not the ccall asked for one, and any call made
+// before it resumes aborts the core.
+function suspendCall(core, name, finish) {
+  core.suspended = name;
+  return new Promise((resolve) => {
+    setTimeout(() => {
+      core.suspended = null;
+      resolve(finish());
+    }, 0);
+  });
+}
+
+function createCore(fs, { freeModelRc = 0, suspending = false, onLoad = () => {} } = {}) {
   const core = {
     FS: fs,
     trace: [],
     model: null,
     projector: null,
     lastError: '',
-    ccall(name, _returnType, _argTypes, args = []) {
+    suspended: null,
+    shutdowns: 0,
+    ccall(name, _returnType, _argTypes, args = [], opts = {}) {
+      if (core.suspended) {
+        core.trace.push(['abort', `${name} while ${core.suspended} was suspended`]);
+        throw new Error('Aborted(). Build with -sASSERTIONS for more info.');
+      }
+      if (suspending && (name === 'llamadart_webgpu_free_model' || name === 'llamadart_webgpu_shutdown')) {
+        core.trace.push([name === 'llamadart_webgpu_free_model' ? 'free' : 'shutdown', core.model, opts?.async === true]);
+        return suspendCall(core, name, () => {
+          if (name === 'llamadart_webgpu_free_model' && freeModelRc !== 0) {
+            core.lastError = 'Model cannot be released during active generation or text-to-speech synthesis';
+            return freeModelRc;
+          }
+          core.model = null;
+          core.projector = null;
+          if (name === 'llamadart_webgpu_shutdown') {
+            core.shutdowns += 1;
+            return undefined;
+          }
+          return 0;
+        });
+      }
       switch (name) {
         case 'llamadart_webgpu_load_model': {
+          onLoad();
           const [modelPath] = args;
           // Native load reads the file it was given, then the bridge releases it.
           fs.readFile(modelPath);
@@ -136,6 +174,11 @@ function createCore(fs, { freeModelRc = 0 } = {}) {
           return core.projector ? 1 : 0;
         case 'llamadart_webgpu_mmproj_supports_audio':
           return 0;
+        case 'llamadart_webgpu_mmproj_free':
+          core.projector = null;
+          return 0;
+        case 'llamadart_webgpu_media_clear_pending':
+          return undefined;
         case 'llamadart_webgpu_get_context_size':
           return 128;
         case 'llamadart_webgpu_last_error':
@@ -314,6 +357,80 @@ const cases = [
       ['remote-load', 'https://models.test/large.gguf'],
     ]);
     assert.equal(fs.files.size, 0);
+  }],
+
+  ['a reload awaits the suspending model free before loading the next model', async () => {
+    const { runtime, core } = createRuntime({ suspending: true });
+
+    await runtime.loadModelFromUrl('https://models.test/a.gguf', loadOptions);
+    assert.equal(await runtime.loadModelFromUrl('https://models.test/b.gguf', loadOptions), 1);
+
+    assert.deepEqual(core.trace.slice(2), [
+      ['free', '/models/a.gguf', true],
+      ['fetch', 'https://models.test/b.gguf'],
+      ['load', '/models/b.gguf'],
+    ]);
+    assert.equal(core.model, '/models/b.gguf');
+  }],
+
+  ['a suspended refused release still keeps the current model', async () => {
+    const { runtime, core } = createRuntime({ suspending: true, freeModelRc: -1 });
+
+    await runtime.loadModelFromUrl('https://models.test/a.gguf', loadOptions);
+    await assert.rejects(
+      runtime.loadModelFromUrl('https://models.test/b.gguf', loadOptions),
+      /Failed to release the loaded model.*active generation/,
+    );
+
+    assert.deepEqual(core.trace.slice(2), [['free', '/models/a.gguf', true]]);
+    assert.equal(core.model, '/models/a.gguf');
+    assert.equal(runtime._loadedModelUrl, 'https://models.test/a.gguf');
+  }],
+
+  ['dispose resolves only after the suspending shutdown finishes', async () => {
+    const { runtime, core, fs } = createRuntime({ suspending: true });
+
+    await runtime.loadModelFromUrl('https://models.test/a.gguf', loadOptions);
+    await runtime.loadMultimodalProjector('https://models.test/mmproj-a.gguf');
+    await runtime.dispose();
+
+    assert.equal(core.shutdowns, 1, 'shutdown must finish before dispose resolves');
+    assert.deepEqual(core.trace.at(-1), ['shutdown', '/models/a.gguf', true]);
+    assert.equal(fs.files.size, 0);
+  }],
+
+  ['a cancelled native load awaits its shutdown before the core is used again', async () => {
+    const controller = new AbortController();
+    let abortDuringLoad = true;
+    const { runtime, core } = createRuntime({
+      suspending: true,
+      onLoad: () => {
+        if (abortDuringLoad) {
+          abortDuringLoad = false;
+          controller.abort();
+        }
+      },
+    });
+
+    await assert.rejects(
+      runtime.loadModelFromUrl('https://models.test/a.gguf', { ...loadOptions, signal: controller.signal }),
+      { name: 'AbortError' },
+    );
+    assert.equal(core.shutdowns, 1, 'the cancelled load must finish its cleanup before rejecting');
+
+    assert.equal(await runtime.loadModelFromUrl('https://models.test/b.gguf', loadOptions), 1);
+    assert.equal(core.model, '/models/b.gguf');
+    assert.deepEqual(core.trace.filter(([kind]) => kind === 'abort'), []);
+  }],
+
+  ['every model free and shutdown, including Safari probe retries, is an awaited async ccall', async () => {
+    const calls = [...bridgeJsSource().matchAll(
+      /(\bawait\s+)?[\w.!?]*ccall\(\s*'llamadart_webgpu_(free_model|shutdown)'[^;]*;/g,
+    )];
+    assert.ok(calls.length >= 5, `expected the free and shutdown call sites, found ${calls.length}`);
+    for (const [call, awaited] of calls) {
+      assert.ok(awaited && call.includes('{ async: true }'), `synchronous core free: ${call}`);
+    }
   }],
 
   ['state snapshots reuse an existing /states directory', async () => {

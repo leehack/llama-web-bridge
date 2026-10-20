@@ -174,8 +174,8 @@ require(
     String.raw`const mmprojPath = this\._mmProjPath;.*?`
       + String.raw`const mmprojFreeRc = Number\(\s*`
       + String.raw`this\._core\.ccall\('llamadart_webgpu_mmproj_free', 'number'.*?`
-      + String.raw`llamadart_webgpu_shutdown'.*?this\._deleteFsFile\(mmprojPath\);.*?`
-      + String.raw`if \(mmprojFreeRc !== 0\)`,
+      + String.raw`if \(mmprojFreeRc !== 0\).*?`
+      + String.raw`llamadart_webgpu_shutdown'.*?this\._deleteFsFile\(mmprojPath\);`,
     's',
   ).test(methodBody(RUNTIME_JS, 'async dispose() {')),
   'runtime dispose must inspect projector unload status and release the staged WasmFS file after shutdown',
