@@ -45,6 +45,10 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_state_save_file(
     return -3;
   }
 
+  if (!can_open_state_file(state_path, "wb")) {
+    return -5;
+  }
+
   std::vector<llama_token> tokens;
   parse_token_list(token_text, tokens);
 
@@ -86,6 +90,14 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_state_load_file(
   if (token_capacity <= 0 || token_capacity > n_ctx) {
     set_error("State token capacity must be positive and not exceed context size");
     return -4;
+  }
+
+  if (!can_open_state_file(state_path, "rb")) {
+    set_error(
+        g_last_error
+        + ". State file paths are in-memory and do not survive a page reload; "
+          "persist snapshots with stateSaveBytes and restore them with stateLoadBytes.");
+    return -7;
   }
 
   std::vector<llama_token> restored_tokens(static_cast<size_t>(token_capacity));

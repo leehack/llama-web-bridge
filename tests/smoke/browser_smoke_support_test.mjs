@@ -598,9 +598,15 @@ const stateBridge = (tweak = {}) => class FakeStateBridge {
     return { tokens };
   }
 
-  async stateSaveFile() { this.requireModel(); }
+  missingStateFile(action, path) {
+    if (!path.startsWith('/missing') && path !== '/') return;
+    throw new Error(tweak.stateFileError
+      || `State ${action} failed: Cannot open state file ${path}: No such file or directory`);
+  }
 
-  async stateLoadFile() { this.requireModel(); }
+  async stateSaveFile(path) { this.requireModel(); this.missingStateFile('save', path); }
+
+  async stateLoadFile(path) { this.requireModel(); this.missingStateFile('load', path); }
 
   async _callWorker(name, args, _signal, transfer) {
     // Like postMessage: the worker gets copies and the transferred buffers detach.
@@ -658,6 +664,8 @@ const stateBridge = (tweak = {}) => class FakeStateBridge {
     /did not use the requested wasm64 core/);
   assert.match(firstErrorLine(await runHarnessPage(page, stateBridge({ execution: 'main-thread' }))),
     /worker runtime silently changed execution path/);
+  assert.match(firstErrorLine(await runHarnessPage(page, stateBridge({ stateFileError: 'Aborted(undefined)' }))),
+    /direct runtime stateLoadFile of a missing file did not reject cleanly: Aborted\(undefined\)/);
   stateSmoke.checkPayload(passed, true);
   const [direct, worker] = passed.modeResults;
   assert.deepEqual(direct.initialUsage,

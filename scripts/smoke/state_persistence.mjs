@@ -230,6 +230,25 @@ export function renderHarness(modelFilename, memoryMode = 'wasm32') {
       );
       const restoredUsage = usages[0];
 
+      // A path the core cannot open must reject without aborting the core.
+      const workerBeforeMissingFile = bridge._workerProxy;
+      const rejectsCleanly = async (label, operation) => {
+        let message = null;
+        try {
+          await operation();
+        } catch (error) {
+          message = String(error && error.message ? error.message : error);
+        }
+        assert(
+          message !== null && message.includes('Cannot open state file'),
+          \`\${mode} \${label} did not reject cleanly: \${message}\`,
+        );
+      };
+      await rejectsCleanly('stateLoadFile of a missing file', () => bridge.stateLoadFile('/missing-state.bin', tokens.length));
+      await rejectsCleanly('stateLoadFile of a directory', () => bridge.stateLoadFile('/', tokens.length));
+      await rejectsCleanly('stateSaveFile into a missing directory', () => bridge.stateSaveFile('/missing-dir/state.bin', tokens));
+      assert(bridge._workerProxy === workerBeforeMissingFile, \`\${mode} missing state file replaced the runtime\`);
+
       // A repeated prompt keeps all but its last token.
       const longPrompt = 'The quick brown fox jumps over the lazy dog';
       const longTokens = await bridge.tokenize(longPrompt, true);
