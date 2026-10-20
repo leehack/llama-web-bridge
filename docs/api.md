@@ -225,6 +225,9 @@ Loads a GGUF model from one URL, an explicit shard URL array, or an auto-expande
 split GGUF URL such as `model-00001-of-00002.gguf`. The bridge streams model
 bytes into the active WASM filesystem unless the native remote-fetch backend is
 used for a qualifying large single-file model.
+Relative URLs resolve against the page's base URL (`document.baseURI`, so a
+`<base href>` applies) in both runtimes; worker mode resolves them before
+posting them to the worker.
 
 Common `options` keys:
 
@@ -684,7 +687,8 @@ loadMultimodalProjector(url: string): Promise<unknown>
 ```
 
 Loads a multimodal projector (`mmproj`) file and updates the vision/audio
-capability helpers. Multimodal generation uses `createCompletion(prompt,
+capability helpers. A relative URL resolves against the page's base URL, as
+for `loadModelFromUrl()`. Multimodal generation uses `createCompletion(prompt,
 { parts })` after this succeeds. The bridge may restart or switch worker/direct
 execution modes to satisfy projector constraints.
 

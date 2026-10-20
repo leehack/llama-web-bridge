@@ -615,9 +615,15 @@ function cloneModelSource(source) {
 function hasModelSource(source) {
   return Array.isArray(source) ? source.length > 0 : typeof source === "string" && source.length > 0;
 }
+function pageBaseUrl() {
+  if (typeof document !== "undefined" && typeof document.baseURI === "string" && document.baseURI.length > 0) {
+    return document.baseURI;
+  }
+  return typeof window !== "undefined" ? window.location.href : void 0;
+}
 function basenameFromUrl(url) {
   try {
-    const parsed = new URL(url, typeof window !== "undefined" ? window.location.href : void 0);
+    const parsed = new URL(url, pageBaseUrl());
     const pathname = parsed.pathname || "";
     const name = pathname.split("/").pop() || "model.gguf";
     return name.includes("?") ? name.split("?")[0] : name;
@@ -628,10 +634,23 @@ function basenameFromUrl(url) {
 }
 function normalizeAbsoluteUrl(url) {
   try {
-    return new URL(url, typeof window !== "undefined" ? window.location.href : void 0).toString();
+    return new URL(url, pageBaseUrl()).toString();
   } catch (_) {
     return String(url);
   }
+}
+function resolveModelSource(source) {
+  const cloned = cloneModelSource(source);
+  if (Array.isArray(cloned)) {
+    return cloned.map((value) => typeof value === "string" && value.trim().length > 0 ? normalizeAbsoluteUrl(value.trim()) : value);
+  }
+  return cloned.length > 0 ? normalizeAbsoluteUrl(cloned) : cloned;
+}
+function resolvePartUrls(parts) {
+  return parts.map((part) => {
+    const url = part != null && typeof part === "object" ? part.url : void 0;
+    return typeof url === "string" && url.length > 0 ? { ...part, url: normalizeAbsoluteUrl(url) } : part;
+  });
 }
 function parseSplitShardPattern(fileName) {
   if (typeof fileName !== "string" || fileName.length === 0) {
@@ -660,7 +679,7 @@ function expandModelShardUrls(modelUrlOrUrls) {
     return [];
   }
   try {
-    const parsed = new URL(source, typeof window !== "undefined" ? window.location.href : void 0);
+    const parsed = new URL(source, pageBaseUrl());
     const pathname = parsed.pathname || "";
     const slash = pathname.lastIndexOf("/");
     const dirPath = slash >= 0 ? pathname.slice(0, slash + 1) : "";
@@ -6248,7 +6267,8 @@ var LlamaWebGpuBridge = class {
   async _loadModelFromUrlUnlocked(url, options = {}) {
     const attempt = { proxy: null, state: null, loaded: false };
     try {
-      return await this._loadModelFromUrlOnTarget(url, options, attempt);
+      const source = resolveModelSource(url);
+      return await this._loadModelFromUrlOnTarget(source, options, attempt);
     } catch (error) {
       this._syncLoadedModelAfterFailedLoad(attempt);
       throw error;
@@ -6468,6 +6488,9 @@ var LlamaWebGpuBridge = class {
       delete workerOptions.onUsage;
       delete workerOptions.signal;
       delete workerOptions.__llamadartEmptyRetryAttempted;
+      if (Array.isArray(options.parts)) {
+        workerOptions.parts = resolvePartUrls(options.parts);
+      }
       const speculative = options.speculativeDecoding;
       if (speculative != null && typeof speculative === "object" && !Array.isArray(speculative)) {
         const resolveCache = (source) => typeof source === "string" && source.length > 0 ? normalizeAbsoluteUrl(source) : source;
@@ -6603,7 +6626,8 @@ var LlamaWebGpuBridge = class {
       { kind: "projector-load" }
     );
   }
-  async _loadMultimodalProjectorUnlocked(url) {
+  async _loadMultimodalProjectorUnlocked(source) {
+    const url = typeof source === "string" && source.length > 0 ? normalizeAbsoluteUrl(source) : source;
     const startedWithWorker = this._workerProxy != null;
     const invokeRuntimeLoad = async () => {
       if (!this._runtime) {
@@ -7518,7 +7542,8 @@ var LlamaWebGpuBridge = class {
     try {
       await this._restoreWorkerModelIfMissing();
       if (Array.isArray(text)) await this._getEmbeddingCapabilitiesUnlocked();
-      return await this._callWorker("embed", [text, options]);
+      const workerInput = Array.isArray(text) ? resolvePartUrls(text) : text;
+      return await this._callWorker("embed", [workerInput, options]);
     } catch (error) {
       this._throwIfOperationCancelled(error, "Embedding was cancelled.");
       if (!this._isWorkerUnusableError(error)) {
@@ -7544,7 +7569,8 @@ var LlamaWebGpuBridge = class {
     try {
       await this._restoreWorkerModelIfMissing();
       if (normalized.some(Array.isArray)) await this._getEmbeddingCapabilitiesUnlocked();
-      return await this._callWorker("embedBatch", [normalized, options]);
+      const workerInputs = normalized.map((input) => Array.isArray(input) ? resolvePartUrls(input) : input);
+      return await this._callWorker("embedBatch", [workerInputs, options]);
     } catch (error) {
       this._throwIfOperationCancelled(error, "Batch embedding was cancelled.");
       if (!this._isWorkerUnusableError(error)) {
