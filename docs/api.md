@@ -480,7 +480,8 @@ stateSaveFile(path: string, tokens?: number[] | ArrayLike<number>): Promise<true
 
 Saves the current llama.cpp session to a path inside the active runtime's WASMFS
 and stores the supplied token list in the session metadata. The method returns
-`true` on success.
+`true` on success. A path the runtime cannot create, such as one in a missing
+directory, rejects with `Cannot open state file <path>: <reason>`.
 
 ### `stateLoadFile(path, tokenCapacity?)`
 
@@ -493,7 +494,9 @@ whose numeric conversion is greater than zero is truncated and used; all other
 values fall back to the active context size. The resolved capacity must be at
 least large enough for the stored token list and no larger than the active
 context size. The resolved `{ tokens }` value is the token list stored at save
-time.
+time. A missing or unreadable path rejects with `Cannot open state file <path>:
+<reason>` and keeps the current context state. WASMFS paths do not survive a
+page reload; use `stateSaveBytes()` and `stateLoadBytes()` for durable state.
 
 ### `stateSaveBytes(tokens?)`
 

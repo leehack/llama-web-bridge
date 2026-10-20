@@ -47,6 +47,24 @@ void clear_error() {
   g_last_error.clear();
 }
 
+// llama.cpp's state file functions catch the exception llama_file throws when
+// the open or a read fails, but exception catching is compiled out of llama.cpp
+// here, so that throw would abort the core. Open the file the same way first.
+// WASMFS opens a directory for reading, and the first read then throws.
+bool can_open_state_file(const char * state_path, const char * mode) {
+  struct stat info;
+  const bool is_directory = stat(state_path, &info) == 0 && S_ISDIR(info.st_mode);
+  FILE * file = is_directory ? nullptr : std::fopen(state_path, mode);
+  if (file == nullptr) {
+    set_error(
+        std::string("Cannot open state file ") + state_path + ": "
+        + std::strerror(is_directory ? EISDIR : errno));
+    return false;
+  }
+  std::fclose(file);
+  return true;
+}
+
 void webgpu_log_callback(
     ggml_log_level level,
     const char * text,

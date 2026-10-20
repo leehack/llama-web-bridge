@@ -88,6 +88,24 @@ require(
     && loadWrapper.includes('g_last_detokenized.clear();'),
   'state load failure must clear potentially stale KV/prompt-cache/output state',
 );
+const saveWrapper = extractNativeFunction('llamadart_webgpu_state_save_file');
+const openBeforeLlama = (wrapper, mode, llamaCall) => {
+  const open = wrapper.indexOf(`can_open_state_file(state_path, "${mode}")`);
+  return open >= 0 && open < wrapper.indexOf(llamaCall);
+};
+require(
+  openBeforeLlama(loadWrapper, 'rb', 'llama_state_load_file(')
+    && openBeforeLlama(saveWrapper, 'wb', 'llama_state_save_file('),
+  'state wrappers must open the file before llama.cpp does: its open error is a C++ throw that aborts the core',
+);
+require(
+  /if \(!can_open_state_file\(state_path, "rb"\)\) \{(?:(?!llama_memory_clear)[^}])*return -7;\s*\}/s.test(loadWrapper),
+  'a state file that cannot be opened must reject with its own code and keep the current context state',
+);
+require(
+  /bool can_open_state_file\([^)]*\) \{.*?S_ISDIR\(info\.st_mode\).*?std::fopen\(state_path, mode\).*?set_error\(.*?std::strerror\(/s.test(SRC),
+  'the state file open check must reject directories and report the path and the open error',
+);
 require(
   SRC.includes('g_generation_active')
     && SRC.includes('State cannot be saved or loaded during active generation'),
