@@ -17,7 +17,7 @@ import {
   loraScaleFrom,
   staleLoraAdapterError,
 } from './internal/lora.ts';
-import { cloneModelSource, hasModelSource, normalizeAbsoluteUrl } from './internal/model_source.ts';
+import { cloneModelSource, hasModelSource, normalizeAbsoluteUrl, resolveModelSource, resolvePartUrls } from './internal/model_source.ts';
 import { bufferSourceBytes, toUint8Array } from './internal/typed_values.ts';
 import { LlamaWebGpuBridgeRuntime } from './runtime.ts';
 import { emptyBridgeState, serializeWorkerError } from './worker_protocol.ts';
@@ -1760,7 +1760,9 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
   async _loadModelFromUrlUnlocked(url: string | string[], options: LoadModelOptions = {}) {
     const attempt: WorkerLoadAttempt = { proxy: null, state: null, loaded: false };
     try {
-      return await this._loadModelFromUrlOnTarget(url, options, attempt);
+      // The worker resolves relative URLs against its own script URL.
+      const source = resolveModelSource(url) as string | string[];
+      return await this._loadModelFromUrlOnTarget(source, options, attempt);
     } catch (error) {
       this._syncLoadedModelAfterFailedLoad(attempt);
       throw error;
@@ -2015,6 +2017,10 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
       delete workerOptions.onUsage;
       delete workerOptions.signal;
       delete workerOptions.__llamadartEmptyRetryAttempted;
+      if (Array.isArray(options.parts)) {
+        // The worker resolves relative URLs against its own script URL.
+        workerOptions.parts = resolvePartUrls(options.parts);
+      }
       const speculative = options.speculativeDecoding;
       if (speculative != null && typeof speculative === 'object' && !Array.isArray(speculative)) {
         // The worker resolves relative URLs against its own script URL.
@@ -2185,7 +2191,9 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
     );
   }
 
-  async _loadMultimodalProjectorUnlocked(url: string) {
+  async _loadMultimodalProjectorUnlocked(source: string) {
+    // The worker resolves relative URLs against its own script URL.
+    const url = typeof source === 'string' && source.length > 0 ? normalizeAbsoluteUrl(source) : source;
     const startedWithWorker = this._workerProxy != null;
     const invokeRuntimeLoad = async () => {
       if (!this._runtime) {
@@ -3250,7 +3258,9 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
     try {
       await this._restoreWorkerModelIfMissing();
       if (Array.isArray(text)) await this._getEmbeddingCapabilitiesUnlocked();
-      return await this._callWorker<number[]>('embed', [text, options]);
+      // The worker resolves relative URLs against its own script URL.
+      const workerInput = Array.isArray(text) ? resolvePartUrls(text) : text;
+      return await this._callWorker<number[]>('embed', [workerInput, options]);
     } catch (error) {
       this._throwIfOperationCancelled(error, 'Embedding was cancelled.');
       if (!this._isWorkerUnusableError(error)) {
@@ -3281,7 +3291,9 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
     try {
       await this._restoreWorkerModelIfMissing();
       if (normalized.some(Array.isArray)) await this._getEmbeddingCapabilitiesUnlocked();
-      return await this._callWorker<number[][]>('embedBatch', [normalized, options]);
+      // The worker resolves relative URLs against its own script URL.
+      const workerInputs = normalized.map((input) => (Array.isArray(input) ? resolvePartUrls(input) : input));
+      return await this._callWorker<number[][]>('embedBatch', [workerInputs, options]);
     } catch (error) {
       this._throwIfOperationCancelled(error, 'Batch embedding was cancelled.');
       if (!this._isWorkerUnusableError(error)) {
