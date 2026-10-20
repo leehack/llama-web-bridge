@@ -206,7 +206,7 @@ function installCaches() {
   assert.equal(reloads, 0);
   assert.ok(runtime._runtimeNotes.includes('generation_recovery_cpu_skipped_lora'));
   runtime._modelBytes = 1;
-  runtime._releaseLoadedModel(core);
+  await runtime._releaseLoadedModel(core);
   assert.equal(runtime._loraAdaptersLoaded, false, 'releasing the model forgets its adapters');
 
   await bridge.dispose();

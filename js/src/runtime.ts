@@ -1417,14 +1417,16 @@ export class LlamaWebGpuBridgeRuntime {
   // before downloading the next model so both never occupy the wasm heap at once.
   // The core refuses while a generation or speech synthesis is still active,
   // which leaves the current model untouched.
-  _releaseLoadedModel(core: LlamaCoreModule) {
+  async _releaseLoadedModel(core: LlamaCoreModule) {
     const projectorPath = this._mmProjPath;
     const hasModelFiles = Array.isArray(this._modelPaths) && this._modelPaths.length > 0;
     if (this._modelBytes <= 0 && !projectorPath && !hasModelFiles) {
       return false;
     }
 
-    const rc = Number(core.ccall('llamadart_webgpu_free_model', 'number', [], []));
+    // Freeing a WebGPU context synchronizes the device, which suspends the core
+    // under ASYNCIFY; a synchronous ccall would return before the free finished.
+    const rc = Number(await core.ccall('llamadart_webgpu_free_model', 'number', [], [], { async: true }));
     if (rc !== 0) {
       throw new Error(this._coreErrorMessage('Failed to release the loaded model', rc));
     }
@@ -1983,7 +1985,7 @@ export class LlamaWebGpuBridgeRuntime {
     }
     // Release before any per-load option below changes, so a refused release
     // leaves the current model and its configuration intact.
-    this._releaseLoadedModel(core);
+    await this._releaseLoadedModel(core);
     this._mmProjSourceUrl = null;
 
     const configuredPoolHint = Number(this._threadPoolSizeHint);
@@ -2328,7 +2330,7 @@ export class LlamaWebGpuBridgeRuntime {
           );
           if (operationSignal?.aborted) {
             try {
-              core.ccall('llamadart_webgpu_shutdown', null, [], []);
+              await core.ccall('llamadart_webgpu_shutdown', null, [], [], { async: true });
               nativeAbortCleanupDone = true;
             } catch (_) {
               // best-effort cleanup after an unpreemptible native load
@@ -2338,7 +2340,7 @@ export class LlamaWebGpuBridgeRuntime {
         } catch (error) {
           if (operationSignal?.aborted && nativeLoadStarted && !nativeAbortCleanupDone) {
             try {
-              core.ccall('llamadart_webgpu_shutdown', null, [], []);
+              await core.ccall('llamadart_webgpu_shutdown', null, [], [], { async: true });
               nativeAbortCleanupDone = true;
             } catch (_) {
               // best-effort cleanup after an unpreemptible native load
@@ -2441,7 +2443,7 @@ export class LlamaWebGpuBridgeRuntime {
         let stabilized = false;
         for (const candidateLayers of retryCandidates) {
           try {
-            core.ccall('llamadart_webgpu_shutdown', null, [], []);
+            await core.ccall('llamadart_webgpu_shutdown', null, [], [], { async: true });
           } catch (_) {
             // ignore shutdown retries
           }
@@ -4494,14 +4496,14 @@ export class LlamaWebGpuBridgeRuntime {
       const mmprojFreeRc = Number(
         this._core.ccall('llamadart_webgpu_mmproj_free', 'number', [], []),
       );
-      this._core.ccall('llamadart_webgpu_shutdown', null, [], []);
-      this._deleteFsFile(mmprojPath);
       if (mmprojFreeRc !== 0) {
         this._emitLogger(
           'warn',
           this._coreErrorMessage('Failed to unload multimodal projector during dispose', mmprojFreeRc),
         );
       }
+      await this._core.ccall('llamadart_webgpu_shutdown', null, [], [], { async: true });
+      this._deleteFsFile(mmprojPath);
     }
     this._modelPath = null;
     this._modelPaths = [];

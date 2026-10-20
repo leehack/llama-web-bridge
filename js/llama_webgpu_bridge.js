@@ -2129,13 +2129,13 @@ var LlamaWebGpuBridgeRuntime = class {
   // before downloading the next model so both never occupy the wasm heap at once.
   // The core refuses while a generation or speech synthesis is still active,
   // which leaves the current model untouched.
-  _releaseLoadedModel(core) {
+  async _releaseLoadedModel(core) {
     const projectorPath = this._mmProjPath;
     const hasModelFiles = Array.isArray(this._modelPaths) && this._modelPaths.length > 0;
     if (this._modelBytes <= 0 && !projectorPath && !hasModelFiles) {
       return false;
     }
-    const rc = Number(core.ccall("llamadart_webgpu_free_model", "number", [], []));
+    const rc = Number(await core.ccall("llamadart_webgpu_free_model", "number", [], [], { async: true }));
     if (rc !== 0) {
       throw new Error(this._coreErrorMessage("Failed to release the loaded model", rc));
     }
@@ -2585,7 +2585,7 @@ var LlamaWebGpuBridgeRuntime = class {
     if (modelUrls.length === 0) {
       throw new Error("Model URL is empty.");
     }
-    this._releaseLoadedModel(core);
+    await this._releaseLoadedModel(core);
     this._mmProjSourceUrl = null;
     const configuredPoolHint = Number(this._threadPoolSizeHint);
     this._syncThreadPoolSizeHintFromCore();
@@ -2870,7 +2870,7 @@ var LlamaWebGpuBridgeRuntime = class {
           );
           if (operationSignal?.aborted) {
             try {
-              core.ccall("llamadart_webgpu_shutdown", null, [], []);
+              await core.ccall("llamadart_webgpu_shutdown", null, [], [], { async: true });
               nativeAbortCleanupDone = true;
             } catch (_) {
             }
@@ -2879,7 +2879,7 @@ var LlamaWebGpuBridgeRuntime = class {
         } catch (error) {
           if (operationSignal?.aborted && nativeLoadStarted && !nativeAbortCleanupDone) {
             try {
-              core.ccall("llamadart_webgpu_shutdown", null, [], []);
+              await core.ccall("llamadart_webgpu_shutdown", null, [], [], { async: true });
               nativeAbortCleanupDone = true;
             } catch (_) {
             }
@@ -2959,7 +2959,7 @@ var LlamaWebGpuBridgeRuntime = class {
         let stabilized = false;
         for (const candidateLayers of retryCandidates) {
           try {
-            core.ccall("llamadart_webgpu_shutdown", null, [], []);
+            await core.ccall("llamadart_webgpu_shutdown", null, [], [], { async: true });
           } catch (_) {
           }
           let retryRc = 0;
@@ -4722,14 +4722,14 @@ var LlamaWebGpuBridgeRuntime = class {
       const mmprojFreeRc = Number(
         this._core.ccall("llamadart_webgpu_mmproj_free", "number", [], [])
       );
-      this._core.ccall("llamadart_webgpu_shutdown", null, [], []);
-      this._deleteFsFile(mmprojPath);
       if (mmprojFreeRc !== 0) {
         this._emitLogger(
           "warn",
           this._coreErrorMessage("Failed to unload multimodal projector during dispose", mmprojFreeRc)
         );
       }
+      await this._core.ccall("llamadart_webgpu_shutdown", null, [], [], { async: true });
+      this._deleteFsFile(mmprojPath);
     }
     this._modelPath = null;
     this._modelPaths = [];
