@@ -114,7 +114,7 @@ export interface CompletionUsage {
   timeToFirstTokenMs: number | null;
   /** Milliseconds from the runtime starting the completion to its end. */
   durationMs: number;
-  /** `stop` at an end-of-generation token, `length` at `nPredict` or the context limit, `cancelled` after `cancel()` or an abort. */
+  /** `stop` at an end-of-generation token, `length` at `nPredict` or the context limit, `cancelled` after `cancel()` or an abort. In worker mode an abort that reaches the worker only after generation ended still rejects with an `AbortError`, but the usage keeps that generation's `stop` or `length`. */
   finishReason: CompletionFinishReason;
   /** Speculative decoding counters; present only when the completion used `speculativeDecoding`. */
   speculative?: SpeculativeDecodingUsage;

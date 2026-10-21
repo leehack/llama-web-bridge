@@ -381,7 +381,7 @@ export function renderHarness(modelFilename, memoryMode = 'wasm32') {
       let abortOutcome;
       try {
         await bridge.createCompletion(prompt, {
-          nPredict: 8,
+          nPredict: 128,
           temp: 0,
           topK: 1,
           topP: 1,
@@ -402,7 +402,7 @@ export function renderHarness(modelFilename, memoryMode = 'wasm32') {
       assert(usages.length === 1, \`\${mode} aborted completion reported usage \${usages.length} times\`);
       assert(usages[0].finishReason === 'cancelled', \`\${mode} aborted completion finished with \${usages[0].finishReason}\`);
       assert(
-        usages[0].completionTokens >= 1 && usages[0].completionTokens < 8,
+        usages[0].completionTokens >= 1 && usages[0].completionTokens < 128,
         \`\${mode} aborted completion reported \${usages[0].completionTokens} completion tokens\`,
       );
       const abortedUsage = usages[0];

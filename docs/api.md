@@ -330,7 +330,7 @@ generation starts. A nonzero `minP` or `presencePenalty`, or any
 | `completionTokens` | Generated tokens in the returned text. The end-of-generation token is not counted. |
 | `timeToFirstTokenMs` | Milliseconds from the runtime starting the completion to its first streamed text, or `null` when it streamed none. |
 | `durationMs` | Milliseconds from the runtime starting the completion to its end. |
-| `finishReason` | `stop` at an end-of-generation token, `length` at `nPredict` or the context limit, `cancelled` after `cancel()` or an abort during generation. |
+| `finishReason` | `stop` at an end-of-generation token, `length` at `nPredict` or the context limit, `cancelled` after `cancel()` or an abort during generation. In worker mode an abort that reaches the worker only after generation ended still rejects with an `AbortError`, but the usage keeps that generation's `stop` or `length`. |
 | `speculative` | Present only for a `speculativeDecoding` completion: `{ draftTokens, acceptedDraftTokens, draftAttempts, verifyTokens, replayTokens }`, the drafted and accepted tokens, draft steps (including those that drafted nothing), target tokens decoded to verify drafts, and target tokens decoded again after restoring a recurrent-state checkpoint. |
 
 Both times are measured by the runtime that generates, inside the worker in
