@@ -780,7 +780,7 @@ const stateBridge = (tweak = {}) => class FakeStateBridge {
     [onCall('direct runtime', 6, (usage) => [usage, usage]), 'direct runtime aborted completion reported usage 2 times'],
     [onCall('direct runtime', 6, edit({ finishReason: 'length' })), 'direct runtime aborted completion finished with length'],
     [onCall('direct runtime', 6, edit({ completionTokens: 0 })), 'direct runtime aborted completion reported 0 completion tokens'],
-    [onCall('worker runtime', 6, edit({ completionTokens: 8 })), 'worker runtime aborted completion reported 8 completion tokens'],
+    [onCall('worker runtime', 6, edit({ completionTokens: 128 })), 'worker runtime aborted completion reported 128 completion tokens'],
   ];
   for (const [tweak, message] of cases) {
     assert.equal(firstErrorLine(await runHarnessPage(page, stateBridge(tweak))), `Error: ${message}`, message);
