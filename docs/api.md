@@ -501,10 +501,12 @@ time. A missing or unreadable path rejects with `Cannot open state file <path>:
 <reason>` and keeps the current context state. A truncated snapshot, or one
 llama.cpp rejects (another format version, model architecture or cache
 layout), rejects with a message ending in `The current context state was
-kept.`, and the context and its prompt cache are unchanged. Snapshots carry no
-checksum, so corrupt bytes inside a well-formed snapshot are not detected. WASMFS
-paths do not survive a page reload; use `stateSaveBytes()` and
-`stateLoadBytes()` for durable state.
+kept.`, and the context and its prompt cache are unchanged. Keeping them needs
+memory for a copy of the current state; without it, a snapshot llama.cpp
+rejects clears them instead, with `The current context state could not be
+kept`. Snapshots carry no checksum, so corrupt bytes inside a well-formed
+snapshot are not detected. WASMFS paths do not survive a page reload; use
+`stateSaveBytes()` and `stateLoadBytes()` for durable state.
 
 ### `stateSaveBytes(tokens?)`
 

@@ -65,7 +65,13 @@ bool can_open_state_file(const char * state_path, const char * mode) {
   return true;
 }
 
-bool read_state_file(const char * state_path, std::vector<uint8_t> & bytes) {
+// The session header, token list and architecture name length of a state
+// file: everything check_state_snapshot reads, without the state itself.
+bool read_state_file_head(
+    const char * state_path,
+    size_t token_capacity,
+    std::vector<uint8_t> & head,
+    size_t & file_size) {
   if (!can_open_state_file(state_path, "rb")) {
     return false;
   }
@@ -73,8 +79,9 @@ bool read_state_file(const char * state_path, std::vector<uint8_t> & bytes) {
   FILE * file = stat(state_path, &info) == 0 ? std::fopen(state_path, "rb") : nullptr;
   bool read = file != nullptr;
   if (read) {
-    bytes.resize(static_cast<size_t>(info.st_size));
-    read = std::fread(bytes.data(), 1, bytes.size(), file) == bytes.size();
+    file_size = static_cast<size_t>(info.st_size);
+    head.resize(std::min(file_size, (4 + token_capacity) * sizeof(uint32_t)));
+    read = std::fread(head.data(), 1, head.size(), file) == head.size();
     std::fclose(file);
   }
   if (!read) {
@@ -94,25 +101,26 @@ uint32_t read_u32_le(const uint8_t * bytes) {
 // short header without touching the context, and a corrupt name length that
 // llama.cpp would otherwise allocate before reading.
 bool check_state_snapshot(
-    const std::vector<uint8_t> & bytes,
+    const std::vector<uint8_t> & head,
+    size_t file_size,
     size_t token_capacity,
     size_t & token_count,
     size_t & state_offset,
     std::string & error) {
   constexpr size_t header_size = 3 * sizeof(uint32_t);
-  if (bytes.size() < header_size) {
-    error = "State snapshot is truncated: " + std::to_string(bytes.size())
+  if (file_size < header_size) {
+    error = "State snapshot is truncated: " + std::to_string(file_size)
         + " bytes is shorter than its " + std::to_string(header_size) + "-byte header";
     return false;
   }
-  const uint32_t magic = read_u32_le(bytes.data());
-  const uint32_t version = read_u32_le(bytes.data() + 4);
+  const uint32_t magic = read_u32_le(head.data());
+  const uint32_t version = read_u32_le(head.data() + 4);
   if (magic != LLAMA_SESSION_MAGIC || version != LLAMA_SESSION_VERSION) {
     error = "State snapshot is not a llama.cpp session of version "
         + std::to_string(LLAMA_SESSION_VERSION);
     return false;
   }
-  token_count = read_u32_le(bytes.data() + 8);
+  token_count = read_u32_le(head.data() + 8);
   if (token_count > token_capacity) {
     error = "State snapshot holds " + std::to_string(token_count)
         + " tokens, more than tokenCapacity " + std::to_string(token_capacity);
@@ -120,13 +128,49 @@ bool check_state_snapshot(
   }
   state_offset = header_size + token_count * sizeof(llama_token);
   const size_t arch_offset = state_offset + sizeof(uint32_t);
-  if (bytes.size() < arch_offset
-      || bytes.size() - arch_offset < read_u32_le(bytes.data() + state_offset)) {
-    error = "State snapshot is truncated: " + std::to_string(bytes.size())
+  if (file_size < arch_offset
+      || file_size - arch_offset < read_u32_le(head.data() + state_offset)) {
+    error = "State snapshot is truncated: " + std::to_string(file_size)
         + " bytes ends inside its token list or model architecture";
     return false;
   }
   return true;
+}
+
+struct free_deleter {
+  void operator()(void * memory) const { std::free(memory); }
+};
+using malloc_buffer = std::unique_ptr<uint8_t, free_deleter>;
+
+// The snapshot and current-state copies make a state load safer but are not
+// needed for it, so they must never fail a load that would otherwise succeed.
+// With memory growth (the default build) malloc returns null when the heap
+// cannot grow. Without growth it aborts instead, so only the space above the
+// heap's break that the heap already holds is used.
+malloc_buffer try_state_load_alloc(size_t size, int32_t test_failure) {
+  if ((g_state_load_test_failures & test_failure) != 0) {
+    return nullptr;
+  }
+#if !LLAMADART_WEBGPU_ALLOW_MEMORY_GROWTH
+  constexpr size_t allocator_slack = 1 << 20;
+  const size_t heap_size = emscripten_get_heap_size();
+  const size_t heap_top = reinterpret_cast<uintptr_t>(sbrk(0));
+  if (heap_size < heap_top || heap_size - heap_top < allocator_slack
+      || heap_size - heap_top - allocator_slack < size) {
+    return nullptr;
+  }
+#endif
+  return malloc_buffer(static_cast<uint8_t *>(std::malloc(std::max<size_t>(size, 1))));
+}
+
+bool read_state_file_into(const char * state_path, uint8_t * bytes, size_t size) {
+  FILE * file = std::fopen(state_path, "rb");
+  if (file == nullptr) {
+    return false;
+  }
+  const bool read = std::fread(bytes, 1, size, file) == size;
+  std::fclose(file);
+  return read;
 }
 
 void webgpu_log_callback(

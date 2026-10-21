@@ -92,8 +92,9 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_state_load_file(
     return -4;
   }
 
-  std::vector<uint8_t> snapshot;
-  if (!read_state_file(state_path, snapshot)) {
+  std::vector<uint8_t> head;
+  size_t file_size = 0;
+  if (!read_state_file_head(state_path, static_cast<size_t>(token_capacity), head, file_size)) {
     set_error(
         g_last_error
         + ". State file paths are in-memory and do not survive a page reload; "
@@ -108,47 +109,63 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_state_load_file(
   size_t state_offset = 0;
   std::string rejection;
   if (!check_state_snapshot(
-          snapshot, static_cast<size_t>(token_capacity), restored_count, state_offset, rejection)) {
+          head, file_size, static_cast<size_t>(token_capacity), restored_count, state_offset, rejection)) {
     set_error(rejection + kept);
     return -5;
   }
 
-  // llama.cpp clears the context memory before it finds most problems, so a
-  // rejected snapshot is undone by restoring this copy.
+  // Restoring from memory leaks nothing when llama.cpp rejects the snapshot;
+  // without the memory, llama.cpp reads the file, as it did before.
+  bool loaded = false;
   llama_synchronize(g_state.ctx);
-  std::vector<uint8_t> current_state(llama_state_get_size(g_state.ctx));
-  if (llama_state_get_data(g_state.ctx, current_state.data(), current_state.size())
-      != current_state.size()) {
-    set_error("Failed to copy the current context state before loading the snapshot. The current context state was kept.");
-    return -5;
+  malloc_buffer snapshot = try_state_load_alloc(file_size, 1);
+  const bool snapshot_read = snapshot && read_state_file_into(state_path, snapshot.get(), file_size);
+  if (!snapshot_read) {
+    snapshot.reset();
   }
 
-  if (!llamadart_webgpu_state_set_data(
-          g_state.ctx,
-          snapshot.data() + state_offset,
-          snapshot.size() - state_offset,
-          &rejection)) {
-    std::string restore_error;
-    if (!llamadart_webgpu_state_set_data(
-            g_state.ctx, current_state.data(), current_state.size(), &restore_error)) {
-      llama_memory_clear(llama_get_memory(g_state.ctx), false);
-      g_cached_prompt_tokens.clear();
-      g_last_output.clear();
-      g_last_piece.clear();
-      g_last_detokenized.clear();
-      set_error(
-          "State snapshot rejected (" + rejection + "), and restoring the current context state failed ("
-          + restore_error + "), so the context state was cleared.");
-      return -6;
+  // llama.cpp clears the context memory before it finds most problems, so a
+  // rejected snapshot is undone by restoring this copy when there is room.
+  const size_t current_size = llama_state_get_size(g_state.ctx);
+  malloc_buffer current_state = try_state_load_alloc(current_size, 2);
+  if (current_state
+      && llama_state_get_data(g_state.ctx, current_state.get(), current_size) != current_size) {
+    current_state.reset();
+  }
+
+  if (snapshot) {
+    loaded = llamadart_webgpu_state_set_data(
+        g_state.ctx, snapshot.get() + state_offset, file_size - state_offset, &rejection);
+    snapshot.reset();
+  } else {
+    std::vector<llama_token> file_tokens(static_cast<size_t>(token_capacity));
+    loaded = llamadart_webgpu_state_read_file(
+        g_state.ctx, state_path, file_tokens.data(), file_tokens.size(), &rejection);
+  }
+
+  if (!loaded) {
+    std::string restore_error = "there was not enough memory to copy it first";
+    if (current_state
+        && llamadart_webgpu_state_set_data(
+            g_state.ctx, current_state.get(), current_size, &restore_error)) {
+      set_error("State snapshot rejected: " + rejection + kept);
+      return -5;
     }
-    set_error("State snapshot rejected: " + rejection + kept);
-    return -5;
+    llama_memory_clear(llama_get_memory(g_state.ctx), false);
+    g_cached_prompt_tokens.clear();
+    g_last_output.clear();
+    g_last_piece.clear();
+    g_last_detokenized.clear();
+    set_error(
+        "State snapshot rejected: " + rejection + ". The current context state could not be kept ("
+        + restore_error + "), so it was cleared.");
+    return -6;
   }
 
-  const auto * snapshot_tokens = snapshot.data() + 3 * sizeof(uint32_t);
   std::vector<llama_token> restored_tokens(restored_count);
   if (restored_count > 0) {
-    std::memcpy(restored_tokens.data(), snapshot_tokens, restored_count * sizeof(llama_token));
+    std::memcpy(
+        restored_tokens.data(), head.data() + 3 * sizeof(uint32_t), restored_count * sizeof(llama_token));
   }
   g_cached_prompt_tokens = restored_tokens;
   g_last_tokens_json = serialize_tokens_json(restored_tokens);
@@ -157,6 +174,12 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_state_load_file(
   g_last_detokenized.clear();
 
   return static_cast<int32_t>(restored_count);
+}
+
+// Test hook for the state smoke: makes the optional copies of the next state
+// loads fail, as they do when the heap is out of memory. Not part of the API.
+EMSCRIPTEN_KEEPALIVE void llamadart_webgpu_test_state_load_failures(int32_t failures) {
+  g_state_load_test_failures = failures;
 }
 
 EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_detokenize_from_json(

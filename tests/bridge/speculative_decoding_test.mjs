@@ -618,6 +618,7 @@ const CASES = [
       'llamadart_webgpu_draft_context_init',
       'llamadart_webgpu_speculative_init',
       'llamadart_webgpu_state_set_data',
+      'llamadart_webgpu_state_read_file',
     ]);
     for (const name of names.slice(2, 5)) {
       assert.match(wrappers, new RegExp(`extern "C" __attribute__\\(\\(noinline\\)\\)[^\\n]*\\n${name}\\(`), `${name} must stay noinline`);

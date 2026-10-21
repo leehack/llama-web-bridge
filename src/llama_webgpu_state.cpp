@@ -32,3 +32,27 @@ extern "C" __attribute__((noinline)) bool llamadart_webgpu_state_set_data(
   }
   return false;
 }
+
+extern "C" __attribute__((noinline)) bool llamadart_webgpu_state_read_file(
+    llama_context * ctx,
+    const char * path,
+    llama_token * tokens,
+    size_t token_capacity,
+    std::string * error_out) {
+  try {
+    size_t token_count = 0;
+    if (llama_state_load_file(ctx, path, tokens, token_capacity, &token_count)) {
+      return true;
+    }
+    if (error_out != nullptr) {
+      *error_out = "rejected by llama.cpp";
+    }
+  } catch (const std::bad_alloc &) {
+    std::abort();
+  } catch (const std::exception & error) {
+    if (error_out != nullptr) {
+      *error_out = error.what();
+    }
+  }
+  return false;
+}

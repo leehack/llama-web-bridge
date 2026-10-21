@@ -449,6 +449,7 @@ assert.deepEqual(webGpuLaunchArgs('linux'), [
   const stateEntry = (mode) => ({
     mode, preload: true, progressEvents: 3, embeddingComponents: 32, embeddingBatchSize: 2, savedBytes: 1000, restoredTokens: 2,
     rejectedSnapshots: 130,
+    allocationFallbacks: mode === 'direct runtime' ? 3 : null,
   });
   const statePayload = () => ({
     ok: true,
@@ -471,6 +472,8 @@ assert.deepEqual(webGpuLaunchArgs('linux'), [
     [mutate(statePayload(), (p) => { p.modeResults[0].embeddingBatchSize = 1; }), true, 'embedding batch result was incomplete'],
     [mutate(statePayload(), (p) => { delete p.modeResults[1].restoredTokens; }), true, 'restored token metadata missing'],
     [mutate(statePayload(), (p) => { p.modeResults[0].rejectedSnapshots = 0; }), true, 'corrupt state snapshots were not checked'],
+    [mutate(statePayload(), (p) => { p.modeResults[0].allocationFallbacks = 2; }), true, 'state load allocation fallbacks were not checked'],
+    [mutate(statePayload(), (p) => { p.modeResults[1].allocationFallbacks = 3; }), true, 'state load allocation fallbacks were not checked'],
   ];
   for (const [payload, modelBacked, message] of stateCases) {
     if (message === null) stateSmoke.checkPayload(payload, modelBacked);
@@ -589,7 +592,19 @@ const stateBridge = (tweak = {}) => class FakeStateBridge {
     this.loaded = false;
     this.cache = [];
     this.calls = 0;
-    if (!disableWorker) this._workerProxy = {};
+    this.failures = 0;
+    if (disableWorker) {
+      this._runtime = {
+        _core: {
+          ccall: (name, _returnType, _argTypes, [failures]) => {
+            assert.equal(name, 'llamadart_webgpu_test_state_load_failures');
+            this.failures = failures;
+          },
+        },
+      };
+    } else {
+      this._workerProxy = {};
+    }
   }
 
   getModelMetadata() {
@@ -630,6 +645,10 @@ const stateBridge = (tweak = {}) => class FakeStateBridge {
       if (tweak.corruptSnapshot === 'abort') throw new Error('Aborted(undefined)');
       if (tweak.corruptSnapshot === 'accept') return { tokens: [] };
       if (tweak.corruptSnapshot === 'clear') this.cache = [];
+      if (snapshot === null && (this.failures & 2) !== 0 && tweak.corruptSnapshot !== 'keep-without-copy') {
+        this.cache = [];
+        throw new Error('State load failed: State snapshot rejected: truncated. The current context state could not be kept, so it was cleared.');
+      }
       throw new Error(`State load failed: State snapshot rejected: ${tweak.rejectionReason ?? snapshot}. The current context state was kept.`);
     }
     this.cache = snapshot.cache;
@@ -710,6 +729,8 @@ const stateBridge = (tweak = {}) => class FakeStateBridge {
     /direct runtime stateLoadBytes of a 1-byte prefix of a 61-byte snapshot did not reject cleanly: null/);
   assert.match(firstErrorLine(await runHarnessPage(page, stateBridge({ rejectionReason: 'rejected by llama.cpp' }))),
     /direct runtime stateLoadBytes of a snapshot with a wrong magic did not reject cleanly: .*rejected by llama\.cpp/);
+  assert.match(firstErrorLine(await runHarnessPage(page, stateBridge({ corruptSnapshot: 'keep-without-copy' }))),
+    /direct runtime stateLoadBytes of a truncated snapshot without allocations 2 did not reject cleanly: .*The current context state was kept/);
   assert.match(firstErrorLine(await runHarnessPage(page, stateBridge({ corruptSnapshot: 'clear' }))),
     /direct runtime stateLoadBytes of a 1-byte prefix of a 61-byte snapshot changed the context state/);
   stateSmoke.checkPayload(passed, true);

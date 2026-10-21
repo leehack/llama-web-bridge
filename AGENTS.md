@@ -231,11 +231,11 @@ candidate and exact `candidate_run_id`/`attestation_run_id` pair.
   adapter` errors, and the speculative wrappers in
   `src/llama_webgpu_speculative.cpp`, which turn draft model, draft context and
   speculative setup throws into load or generation errors, and
-  `llamadart_webgpu_state_set_data`, which turns state restore throws on a
-  truncated or mismatched snapshot into a rejected state load. Do not widen
-  it with `-fexceptions` or `-fwasm-exceptions`: whole-TU catching puts
-  `invoke_*` trampolines and their ASYNCIFY instrumentation on hot paths, and
-  Wasm EH conflicts with ASYNCIFY.
+  `llamadart_webgpu_state_set_data` and `llamadart_webgpu_state_read_file`,
+  which turn state restore throws on a truncated or mismatched snapshot into
+  a rejected state load. Do not widen it with `-fexceptions` or
+  `-fwasm-exceptions`: whole-TU catching puts `invoke_*` trampolines and their
+  ASYNCIFY instrumentation on hot paths, and Wasm EH conflicts with ASYNCIFY.
   The link setting makes every other uncaught throw escape `ccall` as a
   `CppException`; `src/llama_webgpu_core_post.js` turns it back into
   `abort()` for `ccall`, the bridge's only entry into the core, so keep the two

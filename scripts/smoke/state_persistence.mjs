@@ -273,6 +273,53 @@ export function renderHarness(modelFilename, memoryMode = 'wasm32') {
       }
       assert(bridge._workerProxy === workerBeforeCorruptSnapshots, \`\${mode} corrupt state snapshot replaced the runtime\`);
 
+      // The core's copies of the snapshot and of the current state are
+      // optional. Without them (bit 1 and bit 2 of the test hook) a snapshot
+      // still loads, and a rejected one still rejects: the current state is
+      // kept while its copy exists and cleared, as before, when it does not.
+      let allocationFallbacks = null;
+      if (mode === 'direct runtime') {
+        const core = bridge._runtime && bridge._runtime._core;
+        assert(core && typeof core.ccall === 'function', \`\${mode} core is not reachable for the allocation test hook\`);
+        const failAllocations = (failures) => core.ccall('llamadart_webgpu_test_state_load_failures', null, ['number'], [failures]);
+        const truncated = source.slice(0, source.byteLength - 1);
+        allocationFallbacks = 0;
+        try {
+          for (const [failures, keepsState] of [[1, true], [2, false], [3, false]]) {
+            failAllocations(failures);
+            const label = \`without allocations \${failures}\`;
+            const reloaded = await bridge.stateLoadBytes(snapshot.slice(), bridge.getContextSize());
+            assert(arraysEqual(reloaded.tokens, tokens), \`\${mode} snapshot did not load \${label}\`);
+            assert(
+              arraysEqual([...await bridge.stateSaveBytes(tokens)], stateBeforeCorruptSnapshots),
+              \`\${mode} snapshot loaded \${label} did not restore the saved state\`,
+            );
+            await rejectsCleanly(
+              \`stateLoadBytes of a snapshot with a wrong magic \${label}\`,
+              () => bridge.stateLoadBytes(withUint32(0, 0), bridge.getContextSize()),
+              'The current context state was kept',
+            );
+            await rejectsCleanly(
+              \`stateLoadBytes of a truncated snapshot \${label}\`,
+              () => bridge.stateLoadBytes(truncated, bridge.getContextSize()),
+              keepsState ? 'The current context state was kept' : 'The current context state could not be kept',
+            );
+            assert(
+              arraysEqual([...await bridge.stateSaveBytes(tokens)], stateBeforeCorruptSnapshots) === keepsState,
+              \`\${mode} truncated snapshot \${label} \${keepsState ? 'changed' : 'did not clear'} the context state\`,
+            );
+            allocationFallbacks += 1;
+          }
+        } finally {
+          failAllocations(0);
+        }
+        await bridge.stateLoadBytes(snapshot.slice(), bridge.getContextSize());
+        assert(
+          arraysEqual([...await bridge.stateSaveBytes(tokens)], stateBeforeCorruptSnapshots),
+          \`\${mode} snapshot did not reload after the allocation fallbacks\`,
+        );
+      }
+
       usages.length = 0;
       const afterRestoreText = await bridge.createCompletion(prompt, {
         nPredict: 1,
@@ -386,6 +433,7 @@ export function renderHarness(modelFilename, memoryMode = 'wasm32') {
         savedBytes: snapshot.byteLength,
         restoredTokens: restored.tokens.length,
         rejectedSnapshots: corruptSnapshots.length,
+        allocationFallbacks,
         initialUsage,
         restoredUsage,
         repeatedUsage,
@@ -525,6 +573,10 @@ export function checkPayload(payload, modelBacked) {
     ensure(positiveInt(pyGet(entry, 'savedBytes')), 'state snapshot was empty');
     ensure(positiveInt(pyGet(entry, 'restoredTokens')), 'restored token metadata missing');
     ensure(positiveInt(pyGet(entry, 'rejectedSnapshots')), 'corrupt state snapshots were not checked');
+    ensure(
+      pyGet(entry, 'allocationFallbacks') === (pyGet(entry, 'mode') === 'direct runtime' ? 3 : null),
+      'state load allocation fallbacks were not checked',
+    );
   }
 }
 

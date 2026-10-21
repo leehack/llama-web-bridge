@@ -86,43 +86,62 @@ require(
   'state load must not hand a file to llama.cpp: its short reads throw past the catch compiled out of llama.cpp',
 );
 const loadSteps = [
-  'read_state_file(state_path, snapshot)',
+  'read_state_file_head(state_path,',
   'check_state_snapshot(',
-  'llama_state_get_data(g_state.ctx, current_state.data(), current_state.size())',
-  'llamadart_webgpu_state_set_data(\n          g_state.ctx,\n          snapshot.data() + state_offset,',
-  'llamadart_webgpu_state_set_data(\n            g_state.ctx, current_state.data(), current_state.size(), &restore_error)',
+  'try_state_load_alloc(file_size, 1)',
+  'try_state_load_alloc(current_size, 2)',
+  'llamadart_webgpu_state_set_data(\n        g_state.ctx, snapshot.get() + state_offset,',
+  'llamadart_webgpu_state_read_file(',
+  'llamadart_webgpu_state_set_data(\n            g_state.ctx, current_state.get(), current_size, &restore_error)',
 ].map((step) => loadWrapper.indexOf(step));
 require(
   loadSteps.every((index, i) => index >= 0 && (i === 0 || loadSteps[i - 1] < index)),
-  'state load must read and check the snapshot, copy the current state, restore through the catching wrapper, and restore the copy when llama.cpp rejects the snapshot',
+  'state load must check the snapshot header, try to copy the snapshot and the current state, restore through a catching wrapper, and restore the copy when llama.cpp rejects the snapshot',
+);
+require(
+  !/std::vector<uint8_t>\s+(snapshot|current_state)\b/.test(loadWrapper)
+    && /if \(snapshot\) \{\s*loaded = llamadart_webgpu_state_set_data\(.*?\} else \{.*?loaded = llamadart_webgpu_state_read_file\(/s.test(loadWrapper)
+    && /if \(current_state\s*&& llamadart_webgpu_state_set_data\(/.test(loadWrapper),
+  'the snapshot and current-state copies must be optional: a load without them falls back to llama.cpp reading the file, and a rejection without a copy clears the state',
+);
+const tryAlloc = SRC.slice(SRC.indexOf('malloc_buffer try_state_load_alloc('), SRC.indexOf('bool read_state_file_into('));
+require(
+  /g_state_load_test_failures & test_failure/.test(tryAlloc)
+    && /#if !LLAMADART_WEBGPU_ALLOW_MEMORY_GROWTH.*?sbrk\(0\).*?return nullptr;.*?#endif/s.test(tryAlloc)
+    && /std::malloc\(/.test(tryAlloc) && !/\bnew\b|std::vector/.test(tryAlloc)
+    && /LLAMADART_WEBGPU_ALLOW_MEMORY_GROWTH=\$<BOOL:\$\{LLAMADART_WEBGPU_ALLOW_MEMORY_GROWTH\}>/.test(CMAKE)
+    && CMAKE.includes("'_llamadart_webgpu_test_state_load_failures'"),
+  'optional state-load copies must use a null-returning malloc, stay within the heap when it cannot grow, and honour the test hook',
 );
 const stateClears = [...loadWrapper.matchAll(/llama_memory_clear|g_cached_prompt_tokens\.clear\(\)/g)].map(({ index }) => index);
 require(
   stateClears.length === 2
-    && stateClears.every((index) => index > loadSteps[4] && index < loadWrapper.indexOf('return -6;'))
-    && /llama_memory_clear\(llama_get_memory\(g_state\.ctx\), false\);\s*g_cached_prompt_tokens\.clear\(\);\s*g_last_output\.clear\(\);\s*g_last_piece\.clear\(\);\s*g_last_detokenized\.clear\(\);\s*set_error\([^;]*\);\s*return -6;/.test(loadWrapper),
-  'only a failed restore of the copied state may clear the KV, prompt-cache and output state',
+    && stateClears.every((index) => index > loadSteps[6] && index < loadWrapper.indexOf('return -6;'))
+    && /llama_memory_clear\(llama_get_memory\(g_state\.ctx\), false\);\s*g_cached_prompt_tokens\.clear\(\);\s*g_last_output\.clear\(\);\s*g_last_piece\.clear\(\);\s*g_last_detokenized\.clear\(\);\s*set_error\([^]*?could not be kept[^]*?\);\s*return -6;/.test(loadWrapper),
+  'only a rejection whose current-state copy is missing or fails to restore may clear the KV, prompt-cache and output state',
 );
 const rejections = [...loadWrapper.matchAll(/set_error\(((?:[^;"]|"[^"]*")*)\);\s*return (-[57]);/g)];
 require(
-  rejections.filter(([, , code]) => code === '-5').length === 3
+  rejections.filter(([, , code]) => code === '-5').length === 2
+    && (loadWrapper.match(/return -5;/g) ?? []).length === 2
     && rejections.filter(([, , code]) => code === '-7').length === 1
-    && rejections.every(([, message, code]) => code === '-7' || /\bkept\b|The current context state was kept/.test(message))
+    && rejections.every(([, message, code]) => code === '-7' || /\bkept\b/.test(message))
     && /const std::string kept =[^;]*The current context state was kept\.";/.test(loadWrapper),
-  'unreadable, rejected and uncopyable snapshots must reject with their own codes and say the current context state was kept',
+  'unreadable and rejected snapshots must reject with their own codes and say the current context state was kept',
 );
 require(
-  /bool check_state_snapshot\([^)]*\) \{.*?magic != LLAMA_SESSION_MAGIC \|\| version != LLAMA_SESSION_VERSION.*?token_count > token_capacity.*?bytes\.size\(\) < arch_offset\s*\|\| bytes\.size\(\) - arch_offset < read_u32_le\(bytes\.data\(\) \+ state_offset\)/s.test(SRC),
-  'the snapshot check must cover the session header, the token capacity and the architecture name length llama.cpp allocates before reading',
+  /bool check_state_snapshot\([^)]*\) \{.*?magic != LLAMA_SESSION_MAGIC \|\| version != LLAMA_SESSION_VERSION.*?token_count > token_capacity.*?file_size < arch_offset\s*\|\| file_size - arch_offset < read_u32_le\(head\.data\(\) \+ state_offset\)/s.test(SRC)
+    && /head\.resize\(std::min\(file_size, \(4 \+ token_capacity\) \* sizeof\(uint32_t\)\)\)/.test(SRC),
+  'the snapshot check must read the header, tokens and name length, and cover the token capacity and the architecture name length llama.cpp allocates before reading',
 );
 const STATE_RESTORE = readRepoText('src/llama_webgpu_state.cpp');
 require(
-  CMAKE.includes("'llamadart_webgpu_state_set_data'")
+  ['llamadart_webgpu_state_set_data', 'llamadart_webgpu_state_read_file'].every((name) => CMAKE.includes(`'${name}'`)
+    && new RegExp(String.raw`extern "C" __attribute__\(\(noinline\)\) bool ${name}\(`).test(STATE_RESTORE))
     && /set_source_files_properties\([^)]*src\/llama_webgpu_state\.cpp/.test(CMAKE)
-    && /extern "C" __attribute__\(\(noinline\)\) bool llamadart_webgpu_state_set_data\(/.test(STATE_RESTORE)
-    && /catch \(const std::exception & error\)/.test(STATE_RESTORE)
+    && (STATE_RESTORE.match(/catch \(const std::exception & error\)/g) ?? []).length === 2
     && /n_read == size/.test(STATE_RESTORE),
-  'state restore must catch llama.cpp throws by name, with exception catching compiled and linked, and require every byte read',
+  'state restores must catch llama.cpp throws by name, with exception catching compiled and linked, and require every byte read',
 );
 require(
   /bool can_open_state_file\([^)]*\) \{.*?S_ISDIR\(info\.st_mode\).*?std::fopen\(state_path, mode\).*?set_error\(.*?std::strerror\(/s.test(SRC),
