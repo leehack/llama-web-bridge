@@ -186,6 +186,32 @@ test('older native at the published alignment is superseded by a newer scanned n
   assert.deepEqual(gateway.dispatches, []);
 }));
 
+test('older native with a failed or in-flight candidate is observed, not superseded', withAdvancePipelineFixture((self) => {
+  const binding = new model.PipelineBinding({ bridgeSourceSha: BRIDGE_SHA, releaseTag: 'v0.1.41', releaseRebuild: 0 });
+  for (const [status, conclusion, action] of [
+    ['completed', 'failure', OrchestrationAction.BLOCKED],
+    ['in_progress', null, OrchestrationAction.IN_FLIGHT],
+  ]) {
+    const run = runPayload({
+      runId: OLDER_IDS.candidate,
+      path: model.CANDIDATE_WORKFLOW_PATH,
+      runName: runNames.candidateRunName(self.correlationId, binding),
+      status,
+      conclusion,
+    });
+    const gateway = new FakeGateway({ jsonRoutes: self.routes({ releases: [priorAlignment(self)], candidateRuns: [run] }) });
+    const plan = driver.advancePipeline(gateway, {
+      provenance: self.provenance,
+      workspace: self.tmp,
+      dryRun: true,
+      newerNativeScanned: true,
+      scannedProvenances: [self.provenance, self.newerNative()],
+    });
+    assert.equal(plan.action, action, status);
+    assert.equal(plan.releaseTarget.releaseTag, 'v0.1.41', status);
+  }
+}));
+
 test('fresh older native does not hold back a newer native pipeline with a lower tag', withAdvancePipelineFixture(async (self) => {
   const older = self.provenance;
   const newer = self.newerNative();
