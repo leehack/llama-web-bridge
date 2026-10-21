@@ -274,9 +274,10 @@ export function renderHarness(modelFilename, memoryMode = 'wasm32') {
       assert(bridge._workerProxy === workerBeforeCorruptSnapshots, \`\${mode} corrupt state snapshot replaced the runtime\`);
 
       // The core's copies of the snapshot and of the current state are
-      // optional. Without them (bit 1 and bit 2 of the test hook) a snapshot
-      // still loads, and a rejected one still rejects: the current state is
-      // kept while its copy exists and cleared, as before, when it does not.
+      // optional. Without them (bit 1 and bit 2 of the test hook), or without
+      // room to keep them beside the restore (bit 4), a snapshot still loads
+      // and a rejected one still rejects: the current state is kept while its
+      // copy exists and cleared, as before, when it does not.
       let allocationFallbacks = null;
       if (mode === 'direct runtime') {
         const core = bridge._runtime && bridge._runtime._core;
@@ -285,7 +286,7 @@ export function renderHarness(modelFilename, memoryMode = 'wasm32') {
         const truncated = source.slice(0, source.byteLength - 1);
         allocationFallbacks = 0;
         try {
-          for (const [failures, keepsState] of [[1, true], [2, false], [3, false]]) {
+          for (const [failures, keepsState] of [[1, false], [2, false], [3, false], [4, false]]) {
             failAllocations(failures);
             const label = \`without allocations \${failures}\`;
             const reloaded = await bridge.stateLoadBytes(snapshot.slice(), bridge.getContextSize());
@@ -574,7 +575,7 @@ export function checkPayload(payload, modelBacked) {
     ensure(positiveInt(pyGet(entry, 'restoredTokens')), 'restored token metadata missing');
     ensure(positiveInt(pyGet(entry, 'rejectedSnapshots')), 'corrupt state snapshots were not checked');
     ensure(
-      pyGet(entry, 'allocationFallbacks') === (pyGet(entry, 'mode') === 'direct runtime' ? 3 : null),
+      pyGet(entry, 'allocationFallbacks') === (pyGet(entry, 'mode') === 'direct runtime' ? 4 : null),
       'state load allocation fallbacks were not checked',
     );
   }

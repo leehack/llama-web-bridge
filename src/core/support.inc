@@ -65,76 +65,79 @@ bool can_open_state_file(const char * state_path, const char * mode) {
   return true;
 }
 
-// The session header, token list and architecture name length of a state
-// file: everything check_state_snapshot reads, without the state itself.
-bool read_state_file_head(
+struct file_closer {
+  void operator()(FILE * file) const { std::fclose(file); }
+};
+
+// Reads and checks what llama_state_save_file writes before the state: the
+// magic, the version, the token count and the tokens, then the model
+// architecture's name, which opens the llama_state_get_data bytes. A short
+// header is rejected without touching the context, and so is a corrupt name
+// length that llama.cpp would otherwise allocate before reading. The tokens
+// land in `tokens`, which holds token_capacity of them.
+// Returns 0, -5 with `rejection` set, or -7 with the error set.
+int32_t read_state_snapshot_head(
     const char * state_path,
-    size_t token_capacity,
-    std::vector<uint8_t> & head,
-    size_t & file_size) {
-  if (!can_open_state_file(state_path, "rb")) {
-    return false;
-  }
-  struct stat info;
-  FILE * file = stat(state_path, &info) == 0 ? std::fopen(state_path, "rb") : nullptr;
-  bool read = file != nullptr;
-  if (read) {
-    file_size = static_cast<size_t>(info.st_size);
-    head.resize(std::min(file_size, (4 + token_capacity) * sizeof(uint32_t)));
-    read = std::fread(head.data(), 1, head.size(), file) == head.size();
-    std::fclose(file);
-  }
-  if (!read) {
-    set_error(std::string("Cannot read state file ") + state_path + ": " + std::strerror(errno));
-  }
-  return read;
-}
-
-uint32_t read_u32_le(const uint8_t * bytes) {
-  return static_cast<uint32_t>(bytes[0]) | (static_cast<uint32_t>(bytes[1]) << 8)
-      | (static_cast<uint32_t>(bytes[2]) << 16) | (static_cast<uint32_t>(bytes[3]) << 24);
-}
-
-// llama_state_save_file writes the magic, the version, the token count and the
-// tokens, then the llama_state_get_data bytes, which open with the model
-// architecture's name. Checking these before llama.cpp reads them rejects a
-// short header without touching the context, and a corrupt name length that
-// llama.cpp would otherwise allocate before reading.
-bool check_state_snapshot(
-    const std::vector<uint8_t> & head,
-    size_t file_size,
-    size_t token_capacity,
+    std::vector<llama_token> & tokens,
     size_t & token_count,
     size_t & state_offset,
-    std::string & error) {
-  constexpr size_t header_size = 3 * sizeof(uint32_t);
-  if (file_size < header_size) {
-    error = "State snapshot is truncated: " + std::to_string(file_size)
-        + " bytes is shorter than its " + std::to_string(header_size) + "-byte header";
-    return false;
+    size_t & file_size,
+    std::string & rejection) {
+  if (!can_open_state_file(state_path, "rb")) {
+    return -7;
   }
-  const uint32_t magic = read_u32_le(head.data());
-  const uint32_t version = read_u32_le(head.data() + 4);
-  if (magic != LLAMA_SESSION_MAGIC || version != LLAMA_SESSION_VERSION) {
-    error = "State snapshot is not a llama.cpp session of version "
+  struct stat info;
+  std::unique_ptr<FILE, file_closer> file(
+      stat(state_path, &info) == 0 ? std::fopen(state_path, "rb") : nullptr);
+  if (file == nullptr) {
+    set_error(std::string("Cannot read state file ") + state_path + ": " + std::strerror(errno));
+    return -7;
+  }
+  file_size = static_cast<size_t>(info.st_size);
+
+  uint32_t header[3] = {};
+  if (file_size < sizeof(header)) {
+    rejection = "State snapshot is truncated: " + std::to_string(file_size)
+        + " bytes is shorter than its " + std::to_string(sizeof(header)) + "-byte header";
+    return -5;
+  }
+  const auto read = [&](void * dst, size_t size) {
+    if (std::fread(dst, 1, size, file.get()) == size) {
+      return true;
+    }
+    set_error(std::string("Cannot read state file ") + state_path + ": " + std::strerror(errno));
+    return false;
+  };
+  if (!read(header, sizeof(header))) {
+    return -7;
+  }
+  if (header[0] != LLAMA_SESSION_MAGIC || header[1] != LLAMA_SESSION_VERSION) {
+    rejection = "State snapshot is not a llama.cpp session of version "
         + std::to_string(LLAMA_SESSION_VERSION);
-    return false;
+    return -5;
   }
-  token_count = read_u32_le(head.data() + 8);
-  if (token_count > token_capacity) {
-    error = "State snapshot holds " + std::to_string(token_count)
-        + " tokens, more than tokenCapacity " + std::to_string(token_capacity);
-    return false;
+  token_count = header[2];
+  if (token_count > tokens.size()) {
+    rejection = "State snapshot holds " + std::to_string(token_count)
+        + " tokens, more than tokenCapacity " + std::to_string(tokens.size());
+    return -5;
   }
-  state_offset = header_size + token_count * sizeof(llama_token);
-  const size_t arch_offset = state_offset + sizeof(uint32_t);
-  if (file_size < arch_offset
-      || file_size - arch_offset < read_u32_le(head.data() + state_offset)) {
-    error = "State snapshot is truncated: " + std::to_string(file_size)
+  state_offset = sizeof(header) + token_count * sizeof(llama_token);
+  uint32_t arch_size = 0;
+  if (file_size < state_offset + sizeof(arch_size)) {
+    rejection = "State snapshot is truncated: " + std::to_string(file_size)
         + " bytes ends inside its token list or model architecture";
-    return false;
+    return -5;
   }
-  return true;
+  if (!read(tokens.data(), token_count * sizeof(llama_token)) || !read(&arch_size, sizeof(arch_size))) {
+    return -7;
+  }
+  if (file_size - state_offset - sizeof(arch_size) < arch_size) {
+    rejection = "State snapshot is truncated: " + std::to_string(file_size)
+        + " bytes ends inside its token list or model architecture";
+    return -5;
+  }
+  return 0;
 }
 
 struct free_deleter {
@@ -164,13 +167,8 @@ malloc_buffer try_state_load_alloc(size_t size, int32_t test_failure) {
 }
 
 bool read_state_file_into(const char * state_path, uint8_t * bytes, size_t size) {
-  FILE * file = std::fopen(state_path, "rb");
-  if (file == nullptr) {
-    return false;
-  }
-  const bool read = std::fread(bytes, 1, size, file) == size;
-  std::fclose(file);
-  return read;
+  std::unique_ptr<FILE, file_closer> file(std::fopen(state_path, "rb"));
+  return file != nullptr && std::fread(bytes, 1, size, file.get()) == size;
 }
 
 void webgpu_log_callback(

@@ -92,55 +92,66 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_state_load_file(
     return -4;
   }
 
-  std::vector<uint8_t> head;
+  const std::string kept =
+      ". The snapshot may be truncated, corrupt, or saved by a different model, build or "
+      "context configuration. The current context state was kept.";
+  std::vector<llama_token> restored_tokens(static_cast<size_t>(token_capacity));
+  size_t restored_count = 0;
+  size_t state_offset = 0;
   size_t file_size = 0;
-  if (!read_state_file_head(state_path, static_cast<size_t>(token_capacity), head, file_size)) {
+  std::string rejection;
+  const int32_t head_rc = read_state_snapshot_head(
+      state_path, restored_tokens, restored_count, state_offset, file_size, rejection);
+  if (head_rc == -7) {
     set_error(
         g_last_error
         + ". State file paths are in-memory and do not survive a page reload; "
           "persist snapshots with stateSaveBytes and restore them with stateLoadBytes.");
     return -7;
   }
-
-  const std::string kept =
-      ". The snapshot may be truncated, corrupt, or saved by a different model, build or "
-      "context configuration. The current context state was kept.";
-  size_t restored_count = 0;
-  size_t state_offset = 0;
-  std::string rejection;
-  if (!check_state_snapshot(
-          head, file_size, static_cast<size_t>(token_capacity), restored_count, state_offset, rejection)) {
+  if (head_rc != 0) {
     set_error(rejection + kept);
     return -5;
   }
 
-  // Restoring from memory leaks nothing when llama.cpp rejects the snapshot;
-  // without the memory, llama.cpp reads the file, as it did before.
-  bool loaded = false;
+  // Two optional copies: the snapshot, which llama.cpp restores from memory
+  // without leaking a file handle when it rejects it, and the current state,
+  // which undoes a rejected snapshot because llama.cpp clears the context
+  // memory before it finds most problems. They must never take memory the
+  // restore itself needs, which stays well under the snapshot's size, so each
+  // is kept only while a reserve of that size still fits beside them. Without
+  // them llama.cpp reads the file, as it did before.
   llama_synchronize(g_state.ctx);
   malloc_buffer snapshot = try_state_load_alloc(file_size, 1);
-  const bool snapshot_read = snapshot && read_state_file_into(state_path, snapshot.get(), file_size);
-  if (!snapshot_read) {
+  if (snapshot && !read_state_file_into(state_path, snapshot.get(), file_size)) {
     snapshot.reset();
   }
-
-  // llama.cpp clears the context memory before it finds most problems, so a
-  // rejected snapshot is undone by restoring this copy when there is room.
-  const size_t current_size = llama_state_get_size(g_state.ctx);
-  malloc_buffer current_state = try_state_load_alloc(current_size, 2);
-  if (current_state
-      && llama_state_get_data(g_state.ctx, current_state.get(), current_size) != current_size) {
-    current_state.reset();
+  size_t current_size = 0;
+  malloc_buffer current_state;
+  if (snapshot) {
+    current_size = llama_state_get_size(g_state.ctx);
+    current_state = try_state_load_alloc(current_size, 2);
+    if (current_state
+        && llama_state_get_data(g_state.ctx, current_state.get(), current_size) != current_size) {
+      current_state.reset();
+    }
+  }
+  while (snapshot && !try_state_load_alloc(file_size, 4)) {
+    if (current_state) {
+      current_state.reset();
+    } else {
+      snapshot.reset();
+    }
   }
 
+  bool loaded = false;
   if (snapshot) {
     loaded = llamadart_webgpu_state_set_data(
         g_state.ctx, snapshot.get() + state_offset, file_size - state_offset, &rejection);
     snapshot.reset();
   } else {
-    std::vector<llama_token> file_tokens(static_cast<size_t>(token_capacity));
     loaded = llamadart_webgpu_state_read_file(
-        g_state.ctx, state_path, file_tokens.data(), file_tokens.size(), &rejection);
+        g_state.ctx, state_path, restored_tokens.data(), restored_tokens.size(), &rejection);
   }
 
   if (!loaded) {
@@ -162,11 +173,7 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_state_load_file(
     return -6;
   }
 
-  std::vector<llama_token> restored_tokens(restored_count);
-  if (restored_count > 0) {
-    std::memcpy(
-        restored_tokens.data(), head.data() + 3 * sizeof(uint32_t), restored_count * sizeof(llama_token));
-  }
+  restored_tokens.resize(restored_count);
   g_cached_prompt_tokens = restored_tokens;
   g_last_tokens_json = serialize_tokens_json(restored_tokens);
   g_last_output.clear();

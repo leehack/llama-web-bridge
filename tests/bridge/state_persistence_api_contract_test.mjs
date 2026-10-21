@@ -86,17 +86,23 @@ require(
   'state load must not hand a file to llama.cpp: its short reads throw past the catch compiled out of llama.cpp',
 );
 const loadSteps = [
-  'read_state_file_head(state_path,',
-  'check_state_snapshot(',
+  'read_state_snapshot_head(\n      state_path, restored_tokens,',
   'try_state_load_alloc(file_size, 1)',
   'try_state_load_alloc(current_size, 2)',
+  'while (snapshot && !try_state_load_alloc(file_size, 4)) {',
   'llamadart_webgpu_state_set_data(\n        g_state.ctx, snapshot.get() + state_offset,',
   'llamadart_webgpu_state_read_file(',
   'llamadart_webgpu_state_set_data(\n            g_state.ctx, current_state.get(), current_size, &restore_error)',
 ].map((step) => loadWrapper.indexOf(step));
 require(
   loadSteps.every((index, i) => index >= 0 && (i === 0 || loadSteps[i - 1] < index)),
-  'state load must check the snapshot header, try to copy the snapshot and the current state, restore through a catching wrapper, and restore the copy when llama.cpp rejects the snapshot',
+  'state load must check the snapshot header, try to copy the snapshot and the current state, keep them only beside a restore reserve, restore through a catching wrapper, and restore the copy when llama.cpp rejects the snapshot',
+);
+require(
+  /if \(snapshot\) \{\s*current_size = llama_state_get_size\(g_state\.ctx\);\s*current_state = try_state_load_alloc\(current_size, 2\);/.test(loadWrapper)
+    && /while \(snapshot && !try_state_load_alloc\(file_size, 4\)\) \{\s*if \(current_state\) \{\s*current_state\.reset\(\);\s*\} else \{\s*snapshot\.reset\(\);\s*\}\s*\}/.test(loadWrapper)
+    && !/std::vector<uint8_t>/.test(loadWrapper),
+  'the copies must not crowd out the restore: the current state is copied only beside a snapshot copy, both only while a snapshot-sized reserve still fits, and without them the load matches the previous file path',
 );
 require(
   !/std::vector<uint8_t>\s+(snapshot|current_state)\b/.test(loadWrapper)
@@ -116,7 +122,7 @@ require(
 const stateClears = [...loadWrapper.matchAll(/llama_memory_clear|g_cached_prompt_tokens\.clear\(\)/g)].map(({ index }) => index);
 require(
   stateClears.length === 2
-    && stateClears.every((index) => index > loadSteps[6] && index < loadWrapper.indexOf('return -6;'))
+    && stateClears.every((index) => index > loadSteps[loadSteps.length - 1] && index < loadWrapper.indexOf('return -6;'))
     && /llama_memory_clear\(llama_get_memory\(g_state\.ctx\), false\);\s*g_cached_prompt_tokens\.clear\(\);\s*g_last_output\.clear\(\);\s*g_last_piece\.clear\(\);\s*g_last_detokenized\.clear\(\);\s*set_error\([^]*?could not be kept[^]*?\);\s*return -6;/.test(loadWrapper),
   'only a rejection whose current-state copy is missing or fails to restore may clear the KV, prompt-cache and output state',
 );
@@ -129,10 +135,11 @@ require(
     && /const std::string kept =[^;]*The current context state was kept\.";/.test(loadWrapper),
   'unreadable and rejected snapshots must reject with their own codes and say the current context state was kept',
 );
+const snapshotHead = SRC.slice(SRC.indexOf('int32_t read_state_snapshot_head('), SRC.indexOf('struct free_deleter'));
 require(
-  /bool check_state_snapshot\([^)]*\) \{.*?magic != LLAMA_SESSION_MAGIC \|\| version != LLAMA_SESSION_VERSION.*?token_count > token_capacity.*?file_size < arch_offset\s*\|\| file_size - arch_offset < read_u32_le\(head\.data\(\) \+ state_offset\)/s.test(SRC)
-    && /head\.resize\(std::min\(file_size, \(4 \+ token_capacity\) \* sizeof\(uint32_t\)\)\)/.test(SRC),
-  'the snapshot check must read the header, tokens and name length, and cover the token capacity and the architecture name length llama.cpp allocates before reading',
+  /file_size < sizeof\(header\).*?return -5;.*?header\[0\] != LLAMA_SESSION_MAGIC \|\| header\[1\] != LLAMA_SESSION_VERSION.*?return -5;.*?token_count > tokens\.size\(\).*?return -5;.*?file_size < state_offset \+ sizeof\(arch_size\).*?return -5;.*?read\(tokens\.data\(\), token_count \* sizeof\(llama_token\)\).*?file_size - state_offset - sizeof\(arch_size\) < arch_size.*?return -5;/s.test(snapshotHead)
+    && !/std::vector<uint8_t>|resize\(/.test(snapshotHead),
+  'the snapshot head check must cover the session header, the token capacity and the architecture name length llama.cpp allocates before reading, reading the tokens into the caller\'s buffer',
 );
 const STATE_RESTORE = readRepoText('src/llama_webgpu_state.cpp');
 require(
