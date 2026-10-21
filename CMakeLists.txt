@@ -157,20 +157,22 @@ add_executable(llama_webgpu_core
     src/llama_webgpu_grammar.cpp
     src/llama_webgpu_lora.cpp
     src/llama_webgpu_speculative.cpp
+    src/llama_webgpu_state.cpp
     src/llama_webgpu_tts.cpp
 )
 
 # llama.cpp throws on invalid GBNF and on a LoRA adapter it rejects, and draft
 # model loading, draft context creation and speculative setup throw on rejected
-# drafts or allocation failures. Catch them in these extern "C" wrappers only:
+# drafts or allocation failures. State restore throws on truncated or
+# mismatched snapshots. Catch them in these extern "C" wrappers only:
 # Emscripten keeps catching disabled in every other function, so upstream code
 # and the sampling hot paths stay free of invoke_* trampolines and the ASYNCIFY
 # instrumentation they would pull in. The link setting also changes how every
 # other throw surfaces; llama_webgpu_core_post.js turns those back into aborts.
 set(LLAMADART_WEBGPU_EXCEPTION_CATCHING_ALLOWED
-    "-sEXCEPTION_CATCHING_ALLOWED=['llamadart_webgpu_grammar_sampler_init','llamadart_webgpu_lora_adapter_init','llamadart_webgpu_draft_model_load_file','llamadart_webgpu_draft_context_init','llamadart_webgpu_speculative_init']")
+    "-sEXCEPTION_CATCHING_ALLOWED=['llamadart_webgpu_grammar_sampler_init','llamadart_webgpu_lora_adapter_init','llamadart_webgpu_draft_model_load_file','llamadart_webgpu_draft_context_init','llamadart_webgpu_speculative_init','llamadart_webgpu_state_set_data']")
 set(LLAMADART_WEBGPU_CORE_POST_JS "${CMAKE_CURRENT_SOURCE_DIR}/src/llama_webgpu_core_post.js")
-set_source_files_properties(src/llama_webgpu_grammar.cpp src/llama_webgpu_lora.cpp src/llama_webgpu_speculative.cpp PROPERTIES
+set_source_files_properties(src/llama_webgpu_grammar.cpp src/llama_webgpu_lora.cpp src/llama_webgpu_speculative.cpp src/llama_webgpu_state.cpp PROPERTIES
     COMPILE_OPTIONS "${LLAMADART_WEBGPU_EXCEPTION_CATCHING_ALLOWED}")
 set_target_properties(llama_webgpu_core PROPERTIES
     LINK_DEPENDS "${LLAMADART_WEBGPU_CORE_POST_JS}")

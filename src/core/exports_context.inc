@@ -92,7 +92,8 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_state_load_file(
     return -4;
   }
 
-  if (!can_open_state_file(state_path, "rb")) {
+  std::vector<uint8_t> snapshot;
+  if (!read_state_file(state_path, snapshot)) {
     set_error(
         g_last_error
         + ". State file paths are in-memory and do not survive a page reload; "
@@ -100,37 +101,55 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_state_load_file(
     return -7;
   }
 
-  std::vector<llama_token> restored_tokens(static_cast<size_t>(token_capacity));
+  const std::string kept =
+      ". The snapshot may be truncated, corrupt, or saved by a different model, build or "
+      "context configuration. The current context state was kept.";
   size_t restored_count = 0;
-  llama_synchronize(g_state.ctx);
-  const bool loaded = llama_state_load_file(
-      g_state.ctx,
-      state_path,
-      restored_tokens.data(),
-      restored_tokens.size(),
-      &restored_count);
-  if (!loaded) {
-    llama_memory_clear(llama_get_memory(g_state.ctx), false);
-    g_cached_prompt_tokens.clear();
-    g_last_output.clear();
-    g_last_piece.clear();
-    g_last_detokenized.clear();
-    set_error(
-        "Failed to load llama.cpp state file. The file may be corrupt, from a different model/build, or larger than tokenCapacity.");
+  size_t state_offset = 0;
+  std::string rejection;
+  if (!check_state_snapshot(
+          snapshot, static_cast<size_t>(token_capacity), restored_count, state_offset, rejection)) {
+    set_error(rejection + kept);
     return -5;
   }
 
-  if (restored_count > restored_tokens.size()) {
-    llama_memory_clear(llama_get_memory(g_state.ctx), false);
-    g_cached_prompt_tokens.clear();
-    g_last_output.clear();
-    g_last_piece.clear();
-    g_last_detokenized.clear();
-    set_error("Loaded state token count exceeds token capacity");
-    return -6;
+  // llama.cpp clears the context memory before it finds most problems, so a
+  // rejected snapshot is undone by restoring this copy.
+  llama_synchronize(g_state.ctx);
+  std::vector<uint8_t> current_state(llama_state_get_size(g_state.ctx));
+  if (llama_state_get_data(g_state.ctx, current_state.data(), current_state.size())
+      != current_state.size()) {
+    set_error("Failed to copy the current context state before loading the snapshot. The current context state was kept.");
+    return -5;
   }
 
-  restored_tokens.resize(restored_count);
+  if (!llamadart_webgpu_state_set_data(
+          g_state.ctx,
+          snapshot.data() + state_offset,
+          snapshot.size() - state_offset,
+          &rejection)) {
+    std::string restore_error;
+    if (!llamadart_webgpu_state_set_data(
+            g_state.ctx, current_state.data(), current_state.size(), &restore_error)) {
+      llama_memory_clear(llama_get_memory(g_state.ctx), false);
+      g_cached_prompt_tokens.clear();
+      g_last_output.clear();
+      g_last_piece.clear();
+      g_last_detokenized.clear();
+      set_error(
+          "State snapshot rejected (" + rejection + "), and restoring the current context state failed ("
+          + restore_error + "), so the context state was cleared.");
+      return -6;
+    }
+    set_error("State snapshot rejected: " + rejection + kept);
+    return -5;
+  }
+
+  const auto * snapshot_tokens = snapshot.data() + 3 * sizeof(uint32_t);
+  std::vector<llama_token> restored_tokens(restored_count);
+  if (restored_count > 0) {
+    std::memcpy(restored_tokens.data(), snapshot_tokens, restored_count * sizeof(llama_token));
+  }
   g_cached_prompt_tokens = restored_tokens;
   g_last_tokens_json = serialize_tokens_json(restored_tokens);
   g_last_output.clear();

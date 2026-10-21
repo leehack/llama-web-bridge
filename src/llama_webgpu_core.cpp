@@ -43,6 +43,7 @@
 #include "llama_webgpu_mtmd_compat.h"
 #include "llama_webgpu_next_token_scores.h"
 #include "llama_webgpu_speculative.h"
+#include "llama_webgpu_state.h"
 #include "llama_webgpu_tts.h"
 
 namespace {

@@ -65,6 +65,70 @@ bool can_open_state_file(const char * state_path, const char * mode) {
   return true;
 }
 
+bool read_state_file(const char * state_path, std::vector<uint8_t> & bytes) {
+  if (!can_open_state_file(state_path, "rb")) {
+    return false;
+  }
+  struct stat info;
+  FILE * file = stat(state_path, &info) == 0 ? std::fopen(state_path, "rb") : nullptr;
+  bool read = file != nullptr;
+  if (read) {
+    bytes.resize(static_cast<size_t>(info.st_size));
+    read = std::fread(bytes.data(), 1, bytes.size(), file) == bytes.size();
+    std::fclose(file);
+  }
+  if (!read) {
+    set_error(std::string("Cannot read state file ") + state_path + ": " + std::strerror(errno));
+  }
+  return read;
+}
+
+uint32_t read_u32_le(const uint8_t * bytes) {
+  return static_cast<uint32_t>(bytes[0]) | (static_cast<uint32_t>(bytes[1]) << 8)
+      | (static_cast<uint32_t>(bytes[2]) << 16) | (static_cast<uint32_t>(bytes[3]) << 24);
+}
+
+// llama_state_save_file writes the magic, the version, the token count and the
+// tokens, then the llama_state_get_data bytes, which open with the model
+// architecture's name. Checking these before llama.cpp reads them rejects a
+// short header without touching the context, and a corrupt name length that
+// llama.cpp would otherwise allocate before reading.
+bool check_state_snapshot(
+    const std::vector<uint8_t> & bytes,
+    size_t token_capacity,
+    size_t & token_count,
+    size_t & state_offset,
+    std::string & error) {
+  constexpr size_t header_size = 3 * sizeof(uint32_t);
+  if (bytes.size() < header_size) {
+    error = "State snapshot is truncated: " + std::to_string(bytes.size())
+        + " bytes is shorter than its " + std::to_string(header_size) + "-byte header";
+    return false;
+  }
+  const uint32_t magic = read_u32_le(bytes.data());
+  const uint32_t version = read_u32_le(bytes.data() + 4);
+  if (magic != LLAMA_SESSION_MAGIC || version != LLAMA_SESSION_VERSION) {
+    error = "State snapshot is not a llama.cpp session of version "
+        + std::to_string(LLAMA_SESSION_VERSION);
+    return false;
+  }
+  token_count = read_u32_le(bytes.data() + 8);
+  if (token_count > token_capacity) {
+    error = "State snapshot holds " + std::to_string(token_count)
+        + " tokens, more than tokenCapacity " + std::to_string(token_capacity);
+    return false;
+  }
+  state_offset = header_size + token_count * sizeof(llama_token);
+  const size_t arch_offset = state_offset + sizeof(uint32_t);
+  if (bytes.size() < arch_offset
+      || bytes.size() - arch_offset < read_u32_le(bytes.data() + state_offset)) {
+    error = "State snapshot is truncated: " + std::to_string(bytes.size())
+        + " bytes ends inside its token list or model architecture";
+    return false;
+  }
+  return true;
+}
+
 void webgpu_log_callback(
     ggml_log_level level,
     const char * text,
