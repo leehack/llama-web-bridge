@@ -15,8 +15,9 @@ import {
 import { candidatePublicationDigests } from '../publication_state.mjs';
 import { pyCompareIntTuples } from '../python_compat.mjs';
 import {
-  fetchAssetReleases, fetchAssetTagNames, findCorrelatedRelease, latestAlignedRelease, latestPublishedNativeAlignment,
-  publicationBytesIdentical, verifyPublishedRelease, workflowHistorySince,
+  correlationMarker, fetchAssetReleases, fetchAssetTagNames, findCorrelatedRelease, latestAlignedRelease,
+  latestPublishedNativeAlignment, newestPublishedStableRelease, publicationBytesIdentical, verifyPublishedRelease,
+  workflowHistorySince,
 } from './asset_releases.mjs';
 import {
   CANDIDATE_WORKFLOW_FILE, CANDIDATE_WORKFLOW_PATH, OrchestrationAction, OrchestrationPlan, PUBLISH_WORKFLOW_FILE,
@@ -321,6 +322,7 @@ function observeAndPlan(gateway, {
   publicationAllowed = true,
   publicationBarrierNativeTag = null,
   newerNativeScanned = false,
+  scannedProvenances = [],
 }, evidence) {
   requireStableProvenance(provenance);
   if (!publicationAllowed) {
@@ -419,6 +421,22 @@ function observeAndPlan(gateway, {
     defaultBranch,
   });
   const persisted = resolveCandidateBinding(candidateSelection, correlationId);
+
+  // A fresh pipeline would take the next free output tag, above any newer
+  // native's pipeline, and the publication barrier would then publish this
+  // older native first under the higher tag.
+  if (newerNativeScanned && candidateSelection.matched.length === 0) {
+    return new OrchestrationPlan({
+      action: OrchestrationAction.SUPERSEDED,
+      reason: (
+        `${provenance.nativeReleaseTag} has no pipeline for this build identity `
+        + 'and a newer stable native release is part of this scan; only the '
+        + 'newest scanned native release starts a new build identity'
+      ),
+      provenance,
+      correlationId,
+    });
+  }
 
   const stillClaimedTags = () => {
     const downstreamWorkflows = hasOtherBuildClaim(candidateRuns, { bridgeBuildSha: provenance.bridgeBuildSha })
@@ -519,6 +537,92 @@ function observeAndPlan(gateway, {
     });
   };
 
+  const nativeOrder = nativeReleaseOrder(provenance.nativeReleaseTag);
+  const newerScanned = new Map([...scannedProvenances]
+    .filter((other) => pyCompareIntTuples(nativeReleaseOrder(other.nativeReleaseTag), nativeOrder) > 0)
+    .map((other) => [computeCorrelationId(other), other]));
+  const releaseTag = candidate.binding.releaseTag;
+  const retired = (action, reason, { qualificationRunId, releaseTarget = candidate.binding.releaseTarget }) => (
+    new OrchestrationPlan({
+      action, reason, provenance, correlationId, releaseTarget, candidateRunId: candidate.runId, qualificationRunId,
+    })
+  );
+
+  // Publication follows native order, so an older native whose output tag is
+  // above a newer scanned native's would publish first and turn the newer
+  // native's lower tag into an ordering rollback.
+  const outOfOrderPlan = (qualificationRunId) => {
+    for (const record of candidateRuns) {
+      const claim = candidateTagClaim(record.runName);
+      if (claim === null || !newerScanned.has(claim.correlationId)) continue;
+      if (claimsNotBelow(claim.releaseTag, [releaseTag]).length === 0) continue;
+      const newer = newerScanned.get(claim.correlationId).nativeReleaseTag;
+      return retired(OrchestrationAction.SUPERSEDED, (
+        `candidate ${candidate.runId} is bound to ${releaseTag}, above ${claim.releaseTag} `
+        + `claimed by the pipeline of newer scanned native release ${newer}; publishing `
+        + `${provenance.nativeReleaseTag} first would make ${claim.releaseTag} an ordering `
+        + `rollback, so ${newer} supersedes it and nothing further is dispatched`
+      ), { qualificationRunId });
+    }
+    return null;
+  };
+
+  // Once a published release reaches this candidate's output tag, publishing it
+  // is an ordering rollback, so it is never retried. It is satisfied only by a
+  // proven byte-identical publication; otherwise it stays blocked.
+  const overtakenPlan = (qualificationRunId) => {
+    const head = newestPublishedStableRelease(releases);
+    if (head === null) return null;
+    const headTag = pyStr(pyGet(head, 'tag_name'));
+    if (claimsNotBelow(releaseTag, [headTag]).length === 0) return null;
+    const satisfied = satisfiedPlan(qualificationRunId);
+    if (satisfied !== null) return satisfied;
+    const overtaken = (
+      `published release ${headTag} is at or above output tag ${releaseTag} of `
+      + `candidate ${candidate.runId}, so publishing it would be an ordering rollback`
+    );
+    // Blocked, it would hold the publication barrier and starve the newer
+    // native release that supersedes it anyway.
+    if (newerNativeScanned) {
+      return retired(OrchestrationAction.SUPERSEDED, (
+        `${overtaken}; a newer stable native release is part of this scan and `
+        + 'supersedes it, so nothing further is dispatched'
+      ), { qualificationRunId });
+    }
+    const blocked = (why) => retired(OrchestrationAction.BLOCKED, (
+      `${overtaken}; ${why}; nothing was dispatched, and ${provenance.nativeReleaseTag} `
+      + 'publishes only from a new governed bridge build identity'
+    ), { qualificationRunId });
+    const body = pyGet(head, 'body');
+    const publisher = [...scannedProvenances].find((other) => (
+      other.nativeReleaseTag !== provenance.nativeReleaseTag
+      && typeof body === 'string'
+      && body.includes(correlationMarker(computeCorrelationId(other)))
+    ));
+    if (publisher === undefined) {
+      return blocked(`${headTag} is not the publication of another native release in this scan, so its bytes cannot be compared`);
+    }
+    const published = verifyPublishedRelease(gateway, {
+      release: head,
+      provenance: publisher,
+      correlationId: computeCorrelationId(publisher),
+      workspace,
+    });
+    if (published.directory === null) throw new ContractError('verified release did not retain its downloaded bytes');
+    if (!publicationBytesIdentical(
+      candidatePublicationDigests(candidate.directory),
+      candidatePublicationDigests(published.directory),
+    )) {
+      return blocked(`its publication files differ from ${headTag}`);
+    }
+    return retired(OrchestrationAction.SATISFIED_BY_IDENTICAL_RELEASE, (
+      `${overtaken}; its publication files other than manifest.json are byte-identical `
+      + `to the immutable release ${headTag} (id ${pyStr(published.releaseId)}, published `
+      + `${published.publishedAt}), which records native ${publisher.nativeReleaseTag}; `
+      + 'nothing further is dispatched'
+    ), { qualificationRunId, releaseTarget: published.releaseTarget });
+  };
+
   const qualificationRuns = observedRuns(QUALIFICATION_WORKFLOW_FILE, QUALIFICATION_WORKFLOW_PATH);
   const expectedQualificationName = qualificationRunName(correlationId, candidate.runId);
   const qualificationSelection = selectPipelineRuns(qualificationRuns, {
@@ -549,8 +653,8 @@ function observeAndPlan(gateway, {
 
   if (qualificationSelection.succeededRunId === null) {
     if (qualificationSelection.inFlightRunId === null) {
-      const satisfied = satisfiedPlan(null);
-      if (satisfied !== null) return satisfied;
+      const settled = outOfOrderPlan(null) ?? overtakenPlan(null) ?? satisfiedPlan(null);
+      if (settled !== null) return settled;
     }
     const plan = planPipeline({
       provenance,
@@ -585,6 +689,12 @@ function observeAndPlan(gateway, {
     matcher: (name) => name === expectedPublishName,
     defaultBranch,
   });
+  const publishIdle = publishSelection.inFlightRunId === null && publishSelection.succeededRunId === null;
+  if (publishIdle) {
+    const settled = outOfOrderPlan(qualificationSelection.succeededRunId)
+      ?? overtakenPlan(qualificationSelection.succeededRunId);
+    if (settled !== null) return settled;
+  }
   if (!publicationAllowed) {
     if (publishSelection.inFlightRunId !== null || publishSelection.succeededRunId !== null) {
       return new OrchestrationPlan({
@@ -618,7 +728,7 @@ function observeAndPlan(gateway, {
       qualificationRunId: qualificationSelection.succeededRunId,
     });
   }
-  if (publishSelection.inFlightRunId === null && publishSelection.succeededRunId === null) {
+  if (publishIdle) {
     const satisfied = satisfiedPlan(qualificationSelection.succeededRunId);
     if (satisfied !== null) return satisfied;
   }

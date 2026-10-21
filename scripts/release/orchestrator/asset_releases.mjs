@@ -190,6 +190,22 @@ export function latestPublishedNativeAlignment(releases) {
   return latest === null ? null : latest.slice(1);
 }
 
+// The non-draft stable asset release with the highest output tag, else null.
+// Publication orders every new output tag after it, so a candidate bound to
+// this tag or a lower one can never publish.
+export function newestPublishedStableRelease(releases) {
+  let newest = null;
+  for (const release of releases) {
+    const tag = pyGet(release, 'tag_name');
+    if (typeof tag !== 'string') continue;
+    const version = tryParseReleaseTag(tag, { allowLegacy: true });
+    if (version === null || version.channel !== Channel.STABLE || pyGet(release, 'draft') !== false) continue;
+    const order = releaseOrder(version);
+    if (newest === null || pyCompareIntTuples(order, newest[0]) > 0) newest = [order, release];
+  }
+  return newest === null ? null : newest[1];
+}
+
 // The one valid correlation claims of a release body, as require_correlation_id
 // accepts them.
 function validCorrelationClaims(body) {
