@@ -33,7 +33,7 @@ std::atomic<int32_t> g_last_non_cont_level{GGML_LOG_LEVEL_NONE};
 
 std::string g_last_error;
 // Test hook: bit 1 fails the snapshot copy of a state load, bit 2 its copy
-// of the current state, bit 4 the reserve that lets it keep them.
+// of the current state, bit 4 the heap probe that allows both.
 int32_t g_state_load_test_failures = 0;
 std::string g_last_output;
 std::string g_last_piece;

@@ -117,30 +117,24 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_state_load_file(
   // Two optional copies: the snapshot, which llama.cpp restores from memory
   // without leaking a file handle when it rejects it, and the current state,
   // which undoes a rejected snapshot because llama.cpp clears the context
-  // memory before it finds most problems. They must never take memory the
-  // restore itself needs, which stays well under the snapshot's size, so each
-  // is kept only while a reserve of that size still fits beside them. Without
-  // them llama.cpp reads the file, as it did before.
+  // memory before it finds most problems. They are taken only when the heap
+  // has room for everything that path needs beside them, so they never take
+  // memory the load needs; otherwise llama.cpp reads the file, as before.
   llama_synchronize(g_state.ctx);
-  malloc_buffer snapshot = try_state_load_alloc(file_size, 1);
-  if (snapshot && !read_state_file_into(state_path, snapshot.get(), file_size)) {
-    snapshot.reset();
-  }
-  size_t current_size = 0;
+  const size_t current_size = llama_state_get_size(g_state.ctx);
+  malloc_buffer snapshot;
   malloc_buffer current_state;
-  if (snapshot) {
-    current_size = llama_state_get_size(g_state.ctx);
-    current_state = try_state_load_alloc(current_size, 2);
-    if (current_state
-        && llama_state_get_data(g_state.ctx, current_state.get(), current_size) != current_size) {
-      current_state.reset();
-    }
-  }
-  while (snapshot && !try_state_load_alloc(file_size, 4)) {
-    if (current_state) {
-      current_state.reset();
-    } else {
+  if (state_load_has_room(state_load_copy_budget(file_size, current_size))) {
+    snapshot = try_state_load_alloc(file_size, 1);
+    if (snapshot && !read_state_file_into(state_path, snapshot.get(), file_size)) {
       snapshot.reset();
+    }
+    if (snapshot) {
+      current_state = try_state_load_alloc(current_size, 2);
+      if (current_state
+          && llama_state_get_data(g_state.ctx, current_state.get(), current_size) != current_size) {
+        current_state.reset();
+      }
     }
   }
 

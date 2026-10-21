@@ -87,22 +87,22 @@ require(
 );
 const loadSteps = [
   'read_state_snapshot_head(\n      state_path, restored_tokens,',
+  'state_load_has_room(state_load_copy_budget(file_size, current_size))',
   'try_state_load_alloc(file_size, 1)',
   'try_state_load_alloc(current_size, 2)',
-  'while (snapshot && !try_state_load_alloc(file_size, 4)) {',
   'llamadart_webgpu_state_set_data(\n        g_state.ctx, snapshot.get() + state_offset,',
   'llamadart_webgpu_state_read_file(',
   'llamadart_webgpu_state_set_data(\n            g_state.ctx, current_state.get(), current_size, &restore_error)',
 ].map((step) => loadWrapper.indexOf(step));
 require(
   loadSteps.every((index, i) => index >= 0 && (i === 0 || loadSteps[i - 1] < index)),
-  'state load must check the snapshot header, try to copy the snapshot and the current state, keep them only beside a restore reserve, restore through a catching wrapper, and restore the copy when llama.cpp rejects the snapshot',
+  'state load must check the snapshot header, probe the heap, try to copy the snapshot and the current state, restore through a catching wrapper, and restore the copy when llama.cpp rejects the snapshot',
 );
 require(
-  /if \(snapshot\) \{\s*current_size = llama_state_get_size\(g_state\.ctx\);\s*current_state = try_state_load_alloc\(current_size, 2\);/.test(loadWrapper)
-    && /while \(snapshot && !try_state_load_alloc\(file_size, 4\)\) \{\s*if \(current_state\) \{\s*current_state\.reset\(\);\s*\} else \{\s*snapshot\.reset\(\);\s*\}\s*\}/.test(loadWrapper)
+  /if \(state_load_has_room\(state_load_copy_budget\(file_size, current_size\)\)\) \{\s*snapshot = try_state_load_alloc\(file_size, 1\);.*?if \(snapshot\) \{\s*current_state = try_state_load_alloc\(current_size, 2\);.*?llama_state_get_data\(.*?\}\s*\}\s*\}\s*bool loaded = false;/s.test(loadWrapper)
+    && loadWrapper.indexOf('llama_state_get_data(') > loadWrapper.indexOf('state_load_has_room(')
     && !/std::vector<uint8_t>/.test(loadWrapper),
-  'the copies must not crowd out the restore: the current state is copied only beside a snapshot copy, both only while a snapshot-sized reserve still fits, and without them the load matches the previous file path',
+  'the copies must not crowd out the load: both, and copying the current state, happen only after the heap probe passes, the current state is copied only beside a snapshot copy, and without them the load matches the previous file path',
 );
 require(
   !/std::vector<uint8_t>\s+(snapshot|current_state)\b/.test(loadWrapper)
@@ -110,9 +110,19 @@ require(
     && /if \(current_state\s*&& llamadart_webgpu_state_set_data\(/.test(loadWrapper),
   'the snapshot and current-state copies must be optional: a load without them falls back to llama.cpp reading the file, and a rejection without a copy clears the state',
 );
-const tryAlloc = SRC.slice(SRC.indexOf('malloc_buffer try_state_load_alloc('), SRC.indexOf('bool read_state_file_into('));
+const tryAlloc = SRC.slice(SRC.indexOf('malloc_buffer try_state_load_alloc('), SRC.indexOf('size_t add_saturating('));
+const budget = SRC.slice(SRC.indexOf('size_t state_load_copy_budget('), SRC.indexOf('bool read_state_file_into('));
 require(
-  /g_state_load_test_failures & test_failure/.test(tryAlloc)
+  /add_saturating\(snapshot_size, current_size\)/.test(budget)
+    && /llama_model_n_layer\(g_state\.model\)/.test(budget) && /llama_model_n_embd\(g_state\.model\)/.test(budget)
+    && /multiply_saturating\(width, 4\)/.test(budget)
+    && /llama_n_ctx\(g_state\.ctx\)/.test(budget)
+    && /void \* volatile g_state_load_probe/.test(budget)
+    && /malloc_buffer probe = try_state_load_alloc\(size, 4\);\s*g_state_load_probe = probe\.get\(\);\s*const bool fits = g_state_load_probe != nullptr;/.test(budget),
+  'the heap probe must cover both copies, llama.cpp\'s per-layer bookkeeping and the cells, and keep its malloc from being optimized away',
+);
+require(
+  /if \(\(g_state_load_test_failures & test_failure\) != 0\) \{\s*size = std::numeric_limits<size_t>::max\(\);\s*\}/.test(tryAlloc)
     && /#if !LLAMADART_WEBGPU_ALLOW_MEMORY_GROWTH.*?sbrk\(0\).*?return nullptr;.*?#endif/s.test(tryAlloc)
     && /std::malloc\(/.test(tryAlloc) && !/\bnew\b|std::vector/.test(tryAlloc)
     && /LLAMADART_WEBGPU_ALLOW_MEMORY_GROWTH=\$<BOOL:\$\{LLAMADART_WEBGPU_ALLOW_MEMORY_GROWTH\}>/.test(CMAKE)

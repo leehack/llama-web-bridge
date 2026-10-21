@@ -149,10 +149,11 @@ using malloc_buffer = std::unique_ptr<uint8_t, free_deleter>;
 // needed for it, so they must never fail a load that would otherwise succeed.
 // With memory growth (the default build) malloc returns null when the heap
 // cannot grow. Without growth it aborts instead, so only the space above the
-// heap's break that the heap already holds is used.
+// heap's break that the heap already holds is used. A test-hook bit asks for
+// more than malloc ever grants, so tests take the same null path.
 malloc_buffer try_state_load_alloc(size_t size, int32_t test_failure) {
   if ((g_state_load_test_failures & test_failure) != 0) {
-    return nullptr;
+    size = std::numeric_limits<size_t>::max();
   }
 #if !LLAMADART_WEBGPU_ALLOW_MEMORY_GROWTH
   constexpr size_t allocator_slack = 1 << 20;
@@ -164,6 +165,44 @@ malloc_buffer try_state_load_alloc(size_t size, int32_t test_failure) {
   }
 #endif
   return malloc_buffer(static_cast<uint8_t *>(std::malloc(std::max<size_t>(size, 1))));
+}
+
+size_t add_saturating(size_t a, size_t b) {
+  return a > std::numeric_limits<size_t>::max() - b ? std::numeric_limits<size_t>::max() : a + b;
+}
+
+size_t multiply_saturating(size_t a, size_t b) {
+  return b != 0 && a > std::numeric_limits<size_t>::max() / b ? std::numeric_limits<size_t>::max() : a * b;
+}
+
+// Everything restoring a snapshot from memory holds or allocates beyond what
+// llama.cpp reading the file does: both copies, llama.cpp's per-tensor-call
+// bookkeeping while it copies the current state and while it restores either
+// copy (one entry per layer and K row run or V row, at most 4 * n_embd V rows
+// per layer, held in a doubling vector), the cell bookkeeping (bounded by the
+// context size), and slack for allocator overhead.
+size_t state_load_copy_budget(size_t snapshot_size, size_t current_size) {
+  const size_t layers = static_cast<size_t>(std::max(1, llama_model_n_layer(g_state.model)));
+  const size_t width = static_cast<size_t>(std::max(1, llama_model_n_embd(g_state.model)));
+  const size_t entries = multiply_saturating(layers, add_saturating(multiply_saturating(width, 4), 2));
+  const size_t bookkeeping = multiply_saturating(entries, 4 * sizeof(size_t) * 4);
+  const size_t cells = multiply_saturating(llama_n_ctx(g_state.ctx), 128);
+  constexpr size_t slack = 16u << 20;
+  return add_saturating(
+      add_saturating(snapshot_size, current_size),
+      add_saturating(bookkeeping, add_saturating(cells, slack)));
+}
+
+// A block that is only tested and freed is removed by the optimizer, and the
+// probe would always pass; storing it in a volatile keeps the malloc.
+void * volatile g_state_load_probe = nullptr;
+
+bool state_load_has_room(size_t size) {
+  malloc_buffer probe = try_state_load_alloc(size, 4);
+  g_state_load_probe = probe.get();
+  const bool fits = g_state_load_probe != nullptr;
+  g_state_load_probe = nullptr;
+  return fits;
 }
 
 bool read_state_file_into(const char * state_path, uint8_t * bytes, size_t size) {

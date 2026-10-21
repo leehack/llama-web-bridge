@@ -275,7 +275,7 @@ export function renderHarness(modelFilename, memoryMode = 'wasm32') {
 
       // The core's copies of the snapshot and of the current state are
       // optional. Without them (bit 1 and bit 2 of the test hook), or without
-      // room to keep them beside the restore (bit 4), a snapshot still loads
+      // heap room for them and their restore (bit 4), a snapshot still loads
       // and a rejected one still rejects: the current state is kept while its
       // copy exists and cleared, as before, when it does not.
       let allocationFallbacks = null;
