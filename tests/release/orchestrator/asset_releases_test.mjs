@@ -85,6 +85,18 @@ test('test_contradictory_or_malformed_alignment_fails_closed', () => {
   );
 });
 
+test('newest published stable release ignores drafts and other channels', () => {
+  const releases = [
+    assetReleaseStub('v0.1.41'),
+    assetReleaseStub('b9999'),
+    { ...assetReleaseStub('v0.1.50'), draft: true },
+    assetReleaseStub('v0.1.42'),
+    assetReleaseStub('v0.1.40'),
+  ];
+  assert.equal(assetReleases.newestPublishedStableRelease(releases).tag_name, 'v0.1.42');
+  assert.equal(assetReleases.newestPublishedStableRelease([assetReleaseStub('b9999')]), null);
+});
+
 // --- IdenticalPublicationTest ------------------------------------------------------
 
 function withIdentical(fn) {

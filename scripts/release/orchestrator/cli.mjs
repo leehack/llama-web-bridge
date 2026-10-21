@@ -594,6 +594,7 @@ export function main(argv = process.argv.slice(2), {
           publicationAllowed: publicationBarrierNativeTag === null,
           publicationBarrierNativeTag,
           newerNativeScanned: pyCompareIntTuples(nativeReleaseOrder(provenance.nativeReleaseTag), newestNativeOrder) < 0,
+          scannedProvenances: provenances,
         });
         plans.push(plan.toDict());
         if (plan.action === OrchestrationAction.SATISFIED_BY_IDENTICAL_RELEASE) {

@@ -1,20 +1,24 @@
 // Node-only helpers the driver and CLI suites share, for idioms the Python
 // suites write inline: a run-listing route key, wrapping the fake gateway's
 // dispatch (Python reassigns gateway.dispatch_workflow), dataclasses.replace
-// of a provenance, and the hosted qualification attestation the Python suites
-// build with release_qualification_test's fixtures.
+// of a provenance, the hosted qualification attestation the Python suites
+// build with release_qualification_test's fixtures, and a verifiable
+// published release.
 
+import { createHash } from 'node:crypto';
 import path from 'node:path';
 
+import { ASSETS_REPOSITORY } from '../../../scripts/release/contract.mjs';
 import * as model from '../../../scripts/release/orchestrator/model.mjs';
 import * as workflowRuns from '../../../scripts/release/orchestrator/workflow_runs.mjs';
 import { buildAttestation, canonicalJson, harnessSourceSha256, loadCandidate } from '../../../scripts/release/qualification.mjs';
 import {
   qualificationEnvironment, qualificationIdentity, speechPhase, ttsPhase,
 } from '../qualification_fixtures.mjs';
+import { releaseAttestation } from '../contract_fixtures.mjs';
 import {
-  CANDIDATE_ARTIFACT_ID, CANDIDATE_RUN_ID, DEFAULT_BRANCH, HEAD_SHA, NATIVE_PUBLISHED_AT, QUALIFICATION_RUN_ID,
-  provenanceToDict,
+  ASSETS_TAG_COMMIT, CANDIDATE_ARTIFACT_ID, CANDIDATE_RUN_ID, DEFAULT_BRANCH, HEAD_SHA, NATIVE_PUBLISHED_AT,
+  QUALIFICATION_RUN_ID, directoryMembers, provenanceToDict, releasePayload,
 } from './fixtures.mjs';
 
 // The scripts/ directory, whose harness sources the attestation digests
@@ -66,4 +70,38 @@ export function attestationBytes(candidateDir, {
     ttsPhase: ttsPhase(),
   });
   return Buffer.from(canonicalJson(attestation), 'utf8');
+}
+
+// _aligned_release: [release, routes, blobs, attestations], a verifiable
+// immutable release carrying the deterministic notes.
+export function alignedRelease(publishedDir, {
+  tag, provenance, correlationId, releaseId = 4343,
+}) {
+  const members = directoryMembers(publishedDir);
+  const fingerprint = loadCandidate(publishedDir)[1];
+  const body = (
+    `Candidate fingerprint: \`${fingerprint}\`\n`
+    + `Native: \`${provenance.nativeRepo}@${provenance.nativeReleaseTag}\`\n`
+    + `Native manifest SHA-256: \`${provenance.nativeManifestSha256}\`\n`
+    + `Orchestrator correlation: \`${correlationId}\`\n`
+  );
+  const release = releasePayload({
+    tag, body, members, releaseId,
+  });
+  const routes = {
+    [`repos/${ASSETS_REPOSITORY}/git/ref/tags/${tag}`]: { ref: `refs/tags/${tag}`, object: { type: 'commit', sha: ASSETS_TAG_COMMIT } },
+    [`repos/${ASSETS_REPOSITORY}/releases/tags/${tag}`]: release,
+    [`repos/${ASSETS_REPOSITORY}/releases/${releaseId}`]: release,
+  };
+  const blobs = Object.fromEntries(release.assets.map((asset) => [
+    `repos/${ASSETS_REPOSITORY}/releases/assets/${asset.id}`, members[asset.name],
+  ]));
+  const attestations = [[[ASSETS_REPOSITORY, tag], releaseAttestation({
+    releaseTag: tag,
+    assetsRepo: ASSETS_REPOSITORY,
+    tagCommit: ASSETS_TAG_COMMIT,
+    releaseId,
+    assets: Object.fromEntries(Object.entries(members).map(([name, data]) => [name, createHash('sha256').update(data).digest('hex')])),
+  })]];
+  return [release, routes, blobs, attestations];
 }

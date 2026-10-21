@@ -4,7 +4,6 @@
 // its test.
 
 import assert from 'node:assert/strict';
-import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { test } from 'node:test';
@@ -15,55 +14,20 @@ import * as assetReleases from '../../../scripts/release/orchestrator/asset_rele
 import * as driver from '../../../scripts/release/orchestrator/driver.mjs';
 import * as model from '../../../scripts/release/orchestrator/model.mjs';
 import * as runNames from '../../../scripts/release/orchestrator/run_names.mjs';
-import { ATTESTATION_ARTIFACT_NAME, CANDIDATE_ARTIFACT_NAME, loadCandidate } from '../../../scripts/release/qualification.mjs';
-import { releaseAttestation } from '../contract_fixtures.mjs';
+import { ATTESTATION_ARTIFACT_NAME, CANDIDATE_ARTIFACT_NAME } from '../../../scripts/release/qualification.mjs';
 import {
-  ADVANCED_BRIDGE_SHA, ASSETS_TAG_COMMIT, BRIDGE_SHA, CANDIDATE_ARTIFACT_ID, CANDIDATE_RUN_ID, FakeGateway,
+  ADVANCED_BRIDGE_SHA, BRIDGE_SHA, CANDIDATE_ARTIFACT_ID, CANDIDATE_RUN_ID, FakeGateway,
   NATIVE_PUBLISHED_AT, QUALIFICATION_ARTIFACT_ID, QUALIFICATION_RUN_ID, artifactInventory, directoryMembers, flatZip,
-  makeProvenance, releasePayload, runPayload, runsResponse, withAdvancePipelineFixture, writeBridgeCandidate,
+  makeProvenance, runPayload, runsResponse, withAdvancePipelineFixture, writeBridgeCandidate,
 } from './fixtures.mjs';
 import {
-  attestationBytes, onDispatch, replaceProvenance, runsKey,
+  alignedRelease, attestationBytes, onDispatch, replaceProvenance, runsKey,
 } from './driver_fixtures.mjs';
 
 const RUNS = `repos/${BRIDGE_REPOSITORY}/actions/runs`;
 
 function withFixture(fn) {
   return withAdvancePipelineFixture(fn, { orchestrator });
-}
-
-// _aligned_release: [release, routes, blobs, attestations], a verifiable
-// immutable release carrying the deterministic notes.
-function alignedRelease(publishedDir, {
-  tag, provenance, correlationId, releaseId = 4343,
-}) {
-  const members = directoryMembers(publishedDir);
-  const fingerprint = loadCandidate(publishedDir)[1];
-  const body = (
-    `Candidate fingerprint: \`${fingerprint}\`\n`
-    + `Native: \`${provenance.nativeRepo}@${provenance.nativeReleaseTag}\`\n`
-    + `Native manifest SHA-256: \`${provenance.nativeManifestSha256}\`\n`
-    + `Orchestrator correlation: \`${correlationId}\`\n`
-  );
-  const release = releasePayload({
-    tag, body, members, releaseId,
-  });
-  const routes = {
-    [`repos/${ASSETS_REPOSITORY}/git/ref/tags/${tag}`]: { ref: `refs/tags/${tag}`, object: { type: 'commit', sha: ASSETS_TAG_COMMIT } },
-    [`repos/${ASSETS_REPOSITORY}/releases/tags/${tag}`]: release,
-    [`repos/${ASSETS_REPOSITORY}/releases/${releaseId}`]: release,
-  };
-  const blobs = Object.fromEntries(release.assets.map((asset) => [
-    `repos/${ASSETS_REPOSITORY}/releases/assets/${asset.id}`, members[asset.name],
-  ]));
-  const attestations = [[[ASSETS_REPOSITORY, tag], releaseAttestation({
-    releaseTag: tag,
-    assetsRepo: ASSETS_REPOSITORY,
-    tagCommit: ASSETS_TAG_COMMIT,
-    releaseId,
-    assets: Object.fromEntries(Object.entries(members).map(([name, data]) => [name, createHash('sha256').update(data).digest('hex')])),
-  })]];
-  return [release, routes, blobs, attestations];
 }
 
 // _proven_candidate: [run, routes, blobs], a succeeded candidate run whose

@@ -424,7 +424,12 @@ query strings, and fragments before printing the location.
   unique release-asset ID and runs the complete native release/tag/inventory
   contract first. Each exact pipeline advances by at most one stage per scan,
   and the complete backlog is visited so an older in-flight gate does not starve
-  a newer candidate. Publication remains ordered by native release time.
+  a newer candidate. Publication remains ordered by native release time, so
+  output tags must follow the same order: an older native with no pipeline for
+  the current build identity is `superseded` when a newer native release is in
+  the scan. Where its qualification or publication would be dispatched, an
+  older pipeline bound to an output tag at or above one a newer scanned native's
+  pipeline claims is `superseded` too.
   An entry without its own exact publication is `superseded` when a published
   stable asset release's `Native:` marker names a newer native release (version,
   then rebuild); the newest native release in a scan is `blocked` instead.
@@ -434,7 +439,14 @@ query strings, and fragments before printing the location.
   further is dispatched and its output tag is released to later pipelines in
   the same scan. The comparison runs only where a qualification or publication
   would otherwise be dispatched, never while one of the correlation's runs is
-  in flight, and never across native alignments.
+  in flight, and never across native alignments, with one exception. A
+  candidate whose output tag a published release has reached can never publish,
+  so it is never retried. Unless an identical release of its own native
+  satisfies it as above, it is `superseded`, without a byte comparison, when a
+  newer native release is in the scan. The newest scanned native is instead
+  `satisfied_by_identical_release` when its publication files other than
+  `manifest.json` match that newest release, published for another native
+  release in the same scan, and `blocked` otherwise.
   Manual `development` scans stay scan-only: they resolve exact `bNNNN`
   provenance and report it, and the orchestrator refuses non-stable provenance.
   A failed candidate or qualification is never retried automatically; after diagnosis,
