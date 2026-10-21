@@ -65,6 +65,151 @@ bool can_open_state_file(const char * state_path, const char * mode) {
   return true;
 }
 
+struct file_closer {
+  void operator()(FILE * file) const { std::fclose(file); }
+};
+
+// Reads and checks what llama_state_save_file writes before the state: the
+// magic, the version, the token count and the tokens, then the model
+// architecture's name, which opens the llama_state_get_data bytes. A short
+// header is rejected without touching the context, and so is a corrupt name
+// length that llama.cpp would otherwise allocate before reading. The tokens
+// land in `tokens`, which holds token_capacity of them.
+// Returns 0, -5 with `rejection` set, or -7 with the error set.
+int32_t read_state_snapshot_head(
+    const char * state_path,
+    std::vector<llama_token> & tokens,
+    size_t & token_count,
+    size_t & state_offset,
+    size_t & file_size,
+    std::string & rejection) {
+  if (!can_open_state_file(state_path, "rb")) {
+    return -7;
+  }
+  struct stat info;
+  std::unique_ptr<FILE, file_closer> file(
+      stat(state_path, &info) == 0 ? std::fopen(state_path, "rb") : nullptr);
+  if (file == nullptr) {
+    set_error(std::string("Cannot read state file ") + state_path + ": " + std::strerror(errno));
+    return -7;
+  }
+  file_size = static_cast<size_t>(info.st_size);
+
+  uint32_t header[3] = {};
+  if (file_size < sizeof(header)) {
+    rejection = "State snapshot is truncated: " + std::to_string(file_size)
+        + " bytes is shorter than its " + std::to_string(sizeof(header)) + "-byte header";
+    return -5;
+  }
+  const auto read = [&](void * dst, size_t size) {
+    if (std::fread(dst, 1, size, file.get()) == size) {
+      return true;
+    }
+    set_error(std::string("Cannot read state file ") + state_path + ": " + std::strerror(errno));
+    return false;
+  };
+  if (!read(header, sizeof(header))) {
+    return -7;
+  }
+  if (header[0] != LLAMA_SESSION_MAGIC || header[1] != LLAMA_SESSION_VERSION) {
+    rejection = "State snapshot is not a llama.cpp session of version "
+        + std::to_string(LLAMA_SESSION_VERSION);
+    return -5;
+  }
+  token_count = header[2];
+  if (token_count > tokens.size()) {
+    rejection = "State snapshot holds " + std::to_string(token_count)
+        + " tokens, more than tokenCapacity " + std::to_string(tokens.size());
+    return -5;
+  }
+  state_offset = sizeof(header) + token_count * sizeof(llama_token);
+  uint32_t arch_size = 0;
+  if (file_size < state_offset + sizeof(arch_size)) {
+    rejection = "State snapshot is truncated: " + std::to_string(file_size)
+        + " bytes ends inside its token list or model architecture";
+    return -5;
+  }
+  if (!read(tokens.data(), token_count * sizeof(llama_token)) || !read(&arch_size, sizeof(arch_size))) {
+    return -7;
+  }
+  if (file_size - state_offset - sizeof(arch_size) < arch_size) {
+    rejection = "State snapshot is truncated: " + std::to_string(file_size)
+        + " bytes ends inside its token list or model architecture";
+    return -5;
+  }
+  return 0;
+}
+
+struct free_deleter {
+  void operator()(void * memory) const { std::free(memory); }
+};
+using malloc_buffer = std::unique_ptr<uint8_t, free_deleter>;
+
+// The snapshot and current-state copies make a state load safer but are not
+// needed for it, so they must never fail a load that would otherwise succeed.
+// With memory growth (the default build) malloc returns null when the heap
+// cannot grow. Without growth it aborts instead, so only the space above the
+// heap's break that the heap already holds is used. A test-hook bit asks for
+// more than malloc ever grants, so tests take the same null path.
+malloc_buffer try_state_load_alloc(size_t size, int32_t test_failure) {
+  if ((g_state_load_test_failures & test_failure) != 0) {
+    size = std::numeric_limits<size_t>::max();
+  }
+#if !LLAMADART_WEBGPU_ALLOW_MEMORY_GROWTH
+  constexpr size_t allocator_slack = 1 << 20;
+  const size_t heap_size = emscripten_get_heap_size();
+  const size_t heap_top = reinterpret_cast<uintptr_t>(sbrk(0));
+  if (heap_size < heap_top || heap_size - heap_top < allocator_slack
+      || heap_size - heap_top - allocator_slack < size) {
+    return nullptr;
+  }
+#endif
+  return malloc_buffer(static_cast<uint8_t *>(std::malloc(std::max<size_t>(size, 1))));
+}
+
+size_t add_saturating(size_t a, size_t b) {
+  return a > std::numeric_limits<size_t>::max() - b ? std::numeric_limits<size_t>::max() : a + b;
+}
+
+size_t multiply_saturating(size_t a, size_t b) {
+  return b != 0 && a > std::numeric_limits<size_t>::max() / b ? std::numeric_limits<size_t>::max() : a * b;
+}
+
+// Everything restoring a snapshot from memory holds or allocates beyond what
+// llama.cpp reading the file does: both copies, llama.cpp's per-tensor-call
+// bookkeeping while it copies the current state and while it restores either
+// copy (one entry per layer and K row run or V row, at most 4 * n_embd V rows
+// per layer, held in a doubling vector), the cell bookkeeping (bounded by the
+// context size), and slack for allocator overhead.
+size_t state_load_copy_budget(size_t snapshot_size, size_t current_size) {
+  const size_t layers = static_cast<size_t>(std::max(1, llama_model_n_layer(g_state.model)));
+  const size_t width = static_cast<size_t>(std::max(1, llama_model_n_embd(g_state.model)));
+  const size_t entries = multiply_saturating(layers, add_saturating(multiply_saturating(width, 4), 2));
+  const size_t bookkeeping = multiply_saturating(entries, 4 * sizeof(size_t) * 4);
+  const size_t cells = multiply_saturating(llama_n_ctx(g_state.ctx), 128);
+  constexpr size_t slack = 16u << 20;
+  return add_saturating(
+      add_saturating(snapshot_size, current_size),
+      add_saturating(bookkeeping, add_saturating(cells, slack)));
+}
+
+// A block that is only tested and freed is removed by the optimizer, and the
+// probe would always pass; storing it in a volatile keeps the malloc.
+void * volatile g_state_load_probe = nullptr;
+
+bool state_load_has_room(size_t size) {
+  malloc_buffer probe = try_state_load_alloc(size, 4);
+  g_state_load_probe = probe.get();
+  const bool fits = g_state_load_probe != nullptr;
+  g_state_load_probe = nullptr;
+  return fits;
+}
+
+bool read_state_file_into(const char * state_path, uint8_t * bytes, size_t size) {
+  std::unique_ptr<FILE, file_closer> file(std::fopen(state_path, "rb"));
+  return file != nullptr && std::fread(bytes, 1, size, file.get()) == size;
+}
+
 void webgpu_log_callback(
     ggml_log_level level,
     const char * text,

@@ -448,6 +448,8 @@ assert.deepEqual(webGpuLaunchArgs('linux'), [
 
   const stateEntry = (mode) => ({
     mode, preload: true, progressEvents: 3, embeddingComponents: 32, embeddingBatchSize: 2, savedBytes: 1000, restoredTokens: 2,
+    rejectedSnapshots: 130,
+    allocationFallbacks: mode === 'direct runtime' ? 4 : null,
   });
   const statePayload = () => ({
     ok: true,
@@ -469,6 +471,9 @@ assert.deepEqual(webGpuLaunchArgs('linux'), [
     [mutate(statePayload(), (p) => { p.modeResults[0].savedBytes = 1.5; }), true, 'state snapshot was empty'],
     [mutate(statePayload(), (p) => { p.modeResults[0].embeddingBatchSize = 1; }), true, 'embedding batch result was incomplete'],
     [mutate(statePayload(), (p) => { delete p.modeResults[1].restoredTokens; }), true, 'restored token metadata missing'],
+    [mutate(statePayload(), (p) => { p.modeResults[0].rejectedSnapshots = 0; }), true, 'corrupt state snapshots were not checked'],
+    [mutate(statePayload(), (p) => { p.modeResults[0].allocationFallbacks = 3; }), true, 'state load allocation fallbacks were not checked'],
+    [mutate(statePayload(), (p) => { p.modeResults[1].allocationFallbacks = 4; }), true, 'state load allocation fallbacks were not checked'],
   ];
   for (const [payload, modelBacked, message] of stateCases) {
     if (message === null) stateSmoke.checkPayload(payload, modelBacked);
@@ -545,10 +550,41 @@ const firstErrorLine = (payload) => {
 // Words as tokens after a BOS token, like a tokenizer that adds special tokens.
 const fakeTokenize = (text) => [1, ...text.split(/\s+/).filter(Boolean).map((word) => 100 + word.length)];
 
+// A state snapshot in llama_state_save_file's layout: magic, version, token
+// count and tokens, then the state, which opens with the architecture name.
+// Here the rest of the state is the fake KV cache.
+const SNAPSHOT_ARCH = [...'llama'].map((char) => char.charCodeAt(0));
+const encodeSnapshot = (tokens, cache) => {
+  const words = [0x6767736e, 11, tokens.length, ...tokens, SNAPSHOT_ARCH.length];
+  const bytes = new Uint8Array(4 * words.length + SNAPSHOT_ARCH.length + 4 * (cache.length + 1));
+  const view = new DataView(bytes.buffer);
+  words.forEach((word, index) => view.setUint32(4 * index, word, true));
+  bytes.set(SNAPSHOT_ARCH, 4 * words.length);
+  [cache.length, ...cache].forEach((word, index) => view.setUint32(4 * words.length + SNAPSHOT_ARCH.length + 4 * index, word, true));
+  return bytes;
+};
+const decodeSnapshot = (bytes, capacity) => {
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const word = (index) => (4 * index + 4 <= bytes.byteLength ? view.getUint32(4 * index, true) : null);
+  if (word(0) !== 0x6767736e || word(1) !== 11) return 'is not a llama.cpp session';
+  if (word(2) === null) return null;
+  if (word(2) > capacity) return 'more than tokenCapacity';
+  const tokens = Array.from({ length: word(2) }, (_, index) => word(3 + index));
+  const archAt = 4 * (3 + tokens.length + 1);
+  const arch = bytes.subarray(archAt, archAt + SNAPSHOT_ARCH.length);
+  const cacheAt = (archAt + SNAPSHOT_ARCH.length) / 4;
+  if (word(3 + tokens.length) > bytes.byteLength) return 'ends inside its token list or model architecture';
+  if (word(3 + tokens.length) !== SNAPSHOT_ARCH.length || arch.some((byte, index) => byte !== SNAPSHOT_ARCH[index])) return 'wrong model arch';
+  const cache = Array.from({ length: word(cacheAt) ?? 0 }, (_, index) => word(cacheAt + 1 + index));
+  if (tokens.includes(null) || word(cacheAt) === null || cache.includes(null)) return null;
+  return bytes.byteLength === 4 * (cacheAt + 1 + cache.length) ? { tokens, cache } : null;
+};
+
 // A fake bridge for the state harness. The KV cache keeps the prompt and the
 // generated token, a repeated prompt keeps all but its last token, and an abort
 // during generation resolves in the direct runtime and rejects in the worker.
-// `tweak.usage(context)` returns the usages to report for one completion.
+// `tweak.usage(context)` returns the usages to report for one completion, and
+// `tweak.corruptSnapshot` changes how a corrupt snapshot is handled.
 const stateBridge = (tweak = {}) => class FakeStateBridge {
   constructor({ disableWorker, preferMemory64 }) {
     this.mode = disableWorker ? 'direct runtime' : 'worker runtime';
@@ -556,7 +592,19 @@ const stateBridge = (tweak = {}) => class FakeStateBridge {
     this.loaded = false;
     this.cache = [];
     this.calls = 0;
-    if (!disableWorker) this._workerProxy = {};
+    this.failures = 0;
+    if (disableWorker) {
+      this._runtime = {
+        _core: {
+          ccall: (name, _returnType, _argTypes, [failures]) => {
+            assert.equal(name, 'llamadart_webgpu_test_state_load_failures');
+            this.failures = failures;
+          },
+        },
+      };
+    } else {
+      this._workerProxy = {};
+    }
   }
 
   getModelMetadata() {
@@ -587,15 +635,24 @@ const stateBridge = (tweak = {}) => class FakeStateBridge {
 
   async stateSaveBytes(tokens) {
     this.requireModel();
-    return new Uint8Array(tokens.flatMap((token) => [token & 0xff, token >> 8]));
+    return encodeSnapshot(tokens, this.cache);
   }
 
-  async stateLoadBytes(bytes) {
+  async stateLoadBytes(bytes, capacity) {
     this.requireModel();
-    const tokens = [];
-    for (let index = 0; index < bytes.length; index += 2) tokens.push(bytes[index] | (bytes[index + 1] << 8));
-    this.cache = tokens;
-    return { tokens };
+    const snapshot = decodeSnapshot(bytes, capacity);
+    if (typeof snapshot !== 'object' || snapshot === null) {
+      if (tweak.corruptSnapshot === 'abort') throw new Error('Aborted(undefined)');
+      if (tweak.corruptSnapshot === 'accept') return { tokens: [] };
+      if (tweak.corruptSnapshot === 'clear') this.cache = [];
+      if (snapshot === null && this.failures !== 0 && tweak.corruptSnapshot !== 'keep-without-copy') {
+        this.cache = [];
+        throw new Error('State load failed: State snapshot rejected: truncated. The current context state could not be kept, so it was cleared.');
+      }
+      throw new Error(`State load failed: State snapshot rejected: ${tweak.rejectionReason ?? snapshot}. The current context state was kept.`);
+    }
+    this.cache = snapshot.cache;
+    return { tokens: snapshot.tokens };
   }
 
   missingStateFile(action, path) {
@@ -666,6 +723,16 @@ const stateBridge = (tweak = {}) => class FakeStateBridge {
     /worker runtime silently changed execution path/);
   assert.match(firstErrorLine(await runHarnessPage(page, stateBridge({ stateFileError: 'Aborted(undefined)' }))),
     /direct runtime stateLoadFile of a missing file did not reject cleanly: Aborted\(undefined\)/);
+  assert.match(firstErrorLine(await runHarnessPage(page, stateBridge({ corruptSnapshot: 'abort' }))),
+    /direct runtime stateLoadBytes of a 1-byte prefix of a 61-byte snapshot did not reject cleanly: Aborted\(undefined\)/);
+  assert.match(firstErrorLine(await runHarnessPage(page, stateBridge({ corruptSnapshot: 'accept' }))),
+    /direct runtime stateLoadBytes of a 1-byte prefix of a 61-byte snapshot did not reject cleanly: null/);
+  assert.match(firstErrorLine(await runHarnessPage(page, stateBridge({ rejectionReason: 'rejected by llama.cpp' }))),
+    /direct runtime stateLoadBytes of a snapshot with a wrong magic did not reject cleanly: .*rejected by llama\.cpp/);
+  assert.match(firstErrorLine(await runHarnessPage(page, stateBridge({ corruptSnapshot: 'keep-without-copy' }))),
+    /direct runtime stateLoadBytes of a truncated snapshot without allocations 1 did not reject cleanly: .*The current context state was kept/);
+  assert.match(firstErrorLine(await runHarnessPage(page, stateBridge({ corruptSnapshot: 'clear' }))),
+    /direct runtime stateLoadBytes of a 1-byte prefix of a 61-byte snapshot changed the context state/);
   stateSmoke.checkPayload(passed, true);
   const [direct, worker] = passed.modeResults;
   assert.deepEqual(direct.initialUsage,

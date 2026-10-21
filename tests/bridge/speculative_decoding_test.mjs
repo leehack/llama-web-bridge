@@ -608,7 +608,7 @@ const CASES = [
     assert.match(upstream, /common_speculative_type_from_name\(name\)/, 'the core maps names through llama.cpp');
   }],
 
-  ['only the grammar, LoRA and speculative wrappers catch exceptions and every new export is linked', () => {
+  ['only the grammar, LoRA, speculative and state restore wrappers catch exceptions and every new export is linked', () => {
     const allowed = cmake.match(/-sEXCEPTION_CATCHING_ALLOWED=\[([^\]]*)\]/)[1];
     const names = allowed.split(',').map((name) => name.trim().replace(/^'|'$/g, ''));
     assert.deepEqual(names, [
@@ -617,8 +617,10 @@ const CASES = [
       'llamadart_webgpu_draft_model_load_file',
       'llamadart_webgpu_draft_context_init',
       'llamadart_webgpu_speculative_init',
+      'llamadart_webgpu_state_set_data',
+      'llamadart_webgpu_state_read_file',
     ]);
-    for (const name of names.slice(2)) {
+    for (const name of names.slice(2, 5)) {
       assert.match(wrappers, new RegExp(`extern "C" __attribute__\\(\\(noinline\\)\\)[^\\n]*\\n${name}\\(`), `${name} must stay noinline`);
     }
     const exported = cmake.match(/-sEXPORTED_FUNCTIONS=\[([^\]]*)\]/)[1];

@@ -38,7 +38,8 @@ The default smoke stays lightweight by verifying API shape and clean pre-load
 failures in Chromium. When a tiny GGUF model is supplied, the same harness also
 loads the model in both direct and worker runtimes, verifies finite embeddings,
 evaluates a prompt, saves a state snapshot as bytes, mutates the context, reloads
-the snapshot, and verifies restored token metadata. CI supplies an
+the snapshot, verifies restored token metadata, and checks that truncated and
+corrupt snapshots reject without changing the restored state. CI supplies an
 integrity-pinned tiny model so core API regressions are caught without large
 downloads.`;
 
@@ -194,6 +195,8 @@ export function renderHarness(modelFilename, memoryMode = 'wasm32') {
         seed: 2,
         tokenEventEncoding: 'text',
       });
+      const mutationTokens = await bridge.tokenize(mutationPrompt, true);
+      const mutatedSnapshot = await bridge.stateSaveBytes(mutationTokens);
 
       let restored;
       let detachedAfterLoadTransfer = null;
@@ -211,6 +214,112 @@ export function renderHarness(modelFilename, memoryMode = 'wasm32') {
       }
 
       assert(restored && arraysEqual(restored.tokens, tokens), \`\${mode} restored tokens did not match saved prompt tokens\`);
+
+      const rejectsCleanly = async (label, operation, expected) => {
+        let message = null;
+        try {
+          await operation();
+        } catch (error) {
+          message = String(error && error.message ? error.message : error);
+        }
+        assert(
+          message !== null && [expected].flat().every((text) => message.includes(text)),
+          \`\${mode} \${label} did not reject cleanly: \${message}\`,
+        );
+      };
+
+      // A truncated or corrupt snapshot must reject without aborting the core
+      // and keep the restored state, which the completion below then reuses.
+      // The corrupt snapshots come from the mutated state, so a load that is
+      // applied even in part changes the restored state.
+      const workerBeforeCorruptSnapshots = bridge._workerProxy;
+      const stateBeforeCorruptSnapshots = [...await bridge.stateSaveBytes(tokens)];
+      const source = mutatedSnapshot;
+      const prefixLengths = new Set([source.byteLength - 1]);
+      for (let length = 1; length <= Math.min(512, source.byteLength - 1); length += 1) prefixLengths.add(length);
+      for (let part = 1; part < 64; part += 1) prefixLengths.add(Math.floor((source.byteLength * part) / 64));
+      const corruptSnapshots = [...prefixLengths]
+        .filter((length) => length > 0)
+        .sort((a, b) => a - b)
+        .map((length) => [\`\${length}-byte prefix of a \${source.byteLength}-byte snapshot\`, source.slice(0, length)]);
+      const withTrailingByte = new Uint8Array(source.byteLength + 1);
+      withTrailingByte.set(source);
+      const withUint32 = (offset, value) => {
+        const copy = source.slice();
+        new DataView(copy.buffer).setUint32(offset, value, true);
+        return copy;
+      };
+      // Session layout: magic, version, token count, tokens, then the
+      // architecture name's length and bytes.
+      const archOffset = 12 + 4 * mutationTokens.length;
+      corruptSnapshots.push(
+        ['snapshot with a trailing byte', withTrailingByte],
+        ['snapshot with a wrong magic', withUint32(0, 0), 'is not a llama.cpp session'],
+        ['snapshot with a huge token count', withUint32(8, 0xffffffff), 'more than tokenCapacity'],
+        // Rejected before llama.cpp allocates the name, which can exhaust the heap.
+        ['snapshot with a huge architecture name', withUint32(archOffset, 0xffffffff), 'ends inside its token list or model architecture'],
+        ['snapshot from another architecture', withUint32(archOffset + 4, 0x6f6f6f6f), 'wrong model arch'],
+      );
+      for (const [label, bytes, reason = []] of corruptSnapshots) {
+        await rejectsCleanly(
+          \`stateLoadBytes of a \${label}\`,
+          () => bridge.stateLoadBytes(bytes, bridge.getContextSize()),
+          ['The current context state was kept', reason].flat(),
+        );
+        assert(
+          arraysEqual([...await bridge.stateSaveBytes(tokens)], stateBeforeCorruptSnapshots),
+          \`\${mode} stateLoadBytes of a \${label} changed the context state\`,
+        );
+      }
+      assert(bridge._workerProxy === workerBeforeCorruptSnapshots, \`\${mode} corrupt state snapshot replaced the runtime\`);
+
+      // The core's copies of the snapshot and of the current state are
+      // optional. Without them (bit 1 and bit 2 of the test hook), or without
+      // heap room for them and their restore (bit 4), a snapshot still loads
+      // and a rejected one still rejects: the current state is kept while its
+      // copy exists and cleared, as before, when it does not.
+      let allocationFallbacks = null;
+      if (mode === 'direct runtime') {
+        const core = bridge._runtime && bridge._runtime._core;
+        assert(core && typeof core.ccall === 'function', \`\${mode} core is not reachable for the allocation test hook\`);
+        const failAllocations = (failures) => core.ccall('llamadart_webgpu_test_state_load_failures', null, ['number'], [failures]);
+        const truncated = source.slice(0, source.byteLength - 1);
+        allocationFallbacks = 0;
+        try {
+          for (const [failures, keepsState] of [[1, false], [2, false], [3, false], [4, false]]) {
+            failAllocations(failures);
+            const label = \`without allocations \${failures}\`;
+            const reloaded = await bridge.stateLoadBytes(snapshot.slice(), bridge.getContextSize());
+            assert(arraysEqual(reloaded.tokens, tokens), \`\${mode} snapshot did not load \${label}\`);
+            assert(
+              arraysEqual([...await bridge.stateSaveBytes(tokens)], stateBeforeCorruptSnapshots),
+              \`\${mode} snapshot loaded \${label} did not restore the saved state\`,
+            );
+            await rejectsCleanly(
+              \`stateLoadBytes of a snapshot with a wrong magic \${label}\`,
+              () => bridge.stateLoadBytes(withUint32(0, 0), bridge.getContextSize()),
+              'The current context state was kept',
+            );
+            await rejectsCleanly(
+              \`stateLoadBytes of a truncated snapshot \${label}\`,
+              () => bridge.stateLoadBytes(truncated, bridge.getContextSize()),
+              keepsState ? 'The current context state was kept' : 'The current context state could not be kept',
+            );
+            assert(
+              arraysEqual([...await bridge.stateSaveBytes(tokens)], stateBeforeCorruptSnapshots) === keepsState,
+              \`\${mode} truncated snapshot \${label} \${keepsState ? 'changed' : 'did not clear'} the context state\`,
+            );
+            allocationFallbacks += 1;
+          }
+        } finally {
+          failAllocations(0);
+        }
+        await bridge.stateLoadBytes(snapshot.slice(), bridge.getContextSize());
+        assert(
+          arraysEqual([...await bridge.stateSaveBytes(tokens)], stateBeforeCorruptSnapshots),
+          \`\${mode} snapshot did not reload after the allocation fallbacks\`,
+        );
+      }
 
       usages.length = 0;
       const afterRestoreText = await bridge.createCompletion(prompt, {
@@ -232,21 +341,10 @@ export function renderHarness(modelFilename, memoryMode = 'wasm32') {
 
       // A path the core cannot open must reject without aborting the core.
       const workerBeforeMissingFile = bridge._workerProxy;
-      const rejectsCleanly = async (label, operation) => {
-        let message = null;
-        try {
-          await operation();
-        } catch (error) {
-          message = String(error && error.message ? error.message : error);
-        }
-        assert(
-          message !== null && message.includes('Cannot open state file'),
-          \`\${mode} \${label} did not reject cleanly: \${message}\`,
-        );
-      };
-      await rejectsCleanly('stateLoadFile of a missing file', () => bridge.stateLoadFile('/missing-state.bin', tokens.length));
-      await rejectsCleanly('stateLoadFile of a directory', () => bridge.stateLoadFile('/', tokens.length));
-      await rejectsCleanly('stateSaveFile into a missing directory', () => bridge.stateSaveFile('/missing-dir/state.bin', tokens));
+      const cannotOpen = 'Cannot open state file';
+      await rejectsCleanly('stateLoadFile of a missing file', () => bridge.stateLoadFile('/missing-state.bin', tokens.length), cannotOpen);
+      await rejectsCleanly('stateLoadFile of a directory', () => bridge.stateLoadFile('/', tokens.length), cannotOpen);
+      await rejectsCleanly('stateSaveFile into a missing directory', () => bridge.stateSaveFile('/missing-dir/state.bin', tokens), cannotOpen);
       assert(bridge._workerProxy === workerBeforeMissingFile, \`\${mode} missing state file replaced the runtime\`);
 
       // A repeated prompt keeps all but its last token.
@@ -335,6 +433,8 @@ export function renderHarness(modelFilename, memoryMode = 'wasm32') {
         embeddingBatchSize: embeddingBatch.length,
         savedBytes: snapshot.byteLength,
         restoredTokens: restored.tokens.length,
+        rejectedSnapshots: corruptSnapshots.length,
+        allocationFallbacks,
         initialUsage,
         restoredUsage,
         repeatedUsage,
@@ -473,6 +573,11 @@ export function checkPayload(payload, modelBacked) {
     ensure(pyEquals(pyGet(entry, 'embeddingBatchSize'), 2), 'embedding batch result was incomplete');
     ensure(positiveInt(pyGet(entry, 'savedBytes')), 'state snapshot was empty');
     ensure(positiveInt(pyGet(entry, 'restoredTokens')), 'restored token metadata missing');
+    ensure(positiveInt(pyGet(entry, 'rejectedSnapshots')), 'corrupt state snapshots were not checked');
+    ensure(
+      pyGet(entry, 'allocationFallbacks') === (pyGet(entry, 'mode') === 'direct runtime' ? 4 : null),
+      'state load allocation fallbacks were not checked',
+    );
   }
 }
 

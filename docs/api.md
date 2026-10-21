@@ -498,8 +498,15 @@ values fall back to the active context size. The resolved capacity must be at
 least large enough for the stored token list and no larger than the active
 context size. The resolved `{ tokens }` value is the token list stored at save
 time. A missing or unreadable path rejects with `Cannot open state file <path>:
-<reason>` and keeps the current context state. WASMFS paths do not survive a
-page reload; use `stateSaveBytes()` and `stateLoadBytes()` for durable state.
+<reason>` and keeps the current context state. A truncated snapshot, or one
+llama.cpp rejects (another format version, model architecture or cache
+layout), rejects with a message ending in `The current context state was
+kept.`, and the context and its prompt cache are unchanged. Keeping them needs
+memory for a copy of the current state; without it, a snapshot llama.cpp
+rejects clears them instead, with `The current context state could not be
+kept`. Snapshots carry no checksum, so corrupt bytes inside a well-formed
+snapshot are not detected. WASMFS paths do not survive a page reload; use
+`stateSaveBytes()` and `stateLoadBytes()` for durable state.
 
 ### `stateSaveBytes(tokens?)`
 
@@ -521,7 +528,7 @@ stateLoadBytes(
 ```
 
 Loads state from bytes by staging them into a temporary runtime file. It uses the
-same `tokenCapacity` resolution as `stateLoadFile()`. Empty input is rejected.
+same `tokenCapacity` resolution and snapshot rejection as `stateLoadFile()`. Empty input is rejected.
 Worker mode transfers an internal copy to the worker, so caller-owned
 `ArrayBuffer` or `Uint8Array` inputs are not detached.
 
