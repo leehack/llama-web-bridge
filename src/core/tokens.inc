@@ -122,6 +122,24 @@ std::string serialize_tokens_json(const std::vector<llama_token> & tokens) {
   return json;
 }
 
+// ASCII transport for text bytes from `offset`: the bridge decodes them itself
+// because Emscripten's string return mis-decodes an incomplete or invalid
+// UTF-8 sequence in a string of 16 bytes or fewer.
+std::string serialize_bytes_json(const std::string & bytes, int32_t offset) {
+  const size_t start = offset > 0
+      ? std::min(static_cast<size_t>(offset), bytes.size())
+      : 0;
+  std::string json = "[";
+  for (size_t i = start; i < bytes.size(); ++i) {
+    if (i > start) {
+      json += ",";
+    }
+    json += std::to_string(static_cast<unsigned char>(bytes[i]));
+  }
+  json += "]";
+  return json;
+}
+
 void normalize_embedding_inplace(std::vector<float> & embedding) {
   double norm_squared = 0.0;
   for (const float value : embedding) {

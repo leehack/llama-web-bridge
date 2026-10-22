@@ -144,6 +144,12 @@ EMSCRIPTEN_KEEPALIVE const char * llamadart_webgpu_last_output() {
   return g_last_output.c_str();
 }
 
+EMSCRIPTEN_KEEPALIVE const char * llamadart_webgpu_last_output_bytes_json(
+    int32_t offset) {
+  g_last_output_bytes_json = serialize_bytes_json(g_last_output, offset);
+  return g_last_output_bytes_json.c_str();
+}
+
 EMSCRIPTEN_KEEPALIVE const char * llamadart_webgpu_last_generation_usage_json() {
   g_generation_usage_json =
       "{\"promptTokens\":" + std::to_string(g_usage_prompt_tokens) +

@@ -4266,8 +4266,31 @@ var LlamaWebGpuBridgeRuntime = class {
       const tokenEventEncoding = typeof options.tokenEventEncoding === "string" ? String(options.tokenEventEncoding || "").toLowerCase() : "bytes";
       const emitTokenText = tokenEventEncoding === "text";
       const yieldInterval = 4;
-      let streamed = "";
-      let emittedStableText = "";
+      const readsOutputBytes = typeof this._core._llamadart_webgpu_last_output_bytes_json === "function";
+      const outputDecoder = new TextDecoder("utf-8", { ignoreBOM: true });
+      let outputByteLength = 0;
+      let legacyEmittedText = "";
+      let text = "";
+      const readOutputDelta = (final) => {
+        if (!readsOutputBytes) {
+          text = this._core.ccall("llamadart_webgpu_last_output", "string", [], []) || (final ? text : "");
+          const stableText = final ? text : trimUnstableUtf8Tail(text);
+          if (!stableText.startsWith(legacyEmittedText)) {
+            if (final) {
+              return "";
+            }
+            legacyEmittedText = "";
+          }
+          const delta2 = stableText.slice(legacyEmittedText.length);
+          legacyEmittedText = stableText;
+          return delta2;
+        }
+        const bytes = this._coreTextBytes("llamadart_webgpu_last_output_bytes_json", [outputByteLength]);
+        outputByteLength += bytes.length;
+        const delta = outputDecoder.decode(bytes, { stream: !final });
+        text += delta;
+        return delta;
+      };
       let finishReason = "length";
       while (generated < nPredict) {
         if (this._abortRequested || options.signal?.aborted) {
@@ -4318,28 +4341,20 @@ var LlamaWebGpuBridgeRuntime = class {
           throw new Error(stepErrorText);
         }
         generated += 1;
-        const fullText = this._core.ccall("llamadart_webgpu_last_output", "string", [], []) || "";
-        streamed = fullText;
-        const stableText = trimUnstableUtf8Tail(fullText);
-        if (!stableText.startsWith(emittedStableText)) {
-          emittedStableText = "";
-        }
-        const deltaText = stableText.slice(emittedStableText.length);
+        const deltaText = readOutputDelta(false);
         if (deltaText.length === 0) {
           continue;
         }
-        emittedStableText = stableText;
         firstTokenAt ??= performance.now();
         if (typeof options.onToken === "function") {
           const piecePayload = emitTokenText ? deltaText : textEncoder.encode(deltaText);
-          options.onToken(piecePayload, shouldEmitCurrentText ? fullText : null);
+          options.onToken(piecePayload, shouldEmitCurrentText ? text : null);
         }
         if (yieldInterval > 0 && generated % yieldInterval === 0) {
           await new Promise((resolve) => setTimeout(resolve, 0));
         }
       }
-      const text = this._core.ccall("llamadart_webgpu_last_output", "string", [], []) || streamed || "";
-      const tailText = text.startsWith(emittedStableText) ? text.slice(emittedStableText.length) : "";
+      const tailText = readOutputDelta(true);
       if (tailText.length > 0) {
         firstTokenAt ??= performance.now();
         if (typeof options.onToken === "function") {
@@ -4512,7 +4527,17 @@ var LlamaWebGpuBridgeRuntime = class {
     if (rc < 0) {
       throw new Error(this._coreErrorMessage("Detokenization failed", rc));
     }
+    if (typeof this._core._llamadart_webgpu_last_detokenized_bytes_json === "function") {
+      return new TextDecoder("utf-8", { ignoreBOM: true }).decode(this._coreTextBytes("llamadart_webgpu_last_detokenized_bytes_json"));
+    }
     return this._core.ccall("llamadart_webgpu_last_detokenized", "string", [], []) || "";
+  }
+  // Core text as raw bytes: a 'string' ccall hand-decodes 16 bytes or fewer
+  // and turns an incomplete or invalid UTF-8 sequence into wrong but valid
+  // code points instead of U+FFFD.
+  _coreTextBytes(exportName, args = []) {
+    const argTypes = args.map(() => "number");
+    return Uint8Array.from(JSON.parse(this._core.ccall(exportName, "string", argTypes, args) || "[]"));
   }
   _embeddingAssetVersion() {
     return embeddingAssetVersion(this._coreVariant === "wasm64" ? this._config.coreModuleUrlMem64 : this._config.coreModuleUrl);
