@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Remove the unreferenced `js/wasmfs_fetch_patch.js`; the build already links the stock
+  `-lwasmfs_fetch.js`, so shipped assets are unchanged.
 - Add ordered text/image/audio parts to `embed` and `embedBatch`, with a versioned
   `getEmbeddingCapabilities` probe and typed, payload-free `EmbeddingError` codes
   in direct and worker runtimes. Existing string embedding behavior is unchanged.
