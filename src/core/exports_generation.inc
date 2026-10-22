@@ -144,23 +144,9 @@ EMSCRIPTEN_KEEPALIVE const char * llamadart_webgpu_last_output() {
   return g_last_output.c_str();
 }
 
-// ASCII transport for the output bytes from `offset`: the bridge decodes them
-// itself because Emscripten's string return mis-decodes a character that a
-// token split if the string is 16 bytes or fewer.
 EMSCRIPTEN_KEEPALIVE const char * llamadart_webgpu_last_output_bytes_json(
     int32_t offset) {
-  g_last_output_bytes_json = "[";
-  const size_t start = offset > 0
-      ? std::min(static_cast<size_t>(offset), g_last_output.size())
-      : 0;
-  for (size_t i = start; i < g_last_output.size(); ++i) {
-    if (i > start) {
-      g_last_output_bytes_json += ',';
-    }
-    g_last_output_bytes_json +=
-        std::to_string(static_cast<unsigned char>(g_last_output[i]));
-  }
-  g_last_output_bytes_json += ']';
+  g_last_output_bytes_json = serialize_bytes_json(g_last_output, offset);
   return g_last_output_bytes_json.c_str();
 }
 

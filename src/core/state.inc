@@ -40,6 +40,7 @@ std::string g_last_output_bytes_json = "[]";
 std::string g_last_piece;
 std::string g_last_tokens_json = "[]";
 std::string g_last_detokenized;
+std::string g_last_detokenized_bytes_json = "[]";
 std::string g_last_embedding_json = "[]";
 std::string g_last_next_token_scores_json = "{}";
 std::string g_backend_json = "[]";

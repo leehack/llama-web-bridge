@@ -4285,14 +4285,7 @@ var LlamaWebGpuBridgeRuntime = class {
           legacyEmittedText = stableText;
           return delta2;
         }
-        const bytes = Uint8Array.from(JSON.parse(
-          this._core.ccall(
-            "llamadart_webgpu_last_output_bytes_json",
-            "string",
-            ["number"],
-            [outputByteLength]
-          ) || "[]"
-        ));
+        const bytes = this._coreTextBytes("llamadart_webgpu_last_output_bytes_json", [outputByteLength]);
         outputByteLength += bytes.length;
         const delta = outputDecoder.decode(bytes, { stream: !final });
         text += delta;
@@ -4534,7 +4527,17 @@ var LlamaWebGpuBridgeRuntime = class {
     if (rc < 0) {
       throw new Error(this._coreErrorMessage("Detokenization failed", rc));
     }
+    if (typeof this._core._llamadart_webgpu_last_detokenized_bytes_json === "function") {
+      return new TextDecoder().decode(this._coreTextBytes("llamadart_webgpu_last_detokenized_bytes_json"));
+    }
     return this._core.ccall("llamadart_webgpu_last_detokenized", "string", [], []) || "";
+  }
+  // Core text as raw bytes: a 'string' ccall hand-decodes 16 bytes or fewer
+  // and turns an incomplete or invalid UTF-8 sequence into wrong but valid
+  // code points instead of U+FFFD.
+  _coreTextBytes(exportName, args = []) {
+    const argTypes = args.map(() => "number");
+    return Uint8Array.from(JSON.parse(this._core.ccall(exportName, "string", argTypes, args) || "[]"));
   }
   _embeddingAssetVersion() {
     return embeddingAssetVersion(this._coreVariant === "wasm64" ? this._config.coreModuleUrlMem64 : this._config.coreModuleUrl);

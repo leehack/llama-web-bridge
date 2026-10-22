@@ -77,13 +77,15 @@ const CASES = [
     assert.equal(emscriptenUtf8ToString([0xC3, 0x41]), 'Á');
   }],
 
-  ['the core exports generated output as bytes from an offset', () => {
+  ['the core exports generated and detokenized text as bytes', () => {
     const exported = readRepoText('CMakeLists.txt').match(/-sEXPORTED_FUNCTIONS=\[([^\]]*)\]/)[1];
     assert.ok(exported.includes("'_llamadart_webgpu_last_output_bytes_json'"));
+    assert.ok(exported.includes("'_llamadart_webgpu_last_detokenized_bytes_json'"));
     const source = readNativeCoreSource();
-    const body = source.slice(source.indexOf('llamadart_webgpu_last_output_bytes_json('));
-    assert.match(body, /^llamadart_webgpu_last_output_bytes_json\(\s*int32_t offset\)/);
-    assert.match(body, /static_cast<unsigned char>\(g_last_output\[i\]\)/);
+    const serializer = source.slice(source.indexOf('std::string serialize_bytes_json('));
+    assert.match(serializer, /static_cast<unsigned char>\(bytes\[i\]\)/);
+    assert.match(source, /llamadart_webgpu_last_output_bytes_json\(\s*int32_t offset\) \{\s*g_last_output_bytes_json = serialize_bytes_json\(g_last_output, offset\);/);
+    assert.match(source, /llamadart_webgpu_last_detokenized_bytes_json\(\) \{\s*g_last_detokenized_bytes_json = serialize_bytes_json\(g_last_detokenized, 0\);/);
   }],
 
   ['byte-split emoji, rare Han and CJK at the start of a response stream intact', async () => {

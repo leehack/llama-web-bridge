@@ -212,6 +212,11 @@ EMSCRIPTEN_KEEPALIVE const char * llamadart_webgpu_last_detokenized() {
   return g_last_detokenized.c_str();
 }
 
+EMSCRIPTEN_KEEPALIVE const char * llamadart_webgpu_last_detokenized_bytes_json() {
+  g_last_detokenized_bytes_json = serialize_bytes_json(g_last_detokenized, 0);
+  return g_last_detokenized_bytes_json.c_str();
+}
+
 EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_embed_to_json(
     const char * text,
     int32_t normalize) {

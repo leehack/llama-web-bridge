@@ -147,6 +147,20 @@ function byteString(piece) {
   return String.fromCharCode(...bytes);
 }
 
+// The stub vocabulary maps a token to its code point, and byteToken(b) to the
+// raw byte b, like a byte-fallback token.
+const BYTE_TOKEN_BASE = 0x200000;
+
+export function byteToken(byte) {
+  return BYTE_TOKEN_BASE + byte;
+}
+
+function tokenBytes(token) {
+  return token >= BYTE_TOKEN_BASE
+    ? String.fromCharCode(token - BYTE_TOKEN_BASE)
+    : byteString(String.fromCodePoint(token));
+}
+
 function bytesOf(text, offset = 0) {
   return [...text.slice(offset)].map((character) => character.charCodeAt(0));
 }
@@ -199,13 +213,15 @@ export function createStubCore(scripts = {}) {
     lastOutput: '',
     usage: { promptTokens: 0, cachedPromptTokens: 0, completionTokens: 0 },
     lastTokensJson: '[]',
+    // g_last_detokenized's bytes, one char per byte.
     lastDetokenized: '',
     lastEmbeddingJson: '[]',
     lastError: '',
     pending: [],
     scripts,
-    // Probed by the runtime; a core older than the export lacks it.
+    // Probed by the runtime; a core older than these exports lacks them.
     _llamadart_webgpu_last_output_bytes_json: () => {},
+    _llamadart_webgpu_last_detokenized_bytes_json: () => {},
     FS: {
       readdir: () => ['states'],
       mkdir: () => {},
@@ -285,13 +301,17 @@ export function createStubCore(scripts = {}) {
 
         case 'llamadart_webgpu_detokenize_from_json':
           core.trace.push(['detokenize', args[0]]);
-          core.lastDetokenized = JSON.parse(args[0])
-            .map((token) => String.fromCodePoint(token))
-            .join('');
+          core.lastDetokenized = JSON.parse(args[0]).map(tokenBytes).join('');
           return 0;
 
         case 'llamadart_webgpu_last_detokenized':
-          return core.lastDetokenized;
+          return emscriptenUtf8ToString(bytesOf(core.lastDetokenized));
+
+        case 'llamadart_webgpu_last_detokenized_bytes_json':
+          if (typeof core._llamadart_webgpu_last_detokenized_bytes_json !== 'function') {
+            throw new TypeError('func is not a function');
+          }
+          return JSON.stringify(bytesOf(core.lastDetokenized));
 
         case 'llamadart_webgpu_embed_to_json':
           core.trace.push(['embed', args[0]]);

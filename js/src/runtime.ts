@@ -3902,10 +3902,8 @@ export class LlamaWebGpuBridgeRuntime {
       // boundary, worker token events and cancellation messages remain queued
       // until generation has already completed.
       const yieldInterval = 4;
-      // Read g_last_output as bytes: a 'string' ccall hand-decodes 16 bytes
-      // or fewer and turns an incomplete trailing character into a wrong but
-      // valid code point. The streaming decoder holds such a tail back. Cores
-      // without the bytes export keep the string read and U+FFFD trim.
+      // The streaming decoder holds back an incomplete trailing character.
+      // Cores without the bytes export keep the string read and U+FFFD trim.
       const readsOutputBytes =
         typeof this._core!._llamadart_webgpu_last_output_bytes_json === 'function';
       const outputDecoder = new TextDecoder();
@@ -3926,14 +3924,7 @@ export class LlamaWebGpuBridgeRuntime {
           legacyEmittedText = stableText;
           return delta;
         }
-        const bytes = Uint8Array.from(JSON.parse(
-          this._core!.ccall(
-            'llamadart_webgpu_last_output_bytes_json',
-            'string',
-            ['number'],
-            [outputByteLength],
-          ) || '[]',
-        ));
+        const bytes = this._coreTextBytes('llamadart_webgpu_last_output_bytes_json', [outputByteLength]);
         outputByteLength += bytes.length;
         const delta = outputDecoder.decode(bytes, { stream: !final });
         text += delta;
@@ -4241,7 +4232,18 @@ export class LlamaWebGpuBridgeRuntime {
       throw new Error(this._coreErrorMessage('Detokenization failed', rc));
     }
 
+    if (typeof this._core!._llamadart_webgpu_last_detokenized_bytes_json === 'function') {
+      return new TextDecoder().decode(this._coreTextBytes('llamadart_webgpu_last_detokenized_bytes_json'));
+    }
     return this._core!.ccall('llamadart_webgpu_last_detokenized', 'string', [], []) || '';
+  }
+
+  // Core text as raw bytes: a 'string' ccall hand-decodes 16 bytes or fewer
+  // and turns an incomplete or invalid UTF-8 sequence into wrong but valid
+  // code points instead of U+FFFD.
+  _coreTextBytes(exportName: string, args: number[] = []): Uint8Array {
+    const argTypes = args.map((): CcallArgType => 'number');
+    return Uint8Array.from(JSON.parse(this._core!.ccall(exportName, 'string', argTypes, args) || '[]'));
   }
 
   _embeddingAssetVersion() {
