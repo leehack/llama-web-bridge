@@ -139,6 +139,55 @@ export function settleQuietly(promise) {
   return promise;
 }
 
+const utf8Encoder = new TextEncoder();
+
+// One char per byte, like the C++ std::string the core appends token pieces to.
+function byteString(piece) {
+  const bytes = piece instanceof Uint8Array ? piece : utf8Encoder.encode(String(piece));
+  return String.fromCharCode(...bytes);
+}
+
+function bytesOf(text, offset = 0) {
+  return [...text.slice(offset)].map((character) => character.charCodeAt(0));
+}
+
+// Emscripten 6.0.8's UTF8ArrayToString as `ccall(..., 'string')` runs it: it
+// decodes 16 bytes or fewer by hand, reading past the terminator (zeros here)
+// to finish an incomplete sequence and never checking continuation bytes.
+export function emscriptenUtf8ToString(bytes) {
+  if (bytes.length > 16) {
+    return new TextDecoder().decode(Uint8Array.from(bytes));
+  }
+  const heap = [...bytes, 0, 0, 0, 0];
+  let index = 0;
+  let text = '';
+  while (index < bytes.length) {
+    let u0 = heap[index++];
+    if (!(u0 & 128)) {
+      text += String.fromCharCode(u0);
+      continue;
+    }
+    const u1 = heap[index++] & 63;
+    if ((u0 & 224) === 192) {
+      text += String.fromCharCode(((u0 & 31) << 6) | u1);
+      continue;
+    }
+    const u2 = heap[index++] & 63;
+    if ((u0 & 240) === 224) {
+      u0 = ((u0 & 15) << 12) | (u1 << 6) | u2;
+    } else {
+      u0 = ((u0 & 7) << 18) | (u1 << 12) | (u2 << 6) | (heap[index++] & 63);
+    }
+    if (u0 < 65536) {
+      text += String.fromCharCode(u0);
+    } else {
+      const ch = u0 - 65536;
+      text += String.fromCharCode(55296 | (ch >> 10), 56320 | (ch & 1023));
+    }
+  }
+  return text;
+}
+
 /** Mirrors singleton result buffers and the C++ re-entrant-begin guard. */
 export function createStubCore(scripts = {}) {
   const files = new Map();
@@ -146,6 +195,7 @@ export function createStubCore(scripts = {}) {
     trace: [],
     beginRejections: 0,
     activePrompt: null,
+    // g_last_output's bytes, one char per byte.
     lastOutput: '',
     usage: { promptTokens: 0, cachedPromptTokens: 0, completionTokens: 0 },
     lastTokensJson: '[]',
@@ -154,6 +204,8 @@ export function createStubCore(scripts = {}) {
     lastError: '',
     pending: [],
     scripts,
+    // Probed by the runtime; a core older than the export lacks it.
+    _llamadart_webgpu_last_output_bytes_json: () => {},
     FS: {
       readdir: () => ['states'],
       mkdir: () => {},
@@ -192,16 +244,27 @@ export function createStubCore(scripts = {}) {
             return 0;
           }
           if (piece instanceof Error) {
+            // A step can append its piece before llama_decode fails.
+            if (piece.appended != null) {
+              core.lastOutput += byteString(piece.appended);
+            }
             core.lastError = piece.message;
             return -1;
           }
-          core.lastOutput += piece;
+          core.lastOutput += byteString(piece);
           core.usage.completionTokens += 1;
           return 1;
         }
 
         case 'llamadart_webgpu_last_output':
-          return core.lastOutput;
+          return emscriptenUtf8ToString(bytesOf(core.lastOutput));
+
+        case 'llamadart_webgpu_last_output_bytes_json':
+          if (typeof core._llamadart_webgpu_last_output_bytes_json !== 'function') {
+            // Emscripten's ccall on a missing export.
+            throw new TypeError('func is not a function');
+          }
+          return JSON.stringify(bytesOf(core.lastOutput, Math.max(0, Number(args[0]) || 0)));
 
         case 'llamadart_webgpu_last_generation_usage_json':
           core.trace.push(['usage', null]);

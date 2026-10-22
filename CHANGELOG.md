@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Stream a character that the model splits across tokens intact at the start of a
+  response, instead of wrong characters and repeated text; invalid bytes stream as
+  U+FFFD.
 - Remove the unreferenced `js/wasmfs_fetch_patch.js`; the build already links the stock
   `-lwasmfs_fetch.js`, so shipped assets are unchanged.
 - Add ordered text/image/audio parts to `embed` and `embedBatch`, with a versioned

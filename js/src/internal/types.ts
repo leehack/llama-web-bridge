@@ -73,6 +73,8 @@ export interface LlamaCoreModule {
   _llamadart_webgpu_completion_capabilities_json?: unknown;
   _llamadart_webgpu_embedding_capabilities_json?: unknown;
   _llamadart_webgpu_embed_parts_to_json?: unknown;
+  // Present only in builds that stream generated output as bytes.
+  _llamadart_webgpu_last_output_bytes_json?: unknown;
   // Present only in builds that include LoRA adapters.
   _llamadart_webgpu_lora_api_version?: unknown;
 }
