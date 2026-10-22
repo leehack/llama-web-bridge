@@ -13,7 +13,9 @@ import { readRepoText } from './bridge_js_source.mjs';
 import { readNativeCoreSource } from './native_core_source.mjs';
 
 const encoder = new TextEncoder();
-const decoder = new TextDecoder();
+// Keeps a leading U+FEFF, as a decoder of streamed text must.
+const decoder = new TextDecoder('utf-8', { ignoreBOM: true });
+const strictDecoder = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
 
 // Byte-fallback tokens: every UTF-8 byte of a multi-byte character is its own piece.
 function bytePieces(text) {
@@ -43,7 +45,7 @@ async function stream(pieces, options = {}, { bytesExport = true } = {}) {
       );
       if (piece instanceof Uint8Array) {
         assert.doesNotThrow(
-          () => new TextDecoder('utf-8', { fatal: true }).decode(piece),
+          () => strictDecoder.decode(piece),
           `streamed bytes must be complete UTF-8: ${[...piece]}`,
         );
       }
@@ -66,6 +68,8 @@ function assertConsistent({ text, events }) {
 }
 
 const ISSUE_TEXT = '🦙 𠜎𠜱 龘靐 你好';
+const BOM_TEXT = '\uFEFFhi';
+const BOM_PIECES = [Uint8Array.of(0xEF), Uint8Array.of(0xBB, 0xBF), 'hi'];
 
 const CASES = [
   ['the stub core reproduces the Emscripten decode of a split character', () => {
@@ -161,6 +165,23 @@ const CASES = [
     assert.deepEqual(result.pieces, ['The answer is here: ', '🦙', ' done']);
   }],
 
+  ['a leading U+FEFF is generated text, not a byte order mark to strip', async () => {
+    for (const pieces of [BOM_PIECES, [Uint8Array.of(0xEF, 0xBB, 0xBF), 'hi']]) {
+      for (const tokenEventEncoding of ['bytes', 'text']) {
+        const result = await stream(pieces, { tokenEventEncoding });
+        assertConsistent(result);
+        assert.equal(result.text, BOM_TEXT);
+        assert.equal(result.pieces[0], '\uFEFF');
+      }
+    }
+  }],
+
+  ['output after a NUL byte is delivered', async () => {
+    const result = await stream(['a', Uint8Array.of(0), 'b']);
+    assertConsistent(result);
+    assert.equal(result.text, 'a\u0000b');
+  }],
+
   ['a completion without onToken returns the decoded text', async () => {
     const { bridge } = createDirectBridge({ prompt: bytePieces(ISSUE_TEXT) });
     assert.equal(await bridge.createCompletion('prompt'), ISSUE_TEXT);
@@ -185,7 +206,7 @@ try {
   globalThis.self = { postMessage: (message) => posted.push(message) };
   LlamaWebGpuBridge.prototype.createCompletion = function createCompletion(prompt, options) {
     if (!this._runtime._core) {
-      this._runtime._core = createStubCore({ prompt: bytePieces(ISSUE_TEXT) });
+      this._runtime._core = createStubCore({ prompt: bytePieces(ISSUE_TEXT), bom: BOM_PIECES });
       this._runtime._modelBytes = 1;
       this._runtime._nCtx = 128;
     }
@@ -200,25 +221,27 @@ try {
     { tokenEventEncoding: 'bytes', tokenEventFlushMs: 50, tokenEventFlushChars: 2 },
     { tokenEventEncoding: 'text', tokenEventFlushMs: 50, tokenEventFlushChars: 2 },
   ];
-  for (const [index, options] of workerCases.entries()) {
+  const workerRuns = [['prompt', ISSUE_TEXT], ['bom', BOM_TEXT]]
+    .flatMap(([prompt, expected]) => workerCases.map((options) => [prompt, expected, options]));
+  for (const [index, [prompt, expected, options]] of workerRuns.entries()) {
     const id = index + 1;
     await globalThis.self.onmessage({
-      data: { type: 'call', id, method: 'createCompletion', args: ['prompt', options] },
+      data: { type: 'call', id, method: 'createCompletion', args: [prompt, options] },
     });
     const messages = posted.filter((message) => message.id === id);
     const result = messages.at(-1);
     assert.equal(result.type, 'result', JSON.stringify(result));
-    assert.equal(result.value, ISSUE_TEXT);
+    assert.equal(result.value, expected);
     const pieces = messages
       .filter((message) => message.type === 'event' && message.event === 'token')
       .map(({ payload }) => (
         typeof payload.pieceText === 'string'
           ? payload.pieceText
-          : new TextDecoder('utf-8', { fatal: true }).decode(Uint8Array.from(payload.piece))
+          : strictDecoder.decode(Uint8Array.from(payload.piece))
       ));
     assert.ok(pieces.every((piece) => !piece.includes('�')), JSON.stringify(pieces));
-    assert.equal(pieces.join(''), ISSUE_TEXT, JSON.stringify({ options, pieces }));
-    console.log(`ok - worker stream intact with ${JSON.stringify(options)}`);
+    assert.equal(pieces.join(''), expected, JSON.stringify({ options, pieces }));
+    console.log(`ok - worker ${prompt} stream intact with ${JSON.stringify(options)}`);
   }
 } finally {
   LlamaWebGpuBridge.prototype.createCompletion = originalCreateCompletion;

@@ -3904,9 +3904,10 @@ export class LlamaWebGpuBridgeRuntime {
       const yieldInterval = 4;
       // The streaming decoder holds back an incomplete trailing character.
       // Cores without the bytes export keep the string read and U+FFFD trim.
+      // ignoreBOM: a leading U+FEFF is generated text, not a byte order mark.
       const readsOutputBytes =
         typeof this._core!._llamadart_webgpu_last_output_bytes_json === 'function';
-      const outputDecoder = new TextDecoder();
+      const outputDecoder = new TextDecoder('utf-8', { ignoreBOM: true });
       let outputByteLength = 0;
       let legacyEmittedText = '';
       let text = '';
@@ -4233,7 +4234,8 @@ export class LlamaWebGpuBridgeRuntime {
     }
 
     if (typeof this._core!._llamadart_webgpu_last_detokenized_bytes_json === 'function') {
-      return new TextDecoder().decode(this._coreTextBytes('llamadart_webgpu_last_detokenized_bytes_json'));
+      return new TextDecoder('utf-8', { ignoreBOM: true })
+        .decode(this._coreTextBytes('llamadart_webgpu_last_detokenized_bytes_json'));
     }
     return this._core!.ccall('llamadart_webgpu_last_detokenized', 'string', [], []) || '';
   }

@@ -23,6 +23,8 @@ function codePointTokens(text) {
 // [tokens, detokenized text] as TextDecoder decodes the bytes.
 const CASES = [
   ['byte-split emoji', [...byteTokens('🦙'), ...codePointTokens('a')], '🦙a'],
+  ['leading U+FEFF from byte tokens', [...byteTokens('\uFEFF'), ...codePointTokens('a')], '\uFEFFa'],
+  ['leading U+FEFF from one token', codePointTokens('\uFEFFa'), '\uFEFFa'],
   ['emoji missing its last bytes', byteTokens('🦙', 2), '�'],
   ['CJK missing its last byte', byteTokens('你', 2), '�'],
   ['4-byte Han missing its last byte', byteTokens('𠜎', 3), '�'],

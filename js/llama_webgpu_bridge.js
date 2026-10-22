@@ -4267,7 +4267,7 @@ var LlamaWebGpuBridgeRuntime = class {
       const emitTokenText = tokenEventEncoding === "text";
       const yieldInterval = 4;
       const readsOutputBytes = typeof this._core._llamadart_webgpu_last_output_bytes_json === "function";
-      const outputDecoder = new TextDecoder();
+      const outputDecoder = new TextDecoder("utf-8", { ignoreBOM: true });
       let outputByteLength = 0;
       let legacyEmittedText = "";
       let text = "";
@@ -4528,7 +4528,7 @@ var LlamaWebGpuBridgeRuntime = class {
       throw new Error(this._coreErrorMessage("Detokenization failed", rc));
     }
     if (typeof this._core._llamadart_webgpu_last_detokenized_bytes_json === "function") {
-      return new TextDecoder().decode(this._coreTextBytes("llamadart_webgpu_last_detokenized_bytes_json"));
+      return new TextDecoder("utf-8", { ignoreBOM: true }).decode(this._coreTextBytes("llamadart_webgpu_last_detokenized_bytes_json"));
     }
     return this._core.ccall("llamadart_webgpu_last_detokenized", "string", [], []) || "";
   }

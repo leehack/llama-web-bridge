@@ -166,9 +166,12 @@ function bytesOf(text, offset = 0) {
 }
 
 // Emscripten 6.0.8's UTF8ArrayToString as `ccall(..., 'string')` runs it: it
-// decodes 16 bytes or fewer by hand, reading past the terminator (zeros here)
-// to finish an incomplete sequence and never checking continuation bytes.
-export function emscriptenUtf8ToString(bytes) {
+// stops at the first NUL, decodes 16 bytes or fewer by hand, reading past the
+// terminator (zeros here) to finish an incomplete sequence and never checking
+// continuation bytes.
+export function emscriptenUtf8ToString(cBytes) {
+  const nul = cBytes.indexOf(0);
+  const bytes = nul < 0 ? cBytes : cBytes.slice(0, nul);
   if (bytes.length > 16) {
     return new TextDecoder().decode(Uint8Array.from(bytes));
   }
