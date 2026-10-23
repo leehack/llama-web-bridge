@@ -473,10 +473,11 @@ and `createCompletion` prompts keep the text after U+0000: the bridge passes the
 core UTF-8 bytes and their length, not a C string. A lone surrogate becomes
 U+FFFD.
 
-- A `grammar` or `thinkingBudget` tag or `forcedMessage` holding U+0000 rejects
-  with a `TypeError`, because llama.cpp reads them as C strings.
-- `synthesizeSpeech` text and decision head labels still end at the first
-  U+0000.
+- A `grammar`, `thinkingBudget` tag or `forcedMessage`, or `synthesizeSpeech`
+  `text` or `language`, holding U+0000 rejects with a `TypeError` before the
+  core runs, because the core reads them as C strings.
+- Decision head load errors name a URL head whose file name holds U+0000 with
+  `%00` in its place, as a parsed URL path does.
 - Cores built before this behavior lack `llamadart_webgpu_tokenize_bytes_to_json`
   and the other `*_bytes` text exports. With them the bridge keeps the C-string
   call for text without U+0000 and rejects text that holds one.

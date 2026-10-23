@@ -6,6 +6,7 @@ import type {
   SpeculativeDecodingStrategy,
   ThinkingBudgetOptions,
 } from '../llama_webgpu_bridge.d.ts';
+import { withoutNul } from './text.ts';
 
 export interface CompletionSamplingOptions {
   minP: number;
@@ -77,20 +78,12 @@ function optionalNumber(value: unknown, name: string, isValid: (value: number) =
   return value;
 }
 
-// The core reads these options as C strings, which end at the first U+0000.
-function withoutNul(value: string, name: string): string {
-  if (value.includes('\0')) {
-    throw new TypeError(`CompletionOptions.${name} contains U+0000, which the core cannot read.`);
-  }
-  return value;
-}
-
 function tag(budget: Record<string, unknown>, name: 'startTag' | 'endTag'): string {
   const value = budget[name];
   if (typeof value !== 'string' || value.trim().length === 0) {
     throw new TypeError(`CompletionOptions.thinkingBudget.${name} must be a non-empty string.`);
   }
-  return withoutNul(value, `thinkingBudget.${name}`);
+  return withoutNul(value, `CompletionOptions.thinkingBudget.${name}`);
 }
 
 function thinkingBudget(value: unknown, hasMediaParts: boolean): Required<ThinkingBudgetOptions> | null {
@@ -114,7 +107,7 @@ function thinkingBudget(value: unknown, hasMediaParts: boolean): Required<Thinki
   if (typeof forcedMessage !== 'string') {
     throw new TypeError('CompletionOptions.thinkingBudget.forcedMessage must be a string.');
   }
-  withoutNul(forcedMessage, 'thinkingBudget.forcedMessage');
+  withoutNul(forcedMessage, 'CompletionOptions.thinkingBudget.forcedMessage');
   if (hasMediaParts) {
     throw new Error('CompletionOptions.thinkingBudget supports text-only prompts; remove the media parts.');
   }
@@ -320,7 +313,7 @@ export function resolveCompletionSamplingOptions(
 ): CompletionSamplingOptions {
   const hasMediaParts = Array.isArray(options?.parts) && options.parts.length > 0;
   if (typeof options?.grammar === 'string') {
-    withoutNul(options.grammar, 'grammar');
+    withoutNul(options.grammar, 'CompletionOptions.grammar');
   }
   const budget = thinkingBudget(options?.thinkingBudget, hasMediaParts);
   return {

@@ -3245,7 +3245,9 @@ export class LlamaWebGpuBridgeRuntime {
       if (bytes) {
         core.FS.writeFile(headPath, bytes);
       } else {
-        label = basenameFromUrl(source).slice(0, 256);
+        // An unparsable URL's basename keeps a raw U+0000, which would end the
+        // core's C-string label; a parsed URL path percent-encodes it.
+        label = basenameFromUrl(source).replaceAll('\0', '%00').slice(0, 256);
         await this._stageDecisionHeadFromUrl(source as string, headPath, options?.onProgress);
       }
       if (configPath !== null) {
