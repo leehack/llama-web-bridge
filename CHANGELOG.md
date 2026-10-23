@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- In worker mode, reload the model before `getDecisionCapabilities` and `runDecision`
+  when a cancelled multimodal setup or a failed worker-restart reload left the worker
+  without it: the probe no longer reports decision heads unsupported, and a run asks
+  for its head to be loaded again instead of failing with "No model loaded".
 - In worker mode, scope each `cancel()` to the operation it targets: a cancel issued
   as a call starts now stops it, as in direct mode, and one that reaches the worker
   after its call returned is dropped instead of setting the runtime's cancel flag. A

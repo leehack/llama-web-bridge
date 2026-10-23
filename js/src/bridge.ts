@@ -1098,7 +1098,9 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
    * still holds that model, but the fresh worker would answer every request
    * with "No model loaded" or without the adapters. Reload them first, and
    * again on the next call if this fails. A failure here reaches the caller's
-   * own worker-error handling.
+   * own worker-error handling. Frees and unloads skip it: the core accepts
+   * them without a model, and the facade forgets what they release, so the
+   * next restore skips it too. The chat template never reads the model.
    */
   async _restoreWorkerModelIfMissing() {
     if (
@@ -2625,6 +2627,7 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
         : { apiVersion: DECISION_API_VERSION, supported: false, reason: 'WebGPU core is not initialized' };
     }
     try {
+      await this._restoreWorkerModelIfMissing();
       return await this._callWorker<DecisionCapabilities>('getDecisionCapabilities', []);
     } catch (error) {
       this._throwIfOperationCancelled(error, 'Decision capability probe was cancelled.');
@@ -2717,6 +2720,7 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
       return this._requireDecisionRuntime().runDecision(entry.handle, normalized);
     }
     try {
+      await this._restoreWorkerModelIfMissing();
       return await this._callWorker<DecisionOutput[]>('runDecision', [entry.handle, normalized]);
     } catch (error) {
       this._throwIfOperationCancelled(error, 'Decision run was cancelled.');
