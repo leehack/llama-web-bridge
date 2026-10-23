@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { decisionCoreStatusCode } from '../../js/src/internal/decision.ts';
 import { LlamaWebGpuBridge, enableBridgeWorkerHost } from '../../js/src/llama_webgpu_bridge.js';
 import { readRepoText } from './bridge_js_source.mjs';
+import { readNativeCoreSource } from './native_core_source.mjs';
 import {
   createRealWorkerBridge,
   createWorkerBridge,
@@ -32,6 +33,22 @@ const sequence = { tokens: [1], markers: [0], questionType: 0 };
   for (const [, name, value] of statuses) {
     assert.equal(decisionCoreStatusCode(Number(value)), expected[name], `core status ${name}`);
   }
+
+  // The core returns its own status for each state the bridge tells apart.
+  const core = readNativeCoreSource();
+  const decision = readRepoText('src/llama_webgpu_decision.cpp');
+  const returns = (source, cause, status) => {
+    const pattern = new RegExp(`${cause}[^}]*?return LLAMADART_WEBGPU_DECISION_STATUS_(\\w+);`, 'g');
+    const found = [...source.matchAll(pattern)].map(([, name]) => name);
+    assert.ok(found.length > 0, `${cause} is followed by a return`);
+    assert.deepEqual(new Set(found), new Set([status]), cause);
+  };
+  returns(core, 'if \\(!ensure_loaded\\(\\)\\) \\{', 'NO_MODEL');
+  returns(core, 'Decision heads cannot be loaded or run during active generation', 'BUSY');
+  returns(core, 'Load the decision head again\\."\\)', 'HEAD_NOT_LOADED');
+  returns(core, 'Decision head handles are exhausted', 'INVALID_STATE');
+  returns(decision, 'Load the decision encoder before its head\\."', 'NO_MODEL');
+  returns(decision, 'unloaded\\. Load the decision head again\\."', 'HEAD_NOT_LOADED');
 
   const declared = readRepoText('js/src/llama_webgpu_bridge.d.ts')
     .match(/export type DecisionErrorCode =([^;]+);/)[1]
