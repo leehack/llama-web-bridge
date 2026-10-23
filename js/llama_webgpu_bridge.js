@@ -132,6 +132,80 @@ function embeddingCoreError(rc, version = embeddingAssetVersion()) {
   return new EmbeddingError(code, message);
 }
 
+// js/src/internal/text.ts
+function withoutNul(value, name) {
+  if (value.includes("\0")) {
+    throw new TypeError(`${name} contains U+0000, which the core cannot read.`);
+  }
+  return value;
+}
+function buildPromptFromMessages(messages, addAssistant) {
+  const lines = [];
+  for (const msg of messages || []) {
+    const role = String(msg?.role ?? "user");
+    const content = String(msg?.content ?? "");
+    lines.push(`${role}: ${content}`);
+  }
+  if (addAssistant) {
+    lines.push("assistant: ");
+  }
+  return lines.join("\n");
+}
+function looksLikeCorruptedGeneration(text) {
+  if (typeof text !== "string" || text.length === 0) {
+    return false;
+  }
+  const normalized = text.trim();
+  if (normalized.length === 0) {
+    return false;
+  }
+  const unusedTokens = text.match(/<unused\d+>/g) || [];
+  if (unusedTokens.length >= 4) {
+    return true;
+  }
+  const tokenLikeTags = text.match(/<[^>]{1,40}>/g) || [];
+  if (tokenLikeTags.length >= 8) {
+    return true;
+  }
+  const compact = text.replace(/\s+/g, "");
+  if (compact.length === 0) {
+    return false;
+  }
+  const tagRun = compact.match(/(?:<[^>]{2,32}>){6,}/);
+  if (tagRun) {
+    return true;
+  }
+  const alphaNum = (normalized.match(/[A-Za-z0-9]/g) || []).length;
+  const printable = (normalized.match(/[\x20-\x7E]/g) || []).length;
+  const angleBrackets = (normalized.match(/[<>]/g) || []).length;
+  const alphaNumRatio = alphaNum / normalized.length;
+  const printableRatio = printable / normalized.length;
+  const bracketRatio = angleBrackets / normalized.length;
+  if (normalized.length >= 24 && printableRatio > 0.95 && alphaNumRatio < 0.18) {
+    return true;
+  }
+  if (normalized.length >= 24 && bracketRatio > 0.25) {
+    return true;
+  }
+  return false;
+}
+function trimUnstableUtf8Tail(text) {
+  if (typeof text !== "string" || text.length === 0) {
+    return "";
+  }
+  let end = text.length;
+  while (end > 0 && text.charCodeAt(end - 1) === 65533) {
+    end -= 1;
+  }
+  if (end > 0) {
+    const tail = text.charCodeAt(end - 1);
+    if (tail >= 55296 && tail <= 56319) {
+      end -= 1;
+    }
+  }
+  return end === text.length ? text : text.slice(0, end);
+}
+
 // js/src/internal/completion_options.ts
 var SPECULATIVE_DECODING_STRATEGIES = Object.freeze([
   "draft-simple",
@@ -169,18 +243,12 @@ function optionalNumber(value, name, isValid, range) {
   }
   return value;
 }
-function withoutNul(value, name) {
-  if (value.includes("\0")) {
-    throw new TypeError(`CompletionOptions.${name} contains U+0000, which the core cannot read.`);
-  }
-  return value;
-}
 function tag(budget, name) {
   const value = budget[name];
   if (typeof value !== "string" || value.trim().length === 0) {
     throw new TypeError(`CompletionOptions.thinkingBudget.${name} must be a non-empty string.`);
   }
-  return withoutNul(value, `thinkingBudget.${name}`);
+  return withoutNul(value, `CompletionOptions.thinkingBudget.${name}`);
 }
 function thinkingBudget(value, hasMediaParts) {
   if (value == null) {
@@ -202,7 +270,7 @@ function thinkingBudget(value, hasMediaParts) {
   if (typeof forcedMessage !== "string") {
     throw new TypeError("CompletionOptions.thinkingBudget.forcedMessage must be a string.");
   }
-  withoutNul(forcedMessage, "thinkingBudget.forcedMessage");
+  withoutNul(forcedMessage, "CompletionOptions.thinkingBudget.forcedMessage");
   if (hasMediaParts) {
     throw new Error("CompletionOptions.thinkingBudget supports text-only prompts; remove the media parts.");
   }
@@ -365,7 +433,7 @@ function penaltyPromptTokens(value) {
 function resolveCompletionSamplingOptions(options) {
   const hasMediaParts = Array.isArray(options?.parts) && options.parts.length > 0;
   if (typeof options?.grammar === "string") {
-    withoutNul(options.grammar, "grammar");
+    withoutNul(options.grammar, "CompletionOptions.grammar");
   }
   const budget = thinkingBudget(options?.thinkingBudget, hasMediaParts);
   return {
@@ -1233,74 +1301,6 @@ function scoredTokensFrom(entries) {
     bytes: Uint8Array.from(Array.isArray(entry?.bytes) ? entry.bytes : []),
     logprob: typeof entry?.logprob === "number" ? entry.logprob : -Infinity
   }));
-}
-
-// js/src/internal/text.ts
-function buildPromptFromMessages(messages, addAssistant) {
-  const lines = [];
-  for (const msg of messages || []) {
-    const role = String(msg?.role ?? "user");
-    const content = String(msg?.content ?? "");
-    lines.push(`${role}: ${content}`);
-  }
-  if (addAssistant) {
-    lines.push("assistant: ");
-  }
-  return lines.join("\n");
-}
-function looksLikeCorruptedGeneration(text) {
-  if (typeof text !== "string" || text.length === 0) {
-    return false;
-  }
-  const normalized = text.trim();
-  if (normalized.length === 0) {
-    return false;
-  }
-  const unusedTokens = text.match(/<unused\d+>/g) || [];
-  if (unusedTokens.length >= 4) {
-    return true;
-  }
-  const tokenLikeTags = text.match(/<[^>]{1,40}>/g) || [];
-  if (tokenLikeTags.length >= 8) {
-    return true;
-  }
-  const compact = text.replace(/\s+/g, "");
-  if (compact.length === 0) {
-    return false;
-  }
-  const tagRun = compact.match(/(?:<[^>]{2,32}>){6,}/);
-  if (tagRun) {
-    return true;
-  }
-  const alphaNum = (normalized.match(/[A-Za-z0-9]/g) || []).length;
-  const printable = (normalized.match(/[\x20-\x7E]/g) || []).length;
-  const angleBrackets = (normalized.match(/[<>]/g) || []).length;
-  const alphaNumRatio = alphaNum / normalized.length;
-  const printableRatio = printable / normalized.length;
-  const bracketRatio = angleBrackets / normalized.length;
-  if (normalized.length >= 24 && printableRatio > 0.95 && alphaNumRatio < 0.18) {
-    return true;
-  }
-  if (normalized.length >= 24 && bracketRatio > 0.25) {
-    return true;
-  }
-  return false;
-}
-function trimUnstableUtf8Tail(text) {
-  if (typeof text !== "string" || text.length === 0) {
-    return "";
-  }
-  let end = text.length;
-  while (end > 0 && text.charCodeAt(end - 1) === 65533) {
-    end -= 1;
-  }
-  if (end > 0) {
-    const tail = text.charCodeAt(end - 1);
-    if (tail >= 55296 && tail <= 56319) {
-      end -= 1;
-    }
-  }
-  return end === text.length ? text : text.slice(0, end);
 }
 
 // js/src/runtime.ts
@@ -3770,7 +3770,7 @@ var LlamaWebGpuBridgeRuntime = class {
       if (bytes) {
         core.FS.writeFile(headPath, bytes);
       } else {
-        label = basenameFromUrl(source).slice(0, 256);
+        label = basenameFromUrl(source).replaceAll("\0", "%00").slice(0, 256);
         try {
           await this._stageDecisionHeadFromUrl(source, headPath, options?.onProgress);
         } catch (error) {
@@ -7014,6 +7014,12 @@ var LlamaWebGpuBridge = class {
     }
   }
   async synthesizeSpeech(options = {}) {
+    for (const field of ["text", "language"]) {
+      const value = options?.[field];
+      if (typeof value === "string") {
+        withoutNul(value, `TextToSpeechOptions.${field}`);
+      }
+    }
     return this._runExclusive(
       () => this._synthesizeSpeechUnlocked(options),
       {

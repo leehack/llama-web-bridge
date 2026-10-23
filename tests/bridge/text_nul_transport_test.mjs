@@ -8,6 +8,7 @@ import {
 import {
   createDirectBridge,
   createStubCore,
+  createWorkerBridge,
   tokensFor,
 } from './bridge_operation_queue_fixtures.mjs';
 
@@ -92,27 +93,146 @@ test('a core without the bytes exports rejects text holding U+0000 instead of cu
   assert.deepEqual(core.trace.filter(([kind]) => ['tokenize', 'embed', 'score', 'begin'].includes(kind)), []);
 });
 
-test('the worker runtime keeps the text after U+0000', async () => {
-  const posted = [];
+// The worker host installs once per module, so every worker test shares one
+// worker global; each call starts a fresh bridge with `init`.
+const workerPosted = [];
+const workerSelf = { postMessage: (message) => workerPosted.push(message) };
+
+async function callWorkerHost(method, args) {
   const originalSelf = globalThis.self;
-  const originalTokenize = LlamaWebGpuBridge.prototype.tokenize;
+  globalThis.self = workerSelf;
   try {
-    globalThis.self = { postMessage: (message) => posted.push(message) };
-    LlamaWebGpuBridge.prototype.tokenize = function tokenize(text, addSpecial) {
-      if (!this._runtime._core) {
-        this._runtime._core = createStubCore();
-        this._runtime._modelBytes = 1;
-      }
-      return originalTokenize.call(this, text, addSpecial);
-    };
     enableBridgeWorkerHost();
-    await globalThis.self.onmessage({ data: { type: 'init', config: {} } });
-    await globalThis.self.onmessage({ data: { type: 'call', id: 1, method: 'tokenize', args: [TEXT, false] } });
-    const result = posted.find((message) => message.id === 1);
+    await workerSelf.onmessage({ data: { type: 'init', config: {} } });
+    workerPosted.length = 0;
+    await workerSelf.onmessage({ data: { type: 'call', id: 1, method, args } });
+    const result = workerPosted.find((message) => message.id === 1 && message.type !== 'event');
     assert.equal(result?.type, 'result', JSON.stringify(result));
-    assert.deepEqual(result.value, tokensFor(TEXT));
+    return result.value;
   } finally {
-    LlamaWebGpuBridge.prototype.tokenize = originalTokenize;
     globalThis.self = originalSelf;
   }
+}
+
+// Gives the worker's bridge `core` on its first call of `method`.
+async function withWorkerCore(method, createCore, run) {
+  const original = LlamaWebGpuBridge.prototype[method];
+  LlamaWebGpuBridge.prototype[method] = function withCore(...args) {
+    if (!this._runtime._core) {
+      createCore(this._runtime);
+      this._runtime._modelBytes = 1;
+    }
+    return original.apply(this, args);
+  };
+  try {
+    return await run();
+  } finally {
+    LlamaWebGpuBridge.prototype[method] = original;
+  }
+}
+
+test('the worker runtime keeps the text after U+0000', async () => {
+  const value = await withWorkerCore(
+    'tokenize',
+    (runtime) => { runtime._core = createStubCore(); },
+    () => callWorkerHost('tokenize', [TEXT, false]),
+  );
+  assert.deepEqual(value, tokensFor(TEXT));
+});
+
+// Speech and decision exports on top of the stub core; their 'string'
+// arguments reach C as NUL-terminated strings.
+function withSpeechAndDecisionExports(core) {
+  const ccall = core.ccall.bind(core);
+  core.calls = [];
+  core._llamadart_webgpu_decision_capabilities_json = () => {};
+  core.ccall = (name, retType, argTypes = [], args = []) => {
+    const cArgs = args.map((arg, index) => (
+      argTypes[index] === 'string' && typeof arg === 'string' ? arg.split('\0')[0] : arg
+    ));
+    switch (name) {
+      case 'llamadart_webgpu_tts_info_json':
+        return JSON.stringify({ supported: true, sampleRate: 24000, channels: 1 });
+      case 'llamadart_webgpu_tts_start':
+        core.calls.push([name, ...cArgs]);
+        core.lastError = 'stub stops after start';
+        return Promise.resolve(-1);
+      case 'llamadart_webgpu_decision_api_version':
+        return 1;
+      case 'llamadart_webgpu_decision_capabilities_json':
+        return JSON.stringify({ apiVersion: 1, supported: true });
+      case 'llamadart_webgpu_decision_load':
+        core.calls.push([name, ...cArgs]);
+        return Promise.resolve(3);
+      case 'llamadart_webgpu_decision_head_info_json':
+        return JSON.stringify({ apiVersion: 1, handle: cArgs[0] });
+      default:
+        return ccall(name, retType, argTypes, args);
+    }
+  };
+  return core;
+}
+
+function speechAndDecisionBridge() {
+  const { bridge, core } = createDirectBridge();
+  withSpeechAndDecisionExports(core);
+  bridge._runtime._fetchWithTimeout = async () => new Response(new Uint8Array([1, 2, 3]));
+  return { bridge, core };
+}
+
+const coreCalls = (core, name) => core.calls.filter(([called]) => called === name);
+
+test('synthesizeSpeech rejects text or language holding U+0000 before the core', async () => {
+  const { bridge, core } = speechAndDecisionBridge();
+  await assert.rejects(
+    bridge.synthesizeSpeech({ text: TEXT }),
+    { name: 'TypeError', message: /TextToSpeechOptions\.text contains U\+0000/ },
+  );
+  await assert.rejects(
+    bridge.synthesizeSpeech({ text: 'ab', language: 'en\0x' }),
+    { name: 'TypeError', message: /TextToSpeechOptions\.language contains U\+0000/ },
+  );
+  assert.deepEqual(coreCalls(core, 'llamadart_webgpu_tts_start'), []);
+
+  await assert.rejects(bridge.synthesizeSpeech({ text: 'ab', language: 'en' }), /stub stops after start/);
+  assert.deepEqual(coreCalls(core, 'llamadart_webgpu_tts_start')[0].slice(1, 3), ['ab', 'en']);
+});
+
+test('worker-mode synthesizeSpeech rejects U+0000 before posting to the worker', async () => {
+  const posted = [];
+  const bridge = createWorkerBridge({
+    _restoreWorkerModelIfMissing: async () => {},
+    _callWorker: async (method) => {
+      posted.push(method);
+      return { pcm: new Float32Array(1), sampleRate: 1, channels: 1, sampleCount: 1 };
+    },
+  });
+  for (const options of [{ text: TEXT }, { text: 'ab', language: 'en\0x' }]) {
+    await assert.rejects(bridge.synthesizeSpeech(options), { name: 'TypeError', message: /contains U\+0000/ });
+  }
+  assert.deepEqual(posted, []);
+});
+
+test('a decision head URL holding U+0000 keeps its whole label', async () => {
+  const { bridge, core } = speechAndDecisionBridge();
+  await bridge.loadDecisionHead('heads/a\0b.safetensors');
+  await bridge.loadDecisionHead('https://example.test/heads/c\0d.safetensors');
+  assert.deepEqual(
+    coreCalls(core, 'llamadart_webgpu_decision_load').map((call) => call[2]),
+    ['a%00b.safetensors', 'c%00d.safetensors'],
+  );
+});
+
+test('the worker runtime keeps the whole decision head label', async () => {
+  let core = null;
+  await withWorkerCore(
+    'loadDecisionHead',
+    (runtime) => {
+      core = withSpeechAndDecisionExports(createStubCore());
+      runtime._core = core;
+      runtime._fetchWithTimeout = async () => new Response(new Uint8Array([1]));
+    },
+    () => callWorkerHost('loadDecisionHead', ['heads/a\0b.safetensors', {}]),
+  );
+  assert.equal(coreCalls(core, 'llamadart_webgpu_decision_load')[0][2], 'a%00b.safetensors');
 });
