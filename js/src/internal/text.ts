@@ -1,5 +1,13 @@
 // Prompt assembly and generated-text sanitation.
 
+// For text the core reads as a C string, which ends at the first U+0000.
+export function withoutNul(value: string, name: string): string {
+  if (value.includes('\0')) {
+    throw new TypeError(`${name} contains U+0000, which the core cannot read.`);
+  }
+  return value;
+}
+
 // A chat message as callers pass it; role and content are stringified.
 interface PromptMessage {
   role?: unknown;

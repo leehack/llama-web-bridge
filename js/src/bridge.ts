@@ -18,6 +18,7 @@ import {
   staleLoraAdapterError,
 } from './internal/lora.ts';
 import { cloneModelSource, hasModelSource, normalizeAbsoluteUrl, resolveModelSource, resolvePartUrls } from './internal/model_source.ts';
+import { withoutNul } from './internal/text.ts';
 import { bufferSourceBytes, toUint8Array } from './internal/typed_values.ts';
 import { LlamaWebGpuBridgeRuntime } from './runtime.ts';
 import { emptyBridgeState, serializeWorkerError } from './worker_protocol.ts';
@@ -2473,6 +2474,12 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
   }
 
   async synthesizeSpeech(options: Partial<TextToSpeechOptions> = {}) {
+    for (const field of ['text', 'language'] as const) {
+      const value = options?.[field];
+      if (typeof value === 'string') {
+        withoutNul(value, `TextToSpeechOptions.${field}`);
+      }
+    }
     return this._runExclusive(
       () => this._synthesizeSpeechUnlocked(options),
       {
