@@ -282,14 +282,14 @@ qualificationTest('test_wrong_attestation_type_or_schema_rejected', (t) => {
 // Node qualify writes over the Node harness, verifies, and one written by the
 // 4.0.0 Python harness (or any other version) is rejected on its version
 // before anything else, whatever it binds.
-qualificationTest('the verifier accepts only harness 5.2.0 attestations', (t) => {
-  assert.equal(HARNESS_VERSION, '5.2.0');
-  assert.equal(t.attestation.harness_version, '5.2.0');
+qualificationTest('the verifier accepts only harness 5.3.0 attestations', (t) => {
+  assert.equal(HARNESS_VERSION, '5.3.0');
+  assert.equal(t.attestation.harness_version, '5.3.0');
   assert.equal(t.verify(t.attestation).verified, true);
-  for (const version of ['4.0.0', '3.0.0', '5.0.0', '5.0.1', '5.1.0', '5.0', '']) {
+  for (const version of ['4.0.0', '3.0.0', '5.0.0', '5.0.1', '5.1.0', '5.2.0', '5.0', '']) {
     const old = copy(t.attestation);
     old.harness_version = version;
-    assert.equal(raises(() => t.verify(old)), `harness_version must be '5.2.0', got ${pyRepr(version)}`);
+    assert.equal(raises(() => t.verify(old)), `harness_version must be '5.3.0', got ${pyRepr(version)}`);
   }
 });
 
@@ -754,7 +754,7 @@ qualificationTest('attestation floats, ints and error text follow Python', (t) =
   // Python repr in messages.
   const bad = copy(t.attestation);
   bad.harness_version = new PyFloat(5.0);
-  assert.equal(raises(() => t.verify(bad)), "harness_version must be '5.2.0', got 5.0");
+  assert.equal(raises(() => t.verify(bad)), "harness_version must be '5.3.0', got 5.0");
   const phase = copy(t.attestation);
   phase.phases.speech_to_text.modes.splice(0, 1);
   assert.equal(
