@@ -676,6 +676,18 @@ function requireLoadedCore(entry, memoryMode, label) {
   }
 }
 
+const EXECUTION_BY_RUNTIME_MODE = Object.freeze({ direct: 'main-thread', worker: 'worker' });
+
+// The bridge moves a worker run onto the main thread when the worker is
+// unusable, so a mode is evidence only for where it actually executed.
+function requireExecution(entry, runtimeMode, label) {
+  const execution = pyGet(entry, 'execution');
+  const expected = Object.hasOwn(EXECUTION_BY_RUNTIME_MODE, runtimeMode) ? EXECUTION_BY_RUNTIME_MODE[runtimeMode] : null;
+  if (expected === null || execution !== expected) {
+    throw new ContractError(`${label} executed on ${pyRepr(execution)}, not ${pyRepr(expected)}`);
+  }
+}
+
 export function timing(entry, key, label) {
   const value = pyGet(entry, key);
   if (!isInt(value) || value < 0) throw new ContractError(`${label} is missing a non-negative ${key} timing`);
@@ -696,6 +708,7 @@ export function speechPhase(payload, rss) {
     const [memoryMode, runtimeMode] = modeKey(entry, 'speech');
     const label = `speech ${memoryMode}/${runtimeMode}`;
     requireLoadedCore(entry, memoryMode, label);
+    requireExecution(entry, runtimeMode, label);
     const timings = pyGet(entry, 'phaseTimingsMs');
     if (!isMapping(timings)) throw new ContractError(`${label} did not report per-phase timings`);
     const coldTranscript = pyGet(entry, 'coldTranscript');
@@ -776,6 +789,7 @@ export function ttsPhase(payload, rss, artifactsDir) {
     const [memoryMode, runtimeMode] = modeKey(entry, 'text-to-speech');
     const label = `text-to-speech ${memoryMode}/${runtimeMode}`;
     requireLoadedCore(entry, memoryMode, label);
+    requireExecution(entry, runtimeMode, label);
     const audioName = pyGet(entry, 'audioArtifact');
     if (typeof audioName !== 'string' || !audioName) {
       throw new ContractError(`${label} did not persist a generated WAV artifact`);

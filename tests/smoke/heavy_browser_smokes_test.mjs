@@ -273,6 +273,10 @@ const sha256 = (bytes) => createHash('sha256').update(bytes).digest('hex');
   const loadedCore = "coreVariant: bridge.getModelMetadata()['llamadart.webgpu.core_variant'] || null,\n";
   assert.ok(speech.includes(`          ${loadedCore}`));
   assert.ok(tts.includes(`            ${loadedCore}`));
+  // It also rejects a worker mode that fell back to the main thread.
+  const execution = "execution: bridge.getModelMetadata()['llamadart.webgpu.execution'] || null,\n";
+  assert.ok(speech.includes(`          ${loadedCore}          ${execution}`));
+  assert.ok(tts.includes(`            ${loadedCore}            ${execution}`));
   for (const page of [speech, tts, decision]) {
     assert.ok(page.startsWith('\n<!doctype html>\n<meta charset="utf-8">\n'));
     assert.ok(page.endsWith('})();\n</script>\n'));
