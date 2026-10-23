@@ -180,6 +180,51 @@ const CASES = [
     assert.equal(bridge._supportsVision, false);
   }],
 
+  ['a bare cancel streams its own worker tokens but not a replaced one', async () => {
+    const workerProxy = createProxy('generation-1');
+    const replacement = createProxy('generation-2');
+    const bridge = createBridge({ _workerProxy: workerProxy, _workerGeneration: 1 });
+    const events = [];
+
+    const pending = bridge._runExclusive(() => bridge._callWorker(
+      'createCompletion',
+      ['hello'],
+      (event) => events.push(event.payload.pieceText),
+    ), { kind: 'generation' });
+    await tick();
+    const onEvent = workerProxy.pending[0].onEvent;
+    onEvent({ event: 'token', payload: { pieceText: 'a' } });
+    bridge.cancel();
+    onEvent({ event: 'token', payload: { pieceText: 'b' } });
+    onEvent({ event: 'progress', payload: { pieceText: 'not a token' } });
+    bridge._workerProxy = replacement;
+    onEvent({ event: 'token', payload: { pieceText: 'stale' } });
+    workerProxy.pending[0].resolve({ value: 'ab' });
+
+    assert.equal(await pending, 'ab');
+    assert.deepEqual(events, ['a', 'b']);
+  }],
+
+  ['a cancelled worker call that outlives its operation streams nothing more', async () => {
+    const workerProxy = createProxy('generation-1');
+    const bridge = createBridge({ _workerProxy: workerProxy, _workerGeneration: 1 });
+    const events = [];
+
+    // Like a stalled completion: the operation settles while its call is pending.
+    await bridge._runExclusive(async () => {
+      bridge._callWorker(
+        'createCompletion',
+        ['hello'],
+        (event) => events.push(event.payload.pieceText),
+      ).catch(() => {});
+      await tick();
+      bridge.cancel();
+    }, { kind: 'generation' });
+    workerProxy.pending[0].onEvent({ event: 'token', payload: { pieceText: 'late' } });
+
+    assert.deepEqual(events, []);
+  }],
+
   ['stale worker state cannot enter an atomic recovery transaction', async () => {
     let resolveRequest;
     const oldProxy = createProxy('generation-1', {

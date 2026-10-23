@@ -5189,6 +5189,14 @@ var LlamaWebGpuBridge = class {
   _isOperationCallbackCurrent(operation, proxy) {
     return this._isOperationCurrent(operation) && proxy === this._workerProxy;
   }
+  /**
+   * A bare `cancel()` still resolves with the text the worker generated before
+   * it read the cancel, so the pieces of that text keep streaming until the
+   * call returns. An aborted signal rejects instead, so its stream stops at once.
+   */
+  _streamsPastBareCancel(operation, proxy) {
+    return operation.state === "cancelling" && !operation.callerSignal?.aborted && proxy === this._workerProxy;
+  }
   _sendWorkerCancel(proxy) {
     if (!proxy) {
       return;
@@ -6227,7 +6235,7 @@ var LlamaWebGpuBridge = class {
       this._recordWorkerGeneration(operation, proxy);
     }
     const guardedEvent = typeof onEvent === "function" ? (event) => {
-      if (!operation || this._isOperationCallbackCurrent(operation, proxy) || event.event === "usage" && proxy === this._workerProxy) {
+      if (!operation || this._isOperationCallbackCurrent(operation, proxy) || event.event === "usage" && proxy === this._workerProxy || event.event === "token" && this._streamsPastBareCancel(operation, proxy)) {
         onEvent(event);
       }
     } : void 0;

@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- In worker mode, keep streaming the pieces generated before the worker reads a
+  `cancel()`, so they add up to the returned text; an aborted `signal` still stops
+  the stream and rejects.
 - Stream a character that the model splits across tokens intact at the start of a
   response, instead of wrong characters and repeated text, and return U+FFFD from a
   short `detokenize` result that ends mid-character; invalid bytes become U+FFFD.
