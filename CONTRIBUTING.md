@@ -396,8 +396,10 @@ query strings, and fragments before printing the location.
 - Keep `scripts/smoke/multimodal.mjs` in normal CI for every llama.cpp
   pin update; build-only validation does not cover mtmd prompt ingestion.
 - Heavy real-model ASR and TTS gates run through
-  `scripts/release/qualification.mjs` in automated qualification. Keep the
-  candidate manifest honest: `scripts/release/manifest.mjs` must record those
+  `scripts/release/qualification.mjs` in automated qualification; a mode that
+  fell back to another core than it requested fails. Keep the candidate
+  manifest honest: `scripts/release/manifest.mjs` refuses a core binary whose
+  memories contradict the `wasm32`/`memory64` capabilities, must record those
   two gates as `required-automated-qualification`, never as a candidate-build
   pass, and must
   keep real-device playback, intelligibility, and speaker-reference fidelity in

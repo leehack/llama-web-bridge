@@ -101,7 +101,8 @@ export const ATTESTATION_TYPE = 'llama-web-bridge-automated-qualification';
 // 5.0.0: the harness itself is Node (scripts/release/*.mjs); the Python
 // release_*.py harness is gone.
 // 5.1.0: candidate extraction/state gates cover both memory modes and reject fallback.
-export const HARNESS_VERSION = '5.1.0';
+// 5.2.0: the heavy gates reject core fallback and the manifest reads the core binaries.
+export const HARNESS_VERSION = '5.2.0';
 
 // --- small Python helpers ---------------------------------------------------
 
@@ -325,6 +326,7 @@ export const QUALIFICATION_SMOKES = Object.freeze([SPEECH_SMOKE, TTS_SMOKE]);
 // publication can prove the harness that ran is the exact bridge source being
 // published.
 export const HARNESS_SOURCES = Object.freeze([
+  'build/patch_wasm64_runtime.mjs',
   'release/archive.mjs',
   'release/cli.mjs',
   'release/contract.mjs',

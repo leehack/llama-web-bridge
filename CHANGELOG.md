@@ -6,6 +6,9 @@
   native llamadart does, unless a `grammar` or media `parts` are set. Output for the same
   seed changes whenever `penalty` is not 1, including the default 1.1, or `presencePenalty`
   is not 0.
+- Fail the release manifest build when a core's memories contradict its `wasm32` or
+  `memory64` capability, and fail qualification when a requested wasm64 ASR or TTS
+  mode fell back to the wasm32 core instead of recording it as wasm64.
 - Keep the text after U+0000 in `tokenize`, string `embed`/`embedBatch` inputs and
   `scoreNextToken`/`createCompletion` prompts instead of dropping it; a grammar or
   thinking-budget tag holding U+0000 now rejects.

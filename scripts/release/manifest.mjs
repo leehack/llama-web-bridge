@@ -10,6 +10,7 @@
 
 import { createHash } from 'node:crypto';
 
+import { Memory64Error, wasmMemoryAddressTypes } from '../build/patch_wasm64_runtime.mjs';
 import {
   SystemExitError, parseArguments, progName, runCli,
 } from './cli.mjs';
@@ -74,6 +75,31 @@ export const QUALIFICATION_GATES = Object.freeze({
   speech_to_text: AUTOMATED_QUALIFICATION_REQUIRED,
   text_to_speech: AUTOMATED_QUALIFICATION_REQUIRED,
 });
+
+// CAPABILITIES claims a wasm32 and a memory64 core; each claim holds only
+// while every memory of that core's binary has this address type.
+const CORE_ADDRESS_TYPES = Object.freeze({
+  'llama_webgpu_core.wasm': 'i32',
+  'llama_webgpu_core_mem64.wasm': 'i64',
+});
+
+function requireCoreAddressType(name, data) {
+  const expected = CORE_ADDRESS_TYPES[name];
+  if (expected === undefined) return;
+  let memories;
+  try {
+    memories = wasmMemoryAddressTypes(data);
+  } catch (error) {
+    if (error instanceof Memory64Error) throw new ContractError(`${name}: ${error.message}`);
+    throw error;
+  }
+  if (memories.length === 0 || memories.some((type) => type !== expected)) {
+    throw new ContractError(
+      `${name} memories are [${memories.join(', ')}], expected only ${expected}: `
+      + 'the manifest capabilities would misstate the built core',
+    );
+  }
+}
 
 const RUN_ID_RE = /^[1-9][0-9]*$/u;
 const HEX_DIGITS = '0123456789abcdef';
@@ -196,6 +222,7 @@ export function generate(args) {
     const path = pyJoinPath(outDir, name);
     if (!pyIsFile(path)) throw new ContractError(`required artifact is missing: ${name}`);
     const data = pyReadBytes(path);
+    requireCoreAddressType(name, data);
     artifacts.push({ name, sha256: sha256Hex(data), sizeBytes: data.length });
   }
   const rendered = render(args, identity, artifacts);

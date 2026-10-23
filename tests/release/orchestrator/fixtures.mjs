@@ -23,6 +23,7 @@ import * as model from '../../../scripts/release/orchestrator/model.mjs';
 import * as runNames from '../../../scripts/release/orchestrator/run_names.mjs';
 import * as workflowRuns from '../../../scripts/release/orchestrator/workflow_runs.mjs';
 import { PUBLICATION_FILES } from '../../../scripts/release/publication_state.mjs';
+import { artifactBytes } from '../core_wasm_fixture.mjs';
 import { ZIP_DEFLATED, buildZip } from '../zip_fixture.mjs';
 
 export const BRIDGE_SHA = '565c8396597ea7c0fb4e8d5d966da8d884b156d8';
@@ -117,7 +118,7 @@ export function writeBridgeCandidate(directory, {
 }) {
   fs.mkdirSync(directory, { recursive: true });
   ARTIFACTS.forEach((name, index) => {
-    fs.writeFileSync(path.join(directory, name), Buffer.concat([Buffer.from(marker), Buffer.from(`-${index}-${name}`, 'utf8')]));
+    fs.writeFileSync(path.join(directory, name), artifactBytes(name, Buffer.concat([Buffer.from(marker), Buffer.from(`-${index}-${name}`, 'utf8')])));
   });
   generate({
     outDir: directory,

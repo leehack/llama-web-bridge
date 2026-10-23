@@ -260,6 +260,7 @@ export function renderHarness({ expectedText, audioSha256, memoryModes }) {
         modeResults.push({
           memoryMode,
           runtimeMode,
+          coreVariant: bridge.getModelMetadata()['llamadart.webgpu.core_variant'] || null,
           elapsedMs: Math.round(performance.now() - startedAt),
           phaseTimingsMs,
           coldTranscript: transcripts[0],

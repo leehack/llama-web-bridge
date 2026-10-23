@@ -667,6 +667,15 @@ export function modeKey(entry, label) {
   return [memoryMode, runtimeMode];
 }
 
+// The bridge falls back to the wasm32 core when the mem64 core fails to
+// start, so a mode is evidence only for the core that actually loaded.
+function requireLoadedCore(entry, memoryMode, label) {
+  const coreVariant = pyGet(entry, 'coreVariant');
+  if (coreVariant !== memoryMode) {
+    throw new ContractError(`${label} ran on core ${pyRepr(coreVariant)}, not the requested ${memoryMode} core`);
+  }
+}
+
 export function timing(entry, key, label) {
   const value = pyGet(entry, key);
   if (!isInt(value) || value < 0) throw new ContractError(`${label} is missing a non-negative ${key} timing`);
@@ -686,6 +695,7 @@ export function speechPhase(payload, rss) {
     if (!isMapping(entry)) throw new ContractError('speech gate reported an invalid mode result');
     const [memoryMode, runtimeMode] = modeKey(entry, 'speech');
     const label = `speech ${memoryMode}/${runtimeMode}`;
+    requireLoadedCore(entry, memoryMode, label);
     const timings = pyGet(entry, 'phaseTimingsMs');
     if (!isMapping(timings)) throw new ContractError(`${label} did not report per-phase timings`);
     const coldTranscript = pyGet(entry, 'coldTranscript');
@@ -765,6 +775,7 @@ export function ttsPhase(payload, rss, artifactsDir) {
     if (!isMapping(entry)) throw new ContractError('text-to-speech gate reported an invalid mode result');
     const [memoryMode, runtimeMode] = modeKey(entry, 'text-to-speech');
     const label = `text-to-speech ${memoryMode}/${runtimeMode}`;
+    requireLoadedCore(entry, memoryMode, label);
     const audioName = pyGet(entry, 'audioArtifact');
     if (typeof audioName !== 'string' || !audioName) {
       throw new ContractError(`${label} did not persist a generated WAV artifact`);

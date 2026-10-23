@@ -367,8 +367,9 @@ test('test_harness_version_moves_with_the_harness_sources', () => {
   // A new harness file list is a new harness: bump HARNESS_VERSION with it,
   // so an attestation from the old list fails on its version too.
   assert.deepEqual([HARNESS_VERSION, [...HARNESS_SOURCES].sort()], [
-    '5.1.0',
+    '5.2.0',
     [
+      'build/patch_wasm64_runtime.mjs',
       'release/archive.mjs',
       'release/cli.mjs',
       'release/contract.mjs',
