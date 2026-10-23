@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Keep the text after U+0000 in `tokenize`, string `embed`/`embedBatch` inputs and
+  `scoreNextToken`/`createCompletion` prompts instead of dropping it; a grammar or
+  thinking-budget tag holding U+0000 now rejects.
 - In worker mode, reload the model before `getDecisionCapabilities` and `runDecision`
   when a cancelled multimodal setup or a failed worker-restart reload left the worker
   without it: the probe no longer reports decision heads unsupported, and a run asks

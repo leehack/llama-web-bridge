@@ -168,12 +168,18 @@ function optionalNumber(value, name, isValid, range) {
   }
   return value;
 }
+function withoutNul(value, name) {
+  if (value.includes("\0")) {
+    throw new TypeError(`CompletionOptions.${name} contains U+0000, which the core cannot read.`);
+  }
+  return value;
+}
 function tag(budget, name) {
   const value = budget[name];
   if (typeof value !== "string" || value.trim().length === 0) {
     throw new TypeError(`CompletionOptions.thinkingBudget.${name} must be a non-empty string.`);
   }
-  return value;
+  return withoutNul(value, `thinkingBudget.${name}`);
 }
 function thinkingBudget(value, hasMediaParts) {
   if (value == null) {
@@ -195,6 +201,7 @@ function thinkingBudget(value, hasMediaParts) {
   if (typeof forcedMessage !== "string") {
     throw new TypeError("CompletionOptions.thinkingBudget.forcedMessage must be a string.");
   }
+  withoutNul(forcedMessage, "thinkingBudget.forcedMessage");
   if (hasMediaParts) {
     throw new Error("CompletionOptions.thinkingBudget supports text-only prompts; remove the media parts.");
   }
@@ -347,6 +354,9 @@ function speculativeDecoding(value, conflicts) {
 }
 function resolveCompletionSamplingOptions(options) {
   const hasMediaParts = Array.isArray(options?.parts) && options.parts.length > 0;
+  if (typeof options?.grammar === "string") {
+    withoutNul(options.grammar, "grammar");
+  }
   const budget = thinkingBudget(options?.thinkingBudget, hasMediaParts);
   return {
     minP: optionalNumber(options?.minP, "minP", (value) => value >= 0 && value <= 1, " from 0 to 1") ?? 0,
@@ -4188,6 +4198,11 @@ var LlamaWebGpuBridgeRuntime = class {
     }
     const sampling = resolveCompletionSamplingOptions(options);
     requireCompletionCapabilities(sampling, this.getCompletionCapabilities());
+    const input = this._coreText(
+      String(prompt),
+      "llamadart_webgpu_begin_generation_bytes",
+      "llamadart_webgpu_begin_generation"
+    );
     this._abortRequested = false;
     const startedAt = performance.now();
     let firstTokenAt = null;
@@ -4216,10 +4231,10 @@ var LlamaWebGpuBridgeRuntime = class {
       }
       const beginRc = Number(
         await this._core.ccall(
-          "llamadart_webgpu_begin_generation",
+          input.exportName,
           "number",
           [
-            "string",
+            ...input.argTypes,
             "number",
             "number",
             "number",
@@ -4234,7 +4249,7 @@ var LlamaWebGpuBridgeRuntime = class {
             "string"
           ],
           [
-            String(prompt),
+            ...input.args,
             temp,
             topK,
             topP,
@@ -4400,12 +4415,13 @@ var LlamaWebGpuBridgeRuntime = class {
     if (this._modelBytes <= 0) {
       throw new Error("No model loaded. Call loadModelFromUrl first.");
     }
+    const input = this._coreText(String(text), "llamadart_webgpu_tokenize_bytes_to_json", "llamadart_webgpu_tokenize_to_json");
     const rc = Number(
       await this._core.ccall(
-        "llamadart_webgpu_tokenize_to_json",
+        input.exportName,
         "number",
-        ["string", "number"],
-        [String(text), _addSpecial ? 1 : 0],
+        [...input.argTypes, "number"],
+        [...input.args, _addSpecial ? 1 : 0],
         { async: true }
       )
     );
@@ -4532,6 +4548,21 @@ var LlamaWebGpuBridgeRuntime = class {
     }
     return this._core.ccall("llamadart_webgpu_last_detokenized", "string", [], []) || "";
   }
+  // A 'string' ccall argument reaches the core as a C string, which ends at the
+  // first U+0000, so text goes as UTF-8 bytes and a length when the core can
+  // take them. An older core would silently drop the rest of the text.
+  _coreText(text, bytesExport, stringExport) {
+    if (typeof this._core[`_${bytesExport}`] === "function") {
+      const bytes = textEncoder.encode(text);
+      return { exportName: bytesExport, argTypes: ["array", "number"], args: [bytes, bytes.length] };
+    }
+    if (text.includes("\0")) {
+      throw new Error(
+        `Text contains U+0000, which this core cannot read: it lacks ${bytesExport}. Use the core from the same bridge release.`
+      );
+    }
+    return { exportName: stringExport, argTypes: ["string"], args: [text] };
+  }
   // Core text as raw bytes: a 'string' ccall hand-decodes 16 bytes or fewer
   // and turns an incomplete or invalid UTF-8 sequence into wrong but valid
   // code points instead of U+FFFD.
@@ -4596,12 +4627,13 @@ var LlamaWebGpuBridgeRuntime = class {
       throw new Error("No model loaded. Call loadModelFromUrl first.");
     }
     const normalize = options?.normalize !== false;
+    const input = this._coreText(String(text), "llamadart_webgpu_embed_bytes_to_json", "llamadart_webgpu_embed_to_json");
     const rc = Number(
       await this._core.ccall(
-        "llamadart_webgpu_embed_to_json",
+        input.exportName,
         "number",
-        ["string", "number"],
-        [String(text), normalize ? 1 : 0],
+        [...input.argTypes, "number"],
+        [...input.args, normalize ? 1 : 0],
         { async: true }
       )
     );
@@ -4644,12 +4676,17 @@ var LlamaWebGpuBridgeRuntime = class {
       throw new TypeError(`Next-token topK is ${String(topK)}; expected a 32-bit integer.`);
     }
     const reusePromptPrefix = options?.reusePromptPrefix !== false;
+    const input = this._coreText(
+      prompt,
+      "llamadart_webgpu_score_next_token_bytes_to_json",
+      "llamadart_webgpu_score_next_token_to_json"
+    );
     const rc = Number(
       await this._core.ccall(
-        "llamadart_webgpu_score_next_token_to_json",
+        input.exportName,
         "number",
-        ["string", "string", "number", "number"],
-        [prompt, JSON.stringify(candidates), topK, reusePromptPrefix ? 1 : 0],
+        [...input.argTypes, "string", "number", "number"],
+        [...input.args, JSON.stringify(candidates), topK, reusePromptPrefix ? 1 : 0],
         { async: true }
       )
     );

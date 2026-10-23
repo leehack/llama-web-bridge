@@ -205,6 +205,22 @@ export function emscriptenUtf8ToString(cBytes) {
   return text;
 }
 
+const utf8Decoder = new TextDecoder();
+
+// A 'string' ccall argument reaches C as a NUL-terminated string.
+function cString(arg) {
+  return typeof arg === 'string' && arg.includes('\0') ? arg.slice(0, arg.indexOf('\0')) : arg;
+}
+
+// Exports that take (bytes, length, ...) in place of their legacy C-string
+// export's text argument.
+const TEXT_BYTES_EXPORTS = new Map([
+  ['llamadart_webgpu_tokenize_bytes_to_json', 'llamadart_webgpu_tokenize_to_json'],
+  ['llamadart_webgpu_embed_bytes_to_json', 'llamadart_webgpu_embed_to_json'],
+  ['llamadart_webgpu_score_next_token_bytes_to_json', 'llamadart_webgpu_score_next_token_to_json'],
+  ['llamadart_webgpu_begin_generation_bytes', 'llamadart_webgpu_begin_generation'],
+]);
+
 /** Mirrors singleton result buffers and the C++ re-entrant-begin guard. */
 export function createStubCore(scripts = {}) {
   const files = new Map();
@@ -227,6 +243,10 @@ export function createStubCore(scripts = {}) {
     // Probed by the runtime; a core older than these exports lacks them.
     _llamadart_webgpu_last_output_bytes_json: () => {},
     _llamadart_webgpu_last_detokenized_bytes_json: () => {},
+    _llamadart_webgpu_tokenize_bytes_to_json: () => {},
+    _llamadart_webgpu_embed_bytes_to_json: () => {},
+    _llamadart_webgpu_score_next_token_bytes_to_json: () => {},
+    _llamadart_webgpu_begin_generation_bytes: () => {},
     FS: {
       readdir: () => ['states'],
       mkdir: () => {},
@@ -238,7 +258,17 @@ export function createStubCore(scripts = {}) {
       write: () => {},
       close: () => {},
     },
-    ccall(name, _retType, _argTypes, args = []) {
+    ccall(exportName, _retType, argTypes = [], cArgs = []) {
+      let name = exportName;
+      let args = cArgs.map((arg, index) => (argTypes[index] === 'string' ? cString(arg) : arg));
+      const legacyName = TEXT_BYTES_EXPORTS.get(name);
+      if (legacyName) {
+        if (typeof core[`_${name}`] !== 'function') {
+          throw new TypeError('func is not a function');
+        }
+        name = legacyName;
+        args = [utf8Decoder.decode(args[0].subarray(0, args[1])), ...args.slice(2)];
+      }
       switch (name) {
         case 'llamadart_webgpu_begin_generation': {
           if (core.activePrompt !== null) {

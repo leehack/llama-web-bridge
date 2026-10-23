@@ -11,6 +11,13 @@ export type CcallArgType = 'number' | 'string' | 'array';
 // Emscripten `ccall` argument values: 'array' takes bytes, 'string' may be null.
 export type CcallArg = number | string | Uint8Array | null;
 
+// Core exports that take text as UTF-8 bytes and a length instead of a C string.
+export type TextBytesExport =
+  | 'llamadart_webgpu_tokenize_bytes_to_json'
+  | 'llamadart_webgpu_embed_bytes_to_json'
+  | 'llamadart_webgpu_score_next_token_bytes_to_json'
+  | 'llamadart_webgpu_begin_generation_bytes';
+
 // The Emscripten FS subset the runtime uses, on top of the download helpers'.
 export interface LlamaCoreFs extends EmscriptenFs {
   readFile(path: string): Uint8Array;
@@ -76,6 +83,11 @@ export interface LlamaCoreModule {
   // Present only in builds that return generated and detokenized text as bytes.
   _llamadart_webgpu_last_output_bytes_json?: unknown;
   _llamadart_webgpu_last_detokenized_bytes_json?: unknown;
+  // Present only in builds that take text after a U+0000.
+  _llamadart_webgpu_tokenize_bytes_to_json?: unknown;
+  _llamadart_webgpu_embed_bytes_to_json?: unknown;
+  _llamadart_webgpu_score_next_token_bytes_to_json?: unknown;
+  _llamadart_webgpu_begin_generation_bytes?: unknown;
   // Present only in builds that include LoRA adapters.
   _llamadart_webgpu_lora_api_version?: unknown;
 }

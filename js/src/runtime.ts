@@ -68,7 +68,7 @@ import { bufferSourceBytes, isInt32, toFloat32Array, toUint8Array } from './inte
 import type { ResolvedSpeculativeOptions } from './internal/completion_options.ts';
 import type { ProgressCallback } from './internal/download.ts';
 import type { ModelSource } from './internal/model_source.ts';
-import type { CcallArgType, LlamaCoreModule, LogMethod } from './internal/types.ts';
+import type { CcallArg, CcallArgType, LlamaCoreModule, LogMethod, TextBytesExport } from './internal/types.ts';
 import type {
   CompletionCapabilities,
   CompletionFinishReason,
@@ -3815,6 +3815,11 @@ export class LlamaWebGpuBridgeRuntime {
     }
     const sampling = resolveCompletionSamplingOptions(options);
     requireCompletionCapabilities(sampling, this.getCompletionCapabilities());
+    const input = this._coreText(
+      String(prompt),
+      'llamadart_webgpu_begin_generation_bytes',
+      'llamadart_webgpu_begin_generation',
+    );
 
     this._abortRequested = false;
     const startedAt = performance.now();
@@ -3854,14 +3859,14 @@ export class LlamaWebGpuBridgeRuntime {
       }
       const beginRc = Number(
         await this._core!.ccall(
-          'llamadart_webgpu_begin_generation',
+          input.exportName,
           'number',
           [
-            'string', 'number', 'number', 'number', 'number', 'string', 'number', 'number', 'number',
+            ...input.argTypes, 'number', 'number', 'number', 'number', 'string', 'number', 'number', 'number',
             'number', 'string', 'string', 'string',
           ],
           [
-            String(prompt),
+            ...input.args,
             temp,
             topK,
             topP,
@@ -4068,12 +4073,13 @@ export class LlamaWebGpuBridgeRuntime {
       throw new Error('No model loaded. Call loadModelFromUrl first.');
     }
 
+    const input = this._coreText(String(text), 'llamadart_webgpu_tokenize_bytes_to_json', 'llamadart_webgpu_tokenize_to_json');
     const rc = Number(
       await this._core!.ccall(
-        'llamadart_webgpu_tokenize_to_json',
+        input.exportName,
         'number',
-        ['string', 'number'],
-        [String(text), _addSpecial ? 1 : 0],
+        [...input.argTypes, 'number'],
+        [...input.args, _addSpecial ? 1 : 0],
         { async: true },
       ),
     );
@@ -4240,6 +4246,27 @@ export class LlamaWebGpuBridgeRuntime {
     return this._core!.ccall('llamadart_webgpu_last_detokenized', 'string', [], []) || '';
   }
 
+  // A 'string' ccall argument reaches the core as a C string, which ends at the
+  // first U+0000, so text goes as UTF-8 bytes and a length when the core can
+  // take them. An older core would silently drop the rest of the text.
+  _coreText(text: string, bytesExport: TextBytesExport, stringExport: string): {
+    exportName: string;
+    argTypes: CcallArgType[];
+    args: CcallArg[];
+  } {
+    if (typeof this._core![`_${bytesExport}`] === 'function') {
+      const bytes = textEncoder.encode(text);
+      return { exportName: bytesExport, argTypes: ['array', 'number'], args: [bytes, bytes.length] };
+    }
+    if (text.includes('\0')) {
+      throw new Error(
+        `Text contains U+0000, which this core cannot read: it lacks ${bytesExport}. `
+        + 'Use the core from the same bridge release.',
+      );
+    }
+    return { exportName: stringExport, argTypes: ['string'], args: [text] };
+  }
+
   // Core text as raw bytes: a 'string' ccall hand-decodes 16 bytes or fewer
   // and turns an incomplete or invalid UTF-8 sequence into wrong but valid
   // code points instead of U+FFFD.
@@ -4308,12 +4335,13 @@ export class LlamaWebGpuBridgeRuntime {
     }
 
     const normalize = options?.normalize !== false;
+    const input = this._coreText(String(text), 'llamadart_webgpu_embed_bytes_to_json', 'llamadart_webgpu_embed_to_json');
     const rc = Number(
       await this._core!.ccall(
-        'llamadart_webgpu_embed_to_json',
+        input.exportName,
         'number',
-        ['string', 'number'],
-        [String(text), normalize ? 1 : 0],
+        [...input.argTypes, 'number'],
+        [...input.args, normalize ? 1 : 0],
         { async: true },
       ),
     );
@@ -4369,12 +4397,17 @@ export class LlamaWebGpuBridgeRuntime {
     }
     const reusePromptPrefix = options?.reusePromptPrefix !== false;
 
+    const input = this._coreText(
+      prompt,
+      'llamadart_webgpu_score_next_token_bytes_to_json',
+      'llamadart_webgpu_score_next_token_to_json',
+    );
     const rc = Number(
       await this._core!.ccall(
-        'llamadart_webgpu_score_next_token_to_json',
+        input.exportName,
         'number',
-        ['string', 'string', 'number', 'number'],
-        [prompt, JSON.stringify(candidates), topK, reusePromptPrefix ? 1 : 0],
+        [...input.argTypes, 'string', 'number', 'number'],
+        [...input.args, JSON.stringify(candidates), topK, reusePromptPrefix ? 1 : 0],
         { async: true },
       ),
     );
