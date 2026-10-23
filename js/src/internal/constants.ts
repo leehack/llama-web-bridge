@@ -6,6 +6,10 @@ export const defaultModelCacheName = 'llamadart-webgpu-model-cache-v1';
 // bridge from a transient runtime failure.
 export const BRIDGE_DISPOSED_MESSAGE = 'Bridge has been disposed.';
 
+export function bridgeDisposedError(): Error {
+  return Object.assign(new Error(BRIDGE_DISPOSED_MESSAGE), { code: 'disposed' });
+}
+
 // llamadart_webgpu_begin_generation returns this when a generation is already
 // active. The core leaves g_last_error untouched in that case, so the message is
 // fixed here rather than read from the shared buffer.

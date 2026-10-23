@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Give every decision API rejection a stable string `code`, such as `head-lost`, `busy` or
+  `context`, in direct and worker mode, so callers need not match its unchanged message.
 - Reject `synthesizeSpeech` `text` or `language` holding U+0000 with a `TypeError` instead
   of speaking only the text before it, and keep the whole file name of a decision head URL
   holding U+0000 in its load errors.

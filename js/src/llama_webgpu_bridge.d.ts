@@ -369,6 +369,17 @@ export interface DecisionOutput {
   actLogits: Float32Array;
 }
 
+/**
+ * The `code` of every `getDecisionCapabilities`, `loadDecisionHead`,
+ * `runDecision` and `freeDecisionHead` rejection; docs/api.md lists what each
+ * means. The error keeps its type, name and message, so branch on `code`
+ * rather than on the message.
+ */
+export type DecisionErrorCode =
+  | 'head-lost' | 'no-model' | 'disposed' | 'cancelled' | 'busy' | 'context'
+  | 'invalid-argument' | 'unsupported' | 'model' | 'inference' | 'invalid-state'
+  | 'runtime';
+
 export interface LoraAdapterCapabilities {
   apiVersion: number;
   supported: boolean;

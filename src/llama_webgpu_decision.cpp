@@ -1221,7 +1221,7 @@ llama_webgpu_decision_status llama_webgpu_decision_head_load(
   *out_head = nullptr;
   if (request.model == nullptr) {
     error = "Model is not loaded. Load the decision encoder before its head.";
-    return LLAMADART_WEBGPU_DECISION_STATUS_INVALID_STATE;
+    return LLAMADART_WEBGPU_DECISION_STATUS_NO_MODEL;
   }
   if (request.head_path == nullptr || request.head_path[0] == '\0') {
     error = "Decision head path is empty.";
@@ -1436,7 +1436,7 @@ llama_webgpu_decision_status llama_webgpu_decision_run(
   if (head == nullptr || out_outputs == nullptr) {
     error = "The decision head is not loaded; it was freed or its model was "
         "unloaded. Load the decision head again.";
-    return LLAMADART_WEBGPU_DECISION_STATUS_INVALID_STATE;
+    return LLAMADART_WEBGPU_DECISION_STATUS_HEAD_NOT_LOADED;
   }
   out_outputs->clear();
   // Reject every invalid sequence before the first llama_encode, whose

@@ -1,6 +1,6 @@
 // Decision-head API constants and sequence/output codecs.
 
-import type { DecisionOutput } from '../llama_webgpu_bridge.d.ts';
+import type { DecisionErrorCode, DecisionOutput } from '../llama_webgpu_bridge.d.ts';
 import { isInt32 } from './typed_values.ts';
 
 // Decision head API version shared with llama_webgpu_decision.h.
@@ -9,6 +9,58 @@ export const DECISION_API_VERSION = 1;
 // Worker runDecision budget per sequence on top of a 10-minute base; one
 // 512-token sequence takes a few seconds on the WASM CPU backend.
 export const DECISION_WORKER_TIMEOUT_PER_SEQUENCE_MS = 60 * 1000;
+
+const DECISION_ERROR_CODES: ReadonlySet<unknown> = new Set<DecisionErrorCode>([
+  'head-lost', 'no-model', 'disposed', 'cancelled', 'busy', 'context',
+  'invalid-argument', 'unsupported', 'model', 'inference', 'invalid-state',
+  'runtime',
+]);
+
+// llama_webgpu_decision_status values from llama_webgpu_decision.h.
+const CORE_STATUS_CODES: Readonly<Record<number, DecisionErrorCode>> = {
+  [-1]: 'invalid-argument',
+  [-2]: 'unsupported',
+  [-3]: 'invalid-state',
+  [-4]: 'model',
+  [-5]: 'context',
+  [-6]: 'inference',
+  [-7]: 'busy',
+  [-8]: 'head-lost',
+  [-9]: 'no-model',
+};
+
+export function isDecisionErrorCode(value: unknown): value is DecisionErrorCode {
+  return DECISION_ERROR_CODES.has(value);
+}
+
+export function decisionErrorCodeOf(error: unknown): DecisionErrorCode | null {
+  const code = error && typeof error === 'object' ? (error as { code?: unknown }).code : undefined;
+  return isDecisionErrorCode(code) ? code : null;
+}
+
+// An own data property, because DOMException's numeric `code` is a
+// getter-only accessor on its prototype.
+export function withDecisionErrorCode<T extends object>(error: T, code: DecisionErrorCode): T {
+  Object.defineProperty(error, 'code', {
+    value: code,
+    writable: true,
+    enumerable: true,
+    configurable: true,
+  });
+  return error;
+}
+
+export function decisionError(code: DecisionErrorCode, message: string): Error {
+  return withDecisionErrorCode(new Error(message), code);
+}
+
+export function decisionCoreStatusCode(status: number): DecisionErrorCode {
+  return CORE_STATUS_CODES[status] ?? 'runtime';
+}
+
+export function invalidDecisionArgument(message: string): TypeError {
+  return withDecisionErrorCode(new TypeError(message), 'invalid-argument');
+}
 
 // A decision sequence after its integer lists are validated and copied.
 export interface NormalizedDecisionSequence {
@@ -19,7 +71,7 @@ export interface NormalizedDecisionSequence {
 
 export function decisionHandleFrom(handle: unknown): number {
   if (!isInt32(handle) || (handle as number) <= 0) {
-    throw new TypeError(`Decision head handle must be a positive integer, got ${String(handle)}.`);
+    throw invalidDecisionArgument(`Decision head handle must be a positive integer, got ${String(handle)}.`);
   }
   return handle as number;
 }
@@ -28,14 +80,14 @@ function decisionIntegerList(value: unknown, label: string): Int32Array {
   const isList = Array.isArray(value)
     || (ArrayBuffer.isView(value) && !(value instanceof DataView));
   if (!isList) {
-    throw new TypeError(`${label} must be an array or typed array of integers.`);
+    throw invalidDecisionArgument(`${label} must be an array or typed array of integers.`);
   }
   const list = value as ArrayLike<unknown>;
   const out = new Int32Array(list.length);
   for (let index = 0; index < list.length; index += 1) {
     const item = list[index];
     if (!isInt32(item)) {
-      throw new TypeError(`${label}[${index}] is ${String(item)}; expected a 32-bit integer.`);
+      throw invalidDecisionArgument(`${label}[${index}] is ${String(item)}; expected a 32-bit integer.`);
     }
     out[index] = item as number;
   }
@@ -50,18 +102,18 @@ function decisionIntegerList(value: unknown, label: string): Int32Array {
  */
 export function normalizeDecisionSequences(sequences: unknown): NormalizedDecisionSequence[] {
   if (!Array.isArray(sequences)) {
-    throw new TypeError('Decision sequences must be an array.');
+    throw invalidDecisionArgument('Decision sequences must be an array.');
   }
   return sequences.map((sequence, index) => {
     const label = `Decision sequence ${index}`;
     if (!sequence || typeof sequence !== 'object') {
-      throw new TypeError(`${label} must be an object with tokens, markers and questionType.`);
+      throw invalidDecisionArgument(`${label} must be an object with tokens, markers and questionType.`);
     }
     const tokens = decisionIntegerList(sequence.tokens, `${label} tokens`);
     const markers = decisionIntegerList(sequence.markers, `${label} markers`);
     const questionType = sequence.questionType;
     if (!isInt32(questionType)) {
-      throw new TypeError(
+      throw invalidDecisionArgument(
         `${label} questionType is ${String(questionType)}; expected 0 (choice), 1 (score) or 2 (noul).`,
       );
     }
@@ -103,7 +155,7 @@ export function encodeDecisionSequences(sequences: unknown): Uint8Array {
  * act counts, then the float32 logits and act logits.
  */
 export function decodeDecisionOutputs(bytes: Uint8Array, count: number): DecisionOutput[] {
-  const malformed = () => new Error('Decision output from the WebGPU core is malformed.');
+  const malformed = () => decisionError('inference', 'Decision output from the WebGPU core is malformed.');
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   let offset = 0;
   const floats = (length: number) => {

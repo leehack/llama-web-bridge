@@ -109,12 +109,13 @@ export function renderHarness({ fixture, configJson, memoryModes, runtimeModes, 
   const assert = (condition, message) => {
     if (!condition) throw new Error(message);
   };
-  const rejects = async (promise, pattern, label) => {
+  const rejects = async (promise, pattern, label, code) => {
     try {
       await promise;
     } catch (error) {
       const text = String(error?.message || error);
       assert(pattern.test(text), \`\${label} rejected with an unexpected error: \${text}\`);
+      assert(error?.code === code, \`\${label} rejected with code \${error?.code}, expected \${code}\`);
       return text;
     }
     throw new Error(\`\${label} unexpectedly succeeded\`);
@@ -194,6 +195,7 @@ export function renderHarness({ fixture, configJson, memoryModes, runtimeModes, 
             bridge.loadDecisionHead(new Uint8Array([1, 2, 3])),
             /Invalid safetensors file "decision head bytes"/,
             'truncated head bytes',
+            'model',
           );
 
           setStage(\`\${memoryMode}:\${runtimeMode}:reject-deep-header\`);
@@ -203,6 +205,7 @@ export function renderHarness({ fixture, configJson, memoryModes, runtimeModes, 
             )),
             /Invalid safetensors file "decision head bytes": header nests JSON deeper than 64 levels/,
             'deeply nested head header',
+            'model',
           );
 
           setStage(\`\${memoryMode}:\${runtimeMode}:reject-deep-config\`);
@@ -212,6 +215,7 @@ export function renderHarness({ fixture, configJson, memoryModes, runtimeModes, 
             }),
             /Decision head config nests JSON deeper than 64 levels/,
             'deeply nested configJson',
+            'model',
           );
 
           setStage(\`\${memoryMode}:\${runtimeMode}:large-config\`);
@@ -223,6 +227,7 @@ export function renderHarness({ fixture, configJson, memoryModes, runtimeModes, 
             }),
             /has no tensor "head[.]layers[.]0[.]linear1[.]weight"/,
             'large configJson',
+            'model',
           );
 
           setStage(\`\${memoryMode}:\${runtimeMode}:load-head\`);
@@ -253,6 +258,7 @@ export function renderHarness({ fixture, configJson, memoryModes, runtimeModes, 
             ]),
             new RegExp(\`Decision sequence 1 has \${oversizedLength} tokens; the decision encoder accepts 1 to [0-9]+[.]\`),
             'oversized sequence',
+            'inference',
           );
 
           setStage(\`\${memoryMode}:\${runtimeMode}:reject-excess-markers\`);
@@ -265,6 +271,7 @@ export function renderHarness({ fixture, configJson, memoryModes, runtimeModes, 
             }]),
             new RegExp(\`Decision sequence 0 has \${firstTokens.length + 1} markers for its \${firstTokens.length} tokens\`),
             'more markers than tokens',
+            'inference',
           );
 
           setStage(\`\${memoryMode}:\${runtimeMode}:run\`);
@@ -326,6 +333,7 @@ export function renderHarness({ fixture, configJson, memoryModes, runtimeModes, 
             bridge.runDecision(info.handle, [sequences[0]]),
             /Decision head \\d+ is not loaded/,
             'freed head',
+            'head-lost',
           );
 
           modeResults.push({

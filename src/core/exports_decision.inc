@@ -17,11 +17,11 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_decision_load(
     const char * config_path) {
   clear_error();
   if (!ensure_loaded()) {
-    return LLAMADART_WEBGPU_DECISION_STATUS_INVALID_STATE;
+    return LLAMADART_WEBGPU_DECISION_STATUS_NO_MODEL;
   }
   if (g_generation_active || g_tts_active) {
     set_error("Decision heads cannot be loaded or run during active generation or text-to-speech synthesis");
-    return LLAMADART_WEBGPU_DECISION_STATUS_INVALID_STATE;
+    return LLAMADART_WEBGPU_DECISION_STATUS_BUSY;
   }
   if (g_next_decision_handle == std::numeric_limits<int32_t>::max()) {
     set_error("Decision head handles are exhausted; reload the model.");
@@ -66,11 +66,11 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_decision_run(
   const auto it = g_decision_heads.find(handle);
   if (it == g_decision_heads.end()) {
     set_error("The decision head is not loaded; it was freed or its model was unloaded. Load the decision head again.");
-    return LLAMADART_WEBGPU_DECISION_STATUS_INVALID_STATE;
+    return LLAMADART_WEBGPU_DECISION_STATUS_HEAD_NOT_LOADED;
   }
   if (g_generation_active || g_tts_active) {
     set_error("Decision heads cannot be loaded or run during active generation or text-to-speech synthesis");
-    return LLAMADART_WEBGPU_DECISION_STATUS_INVALID_STATE;
+    return LLAMADART_WEBGPU_DECISION_STATUS_BUSY;
   }
   std::vector<llama_webgpu_decision_sequence> sequences;
   std::string error;
