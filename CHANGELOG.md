@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Fail the release manifest build when a core's memories contradict its `wasm32` or
+  `memory64` capability, and fail qualification when a requested wasm64 ASR or TTS
+  mode fell back to the wasm32 core instead of recording it as wasm64.
 - Fail the wasm64 build when `llama_webgpu_core_mem64.wasm` is not memory64, instead of
   shipping a wasm32 core whose patched `FS.read` and `FS.write` throw on BigInt arguments.
 - In worker mode, reload the model before `getDecisionCapabilities` and `runDecision`

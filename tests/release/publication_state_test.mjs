@@ -32,6 +32,7 @@ import {
   verifyImmutablePublication,
 } from '../../scripts/release/publication_state.mjs';
 import { releaseAttestation } from './contract_fixtures.mjs';
+import { artifactBytes } from './core_wasm_fixture.mjs';
 
 const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const CLI = path.join(rootDir, 'scripts/release/publication_state.mjs');
@@ -83,7 +84,7 @@ class Fixture {
     git(this.repository, 'config', 'user.name', 'test');
     git(this.repository, 'config', 'user.email', 'test@example.com');
 
-    ARTIFACTS.forEach((name, index) => writeFileSync(path.join(this.candidate, name), `candidate-${index}`));
+    ARTIFACTS.forEach((name, index) => writeFileSync(path.join(this.candidate, name), artifactBytes(name, `candidate-${index}`)));
     this.identity = new CandidateIdentity({
       releaseTag: 'v0.2.0',
       releaseRebuild: 0,

@@ -89,6 +89,7 @@ import {
   loadCandidate,
   verifyAttestation,
 } from '../../scripts/release/qualification.mjs';
+import { artifactBytes } from './core_wasm_fixture.mjs';
 
 export const BRIDGE_SHA = '565c8396597ea7c0fb4e8d5d966da8d884b156d8';
 export const UPSTREAM_COMMIT = 'bb4caa7540188872173c44d161602d9271386413';
@@ -140,7 +141,7 @@ export function manifestArgs(directory, overrides = {}) {
 
 export function writeCandidate(directory, { marker = 'candidate' } = {}) {
   fs.mkdirSync(directory, { recursive: true });
-  ARTIFACTS.forEach((name, index) => fs.writeFileSync(path.join(directory, name), `${marker}-${index}-${name}`));
+  ARTIFACTS.forEach((name, index) => fs.writeFileSync(path.join(directory, name), artifactBytes(name, `${marker}-${index}-${name}`)));
   generate(manifestArgs(directory));
 }
 

@@ -206,7 +206,7 @@ scanned stable native release; each candidate gets its own exact
   smoke, and release tooling lives in `scripts/build/`, `scripts/ci/`,
   `scripts/smoke/`, and `scripts/release/`. The qualification harness digest
   covers `HARNESS_SOURCES` in `scripts/release/qualification.mjs` (harness
-  `5.1.0`, the Node harness), and the candidate/publication checkouts address
+  `5.2.0`, the Node harness), and the candidate/publication checkouts address
   harness files by their `scripts/` path at the candidate's commit, so moving
   or adding a harness module changes the digest and needs a new candidate.
   `tests/release/qualification_harness_test.mjs` requires that list to equal
