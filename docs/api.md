@@ -943,7 +943,7 @@ Handles are never reused within one bridge instance.
 
 Every rejection of the four decision methods has a string `code`
 (`DecisionErrorCode`), in both direct and worker mode. The error keeps its
-type, name and message: argument errors stay `TypeError`s and cancellation an
+type, name and message: a `TypeError` stays a `TypeError`, and cancellation an
 `AbortError`, whose numeric DOMException `code` this replaces. Branch on `code`;
 messages may change.
 
@@ -955,10 +955,10 @@ messages may change.
 | `cancelled` | `cancel()` stopped the operation. |
 | `busy` | Generation or text-to-speech synthesis holds the runtime. |
 | `context` | The head's private encoder context cannot be created, or its pooling or batch size cannot serve the head. |
-| `invalid-argument` | A malformed handle, source, `configJson` or sequence, including sequences the core rejects for the loaded encoder. |
+| `invalid-argument` | A handle, source, `configJson` or sequence the bridge rejects before the core runs, such as a non-integer token id. |
 | `unsupported` | The core build or the loaded model cannot run decision heads. |
 | `model` | The head or its config cannot be fetched or read, is malformed, or does not fit the encoder. |
-| `inference` | The encoder or head failed while running, or returned malformed output. |
+| `inference` | The core rejected a sequence for the loaded encoder (length, token ids, markers or question type), or the encoder or head failed or returned malformed output. |
 | `invalid-state` | Another runtime state rejected the call, such as exhausted head handles. |
 | `runtime` | Any other failure, such as a worker or Wasm failure the bridge could not recover from. |
 
