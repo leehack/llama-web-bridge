@@ -5,6 +5,8 @@
 - Reject `synthesizeSpeech` `text` or `language` holding U+0000 with a `TypeError` instead
   of speaking only the text before it, and keep the whole file name of a decision head URL
   holding U+0000 in its load errors.
+- Fail qualification when a requested worker ASR or TTS mode fell back to the main
+  thread instead of recording it as a worker run.
 - `penalty` and `presencePenalty` count the prompt's last tokens in their 64-token window, as
   native llamadart does, unless a `grammar` (even an empty one) or media `parts` are set.
   Output for the same seed changes whenever `penalty` is not 1, including the default 1.1,
