@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- `penalty` and `presencePenalty` count the prompt's last tokens in their 64-token window, as
+  native llamadart does, unless a `grammar` (even an empty one) or media `parts` are set.
+  Output for the same seed changes whenever `penalty` is not 1, including the default 1.1,
+  or `presencePenalty` is not 0. The new `penaltyPromptTokens: false` option keeps the
+  prompt out, and `getCompletionCapabilities` reports `penaltyPromptTokens`.
 - Fail the release manifest build when a core's memories contradict its `wasm32` or
   `memory64` capability, and fail qualification when a requested wasm64 ASR or TTS
   mode fell back to the wasm32 core instead of recording it as wasm64.

@@ -11,6 +11,7 @@ export interface CompletionSamplingOptions {
   minP: number;
   presencePenalty: number;
   thinkingBudget: Required<ThinkingBudgetOptions> | null;
+  penaltyPromptTokens: boolean;
   speculative: ResolvedSpeculativeOptions | null;
 }
 
@@ -57,6 +58,7 @@ export const NO_COMPLETION_CAPABILITIES: Readonly<CompletionCapabilities> = Obje
   presencePenalty: false,
   minP: false,
   thinkingBudget: false,
+  penaltyPromptTokens: false,
   speculativeDecoding: Object.freeze(speculativeFlags(() => false)),
 });
 
@@ -288,8 +290,18 @@ function speculativeDecoding(
   };
 }
 
+function penaltyPromptTokens(value: unknown): boolean {
+  if (value == null) {
+    return true;
+  }
+  if (typeof value !== 'boolean') {
+    throw new TypeError(`CompletionOptions.penaltyPromptTokens must be a boolean; got ${String(value)}.`);
+  }
+  return value;
+}
+
 /**
- * Resolves `minP`, `presencePenalty`, `thinkingBudget` and `speculativeDecoding`. Throws a RangeError
+ * Resolves `minP`, `presencePenalty`, `thinkingBudget`, `penaltyPromptTokens` and `speculativeDecoding`. Throws a RangeError
  * or TypeError for an invalid value, including a number that is not finite as
  * the core's 32-bit float and a grammar or thinking tag holding U+0000, and an
  * Error for a thinking budget with media parts or a speculative configuration
@@ -300,6 +312,7 @@ export function resolveCompletionSamplingOptions(
     minP?: unknown;
     presencePenalty?: unknown;
     thinkingBudget?: unknown;
+    penaltyPromptTokens?: unknown;
     speculativeDecoding?: unknown;
     grammar?: unknown;
     parts?: unknown;
@@ -314,6 +327,7 @@ export function resolveCompletionSamplingOptions(
     minP: optionalNumber(options?.minP, 'minP', (value) => value >= 0 && value <= 1, ' from 0 to 1') ?? 0,
     presencePenalty: optionalNumber(options?.presencePenalty, 'presencePenalty', () => true, '') ?? 0,
     thinkingBudget: budget,
+    penaltyPromptTokens: penaltyPromptTokens(options?.penaltyPromptTokens),
     speculative: speculativeDecoding(options?.speculativeDecoding, {
       hasMediaParts,
       hasGrammar: typeof options?.grammar === 'string' && options.grammar.length > 0,
@@ -335,6 +349,7 @@ export function completionCapabilitiesFrom(raw: string | null): CompletionCapabi
     presencePenalty: parsed?.presencePenalty === true,
     minP: parsed?.minP === true,
     thinkingBudget: parsed?.thinkingBudget === true,
+    penaltyPromptTokens: parsed?.penaltyPromptTokens === true,
     speculativeDecoding: speculativeFlags((strategy) => speculative?.[strategy] === true),
   };
 }

@@ -16,7 +16,8 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_generate(
     int32_t thinking_budget_tokens,
     const char * thinking_start_tag,
     const char * thinking_end_tag,
-    const char * thinking_forced_message) {
+    const char * thinking_forced_message,
+    int32_t skip_prompt_penalty) {
   if (n_predict <= 0) {
     n_predict = 128;
   }
@@ -35,7 +36,8 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_generate(
       thinking_budget_tokens,
       thinking_start_tag,
       thinking_end_tag,
-      thinking_forced_message);
+      thinking_forced_message,
+      skip_prompt_penalty);
   if (begin_rc != 0) {
     return begin_rc;
   }
@@ -70,7 +72,8 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_begin_generation_bytes(
     int32_t thinking_budget_tokens,
     const char * thinking_start_tag,
     const char * thinking_end_tag,
-    const char * thinking_forced_message) {
+    const char * thinking_forced_message,
+    int32_t skip_prompt_penalty) {
   return begin_generation_impl(
       prompt,
       prompt_length,
@@ -85,7 +88,8 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_begin_generation_bytes(
       thinking_budget_tokens,
       thinking_start_tag,
       thinking_end_tag,
-      thinking_forced_message);
+      thinking_forced_message,
+      skip_prompt_penalty);
 }
 
 EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_begin_generation(
@@ -101,7 +105,8 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_begin_generation(
     int32_t thinking_budget_tokens,
     const char * thinking_start_tag,
     const char * thinking_end_tag,
-    const char * thinking_forced_message) {
+    const char * thinking_forced_message,
+    int32_t skip_prompt_penalty) {
   return begin_generation_impl(
       prompt,
       c_string_length(prompt),
@@ -116,7 +121,8 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_begin_generation(
       thinking_budget_tokens,
       thinking_start_tag,
       thinking_end_tag,
-      thinking_forced_message);
+      thinking_forced_message,
+      skip_prompt_penalty);
 }
 
 // Strategy flags report what the loaded models can run: draft-mtp needs the
@@ -143,6 +149,7 @@ EMSCRIPTEN_KEEPALIVE const char * llamadart_webgpu_completion_capabilities_json(
   };
   g_completion_capabilities_json =
       "{\"presencePenalty\":true,\"minP\":true,\"thinkingBudget\":true,"
+      "\"penaltyPromptTokens\":true,"
       "\"speculativeDecoding\":{";
   bool first = true;
   for (const auto & strategy : strategies) {

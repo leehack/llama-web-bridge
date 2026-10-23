@@ -200,9 +200,12 @@ export interface CompletionOptions {
   topP?: number;
   /** Min-P threshold from 0 to 1, applied after top-p; 0, the default, disables it. A value outside that range rejects. */
   minP?: number;
+  /** Repetition penalty over the last 64 tokens of the prompt and this completion; the prompt counts only for a text prompt without a `grammar` (an empty string included) and with `penaltyPromptTokens` not false. Defaults to 1.1; 1 disables it. */
   penalty?: number;
-  /** Subtracted once from the logit of each token among this completion's last 64 tokens; prompt tokens do not count. 0, the default, disables it. A value that is not finite as a 32-bit float rejects. */
+  /** Subtracted once from the logit of each token in the same 64-token window as `penalty`. 0, the default, disables it. A value that is not finite as a 32-bit float rejects. */
   presencePenalty?: number;
+  /** `false` keeps a text prompt out of the `penalty` and `presencePenalty` window, as a `grammar` does. For a caller that drops a grammar native llamadart would keep, such as llamadart dropping a lazy tool-call grammar on WebGPU, so its output matches native, which does not count the prompt with a lazy grammar. Omitted or null means true; any other non-boolean rejects. */
+  penaltyPromptTokens?: boolean | null;
   grammar?: string;
   seed?: number;
   /** Caps the tokens generated inside each reasoning block; text-only prompts. */
@@ -231,6 +234,8 @@ export interface CompletionCapabilities {
   minP: boolean;
   /** `CompletionOptions.thinkingBudget` is applied. */
   thinkingBudget: boolean;
+  /** The penalties count the prompt, and `CompletionOptions.penaltyPromptTokens` is applied. A core without it never counts the prompt, so `penaltyPromptTokens: false` holds there too. */
+  penaltyPromptTokens: boolean;
   /** Each speculative strategy the loaded models can run now: `draft-mtp` needs a model loaded with `loadMtp` that has MTP layers, and the other `draft-*` strategies a matching `loadDraftModel` draft. */
   speculativeDecoding: Record<SpeculativeDecodingStrategy, boolean>;
 }

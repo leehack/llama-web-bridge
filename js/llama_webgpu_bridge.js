@@ -154,6 +154,7 @@ var NO_COMPLETION_CAPABILITIES = Object.freeze({
   presencePenalty: false,
   minP: false,
   thinkingBudget: false,
+  penaltyPromptTokens: false,
   speculativeDecoding: Object.freeze(speculativeFlags(() => false))
 });
 var MAX_NGRAM_SIZE = 65535;
@@ -352,6 +353,15 @@ function speculativeDecoding(value, conflicts) {
     ngramCacheDynamic
   };
 }
+function penaltyPromptTokens(value) {
+  if (value == null) {
+    return true;
+  }
+  if (typeof value !== "boolean") {
+    throw new TypeError(`CompletionOptions.penaltyPromptTokens must be a boolean; got ${String(value)}.`);
+  }
+  return value;
+}
 function resolveCompletionSamplingOptions(options) {
   const hasMediaParts = Array.isArray(options?.parts) && options.parts.length > 0;
   if (typeof options?.grammar === "string") {
@@ -362,6 +372,7 @@ function resolveCompletionSamplingOptions(options) {
     minP: optionalNumber(options?.minP, "minP", (value) => value >= 0 && value <= 1, " from 0 to 1") ?? 0,
     presencePenalty: optionalNumber(options?.presencePenalty, "presencePenalty", () => true, "") ?? 0,
     thinkingBudget: budget,
+    penaltyPromptTokens: penaltyPromptTokens(options?.penaltyPromptTokens),
     speculative: speculativeDecoding(options?.speculativeDecoding, {
       hasMediaParts,
       hasGrammar: typeof options?.grammar === "string" && options.grammar.length > 0,
@@ -381,6 +392,7 @@ function completionCapabilitiesFrom(raw) {
     presencePenalty: parsed?.presencePenalty === true,
     minP: parsed?.minP === true,
     thinkingBudget: parsed?.thinkingBudget === true,
+    penaltyPromptTokens: parsed?.penaltyPromptTokens === true,
     speculativeDecoding: speculativeFlags((strategy) => speculative?.[strategy] === true)
   };
 }
@@ -4220,7 +4232,7 @@ var LlamaWebGpuBridgeRuntime = class {
     const topK = Number.isFinite(options.topK) ? Number(options.topK) : 40;
     const topP = Number.isFinite(options.topP) ? Number(options.topP) : 0.95;
     const penalty = Number.isFinite(options.penalty) ? Number(options.penalty) : 1.1;
-    const grammar = typeof options.grammar === "string" && options.grammar.length > 0 ? options.grammar : null;
+    const grammar = typeof options.grammar === "string" ? options.grammar : null;
     const seed = Number.isInteger(options.seed) ? Number(options.seed) : Math.floor(Math.random() * 4294967295);
     await this._stageMultimodalParts(options.parts, options);
     let generationStarted = false;
@@ -4246,7 +4258,8 @@ var LlamaWebGpuBridgeRuntime = class {
             "number",
             "string",
             "string",
-            "string"
+            "string",
+            "number"
           ],
           [
             ...input.args,
@@ -4261,7 +4274,8 @@ var LlamaWebGpuBridgeRuntime = class {
             sampling.thinkingBudget?.maxTokens ?? 0,
             sampling.thinkingBudget?.startTag ?? null,
             sampling.thinkingBudget?.endTag ?? null,
-            sampling.thinkingBudget?.forcedMessage ?? null
+            sampling.thinkingBudget?.forcedMessage ?? null,
+            sampling.penaltyPromptTokens ? 0 : 1
           ],
           { async: true }
         )

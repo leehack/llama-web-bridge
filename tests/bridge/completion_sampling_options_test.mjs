@@ -15,9 +15,16 @@ const SUPPORTED = {
   presencePenalty: true,
   minP: true,
   thinkingBudget: true,
+  penaltyPromptTokens: true,
   speculativeDecoding: NO_SPECULATIVE,
 };
-const NONE = { presencePenalty: false, minP: false, thinkingBudget: false, speculativeDecoding: NO_SPECULATIVE };
+const NONE = {
+  presencePenalty: false,
+  minP: false,
+  thinkingBudget: false,
+  penaltyPromptTokens: false,
+  speculativeDecoding: NO_SPECULATIVE,
+};
 const BUDGET = { maxTokens: 8, startTag: '<think>', endTag: '</think>' };
 const BUDGET_PARAMETERS = [
   'thinking_budget_tokens',
@@ -25,6 +32,7 @@ const BUDGET_PARAMETERS = [
   'thinking_end_tag',
   'thinking_forced_message',
 ];
+const SAMPLING_PARAMETERS = ['min_p', 'presence_penalty', ...BUDGET_PARAMETERS, 'skip_prompt_penalty'];
 
 function functionBody(signature) {
   const start = coreSource.indexOf(signature);
@@ -45,7 +53,9 @@ function nativeParameterNames(name) {
 // unless the C++ table sets it to the literal true.
 function coreCapabilityJson() {
   const body = functionBody('llamadart_webgpu_completion_capabilities_json()');
-  const literal = body.match(/"\{\\"presencePenalty\\":true,\\"minP\\":true,\\"thinkingBudget\\":true,"/);
+  const literal = body.match(
+    /"\{\\"presencePenalty\\":true,\\"minP\\":true,\\"thinkingBudget\\":true,"\s*"\\"penaltyPromptTokens\\":true,"/,
+  );
   assert.ok(literal, 'the capability export must start with its fixed flags');
   const strategies = [...body.matchAll(/\{"([a-z0-9-]+)",\s*([^}]*)\}/g)];
   assert.deepEqual(strategies.map(([, name]) => name), SPECULATIVE_DECODING_STRATEGIES);
@@ -53,6 +63,7 @@ function coreCapabilityJson() {
     presencePenalty: true,
     minP: true,
     thinkingBudget: true,
+    penaltyPromptTokens: true,
     speculativeDecoding: Object.fromEntries(
       strategies.map(([, name, flag]) => [name, flag.trim() === 'true']),
     ),
@@ -103,6 +114,8 @@ const INVALID_TYPES = [
   [{ thinkingBudget: { ...BUDGET, startTag: ' \n' } }, /thinkingBudget\.startTag/],
   [{ thinkingBudget: { maxTokens: 1, startTag: '<think>' } }, /thinkingBudget\.endTag must be a non-empty string/],
   [{ thinkingBudget: { ...BUDGET, forcedMessage: 3 } }, /thinkingBudget\.forcedMessage must be a string/],
+  [{ penaltyPromptTokens: 'false' }, /CompletionOptions\.penaltyPromptTokens must be a boolean; got false\./],
+  [{ penaltyPromptTokens: 0 }, /CompletionOptions\.penaltyPromptTokens must be a boolean; got 0\./],
 ];
 
 const MEDIA_BUDGET = {
@@ -124,7 +137,7 @@ const CASES = [
     );
 
     const names = nativeParameterNames('llamadart_webgpu_begin_generation_bytes');
-    assert.deepEqual(names.slice(-6), ['min_p', 'presence_penalty', ...BUDGET_PARAMETERS]);
+    assert.deepEqual(names.slice(-SAMPLING_PARAMETERS.length), SAMPLING_PARAMETERS);
     const [{ argTypes, args }] = begins;
     assert.equal(argTypes.length, names.length);
     assert.equal(args.length, names.length);
@@ -137,9 +150,10 @@ const CASES = [
     assert.deepEqual([...arg('prompt')], [...new TextEncoder().encode('hello')]);
     assert.equal(arg('prompt_length'), 5);
     assert.deepEqual(BUDGET_PARAMETERS.map(arg), [8, '<think>', '</think>', 'Done.']);
+    assert.equal(arg('skip_prompt_penalty'), 0);
     assert.deepEqual(
-      ['min_p', 'presence_penalty', ...BUDGET_PARAMETERS].map(type),
-      ['number', 'number', 'number', 'string', 'string', 'string'],
+      SAMPLING_PARAMETERS.map(type),
+      ['number', 'number', 'number', 'string', 'string', 'string', 'number'],
     );
   }],
 
@@ -148,16 +162,17 @@ const CASES = [
     await bridge.createCompletion('hello');
     await bridge.createCompletion('hello', { minP: null, presencePenalty: null, thinkingBudget: null });
     await bridge.createCompletion('hello', { minP: 0, presencePenalty: 0 });
-    const disabled = [0, 0, 0, null, null, null];
-    assert.deepEqual(begins.map(({ args }) => args.slice(-6)), [disabled, disabled, disabled]);
+    await bridge.createCompletion('hello', { penaltyPromptTokens: null });
+    const disabled = [0, 0, 0, null, null, null, 0];
+    assert.deepEqual(begins.map(({ args }) => args.slice(-7)), [disabled, disabled, disabled, disabled]);
   }],
 
   ['the range ends are accepted and forcedMessage defaults to empty', async () => {
     const { bridge, begins } = directBridge(JSON.stringify(SUPPORTED));
     await bridge.createCompletion('hello', { minP: 1, presencePenalty: 1e6, thinkingBudget: { ...BUDGET, maxTokens: 0 } });
     await bridge.createCompletion('hello', { thinkingBudget: { ...BUDGET, maxTokens: 2147483647 } });
-    assert.deepEqual(begins[0].args.slice(-6), [1, 1e6, 0, '<think>', '</think>', '']);
-    assert.equal(begins[1].args.at(-4), 2147483647);
+    assert.deepEqual(begins[0].args.slice(-7), [1, 1e6, 0, '<think>', '</think>', '', 0]);
+    assert.equal(begins[1].args.at(-5), 2147483647);
   }],
 
   ['an invalid value rejects before the direct runtime touches the core', async () => {
@@ -241,7 +256,7 @@ const CASES = [
     const { bridge, begins } = directBridge(JSON.stringify({ minP: true }));
     assert.deepEqual(
       await bridge.getCompletionCapabilities(),
-      { presencePenalty: false, minP: true, thinkingBudget: false, speculativeDecoding: NO_SPECULATIVE },
+      { ...NONE, minP: true },
     );
     await bridge.createCompletion('hello', { minP: 0.1 });
     await assert.rejects(
@@ -307,6 +322,92 @@ const CASES = [
     ].map((name) => body.indexOf(name));
     assert.ok(order.every((index) => index >= 0), 'every sampler is in the chain');
     assert.deepEqual([...order].sort((a, b) => a - b), order);
+  }],
+
+  ['the penalty window starts with the prompt tokens, which no other sampler sees', async () => {
+    const body = functionBody('llama_sampler * create_sampler(');
+    assert.match(
+      body,
+      /llama_sampler \* penalties = llama_sampler_init_penalties\(\s*vocab_size, 64, repeat_penalty, 0\.0f, presence_penalty\);\s*for \(const llama_token token : penalty_prompt_tokens\) \{\s*llama_sampler_accept\(penalties, token\);\s*\}\s*llama_sampler_chain_add\(sampler, penalties\);/,
+    );
+    assert.equal(body.match(/llama_sampler_accept\(/g).length, 1, 'only the penalties sampler accepts prompt tokens');
+  }],
+
+  ['a text prompt seeds the penalties whole unless a grammar is set; a media prompt seeds nothing', async () => {
+    const body = functionBody('int32_t begin_generation_impl(');
+    const at = (text, from = 0) => {
+      const index = body.indexOf(text, from);
+      assert.ok(index >= 0, `begin_generation_impl must contain ${text}`);
+      return index;
+    };
+    const media = at('if (!g_pending_media.empty()) {\n    llama_memory_clear(');
+    const speculative = at('} else if (speculative.active) {', media);
+    const text = at('} else {\n    std::vector<llama_token> prompt_tokens;', speculative);
+    const grammarGate = at(
+      'if (grammar != nullptr || skip_prompt_penalty != 0) {\n    penalty_prompt_tokens.clear();\n  }',
+      text,
+    );
+    const create = at('g_active_sampler = create_sampler(', grammarGate);
+    const seed = 'penalty_prompt_tokens = std::move(prompt_tokens);';
+
+    assert.ok(!body.slice(media, speculative).includes('penalty_prompt_tokens'), 'a media prompt seeds nothing');
+    const speculativeSeed = at(seed, speculative);
+    assert.ok(speculativeSeed > at('evaluate_speculative_prompt(prompt_tokens)', speculative) && speculativeSeed < text);
+    const textSeed = at(seed, text);
+    assert.ok(textSeed > at('reasoning_budget_initial_state(reasoning_budget, prompt_tokens)', text));
+    assert.ok(textSeed < grammarGate);
+    assert.ok(at('evaluate_prompt_tokens(prompt_tokens, true, &reused_tokens)', text) < textSeed,
+      'the cached prefix is part of the seeded prompt');
+    assert.match(body.slice(create), /^g_active_sampler = create_sampler\([^;]*reasoning_budget_sampler\.release\(\),\s*penalty_prompt_tokens\);/);
+    assert.equal(body.match(/penalty_prompt_tokens/g).length, 5);
+  }],
+
+  ['penaltyPromptTokens: false reaches the core and needs no capability', async () => {
+    const { bridge, begins } = directBridge(undefined);
+    await bridge.createCompletion('hello', { penaltyPromptTokens: false });
+    await bridge.createCompletion('hello', { penaltyPromptTokens: true });
+    const names = nativeParameterNames('llamadart_webgpu_begin_generation_bytes');
+    assert.deepEqual(begins.map(({ args }) => args[names.indexOf('skip_prompt_penalty')]), [1, 0]);
+  }],
+
+  ['every generation export forwards skip_prompt_penalty to the core', async () => {
+    for (const name of [
+      'llamadart_webgpu_generate',
+      'llamadart_webgpu_begin_generation_bytes',
+      'llamadart_webgpu_begin_generation',
+    ]) {
+      assert.equal(nativeParameterNames(name).at(-1), 'skip_prompt_penalty', name);
+      assert.match(
+        functionBody(`EMSCRIPTEN_KEEPALIVE int32_t ${name}(`),
+        /begin_generation_impl\([^;]*thinking_forced_message,\s*skip_prompt_penalty\);/,
+        name,
+      );
+    }
+  }],
+
+  ['a worker completion forwards penaltyPromptTokens', async () => {
+    let sent = null;
+    const bridge = createWorkerBridge({
+      _callWorker: async (method, args) => {
+        sent = args[1];
+        return 'x';
+      },
+    });
+    await bridge.createCompletion('hello', { penaltyPromptTokens: false });
+    assert.equal(structuredClone(sent).penaltyPromptTokens, false);
+  }],
+
+  ['an empty grammar reaches the core as a grammar; an omitted one as null', async () => {
+    const { bridge, begins } = directBridge(undefined);
+    await bridge.createCompletion('hello', { grammar: '' });
+    await bridge.createCompletion('hello');
+    const names = nativeParameterNames('llamadart_webgpu_begin_generation_bytes');
+    assert.deepEqual(begins.map(({ args }) => args[names.indexOf('grammar')]), ['', null]);
+  }],
+
+  ['only a literal true reports penaltyPromptTokens', async () => {
+    assert.deepEqual(completionCapabilitiesFrom('{"penaltyPromptTokens":true}'), { ...NONE, penaltyPromptTokens: true });
+    assert.deepEqual(completionCapabilitiesFrom('{"penaltyPromptTokens":1}'), NONE);
   }],
 
   ['the native core rejects invalid values before it changes generation state', async () => {

@@ -2,7 +2,8 @@
 // Part of llama_webgpu_core.cpp, included inside its anonymous namespace;
 // not a standalone translation unit.
 
-// Takes ownership of reasoning_budget, which may be null.
+// Takes ownership of reasoning_budget, which may be null. The penalty window
+// starts with penalty_prompt_tokens; no other sampler sees them.
 llama_sampler * create_sampler(
     const float temp,
     const int32_t top_k,
@@ -11,7 +12,8 @@ llama_sampler * create_sampler(
     const float repeat_penalty,
     const float presence_penalty,
     const uint32_t seed,
-    llama_sampler * reasoning_budget) {
+    llama_sampler * reasoning_budget,
+    const std::vector<llama_token> & penalty_prompt_tokens) {
   llama_sampler_ptr owned_reasoning_budget(reasoning_budget);
   llama_sampler_chain_params sparams = llama_sampler_chain_default_params();
   llama_sampler * sampler = llama_sampler_chain_init(sparams);
@@ -21,10 +23,12 @@ llama_sampler * create_sampler(
 
   if (repeat_penalty != 1.0f || presence_penalty != 0.0f) {
     const int32_t vocab_size = llama_vocab_n_tokens(g_state.vocab);
-    llama_sampler_chain_add(
-        sampler,
-        llama_sampler_init_penalties(
-            vocab_size, 64, repeat_penalty, 0.0f, presence_penalty));
+    llama_sampler * penalties = llama_sampler_init_penalties(
+        vocab_size, 64, repeat_penalty, 0.0f, presence_penalty);
+    for (const llama_token token : penalty_prompt_tokens) {
+      llama_sampler_accept(penalties, token);
+    }
+    llama_sampler_chain_add(sampler, penalties);
   }
 
   if (owned_reasoning_budget) {
@@ -276,7 +280,8 @@ int32_t begin_generation_impl(
     const int32_t thinking_budget_tokens,
     const char * thinking_start_tag,
     const char * thinking_end_tag,
-    const char * thinking_forced_message) {
+    const char * thinking_forced_message,
+    const int32_t skip_prompt_penalty) {
   // Defence in depth behind the bridge's single-writer queue: reject before
   // touching any shared state, so a stray second begin cannot destroy the
   // in-flight generation's output, sampler, or g_last_error. The caller maps
@@ -387,6 +392,7 @@ int32_t begin_generation_impl(
       !g_pending_media.empty();
 
   llama_sampler_ptr reasoning_budget_sampler;
+  std::vector<llama_token> penalty_prompt_tokens;
   if (!g_pending_media.empty()) {
     llama_memory_clear(llama_get_memory(g_state.ctx), false);
     g_cached_prompt_tokens.clear();
@@ -420,6 +426,7 @@ int32_t begin_generation_impl(
     g_cached_prompt_tokens = prompt_tokens;
     g_usage_prompt_tokens = static_cast<int32_t>(prompt_tokens.size());
     g_speculative_usage.ran = true;
+    penalty_prompt_tokens = std::move(prompt_tokens);
   } else {
     std::vector<llama_token> prompt_tokens;
     if (!tokenize_text(prompt_text, true, prompt_tokens)) {
@@ -446,6 +453,15 @@ int32_t begin_generation_impl(
         return -5;
       }
     }
+    penalty_prompt_tokens = std::move(prompt_tokens);
+  }
+
+  // As native llamadart does, the whole text prompt, cached prefix included,
+  // seeds the penalties unless a grammar string is given, even an empty one; a
+  // multimodal prompt seeds nothing. skip_prompt_penalty lets a caller that
+  // dropped a grammar native would keep, such as a lazy one, match native.
+  if (grammar != nullptr || skip_prompt_penalty != 0) {
+    penalty_prompt_tokens.clear();
   }
 
   llama_sampler * reasoning_budget_ptr = reasoning_budget_sampler.get();
@@ -457,7 +473,8 @@ int32_t begin_generation_impl(
       repeat_penalty,
       presence_penalty,
       seed,
-      reasoning_budget_sampler.release());
+      reasoning_budget_sampler.release(),
+      penalty_prompt_tokens);
   if (g_active_sampler == nullptr) {
     free_speculative_session();
     set_error("Failed to initialize sampler chain");
