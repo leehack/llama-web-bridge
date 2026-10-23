@@ -5197,7 +5197,7 @@ var LlamaWebGpuBridge = class {
   _streamsPastBareCancel(operation, proxy) {
     return operation.state === "cancelling" && !operation.callerSignal?.aborted && proxy === this._workerProxy;
   }
-  _sendWorkerCancel(proxy) {
+  _sendWorkerCancel(proxy, operation = null) {
     if (!proxy) {
       return;
     }
@@ -5212,7 +5212,13 @@ var LlamaWebGpuBridge = class {
       return;
     }
     try {
-      Promise.resolve(proxy.call("cancel", [], null)).catch(() => {
+      Promise.resolve(proxy.call(
+        "cancel",
+        [],
+        null,
+        [],
+        operation ? { operationId: operation.id } : null
+      )).catch(() => {
       });
     } catch (_) {
     }
@@ -5233,7 +5239,7 @@ var LlamaWebGpuBridge = class {
         proxies2.add(operation.workerProxy);
       }
       for (const proxy of proxies2) {
-        this._sendWorkerCancel(proxy);
+        this._sendWorkerCancel(proxy, operation);
       }
       return;
     }
@@ -5252,7 +5258,7 @@ var LlamaWebGpuBridge = class {
       proxies.add(operation.workerProxy);
     }
     for (const proxy of proxies) {
-      this._sendWorkerCancel(proxy);
+      this._sendWorkerCancel(proxy, operation);
     }
     const runtimes = new Set(operation.runtimes || []);
     if (operation.runtime) {
@@ -5759,6 +5765,10 @@ var LlamaWebGpuBridge = class {
       return true;
     } catch (error) {
       this._throwIfDisposed();
+      if (this._isOperationCancellation(error)) {
+        this._workerModelMissing = true;
+        throw createAbortError("Bridge operation was cancelled.");
+      }
       this._emitBridgeWarn(
         `llamadart: multimodal worker setup failed once; restarting worker (${serializeWorkerError(error)}).`
       );
@@ -6240,13 +6250,17 @@ var LlamaWebGpuBridge = class {
       }
     } : void 0;
     try {
-      const response = await proxy.call(
+      const pending = proxy.call(
         method,
         args,
         guardedEvent,
         transferList,
         operation ? { operationId: operation.id, workerGeneration: operation.workerGeneration } : void 0
       );
+      if (operation?.cancelRequested) {
+        this._sendWorkerCancel(proxy, operation);
+      }
+      const response = await pending;
       if (response?.state) {
         this._acceptWorkerState(operation, proxy, response.state);
       }
@@ -6588,7 +6602,7 @@ var LlamaWebGpuBridge = class {
           ),
           stallPromise
         ]);
-        if (this._hasMediaParts(options) && !isWarmup && !sawWorkerTokenEvent && String(workerResult || "").trim().length == 0) {
+        if (this._hasMediaParts(options) && !isWarmup && !sawWorkerTokenEvent && !this._activeOperation?.cancelRequested && String(workerResult || "").trim().length == 0) {
           this._emitBridgeWarn(
             "llamadart: multimodal worker produced empty response without token events."
           );
@@ -7813,8 +7827,9 @@ function installBridgeWorkerHost() {
       state
     });
   };
-  self.onmessage = async (event) => {
-    const message = event.data || {};
+  const callsInFlight = /* @__PURE__ */ new Map();
+  const isCallInFlight = (operationId) => operationId === void 0 ? callsInFlight.size > 0 : callsInFlight.has(operationId);
+  const handleMessage = async (message) => {
     const type = message.type;
     const id = message.id ?? 0;
     try {
@@ -7834,6 +7849,13 @@ function installBridgeWorkerHost() {
       }
       const method = String(message.method || "");
       const args = Array.isArray(message.args) ? message.args : [];
+      if (method === "cancel") {
+        if (isCallInFlight(message.operationId)) {
+          bridge.cancel();
+        }
+        self.postMessage({ type: "result", id, value: void 0 });
+        return;
+      }
       if (method === "loadModelFromUrl") {
         const url = args[0];
         const options = args[1] && typeof args[1] === "object" ? { ...args[1] } : {};
@@ -8103,6 +8125,25 @@ function installBridgeWorkerHost() {
       self.postMessage({ type: "result", id, value });
     } catch (error) {
       postError(id, error);
+    }
+  };
+  self.onmessage = async (event) => {
+    const message = event.data || {};
+    if (message.type !== "call" || message.method === "cancel") {
+      await handleMessage(message);
+      return;
+    }
+    const operationId = message.operationId;
+    callsInFlight.set(operationId, (callsInFlight.get(operationId) ?? 0) + 1);
+    try {
+      await handleMessage(message);
+    } finally {
+      const remaining = (callsInFlight.get(operationId) ?? 1) - 1;
+      if (remaining > 0) {
+        callsInFlight.set(operationId, remaining);
+      } else {
+        callsInFlight.delete(operationId);
+      }
     }
   };
 }

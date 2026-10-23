@@ -340,7 +340,10 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
     );
   }
 
-  _sendWorkerCancel(proxy: Partial<BridgeWorkerProxy> | null) {
+  _sendWorkerCancel(
+    proxy: Partial<BridgeWorkerProxy> | null,
+    operation: BridgeOperation | null = null,
+  ) {
     if (!proxy) {
       return;
     }
@@ -360,7 +363,13 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
     }
 
     try {
-      Promise.resolve(proxy.call('cancel', [], null)).catch(() => {});
+      Promise.resolve(proxy.call(
+        'cancel',
+        [],
+        null,
+        [],
+        operation ? { operationId: operation.id } : null,
+      )).catch(() => {});
     } catch (_) {
       // Best-effort cancellation must never throw into the caller.
     }
@@ -382,7 +391,7 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
         proxies.add(operation.workerProxy);
       }
       for (const proxy of proxies) {
-        this._sendWorkerCancel(proxy);
+        this._sendWorkerCancel(proxy, operation);
       }
       return;
     }
@@ -404,7 +413,7 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
       proxies.add(operation.workerProxy);
     }
     for (const proxy of proxies) {
-      this._sendWorkerCancel(proxy);
+      this._sendWorkerCancel(proxy, operation);
     }
 
     const runtimes = new Set(operation.runtimes || []);
@@ -1028,6 +1037,11 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
       return true;
     } catch (error) {
       this._throwIfDisposed();
+      if (this._isOperationCancellation(error)) {
+        // The cancelled load may already have released the worker's model.
+        this._workerModelMissing = true;
+        throw createAbortError('Bridge operation was cancelled.');
+      }
       this._emitBridgeWarn(
         `llamadart: multimodal worker setup failed once; restarting worker (${serializeWorkerError(error)}).`,
       );
@@ -1702,7 +1716,7 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
       : undefined;
 
     try {
-      const response = await proxy.call(
+      const pending = proxy.call(
         method,
         args,
         guardedEvent,
@@ -1711,6 +1725,12 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
           ? { operationId: operation.id, workerGeneration: operation.workerGeneration }
           : undefined,
       );
+      if (operation?.cancelRequested) {
+        // The worker drops a cancel that reached it before this call, so the
+        // cancelled operation's call gets one queued right behind it.
+        this._sendWorkerCancel(proxy, operation);
+      }
+      const response = await pending;
       if (response?.state) {
         this._acceptWorkerState(operation, proxy, response.state);
       }
@@ -2121,6 +2141,7 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
           this._hasMediaParts(options)
           && !isWarmup
           && !sawWorkerTokenEvent
+          && !this._activeOperation?.cancelRequested
           && String(workerResult || '').trim().length == 0
         ) {
           this._emitBridgeWarn(

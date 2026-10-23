@@ -1087,8 +1087,10 @@ that currently owns the runtime and asks that operation's captured worker
 generation and runtime to stop, so an internal worker restart or main-thread
 fallback cannot redirect the cancel to an unrelated replacement. It never
 cancels a queued operation, and it stays out-of-band: it does not wait behind
-the operation it controls. After disposal it is a no-op and never resurrects
-torn-down state.
+the operation it controls. In worker mode the cancel names its operation, and
+the worker applies it only while that operation's call runs there, so a cancel
+that arrives after the call returned never affects a later call. After disposal
+it is a no-op and never resurrects torn-down state.
 
 ### `dispose()`
 

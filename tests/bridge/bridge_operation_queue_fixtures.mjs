@@ -211,6 +211,8 @@ export function createStubCore(scripts = {}) {
   const core = {
     trace: [],
     beginRejections: 0,
+    // Calls of llamadart_webgpu_request_cancel, which sets the core's cancel flag.
+    cancelRequests: 0,
     activePrompt: null,
     // g_last_output's bytes, one char per byte.
     lastOutput: '',
@@ -274,6 +276,10 @@ export function createStubCore(scripts = {}) {
           core.usage.completionTokens += 1;
           return 1;
         }
+
+        case 'llamadart_webgpu_request_cancel':
+          core.cancelRequests += 1;
+          return undefined;
 
         case 'llamadart_webgpu_last_output':
           return emscriptenUtf8ToString(bytesOf(core.lastOutput));

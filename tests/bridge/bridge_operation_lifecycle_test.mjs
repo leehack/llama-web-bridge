@@ -832,6 +832,89 @@ const CASES = [
     );
   }],
 
+  ['a bare cancel before the first multimodal token resolves empty without a retry', async () => {
+    let releaseCompletion;
+    const proxy = createProxy('generation-7', {
+      callImpl: (method) => {
+        if (method === 'createCompletion') {
+          return new Promise((resolve) => { releaseCompletion = resolve; });
+        }
+        return Promise.resolve({ value: undefined });
+      },
+    });
+    const bridge = createBridge({
+      _workerProxy: proxy,
+      _workerGeneration: 7,
+      _loadedModelUrl: 'model.gguf',
+      _loadedModelOptions: {},
+      _loadedMmProjUrl: 'projector.gguf',
+      _multimodalWorkerCpuMode: true,
+      _replaceWorkerProxyForMultimodalCpuMode: async () => {
+        throw new Error('a cancelled completion must not restart the worker');
+      },
+    });
+    const pieces = [];
+    const pending = bridge.createCompletion('describe', {
+      parts: [{ type: 'image', url: 'https://example.invalid/image.png' }],
+      onToken: (piece) => pieces.push(piece),
+    });
+
+    await tick();
+    bridge.cancel();
+    releaseCompletion({ value: '' });
+
+    assert.equal(await pending, '');
+    assert.deepEqual(pieces, []);
+    assert.deepEqual(
+      proxy.calls.map(({ method }) => method),
+      ['createCompletion', 'cancel'],
+      'an empty result from a cancelled completion is not retried',
+    );
+  }],
+
+  ['a cancelled multimodal worker setup rejects without restarting the worker', async () => {
+    let rejectLoad = null;
+    const proxy = createProxy('generation-8', {
+      callImpl: (method) => {
+        if (method === 'loadModelFromUrl' && rejectLoad === null) {
+          return new Promise((_, reject) => { rejectLoad = reject; });
+        }
+        if (method === 'createCompletion') {
+          return Promise.resolve({ value: 'restored' });
+        }
+        return Promise.resolve({ value: undefined });
+      },
+    });
+    let restarts = 0;
+    const bridge = createBridge({
+      _workerProxy: proxy,
+      _workerGeneration: 8,
+      _loadedModelUrl: 'model.gguf',
+      _loadedModelOptions: {},
+      _loadedMmProjUrl: 'projector.gguf',
+      _replaceWorkerProxyForMultimodalCpuMode: async () => {
+        restarts += 1;
+      },
+    });
+    const pending = bridge._runExclusive(() => bridge._ensureWorkerMultimodalCpuMode());
+
+    await tick();
+    bridge.cancel();
+    rejectLoad(new Error('Model load was cancelled.'));
+
+    await expectAbort(pending);
+    assert.equal(restarts, 0, 'the operation\'s own cancellation is not a worker failure');
+
+    // The cancelled load may have released the worker's model, so the next
+    // call reloads it first.
+    proxy.calls.length = 0;
+    assert.equal(await bridge.createCompletion('next'), 'restored');
+    assert.deepEqual(
+      proxy.calls.map(({ method }) => method),
+      ['loadModelFromUrl', 'loadMultimodalProjector', 'createCompletion'],
+    );
+  }],
+
   ['cancel during disposal never cancels the teardown operation', async () => {
     let releaseTeardown;
     const teardown = new Promise((resolve) => { releaseTeardown = resolve; });
