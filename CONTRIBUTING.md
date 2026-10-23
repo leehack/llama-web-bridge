@@ -47,7 +47,8 @@ runs the same generator plus TypeScript and syntax checks, so commit any updated
 `tests/**/*_test.mjs` contract test in parallel through Node's test runner,
 including the static state-persistence, text-to-speech, and decision API
 contracts, the media-helper compatibility contract, the wasm64 runtime patch
-contract for `scripts/build/patch_wasm64_runtime.mjs`, and the CI change selector.
+and memory64 contract for `scripts/build/patch_wasm64_runtime.mjs`, and the CI
+change selector.
 Run one test file directly with `node tests/<area>/<name>_test.mjs`.
 
 `js/src/llama_webgpu_bridge.js` is the public entry. It re-exports the API and
