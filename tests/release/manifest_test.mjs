@@ -4,7 +4,7 @@
 
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
@@ -13,6 +13,7 @@ import { ContractError } from '../../scripts/release/contract.mjs';
 import { parseArguments } from '../../scripts/release/cli.mjs';
 import { ARTIFACTS, OPTIONS, generate, renderManifestFiles } from '../../scripts/release/manifest.mjs';
 import { pyJsonDumps, pyJsonLoads } from '../../scripts/release/json.mjs';
+import { artifactBytes, coreWasm } from './core_wasm_fixture.mjs';
 import * as V0_1_53 from './manifest_v0_1_53_fixture.mjs';
 import { loadCandidate } from './publication_fixtures.mjs';
 
@@ -51,7 +52,7 @@ function withTemporaryDirectory(fn) {
 }
 
 function manifestArgs(outDir) {
-  ARTIFACTS.forEach((name, index) => writeFileSync(path.join(outDir, name), `artifact-${index}`));
+  ARTIFACTS.forEach((name, index) => writeFileSync(path.join(outDir, name), artifactBytes(name, `artifact-${index}`)));
   return {
     outDir,
     releaseTag: 'v0.2.0-1',
@@ -160,5 +161,30 @@ test('the Node generator reproduces the published v0.1.53 manifest.json and sha2
   const published = pyJsonLoads(V0_1_53.MANIFEST_JSON);
   for (const { name, sha256: digest, sizeBytes } of V0_1_53.ARTIFACTS) {
     assert.deepEqual({ ...published.files[name] }, { sha256: digest, size_bytes: sizeBytes }, name);
+  }
+});
+
+// The capabilities claim a wasm32 and a memory64 core, so generation reads each
+// core's memories and refuses a build whose binary disagrees (#108).
+test('generation refuses a core binary that contradicts its claimed address type', () => {
+  const emptyModule = Buffer.from([0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00]);
+  const cases = [
+    ['llama_webgpu_core_mem64.wasm', coreWasm('i32'), 'llama_webgpu_core_mem64.wasm memories are [i32], expected only i64'],
+    ['llama_webgpu_core_mem64.wasm', coreWasm(['i64', 'i32']), 'llama_webgpu_core_mem64.wasm memories are [i64, i32], expected only i64'],
+    ['llama_webgpu_core_mem64.wasm', emptyModule, 'llama_webgpu_core_mem64.wasm memories are [], expected only i64'],
+    ['llama_webgpu_core_mem64.wasm', Buffer.from('not wasm'), 'llama_webgpu_core_mem64.wasm: malformed wasm at byte 1'],
+    ['llama_webgpu_core.wasm', coreWasm('i64'), 'llama_webgpu_core.wasm memories are [i64], expected only i32'],
+  ];
+  for (const [name, bytes, message] of cases) {
+    withTemporaryDirectory((outDir) => {
+      const args = manifestArgs(outDir);
+      writeFileSync(path.join(outDir, name), bytes);
+      assert.throws(
+        () => generate(args),
+        (error) => error instanceof ContractError && error.message.startsWith(message),
+        message,
+      );
+      assert.equal(existsSync(path.join(outDir, 'manifest.json')), false, name);
+    });
   }
 });

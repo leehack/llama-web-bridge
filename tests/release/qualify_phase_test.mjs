@@ -261,3 +261,25 @@ test('the artifacts directory is resolved through symlinks, and a symlinked WAV 
   rejects(() => ttsPhase({ modeResults: [ttsModeResult('link.wav', { peak: measured.peak, rms: measured.rms })] }, 1, artifacts),
     'text-to-speech wasm64/direct WAV artifact is missing: link.wav');
 });
+
+// The bridge falls back to the wasm32 core when the mem64 core fails to start,
+// so a mode is evidence only for the core that actually loaded.
+test('a mode that ran on another core than it requested is rejected', () => {
+  const speechCases = [
+    [speechModeResult('wasm64', 'worker', { coreVariant: 'wasm32' }), "speech wasm64/worker ran on core 'wasm32', not the requested wasm64 core"],
+    [speechModeResult('wasm32', 'direct', { coreVariant: 'wasm64' }), "speech wasm32/direct ran on core 'wasm64', not the requested wasm32 core"],
+    [speechModeResult('wasm64', 'direct', { coreVariant: undefined }), 'speech wasm64/direct ran on core None, not the requested wasm64 core'],
+  ];
+  for (const [entry, message] of speechCases) rejects(() => speechPhase({ modeResults: [entry] }, 1), message);
+  const artifacts = ttsArtifacts();
+  const measured = readWavIdentity(path.join(artifacts, 'generated.wav'));
+  const good = { peak: measured.peak, rms: measured.rms };
+  const ttsCases = [
+    [{ ...good, coreVariant: 'wasm32' }, "text-to-speech wasm64/direct ran on core 'wasm32', not the requested wasm64 core"],
+    [{ ...good, coreVariant: null }, 'text-to-speech wasm64/direct ran on core None, not the requested wasm64 core'],
+  ];
+  for (const [overrides, message] of ttsCases) {
+    rejects(() => ttsPhase({ modeResults: [ttsModeResult('generated.wav', overrides)] }, 1, artifacts), message);
+  }
+  ttsPhase({ modeResults: [ttsModeResult('generated.wav', good)] }, 1, artifacts);
+});

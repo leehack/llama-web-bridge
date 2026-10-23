@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Fail the release manifest build when a core's memories contradict its `wasm32` or
+  `memory64` capability, and fail qualification when a requested wasm64 ASR or TTS
+  mode fell back to the wasm32 core instead of recording it as wasm64.
 - Keep the text after U+0000 in `tokenize`, string `embed`/`embedBatch` inputs and
   `scoreNextToken`/`createCompletion` prompts instead of dropping it; a grammar or
   thinking-budget tag holding U+0000 now rejects.

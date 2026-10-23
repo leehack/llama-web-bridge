@@ -268,6 +268,11 @@ const sha256 = (bytes) => createHash('sha256').update(bytes).digest('hex');
   assert.ok(decision.includes('    const configJson = null;\n    const headSource = "bytes";\n'));
   assert.ok(decision.includes('            nCtx: 64,\n'));
   assert.ok(decision.includes('            /Decision head \\d+ is not loaded/,\n'));
+  // Qualification rejects a mode whose loaded core differs from the requested
+  // one, so each result reports the core the bridge started, not memoryMode.
+  const loadedCore = "coreVariant: bridge.getModelMetadata()['llamadart.webgpu.core_variant'] || null,\n";
+  assert.ok(speech.includes(`          ${loadedCore}`));
+  assert.ok(tts.includes(`            ${loadedCore}`));
   for (const page of [speech, tts, decision]) {
     assert.ok(page.startsWith('\n<!doctype html>\n<meta charset="utf-8">\n'));
     assert.ok(page.endsWith('})();\n</script>\n'));
