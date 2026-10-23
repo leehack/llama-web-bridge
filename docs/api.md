@@ -327,6 +327,9 @@ the returned text:
   incomplete character left when generation stops, is cancelled or reaches
   `nPredict` is delivered as U+FFFD in the last piece.
 - A leading U+FEFF is kept, and output after a NUL byte is delivered.
+- After `cancel()`, pieces generated before the runtime reads it still stream
+  until the call returns, in worker mode too. An aborted `signal` stops worker
+  pieces at once and rejects with an `AbortError`.
 
 Cores built before this behavior lack `llamadart_webgpu_last_output_bytes_json`.
 With them the bridge keeps its previous behavior: it reads the output as a C
