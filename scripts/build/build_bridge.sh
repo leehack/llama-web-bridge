@@ -183,7 +183,7 @@ if [[ "$BUILD_MEM64" == "1" ]]; then
   cp "$CORE_MEM64_JS" "$OUT_DIR/llama_webgpu_core_mem64.js"
   cp "$CORE_MEM64_WASM" "$OUT_DIR/llama_webgpu_core_mem64.wasm"
 
-  echo "[bridge] applying wasm64 runtime bigint interop patch"
+  echo "[bridge] verifying memory64 and applying wasm64 runtime bigint interop patch"
   patch_summary="$(node "$BRIDGE_DIR/scripts/build/patch_wasm64_runtime.mjs" \
     "$OUT_DIR/llama_webgpu_core_mem64.js")"
   echo "$patch_summary"

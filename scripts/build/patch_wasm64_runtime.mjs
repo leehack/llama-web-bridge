@@ -1,8 +1,10 @@
 #!/usr/bin/env node
 // Patch the Emscripten wasm64 WASMFS JavaScript boundary: wrap the pointer,
 // length and offset arguments the generated JS passes to the five __wasmfs_*
-// imports in BigInt(), in place. Idempotent; fails without writing when any
-// of the five symbols is missing from the generated output.
+// imports in BigInt(), in place. Idempotent; fails without writing when the
+// sibling .wasm is not memory64 or any of the five symbols is missing from the
+// generated output. A wasm32 link emits the same call sites, so the symbols
+// alone cannot tell the builds apart.
 //
 // Ported from scripts/patch_wasm64_runtime.py with byte-identical output: the
 // file is read as UTF-8 dropping undecodable bytes and with universal
@@ -72,6 +74,118 @@ export function patchWasm64Runtime(text) {
     );
   }
   return { text, counts };
+}
+
+export class Memory64Error extends Error {}
+
+const LIMITS_HAS_MAX = 0x01;
+const LIMITS_MEMORY64 = 0x04;
+const LIMITS_PAGE_SIZE = 0x08;
+const LIMITS_KNOWN_FLAGS = 0x0f;
+
+function wasmReader(bytes) {
+  let offset = 0;
+  const fail = (message) => {
+    throw new Memory64Error(`malformed wasm at byte ${offset}: ${message}`);
+  };
+  const reader = {
+    get offset() { return offset; },
+    byte() {
+      if (offset >= bytes.length) fail('unexpected end of module');
+      return bytes[offset++];
+    },
+    leb() {
+      let value = 0n;
+      for (let shift = 0n; shift < 70n; shift += 7n) {
+        const byte = reader.byte();
+        value |= BigInt(byte & 0x7f) << shift;
+        if ((byte & 0x80) === 0) return value;
+      }
+      return fail('LEB128 value is too long');
+    },
+    u32() {
+      const value = reader.leb();
+      if (value > 0xffffffffn) fail('u32 is out of range');
+      return Number(value);
+    },
+    skip(count) {
+      if (count > bytes.length - offset) fail('unexpected end of module');
+      offset += count;
+    },
+    fail,
+  };
+  return reader;
+}
+
+function readLimitsIsMemory64(reader) {
+  const flags = reader.byte();
+  if ((flags & ~LIMITS_KNOWN_FLAGS) !== 0) reader.fail(`unknown limits flags 0x${flags.toString(16)}`);
+  reader.leb();
+  if (flags & LIMITS_HAS_MAX) reader.leb();
+  if (flags & LIMITS_PAGE_SIZE) reader.u32();
+  return (flags & LIMITS_MEMORY64) !== 0;
+}
+
+function skipValueType(reader) {
+  const type = reader.byte();
+  // (ref null ht) and (ref ht) carry a heap type.
+  if (type === 0x63 || type === 0x64) reader.leb();
+}
+
+// Address type of every memory the module imports or defines, in index order.
+export function wasmMemoryAddressTypes(bytes) {
+  const reader = wasmReader(bytes);
+  const header = [0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+  for (const expected of header) {
+    if (reader.byte() !== expected) reader.fail('not a version 1 wasm binary module');
+  }
+  const memories = [];
+  while (reader.offset < bytes.length) {
+    const id = reader.byte();
+    const size = reader.u32();
+    const end = reader.offset + size;
+    if (id === 2) {
+      for (let count = reader.u32(); count > 0; count -= 1) {
+        reader.skip(reader.u32());
+        reader.skip(reader.u32());
+        const kind = reader.byte();
+        if (kind === 0x00) {
+          reader.u32();
+        } else if (kind === 0x01) {
+          skipValueType(reader);
+          readLimitsIsMemory64(reader);
+        } else if (kind === 0x02) {
+          memories.push(readLimitsIsMemory64(reader) ? 'i64' : 'i32');
+        } else if (kind === 0x03) {
+          skipValueType(reader);
+          reader.byte();
+        } else if (kind === 0x04) {
+          reader.byte();
+          reader.u32();
+        } else {
+          reader.fail(`unknown import kind 0x${kind.toString(16)}`);
+        }
+      }
+    } else if (id === 5) {
+      for (let count = reader.u32(); count > 0; count -= 1) {
+        memories.push(readLimitsIsMemory64(reader) ? 'i64' : 'i32');
+      }
+    } else {
+      reader.skip(size);
+    }
+    if (reader.offset !== end) reader.fail(`section ${id} size does not match its contents`);
+  }
+  return memories;
+}
+
+export function assertWasmMemory64(bytes) {
+  const memories = wasmMemoryAddressTypes(bytes);
+  if (memories.length === 0 || memories.some((type) => type !== 'i64')) {
+    throw new Memory64Error(
+      `wasm memories are [${memories.join(', ')}], expected only i64: `
+      + 'the wasm64 runtime patch applies only to a memory64 (-m64) link',
+    );
+  }
 }
 
 // UTF-8 decoding that drops each maximal ill-formed subsequence, as Python's
@@ -159,7 +273,7 @@ function parseArgs(argv) {
 export function main(argv = process.argv.slice(2)) {
   const args = parseArgs(argv);
   if (args.help) {
-    console.log(`${USAGE}\n\npositional arguments:\n  target      generated wasm64 JavaScript file`);
+    console.log(`${USAGE}\n\npositional arguments:\n  target      generated wasm64 JavaScript file; its sibling .wasm must be memory64`);
     return 0;
   }
   if (args.error) {
@@ -168,6 +282,13 @@ export function main(argv = process.argv.slice(2)) {
   }
   let counts;
   try {
+    if (!args.target.endsWith('.js')) throw new PatchError(`target must be a .js file: ${args.target}`);
+    const wasm = `${args.target.slice(0, -'.js'.length)}.wasm`;
+    try {
+      assertWasmMemory64(fs.readFileSync(wasm));
+    } catch (error) {
+      throw new PatchError(`${wasm}: ${error.message}`);
+    }
     const patched = patchWasm64Runtime(readText(args.target));
     counts = patched.counts;
     fs.writeFileSync(args.target, patched.text, 'utf8');
