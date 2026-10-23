@@ -233,20 +233,58 @@ for (const [status, code] of [
   await rejectsWith(bridge.loadDecisionHead(new Uint8Array([1])), 'no-model', /^No model loaded\./);
 }
 
-// Worker path: cancellation, a lost worker, an unrecovered failure, and a
-// coded worker error that is rethrown as is.
-{
-  let bridge;
-  bridge = createWorkerBridge({
-    _callWorker: async () => {
-      bridge.cancel();
-      throw new Error('Worker request failed');
+// Worker path: cancellation and uncoded failures of every method, a lost
+// worker, and a coded worker error that is rethrown as is.
+function createFailingWorkerBridge() {
+  let failure = null;
+  const bridge = createWorkerBridge({
+    _callWorker: async (method) => {
+      if (failure) {
+        return failure();
+      }
+      return method === 'loadDecisionHead' ? { apiVersion: 1, handle: 3 } : undefined;
     },
   });
-  const error = await bridge.loadDecisionHead(new Uint8Array([1])).catch((caught) => caught);
-  assert.equal(error.name, 'AbortError');
-  assert.equal(error.code, 'cancelled');
-  assert.equal(error.message, 'Decision head load was cancelled.');
+  const calls = async () => {
+    const { handle } = await bridge.loadDecisionHead(new Uint8Array([1]));
+    const { handle: freed } = await bridge.loadDecisionHead(new Uint8Array([1]));
+    return [
+      ['Decision capability probe', () => bridge.getDecisionCapabilities()],
+      ['Decision head load', () => bridge.loadDecisionHead(new Uint8Array([1]))],
+      ['Decision run', () => bridge.runDecision(handle, [sequence])],
+      ['Decision head free', () => bridge.freeDecisionHead(freed)],
+    ];
+  };
+  return { bridge, calls, failWith: (next) => { failure = next; } };
+}
+
+for (const [thrown, code, message] of [
+  [() => new Error('RuntimeError: Aborted(native code called abort())'), 'runtime', /^RuntimeError: Aborted/],
+  [() => 'uncoded string', 'runtime', /^uncoded string$/],
+]) {
+  for (let index = 0; index < 4; index += 1) {
+    const { calls, failWith } = createFailingWorkerBridge();
+    const [label, call] = (await calls())[index];
+    failWith(() => {
+      throw thrown();
+    });
+    await rejectsWith(call(), code, message).catch((error) => {
+      throw new Error(`${label}: ${error.message}`);
+    });
+  }
+}
+
+for (let index = 0; index < 4; index += 1) {
+  const { bridge, calls, failWith } = createFailingWorkerBridge();
+  const [label, call] = (await calls())[index];
+  failWith(() => {
+    bridge.cancel();
+    throw new Error('Worker request failed');
+  });
+  const error = await call().catch((caught) => caught);
+  assert.equal(error.name, 'AbortError', label);
+  assert.equal(error.code, 'cancelled', label);
+  assert.equal(error.message, `${label} was cancelled.`);
 }
 
 {
@@ -273,15 +311,6 @@ for (const [status, code] of [
     'head-lost',
     /^Decision head 1 was lost when the bridge worker failed .*Load the decision head again\.$/,
   );
-}
-
-{
-  const bridge = createWorkerBridge({
-    _callWorker: async () => {
-      throw new Error('RuntimeError: Aborted(native code called abort())');
-    },
-  });
-  await rejectsWith(bridge.getDecisionCapabilities(), 'runtime', /native code called abort/);
 }
 
 {
