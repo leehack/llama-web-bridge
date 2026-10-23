@@ -297,7 +297,9 @@ assert.deepEqual(webGpuLaunchArgs('linux'), [
     'closed-budget-zero': 'c',
   });
   assert.deepEqual(Object.keys(thinkingRuns()), grammarSmoke.THINKING_RUNS.map(([name]) => name));
-  const promptPenalty = () => ({ steps: 2, best: 'a', unpenalized: 'b', neutral: 'a', penalized: 'b', grammar: 'a' });
+  const promptPenalty = () => ({
+    steps: 2, best: 'a', unpenalized: 'b', neutral: 'a', penalized: 'b', grammar: 'a', emptyGrammar: 'a', optOut: 'a',
+  });
   const capabilities = (supported) => Object.fromEntries(
     grammarSmoke.COMPLETION_CAPABILITIES.map((name) => [name, supported]),
   );
@@ -376,6 +378,8 @@ assert.deepEqual(webGpuLaunchArgs('linux'), [
       probeCase({ neutral: 'c' }, ['the greedy token is not the most probable scored token']),
       probeCase({ penalized: 'a' }, ['the presence penalty did not count the prompt, so a prompt token stayed the greedy pick']),
       probeCase({ grammar: 'b' }, ['with a grammar the presence penalty counted the prompt, unlike native llamadart']),
+      probeCase({ emptyGrammar: 'b' }, ['with an empty grammar the presence penalty counted the prompt, unlike native llamadart']),
+      probeCase({ optOut: 'b' }, ['with penaltyPromptTokens: false the presence penalty counted the prompt']),
       [mutate(grammarPayload(), (p) => { p.modeResults[1].promptPenalty = { steps: 32, best: null }; }), both, [
         'wasm32 worker: prompt penalty: no prompt within 32 steps had its most probable token among its last 64 tokens: '
           + "{'steps': 32, 'best': None}",
@@ -450,7 +454,8 @@ assert.deepEqual(webGpuLaunchArgs('linux'), [
         p.modeResults[3].capabilitiesBeforeLoad.minP = true;
         p.modeResults[3].capabilitiesAfterLoad = null;
       }), both, [
-        "wasm64 worker: capabilities before the load: expected none, got {'presencePenalty': False, 'minP': True, 'thinkingBudget': False}",
+        "wasm64 worker: capabilities before the load: expected none, got {'presencePenalty': False, 'minP': True, 'thinkingBudget': False, "
+          + "'penaltyPromptTokens': False}",
         'wasm64 worker: capabilities after the load: expected all, got None',
         `wasm64 worker: sampler outputs: {${Object.entries(samplerRuns()).map(([n, t]) => `'${n}': '${t}'`).join(', ')}}`,
       ]],

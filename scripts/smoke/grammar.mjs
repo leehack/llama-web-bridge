@@ -60,8 +60,9 @@ As native llamadart does, the penalties count the prompt's last 64 tokens
 unless a grammar is set. The smoke extends the sampler prompt with its most
 probable next token until that token is among the prompt's last 64 tokens.
 A greedy token under a presence penalty far above any logit gap must then be
-the most probable token outside them; with a grammar that accepts any text,
-it stays the most probable token.
+the most probable token outside them. It stays the most probable token with a
+grammar that accepts any text, with an empty grammar, and with
+\`\`penaltyPromptTokens: false\`\`.
 
 Last, it checks \`\`thinkingBudget\`\` with greedy decoding and a prompt that
 leaves a reasoning block open. With \`\`maxTokens: 8\`\` the output is the
@@ -169,7 +170,7 @@ const INVALID_SAMPLER_OPTIONS = Object.freeze([
   { presencePenalty: Number.POSITIVE_INFINITY },
 ]);
 // speculative.mjs checks the speculativeDecoding capabilities.
-export const COMPLETION_CAPABILITIES = Object.freeze(['presencePenalty', 'minP', 'thinkingBudget']);
+export const COMPLETION_CAPABILITIES = Object.freeze(['presencePenalty', 'minP', 'thinkingBudget', 'penaltyPromptTokens']);
 // Each tag follows a space: SentencePiece vocabularies tokenize a tag at the
 // start of text with a space prefix, so only a spaced tag in the prompt
 // matches the tokenized start and end tags.
@@ -316,6 +317,8 @@ export function renderHarness(nCtx, memoryModes) {
               neutral: await run({}),
               penalized,
               grammar: await run({ presencePenalty: probe.presencePenalty, grammar: probe.grammar }),
+              emptyGrammar: await run({ presencePenalty: probe.presencePenalty, grammar: '' }),
+              optOut: await run({ presencePenalty: probe.presencePenalty, penaltyPromptTokens: false }),
             };
           }
         }
@@ -566,6 +569,8 @@ export function validatePromptPenalty(entry) {
     'the presence penalty did not count the prompt, so a prompt token stayed the greedy pick',
   );
   expect(probe.grammar === best, 'with a grammar the presence penalty counted the prompt, unlike native llamadart');
+  expect(probe.emptyGrammar === best, 'with an empty grammar the presence penalty counted the prompt, unlike native llamadart');
+  expect(probe.optOut === best, 'with penaltyPromptTokens: false the presence penalty counted the prompt');
   if (failures.length > 0) failures.push(`prompt penalty outputs: ${pyRepr(probe)}`);
   return failures;
 }

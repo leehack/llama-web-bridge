@@ -297,8 +297,9 @@ Common `options` keys:
 | `topK` | Top-k sampling. Defaults to `40`. |
 | `topP` | Top-p sampling. Defaults to `0.95`. |
 | `minP` | Min-P threshold from `0` to `1`, applied after top-p. Defaults to `0`, which disables it. |
-| `penalty` | Repetition penalty over the last 64 tokens of the prompt and this completion, as in native llamadart: the prompt counts only for a text prompt without a `grammar`. Defaults to `1.1`; `1` disables it. |
+| `penalty` | Repetition penalty over the last 64 tokens of the prompt and this completion, as in native llamadart: the prompt counts only for a text prompt without a `grammar` (an empty string counts as one) and without `penaltyPromptTokens: false`. Defaults to `1.1`; `1` disables it. |
 | `presencePenalty` | Subtracted once from the logit of each token in the same 64-token window as `penalty`. Defaults to `0`, which disables it. |
+| `penaltyPromptTokens` | `false` keeps the prompt out of the `penalty` and `presencePenalty` window, as a `grammar` does. It exists for callers that drop a grammar native llamadart keeps: llamadart drops a lazy tool-call grammar on WebGPU, which cannot apply one, and sets this so the output matches native, which does not count the prompt when a lazy grammar is set. Omitted or `null` means `true`; any other non-boolean rejects with a `TypeError`. A core whose `getCompletionCapabilities()` lacks `penaltyPromptTokens` never counts the prompt. |
 | `grammar` | Optional llama.cpp GBNF grammar with a `root` rule. An invalid grammar rejects before generation starts with an error containing `(invalid grammar)`; worker mode rethrows it without falling back to the main thread. Each rejection leaks the partly parsed grammar (a few KiB at most for typical grammars), so validate generated grammars before sending them in a loop. |
 | `seed` | Integer seed; random when omitted. |
 | `thinkingBudget` | `{ maxTokens, startTag, endTag, forcedMessage? }`: llama.cpp's reasoning budget. After `maxTokens` tokens inside a block opened by `startTag`, plus any that finish a UTF-8 character, the sampler forces `forcedMessage` (default empty) and `endTag`. A block the prompt leaves open counts from the start of generation, so `maxTokens: 0` forces the end at once. Each new `startTag` gets a fresh budget. A grammar constrains `startTag` like any other text, then pauses until `endTag` completes. `maxTokens` is an integer from `0` to `2147483647`; the tags must be non-empty. Each tag is tokenized on its own, as native llamadart does: with a vocabulary that adds a leading space to text, such as Llama 2's SentencePiece, a tag in the prompt matches only after a space, and the forced end tag starts with one. Text-only prompts: with `parts` it rejects. |
@@ -367,8 +368,10 @@ cancelled generation once it returns.
 getCompletionCapabilities(): Promise<CompletionCapabilities>
 ```
 
-Returns `{ presencePenalty, minP, thinkingBudget, speculativeDecoding }`:
-whether the loaded core applies each `createCompletion` option. Every flag is
+Returns `{ presencePenalty, minP, thinkingBudget, penaltyPromptTokens, speculativeDecoding }`:
+whether the loaded core applies each `createCompletion` option.
+`penaltyPromptTokens` also means the penalties count the prompt; without it they
+never do. Every flag is
 `false` until a model load initializes the core. `speculativeDecoding` maps each
 strategy to whether the loaded models can run it now: the n-gram strategies need
 only a speculative-capable core, `draft-mtp` needs a model with MTP layers

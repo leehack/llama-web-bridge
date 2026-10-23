@@ -3841,9 +3841,9 @@ export class LlamaWebGpuBridgeRuntime {
     const topK = Number.isFinite(options.topK) ? Number(options.topK) : 40;
     const topP = Number.isFinite(options.topP) ? Number(options.topP) : 0.95;
     const penalty = Number.isFinite(options.penalty) ? Number(options.penalty) : 1.1;
-    const grammar = typeof options.grammar === 'string' && options.grammar.length > 0
-      ? options.grammar
-      : null;
+    // An empty grammar constrains nothing, but native llamadart then keeps
+    // the prompt out of the penalties, so it reaches the core.
+    const grammar = typeof options.grammar === 'string' ? options.grammar : null;
     const seed = Number.isInteger(options.seed)
       ? Number(options.seed)
       : Math.floor(Math.random() * 0xffffffff);
@@ -3863,7 +3863,7 @@ export class LlamaWebGpuBridgeRuntime {
           'number',
           [
             ...input.argTypes, 'number', 'number', 'number', 'number', 'string', 'number', 'number', 'number',
-            'number', 'string', 'string', 'string',
+            'number', 'string', 'string', 'string', 'number',
           ],
           [
             ...input.args,
@@ -3879,6 +3879,7 @@ export class LlamaWebGpuBridgeRuntime {
             sampling.thinkingBudget?.startTag ?? null,
             sampling.thinkingBudget?.endTag ?? null,
             sampling.thinkingBudget?.forcedMessage ?? null,
+            sampling.penaltyPromptTokens ? 0 : 1,
           ],
           { async: true },
         ),

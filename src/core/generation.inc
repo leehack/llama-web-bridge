@@ -280,7 +280,8 @@ int32_t begin_generation_impl(
     const int32_t thinking_budget_tokens,
     const char * thinking_start_tag,
     const char * thinking_end_tag,
-    const char * thinking_forced_message) {
+    const char * thinking_forced_message,
+    const int32_t skip_prompt_penalty) {
   // Defence in depth behind the bridge's single-writer queue: reject before
   // touching any shared state, so a stray second begin cannot destroy the
   // in-flight generation's output, sampler, or g_last_error. The caller maps
@@ -456,9 +457,10 @@ int32_t begin_generation_impl(
   }
 
   // As native llamadart does, the whole text prompt, cached prefix included,
-  // seeds the penalties unless a grammar is set; a multimodal prompt seeds
-  // nothing.
-  if (grammar_sampler) {
+  // seeds the penalties unless a grammar string is given, even an empty one; a
+  // multimodal prompt seeds nothing. skip_prompt_penalty lets a caller that
+  // dropped a grammar native would keep, such as a lazy one, match native.
+  if (grammar != nullptr || skip_prompt_penalty != 0) {
     penalty_prompt_tokens.clear();
   }
 
