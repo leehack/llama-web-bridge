@@ -15,7 +15,8 @@ import {
 // completion returns (#178). The page facade, a real BridgeWorkerProxy, the
 // real worker host and the real runtime over the stub core exchange messages
 // as separate macrotasks, so the worker keeps generating until the runtime's
-// next yield lets it read the cancel.
+// next yield lets it read the cancel. A cancel applies only while the operation
+// it names has a call running in the worker (#180).
 
 const encoder = new TextEncoder();
 const strictDecoder = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
@@ -32,15 +33,23 @@ const FULL_TEXT = '🦙 𠜎𠜱 龘靐 你好 é '.repeat(4);
 // Generation ends two bytes into the emoji before the worker reads the cancel,
 // so the text ends in U+FFFD.
 const SPLIT_TAIL_PIECES = ['abcd', 'efgh', 'ijkl', ...bytePieces('🦙').slice(0, 2)];
+// Fewer pieces than the runtime's yield interval: the worker posts them and the
+// result in one task, so a cancel sent from the first piece lands after the result.
+const SHORT_PIECES = ['ab', 'cd'];
 const SCRIPTS = {
   prompt: bytePieces(FULL_TEXT),
   'split-tail': SPLIT_TAIL_PIECES,
+  short: SHORT_PIECES,
 };
 
 const originalSelf = globalThis.self;
 const originalCreateCompletion = LlamaWebGpuBridge.prototype.createCompletion;
 const macrotask = (run) => setTimeout(run, 0);
+const nextMacrotask = () => new Promise((resolve) => macrotask(resolve));
 let pageWorker = null;
+// The stub core under the worker's runtime; its cancelRequests count the
+// requests that set the core's cancel flag.
+let workerCore = null;
 
 function pieceText(piece) {
   if (typeof piece === 'string') {
@@ -89,6 +98,19 @@ async function complete(bridge, prompt, { onPiece = () => {}, ...options } = {})
   }
   settled = true;
   return { text, error, usage, events, pieces: events.map(({ piece }) => piece) };
+}
+
+function assertWholeCompletion(result, text = FULL_TEXT) {
+  assertStreamMatchesText(result);
+  assert.equal(result.text, text);
+  assert.equal(result.usage.finishReason, 'stop');
+}
+
+// A raw protocol cancel, as the facade sends one, naming `operationId`.
+function postWorkerCancel(operationId) {
+  macrotask(() => globalThis.self.onmessage({
+    data: { type: 'call', id: 1_000_000, method: 'cancel', args: [], operationId },
+  }));
 }
 
 function assertStreamMatchesText({ text, error, events }) {
@@ -217,6 +239,100 @@ const WORKER_CASES = [
     assert.equal(next.usage.finishReason, 'stop');
   }],
 
+  ['a cancel that reaches the worker after its result leaves the next completion whole', async (bridge) => {
+    const first = await complete(bridge, 'short', {
+      onPiece: (count) => {
+        if (count === 1) {
+          bridge.cancel();
+        }
+      },
+    });
+    assertWholeCompletion(first, SHORT_PIECES.join(''));
+    await nextMacrotask();
+    assert.equal(workerCore.cancelRequests, 0, 'the late cancel must not set the core cancel flag');
+    assertWholeCompletion(await complete(bridge, 'prompt'));
+    assert.equal(workerCore.cancelRequests, 0);
+  }],
+
+  ['an idle cancel() leaves the next completion whole', async (bridge) => {
+    assertWholeCompletion(await complete(bridge, 'prompt'));
+    bridge.cancel();
+    // The worker reads the cancel before the next call, which it reaches first.
+    assertWholeCompletion(await complete(bridge, 'prompt'));
+    assert.equal(workerCore.cancelRequests, 0, 'an idle cancel must not set the core cancel flag');
+  }],
+
+  ['cancel() right after createCompletion() cancels it before the worker starts', async (bridge) => {
+    const pending = complete(bridge, 'prompt');
+    const operationId = bridge._activeOperation.id;
+    bridge.cancel();
+    const cancelled = await pending;
+    assertStreamMatchesText(cancelled);
+    assert.equal(cancelled.usage.finishReason, 'cancelled');
+    assert.ok(cancelled.text.length < FULL_TEXT.length, 'the cancel stopped generation early');
+    assert.deepEqual(
+      pageWorker.posted
+        .filter((message) => message.type === 'call')
+        .map(({ method, operationId: id }) => [method, id]),
+      [['cancel', operationId], ['createCompletion', operationId], ['cancel', operationId]],
+      'the worker drops the first cancel, so a second follows the call',
+    );
+    assertWholeCompletion(await complete(bridge, 'prompt'));
+  }],
+
+  ['a cancel still applies after another call of the same operation returns', async (bridge) => {
+    const result = await complete(bridge, 'prompt', {
+      onPiece: (count) => {
+        if (count === 1) {
+          bridge.setLogLevel(2);
+        }
+        if (count === 12) {
+          bridge.cancel();
+        }
+      },
+    });
+    const setLogLevel = pageWorker.posted.find((message) => message.method === 'setLogLevel');
+    const completion = pageWorker.posted.find((message) => message.method === 'createCompletion');
+    assert.equal(setLogLevel.operationId, completion.operationId);
+    assertStreamMatchesText(result);
+    assert.equal(result.usage.finishReason, 'cancelled');
+    assert.ok(result.text.length < FULL_TEXT.length);
+  }],
+
+  ['a cancel naming another operation leaves the running one alone', async (bridge) => {
+    let running = null;
+    const result = await complete(bridge, 'prompt', {
+      onPiece: (count) => {
+        if (count === 1) {
+          running = bridge._activeOperation.id;
+          postWorkerCancel(running + 1);
+        }
+      },
+    });
+    assertWholeCompletion(result);
+    assert.equal(workerCore.cancelRequests, 0);
+
+    const named = await complete(bridge, 'prompt', {
+      onPiece: (count) => {
+        if (count === 1) {
+          postWorkerCancel(bridge._activeOperation.id);
+        }
+      },
+    });
+    assertStreamMatchesText(named);
+    assert.equal(named.usage.finishReason, 'cancelled', 'a cancel naming the running operation applies');
+    assert.ok(named.text.length < FULL_TEXT.length);
+
+    const untagged = await complete(bridge, 'prompt', {
+      onPiece: (count) => {
+        if (count === 1) {
+          postWorkerCancel(undefined);
+        }
+      },
+    });
+    assert.equal(untagged.usage.finishReason, 'cancelled', 'a cancel naming no operation stops the running call');
+  }],
+
   ['dispose() racing a cancelled completion settles it with a matching stream', async (bridge) => {
     let disposal = null;
     const result = await complete(bridge, 'prompt', {
@@ -246,6 +362,7 @@ try {
     // The worker host's facade runs the runtime directly; the page's does not.
     if (this._config?.disableWorker === true && !this._runtime._core) {
       this._runtime._core = createStubCore(SCRIPTS);
+      workerCore = this._runtime._core;
       this._runtime._modelBytes = 1;
       this._runtime._nCtx = 128;
     }
@@ -290,3 +407,23 @@ for (const options of STREAM_OPTIONS.slice(0, 2)) {
   console.log(`ok - direct cancel() in onToken streams the returned text (${options.tokenEventEncoding})`);
 }
 
+
+// Direct: the runtime clears its cancel flag when a completion starts, so an
+// idle cancel cannot cut the next completion short, and a cancel issued once the
+// call owns the runtime still stops it.
+{
+  const { bridge } = createDirectBridge(SCRIPTS);
+  assertWholeCompletion(await complete(bridge, 'prompt'));
+  bridge.cancel();
+  assertWholeCompletion(await complete(bridge, 'prompt'));
+
+  const pending = complete(bridge, 'prompt');
+  bridge.cancel();
+  const cancelled = await pending;
+  assertStreamMatchesText(cancelled);
+  assert.equal(cancelled.usage.finishReason, 'cancelled');
+  assert.equal(cancelled.text, '');
+  assertWholeCompletion(await complete(bridge, 'prompt'));
+  await bridge.dispose();
+  console.log('ok - direct idle cancel() and cancel() at the start of a completion stay scoped');
+}

@@ -54,8 +54,13 @@ export function installBridgeWorkerHost() {
     });
   };
 
-  self.onmessage = async (event: MessageEvent) => {
-    const message: WorkerRequest = event.data || {};
+  // Calls running per facade operation id; untagged calls count under `undefined`.
+  const callsInFlight = new Map<unknown, number>();
+  const isCallInFlight = (operationId: unknown) => (
+    operationId === undefined ? callsInFlight.size > 0 : callsInFlight.has(operationId)
+  );
+
+  const handleMessage = async (message: WorkerRequest) => {
     const type = message.type;
     const id = message.id ?? 0;
 
@@ -79,6 +84,18 @@ export function installBridgeWorkerHost() {
 
       const method = String(message.method || '');
       const args: unknown[] = Array.isArray(message.args) ? message.args : [];
+
+      if (method === 'cancel') {
+        // Applied only while a call of the named operation runs here: on an idle
+        // worker it would only set the runtime's cancel flag, which the next call
+        // clears on entry. The facade resends it behind each later call of a
+        // cancelled operation.
+        if (isCallInFlight(message.operationId)) {
+          bridge.cancel();
+        }
+        self.postMessage({ type: 'result', id, value: undefined });
+        return;
+      }
 
       if (method === 'loadModelFromUrl') {
         const url = args[0] as string | string[];
@@ -402,6 +419,27 @@ export function installBridgeWorkerHost() {
       self.postMessage({ type: 'result', id, value });
     } catch (error) {
       postError(id, error);
+    }
+  };
+
+  self.onmessage = async (event: MessageEvent) => {
+    const message: WorkerRequest = event.data || {};
+    if (message.type !== 'call' || message.method === 'cancel') {
+      await handleMessage(message);
+      return;
+    }
+
+    const operationId = message.operationId;
+    callsInFlight.set(operationId, (callsInFlight.get(operationId) ?? 0) + 1);
+    try {
+      await handleMessage(message);
+    } finally {
+      const remaining = (callsInFlight.get(operationId) ?? 1) - 1;
+      if (remaining > 0) {
+        callsInFlight.set(operationId, remaining);
+      } else {
+        callsInFlight.delete(operationId);
+      }
     }
   };
 }

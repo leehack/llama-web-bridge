@@ -35,6 +35,8 @@ export interface WorkerRequest {
   config?: LlamaWebGpuBridgeConfig;
   method?: unknown;
   args?: unknown;
+  // The facade operation that made the call; on a `cancel`, the one it targets.
+  operationId?: unknown;
 }
 
 // A failed worker request: the worker's state at the failure, or a flag that

@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- In worker mode, scope each `cancel()` to the operation it targets: a cancel issued
+  as a call starts now stops it, as in direct mode, and one that reaches the worker
+  after its call returned is dropped instead of setting the runtime's cancel flag. A
+  multimodal completion cancelled before its first token returns empty instead of
+  restarting the worker and generating again.
 - In worker mode, keep streaming the pieces generated before the worker reads a
   `cancel()`, so they add up to the returned text; an aborted `signal` still stops
   the stream and rejects.
