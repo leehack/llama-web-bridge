@@ -934,10 +934,35 @@ Frees a head. Freeing an unknown or already-freed handle does nothing.
 Handles are not durable. `dispose()`, a worker restart, a fallback to the
 main-thread runtime, and any model load that reaches the core, even one that
 then fails, free every head, and a later
-`runDecision()` with such a handle rejects and asks for the head to be loaded
-again. When the worker fails during `runDecision()`, the bridge reloads the
-model on the main thread and rejects the run; heads must then be loaded again.
+`runDecision()` with such a handle rejects with code `head-lost`. When the
+worker fails during `runDecision()`, the bridge reloads the model on the main
+thread and rejects the run with `head-lost`; heads must then be loaded again.
 Handles are never reused within one bridge instance.
+
+### Decision errors
+
+Every rejection of the four decision methods has a string `code`
+(`DecisionErrorCode`), in both direct and worker mode. The error keeps its
+type, name and message: argument errors stay `TypeError`s and cancellation an
+`AbortError`, whose numeric DOMException `code` this replaces. Branch on `code`;
+messages may change.
+
+| Code | Meaning |
+| --- | --- |
+| `head-lost` | The handle's head was freed, its model was unloaded, or the runtime that held it restarted or failed. Load the head again. |
+| `no-model` | No model is loaded. |
+| `disposed` | The bridge was disposed. |
+| `cancelled` | `cancel()` stopped the operation. |
+| `busy` | Generation or text-to-speech synthesis holds the runtime. |
+| `context` | The head's private encoder context cannot be created, or its pooling or batch size cannot serve the head. |
+| `invalid-argument` | A malformed handle, source, `configJson` or sequence, including sequences the core rejects for the loaded encoder. |
+| `unsupported` | The core build or the loaded model cannot run decision heads. |
+| `model` | The head or its config cannot be fetched or read, is malformed, or does not fit the encoder. |
+| `inference` | The encoder or head failed while running, or returned malformed output. |
+| `invalid-state` | Another runtime state rejected the call, such as exhausted head handles. |
+| `runtime` | Any other failure, such as a worker or Wasm failure the bridge could not recover from. |
+
+New codes may be added; treat an unknown code like `runtime`.
 
 ## LoRA adapters
 

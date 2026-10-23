@@ -15,9 +15,13 @@ import {
 import { importCoreFactory } from './internal/core_loader.ts';
 import {
   DECISION_API_VERSION,
+  decisionCoreStatusCode,
+  decisionError,
   decisionHandleFrom,
   decodeDecisionOutputs,
   encodeDecisionSequences,
+  invalidDecisionArgument,
+  withDecisionErrorCode,
 } from './internal/decision.ts';
 import {
   drainResponseWithProgress,
@@ -3206,29 +3210,30 @@ export class LlamaWebGpuBridgeRuntime {
     options: DecisionHeadOptions = {},
   ) {
     if (!this._core || this._modelBytes <= 0) {
-      throw new Error('No model loaded. Call loadModelFromUrl first.');
+      throw decisionError('no-model', 'No model loaded. Call loadModelFromUrl first.');
     }
     const configJson = options?.configJson ?? null;
     if (configJson !== null && typeof configJson !== 'string') {
-      throw new TypeError('Decision head configJson must be a string.');
+      throw invalidDecisionArgument('Decision head configJson must be a string.');
     }
     let bytes = null;
     if (typeof source === 'string') {
       if (source.length === 0) {
-        throw new Error('Decision head URL is empty.');
+        throw decisionError('invalid-argument', 'Decision head URL is empty.');
       }
     } else {
       bytes = bufferSourceBytes(source);
       if (!bytes) {
-        throw new TypeError('Decision head source must be a URL string, an ArrayBuffer or a typed array.');
+        throw invalidDecisionArgument('Decision head source must be a URL string, an ArrayBuffer or a typed array.');
       }
       if (bytes.byteLength === 0) {
-        throw new Error('Decision head bytes are empty.');
+        throw decisionError('invalid-argument', 'Decision head bytes are empty.');
       }
     }
     const capabilities = this.getDecisionCapabilities();
     if (capabilities.supported !== true) {
-      throw new Error(
+      throw decisionError(
+        'unsupported',
         capabilities.reason || 'The loaded model does not support decision heads.',
       );
     }
@@ -3246,7 +3251,11 @@ export class LlamaWebGpuBridgeRuntime {
         core.FS.writeFile(headPath, bytes);
       } else {
         label = basenameFromUrl(source).slice(0, 256);
-        await this._stageDecisionHeadFromUrl(source as string, headPath, options?.onProgress);
+        try {
+          await this._stageDecisionHeadFromUrl(source as string, headPath, options?.onProgress);
+        } catch (error) {
+          throw error && typeof error === 'object' ? withDecisionErrorCode(error, 'model') : error;
+        }
       }
       if (configPath !== null) {
         core.FS.writeFile(configPath, textEncoder.encode(configJson!));
@@ -3261,7 +3270,10 @@ export class LlamaWebGpuBridgeRuntime {
         ),
       );
       if (handle <= 0) {
-        throw new Error(this._coreErrorMessage('Failed to load decision head', handle));
+        throw decisionError(
+          decisionCoreStatusCode(handle),
+          this._coreErrorMessage('Failed to load decision head', handle),
+        );
       }
       const raw = core.ccall(
         'llamadart_webgpu_decision_head_info_json',
@@ -3280,7 +3292,7 @@ export class LlamaWebGpuBridgeRuntime {
     const nativeHandle = decisionHandleFrom(handle);
     const input = encodeDecisionSequences(sequences);
     if (!this._core || this._modelBytes <= 0) {
-      throw new Error('No model loaded. Call loadModelFromUrl first.');
+      throw decisionError('no-model', 'No model loaded. Call loadModelFromUrl first.');
     }
     const core = this._core;
     this._ensureDecisionDir();
@@ -3299,7 +3311,10 @@ export class LlamaWebGpuBridgeRuntime {
         ),
       );
       if (count < 0) {
-        throw new Error(this._coreErrorMessage('Decision run failed', count));
+        throw decisionError(
+          decisionCoreStatusCode(count),
+          this._coreErrorMessage('Decision run failed', count),
+        );
       }
       return decodeDecisionOutputs(core.FS.readFile(outputPath), count);
     } finally {

@@ -3,11 +3,14 @@
 import { createAbortError } from './internal/abort.ts';
 import { embeddingAssetVersion, embeddingCapabilitiesFrom, missingEmbeddingCapability, snapshotEmbedInput } from './internal/embedding.ts';
 import { NO_COMPLETION_CAPABILITIES, resolveCompletionSamplingOptions } from './internal/completion_options.ts';
-import { BRIDGE_DISPOSED_MESSAGE, INVALID_GRAMMAR_ERROR_TEXT } from './internal/constants.ts';
+import { INVALID_GRAMMAR_ERROR_TEXT, bridgeDisposedError } from './internal/constants.ts';
 import {
   DECISION_API_VERSION,
+  decisionError,
+  decisionErrorCodeOf,
   decisionHandleFrom,
   normalizeDecisionSequences,
+  withDecisionErrorCode,
 } from './internal/decision.ts';
 import { logLevelForName, logThresholdForConfiguredLevel } from './internal/logging.ts';
 import {
@@ -545,7 +548,7 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
     const lifecycleState = this._lifecycleState || (this._disposed ? 'disposed' : 'open');
 
     if (!allowDisposed && (this._disposed || lifecycleState !== 'open')) {
-      return Promise.reject(new Error(BRIDGE_DISPOSED_MESSAGE));
+      return Promise.reject(bridgeDisposedError());
     }
     if (signal?.aborted) {
       return Promise.reject(abortError());
@@ -603,7 +606,7 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
       }
       if (!allowDisposed && (this._disposed || this._lifecycleState === 'disposing')) {
         operation.state = 'disposed';
-        throw new Error(BRIDGE_DISPOSED_MESSAGE);
+        throw bridgeDisposedError();
       }
 
       started = true;
@@ -687,7 +690,7 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
         removeDisposalWaiter = this._addDisposalWaiter(() => {
           if (!started) {
             operation.state = 'disposed';
-            reject(new Error(BRIDGE_DISPOSED_MESSAGE));
+            reject(bridgeDisposedError());
           }
         });
       }
@@ -735,13 +738,13 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
    */
   _throwIfDisposed() {
     if (this._lifecycleState === 'disposed') {
-      throw new Error(BRIDGE_DISPOSED_MESSAGE);
+      throw bridgeDisposedError();
     }
     if (
       (this._disposed || this._lifecycleState === 'disposing')
       && !this._isSettleFirstOwner()
     ) {
-      throw new Error(BRIDGE_DISPOSED_MESSAGE);
+      throw bridgeDisposedError();
     }
   }
 
@@ -1347,7 +1350,7 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
       await this._ensureRuntimeDraftModel();
     } catch (error) {
       if (this._disposed || this._lifecycleState === 'disposing') {
-        throw new Error(BRIDGE_DISPOSED_MESSAGE);
+        throw bridgeDisposedError();
       }
       if ((error as Error | null)?.name === 'AbortError') {
         throw error;
@@ -2575,7 +2578,8 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
   }
 
   _staleDecisionHeadError(handle: number) {
-    return new Error(
+    return decisionError(
+      'head-lost',
       `Decision head ${handle} is not loaded; it was freed, its model was unloaded, `
       + 'or the bridge runtime restarted. Load the decision head again.',
     );
@@ -2595,9 +2599,21 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
     return entry;
   }
 
+  // Gives every decision API rejection a DecisionErrorCode.
+  _decisionRejection(error: unknown) {
+    if (decisionErrorCodeOf(error)) {
+      return error;
+    }
+    if (!error || typeof error !== 'object') {
+      return decisionError('runtime', serializeWorkerError(error));
+    }
+    const cancelled = (error as Error).name === 'AbortError' && !this._isWorkerTimeoutError(error);
+    return withDecisionErrorCode(error, cancelled ? 'cancelled' : 'runtime');
+  }
+
   _requireDecisionRuntime() {
     if (!this._runtime) {
-      throw new Error('No model loaded. Call loadModelFromUrl first.');
+      throw decisionError('no-model', 'No model loaded. Call loadModelFromUrl first.');
     }
     return this._runtime;
   }
@@ -2617,7 +2633,9 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
     return this._runExclusive(
       () => this._getDecisionCapabilitiesUnlocked(),
       { kind: 'decision-capabilities' },
-    );
+    ).catch((error) => {
+      throw this._decisionRejection(error);
+    });
   }
 
   async _getDecisionCapabilitiesUnlocked() {
@@ -2646,7 +2664,9 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
     return this._runExclusive(
       () => this._loadDecisionHeadUnlocked(source, options),
       { kind: 'decision-head-load' },
-    );
+    ).catch((error) => {
+      throw this._decisionRejection(error);
+    });
   }
 
   async _loadDecisionHeadUnlocked(
@@ -2707,7 +2727,9 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
     return this._runExclusive(
       () => this._runDecisionUnlocked(handle, sequences),
       { kind: 'decision-run' },
-    );
+    ).catch((error) => {
+      throw this._decisionRejection(error);
+    });
   }
 
   async _runDecisionUnlocked(handle: number, sequences: readonly DecisionSequence[]) {
@@ -2729,7 +2751,8 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
       }
       this._decisionHeadMap().delete(handle);
       await this._recoverWorkerOnMainThread(error);
-      throw new Error(
+      throw decisionError(
+        'head-lost',
         `Decision head ${handle} was lost when the bridge worker failed `
         + `(${serializeWorkerError(error)}). Load the decision head again.`,
       );
@@ -2740,7 +2763,9 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
     return this._runExclusive(
       () => this._freeDecisionHeadUnlocked(handle),
       { kind: 'decision-head-free' },
-    );
+    ).catch((error) => {
+      throw this._decisionRejection(error);
+    });
   }
 
   async _freeDecisionHeadUnlocked(handle: number) {

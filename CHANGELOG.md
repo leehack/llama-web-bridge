@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Give every decision API rejection a stable string `code`, such as `head-lost`, `busy` or
+  `context`, in direct and worker mode, so callers need not match its unchanged message.
 - `penalty` and `presencePenalty` count the prompt's last tokens in their 64-token window, as
   native llamadart does, unless a `grammar` (even an empty one) or media `parts` are set.
   Output for the same seed changes whenever `penalty` is not 1, including the default 1.1,

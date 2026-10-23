@@ -1,6 +1,6 @@
 // State and error shapes shared by the worker host and the bridge facade.
 
-import type { EmbeddingErrorCode, LlamaWebGpuBridge, LlamaWebGpuBridgeConfig, ModelMetadata } from './llama_webgpu_bridge.d.ts';
+import type { DecisionErrorCode, EmbeddingErrorCode, LlamaWebGpuBridge, LlamaWebGpuBridgeConfig, ModelMetadata } from './llama_webgpu_bridge.d.ts';
 
 // Model state a worker reports so the facade can answer synchronous getters.
 export interface BridgeStateSnapshot {
@@ -20,6 +20,7 @@ export interface WorkerResponse {
   state?: BridgeStateSnapshot;
   message?: string;
   embeddingErrorCode?: EmbeddingErrorCode;
+  decisionErrorCode?: DecisionErrorCode;
   event?: string;
   payload?: unknown;
 }
