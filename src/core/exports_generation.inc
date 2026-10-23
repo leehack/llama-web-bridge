@@ -23,6 +23,7 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_generate(
 
   const int32_t begin_rc = begin_generation_impl(
       prompt,
+      c_string_length(prompt),
       temp,
       top_k,
       top_p,
@@ -55,6 +56,38 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_generate(
   return 0;
 }
 
+EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_begin_generation_bytes(
+    const char * prompt,
+    int32_t prompt_length,
+    float temp,
+    int32_t top_k,
+    float top_p,
+    float repeat_penalty,
+    const char * grammar,
+    uint32_t seed,
+    float min_p,
+    float presence_penalty,
+    int32_t thinking_budget_tokens,
+    const char * thinking_start_tag,
+    const char * thinking_end_tag,
+    const char * thinking_forced_message) {
+  return begin_generation_impl(
+      prompt,
+      prompt_length,
+      temp,
+      top_k,
+      top_p,
+      repeat_penalty,
+      grammar,
+      seed,
+      min_p,
+      presence_penalty,
+      thinking_budget_tokens,
+      thinking_start_tag,
+      thinking_end_tag,
+      thinking_forced_message);
+}
+
 EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_begin_generation(
     const char * prompt,
     float temp,
@@ -71,6 +104,7 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_begin_generation(
     const char * thinking_forced_message) {
   return begin_generation_impl(
       prompt,
+      c_string_length(prompt),
       temp,
       top_k,
       top_p,

@@ -47,6 +47,29 @@ void clear_error() {
   g_last_error.clear();
 }
 
+// The *_bytes exports take text as UTF-8 bytes and a length, because a C
+// string ends at the first U+0000. The older C-string exports pass strlen.
+bool text_from_bytes(
+    const char * bytes,
+    const int32_t length,
+    const char * label,
+    std::string & out) {
+  if (bytes == nullptr) {
+    set_error(std::string(label) + " is null");
+    return false;
+  }
+  if (length < 0) {
+    set_error(std::string(label) + " length is negative");
+    return false;
+  }
+  out.assign(bytes, static_cast<size_t>(length));
+  return true;
+}
+
+int32_t c_string_length(const char * text) {
+  return text == nullptr ? 0 : static_cast<int32_t>(std::strlen(text));
+}
+
 // llama.cpp's state file functions catch the exception llama_file throws when
 // the open or a read fails, but exception catching is compiled out of llama.cpp
 // here, so that throw would abort the core. Open the file the same way first.

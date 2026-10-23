@@ -2,24 +2,32 @@
 // Part of llama_webgpu_core.cpp, included inside its extern "C" block;
 // not a standalone translation unit.
 
-EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_tokenize_to_json(
+EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_tokenize_bytes_to_json(
     const char * text,
+    int32_t text_length,
     int32_t add_special) {
   clear_error();
   g_last_tokens_json = "[]";
 
-  if (text == nullptr) {
-    set_error("Text is null");
+  std::string input;
+  if (!text_from_bytes(text, text_length, "Text", input)) {
     return -1;
   }
 
   std::vector<llama_token> tokens;
-  if (!tokenize_text(text, add_special != 0, tokens)) {
+  if (!tokenize_text(input, add_special != 0, tokens)) {
     return -2;
   }
 
   g_last_tokens_json = serialize_tokens_json(tokens);
   return static_cast<int32_t>(tokens.size());
+}
+
+EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_tokenize_to_json(
+    const char * text,
+    int32_t add_special) {
+  return llamadart_webgpu_tokenize_bytes_to_json(
+      text, c_string_length(text), add_special);
 }
 
 EMSCRIPTEN_KEEPALIVE const char * llamadart_webgpu_last_tokens_json() {
@@ -217,8 +225,9 @@ EMSCRIPTEN_KEEPALIVE const char * llamadart_webgpu_last_detokenized_bytes_json()
   return g_last_detokenized_bytes_json.c_str();
 }
 
-EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_embed_to_json(
+EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_embed_bytes_to_json(
     const char * text,
+    int32_t text_length,
     int32_t normalize) {
   clear_error();
   g_last_embedding_json = "[]";
@@ -236,8 +245,8 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_embed_to_json(
   // native export runs. A fresh string request owns a fresh abort state too.
   g_cancel_requested = false;
 
-  if (text == nullptr) {
-    set_error("Text is null");
+  std::string input;
+  if (!text_from_bytes(text, text_length, "Text", input)) {
     return -2;
   }
 
@@ -250,7 +259,7 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_embed_to_json(
   const bool use_encoder_path = has_encoder && !has_decoder;
 
   std::vector<llama_token> tokens;
-  if (!tokenize_text(std::string(text), true, tokens)) {
+  if (!tokenize_text(input, true, tokens)) {
     return -4;
   }
 
@@ -359,6 +368,13 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_embed_to_json(
   return rc;
 }
 
+EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_embed_to_json(
+    const char * text,
+    int32_t normalize) {
+  return llamadart_webgpu_embed_bytes_to_json(
+      text, c_string_length(text), normalize);
+}
+
 EMSCRIPTEN_KEEPALIVE const char * llamadart_webgpu_last_embedding_json() {
   return g_last_embedding_json.c_str();
 }
@@ -366,8 +382,9 @@ EMSCRIPTEN_KEEPALIVE const char * llamadart_webgpu_last_embedding_json() {
 // Scores the position after prompt with a softmax over the raw logits, like
 // llama-server n_probs; sampling settings do not apply. -3 means a candidate
 // or top_k is outside the vocabulary.
-EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_score_next_token_to_json(
+EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_score_next_token_bytes_to_json(
     const char * prompt,
+    int32_t prompt_length,
     const char * candidates_json,
     int32_t top_k,
     int32_t reuse_prompt_prefix) {
@@ -383,8 +400,8 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_score_next_token_to_json(
     return -10;
   }
 
-  if (prompt == nullptr) {
-    set_error("Prompt is null");
+  std::string prompt_text;
+  if (!text_from_bytes(prompt, prompt_length, "Prompt", prompt_text)) {
     return -2;
   }
 
@@ -424,7 +441,7 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_score_next_token_to_json(
   }
 
   std::vector<llama_token> prompt_tokens;
-  if (!tokenize_text(std::string(prompt), true, prompt_tokens)) {
+  if (!tokenize_text(prompt_text, true, prompt_tokens)) {
     return -6;
   }
   if (prompt_tokens.empty()) {
@@ -478,6 +495,15 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_score_next_token_to_json(
           scored_top,
           static_cast<int32_t>(prompt_tokens.size()));
   return 0;
+}
+
+EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_score_next_token_to_json(
+    const char * prompt,
+    const char * candidates_json,
+    int32_t top_k,
+    int32_t reuse_prompt_prefix) {
+  return llamadart_webgpu_score_next_token_bytes_to_json(
+      prompt, c_string_length(prompt), candidates_json, top_k, reuse_prompt_prefix);
 }
 
 EMSCRIPTEN_KEEPALIVE const char * llamadart_webgpu_last_next_token_scores_json() {
