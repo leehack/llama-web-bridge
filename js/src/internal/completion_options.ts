@@ -75,12 +75,20 @@ function optionalNumber(value: unknown, name: string, isValid: (value: number) =
   return value;
 }
 
+// The core reads these options as C strings, which end at the first U+0000.
+function withoutNul(value: string, name: string): string {
+  if (value.includes('\0')) {
+    throw new TypeError(`CompletionOptions.${name} contains U+0000, which the core cannot read.`);
+  }
+  return value;
+}
+
 function tag(budget: Record<string, unknown>, name: 'startTag' | 'endTag'): string {
   const value = budget[name];
   if (typeof value !== 'string' || value.trim().length === 0) {
     throw new TypeError(`CompletionOptions.thinkingBudget.${name} must be a non-empty string.`);
   }
-  return value;
+  return withoutNul(value, `thinkingBudget.${name}`);
 }
 
 function thinkingBudget(value: unknown, hasMediaParts: boolean): Required<ThinkingBudgetOptions> | null {
@@ -104,6 +112,7 @@ function thinkingBudget(value: unknown, hasMediaParts: boolean): Required<Thinki
   if (typeof forcedMessage !== 'string') {
     throw new TypeError('CompletionOptions.thinkingBudget.forcedMessage must be a string.');
   }
+  withoutNul(forcedMessage, 'thinkingBudget.forcedMessage');
   if (hasMediaParts) {
     throw new Error('CompletionOptions.thinkingBudget supports text-only prompts; remove the media parts.');
   }
@@ -282,8 +291,9 @@ function speculativeDecoding(
 /**
  * Resolves `minP`, `presencePenalty`, `thinkingBudget` and `speculativeDecoding`. Throws a RangeError
  * or TypeError for an invalid value, including a number that is not finite as
- * the core's 32-bit float, and an Error for a thinking budget with media parts
- * or a speculative configuration native llamadart rejects.
+ * the core's 32-bit float and a grammar or thinking tag holding U+0000, and an
+ * Error for a thinking budget with media parts or a speculative configuration
+ * native llamadart rejects.
  */
 export function resolveCompletionSamplingOptions(
   options: {
@@ -296,6 +306,9 @@ export function resolveCompletionSamplingOptions(
   } | null | undefined,
 ): CompletionSamplingOptions {
   const hasMediaParts = Array.isArray(options?.parts) && options.parts.length > 0;
+  if (typeof options?.grammar === 'string') {
+    withoutNul(options.grammar, 'grammar');
+  }
   const budget = thinkingBudget(options?.thinkingBudget, hasMediaParts);
   return {
     minP: optionalNumber(options?.minP, 'minP', (value) => value >= 0 && value <= 1, ' from 0 to 1') ?? 0,

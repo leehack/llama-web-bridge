@@ -52,7 +52,7 @@ function directBridge({ capabilities = CAPABILITIES, usage = null, setterRc = 0 
       if (setterRc !== 0) core.lastError = 'Unknown speculative decoding strategy: x';
       return setterRc;
     }
-    if (name === 'llamadart_webgpu_begin_generation') {
+    if (name === 'llamadart_webgpu_begin_generation_bytes') {
       calls.push({ name, files: [...core.files()] });
     }
     if (name === 'llamadart_webgpu_last_generation_usage_json' && usage) {
@@ -174,7 +174,7 @@ const CASES = [
     assert.equal(text, 'ab');
     assert.deepEqual(calls.map(({ name }) => name), [
       'llamadart_webgpu_set_next_speculative',
-      'llamadart_webgpu_begin_generation',
+      'llamadart_webgpu_begin_generation_bytes',
     ]);
 
     const [setter, begin] = calls;
@@ -228,7 +228,7 @@ const CASES = [
     const { bridge, calls } = directBridge();
     let usage = null;
     await bridge.createCompletion('hello', { onUsage: (value) => { usage = value; } });
-    assert.deepEqual(calls.map(({ name }) => name), ['llamadart_webgpu_begin_generation']);
+    assert.deepEqual(calls.map(({ name }) => name), ['llamadart_webgpu_begin_generation_bytes']);
     assert.equal('speculative' in usage, false);
   }],
 

@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Keep the text after U+0000 in `tokenize`, string `embed`/`embedBatch` inputs and
+  `scoreNextToken`/`createCompletion` prompts instead of dropping it; a grammar or
+  thinking-budget tag holding U+0000 now rejects.
 - Fail the wasm64 build when `llama_webgpu_core_mem64.wasm` is not memory64, instead of
   shipping a wasm32 core whose patched `FS.read` and `FS.write` throw on BigInt arguments.
 - In worker mode, reload the model before `getDecisionCapabilities` and `runDecision`
