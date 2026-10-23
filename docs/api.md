@@ -460,7 +460,23 @@ tokenize(text: string, addSpecial = true): Promise<number[]>
 ```
 
 Tokenizes text with the loaded model. `addSpecial` controls whether llama.cpp
-adds model-specific special tokens.
+adds model-specific special tokens. Text after U+0000 is kept; see
+[Text with U+0000](#text-with-u0000).
+
+### Text with U+0000
+
+`tokenize`, string inputs to `embed` and `embedBatch`, and the `scoreNextToken`
+and `createCompletion` prompts keep the text after U+0000: the bridge passes the
+core UTF-8 bytes and their length, not a C string. A lone surrogate becomes
+U+FFFD.
+
+- A `grammar` or `thinkingBudget` tag or `forcedMessage` holding U+0000 rejects
+  with a `TypeError`, because llama.cpp reads them as C strings.
+- `synthesizeSpeech` text and decision head labels still end at the first
+  U+0000.
+- Cores built before this behavior lack `llamadart_webgpu_tokenize_bytes_to_json`
+  and the other `*_bytes` text exports. With them the bridge keeps the C-string
+  call for text without U+0000 and rejects text that holds one.
 
 ### `detokenize(tokens, special?)`
 

@@ -268,6 +268,7 @@ common_reasoning_budget_state reasoning_budget_initial_state(
 
 int32_t begin_generation_impl(
     const char * prompt,
+    const int32_t prompt_length,
     float temp,
     int32_t top_k,
     float top_p,
@@ -308,8 +309,8 @@ int32_t begin_generation_impl(
     return -6;
   }
 
-  if (prompt == nullptr) {
-    set_error("Prompt is null");
+  std::string prompt_text;
+  if (!text_from_bytes(prompt, prompt_length, "Prompt", prompt_text)) {
     return -2;
   }
 
@@ -389,7 +390,6 @@ int32_t begin_generation_impl(
       !mtmd_support_vision(g_state.mm_ctx) &&
       !g_pending_media.empty();
 
-  const std::string prompt_text = prompt;
   llama_sampler_ptr reasoning_budget_sampler;
   std::vector<llama_token> penalty_prompt_tokens;
   if (!g_pending_media.empty()) {

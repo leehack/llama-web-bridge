@@ -10,10 +10,11 @@ import { repoRoot } from './bridge_js_source.mjs';
 // the bridge algorithm. Its output is inspected only when llama_process runs.
 // add_embd copies each row, and encode reuses the same buffer, as upstream does.
 const contextExports = readFileSync(path.join(repoRoot, 'src/core/exports_context.inc'), 'utf8');
-const legacyEmbed = contextExports.slice(contextExports.indexOf('EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_embed_to_json('),
+const legacyEmbed = contextExports.slice(contextExports.indexOf('EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_embed_bytes_to_json('),
   contextExports.indexOf('EMSCRIPTEN_KEEPALIVE const char * llamadart_webgpu_last_embedding_json()'));
 const source = String.raw`
 #include <cassert>
+#include <cstring>
 #include <cstdint>
 #include <vector>
 #include <string>
@@ -137,7 +138,10 @@ namespace llamadart_webgpu_detail { std::string serialize_embedding_json(const s
 #include "src/core/exports_embedding.inc"
 int llama_model_n_embd(llama_model * m) { return m->out; }
 void set_error(const char *) {}
-bool tokenize_text(const std::string &,bool,std::vector<int> & out) { out={7,8}; return true; }
+static std::string tokenized;
+bool tokenize_text(const std::string & text,bool,std::vector<int> & out) { tokenized=text; out={7,8}; return true; }
+bool text_from_bytes(const char * bytes,int32_t length,const char *,std::string & out) { if(!bytes || length<0) return false; out.assign(bytes,length); return true; }
+int32_t c_string_length(const char * text) { return text ? static_cast<int32_t>(std::strlen(text)) : 0; }
 float * llama_get_embeddings_ith(llama_context *,int) { return pooled; }
 float * llama_get_embeddings(llama_context *) { return pooled; }
 ${legacyEmbed}
@@ -146,8 +150,10 @@ int main() {
   int checks=0;
   g_state={&c,&m,&p};
   g_cancel_requested=true; // prior request cancelled in JS staging
-  assert(llamadart_webgpu_embed_to_json("fresh",0)==3 && !g_cancel_requested);
-  ++checks;
+  assert(llamadart_webgpu_embed_to_json("fresh",0)==3 && !g_cancel_requested && tokenized=="fresh");
+  assert(llamadart_webgpu_embed_bytes_to_json("a\0b",3,0)==3 && tokenized==std::string("a\0b",3));
+  assert(llamadart_webgpu_embed_bytes_to_json("a",-1,0)==-2);
+  checks+=3;
   const auto run=[&](int expected,bool media=true) {
     encoded=processed=0; out.clear();
     assert(embed_parts(&c,&m,&p,"x",media?std::vector<const mtmd_bitmap *>{&image,&audio}:std::vector<const mtmd_bitmap *>{},out)==expected);
@@ -214,7 +220,7 @@ test('mixed native batch guards, copied media, output width, one process and cle
     execFileSync(process.env.CXX || 'c++', ['-std=c++17', '-I', dir, '-I', repoRoot,
       path.join(dir, 'test.cpp'), '-o', path.join(dir, 'test')]);
     const output = execFileSync(path.join(dir, 'test'), { encoding: 'utf8' });
-    assert.match(output, /59 native cases passed/);
+    assert.match(output, /61 native cases passed/);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

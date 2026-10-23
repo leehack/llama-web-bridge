@@ -6,6 +6,9 @@
   native llamadart does, unless a `grammar` or media `parts` are set. Output for the same
   seed changes whenever `penalty` is not 1, including the default 1.1, or `presencePenalty`
   is not 0.
+- Keep the text after U+0000 in `tokenize`, string `embed`/`embedBatch` inputs and
+  `scoreNextToken`/`createCompletion` prompts instead of dropping it; a grammar or
+  thinking-budget tag holding U+0000 now rejects.
 - Fail the wasm64 build when `llama_webgpu_core_mem64.wasm` is not memory64, instead of
   shipping a wasm32 core whose patched `FS.read` and `FS.write` throw on BigInt arguments.
 - In worker mode, reload the model before `getDecisionCapabilities` and `runDecision`

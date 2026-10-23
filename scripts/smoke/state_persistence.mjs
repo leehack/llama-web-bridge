@@ -39,7 +39,9 @@ failures in Chromium. When a tiny GGUF model is supplied, the same harness also
 loads the model in both direct and worker runtimes, verifies finite embeddings,
 evaluates a prompt, saves a state snapshot as bytes, mutates the context, reloads
 the snapshot, verifies restored token metadata, and checks that truncated and
-corrupt snapshots reject without changing the restored state. CI supplies an
+corrupt snapshots reject without changing the restored state. It also checks
+that tokenize, embed, scoreNextToken and completion prompts keep the text after
+U+0000. CI supplies an
 integrity-pinned tiny model so core API regressions are caught without large
 downloads.`;
 
@@ -422,6 +424,31 @@ export function renderHarness(modelFilename, memoryMode = 'wasm32') {
       assert(bridge._workerProxy === workerBeforeReload, \`\${mode} model reload replaced the runtime\`);
       const reloadedTokens = await bridge.tokenize(prompt, true);
       assert(arraysEqual(reloadedTokens, tokens), \`\${mode} tokenization changed after model reload\`);
+
+      // Text after U+0000 reaches the core, not just the C string before it.
+      const nulText = 'ab\\u0000cd';
+      const nulTokens = await bridge.tokenize(nulText, false);
+      const nulPrefixTokens = await bridge.tokenize('ab', false);
+      assert(nulTokens.length > nulPrefixTokens.length,
+        \`\${mode} tokenize dropped the text after U+0000: \${JSON.stringify(nulTokens)}\`);
+      const nulPromptTokens = await bridge.tokenize(nulText, true);
+      assert(!arraysEqual(await bridge.embed(nulText), await bridge.embed('ab')),
+        \`\${mode} embed dropped the text after U+0000\`);
+      const nulScores = await bridge.scoreNextToken(nulText, { topK: 1 });
+      assert(nulScores.promptTokens === nulPromptTokens.length,
+        \`\${mode} scoreNextToken read \${nulScores.promptTokens} of \${nulPromptTokens.length} prompt tokens\`);
+      const nulUsages = [];
+      await bridge.createCompletion(nulText, {
+        nPredict: 1,
+        temp: 0,
+        topK: 1,
+        topP: 1,
+        seed: 1,
+        tokenEventEncoding: 'text',
+        onUsage: (usage) => nulUsages.push(usage),
+      });
+      assert(nulUsages[0]?.promptTokens === nulPromptTokens.length,
+        \`\${mode} completion read \${nulUsages[0]?.promptTokens} of \${nulPromptTokens.length} prompt tokens\`);
 
       const workerSaveSnapshotReturned = mode === 'worker runtime'
         ? snapshot instanceof Uint8Array && snapshot.byteLength > 0

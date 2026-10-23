@@ -578,7 +578,8 @@ const firstErrorLine = (payload) => {
 };
 
 // Words as tokens after a BOS token, like a tokenizer that adds special tokens.
-const fakeTokenize = (text) => [1, ...text.split(/\s+/).filter(Boolean).map((word) => 100 + word.length)];
+// U+0000 separates words too.
+const fakeTokenize = (text) => [1, ...text.split(/[\s\0]+/).filter(Boolean).map((word) => 100 + word.length)];
 
 // A state snapshot in llama_state_save_file's layout: magic, version, token
 // count and tokens, then the state, which opens with the architecture name.
@@ -613,8 +614,9 @@ const decodeSnapshot = (bytes, capacity) => {
 // A fake bridge for the state harness. The KV cache keeps the prompt and the
 // generated token, a repeated prompt keeps all but its last token, and an abort
 // during generation resolves in the direct runtime and rejects in the worker.
-// `tweak.usage(context)` returns the usages to report for one completion, and
-// `tweak.corruptSnapshot` changes how a corrupt snapshot is handled.
+// `tweak.usage(context)` returns the usages to report for one completion,
+// `tweak.corruptSnapshot` changes how a corrupt snapshot is handled, and
+// `tweak.cString` names a method that drops its text after U+0000.
 const stateBridge = (tweak = {}) => class FakeStateBridge {
   constructor({ disableWorker, preferMemory64 }) {
     this.mode = disableWorker ? 'direct runtime' : 'worker runtime';
@@ -655,9 +657,18 @@ const stateBridge = (tweak = {}) => class FakeStateBridge {
     if (!this.loaded) throw new Error('No model loaded');
   }
 
-  async tokenize(text) { this.requireModel(); return fakeTokenize(text); }
+  input(method, text) {
+    return tweak.cString === method ? text.split('\0')[0] : text;
+  }
 
-  async embed(text) { this.requireModel(); return [text.length, 0.5, -0.25]; }
+  async tokenize(text) { this.requireModel(); return fakeTokenize(this.input('tokenize', text)); }
+
+  async embed(text) { this.requireModel(); return [this.input('embed', text).length, 0.5, -0.25]; }
+
+  async scoreNextToken(prompt) {
+    this.requireModel();
+    return { candidates: [], top: [], promptTokens: fakeTokenize(this.input('scoreNextToken', prompt)).length };
+  }
 
   async embedBatch(texts) { return Promise.all(texts.map((text) => this.embed(text))); }
 
@@ -702,7 +713,7 @@ const stateBridge = (tweak = {}) => class FakeStateBridge {
 
   async createCompletion(prompt, options) {
     this.requireModel();
-    const tokens = fakeTokenize(prompt);
+    const tokens = fakeTokenize(this.input('createCompletion', prompt));
     let cached = 0;
     while (cached < tokens.length - 1 && this.cache[cached] === tokens[cached]) cached += 1;
     let completionTokens = 0;
@@ -761,6 +772,14 @@ const stateBridge = (tweak = {}) => class FakeStateBridge {
     /direct runtime stateLoadBytes of a snapshot with a wrong magic did not reject cleanly: .*rejected by llama\.cpp/);
   assert.match(firstErrorLine(await runHarnessPage(page, stateBridge({ corruptSnapshot: 'keep-without-copy' }))),
     /direct runtime stateLoadBytes of a truncated snapshot without allocations 1 did not reject cleanly: .*The current context state was kept/);
+  for (const [method, message] of [
+    ['tokenize', /direct runtime tokenize dropped the text after U\+0000: \[1,102\]/],
+    ['embed', /direct runtime embed dropped the text after U\+0000/],
+    ['scoreNextToken', /direct runtime scoreNextToken read 2 of 3 prompt tokens/],
+    ['createCompletion', /direct runtime completion read 2 of 3 prompt tokens/],
+  ]) {
+    assert.match(firstErrorLine(await runHarnessPage(page, stateBridge({ cString: method }))), message);
+  }
   assert.match(firstErrorLine(await runHarnessPage(page, stateBridge({ corruptSnapshot: 'clear' }))),
     /direct runtime stateLoadBytes of a 1-byte prefix of a 61-byte snapshot changed the context state/);
   stateSmoke.checkPayload(passed, true);

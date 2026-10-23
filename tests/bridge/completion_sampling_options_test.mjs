@@ -59,14 +59,14 @@ function coreCapabilityJson() {
   });
 }
 
-// A direct bridge whose stub core records begin_generation's arguments and,
+// A direct bridge whose stub core records begin_generation_bytes' arguments and,
 // when capabilityJson is given, exports the completion capability probe.
 function directBridge(capabilityJson) {
   const { bridge, core } = createDirectBridge({ hello: ['a'] });
   const begins = [];
   const ccall = core.ccall.bind(core);
   core.ccall = (name, returnType, argTypes, args) => {
-    if (name === 'llamadart_webgpu_begin_generation') {
+    if (name === 'llamadart_webgpu_begin_generation_bytes') {
       begins.push({ argTypes, args });
     }
     if (name === 'llamadart_webgpu_completion_capabilities_json') {
@@ -123,7 +123,7 @@ const CASES = [
       'a',
     );
 
-    const names = nativeParameterNames('llamadart_webgpu_begin_generation');
+    const names = nativeParameterNames('llamadart_webgpu_begin_generation_bytes');
     assert.deepEqual(names.slice(-6), ['min_p', 'presence_penalty', ...BUDGET_PARAMETERS]);
     const [{ argTypes, args }] = begins;
     assert.equal(argTypes.length, names.length);
@@ -133,6 +133,9 @@ const CASES = [
     assert.equal(arg('min_p'), 0.05);
     assert.equal(arg('presence_penalty'), -1.5);
     assert.equal(arg('seed'), 3);
+    assert.deepEqual([type('prompt'), type('prompt_length')], ['array', 'number']);
+    assert.deepEqual([...arg('prompt')], [...new TextEncoder().encode('hello')]);
+    assert.equal(arg('prompt_length'), 5);
     assert.deepEqual(BUDGET_PARAMETERS.map(arg), [8, '<think>', '</think>', 'Done.']);
     assert.deepEqual(
       ['min_p', 'presence_penalty', ...BUDGET_PARAMETERS].map(type),
