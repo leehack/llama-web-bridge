@@ -198,8 +198,9 @@ export interface CompletionOptions {
   topP?: number;
   /** Min-P threshold from 0 to 1, applied after top-p; 0, the default, disables it. A value outside that range rejects. */
   minP?: number;
+  /** Repetition penalty over the last 64 tokens of the prompt and this completion; the prompt counts only for a text prompt without a grammar. Defaults to 1.1; 1 disables it. */
   penalty?: number;
-  /** Subtracted once from the logit of each token among this completion's last 64 tokens; prompt tokens do not count. 0, the default, disables it. A value that is not finite as a 32-bit float rejects. */
+  /** Subtracted once from the logit of each token in the same 64-token window as `penalty`. 0, the default, disables it. A value that is not finite as a 32-bit float rejects. */
   presencePenalty?: number;
   grammar?: string;
   seed?: number;

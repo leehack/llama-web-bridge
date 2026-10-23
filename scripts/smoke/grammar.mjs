@@ -56,6 +56,13 @@ and the same seeded sample repeats exactly afterwards.
 \`\`getCompletionCapabilities\`\` reports no option before a model load and
 every option after it.
 
+As native llamadart does, the penalties count the prompt's last 64 tokens
+unless a grammar is set. The smoke extends the sampler prompt with its most
+probable next token until that token is among the prompt's last 64 tokens.
+A greedy token under a presence penalty far above any logit gap must then be
+the most probable token outside them; with a grammar that accepts any text,
+it stays the most probable token.
+
 Last, it checks \`\`thinkingBudget\`\` with greedy decoding and a prompt that
 leaves a reasoning block open. With \`\`maxTokens: 8\`\` the output is the
 unbudgeted 8-token output, then the forced end tag. With \`\`maxTokens: 0\`\` it
@@ -143,6 +150,19 @@ export const SAMPLER_RUNS = Object.freeze([
   ['min-p-one', { ...SAMPLED, minP: 1 }],
   ['greedy-presence', { ...GREEDY, presencePenalty: 20 }],
 ]);
+// The penalty window, a topK above it so some scored token lies outside it, a
+// presence penalty larger than any logit gap among those tokens, and the least
+// logprob gap a compared pick needs over the next token: CPU logits of a
+// re-decoded position drift by up to 1e-3 (next_token_scores.mjs).
+export const PROMPT_PENALTY = Object.freeze({
+  window: 64,
+  topK: 80,
+  maxSteps: 32,
+  minGap: 0.005,
+  presencePenalty: 1000,
+  options: { ...GREEDY, nPredict: 1 },
+  grammar: String.raw`root ::= [^\x00]*`,
+});
 const INVALID_SAMPLER_OPTIONS = Object.freeze([
   { minP: 1.5 },
   { minP: -0.1 },
@@ -206,6 +226,7 @@ export function renderHarness(nCtx, memoryModes) {
     samplerPrompt: SAMPLER_PROMPT,
     samplerRuns: SAMPLER_RUNS,
     thinkingRuns: THINKING_RUNS,
+    promptPenalty: PROMPT_PENALTY,
     invalidThinkingBudget: INVALID_THINKING_BUDGET,
     completionCapabilities: COMPLETION_CAPABILITIES,
     nCtx,
@@ -261,6 +282,47 @@ export function renderHarness(nCtx, memoryModes) {
       config.completionCapabilities.map((name) => [name, capabilities[name]]),
     );
     const modeResults = [];
+
+    // Appends the most probable next token's text, a greedy continuation,
+    // until that token is among the prompt's last tokens, then runs the
+    // greedy token under a large presence penalty with and without a grammar.
+    // A step whose picks are near ties, or whose penalized pick ends
+    // generation and so returns no text, is skipped.
+    const probePromptPenalty = async (bridge) => {
+      const probe = config.promptPenalty;
+      const text = (bytes) => new TextDecoder().decode(bytes);
+      const usable = (piece) => piece.length > 0 && !piece.includes('\uFFFD');
+      const clear = ([first, second]) => second === undefined || first.logprob - second.logprob > probe.minGap;
+      let prompt = config.samplerPrompt;
+      for (let step = 0; step < probe.maxSteps; step++) {
+        const { top } = await bridge.scoreNextToken(prompt, { topK: probe.topK });
+        const window = (await bridge.tokenize(prompt, true)).slice(-probe.window);
+        const outside = top.filter((entry) => !window.includes(entry.token));
+        const best = text(top[0].bytes);
+        const unpenalized = outside.length > 0 ? text(outside[0].bytes) : '';
+        if (window.includes(top[0].token) && clear(top) && clear(outside)
+            && usable(best) && usable(unpenalized) && best !== unpenalized) {
+          const run = (options) => bridge.createCompletion(prompt, {
+            ...probe.options,
+            ...options,
+            tokenEventEncoding: 'text',
+          });
+          const penalized = await run({ presencePenalty: probe.presencePenalty });
+          if (penalized !== '') {
+            return {
+              steps: step,
+              best,
+              unpenalized,
+              neutral: await run({}),
+              penalized,
+              grammar: await run({ presencePenalty: probe.presencePenalty, grammar: probe.grammar }),
+            };
+          }
+        }
+        prompt += best;
+      }
+      return { steps: probe.maxSteps, best: null };
+    };
 
     const runMode = async (memoryMode, runtimeMode) => {
       const mode = \`\${memoryMode} \${runtimeMode}\`;
@@ -346,6 +408,8 @@ export function renderHarness(nCtx, memoryModes) {
           tokenEventEncoding: 'text',
         });
 
+        const promptPenalty = await probePromptPenalty(bridge);
+
         const thinkingRuns = {};
         for (const [name, prompt, options] of config.thinkingRuns) {
           thinkingRuns[name] = await bridge.createCompletion(prompt, {
@@ -372,6 +436,7 @@ export function renderHarness(nCtx, memoryModes) {
           samplerRuns,
           invalidSamplerErrors,
           samplerAfterInvalid,
+          promptPenalty,
           thinkingRuns,
           invalidThinkingBudgetError,
           plainCompletionError: plainError,
@@ -479,7 +544,30 @@ export function validateSampler(entry) {
     'a seeded sample after the rejected options did not repeat the earlier one',
   );
   if (failures.length > 0) failures.push(`sampler outputs: ${pyRepr(runs)}`);
-  return [...failures, ...validateThinkingBudget(entry)];
+  return [...failures, ...validatePromptPenalty(entry), ...validateThinkingBudget(entry)];
+}
+
+export function validatePromptPenalty(entry) {
+  const probe = pyGet(entry, 'promptPenalty');
+  if (!isDict(probe) || typeof pyGet(probe, 'best') !== 'string') {
+    return [
+      `prompt penalty: no prompt within ${PROMPT_PENALTY.maxSteps} steps had its most probable token `
+        + `among its last ${PROMPT_PENALTY.window} tokens: ${pyRepr(probe)}`,
+    ];
+  }
+  const failures = [];
+  const expect = (condition, message) => {
+    if (!condition) failures.push(`prompt penalty: ${message}`);
+  };
+  const { best, unpenalized } = probe;
+  expect(probe.neutral === best, 'the greedy token is not the most probable scored token');
+  expect(
+    probe.penalized === unpenalized,
+    'the presence penalty did not count the prompt, so a prompt token stayed the greedy pick',
+  );
+  expect(probe.grammar === best, 'with a grammar the presence penalty counted the prompt, unlike native llamadart');
+  if (failures.length > 0) failures.push(`prompt penalty outputs: ${pyRepr(probe)}`);
+  return failures;
 }
 
 export function validateThinkingBudget(entry) {

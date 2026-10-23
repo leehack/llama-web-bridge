@@ -231,12 +231,13 @@ node scripts/smoke/multimodal.mjs \
 ```
 
 For sampler or grammar changes, run grammar-constrained completion, the
-seeded `minP`/`presencePenalty` checks and the greedy `thinkingBudget` checks
-through direct and worker runtimes on both memory modes. CI runs it twice: with
-the state-persistence model, then with the multimodal model. Pass each model's
-`--model-url` (or `--model-path`) and `--model-sha256` pin from the commands
-above; the smoke defaults to the `LLAMA_WEBGPU_SMOKE_MODEL_URL` and
-`LLAMA_WEBGPU_SMOKE_MODEL_SHA256` environment variables:
+seeded `minP`/`presencePenalty` checks, the prompt-penalty check and the greedy
+`thinkingBudget` checks through direct and worker runtimes on both memory modes.
+CI runs it twice: with the state-persistence model, then with the multimodal
+model. Pass each model's `--model-url` (or `--model-path`) and `--model-sha256`
+pin from the commands above; the smoke defaults to the
+`LLAMA_WEBGPU_SMOKE_MODEL_URL` and `LLAMA_WEBGPU_SMOKE_MODEL_SHA256` environment
+variables:
 
 ```bash
 node scripts/smoke/grammar.mjs \

@@ -306,6 +306,42 @@ const CASES = [
     assert.deepEqual([...order].sort((a, b) => a - b), order);
   }],
 
+  ['the penalty window starts with the prompt tokens, which no other sampler sees', async () => {
+    const body = functionBody('llama_sampler * create_sampler(');
+    assert.match(
+      body,
+      /llama_sampler \* penalties = llama_sampler_init_penalties\(\s*vocab_size, 64, repeat_penalty, 0\.0f, presence_penalty\);\s*for \(const llama_token token : penalty_prompt_tokens\) \{\s*llama_sampler_accept\(penalties, token\);\s*\}\s*llama_sampler_chain_add\(sampler, penalties\);/,
+    );
+    assert.equal(body.match(/llama_sampler_accept\(/g).length, 1, 'only the penalties sampler accepts prompt tokens');
+  }],
+
+  ['a text prompt seeds the penalties whole unless a grammar is set; a media prompt seeds nothing', async () => {
+    const body = functionBody('int32_t begin_generation_impl(');
+    const at = (text, from = 0) => {
+      const index = body.indexOf(text, from);
+      assert.ok(index >= 0, `begin_generation_impl must contain ${text}`);
+      return index;
+    };
+    const media = at('if (!g_pending_media.empty()) {\n    llama_memory_clear(');
+    const speculative = at('} else if (speculative.active) {', media);
+    const text = at('} else {\n    std::vector<llama_token> prompt_tokens;', speculative);
+    const grammarGate = at('if (grammar_sampler) {\n    penalty_prompt_tokens.clear();\n  }', text);
+    const create = at('g_active_sampler = create_sampler(', grammarGate);
+    const seed = 'penalty_prompt_tokens = std::move(prompt_tokens);';
+
+    assert.ok(!body.slice(media, speculative).includes('penalty_prompt_tokens'), 'a media prompt seeds nothing');
+    const speculativeSeed = at(seed, speculative);
+    assert.ok(speculativeSeed > at('evaluate_speculative_prompt(prompt_tokens)', speculative) && speculativeSeed < text);
+    const textSeed = at(seed, text);
+    assert.ok(textSeed > at('reasoning_budget_initial_state(reasoning_budget, prompt_tokens)', text));
+    assert.ok(textSeed < grammarGate);
+    assert.ok(at('evaluate_prompt_tokens(prompt_tokens, true, &reused_tokens)', text) < textSeed,
+      'the cached prefix is part of the seeded prompt');
+    assert.match(body.slice(create), /^g_active_sampler = create_sampler\([^;]*reasoning_budget_sampler\.release\(\),\s*penalty_prompt_tokens\);/);
+    assert.ok(at('g_active_grammar = grammar_sampler.release();') > create, 'the grammar gate sees the grammar');
+    assert.equal(body.match(/penalty_prompt_tokens/g).length, 5);
+  }],
+
   ['the native core rejects invalid values before it changes generation state', async () => {
     const body = functionBody('int32_t begin_generation_impl(');
     const checks = [

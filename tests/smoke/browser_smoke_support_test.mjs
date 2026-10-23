@@ -297,6 +297,7 @@ assert.deepEqual(webGpuLaunchArgs('linux'), [
     'closed-budget-zero': 'c',
   });
   assert.deepEqual(Object.keys(thinkingRuns()), grammarSmoke.THINKING_RUNS.map(([name]) => name));
+  const promptPenalty = () => ({ steps: 2, best: 'a', unpenalized: 'b', neutral: 'a', penalized: 'b', grammar: 'a' });
   const capabilities = (supported) => Object.fromEntries(
     grammarSmoke.COMPLETION_CAPABILITIES.map((name) => [name, supported]),
   );
@@ -313,6 +314,7 @@ assert.deepEqual(webGpuLaunchArgs('linux'), [
         'RangeError: CompletionOptions.presencePenalty must be a finite number; got Infinity.',
       ],
       samplerAfterInvalid: 's',
+      promptPenalty: promptPenalty(),
       thinkingRuns: thinkingRuns(),
       invalidThinkingBudgetError: 'RangeError: CompletionOptions.thinkingBudget.maxTokens must be an integer from 0 to 2147483647; got -1.',
       plainCompletionError: null,
@@ -353,8 +355,36 @@ assert.deepEqual(webGpuLaunchArgs('linux'), [
       ["wasm32 worker: expected worker execution, got 'main-thread' (worker fallback reason: 'why')"]],
     [mutate(grammarPayload(), (p) => { p.globalWorkerFallbackReason = 'gone'; }), both, ["worker fell back to the main thread: 'gone'"]],
     ...samplerCases(),
+    ...promptPenaltyCases(),
     ...thinkingCases(),
   ];
+  function promptPenaltyCases() {
+    const probeCase = (change, messages) => {
+      const probe = { ...promptPenalty(), ...change };
+      return [
+        mutate(grammarPayload(), (p) => { p.modeResults[0].promptPenalty = probe; }),
+        both,
+        [
+          ...messages.map((message) => `wasm32 direct: prompt penalty: ${message}`),
+          `wasm32 direct: prompt penalty outputs: {${
+            Object.entries(probe).map(([name, value]) => `'${name}': ${typeof value === 'string' ? `'${value}'` : value}`).join(', ')
+          }}`,
+        ],
+      ];
+    };
+    return [
+      probeCase({ neutral: 'c' }, ['the greedy token is not the most probable scored token']),
+      probeCase({ penalized: 'a' }, ['the presence penalty did not count the prompt, so a prompt token stayed the greedy pick']),
+      probeCase({ grammar: 'b' }, ['with a grammar the presence penalty counted the prompt, unlike native llamadart']),
+      [mutate(grammarPayload(), (p) => { p.modeResults[1].promptPenalty = { steps: 32, best: null }; }), both, [
+        'wasm32 worker: prompt penalty: no prompt within 32 steps had its most probable token among its last 64 tokens: '
+          + "{'steps': 32, 'best': None}",
+      ]],
+      [mutate(grammarPayload(), (p) => { delete p.modeResults[2].promptPenalty; }), both, [
+        'wasm64 direct: prompt penalty: no prompt within 32 steps had its most probable token among its last 64 tokens: None',
+      ]],
+    ];
+  }
   function thinkingCases() {
     const outputs = (runs) => `wasm32 direct: thinking-budget outputs: {${
       Object.entries(runs).map(([name, text]) => `'${name}': '${text}'`).join(', ')
