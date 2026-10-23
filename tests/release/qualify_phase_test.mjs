@@ -170,7 +170,7 @@ test('a text-to-speech phase records the measured waveform and WAV identity', ()
   assert.equal(measured.peak, 1);
   const phase = ttsPhase({
     modeResults: [
-      ttsModeResult('generated.wav', { runtimeMode: 'worker', peak: 1, rms: measured.rms, totalElapsedMs: 7, reuseSampleCount: 1920 }),
+      ttsModeResult('generated.wav', { runtimeMode: 'worker', execution: 'worker', peak: 1, rms: measured.rms, totalElapsedMs: 7, reuseSampleCount: 1920 }),
       ttsModeResult('generated.wav', { peak: new PyFloat(1), rms: measured.rms, totalElapsedMs: 5, framesGenerated: 17 }),
     ],
   }, 42, artifacts);
@@ -282,4 +282,29 @@ test('a mode that ran on another core than it requested is rejected', () => {
     rejects(() => ttsPhase({ modeResults: [ttsModeResult('generated.wav', overrides)] }, 1, artifacts), message);
   }
   ttsPhase({ modeResults: [ttsModeResult('generated.wav', good)] }, 1, artifacts);
+});
+
+// The bridge moves a worker run onto the main thread when the worker is
+// unusable, so a mode is evidence only for where it actually executed.
+test('a mode that executed elsewhere than its runtime mode requires is rejected', () => {
+  const speechCases = [
+    [speechModeResult('wasm64', 'worker', { execution: 'main-thread' }), "speech wasm64/worker executed on 'main-thread', not 'worker'"],
+    [speechModeResult('wasm32', 'worker', { execution: undefined }), "speech wasm32/worker executed on None, not 'worker'"],
+    [speechModeResult('wasm32', 'direct', { execution: 'worker' }), "speech wasm32/direct executed on 'worker', not 'main-thread'"],
+    [speechModeResult('wasm32', 'other', { execution: 'main-thread' }), "speech wasm32/other executed on 'main-thread', not None"],
+  ];
+  for (const [entry, message] of speechCases) rejects(() => speechPhase({ modeResults: [entry] }, 1), message);
+  const artifacts = ttsArtifacts();
+  const measured = readWavIdentity(path.join(artifacts, 'generated.wav'));
+  const good = { peak: measured.peak, rms: measured.rms };
+  const ttsCases = [
+    [{ ...good, runtimeMode: 'worker', execution: 'main-thread' }, "text-to-speech wasm64/worker executed on 'main-thread', not 'worker'"],
+    [{ ...good, runtimeMode: 'worker', execution: null }, "text-to-speech wasm64/worker executed on None, not 'worker'"],
+    [{ ...good, execution: 'worker' }, "text-to-speech wasm64/direct executed on 'worker', not 'main-thread'"],
+  ];
+  for (const [overrides, message] of ttsCases) {
+    rejects(() => ttsPhase({ modeResults: [ttsModeResult('generated.wav', overrides)] }, 1, artifacts), message);
+  }
+  speechPhase({ modeResults: [speechModeResult('wasm32', 'worker'), speechModeResult('wasm32', 'direct')] }, 1);
+  ttsPhase({ modeResults: [ttsModeResult('generated.wav', { ...good, runtimeMode: 'worker', execution: 'worker' })] }, 1, artifacts);
 });

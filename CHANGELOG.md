@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Fail qualification when a requested worker ASR or TTS mode fell back to the main
+  thread instead of recording it as a worker run.
 - `penalty` and `presencePenalty` count the prompt's last tokens in their 64-token window, as
   native llamadart does, unless a `grammar` (even an empty one) or media `parts` are set.
   Output for the same seed changes whenever `penalty` is not 1, including the default 1.1,
