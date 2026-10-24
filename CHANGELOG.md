@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Drop the unused reads of `__llamadartFetchBackendLastError` and `__llamadartFetchBackendStats`;
+  the stock `-lwasmfs_fetch.js` never sets them, so the `model_fetch_js_error` and
+  `model_fetch_stats` runtime notes were never emitted.
 - On a model cache miss, `loadModelFromUrl` and `loadDraftModel` report progress as the model
   downloads instead of only after the whole file is in Cache Storage, and a cancelled or failed
   load no longer leaves the model cached.

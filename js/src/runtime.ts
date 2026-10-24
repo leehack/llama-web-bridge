@@ -176,18 +176,6 @@ interface RemoteFetchProbe {
   sizeBytes: number | null;
 }
 
-// Debug state the core's fetch backend publishes on globalThis.
-interface FetchBackendDebugGlobals {
-  __llamadartFetchBackendLastError?: unknown;
-  __llamadartFetchBackendStats?: {
-    reads?: unknown;
-    getSize?: unknown;
-    ranges?: unknown;
-    wholeFileFallbacks?: unknown;
-    errors?: unknown;
-  };
-}
-
 const textEncoder = new TextEncoder();
 
 export class LlamaWebGpuBridgeRuntime {
@@ -1077,12 +1065,6 @@ export class LlamaWebGpuBridgeRuntime {
       sizeBytes = resolvedProbe!.sizeBytes;
     }
 
-    try {
-      (globalThis as FetchBackendDebugGlobals).__llamadartFetchBackendLastError = null;
-    } catch (_) {
-      // ignore debug-state reset failures
-    }
-
     if (typeof options.progressCallback === 'function') {
       options.progressCallback({ loaded: 0, total: Number.isFinite(sizeBytes) ? sizeBytes! : 0 });
     }
@@ -1155,39 +1137,6 @@ export class LlamaWebGpuBridgeRuntime {
           }
         } catch (_) {
           // ignore stderr capture failures on abort path
-        }
-
-        try {
-          const fetchError = String(
-            (globalThis as FetchBackendDebugGlobals).__llamadartFetchBackendLastError || '',
-          ).trim();
-          if (fetchError.length > 0) {
-            const token = fetchError
-              .slice(0, 120)
-              .replace(/[\s;=]+/g, '_')
-              .replace(/[^a-zA-Z0-9._:-]/g, '');
-            if (token.length > 0) {
-              this._runtimeNotes.push(`model_fetch_js_error:${token}`);
-            }
-          }
-        } catch (_) {
-          // ignore fetch-backend debug-state probe failures
-        }
-
-        try {
-          const stats = (globalThis as FetchBackendDebugGlobals).__llamadartFetchBackendStats;
-          if (stats && typeof stats === 'object') {
-            const reads = Number(stats.reads) || 0;
-            const getSize = Number(stats.getSize) || 0;
-            const ranges = Number(stats.ranges) || 0;
-            const fallbacks = Number(stats.wholeFileFallbacks) || 0;
-            const errors = Number(stats.errors) || 0;
-            this._runtimeNotes.push(
-              `model_fetch_stats:r${reads}_s${getSize}_q${ranges}_f${fallbacks}_e${errors}`,
-            );
-          }
-        } catch (_) {
-          // ignore fetch stats probe failures
         }
 
         try {
