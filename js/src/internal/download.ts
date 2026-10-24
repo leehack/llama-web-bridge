@@ -194,6 +194,141 @@ export async function drainResponseWithProgress(
   return loaded;
 }
 
+export const DEFAULT_CACHE_TEE_LAG_BYTES = 8 * 1024 * 1024;
+
+export interface CacheTee {
+  // The copy the caller reads; it keeps the source's status, headers and url.
+  response: Response;
+  // The copy to hand to `cache.put`.
+  cacheResponse: Response;
+  // Stops feeding the cache copy and errors it, so the cache commits no entry.
+  detachCache(reason: unknown): void;
+  // Whether the caller cancelled its copy before the body ended.
+  readonly cancelled: boolean;
+}
+
+/**
+ * Splits a response body between the caller and `cache.put`.
+ *
+ * `Response.clone()` buffers whatever one branch has not read yet, so a caller
+ * that waits for the cache, or a cache writer slower than the caller, holds up
+ * to the whole body in memory. Here the source is read only when the caller
+ * reads, and only while the cache copy is less than `maxCacheLagBytes` behind,
+ * so a slow cache writer slows the transfer instead. Cancelling the caller's
+ * copy errors the cache copy, so an abandoned transfer never commits an entry.
+ */
+export function teeResponseForCache(
+  source: Response,
+  maxCacheLagBytes: number = DEFAULT_CACHE_TEE_LAG_BYTES,
+): CacheTee {
+  const reader = source.body!.getReader();
+  let cacheController: ReadableStreamDefaultController<Uint8Array> | null = null;
+  let wakeReader: (() => void) | null = null;
+  let finished = false;
+  let cancelled = false;
+
+  const wake = () => {
+    const resolve = wakeReader;
+    wakeReader = null;
+    resolve?.();
+  };
+  const detachCache = (reason: unknown) => {
+    const controller = cacheController;
+    cacheController = null;
+    if (controller) {
+      try {
+        controller.error(reason);
+      } catch (_) {
+        // already closed or errored
+      }
+    }
+    wake();
+  };
+  const cacheIsFull = () => {
+    const desiredSize = cacheController?.desiredSize;
+    return desiredSize != null && desiredSize <= 0;
+  };
+
+  const cacheStream = new ReadableStream<Uint8Array>(
+    {
+      start(controller) {
+        cacheController = controller;
+      },
+      pull() {
+        wake();
+      },
+      cancel() {
+        cacheController = null;
+        wake();
+      },
+    },
+    new ByteLengthQueuingStrategy({ highWaterMark: Math.max(1, maxCacheLagBytes) }),
+  );
+
+  const bodyStream = new ReadableStream<Uint8Array>(
+    {
+      async pull(controller) {
+        while (!finished && cacheIsFull()) {
+          await new Promise<void>((resolve) => {
+            wakeReader = resolve;
+          });
+        }
+        if (finished) {
+          return;
+        }
+        let result: ReadableStreamReadResult<Uint8Array>;
+        try {
+          result = await reader.read();
+        } catch (error) {
+          finished = true;
+          detachCache(error);
+          throw error;
+        }
+        if (finished) {
+          return;
+        }
+        if (result.done) {
+          finished = true;
+          controller.close();
+          try {
+            cacheController?.close();
+          } catch (_) {
+            // cancelled by the cache writer
+          }
+          cacheController = null;
+          return;
+        }
+        controller.enqueue(result.value);
+        try {
+          cacheController?.enqueue(result.value);
+        } catch (_) {
+          cacheController = null;
+        }
+      },
+      cancel(reason) {
+        finished = true;
+        cancelled = true;
+        detachCache(reason ?? new Error('The response was cancelled before the cache copy completed.'));
+        return reader.cancel(reason);
+      },
+    },
+    { highWaterMark: 0 },
+  );
+
+  const init = { status: source.status, statusText: source.statusText, headers: source.headers };
+  const response = new Response(bodyStream, init);
+  // A constructed Response has an empty url; callers resolve redirects from it.
+  Object.defineProperty(response, 'url', { value: source.url });
+  return {
+    response,
+    cacheResponse: new Response(cacheStream, init),
+    detachCache,
+    get cancelled() {
+      return cancelled;
+    },
+  };
+}
+
 // Emscripten's WASMFS FS.analyzePath() reads the whole entry to fill
 // `object.contents`: it throws ErrnoError ("FS error") for an existing directory
 // and copies an existing file into JS memory. Probe paths with mkdir/unlink and

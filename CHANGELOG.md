@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- On a model cache miss, `loadModelFromUrl` and `loadDraftModel` report progress as the model
+  downloads instead of only after the whole file is in Cache Storage, and a cancelled or failed
+  load no longer leaves the model cached.
 - String `embed`/`embedBatch` reject rank-pooled models (rerankers) instead of returning
   a vector padded with out-of-bounds memory, and reject input longer than `nUbatch` when
   the model must embed it in one micro-batch instead of aborting the runtime.

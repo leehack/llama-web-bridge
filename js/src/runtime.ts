@@ -30,6 +30,7 @@ import {
   inferResponseTotalBytes,
   isRetryableStreamNetworkError,
   sumProgressValues,
+  teeResponseForCache,
   unlinkFsFile,
   writeResponseToFsFileWithProgress,
 } from './internal/download.ts';
@@ -98,6 +99,11 @@ import type {
 
 // The optional `logger` config entry: any subset of the console methods.
 type BridgeLogger = Partial<Record<LogMethod, (message: unknown) => void>>;
+
+type ModelCacheStoreOutcome = 'stored' | 'store_failed';
+
+// Cache stores still being written from a response the caller is reading.
+const pendingModelCacheStores = new WeakMap<Response, Promise<ModelCacheStoreOutcome>>();
 
 // Fetch and cache knobs read from a load, prefetch or request options bag.
 // Callers may pass anything, so each value is coerced where it is read.
@@ -1526,38 +1532,16 @@ export class LlamaWebGpuBridgeRuntime {
           ...fetchOptions,
         }, fetchTimeoutMs);
 
-        if (refreshed.ok) {
-          try {
-            await cache.put(cacheKey, refreshed.clone());
-            this._modelCacheState = 'stored';
-            this._runtimeNotes.push('model_cache_stored');
-          } catch (_) {
-            this._modelCacheState = 'store_failed';
-            this._runtimeNotes.push('model_cache_store_failed');
-          }
-        }
-
         this._runtimeNotes.push(
           hasReadableResponseStream(refreshed)
             ? 'model_network_stream'
             : 'model_network_no_stream',
         );
-        return refreshed;
+        return refreshed.ok ? await this._storeModelResponse(cache, cacheKey, refreshed) : refreshed;
       }
 
       this._modelCacheState = forceRefresh ? 'refresh' : 'miss';
       const response = await this._fetchWithTimeout(url, fetchOptions, fetchTimeoutMs);
-
-      if (response.ok) {
-        try {
-          await cache.put(cacheKey, response.clone());
-          this._modelCacheState = 'stored';
-          this._runtimeNotes.push('model_cache_stored');
-        } catch (_) {
-          this._modelCacheState = 'store_failed';
-          this._runtimeNotes.push('model_cache_store_failed');
-        }
-      }
 
       if (requireReadableStream) {
         this._runtimeNotes.push(
@@ -1567,7 +1551,7 @@ export class LlamaWebGpuBridgeRuntime {
         );
       }
 
-      return response;
+      return response.ok ? await this._storeModelResponse(cache, cacheKey, response) : response;
     } catch (_) {
       this._modelCacheState = 'error';
       this._runtimeNotes.push('model_cache_error');
@@ -1580,6 +1564,60 @@ export class LlamaWebGpuBridgeRuntime {
         );
       }
       return response;
+    }
+  }
+
+  /**
+   * Stores an ok network response in the cache and returns the response to
+   * read. A streamed body is written to the cache while the caller reads it, so
+   * progress follows the download; `_settleModelCacheStore` then waits for the
+   * store. Without a stream, the store completes before this returns.
+   */
+  async _storeModelResponse(cache: Cache, cacheKey: string, response: Response): Promise<Response> {
+    const recordFailure = (error: unknown): ModelCacheStoreOutcome => {
+      this._runtimeNotes.push('model_cache_store_failed');
+      this._emitLogger('warn', `Model was not cached: ${error instanceof Error ? error.message : String(error)}`);
+      return 'store_failed';
+    };
+    if (!hasReadableResponseStream(response)) {
+      try {
+        await cache.put(cacheKey, response.clone());
+        this._modelCacheState = 'stored';
+        this._runtimeNotes.push('model_cache_stored');
+      } catch (error) {
+        this._modelCacheState = recordFailure(error);
+      }
+      return response;
+    }
+
+    const tee = teeResponseForCache(response);
+    const stored = cache.put(cacheKey, tee.cacheResponse).then(
+      (): ModelCacheStoreOutcome => {
+        this._runtimeNotes.push('model_cache_stored');
+        return 'stored';
+      },
+      (error: unknown): ModelCacheStoreOutcome => {
+        tee.detachCache(error);
+        // A load that gave up on the body has already failed; its rejected
+        // store may settle during the next load, so record nothing.
+        return tee.cancelled ? 'store_failed' : recordFailure(error);
+      },
+    );
+    pendingModelCacheStores.set(tee.response, stored);
+    return tee.response;
+  }
+
+  // Waits for the cache store a model response feeds, once the caller has read
+  // its body; a failed store leaves the model uncached and the load intact.
+  async _settleModelCacheStore(response: Response, recordState = true) {
+    const stored = pendingModelCacheStores.get(response);
+    if (!stored) {
+      return;
+    }
+    pendingModelCacheStores.delete(response);
+    const outcome = await stored;
+    if (recordState) {
+      this._modelCacheState = outcome;
     }
   }
 
@@ -2241,6 +2279,7 @@ export class LlamaWebGpuBridgeRuntime {
                   abortMessage,
                 },
               );
+              await this._settleModelCacheStore(response);
               break;
             } catch (error) {
               const text = String(error || '').toLowerCase();
@@ -2748,8 +2787,8 @@ export class LlamaWebGpuBridgeRuntime {
     const signal = controller?.signal ?? options.signal ?? null;
     // The target model's cache bookkeeping describes the target, not the draft.
     const targetCacheFields = [this._modelSource, this._modelCacheState, this._modelCacheName] as const;
+    let response: Response | null = null;
     try {
-      let response: Response;
       try {
         response = await this._getCachedModelResponse(url, {
           useCache: options.useCache,
@@ -2787,6 +2826,7 @@ export class LlamaWebGpuBridgeRuntime {
           abortMessage,
         },
       );
+      await this._settleModelCacheStore(response, false);
       throwIfAborted(signal, abortMessage);
 
       const loadRc = Number(
@@ -2815,6 +2855,10 @@ export class LlamaWebGpuBridgeRuntime {
       };
       return { ...info };
     } finally {
+      // An unread body would hold the download, and its cache store, open.
+      if (response?.body && !response.body.locked) {
+        response.body.cancel().catch(() => {});
+      }
       options.signal?.removeEventListener('abort', onCallerAbort);
       this._clearTransferAbortController(controller);
       this._deleteFsFile(draftPath);
