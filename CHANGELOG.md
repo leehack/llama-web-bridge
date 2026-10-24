@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- String `embed`/`embedBatch` reject rank-pooled models (rerankers) instead of returning
+  a vector padded with out-of-bounds memory, and reject input longer than `nUbatch` when
+  the model must embed it in one micro-batch instead of aborting the runtime.
 - `getModelMetadata()` keeps `llamadart.webgpu.worker_fallback_reason` when a CPU-mode audio or
   image request later moves the model to a new worker, and qualification fails such a worker
   ASR or TTS mode.

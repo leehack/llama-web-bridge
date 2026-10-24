@@ -258,6 +258,13 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_embed_bytes_to_json(
   }
   const bool use_encoder_path = has_encoder && !has_decoder;
 
+  // RANK pooling yields n_cls_out classifier scores, not n_embd_out floats.
+  if (llama_pooling_type(g_state.ctx) == LLAMA_POOLING_TYPE_RANK) {
+    set_error("Embeddings are not supported for rank-pooled models such as rerankers: "
+              "llama.cpp returns classifier scores, not an embedding, for pooling type RANK");
+    return -11;
+  }
+
   std::vector<llama_token> tokens;
   if (!tokenize_text(input, true, tokens)) {
     return -4;
@@ -266,6 +273,16 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_embed_bytes_to_json(
   if (tokens.empty()) {
     set_error("Embedding input tokenized to an empty sequence");
     return -5;
+  }
+
+  const uint32_t pass_token_limit = llamadart_webgpu_detail::embedding_pass_token_limit(
+      g_state.ctx, g_state.model, use_encoder_path);
+  if (pass_token_limit > 0 && tokens.size() > pass_token_limit) {
+    set_error("The embedding input has " + std::to_string(tokens.size()) +
+              " tokens, but this model embeds its input in one pass of at most " +
+              std::to_string(pass_token_limit) +
+              " tokens (n_ubatch). Shorten the input or raise nUbatch and nBatch.");
+    return -12;
   }
 
   int32_t embedding_size = llama_model_n_embd_out(g_state.model);
