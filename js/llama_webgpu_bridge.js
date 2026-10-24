@@ -2045,10 +2045,6 @@ var LlamaWebGpuBridgeRuntime = class {
     if ((!Number.isFinite(sizeBytes) || sizeBytes <= 0) && Number.isFinite(resolvedProbe?.sizeBytes) && resolvedProbe.sizeBytes > 0) {
       sizeBytes = resolvedProbe.sizeBytes;
     }
-    try {
-      globalThis.__llamadartFetchBackendLastError = null;
-    } catch (_) {
-    }
     if (typeof options.progressCallback === "function") {
       options.progressCallback({ loaded: 0, total: Number.isFinite(sizeBytes) ? sizeBytes : 0 });
     }
@@ -2109,32 +2105,6 @@ var LlamaWebGpuBridgeRuntime = class {
             if (token.length > 0) {
               this._runtimeNotes.push(`model_core_stderr:${token}`);
             }
-          }
-        } catch (_) {
-        }
-        try {
-          const fetchError = String(
-            globalThis.__llamadartFetchBackendLastError || ""
-          ).trim();
-          if (fetchError.length > 0) {
-            const token = fetchError.slice(0, 120).replace(/[\s;=]+/g, "_").replace(/[^a-zA-Z0-9._:-]/g, "");
-            if (token.length > 0) {
-              this._runtimeNotes.push(`model_fetch_js_error:${token}`);
-            }
-          }
-        } catch (_) {
-        }
-        try {
-          const stats = globalThis.__llamadartFetchBackendStats;
-          if (stats && typeof stats === "object") {
-            const reads = Number(stats.reads) || 0;
-            const getSize = Number(stats.getSize) || 0;
-            const ranges = Number(stats.ranges) || 0;
-            const fallbacks = Number(stats.wholeFileFallbacks) || 0;
-            const errors = Number(stats.errors) || 0;
-            this._runtimeNotes.push(
-              `model_fetch_stats:r${reads}_s${getSize}_q${ranges}_f${fallbacks}_e${errors}`
-            );
           }
         } catch (_) {
         }
