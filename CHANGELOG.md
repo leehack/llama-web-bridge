@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- String `embed`/`embedBatch` reject rank-pooled models (rerankers) instead of returning
+  a vector padded with out-of-bounds memory, and reject input longer than `nUbatch` when
+  the model must embed it in one micro-batch instead of aborting the runtime.
 - Give every decision API rejection a stable string `code`, such as `head-lost`, `busy` or
   `context`, in direct and worker mode, so callers need not match its unchanged message.
 - Reject `synthesizeSpeech` `text` or `language` holding U+0000 with a `TypeError` instead

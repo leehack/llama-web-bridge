@@ -14,16 +14,18 @@ const legacyEmbed = contextExports.slice(contextExports.indexOf('EMSCRIPTEN_KEEP
   contextExports.indexOf('EMSCRIPTEN_KEEPALIVE const char * llamadart_webgpu_last_embedding_json()'));
 const source = String.raw`
 #include <cassert>
+#include <cstdio>
 #include <cstring>
 #include <cstdint>
 #include <vector>
 #include <string>
 using llama_token = int;
 using llama_pos = int;
-enum llama_pooling_type { LLAMA_POOLING_TYPE_NONE, LLAMA_POOLING_TYPE_MEAN, LLAMA_POOLING_TYPE_RANK, LLAMA_POOLING_TYPE_CLS };
+enum llama_pooling_type { LLAMA_POOLING_TYPE_NONE, LLAMA_POOLING_TYPE_MEAN, LLAMA_POOLING_TYPE_RANK, LLAMA_POOLING_TYPE_CLS, LLAMA_POOLING_TYPE_LAST };
 enum llama_process_type { LLAMA_PROCESS_TYPE_ENCODE, LLAMA_PROCESS_TYPE_DECODE };
-struct llama_context { unsigned ctx=16, seq=16, batch=16, ubatch=16, seqmax=1; int pool=1; bool causal=false, extraction=false; };
-struct llama_model { bool encoder=false, decoder=true; int out=3, inp=2; };
+struct llama_model;
+struct llama_context { unsigned ctx=16, seq=16, batch=16, ubatch=16, seqmax=1; int pool=1; bool causal=false, extraction=false; llama_model * model=nullptr; };
+struct llama_model { bool encoder=false, decoder=true; int out=3, inp=2; const char * arch="llama"; const char * causal=nullptr; };
 struct llama_vocab {};
 struct mtmd_context { bool vision=true, audio=true; int rate=16000, positions=1; };
 struct mtmd_bitmap { bool audio=false; };
@@ -40,7 +42,15 @@ static float reused[4], pooled[3]={1,2,3};
 static bool empty=false;
 static bool huge=false;
 static bool g_cancel_requested=false;
+static int memory_handle=0;
+static void * memory=nullptr;
 int llama_model_n_embd_out(llama_model * m) { return m->out; }
+int llama_model_meta_val_str(const llama_model * m,const char * key,char * buf,size_t size) {
+  const char * value=std::string(key)=="general.architecture" ? m->arch
+      : m->arch && std::string(key)==std::string(m->arch)+".attention.causal" ? m->causal : nullptr;
+  if(!value) { if(size) buf[0]=0; return -1; }
+  return std::snprintf(buf,size,"%s",value);
+}
 int llama_model_n_embd_inp(llama_model * m) { return m->inp; }
 bool llama_model_has_encoder(llama_model * m) { return m->encoder; }
 bool llama_model_has_decoder(llama_model * m) { return m->decoder; }
@@ -83,7 +93,7 @@ int llama_batch_ext_add_embd(llama_batch_ext * b,int seq,llama_embd e) { assert(
 bool llama_batch_ext_set_pos(llama_batch_ext * b,int i,const int * p) { b->entries.at(i).position=*p; return fail!=11; }
 bool llama_batch_ext_set_output_embd(llama_batch_ext * b,int i,bool output) { b->entries.at(i).output=output; return fail!=12; }
 void llama_synchronize(llama_context *) {}
-void * llama_get_memory(llama_context *) { return nullptr; }
+void * llama_get_memory(llama_context *) { return memory; }
 void llama_memory_clear(void *,bool) {}
 void llama_set_embeddings(llama_context * c,bool value) { c->extraction=value; }
 int llama_process(llama_context * c,llama_process_type type,llama_batch_ext * b) {
@@ -107,14 +117,20 @@ void llama_batch_free(llama_batch b) {
   for(int i=0;i<b.n_tokens;++i) delete[] b.seq_id[i];
   delete[] b.token; delete[] b.pos; delete[] b.n_seq_id; delete[] b.seq_id; delete[] b.logits; --live_batches;
 }
-int llama_decode(llama_context * c,llama_batch b) {
+static int forward(llama_context * c,llama_batch b) {
   ++processed; assert(c->extraction && !g_cancel_requested);
   assert(b.n_tokens==2 && b.token[0]==7 && b.token[1]==8);
   for(int i=0;i<b.n_tokens;++i) assert(b.pos[i]==i && b.logits[i]==1 && b.n_seq_id[i]==1 && b.seq_id[i][0]==0);
   if(fail==15) g_cancel_requested=true;
   return fail==13 || fail==15?1:0;
 }
-int llama_encode(llama_context * c,llama_batch b) { return llama_decode(c,b); }
+// Upstream asserts: encode always, decode when memoryless or non-causal.
+int llama_encode(llama_context * c,llama_batch b) { assert(unsigned(b.n_tokens)<=c->ubatch); return forward(c,b); }
+int llama_decode(llama_context * c,llama_batch b) {
+  const bool non_causal=c->model && c->model->causal && std::string(c->model->causal)=="false";
+  if(!memory || non_causal) return llama_encode(c,b);
+  return forward(c,b);
+}
 #ifndef MIXED_EMBEDDINGS_TEST
 #define MIXED_EMBEDDINGS_TEST 1
 #endif
@@ -137,7 +153,8 @@ namespace llamadart_webgpu_detail { std::string serialize_embedding_json(const s
 #define EMSCRIPTEN_KEEPALIVE
 #include "src/core/exports_embedding.inc"
 int llama_model_n_embd(llama_model * m) { return m->out; }
-void set_error(const char *) {}
+static std::string last_error;
+void set_error(const std::string & message) { last_error=message; }
 static std::string tokenized;
 bool tokenize_text(const std::string & text,bool,std::vector<int> & out) { tokenized=text; out={7,8}; return true; }
 bool text_from_bytes(const char * bytes,int32_t length,const char *,std::string & out) { if(!bytes || length<0) return false; out.assign(bytes,length); return true; }
@@ -224,6 +241,66 @@ test('mixed native batch guards, copied media, output width, one process and cle
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test('string embeddings reject RANK pooling and inputs that must fit one micro-batch', () => {
+  const dir=mkdtempSync(path.join(tmpdir(),'embedding-string-'));
+  const stringMain=String.raw`
+int main() {
+  llama_context c; llama_model m; mtmd_context p; c.model=&m;
+  g_state={&c,&m,&p};
+  int checks=0;
+  const auto embed=[&](int expected) {
+    processed=0; last_error.clear(); g_last_embedding_json="unset";
+    assert(llamadart_webgpu_embed_to_json("x",1)==expected);
+    assert(!c.extraction && live_batches==0);
+    if(expected<0) assert(processed==0 && g_last_embedding_json=="[]");
+    else assert(processed==1 && g_last_embedding_json=="[1,2,3]");
+    ++checks;
+  };
+  const auto too_long=[&] {
+    embed(-12);
+    assert(last_error.find("has 2 tokens")!=std::string::npos);
+    assert(last_error.find("at most 1 tokens (n_ubatch)")!=std::string::npos);
+  };
+  for(void * state:{(void *)nullptr,(void *)&memory_handle}) {
+    memory=state;
+    c.pool=LLAMA_POOLING_TYPE_RANK; embed(-11); assert(last_error.find("pooling type RANK")!=std::string::npos);
+    for(int pool:{LLAMA_POOLING_TYPE_NONE,LLAMA_POOLING_TYPE_MEAN,LLAMA_POOLING_TYPE_CLS,LLAMA_POOLING_TYPE_LAST}) {
+      c.pool=pool; embed(3);
+    }
+  }
+  c.ubatch=1;
+  memory=nullptr;
+  for(int pool:{LLAMA_POOLING_TYPE_NONE,LLAMA_POOLING_TYPE_MEAN,LLAMA_POOLING_TYPE_CLS,LLAMA_POOLING_TYPE_LAST}) {
+    c.pool=pool; too_long();
+  }
+  memory=&memory_handle;
+  m.encoder=true; m.decoder=false; c.pool=LLAMA_POOLING_TYPE_LAST; too_long(); m.encoder=false; m.decoder=true;
+  c.pool=LLAMA_POOLING_TYPE_MEAN; too_long();
+  c.pool=LLAMA_POOLING_TYPE_CLS; too_long();
+  m.causal="false";
+  c.pool=LLAMA_POOLING_TYPE_LAST; too_long();
+  c.pool=LLAMA_POOLING_TYPE_NONE; too_long();
+  m.arch=nullptr; c.pool=LLAMA_POOLING_TYPE_LAST; too_long(); m.arch="llama";
+  // Causal attention with memory splits a long input across micro-batches.
+  for(const char * causal:{(const char *)nullptr,"true"}) {
+    m.causal=causal;
+    c.pool=LLAMA_POOLING_TYPE_LAST; embed(3);
+    c.pool=LLAMA_POOLING_TYPE_NONE; embed(3);
+  }
+  c.ubatch=2; memory=nullptr; c.pool=LLAMA_POOLING_TYPE_MEAN; embed(3);
+  std::printf("%d string cases passed\n",checks);
+}
+`;
+  try {
+    writeFileSync(path.join(dir,'llama.h'),'');
+    writeFileSync(path.join(dir,'mtmd.h'),'');
+    writeFileSync(path.join(dir,'test.cpp'),source.slice(0,source.indexOf('int main() {'))+stringMain);
+    execFileSync(process.env.CXX || 'c++',['-std=c++17','-I',dir,'-I',repoRoot,
+      path.join(dir,'test.cpp'),'-o',path.join(dir,'test')]);
+    assert.match(execFileSync(path.join(dir,'test'),{encoding:'utf8'}),/25 string cases passed/);
+  } finally { rmSync(dir,{recursive:true,force:true}); }
 });
 
 test('pre-extended-batch core supports truthful text parts and rejects media without inference', () => {

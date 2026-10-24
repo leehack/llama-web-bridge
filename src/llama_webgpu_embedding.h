@@ -4,6 +4,7 @@
 #include "mtmd.h"
 #include <algorithm>
 #include <cstdint>
+#include <cstring>
 #include <memory>
 #include <string>
 #include <vector>
@@ -20,6 +21,35 @@ inline bool supports_pooled_embeddings(llama_context * ctx, llama_model * model)
 inline bool embedding_input_fits(llama_context * ctx, size_t count) {
   return count <= llama_n_ctx(ctx) && count <= llama_n_ctx_seq(ctx) &&
       count <= llama_n_batch(ctx) && count <= llama_n_ubatch(ctx) && llama_n_seq_max(ctx) >= 1;
+}
+
+// The bridge never sets attention_type, so the context keeps the model's
+// optional attention.causal key (default true). The pinned llama.cpp has no
+// llama_get_causal_attn.
+inline bool model_attention_is_causal(const llama_model * model) {
+  char architecture[64];
+  const int32_t length = llama_model_meta_val_str(
+      model, "general.architecture", architecture, sizeof(architecture));
+  if (length <= 0 || length >= static_cast<int32_t>(sizeof(architecture))) return false;
+  const std::string key = std::string(architecture) + ".attention.causal";
+  char value[8];
+  return llama_model_meta_val_str(model, key.c_str(), value, sizeof(value)) < 0 ||
+      std::strcmp(value, "true") == 0;
+}
+
+// llama.cpp asserts n_ubatch >= n_tokens on the encoder path, in memoryless
+// contexts (decode forwards to encode) and under non-causal attention, and
+// MEAN/CLS pooling keeps only the last micro-batch. 0 means the input may span
+// several micro-batches.
+inline uint32_t embedding_pass_token_limit(llama_context * ctx,
+    const llama_model * model, bool use_encoder_path) {
+  const auto pooling = llama_pooling_type(ctx);
+  if (use_encoder_path || llama_get_memory(ctx) == nullptr ||
+      pooling == LLAMA_POOLING_TYPE_MEAN || pooling == LLAMA_POOLING_TYPE_CLS ||
+      !model_attention_is_causal(model)) {
+    return llama_n_ubatch(ctx);
+  }
+  return 0;
 }
 
 struct embedding_scope {

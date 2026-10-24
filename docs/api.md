@@ -624,10 +624,14 @@ embed(input: EmbedInput, options?: { normalize?: boolean }): Promise<number[]>
 ```
 
 One string or one ordered parts array produces one full pooled vector. Strings
-retain the existing execution route and defaults. Adjacent text is concatenated
-verbatim, including empty strings, whitespace and Unicode. No task prefix,
-separator, chat template, truncation or per-part averaging is added. Empty parts
-arrays and sparse arrays reject. The literal `<__media__>` marker is reserved
+retain the existing execution route and defaults. A string must fit one physical
+microbatch (`nUbatch`) when the model is encoder-only or memoryless, its
+attention is noncausal, or its pooling is MEAN or CLS; a longer string rejects
+before inference. Other strings may span several batches. Rank-pooled models
+reject strings too.
+Adjacent text is concatenated verbatim, including empty strings, whitespace and
+Unicode. No task prefix, separator, chat template, truncation or per-part
+averaging is added. Empty parts arrays and sparse arrays reject. The literal `<__media__>` marker is reserved
 in parts text, because it would make media ordering ambiguous.
 
 For each media part provide exactly one source. Encoded image/audio bytes and
