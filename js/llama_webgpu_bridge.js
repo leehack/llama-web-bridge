@@ -7801,16 +7801,10 @@ var LlamaWebGpuBridge = class {
     }
   }
   getModelMetadata() {
-    if (this._workerProxy) {
-      return {
-        ...this._metadata || {},
-        "llamadart.webgpu.execution": "worker"
-      };
-    }
     const workerReason = typeof this._workerFallbackReason === "string" && this._workerFallbackReason.length > 0 ? this._workerFallbackReason : null;
     return {
       ...this._metadata || {},
-      "llamadart.webgpu.execution": "main-thread",
+      "llamadart.webgpu.execution": this._workerProxy ? "worker" : "main-thread",
       ...workerReason == null ? {} : { "llamadart.webgpu.worker_fallback_reason": workerReason }
     };
   }

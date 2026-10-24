@@ -308,3 +308,30 @@ test('a mode that executed elsewhere than its runtime mode requires is rejected'
   speechPhase({ modeResults: [speechModeResult('wasm32', 'worker'), speechModeResult('wasm32', 'direct')] }, 1);
   ttsPhase({ modeResults: [ttsModeResult('generated.wav', { ...good, runtimeMode: 'worker', execution: 'worker' })] }, 1, artifacts);
 });
+
+// A CPU-mode audio request moves a fallen-back worker mode onto a new worker,
+// so its final execution alone hides a model load on the main thread.
+test('a mode whose worker fell back is rejected even when it ended on a worker', () => {
+  const reason = 'Bridge worker crashed at https://user:secret@example.test/w.js?token=abc';
+  const sanitized = "'Bridge worker crashed at https://example.test/w.js'";
+  rejects(
+    () => speechPhase({ modeResults: [speechModeResult('wasm32', 'worker', { workerFallbackReason: reason })] }, 1),
+    `speech wasm32/worker fell back from the worker to the main thread (${sanitized})`,
+  );
+  const unrecorded = speechModeResult('wasm64', 'worker');
+  delete unrecorded.workerFallbackReason;
+  rejects(() => speechPhase({ modeResults: [unrecorded] }, 1), 'speech wasm64/worker did not record whether its worker fell back');
+  rejects(
+    () => speechPhase({ modeResults: [speechModeResult('wasm32', 'direct', { workerFallbackReason: '' })] }, 1),
+    "speech wasm32/direct fell back from the worker to the main thread ('')",
+  );
+  const artifacts = ttsArtifacts();
+  const measured = readWavIdentity(path.join(artifacts, 'generated.wav'));
+  const worker = { peak: measured.peak, rms: measured.rms, runtimeMode: 'worker', execution: 'worker' };
+  rejects(
+    () => ttsPhase({ modeResults: [ttsModeResult('generated.wav', { ...worker, workerFallbackReason: 'Worker request timeout' })] }, 1, artifacts),
+    "text-to-speech wasm64/worker fell back from the worker to the main thread ('Worker request timeout')",
+  );
+  speechPhase({ modeResults: [speechModeResult('wasm32', 'worker'), speechModeResult('wasm64', 'worker')] }, 1);
+  ttsPhase({ modeResults: [ttsModeResult('generated.wav', worker)] }, 1, artifacts);
+});

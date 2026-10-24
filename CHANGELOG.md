@@ -5,6 +5,9 @@
 - String `embed`/`embedBatch` reject rank-pooled models (rerankers) instead of returning
   a vector padded with out-of-bounds memory, and reject input longer than `nUbatch` when
   the model must embed it in one micro-batch instead of aborting the runtime.
+- `getModelMetadata()` keeps `llamadart.webgpu.worker_fallback_reason` when a CPU-mode audio or
+  image request later moves the model to a new worker, and qualification fails such a worker
+  ASR or TTS mode.
 - Give every decision API rejection a stable string `code`, such as `head-lost`, `busy` or
   `context`, in direct and worker mode, so callers need not match its unchanged message.
 - Reject `synthesizeSpeech` `text` or `language` holding U+0000 with a `TypeError` instead

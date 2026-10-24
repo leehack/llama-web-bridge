@@ -44,6 +44,7 @@ import {
   isPyInt,
   pyDecodeUtf8,
   pyGet,
+  pyHasKey,
   pyIntFromString,
   pyIsFile,
   pyIsSymlink,
@@ -685,6 +686,16 @@ function requireExecution(entry, runtimeMode, label) {
   const expected = Object.hasOwn(EXECUTION_BY_RUNTIME_MODE, runtimeMode) ? EXECUTION_BY_RUNTIME_MODE[runtimeMode] : null;
   if (expected === null || execution !== expected) {
     throw new ContractError(`${label} executed on ${pyRepr(execution)}, not ${pyRepr(expected)}`);
+  }
+  // A CPU-mode audio request moves a fallen-back worker mode onto a new
+  // worker, so its final execution hides a model load on the main thread.
+  if (!pyHasKey(entry, 'workerFallbackReason')) {
+    throw new ContractError(`${label} did not record whether its worker fell back`);
+  }
+  const fallbackReason = pyGet(entry, 'workerFallbackReason');
+  if (fallbackReason !== null) {
+    const reason = typeof fallbackReason === 'string' ? sanitizeDiagnosticText(fallbackReason) : fallbackReason;
+    throw new ContractError(`${label} fell back from the worker to the main thread (${pyRepr(reason)})`);
   }
 }
 

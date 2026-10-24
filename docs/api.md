@@ -1085,7 +1085,7 @@ include:
 | `llamadart.webgpu.mmproj_loaded` | `1` when a projector is loaded. |
 | `llamadart.webgpu.supports_vision` | `1` when the active projector supports vision. |
 | `llamadart.webgpu.supports_audio` | `1` when the active projector supports audio. |
-| `llamadart.webgpu.worker_fallback_reason` | Present after falling back from worker mode to direct runtime. |
+| `llamadart.webgpu.worker_fallback_reason` | Present from a fallback from worker mode to direct runtime until `dispose()`, even when a later CPU-mode media request moves the model to a new worker. |
 
 ### `getContextSize()`
 

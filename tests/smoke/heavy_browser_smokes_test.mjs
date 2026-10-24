@@ -277,6 +277,10 @@ const sha256 = (bytes) => createHash('sha256').update(bytes).digest('hex');
   const execution = "execution: bridge.getModelMetadata()['llamadart.webgpu.execution'] || null,\n";
   assert.ok(speech.includes(`          ${loadedCore}          ${execution}`));
   assert.ok(tts.includes(`            ${loadedCore}            ${execution}`));
+  // Or one that ended on a new worker after falling back while loading.
+  const fallback = "workerFallbackReason: bridge.getModelMetadata()['llamadart.webgpu.worker_fallback_reason'] || null,\n";
+  assert.ok(speech.includes(`          ${execution}          ${fallback}`));
+  assert.ok(tts.includes(`            ${execution}            ${fallback}`));
   for (const page of [speech, tts, decision]) {
     assert.ok(page.startsWith('\n<!doctype html>\n<meta charset="utf-8">\n'));
     assert.ok(page.endsWith('})();\n</script>\n'));

@@ -317,7 +317,7 @@ The harness:
   cold transcript, cancellation, warm reuse, and silence-hallucination
   rejection, and records those per-mode results in the attestation; a mode
   whose bridge started another core than it requested, or a worker mode that
-  ran on the main thread, fails;
+  fell back to the main thread at any point, fails;
 - runs Qwen3-TTS across wasm64 direct and worker modes, covering the full
   lifecycle and verifying each generated file is a readable PCM16 mono 24 kHz
   WAV with a recorded SHA-256, byte length, frame count, and non-silent

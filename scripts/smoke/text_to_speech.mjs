@@ -262,6 +262,7 @@ export function renderHarness({
             runtimeMode,
             coreVariant: bridge.getModelMetadata()['llamadart.webgpu.core_variant'] || null,
             execution: bridge.getModelMetadata()['llamadart.webgpu.execution'] || null,
+            workerFallbackReason: bridge.getModelMetadata()['llamadart.webgpu.worker_fallback_reason'] || null,
             requestedGpuLayers: ${gpuLayers},
             gpuActive: bridge.isGpuActive(),
             backendName: bridge.getBackendName(),
