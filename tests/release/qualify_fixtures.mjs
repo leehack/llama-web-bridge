@@ -86,6 +86,7 @@ export function speechModeResult(memoryMode, runtimeMode, overrides = {}) {
     runtimeMode,
     coreVariant: memoryMode,
     execution: runtimeMode === 'worker' ? 'worker' : 'main-thread',
+    workerFallbackReason: null,
     elapsedMs: 10,
     phaseTimingsMs: {
       cancellationMs: 1,
@@ -110,6 +111,7 @@ export function ttsModeResult(audioArtifact, overrides = {}) {
     runtimeMode: 'direct',
     coreVariant: 'wasm64',
     execution: 'main-thread',
+    workerFallbackReason: null,
     totalElapsedMs: 10,
     modelLoadMs: 3,
     projectorLoadMs: 2,

@@ -398,7 +398,7 @@ query strings, and fragments before printing the location.
 - Heavy real-model ASR and TTS gates run through
   `scripts/release/qualification.mjs` in automated qualification; a mode that
   fell back to another core than it requested, or from the worker to the main
-  thread, fails. Keep the candidate
+  thread at any point, fails. Keep the candidate
   manifest honest: `scripts/release/manifest.mjs` refuses a core binary whose
   memories contradict the `wasm32`/`memory64` capabilities, must record those
   two gates as `required-automated-qualification`, never as a candidate-build
