@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- `getModelMetadata()` keeps `llamadart.webgpu.worker_fallback_reason` when a CPU-mode audio or
+  image request later moves the model to a new worker, and qualification fails such a worker
+  ASR or TTS mode.
 - Give every decision API rejection a stable string `code`, such as `head-lost`, `busy` or
   `context`, in direct and worker mode, so callers need not match its unchanged message.
 - Reject `synthesizeSpeech` `text` or `language` holding U+0000 with a `TypeError` instead

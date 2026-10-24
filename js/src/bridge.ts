@@ -3403,13 +3403,8 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
   }
 
   getModelMetadata() {
-    if (this._workerProxy) {
-      return {
-        ...(this._metadata || {}),
-        'llamadart.webgpu.execution': 'worker',
-      };
-    }
-
+    // A CPU-mode media request replaces a fallen-back worker, and the model it
+    // reloads there was first loaded on the main thread, so the reason stays.
     const workerReason =
       typeof this._workerFallbackReason === 'string' && this._workerFallbackReason.length > 0
         ? this._workerFallbackReason
@@ -3417,7 +3412,7 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
 
     return {
       ...(this._metadata || {}),
-      'llamadart.webgpu.execution': 'main-thread',
+      'llamadart.webgpu.execution': this._workerProxy ? 'worker' : 'main-thread',
       ...(workerReason == null
         ? {}
         : { 'llamadart.webgpu.worker_fallback_reason': workerReason }),

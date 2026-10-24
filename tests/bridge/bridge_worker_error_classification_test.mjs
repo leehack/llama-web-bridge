@@ -1148,6 +1148,64 @@ const CASES = [
     }
   }],
 
+  ['a CPU load that fell back keeps reporting it after audio moves to a new worker', async () => {
+    const reasonKey = 'llamadart.webgpu.worker_fallback_reason';
+    const loading = createProxy('loading', async () => {
+      throw new Error('Bridge worker crashed');
+    });
+    const replacement = createModelProxy('replacement');
+    const { bridge } = createBridge({
+      _workerProxy: loading,
+      _createWorkerProxy: () => replacement,
+    });
+    const audio = { nPredict: 4, parts: [{ type: 'audio', bytes: new Uint8Array(1) }] };
+
+    await bridge.loadModelFromUrl('asr.gguf', { nGpuLayers: 0 });
+    await bridge.loadMultimodalProjector('mmproj.gguf');
+    assert.equal(bridge._workerProxy, null, 'the model loaded on the main thread');
+    assert.equal(bridge.getModelMetadata()[reasonKey], 'Bridge worker crashed');
+
+    await bridge.createCompletion('Transcribe this audio.', audio);
+    assert.equal(bridge._workerProxy, replacement);
+    assert.deepEqual(replacement.calls.map((call) => call.method).slice(-1), ['createCompletion']);
+    let metadata = bridge.getModelMetadata();
+    assert.equal(metadata['llamadart.webgpu.execution'], 'worker');
+    assert.equal(metadata[reasonKey], 'Bridge worker crashed');
+
+    await bridge.createCompletion('Transcribe this audio.', audio);
+    await bridge.loadModelFromUrl('asr.gguf', { nGpuLayers: 0 });
+    metadata = bridge.getModelMetadata();
+    assert.equal(metadata['llamadart.webgpu.execution'], 'worker');
+    assert.equal(metadata[reasonKey], 'Bridge worker crashed', 'a later request or reload keeps the history');
+
+    await bridge.dispose();
+    assert.equal(Object.hasOwn(bridge.getModelMetadata(), reasonKey), false, 'dispose resets it');
+  }],
+
+  ['worker and direct runs that never fell back report no fallback reason', async () => {
+    const audio = { nPredict: 4, parts: [{ type: 'audio', bytes: new Uint8Array(1) }] };
+    const worker = createModelProxy('healthy');
+    const { bridge: workerBridge } = createBridge({
+      _workerProxy: worker,
+      _createRuntime: () => {
+        throw new Error('the main-thread runtime must not be created');
+      },
+    });
+    await workerBridge.loadModelFromUrl('asr.gguf', { nGpuLayers: 0 });
+    await workerBridge.createCompletion('Transcribe this audio.', audio);
+
+    const runtime = createRuntime({ createCompletion: async () => 'transcript' });
+    const { bridge: directBridge } = createBridge({ _config: { disableWorker: true }, _runtime: runtime });
+    await directBridge.loadModelFromUrl('asr.gguf', { nGpuLayers: 0 });
+    await directBridge.createCompletion('Transcribe this audio.', audio);
+
+    for (const [bridge, execution] of [[workerBridge, 'worker'], [directBridge, 'main-thread']]) {
+      const metadata = bridge.getModelMetadata();
+      assert.equal(metadata['llamadart.webgpu.execution'], execution);
+      assert.equal(Object.hasOwn(metadata, 'llamadart.webgpu.worker_fallback_reason'), false, execution);
+    }
+  }],
+
   ['multimodal recovery selects CPU-safe reload only for timeout and WebGPU classifications', async () => {
     const run = async (error) => {
       const runtime = createRuntime();
