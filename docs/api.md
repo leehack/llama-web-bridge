@@ -239,7 +239,7 @@ Common `options` keys:
 | `nThreads`, `nThreadsBatch` | Per-load thread overrides, capped to the active runtime. |
 | `nGpuLayers` | Per-load GPU layer override. Use `0` for CPU/WASM mode. |
 | `nBatch`, `nUbatch` | Per-load batch and micro-batch overrides. |
-| `useCache`, `force` | Cache Storage controls for model responses. |
+| `useCache`, `force` | Cache Storage controls for model responses. A cache miss writes the model to Cache Storage while it downloads, so progress follows the download; a failed cache write leaves the model loaded but uncached, and a cancelled load stores nothing. |
 | `streamResumeRetries` | Retry count for resumable streamed model loads. |
 | `remoteFetchThresholdBytes`, `remoteFetchChunkBytes` | Per-load remote-fetch tuning. |
 | `loadMtp` | Loads the model's MTP layers, which `draft-mtp` speculative decoding needs. Defaults to `false`. |
