@@ -250,7 +250,7 @@ load, metadata and capability helpers reflect the loaded model.
 
 Calling it again replaces the loaded model in the same runtime, in both direct
 and worker modes. The bridge first frees the current model, its multimodal
-projector and their filesystem copies, then downloads the new model, so both
+projector and any remaining filesystem copies, then downloads the new model, so both
 never occupy the WASM heap at once. If the download or native load then
 fails, no model stays loaded; call `loadModelFromUrl()` again. The core refuses
 the release while a generation or speech synthesis is active, and the current
@@ -794,7 +794,8 @@ loadMultimodalProjector(url: string): Promise<unknown>
 
 Loads a multimodal projector (`mmproj`) file and updates the vision/audio
 capability helpers. A relative URL resolves against the page's base URL, as
-for `loadModelFromUrl()`. Multimodal generation uses `createCompletion(prompt,
+for `loadModelFromUrl()`. Once loaded, the downloaded file is freed from the
+core filesystem, so it does not occupy the WASM heap. Multimodal generation uses `createCompletion(prompt,
 { parts })` after this succeeds. The bridge may restart or switch worker/direct
 execution modes to satisfy projector constraints.
 
