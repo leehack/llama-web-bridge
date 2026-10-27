@@ -300,6 +300,28 @@ assert.deepEqual(webGpuLaunchArgs('linux'), [
   const promptPenalty = () => ({
     steps: 2, best: 'a', unpenalized: 'b', neutral: 'a', penalized: 'b', grammar: 'a', emptyGrammar: 'a', optOut: 'a',
   });
+  const lazyGrammar = () => ({
+    beforeTokens: 3,
+    before: 'ab',
+    through: 'abcd',
+    word: 'cd',
+    triggered: { word: 'abcdyes', pattern: 'abcdno', 'pattern-full': 'abcdyes' },
+    strict: 'cdno',
+    tokenPiece: 'a',
+    tokenTriggered: 'ayes',
+    tokenNotSampled: 'abcd',
+    root: 'no',
+    errors: {
+      invalidPattern: 'Failed to start generation: Failed to initialize sampler chain (invalid grammar): '
+        + 'grammar trigger pattern ( is not a valid regular expression: x',
+      outOfVocabulary: 'Failed to initialize sampler chain (invalid grammar): grammar trigger token 2147483647 '
+        + 'is outside the vocabulary of 32000 tokens',
+      missingRoot: 'Failed to initialize sampler chain (invalid grammar): grammar rejected by llama.cpp',
+      rejectedTrigger: 'The lazy grammar rejected the text that triggered it: y',
+    },
+    afterErrors: 'abcd',
+  });
+  assert.deepEqual(Object.keys(lazyGrammar().triggered), grammarSmoke.LAZY_TRIGGER_RUNS);
   const capabilities = (supported) => Object.fromEntries(
     grammarSmoke.COMPLETION_CAPABILITIES.map((name) => [name, supported]),
   );
@@ -319,6 +341,7 @@ assert.deepEqual(webGpuLaunchArgs('linux'), [
       promptPenalty: promptPenalty(),
       thinkingRuns: thinkingRuns(),
       invalidThinkingBudgetError: 'RangeError: CompletionOptions.thinkingBudget.maxTokens must be an integer from 0 to 2147483647; got -1.',
+      lazyGrammar: lazyGrammar(),
       plainCompletionError: null,
     })),
     globalWorkerFallbackReason: null,
@@ -455,7 +478,7 @@ assert.deepEqual(webGpuLaunchArgs('linux'), [
         p.modeResults[3].capabilitiesAfterLoad = null;
       }), both, [
         "wasm64 worker: capabilities before the load: expected none, got {'presencePenalty': False, 'minP': True, 'thinkingBudget': False, "
-          + "'penaltyPromptTokens': False}",
+          + "'penaltyPromptTokens': False, 'lazyGrammar': False}",
         'wasm64 worker: capabilities after the load: expected all, got None',
         `wasm64 worker: sampler outputs: {${Object.entries(samplerRuns()).map(([n, t]) => `'${n}': '${t}'`).join(', ')}}`,
       ]],
@@ -463,6 +486,44 @@ assert.deepEqual(webGpuLaunchArgs('linux'), [
   }
   for (const [payload, memoryModes, expected] of grammarCases) {
     assert.deepEqual(grammarSmoke.validatePayload(payload, memoryModes), expected, expected.join('\n'));
+  }
+  const lazyCases = [
+    [{}, []],
+    [{ before: '', triggered: { word: 'cdyes', pattern: 'cdno', 'pattern-full': 'cdyes' } }, [
+      'the text before the trigger is empty, so it proves nothing',
+    ]],
+    [{ triggered: { word: 'cdyes', pattern: 'abcdmaybe', 'pattern-full': 'abcd' } }, [
+      'a word trigger did not leave the text before it unconstrained and constrain the rest',
+      'a pattern trigger did not leave the text before it unconstrained and constrain the rest',
+      'a pattern-full trigger did not leave the text before it unconstrained and constrain the rest',
+    ]],
+    [{ strict: 'abcdyes' }, ['the strict grammar did not constrain the output from the first token']],
+    [{ tokenTriggered: 'abyes' }, ['a token trigger did not constrain the text after the token']],
+    [{ tokenNotSampled: 'ayes' }, ['a token trigger that is never sampled constrained the output']],
+    [{ tokenPiece: undefined, tokenTriggered: undefined, tokenNotSampled: undefined }, [
+      'the first greedy token is a near tie or no usable text, so the token trigger was not run',
+    ]],
+    [{ root: 'unused' }, ['the grammar did not start at grammarRoot']],
+    [{ errors: { ...lazyGrammar().errors, invalidPattern: null, rejectedTrigger: 'Failed to initialize sampler chain (invalid grammar)' } }, [
+      "invalidPattern: expected an error containing '(invalid grammar)' and 'is not a valid regular expression', got None",
+      "rejectedTrigger: expected an error containing 'The lazy grammar rejected the text that triggered it', "
+        + "got 'Failed to initialize sampler chain (invalid grammar)'",
+    ]],
+    [{ afterErrors: 'abce' }, ['the unconstrained completion changed after the rejected grammars']],
+  ];
+  for (const [change, expected] of lazyCases) {
+    const failures = grammarSmoke.validateLazyGrammar({ lazyGrammar: { ...lazyGrammar(), ...change } });
+    assert.deepEqual(
+      failures.filter((failure) => !failure.startsWith('lazy grammar outputs: ')),
+      expected.map((failure) => `lazy grammar: ${failure}`),
+    );
+    assert.equal(failures.length, expected.length === 0 ? 0 : expected.length + 1);
+  }
+  for (const probe of [undefined, { beforeTokens: 12, before: 'ab', through: 'abab', word: null }]) {
+    assert.match(
+      grammarSmoke.validateLazyGrammar({ lazyGrammar: probe })[0],
+      /^lazy grammar: no 2-token window of the greedy completion after token 3 to 12 is new text: /,
+    );
   }
   const ntsCases = [
     [ntsPayload(), []],

@@ -204,15 +204,40 @@ export interface CompletionOptions {
   penalty?: number;
   /** Subtracted once from the logit of each token in the same 64-token window as `penalty`. 0, the default, disables it. A value that is not finite as a 32-bit float rejects. */
   presencePenalty?: number;
-  /** `false` keeps a text prompt out of the `penalty` and `presencePenalty` window, as a `grammar` does. For a caller that drops a grammar native llamadart would keep, such as llamadart dropping a lazy tool-call grammar on WebGPU, so its output matches native, which does not count the prompt with a lazy grammar. Omitted or null means true; any other non-boolean rejects. */
+  /** `false` keeps a text prompt out of the `penalty` and `presencePenalty` window, as a `grammar` does. For a caller that drops a grammar native llamadart would keep, such as llamadart dropping a lazy tool-call grammar on a core without `lazyGrammar`, so its output matches native, which does not count the prompt with a lazy grammar. Omitted or null means true; any other non-boolean rejects. */
   penaltyPromptTokens?: boolean | null;
+  /** GBNF grammar the output must match. An empty string constrains nothing. */
   grammar?: string;
+  /** `true` applies `grammar` only after one of `grammarTriggers` fires, as llama.cpp's lazy grammar does: text before the trigger is unconstrained, and the grammar starts at the trigger. Needs a non-empty `grammar` and at least one trigger. Omitted or null means false. */
+  grammarLazy?: boolean | null;
+  /** Activations for a lazy grammar. Always validated; applied only when `grammarLazy` is true. */
+  grammarTriggers?: readonly GrammarTrigger[] | null;
+  /** The `grammar` rule generation starts from. Defaults to `root`. */
+  grammarRoot?: string | null;
   seed?: number;
   /** Caps the tokens generated inside each reasoning block; text-only prompts. */
   thinkingBudget?: ThinkingBudgetOptions | null;
   /** Drafts tokens and verifies them with the loaded model; text-only prompts without `grammar` or `thinkingBudget`. With greedy sampling the output matches a completion without it. */
   speculativeDecoding?: SpeculativeDecodingOptions | null;
 }
+
+/**
+ * Fires a lazy grammar, as llama.cpp's `common_grammar_trigger` does. The grammar
+ * then constrains the output from where the trigger starts, so it must accept
+ * the trigger text.
+ *
+ * - `word`: `value` appears in the output.
+ * - `pattern`: the output contains a match of `value`, a C++ `std::regex`
+ *   ECMAScript expression (no lookbehind, named groups or flags); the grammar starts at its first non-empty capture group, else at
+ *   the match.
+ * - `pattern-full`: the whole output so far matches `value`, anchored with `^`
+ *   and `$`; the grammar starts as for `pattern`.
+ * - `token`: the model samples the token id `token`, which must be in the
+ *   vocabulary.
+ */
+export type GrammarTrigger =
+  | { type: 'word' | 'pattern' | 'pattern-full'; value: string }
+  | { type: 'token'; token: number };
 
 /** llama.cpp's reasoning budget: after `maxTokens` tokens inside a reasoning block, plus any that finish a UTF-8 character, the sampler forces `forcedMessage` and `endTag`. A grammar pauses after `startTag` until `endTag` completes. */
 export interface ThinkingBudgetOptions {
@@ -236,6 +261,8 @@ export interface CompletionCapabilities {
   thinkingBudget: boolean;
   /** The penalties count the prompt, and `CompletionOptions.penaltyPromptTokens` is applied. A core without it never counts the prompt, so `penaltyPromptTokens: false` holds there too. */
   penaltyPromptTokens: boolean;
+  /** `CompletionOptions.grammarLazy`, `grammarTriggers` and `grammarRoot` are applied. */
+  lazyGrammar: boolean;
   /** Each speculative strategy the loaded models can run now: `draft-mtp` needs a model loaded with `loadMtp` that has MTP layers, and the other `draft-*` strategies a matching `loadDraftModel` draft. */
   speculativeDecoding: Record<SpeculativeDecodingStrategy, boolean>;
 }

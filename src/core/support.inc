@@ -345,6 +345,7 @@ void end_generation_state() {
     llama_sampler_free(g_active_grammar);
     g_active_grammar = nullptr;
   }
+  g_active_grammar_lazy = false;
   g_generation_active = false;
   g_last_piece.clear();
   g_cancel_requested = false;
@@ -427,6 +428,7 @@ void free_runtime() {
   free_decision_heads();
   free_draft_model();
   g_next_speculative = speculative_request();
+  g_next_grammar = grammar_request();
 
   clear_pending_media();
 

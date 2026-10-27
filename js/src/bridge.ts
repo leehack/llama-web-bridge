@@ -3,7 +3,11 @@
 import { createAbortError } from './internal/abort.ts';
 import { embeddingAssetVersion, embeddingCapabilitiesFrom, missingEmbeddingCapability, snapshotEmbedInput } from './internal/embedding.ts';
 import { NO_COMPLETION_CAPABILITIES, resolveCompletionSamplingOptions } from './internal/completion_options.ts';
-import { INVALID_GRAMMAR_ERROR_TEXT, bridgeDisposedError } from './internal/constants.ts';
+import {
+  INVALID_GRAMMAR_ERROR_TEXT,
+  LAZY_GRAMMAR_REJECTED_ERROR_TEXT,
+  bridgeDisposedError,
+} from './internal/constants.ts';
 import {
   DECISION_API_VERSION,
   decisionError,
@@ -2181,7 +2185,11 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
       }
     } catch (error) {
       this._throwIfOperationCancelled(error, 'Generation was cancelled.');
-      if (serializeWorkerError(error).includes(INVALID_GRAMMAR_ERROR_TEXT)) {
+      const workerError = serializeWorkerError(error);
+      if (
+        workerError.includes(INVALID_GRAMMAR_ERROR_TEXT)
+        || workerError.includes(LAZY_GRAMMAR_REJECTED_ERROR_TEXT)
+      ) {
         throw error;
       }
       if (this._hasMediaParts(options)) {

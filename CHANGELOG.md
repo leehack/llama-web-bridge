@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- `createCompletion` takes `grammarLazy`, `grammarTriggers` (word, pattern, full-pattern and
+  token triggers) and `grammarRoot`, which apply llama.cpp's lazy grammar and start symbol;
+  `getCompletionCapabilities` reports `lazyGrammar`. An invalid trigger pattern or token rejects
+  instead of aborting the core.
 - Drop the unused reads of `__llamadartFetchBackendLastError` and `__llamadartFetchBackendStats`;
   the stock `-lwasmfs_fetch.js` never sets them, so the `model_fetch_js_error` and
   `model_fetch_stats` runtime notes were never emitted.

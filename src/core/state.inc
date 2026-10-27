@@ -25,6 +25,9 @@ llama_sampler * g_active_sampler = nullptr;
 // Kept out of g_active_sampler's chain so sample_next_token() can apply it
 // before or after truncation, as llama.cpp's common_sampler does.
 llama_sampler * g_active_grammar = nullptr;
+// A lazy grammar can reject its trigger text when the trigger fires inside
+// llama_sampler_accept, which throws.
+bool g_active_grammar_lazy = false;
 // Borrowed from g_active_sampler's chain, which owns and frees it.
 llama_sampler * g_active_reasoning_budget = nullptr;
 std::vector<llama_token_data> g_sampler_candidates;
@@ -111,6 +114,15 @@ struct speculative_request {
   int32_t max_tokens = 0;
 };
 speculative_request g_next_speculative;
+
+// Grammar root and lazy triggers for the next begin_generation, which
+// consumes them.
+struct grammar_request {
+  std::string root = "root";
+  bool lazy = false;
+  std::vector<common_grammar_trigger> triggers;
+};
+grammar_request g_next_grammar;
 
 // One speculative generation. Sequence 0 of the target memory holds
 // `history`. `id_last` was sampled but is not decoded yet. `output` holds the

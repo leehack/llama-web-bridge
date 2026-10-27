@@ -140,10 +140,67 @@ llama_token sample_next_token(const int32_t batch_index = -1) {
   }
 
   if (use_grammar) {
-    llama_sampler_accept(g_active_grammar, token);
+    if (!g_active_grammar_lazy) {
+      llama_sampler_accept(g_active_grammar, token);
+    } else {
+      std::string grammar_error;
+      if (!llamadart_webgpu_grammar_sampler_accept(
+              g_active_grammar, token, &grammar_error)) {
+        set_error(
+            "The lazy grammar rejected the text that triggered it: " +
+            grammar_error);
+        return LLAMA_TOKEN_NULL;
+      }
+    }
   }
   llama_sampler_accept(g_active_sampler, token);
   return token;
+}
+
+// Converts lazy grammar triggers into the patterns and tokens
+// llama_sampler_init_grammar_lazy_patterns takes, as llama.cpp's
+// common_sampler_init does. Returns false with error_out set for a trigger
+// llama.cpp would assert on or never fire.
+bool lazy_grammar_triggers(
+    const std::vector<common_grammar_trigger> & triggers,
+    std::vector<std::string> & patterns,
+    std::vector<llama_token> & tokens,
+    std::string & error_out) {
+  if (triggers.empty()) {
+    error_out = "a lazy grammar needs at least one trigger";
+    return false;
+  }
+  const int32_t n_vocab = llama_vocab_n_tokens(g_state.vocab);
+  for (const common_grammar_trigger & trigger : triggers) {
+    switch (trigger.type) {
+      case COMMON_GRAMMAR_TRIGGER_TYPE_WORD:
+        patterns.push_back(regex_escape(trigger.value));
+        break;
+      case COMMON_GRAMMAR_TRIGGER_TYPE_PATTERN:
+        patterns.push_back(trigger.value);
+        break;
+      case COMMON_GRAMMAR_TRIGGER_TYPE_PATTERN_FULL: {
+        const std::string & pattern = trigger.value;
+        std::string anchored = "^$";
+        if (!pattern.empty()) {
+          anchored = (pattern.front() != '^' ? "^" : "") + pattern +
+              (pattern.back() != '$' ? "$" : "");
+        }
+        patterns.push_back(anchored);
+        break;
+      }
+      case COMMON_GRAMMAR_TRIGGER_TYPE_TOKEN:
+        if (trigger.token < 0 || trigger.token >= n_vocab) {
+          error_out = "grammar trigger token " + std::to_string(trigger.token) +
+              " is outside the vocabulary of " + std::to_string(n_vocab) +
+              " tokens";
+          return false;
+        }
+        tokens.push_back(trigger.token);
+        break;
+    }
+  }
+  return true;
 }
 
 // Decodes prompt_tokens into sequence 0, keeping the longest prefix shared
@@ -289,6 +346,8 @@ int32_t begin_generation_impl(
   // The speculative request belongs to this call, even a rejected one.
   const speculative_request speculative = std::move(g_next_speculative);
   g_next_speculative = speculative_request();
+  const grammar_request grammar_options = std::move(g_next_grammar);
+  g_next_grammar = grammar_request();
   if (g_generation_active) {
     return -7;
   }
@@ -373,8 +432,33 @@ int32_t begin_generation_impl(
   llama_sampler_ptr grammar_sampler;
   if (grammar != nullptr && grammar[0] != '\0') {
     std::string grammar_error;
+    std::vector<std::string> trigger_patterns;
+    std::vector<llama_token> trigger_tokens;
+    if (grammar_options.lazy &&
+        !lazy_grammar_triggers(
+            grammar_options.triggers,
+            trigger_patterns,
+            trigger_tokens,
+            grammar_error)) {
+      set_error(
+          "Failed to initialize sampler chain (invalid grammar): " +
+          grammar_error);
+      return -5;
+    }
+    std::vector<const char *> trigger_pattern_ptrs;
+    for (const std::string & pattern : trigger_patterns) {
+      trigger_pattern_ptrs.push_back(pattern.c_str());
+    }
     grammar_sampler.reset(llamadart_webgpu_grammar_sampler_init(
-        g_state.vocab, grammar, "root", &grammar_error));
+        g_state.vocab,
+        grammar,
+        grammar_options.root.c_str(),
+        grammar_options.lazy,
+        trigger_pattern_ptrs.data(),
+        trigger_pattern_ptrs.size(),
+        trigger_tokens.data(),
+        trigger_tokens.size(),
+        &grammar_error));
     if (!grammar_sampler) {
       set_error(
           "Failed to initialize sampler chain (invalid grammar): " +
@@ -483,6 +567,7 @@ int32_t begin_generation_impl(
 
   g_active_reasoning_budget = reasoning_budget_ptr;
   g_active_grammar = grammar_sampler.release();
+  g_active_grammar_lazy = g_active_grammar != nullptr && grammar_options.lazy;
   g_generation_active = true;
   return 0;
 }
