@@ -427,10 +427,14 @@ query strings, and fragments before printing the location.
   fallback. The scan downloads
   every selected `assets.json` and `SHA256SUMS` by
   unique release-asset ID and runs the complete native release/tag/inventory
-  contract first. Each exact pipeline advances by at most one stage per scan,
-  and the complete backlog is visited so an older in-flight gate does not starve
-  a newer candidate. Publication remains ordered by native release time, so
-  output tags must follow the same order: an older native with no pipeline for
+  contract first. That contract accepts native `hook_contract_version` 1 and 2
+  and fails on any other; contract 2's `backend-*` sidecar archives (such as
+  Windows x64 CUDA) must be named
+  `llamadart-native-<platform>-<arch>-<variant>-<tag>.tar.gz` and are
+  checksum-verified like every other artifact. Each exact pipeline advances by
+  at most one stage per scan, and the complete backlog is visited so an older
+  in-flight gate does not starve a newer candidate. Publication remains ordered
+  by native release time, so output tags must follow the same order: an older native with no pipeline for
   the current build identity is `superseded` when a newer native release is in
   the scan or a newer native's pipeline still claims an output tag. Where its
   qualification or publication would be dispatched, an older pipeline bound to

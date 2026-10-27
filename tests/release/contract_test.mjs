@@ -447,15 +447,24 @@ test('test_native_manifest_provenance_and_checksum', () => {
   });
 });
 
-// Build the real v0.2.0-1 release shape with a branch target.
-function nativeReleaseFixture(directory, tag = 'v0.2.0-1', upstreamTag = 'v0.2.0') {
+// The v0.7.0-3 Windows x64 CUDA sidecar, as hook contract 2 lists it.
+function cudaSidecar(tag) {
+  return [`llamadart-native-windows-x64-cuda12-${tag}.tar.gz`, ['windows', 'x64', 'cuda', 'backend-cuda12']];
+}
+
+// Build the real v0.2.0-1 release shape with a branch target. Contract 2
+// fixtures list `sidecars` ([file, [platform, arch, backend, module]]) after
+// the core artifacts, in the manifest, SHA256SUMS and GitHub inventory alike.
+function nativeReleaseFixture(directory, {
+  tag = 'v0.2.0-1', upstreamTag = 'v0.2.0', hookContractVersion = 1, sidecars = [],
+} = {}) {
   const upstreamCommit = 'bb4caa7540188872173c44d161602d9271386413';
   const nativeCommit = 'e5c240e34b525da953ed98dc743516eef78cb738';
   const expected = expectedNativeArtifacts(tag);
   const artifacts = [];
   const checksumLines = [];
   const githubAssets = [];
-  pyItems(expected).forEach(([name, [platform, arch, backend, module]], index) => {
+  [...pyItems(expected), ...sidecars].forEach(([name, [platform, arch, backend, module]], index) => {
     const digest = sha256(`artifact-${index}`);
     const size = index + 100;
     artifacts.push({ module, platform, arch, backend, file: name, sha256: digest, size });
@@ -468,7 +477,7 @@ function nativeReleaseFixture(directory, tag = 'v0.2.0-1', upstreamTag = 'v0.2.0
     llama_cpp_commit: upstreamCommit,
     native_commit: nativeCommit,
     generated_at: '2026-08-22T00:00:00Z',
-    hook_contract_version: 1,
+    hook_contract_version: hookContractVersion,
     artifacts,
   };
   const manifestPath = path.join(directory, 'assets.json');
@@ -508,7 +517,7 @@ test('test_native_release_verifies_github_digest_hook_and_inventory', () => {
       const badRelease = clone(release);
       let badDigest;
       if (mutation === 'hook') {
-        badManifest.hook_contract_version = 2;
+        badManifest.hook_contract_version = 3;
         writeFileSync(manifestPath, dumps(badManifest), 'utf8');
         badDigest = sha256(readFileSync(manifestPath));
         badRelease.assets.at(-2).digest = `sha256:${badDigest}`;
@@ -527,6 +536,159 @@ test('test_native_release_verifies_github_digest_hook_and_inventory', () => {
       ), ContractError, mutation);
       writeFileSync(manifestPath, dumps(manifest), 'utf8');
     }
+  });
+});
+
+// Rewrite the fixture's manifest, SHA256SUMS and their GitHub records so only
+// the edited content differs from a consistent release.
+function rewriteNativeRelease(fixture, { manifest = fixture.manifest, manifestText = dumps(manifest), checksums } = {}) {
+  writeFileSync(fixture.manifestPath, manifestText, 'utf8');
+  if (checksums !== undefined) writeFileSync(fixture.checksumsPath, checksums, 'utf8');
+  const release = clone(fixture.release);
+  for (const [name, file] of [['assets.json', fixture.manifestPath], ['SHA256SUMS', fixture.checksumsPath]]) {
+    const record = release.assets.find((asset) => asset.name === name);
+    record.digest = `sha256:${sha256(readFileSync(file))}`;
+    record.size = statSync(file).size;
+  }
+  return { release, manifestDigest: sha256(readFileSync(fixture.manifestPath)) };
+}
+
+function validateFixture(fixture, { release = fixture.release, manifestDigest = fixture.manifestDigest } = {}) {
+  return validateNativeRelease(
+    fixture.manifestPath, fixture.checksumsPath, release, manifestDigest,
+    fixture.tag, fixture.upstreamTag, fixture.upstreamCommit, fixture.nativeCommit,
+  );
+}
+
+test('test_native_release_accepts_hook_contracts_1_and_2', () => {
+  for (const [label, options] of [
+    ['contract-1', { hookContractVersion: 1 }],
+    ['contract-2', { hookContractVersion: 2 }],
+    ['contract-2-cuda-sidecar', { tag: 'v0.7.0-3', upstreamTag: 'v0.7.0', hookContractVersion: 2, sidecars: [cudaSidecar('v0.7.0-3')] }],
+  ]) {
+    withTemporaryDirectory((directory) => {
+      const fixture = nativeReleaseFixture(directory, options);
+      assert.equal(validateFixture(fixture).nativeCommit, fixture.nativeCommit, label);
+    });
+  }
+});
+
+test('test_native_release_rejects_unknown_hook_contracts', () => {
+  for (const [label, version] of [
+    ['zero', '0'], ['three', '3'], ['string', '"2"'], ['float', '2.0'], ['exponent', '1e0'], ['bool', 'true'],
+    ['null', 'null'], ['missing', undefined],
+  ]) {
+    withTemporaryDirectory((directory) => {
+      const fixture = nativeReleaseFixture(directory);
+      const manifestText = version === undefined
+        ? dumps(without(fixture.manifest, 'hook_contract_version'))
+        : dumps(fixture.manifest).replace('"hook_contract_version": 1', `"hook_contract_version": ${version}`);
+      assert.notEqual(manifestText, dumps(fixture.manifest), label);
+      assert.throws(
+        () => validateFixture(fixture, rewriteNativeRelease(fixture, { manifestText })),
+        /unsupported native hook_contract_version/u,
+        label,
+      );
+    });
+  }
+});
+
+test('test_native_release_verifies_contract_2_backend_sidecars', () => {
+  const tag = 'v0.7.0-3';
+  const [cudaFile, cudaMetadata] = cudaSidecar(tag);
+  withTemporaryDirectory((directory) => {
+    // Contract 1 bundles CUDA in windows-x64, so a sidecar is not part of it.
+    const fixture = nativeReleaseFixture(directory, { tag, upstreamTag: 'v0.7.0', sidecars: [cudaSidecar(tag)] });
+    assert.throws(() => validateFixture(fixture), /artifact inventory is incomplete or unexpected/u, 'contract-1-sidecar');
+  });
+
+  const sidecarMutations = [
+    ['missing-github-asset', (fixture) => {
+      const release = clone(fixture.release);
+      release.assets = release.assets.filter((asset) => asset.name !== cudaFile);
+      return { release };
+    }],
+    ['missing-checksum', (fixture) => rewriteNativeRelease(fixture, {
+      checksums: readFileSync(fixture.checksumsPath, 'utf8').split('\n').filter((line) => !line.endsWith(cudaFile)).join('\n'),
+    })],
+    ['github-digest', (fixture) => {
+      const release = clone(fixture.release);
+      release.assets.find((asset) => asset.name === cudaFile).digest = `sha256:${'0'.repeat(64)}`;
+      return { release };
+    }],
+    ['github-size', (fixture) => {
+      const release = clone(fixture.release);
+      release.assets.find((asset) => asset.name === cudaFile).size += 1;
+      return { release };
+    }],
+  ];
+  const recordMutations = [
+    ['extra-key', (record) => ({ ...record, variant: 'cuda12' })],
+    ['missing-backend', (record) => without(record, 'backend')],
+    ['empty-backend', (record) => ({ ...record, backend: '' })],
+    ['non-string-arch', (record) => ({ ...record, arch: 64 })],
+    ['non-backend-module', (record) => ({ ...record, module: 'cuda12' })],
+  ];
+  for (const [label, mutate] of [
+    ...sidecarMutations,
+    ...recordMutations.map(([label, edit]) => [label, (fixture) => {
+      const manifest = clone(fixture.manifest);
+      const index = manifest.artifacts.findIndex((artifact) => artifact.file === cudaFile);
+      manifest.artifacts[index] = edit(manifest.artifacts[index]);
+      return rewriteNativeRelease(fixture, { manifest });
+    }]),
+    // A core bundle relabelled as a sidecar must not stand in for itself.
+    ['core-as-sidecar', (fixture) => {
+      const manifest = clone(fixture.manifest);
+      const index = manifest.artifacts.findIndex((artifact) => artifact.file === `llamadart-native-ios-arm64-sim-${tag}.tar.gz`);
+      manifest.artifacts[index] = { ...manifest.artifacts[index], arch: 'arm64', module: 'backend-sim' };
+      return rewriteNativeRelease(fixture, { manifest });
+    }],
+  ]) {
+    withTemporaryDirectory((directory) => {
+      const fixture = nativeReleaseFixture(directory, {
+        tag, upstreamTag: 'v0.7.0', hookContractVersion: 2, sidecars: [[cudaFile, cudaMetadata]],
+      });
+      validateFixture(fixture);
+      assert.throws(() => validateFixture(fixture, mutate(fixture)), ContractError, label);
+    });
+  }
+
+  // Each of these is listed consistently in the manifest, SHA256SUMS and the
+  // GitHub inventory, so only the sidecar rules can reject it.
+  for (const [label, sidecars] of [
+    ['other-bundle', [[cudaFile, ['linux', 'x64', 'cuda', 'backend-cuda12']]]],
+    ['empty-variant', [[`llamadart-native-windows-x64--${tag}.tar.gz`, cudaMetadata]]],
+    ['other-tag', [['llamadart-native-windows-x64-cuda12-v0.7.0-2.tar.gz', cudaMetadata]]],
+    ['zip', [[`llamadart-native-windows-x64-cuda12-${tag}.zip`, cudaMetadata]]],
+    ['uppercase-variant', [[`llamadart-native-windows-x64-CUDA12-${tag}.tar.gz`, cudaMetadata]]],
+    ['duplicate-backend', [
+      [cudaFile, cudaMetadata],
+      [`llamadart-native-windows-x64-cuda13-${tag}.tar.gz`, ['windows', 'x64', 'cuda', 'backend-cuda13']],
+    ]],
+    // llamadart keys a sidecar by `<platform>-<arch>`, so these share a bundle.
+    ['duplicate-bundle-spelling', [
+      [`llamadart-native-ios-arm64-sim-metal-${tag}.tar.gz`, ['ios', 'arm64-sim', 'metal', 'backend-metal']],
+      [`llamadart-native-ios-arm64-sim-metal2-${tag}.tar.gz`, ['ios-arm64', 'sim', 'metal', 'backend-metal2']],
+    ]],
+  ]) {
+    withTemporaryDirectory((directory) => {
+      const fixture = nativeReleaseFixture(directory, { tag, upstreamTag: 'v0.7.0', hookContractVersion: 2, sidecars });
+      assert.throws(() => validateFixture(fixture), /sidecar|is not named/u, label);
+    });
+  }
+
+  withTemporaryDirectory((directory) => {
+    const fixture = nativeReleaseFixture(directory, {
+      tag,
+      upstreamTag: 'v0.7.0',
+      hookContractVersion: 2,
+      sidecars: [
+        [cudaFile, cudaMetadata],
+        [`llamadart-native-linux-x64-rocm6-${tag}.tar.gz`, ['linux', 'x64', 'hip', 'backend-rocm6']],
+      ],
+    });
+    assert.equal(validateFixture(fixture).nativeCommit, fixture.nativeCommit, 'second-sidecar');
   });
 });
 
