@@ -234,7 +234,11 @@ scanned stable native release; each candidate gets its own exact
   speculative setup throws into load or generation errors, and
   `llamadart_webgpu_state_set_data` and `llamadart_webgpu_state_read_file`,
   which turn state restore throws on a truncated or mismatched snapshot into
-  a rejected state load. Do not widen it with `-fexceptions` or
+  a rejected state load. It also names `llama_init_from_model`, the
+  `llama_context` constructor and `sched_reserve` (mangled) and is applied to
+  `llama-context.cpp`, so a context that cannot be allocated is freed by
+  llama.cpp's own catch instead of leaking; configuration fails when those
+  upstream signatures change. Do not widen it with `-fexceptions` or
   `-fwasm-exceptions`: whole-TU catching puts `invoke_*` trampolines and their
   ASYNCIFY instrumentation on hot paths, and Wasm EH conflicts with ASYNCIFY.
   The link setting makes every other uncaught throw escape `ccall` as a

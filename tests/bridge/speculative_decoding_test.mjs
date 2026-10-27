@@ -608,7 +608,7 @@ const CASES = [
     assert.match(upstream, /common_speculative_type_from_name\(name\)/, 'the core maps names through llama.cpp');
   }],
 
-  ['only the grammar, LoRA, speculative and state restore wrappers catch exceptions and every new export is linked', () => {
+  ['only the grammar, LoRA, speculative and state restore wrappers and context creation catch exceptions and every new export is linked', () => {
     const allowed = cmake.match(/-sEXCEPTION_CATCHING_ALLOWED=\[([^\]]*)\]/)[1];
     const names = allowed.split(',').map((name) => name.trim().replace(/^'|'$/g, ''));
     assert.deepEqual(names, [
@@ -619,6 +619,9 @@ const CASES = [
       'llamadart_webgpu_speculative_init',
       'llamadart_webgpu_state_set_data',
       'llamadart_webgpu_state_read_file',
+      'llama_init_from_model',
+      '_ZN13llama_contextC2ERK11llama_model20llama_context_params',
+      '_ZN13llama_context13sched_reserveEv',
     ]);
     for (const name of names.slice(2, 5)) {
       assert.match(wrappers, new RegExp(`extern "C" __attribute__\\(\\(noinline\\)\\)[^\\n]*\\n${name}\\(`), `${name} must stay noinline`);
@@ -628,6 +631,35 @@ const CASES = [
     for (const [, name] of speculativeExports.matchAll(/EMSCRIPTEN_KEEPALIVE [^(]*?\b(llamadart_webgpu_\w+)\(/g)) {
       assert.ok(exported.includes(`'_${name}'`), `${name} is not in EXPORTED_FUNCTIONS`);
     }
+  }],
+
+  ['a draft context that cannot be allocated is freed by llama.cpp and names smaller batches or memory64', () => {
+    assert.match(
+      cmake,
+      /if \(DEFINED LLAMADART_CONTEXT_PATCHED\)\s+set\(LLAMADART_CONTEXT_INIT_SOURCE "\$\{LLAMADART_CONTEXT_PATCHED\}"\)\s+endif\(\)\s+set_property\(SOURCE "\$\{LLAMADART_CONTEXT_INIT_SOURCE\}" DIRECTORY "\$\{LLAMA_CPP_DIR\}\/src"\s+APPEND PROPERTY COMPILE_OPTIONS "\$\{LLAMADART_WEBGPU_EXCEPTION_CATCHING_ALLOWED\}"\)/,
+      'llama-context.cpp, or its patched copy, is compiled with the context names allowed to catch',
+    );
+    assert.ok(cmake.indexOf('include(cmake/embedding_mode_reserve.cmake)') < cmake.indexOf('if (DEFINED LLAMADART_CONTEXT_PATCHED)'));
+    for (const marker of [
+      String.raw`"llama_context::llama_context\\([ \t\r\n]*const llama_model & model,[ \t\r\n]*llama_context_params params\\)"`,
+      String.raw`"void llama_context::sched_reserve\\(\\) {"`,
+      '"failed to initialize the context: %s"',
+    ]) {
+      assert.ok(cmake.includes(marker), `configuration does not check ${marker}`);
+    }
+    assert.match(wrappers, /constexpr const char \* kContextInitFailure = "failed to initialize the context: ";/);
+    const draftContext = wrappers.slice(wrappers.indexOf('llamadart_webgpu_draft_context_init('));
+    assert.ok(
+      draftContext.indexOf('const context_init_log log;') < draftContext.indexOf('llama_init_from_model(model, params)'),
+      'the failure reason is captured around context creation',
+    );
+
+    const overflow = smoke.GROUPS.tiny.draftContextOverflow;
+    assert.deepEqual(Object.keys(overflow.errors), ['wasm32'], 'the memory64 core fits the same draft context');
+    assert.ok(overflow.attempts > 1, 'repeated failures expose a leak');
+    const hint = overflow.errors.wasm32.split('failed to allocate compute pp buffers. ')[1];
+    const create = functionBody('llama_context * create_draft_context(').replace(/"\s+"/g, '');
+    assert.ok(hint && create.includes(`". ${hint}`), 'the smoke expects the core\'s wasm32 hint');
   }],
 
   ['the core validates a speculative request before it changes generation state', () => {

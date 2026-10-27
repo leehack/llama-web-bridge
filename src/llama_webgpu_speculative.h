@@ -16,7 +16,8 @@
 // linked with catching enabled (EXCEPTION_CATCHING_ALLOWED in
 // CMakeLists.txt). A throw unwinds straight to them without running upstream
 // destructors, so a rejected load or configuration leaks what upstream built
-// before it. Each returns nullptr and sets error_out on failure.
+// before it; a context is the exception, since llama_init_from_model catches
+// and frees it itself. Each returns nullptr and sets error_out on failure.
 
 // Loads a draft model. std::bad_alloc is reported as not fitting in memory.
 extern "C" llama_model * llamadart_webgpu_draft_model_load_file(
@@ -24,8 +25,8 @@ extern "C" llama_model * llamadart_webgpu_draft_model_load_file(
     llama_model_params params,
     std::string * error_out);
 
-// Creates a draft context. std::bad_alloc is reported as not fitting in
-// memory.
+// Creates a draft context. error_out is the reason llama_init_from_model
+// logged for a context it could not create.
 extern "C" llama_context * llamadart_webgpu_draft_context_init(
     llama_model * model,
     llama_context_params params,

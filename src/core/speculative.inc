@@ -288,7 +288,16 @@ llama_context * create_draft_context(
   llama_context * ctx =
       llamadart_webgpu_draft_context_init(model, cparams, &init_error);
   if (ctx == nullptr) {
-    set_error("Failed to create the speculative draft context: " + init_error);
+    std::string error = "Failed to create the speculative draft context: " + init_error;
+    // The draft context inherits the target's nBatch and nUbatch, which size
+    // its compute buffers. Only CPU buffers live in the wasm32 heap.
+    if (init_error.find("failed to allocate compute") != std::string::npos) {
+      error += sizeof(void *) == 4 && !g_model_uses_gpu_ops
+          ? ". It does not fit in the wasm32 core's 4 GiB of memory: load the model with a smaller "
+            "nBatch and nUbatch, or use the memory64 core (coreModuleUrlMem64 and preferMemory64)"
+          : ". It does not fit in memory: load the model with a smaller nBatch and nUbatch";
+    }
+    set_error(error);
     return nullptr;
   }
   llama_set_abort_callback(ctx, should_abort_callback, nullptr);

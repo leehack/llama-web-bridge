@@ -170,10 +170,36 @@ add_executable(llama_webgpu_core
 # instrumentation they would pull in. The link setting also changes how every
 # other throw surfaces; llama_webgpu_core_post.js turns those back into aborts.
 set(LLAMADART_WEBGPU_EXCEPTION_CATCHING_ALLOWED
-    "-sEXCEPTION_CATCHING_ALLOWED=['llamadart_webgpu_grammar_sampler_init','llamadart_webgpu_lora_adapter_init','llamadart_webgpu_draft_model_load_file','llamadart_webgpu_draft_context_init','llamadart_webgpu_speculative_init','llamadart_webgpu_state_set_data','llamadart_webgpu_state_read_file']")
+    "-sEXCEPTION_CATCHING_ALLOWED=['llamadart_webgpu_grammar_sampler_init','llamadart_webgpu_lora_adapter_init','llamadart_webgpu_draft_model_load_file','llamadart_webgpu_draft_context_init','llamadart_webgpu_speculative_init','llamadart_webgpu_state_set_data','llamadart_webgpu_state_read_file','llama_init_from_model','_ZN13llama_contextC2ERK11llama_model20llama_context_params','_ZN13llama_context13sched_reserveEv']")
 set(LLAMADART_WEBGPU_CORE_POST_JS "${CMAKE_CURRENT_SOURCE_DIR}/src/llama_webgpu_core_post.js")
 set_source_files_properties(src/llama_webgpu_grammar.cpp src/llama_webgpu_lora.cpp src/llama_webgpu_speculative.cpp src/llama_webgpu_state.cpp PROPERTIES
     COMPILE_OPTIONS "${LLAMADART_WEBGPU_EXCEPTION_CATCHING_ALLOWED}")
+
+# A context llama.cpp cannot create, such as one whose compute or KV buffers do
+# not fit, throws from llama_context's constructor. Without catching there the
+# throw skips every destructor, so each failure leaks the partial context until
+# the heap is exhausted. Catching in llama_init_from_model, the constructor and
+# sched_reserve (the mangled names above) runs llama.cpp's own cleanup and
+# nullptr return, as a native build does.
+set(LLAMADART_CONTEXT_INIT_SOURCE "${LLAMA_CPP_DIR}/src/llama-context.cpp")
+file(READ "${LLAMADART_CONTEXT_INIT_SOURCE}" LLAMADART_CONTEXT_INIT_CONTENT)
+foreach(LLAMADART_CONTEXT_INIT_MARKER
+    "llama_context::llama_context\\([ \t\r\n]*const llama_model & model,[ \t\r\n]*llama_context_params params\\)"
+    "void llama_context::sched_reserve\\(\\) {"
+    "llama_context \\* llama_init_from_model\\("
+    "failed to initialize the context: %s")
+    string(REGEX MATCH "${LLAMADART_CONTEXT_INIT_MARKER}" LLAMADART_CONTEXT_INIT_MATCH
+        "${LLAMADART_CONTEXT_INIT_CONTENT}")
+    if (NOT LLAMADART_CONTEXT_INIT_MATCH)
+        message(FATAL_ERROR "llama-context.cpp no longer matches '${LLAMADART_CONTEXT_INIT_MARKER}'; "
+            "update the llama_context names in EXCEPTION_CATCHING_ALLOWED and the draft context log capture")
+    endif()
+endforeach()
+if (DEFINED LLAMADART_CONTEXT_PATCHED)
+    set(LLAMADART_CONTEXT_INIT_SOURCE "${LLAMADART_CONTEXT_PATCHED}")
+endif()
+set_property(SOURCE "${LLAMADART_CONTEXT_INIT_SOURCE}" DIRECTORY "${LLAMA_CPP_DIR}/src"
+    APPEND PROPERTY COMPILE_OPTIONS "${LLAMADART_WEBGPU_EXCEPTION_CATCHING_ALLOWED}")
 set_target_properties(llama_webgpu_core PROPERTIES
     LINK_DEPENDS "${LLAMADART_WEBGPU_CORE_POST_JS}")
 

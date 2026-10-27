@@ -33,7 +33,8 @@ runtimes of the wasm32 and wasm64 cores, runs a greedy completion without
 speculative decoding, then the same completion with each strategy. Every
 speculative output must equal the baseline text and token count, report
 speculative usage, and draft tokens where the group expects them. Rejected
-requests must leave the runtime usable.`;
+requests, and a draft context too large for the wasm32 core, must leave the
+runtime usable.`;
 
 export const MEMORY_MODES = Object.freeze(['wasm32', 'wasm64']);
 export const RUNTIME_MODES = Object.freeze(['direct', 'worker']);
@@ -127,6 +128,19 @@ export const GROUPS = Object.freeze({
       { label: 'malformed n-gram cache', strategies: ['ngram-cache'], cache: 'malformed', error: 'n-gram cache is malformed' },
       { label: 'draft-mtp without MTP layers', strategies: ['draft-mtp'], error: "draft-mtp needs the model's MTP head" },
     ],
+    // With these load options the draft context's compute buffers need more
+    // than the target leaves of the wasm32 core's 4 GiB, but fit the memory64
+    // core. A failed draft context must free what it allocated, keep the target
+    // usable and let the model load again.
+    draftContextOverflow: {
+      loadOptions: { nCtx: 98304, nBatch: 2048, nUbatch: 2048, flashAttention: 0 },
+      strategies: ['draft-simple'],
+      draft: 'smoke_model',
+      attempts: 3,
+      errors: {
+        wasm32: "Failed to create the speculative draft context: failed to allocate compute pp buffers. It does not fit in the wasm32 core's 4 GiB of memory: load the model with a smaller nBatch and nUbatch, or use the memory64 core",
+      },
+    },
   },
   smollm2: {
     target: 'smollm2_360m',
@@ -292,15 +306,17 @@ export function renderHarness(groups, nCtx, memoryModes, runtimeModes, gpuLayers
       };
       const runs = [];
       const rejections = [];
+      let overflowResult = null;
+      const loadOptions = {
+        nCtx: config.nCtx,
+        nThreads: 2,
+        nGpuLayers: config.gpuLayers,
+        useCache: false,
+        forceRemoteFetchBackend: false,
+        ...(group.loadOptions || {}),
+      };
       try {
-        await bridge.loadModelFromUrl('/' + group.target, {
-          nCtx: config.nCtx,
-          nThreads: 2,
-          nGpuLayers: config.gpuLayers,
-          useCache: false,
-          forceRemoteFetchBackend: false,
-          ...(group.loadOptions || {}),
-        });
+        await bridge.loadModelFromUrl('/' + group.target, loadOptions);
         const baselines = {};
         let loadedDraft = null;
         for (const run of group.runs) {
@@ -367,6 +383,48 @@ export function renderHarness(groups, nCtx, memoryModes, runtimeModes, gpuLayers
             rejection.label + ': expected ' + JSON.stringify(rejection.error) + ', got ' + JSON.stringify(error));
           rejections.push({ label: rejection.label, error });
         }
+        const overflow = group.draftContextOverflow;
+        if (overflow) {
+          const label = 'draft context overflow';
+          const expected = overflow.errors[memoryMode] || null;
+          const speculativeDecoding = { strategies: overflow.strategies };
+          // The direct runtime's core is reachable, so its heap shows what a
+          // failed draft context leaks.
+          const core = expected && runtimeMode === 'direct' && bridge._runtime ? bridge._runtime._core : null;
+          const headroom = () => (core ? Number(core.ccall('llamadart_webgpu_heap_headroom_bytes', 'number', [], [])) : null);
+          await bridge.loadModelFromUrl('/' + group.target, { ...loadOptions, ...overflow.loadOptions });
+          const baseline = await complete(bridge, config.prompts.draft, null);
+          await bridge.loadDraftModel('/' + overflow.draft, { useCache: false });
+          const before = headroom();
+          const errors = [];
+          for (let attempt = 0; attempt < overflow.attempts; attempt += 1) {
+            let error = null;
+            let text = null;
+            try {
+              text = (await complete(bridge, config.prompts.draft, speculativeDecoding)).text;
+            } catch (caught) {
+              error = errorText(caught);
+            }
+            errors.push(error);
+            if (expected) {
+              check(error !== null && error.includes(expected),
+                label + ': expected ' + JSON.stringify(expected) + ', got ' + JSON.stringify(error));
+            } else {
+              check(error === null && text === baseline.text, label + ': the draft context failed or changed the output: ' + JSON.stringify(error));
+            }
+          }
+          const leakedBytes = before === null ? null : before - headroom();
+          check(leakedBytes === null || leakedBytes < 1024 * 1024,
+            label + ': ' + overflow.attempts + ' draft contexts leaked ' + leakedBytes + ' bytes');
+          check((await complete(bridge, config.prompts.draft, null)).text === baseline.text,
+            label + ': the target changed its output after the draft contexts');
+          await bridge.loadModelFromUrl('/' + group.target, loadOptions);
+          await bridge.loadDraftModel('/' + overflow.draft, { useCache: false });
+          const recovered = await complete(bridge, config.prompts.draft, speculativeDecoding);
+          check(recovered.text === (baselines.draft || recovered).text,
+            label + ': speculative decoding after the model reload differs from the baseline');
+          overflowResult = { errors, leakedBytes };
+        }
         const after = await complete(bridge, config.prompts.draft, null);
         check(after.text === (baselines.draft || after).text, 'the runtime changed its output after the speculative runs');
         const metadata = bridge.getModelMetadata();
@@ -378,13 +436,14 @@ export function renderHarness(groups, nCtx, memoryModes, runtimeModes, gpuLayers
           failures,
           runs,
           rejections,
+          overflow: overflowResult,
           backend,
           execution: metadata['llamadart.webgpu.execution'] || null,
           coreVariant: metadata['llamadart.webgpu.core_variant'] || null,
           workerFallbackReason: metadata['llamadart.webgpu.worker_fallback_reason'] || null,
         };
       } catch (error) {
-        return { mode, group: group.name, failures: [...failures, 'threw: ' + errorText(error)], runs, rejections };
+        return { mode, group: group.name, failures: [...failures, 'threw: ' + errorText(error)], runs, rejections, overflow: overflowResult };
       } finally {
         await bridge.dispose();
       }

@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- A speculative draft context that cannot be allocated, such as an EAGLE3 draft at
+  `nBatch`/`nUbatch` 2048 on the wasm32 core, is freed instead of leaking, so repeated
+  attempts and later model loads no longer abort the runtime. Its error names smaller
+  `nBatch` and `nUbatch` or the memory64 core. A main or decision context that does not fit
+  now rejects its load instead of aborting.
 - Drop the unused reads of `__llamadartFetchBackendLastError` and `__llamadartFetchBackendStats`;
   the stock `-lwasmfs_fetch.js` never sets them, so the `model_fetch_js_error` and
   `model_fetch_stats` runtime notes were never emitted.
