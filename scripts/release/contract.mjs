@@ -35,7 +35,10 @@ export { ContractError };
 export const BRIDGE_REPOSITORY = 'leehack/llama-web-bridge';
 export const ASSETS_REPOSITORY = 'leehack/llama-web-bridge-assets';
 export const NATIVE_REPOSITORY = 'leehack/llamadart-native';
-export const NATIVE_HOOK_CONTRACT_VERSION = 1;
+// Contract 2 adds `backend-*` sidecar archives beside the contract 1 bundles.
+// The bridge uses only a native release's upstream pin, so a contract changes
+// only the artifact inventory verified here.
+export const NATIVE_HOOK_CONTRACT_VERSIONS = Object.freeze([1, 2]);
 
 // The heavy real-model ASR/TTS gates run in their own hosted qualification run
 // rather than inside the candidate build, so a candidate declares the pending
@@ -451,6 +454,43 @@ export function expectedNativeArtifacts(tag) {
   return pyDict(pairs);
 }
 
+const NATIVE_SIDECAR_ARCHIVE_RE = /^[a-z0-9][a-z0-9._-]*$/u;
+
+// File name -> [platform, arch, backend, module] for each `backend-*` sidecar
+// a contract 2 manifest lists, with llamadart's hook naming rule
+// `llamadart-native-<platform>-<arch>-<variant>-<tag>.tar.gz`.
+function nativeBackendSidecars(manifestAssets, tag, coreNames) {
+  const prefix = 'llamadart-native-';
+  const suffix = `-${pyStr(tag)}.tar.gz`;
+  const pairs = [];
+  const backends = new Set();
+  for (const [name, artifact] of manifestAssets) {
+    const module = pyGet(artifact, 'module');
+    if (typeof module !== 'string' || !module.startsWith('backend-')) continue;
+    const platform = pyGet(artifact, 'platform');
+    const arch = pyGet(artifact, 'arch');
+    const backend = pyGet(artifact, 'backend');
+    if (![platform, arch, backend].every((value) => typeof value === 'string' && value)) {
+      throw new ContractError(`native manifest has a malformed ${module} artifact ${pyRepr(name)}`);
+    }
+    const bundle = `${platform}-${arch}-`;
+    const archive = name.startsWith(prefix) && name.endsWith(suffix) ? name.slice(prefix.length, -suffix.length) : '';
+    if (
+      !archive.startsWith(bundle)
+      || archive.length === bundle.length
+      || NATIVE_SIDECAR_ARCHIVE_RE.exec(archive) === null
+      || coreNames.includes(name)
+    ) {
+      throw new ContractError(`native ${module} artifact ${pyRepr(name)} is not named ${prefix}${bundle}<variant>${suffix}`);
+    }
+    const key = JSON.stringify([`${platform}-${arch}`, backend]);
+    if (backends.has(key)) throw new ContractError(`native manifest lists more than one ${backend} sidecar for ${platform}-${arch}`);
+    backends.add(key);
+    pairs.push([name, Object.freeze([platform, arch, backend, module])]);
+  }
+  return pairs;
+}
+
 function releaseAssets(release) {
   const rawAssets = pyGet(release, 'assets');
   if (!Array.isArray(rawAssets)) throw new ContractError('native GitHub release is missing its asset inventory');
@@ -553,13 +593,17 @@ export function validateNativeRelease(
 
   const payload = strictJsonLoads(pyReadText(manifestPath), 'native release manifest');
   const hookContractVersion = pyGet(payload, 'hook_contract_version');
-  if (!pyEquals(hookContractVersion, NATIVE_HOOK_CONTRACT_VERSION)) {
-    throw new ContractError(`unsupported native hook_contract_version: ${pyRepr(hookContractVersion)}`);
+  // Strict equality, as llamadart's hook requires a JSON integer: 2.0 or true
+  // must not pass as a contract.
+  const contractVersion = NATIVE_HOOK_CONTRACT_VERSIONS.find((version) => hookContractVersion === version);
+  if (contractVersion === undefined) {
+    throw new ContractError(
+      `unsupported native hook_contract_version: ${pyRepr(hookContractVersion)}; `
+      + `supported: ${NATIVE_HOOK_CONTRACT_VERSIONS.join(', ')}`,
+    );
   }
   const artifacts = pyGet(payload, 'artifacts');
   if (!Array.isArray(artifacts)) throw new ContractError('native manifest artifacts must be a list');
-  const expected = expectedNativeArtifacts(nativeReleaseTag);
-  const expectedNames = pyKeys(expected);
   const manifestAssets = new Map();
   for (const artifact of artifacts) {
     if (!isDict(artifact) || typeof pyGet(artifact, 'file') !== 'string') {
@@ -569,6 +613,12 @@ export function validateNativeRelease(
     if (manifestAssets.has(name)) throw new ContractError(`native manifest has duplicate artifact ${pyRepr(name)}`);
     manifestAssets.set(name, artifact);
   }
+  const coreArtifacts = pyItems(expectedNativeArtifacts(nativeReleaseTag));
+  const sidecars = contractVersion >= 2
+    ? nativeBackendSidecars(manifestAssets, nativeReleaseTag, coreArtifacts.map(([name]) => name))
+    : [];
+  const expected = pyDict([...coreArtifacts, ...sidecars]);
+  const expectedNames = pyKeys(expected);
   if (!pyKeySetEquals(manifestAssets, expectedNames)) {
     throw new ContractError('native manifest artifact inventory is incomplete or unexpected');
   }
