@@ -464,6 +464,11 @@ capped at that value. A request the loaded models cannot run, such as
 `draft-mtp` without MTP layers or `draft-dflash` with a DSpark draft, rejects
 with a message naming what is missing.
 
+The draft context inherits the target's `nBatch` and `nUbatch`. When its
+buffers do not fit, generation rejects, the partial context is freed and the
+target stays usable; reload the model with a smaller `nBatch` and `nUbatch`, or
+use the memory64 core on wasm32.
+
 ## Draft models
 
 ### `loadDraftModel(url, options?)`

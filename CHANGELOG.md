@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- A speculative draft context that cannot be allocated, such as an EAGLE3 draft at
+  `nBatch`/`nUbatch` 2048 on the wasm32 core, is freed instead of leaking, so repeated
+  attempts and later model loads no longer abort the runtime. Its error names smaller
+  `nBatch` and `nUbatch` or the memory64 core. A model whose context does not fit now rejects
+  its load instead of aborting.
 - `createCompletion` takes `grammarLazy`, `grammarTriggers` (word, pattern, full-pattern and
   token triggers) and `grammarRoot`, which apply llama.cpp's lazy grammar and start symbol;
   `getCompletionCapabilities` reports `lazyGrammar`. An invalid trigger pattern or token rejects
