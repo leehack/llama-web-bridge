@@ -2632,6 +2632,12 @@ export class LlamaWebGpuBridgeRuntime {
           core.ccall('llamadart_webgpu_mmproj_supports_audio', 'number', [], []),
         ) === 1;
         this._mmProjSourceUrl = url;
+        // mtmd has copied the tensors into its own buffers. A resident GGUF
+        // copy leaves wasm32 too little heap to re-reserve the context's
+        // compute buffer, which every embedding call does.
+        if (this._deleteFsFile(mmprojPath)) {
+          this._runtimeNotes.push('mmproj_file_released');
+        }
         return 1;
       } catch (error) {
         lastError = error;

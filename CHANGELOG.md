@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- `loadMultimodalProjector` frees its downloaded GGUF once the projector is loaded instead of
+  keeping a second copy in the wasm heap. On the wasm32 core, repeated media `embedBatch` calls
+  with EmbeddingGemma-2 BF16 at `nCtx`/`nBatch`/`nUbatch` 4096 no longer abort with
+  `Aborted(undefined)` from a compute buffer allocation failure.
 - A speculative draft context that cannot be allocated, such as an EAGLE3 draft at
   `nBatch`/`nUbatch` 2048 on the wasm32 core, is freed instead of leaking, so repeated
   attempts and later model loads no longer abort the runtime. Its error names smaller

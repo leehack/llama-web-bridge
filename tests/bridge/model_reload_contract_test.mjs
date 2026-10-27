@@ -269,7 +269,6 @@ const cases = [
 
     await runtime.loadModelFromUrl('https://models.test/a.gguf', loadOptions);
     await runtime.loadMultimodalProjector('https://models.test/mmproj-a.gguf');
-    assert.ok(fs.files.has('/mmproj/mmproj-a.gguf'));
     assert.equal(runtime.supportsVision(), true);
     fs.mkdir('/media');
     fs.writeFile('/media/staged.bin', new Uint8Array([9]));
@@ -288,8 +287,29 @@ const cases = [
     assert.equal(runtime.supportsVision(), false);
 
     await runtime.loadMultimodalProjector('https://models.test/mmproj-b.gguf');
-    assert.deepEqual(fs.readdir('/mmproj'), ['.', '..', 'mmproj-b.gguf'], 'the projector directory must be reusable');
+    assert.deepEqual(core.trace.at(-1), ['mmproj', '/mmproj/mmproj-b.gguf'], 'the projector directory must be reusable');
     assert.deepEqual(fs.analyzed, []);
+  }],
+
+  ['a loaded projector releases its staged file and still unloads and reloads', async () => {
+    const { runtime, core, fs } = createRuntime();
+
+    await runtime.loadModelFromUrl('https://models.test/a.gguf', loadOptions);
+    await runtime.loadMultimodalProjector('https://models.test/mmproj-a.gguf');
+
+    assert.deepEqual(core.trace.at(-1), ['mmproj', '/mmproj/mmproj-a.gguf']);
+    assert.equal(fs.files.size, 0, 'the native projector owns its tensors; the staged GGUF must not stay in the heap');
+    assert.ok(runtime._runtimeNotes.includes('mmproj_file_released'));
+    assert.equal(runtime.supportsVision(), true);
+    assert.equal(runtime.getModelMetadata()['llamadart.webgpu.mmproj_loaded'], '1');
+
+    await runtime.unloadMultimodalProjector();
+    assert.equal(core.projector, null);
+    assert.equal(runtime.getModelMetadata()['llamadart.webgpu.mmproj_loaded'], '0');
+
+    await runtime.loadMultimodalProjector('https://models.test/mmproj-a.gguf');
+    assert.equal(core.projector, '/mmproj/mmproj-a.gguf');
+    assert.equal(fs.files.size, 0);
   }],
 
   ['a failed replacement leaves no model and no files behind', async () => {
