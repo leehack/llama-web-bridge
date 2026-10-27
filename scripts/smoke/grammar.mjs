@@ -228,7 +228,7 @@ const INVALID_THINKING_BUDGET = { ...THINK_TAGS, maxTokens: -1 };
 // triggerTokens tokens after at least minBeforeTokens tokens whose text does
 // not occur earlier, searched up to maxBeforeTokens, becomes the trigger.
 export const LAZY_GRAMMAR = Object.freeze({
-  prompt: 'Here is the tool call:',
+  prompt: SAMPLER_PROMPT,
   options: { temp: 0, topK: 1, penalty: 1, seed: 5 },
   minBeforeTokens: 3,
   maxBeforeTokens: 12,
