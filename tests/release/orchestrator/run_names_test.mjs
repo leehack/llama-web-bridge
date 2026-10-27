@@ -46,15 +46,20 @@ test('test_correlation_id_changes_with_native_manifest', () => {
   assert.notEqual(runNames.computeCorrelationId(makeProvenance()), other);
 });
 
-test('correlation native release tag reads back the tag computeCorrelationId used', () => {
+test('correlation native identity reads back what computeCorrelationId used', () => {
   for (const nativeReleaseTag of ['v0.2.0', 'v0.7.0-2', 'v10.20.30-11']) {
     const correlationId = runNames.computeCorrelationId(makeProvenance({ nativeReleaseTag }));
-    assert.equal(runNames.correlationNativeReleaseTag(correlationId), nativeReleaseTag);
+    assert.deepEqual(runNames.correlationNativeIdentity(correlationId), {
+      nativeReleaseTag, nativeManifestPrefix: NATIVE_MANIFEST_SHA.slice(0, 16),
+    });
   }
-  assert.equal(runNames.correlationNativeReleaseTag(runNames.computeCorrelationId(makeLegacyV0140Provenance())), 'v0.3.0');
+  const legacy = makeLegacyV0140Provenance();
+  assert.deepEqual(runNames.correlationNativeIdentity(runNames.computeCorrelationId(legacy)), {
+    nativeReleaseTag: 'v0.3.0', nativeManifestPrefix: legacy.nativeManifestSha256.slice(0, 16),
+  });
   for (const other of ['kanban:t_7f112b91:web-v0.1.39', 'auto-stable-b8000-2e5d29d7f98f0d71', 'auto-stable-v0.2.0-0-2e5d29d7f98f0d71',
     'auto-stable-v0.07.0-2e5d29d7f98f0d71', null]) {
-    assert.equal(runNames.correlationNativeReleaseTag(other), null, String(other));
+    assert.equal(runNames.correlationNativeIdentity(other), null, String(other));
   }
 });
 

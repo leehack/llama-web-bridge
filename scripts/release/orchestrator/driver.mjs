@@ -6,8 +6,8 @@
 // deterministic run-name readback.
 
 import {
-  ASSETS_REPOSITORY, BRIDGE_REPOSITORY, Channel, ContractError, parseReleaseTag, validateImmutableReleaseGovernance,
-  validatePublicationEnvironment,
+  ASSETS_REPOSITORY, BRIDGE_REPOSITORY, Channel, ContractError, NATIVE_REPOSITORY, parseReleaseTag,
+  validateImmutableReleaseGovernance, validatePublicationEnvironment,
 } from '../contract.mjs';
 import {
   isDict, pyGet, pyJoinPath, pyPath, pyRepr, pyStr,
@@ -16,7 +16,7 @@ import { candidatePublicationDigests } from '../publication_state.mjs';
 import { pyCompareIntTuples } from '../python_compat.mjs';
 import {
   correlationMarker, fetchAssetReleases, fetchAssetTagNames, findCorrelatedRelease, latestAlignedRelease,
-  latestPublishedNativeAlignment, newestPublishedStableRelease, publicationBytesIdentical, verifyPublishedRelease,
+  latestPublishedNativeAlignment, newestPublishedStableRelease, pages, publicationBytesIdentical, verifyPublishedRelease,
   workflowHistorySince,
 } from './asset_releases.mjs';
 import {
@@ -31,7 +31,7 @@ import {
   releaseTagClaims, runNameCorrelationId, selectNextReleaseTarget,
 } from './release_tags.mjs';
 import {
-  computeCorrelationId, correlationNativeReleaseTag, parsePublishRunName, publishRunName, qualificationRunName,
+  computeCorrelationId, correlationNativeIdentity, parsePublishRunName, publishRunName, qualificationRunName,
 } from './run_names.mjs';
 import { makeDirectories, verifyCandidateRun, verifyQualificationRun } from './stage_proofs.mjs';
 import {
@@ -166,8 +166,50 @@ export function stageCorrelationMatcher(plan) {
 // Whether `correlationId` is a pipeline of a native release newer than
 // `nativeReleaseTag`.
 function namesNewerNative(correlationId, nativeReleaseTag) {
-  const other = correlationNativeReleaseTag(correlationId);
-  return other !== null && pyCompareIntTuples(nativeReleaseOrder(other), nativeReleaseOrder(nativeReleaseTag)) > 0;
+  const other = correlationNativeIdentity(correlationId);
+  return other !== null
+    && pyCompareIntTuples(nativeReleaseOrder(other.nativeReleaseTag), nativeReleaseOrder(nativeReleaseTag)) > 0;
+}
+
+export function fetchNativeReleases(gateway) {
+  const payload = gateway.apiJson(`repos/${NATIVE_REPOSITORY}/releases?per_page=100`, { paginate: true });
+  const releases = [];
+  for (const page of pages(payload, 'native releases')) {
+    for (const release of Array.isArray(page) ? page : [page]) {
+      if (!isMapping(release)) throw new ContractError('native release record must be a JSON object');
+      releases.push(release);
+    }
+  }
+  return releases;
+}
+
+// Why a newer native's tag `claim` proves nothing, or null when it is the
+// pipeline of a published stable native release whose assets.json is the
+// manifest its correlation names. Native releases are mutable, so a deleted,
+// drafted or re-uploaded release leaves a claim that no scan advances.
+export function unprovenNativeClaim(nativeReleases, claim) {
+  const { nativeReleaseTag, nativeManifestPrefix } = correlationNativeIdentity(claim.correlationId);
+  const subject = (
+    `the pipeline of newer native release ${nativeReleaseTag} claims ${claim.releaseTag} `
+    + `(correlation ${claim.correlationId})`
+  );
+  const release = nativeReleases.find((record) => pyGet(record, 'tag_name') === nativeReleaseTag);
+  if (
+    release === undefined
+    || pyGet(release, 'draft') !== false
+    || pyGet(release, 'prerelease') !== parseReleaseTag(nativeReleaseTag).githubPrerelease
+  ) {
+    return `${subject}, but ${nativeReleaseTag} is not a published stable native release`;
+  }
+  const assets = pyGet(release, 'assets');
+  const manifests = Array.isArray(assets)
+    ? assets.filter((asset) => isMapping(asset) && pyGet(asset, 'name') === 'assets.json')
+    : [];
+  const digest = manifests.length === 1 ? pyGet(manifests[0], 'digest') : null;
+  if (typeof digest !== 'string' || !digest.startsWith(`sha256:${nativeManifestPrefix}`)) {
+    return `${subject}, but the published assets.json of ${nativeReleaseTag} is not the manifest that correlation names`;
+  }
+  return null;
 }
 
 // Both fresh reads of one workflow, merged: the complete filtered history and
@@ -451,6 +493,23 @@ function observeAndPlan(gateway, {
   // a targeted scan of one older native sees no newer provenance.
   const newerNativeClaims = () => stillClaimed()
     .filter((claim) => namesNewerNative(claim.correlationId, provenance.nativeReleaseTag));
+  // A scanned provenance proves its own claims. Any other claim is held to the
+  // native repository, read at most once per observation.
+  const scannedCorrelationIds = new Set([...scannedProvenances].map(computeCorrelationId));
+  let nativeReleases = null;
+  const unprovenClaim = (claims) => {
+    for (const claim of claims) {
+      if (scannedCorrelationIds.has(claim.correlationId)) continue;
+      nativeReleases ??= fetchNativeReleases(gateway);
+      const why = unprovenNativeClaim(nativeReleases, claim);
+      if (why !== null) return why;
+    }
+    return null;
+  };
+  const unprovenReason = (why) => (
+    `${why}; output-tag order against that claim cannot be proven, so nothing was dispatched; `
+    + 'a maintainer must resolve the claim or establish a new governed bridge build identity'
+  );
 
   // A fresh pipeline would take the next free output tag, above any newer
   // native's pipeline, and the publication barrier would then publish this
@@ -468,9 +527,16 @@ function observeAndPlan(gateway, {
         correlationId,
       });
     }
-    const [newerClaim] = newerNativeClaims();
+    const newerClaims = newerNativeClaims();
+    const unproven = unprovenClaim(newerClaims);
+    if (unproven !== null) {
+      return new OrchestrationPlan({
+        action: OrchestrationAction.BLOCKED, reason: unprovenReason(unproven), provenance, correlationId,
+      });
+    }
+    const [newerClaim] = newerClaims;
     if (newerClaim !== undefined) {
-      const newer = correlationNativeReleaseTag(newerClaim.correlationId);
+      const newer = correlationNativeIdentity(newerClaim.correlationId).nativeReleaseTag;
       return new OrchestrationPlan({
         action: OrchestrationAction.SUPERSEDED,
         reason: (
@@ -583,17 +649,18 @@ function observeAndPlan(gateway, {
   // above a newer native's would publish first and turn the newer
   // native's lower tag into an ordering rollback.
   const outOfOrderPlan = (qualificationRunId) => {
-    for (const claim of newerNativeClaims()) {
-      if (claimsNotBelow(claim.releaseTag, [releaseTag]).length === 0) continue;
-      const newer = correlationNativeReleaseTag(claim.correlationId);
-      return retired(OrchestrationAction.SUPERSEDED, (
-        `candidate ${candidate.runId} is bound to ${releaseTag}, above ${claim.releaseTag} `
-        + `claimed by the pipeline of newer native release ${newer}; publishing `
-        + `${provenance.nativeReleaseTag} first would make ${claim.releaseTag} an ordering `
-        + `rollback, so ${newer} supersedes it and nothing further is dispatched`
-      ), { qualificationRunId });
-    }
-    return null;
+    const below = newerNativeClaims().filter((claim) => claimsNotBelow(claim.releaseTag, [releaseTag]).length > 0);
+    if (below.length === 0) return null;
+    const unproven = unprovenClaim(below);
+    if (unproven !== null) return retired(OrchestrationAction.BLOCKED, unprovenReason(unproven), { qualificationRunId });
+    const [claim] = below;
+    const newer = correlationNativeIdentity(claim.correlationId).nativeReleaseTag;
+    return retired(OrchestrationAction.SUPERSEDED, (
+      `candidate ${candidate.runId} is bound to ${releaseTag}, above ${claim.releaseTag} `
+      + `claimed by the pipeline of newer native release ${newer}; publishing `
+      + `${provenance.nativeReleaseTag} first would make ${claim.releaseTag} an ordering `
+      + `rollback, so ${newer} supersedes it and nothing further is dispatched`
+    ), { qualificationRunId });
   };
 
   // Once a published release reaches this candidate's output tag, publishing it

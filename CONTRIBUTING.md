@@ -436,7 +436,10 @@ query strings, and fragments before printing the location.
   qualification or publication would be dispatched, an older pipeline bound to
   an output tag at or above one a newer native's pipeline claims is
   `superseded` too. The claim comes from the candidate run name, so a targeted
-  `native_release_tag` scan of an older native obeys the same order.
+  `native_release_tag` scan of an older native obeys the same order. A claim
+  of a native outside the scan counts only while that native is a published,
+  non-draft stable release whose `assets.json` digest matches the claim's
+  correlation; otherwise the older native is `blocked`, naming the claim.
   An entry without its own exact publication is `superseded` when a published
   stable asset release's `Native:` marker names a newer native release (version,
   then rebuild); the newest native release in a scan is `blocked` instead.

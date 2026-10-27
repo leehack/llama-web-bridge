@@ -10,7 +10,9 @@ import path from 'node:path';
 import process from 'node:process';
 import { test } from 'node:test';
 
-import { ASSETS_REPOSITORY, BRIDGE_REPOSITORY } from '../../../scripts/release/contract.mjs';
+import {
+  ASSETS_REPOSITORY, BRIDGE_REPOSITORY, NATIVE_REPOSITORY, parseReleaseTag,
+} from '../../../scripts/release/contract.mjs';
 import { pyJsonDumps, pyJsonLoads } from '../../../scripts/release/json.mjs';
 import * as orchestrator from '../../../scripts/release/orchestrator/cli.mjs';
 import * as assetReleases from '../../../scripts/release/orchestrator/asset_releases.mjs';
@@ -99,12 +101,28 @@ function pipeline(self, {
   return { routes, blobs, runs };
 }
 
+// The native repository's release record of `provenance`, as its listing
+// shows it: a draft when `draft`, its assets.json carrying `manifestSha256`.
+function nativeRelease(provenance, { draft = false, manifestSha256 = provenance.nativeManifestSha256 } = {}) {
+  return {
+    tag_name: provenance.nativeReleaseTag,
+    draft,
+    prerelease: parseReleaseTag(provenance.nativeReleaseTag).githubPrerelease,
+    published_at: provenance.nativeReleasePublishedAt,
+    assets: [{ name: 'assets.json', digest: `sha256:${manifestSha256}` }],
+  };
+}
+
 // A gateway listing `releases` and every pipeline's runs to each provenance's
-// run-history window.
+// run-history window, and `nativeReleases` as the native repository's.
 function scanGateway(self, {
-  releases, provenances, pipelines = [], releaseRoutes = {}, releaseBlobs = {}, attestations = [],
+  releases, provenances, pipelines = [], releaseRoutes = {}, releaseBlobs = {}, attestations = [], nativeReleases = [],
 }) {
-  const routes = { ...self.routes({ releases }), ...releaseRoutes };
+  const routes = {
+    ...self.routes({ releases }),
+    ...releaseRoutes,
+    [`repos/${NATIVE_REPOSITORY}/releases?per_page=100`]: [nativeReleases],
+  };
   const blobs = { ...releaseBlobs };
   const listed = { candidate: [], qualification: [], publish: [] };
   for (const item of pipelines) {
@@ -496,6 +514,7 @@ test('targeted older-native scan does not start a pipeline above a newer native 
       pipelines: [pipeline(self, {
         provenance: newer, releaseTag: 'v0.1.41', ids: NEWER_IDS, qualified,
       })],
+      nativeReleases: [nativeRelease(newer)],
     });
     const [result, backlog] = await scanBacklog(self, gateway, [older]);
     assert.deepEqual(backlog.errors, [], `qualified=${qualified}`);
@@ -521,6 +540,7 @@ test('targeted older-native scan supersedes its pipeline above a newer native pi
           provenance: newer, releaseTag: 'v0.1.41', ids: NEWER_IDS, qualified: false,
         }),
       ],
+      nativeReleases: [nativeRelease(newer)],
     });
     const [result, backlog] = await scanBacklog(self, gateway, [older]);
     assert.deepEqual(backlog.errors, [], `qualified=${qualified}`);
@@ -567,4 +587,71 @@ test('a released newer-native claim of another build does not supersede an older
   const [result, backlog] = await scanBacklog(self, gateway, [older]);
   assert.equal(result, 0);
   assert.deepEqual(rows(backlog), [['v0.2.0', OrchestrationAction.DISPATCH_CANDIDATE, 'v0.1.41']]);
+}));
+
+// A failed or successful candidate run of `provenance`'s pipeline bound to
+// `releaseTag`, with no later stage.
+function claimOnly(provenance, { releaseTag = 'v0.1.41', conclusion = 'failure', correlationId = null } = {}) {
+  const binding = new model.PipelineBinding({ bridgeSourceSha: BRIDGE_SHA, releaseTag, releaseRebuild: 0 });
+  const run = runPayload({
+    runId: NEWER_IDS.candidate,
+    path: model.CANDIDATE_WORKFLOW_PATH,
+    runName: runNames.candidateRunName(correlationId ?? runNames.computeCorrelationId(provenance), binding),
+    conclusion,
+  });
+  return { routes: {}, blobs: {}, runs: { candidate: [run], qualification: [], publish: [] } };
+}
+
+// A targeted scan of the older native only must fail visibly, naming the claim.
+async function assertUnprovenClaimBlocks(self, gateway, { releaseTag, claimed, native }) {
+  const [result, backlog] = await scanBacklog(self, gateway, [self.provenance]);
+  assert.deepEqual(backlog.errors, []);
+  assert.equal(result, 1);
+  assert.deepEqual(rows(backlog), [['v0.2.0', OrchestrationAction.BLOCKED, releaseTag]]);
+  const { reason } = backlog.plans[0];
+  assert.ok(reason.includes(native) && reason.includes(claimed), reason);
+  assert.deepEqual(dispatched(backlog), []);
+}
+
+test('a claim of a newer native that is no longer published blocks a fresh older native', withAdvancePipelineFixture(async (self) => {
+  const newer = self.newerNative();
+  for (const [label, nativeReleases] of [
+    ['deleted', []],
+    ['draft', [nativeRelease(newer, { draft: true })]],
+    ['replaced assets', [nativeRelease(newer, { manifestSha256: 'e'.repeat(64) })]],
+  ]) {
+    for (const conclusion of ['failure', 'success']) {
+      const gateway = scanGateway(self, {
+        releases: [priorAlignment(self)],
+        provenances: [self.provenance],
+        pipelines: [claimOnly(newer, { conclusion })],
+        nativeReleases,
+      });
+      await assertUnprovenClaimBlocks(self, gateway, { releaseTag: null, claimed: 'v0.1.41', native: 'v0.2.1' });
+      assert.ok(gateway.dispatches.length === 0, `${label} ${conclusion}`);
+    }
+  }
+}));
+
+test('a claim of a newer native that is no longer published blocks an older qualified pipeline', withAdvancePipelineFixture(async (self) => {
+  const gateway = scanGateway(self, {
+    releases: [priorAlignment(self)],
+    provenances: [self.provenance],
+    pipelines: [
+      pipeline(self, { provenance: self.provenance, releaseTag: 'v0.1.42', ids: OLDER_IDS }),
+      claimOnly(self.newerNative()),
+    ],
+  });
+  await assertUnprovenClaimBlocks(self, gateway, { releaseTag: 'v0.1.42', claimed: 'v0.1.41', native: 'v0.2.1' });
+}));
+
+test('a crafted claim of a nonexistent newer native blocks instead of superseding', withAdvancePipelineFixture(async (self) => {
+  const crafted = `auto-stable-v99.0.0-${'0'.repeat(16)}-build-${BRIDGE_SHA.slice(0, 16)}`;
+  const gateway = scanGateway(self, {
+    releases: [priorAlignment(self)],
+    provenances: [self.provenance],
+    pipelines: [claimOnly(self.provenance, { correlationId: crafted })],
+    nativeReleases: [nativeRelease(self.newerNative())],
+  });
+  await assertUnprovenClaimBlocks(self, gateway, { releaseTag: null, claimed: 'v0.1.41', native: 'v99.0.0' });
 }));

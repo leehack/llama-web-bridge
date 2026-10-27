@@ -15,7 +15,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { test } from 'node:test';
 
-import { BRIDGE_REPOSITORY, ContractError } from '../../../scripts/release/contract.mjs';
+import { BRIDGE_REPOSITORY, ContractError, NATIVE_REPOSITORY } from '../../../scripts/release/contract.mjs';
 import * as orchestrator from '../../../scripts/release/orchestrator/cli.mjs';
 import * as driver from '../../../scripts/release/orchestrator/driver.mjs';
 import * as model from '../../../scripts/release/orchestrator/model.mjs';
@@ -605,8 +605,17 @@ test('a released claim of another build does not block its tag', withAdvancePipe
 test('stale listing that omits a newer native claim below the fresh tag re-plans to superseded', withAdvancePipelineFixture((self) => {
   const listed = claimRun(self, { runId: '402', binding: TAG_V0141 });
   const { correlationId, run } = claimRun(self, { newerNative: true });
+  const newer = self.newerNative();
   const gateway = new StaleGateway({
-    jsonRoutes: self.routes({ releases: [assetReleaseStub()], candidateRuns: [listed.run, run] }),
+    jsonRoutes: {
+      ...self.routes({ releases: [assetReleaseStub()], candidateRuns: [listed.run, run] }),
+      [`repos/${NATIVE_REPOSITORY}/releases?per_page=100`]: [[{
+        tag_name: newer.nativeReleaseTag,
+        draft: false,
+        prerelease: false,
+        assets: [{ name: 'assets.json', digest: `sha256:${newer.nativeManifestSha256}` }],
+      }]],
+    },
   }).staleFor(CANDIDATE_LISTING, runsResponse([listed.run]));
   const plan = dryRun(self, gateway);
   assert.equal(plan.action, OrchestrationAction.SUPERSEDED);
