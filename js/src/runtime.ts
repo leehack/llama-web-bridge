@@ -70,7 +70,7 @@ import {
   trimUnstableUtf8Tail,
 } from './internal/text.ts';
 import { bufferSourceBytes, isInt32, toFloat32Array, toUint8Array } from './internal/typed_values.ts';
-import type { ResolvedSpeculativeOptions } from './internal/completion_options.ts';
+import type { ResolvedGrammarOptions, ResolvedSpeculativeOptions } from './internal/completion_options.ts';
 import type { ProgressCallback } from './internal/download.ts';
 import type { ModelSource } from './internal/model_source.ts';
 import type { CcallArg, CcallArgType, LlamaCoreModule, LogMethod, TextBytesExport } from './internal/types.ts';
@@ -2903,6 +2903,35 @@ export class LlamaWebGpuBridgeRuntime {
     }
   }
 
+  // Passes a lazy grammar or grammar root to the core for the next
+  // begin_generation, which consumes it.
+  _setNextGrammar(grammarOptions: ResolvedGrammarOptions) {
+    const core = this._core!;
+    const fail = (rc: number) => {
+      throw new Error(this._coreErrorMessage('Failed to configure the grammar', rc));
+    };
+    const rc = Number(core.ccall(
+      'llamadart_webgpu_set_next_grammar',
+      'number',
+      ['string', 'number'],
+      [grammarOptions.root, grammarOptions.lazy ? 1 : 0],
+    ));
+    if (rc !== 0) {
+      fail(rc);
+    }
+    for (const trigger of grammarOptions.triggers) {
+      const triggerRc = Number(core.ccall(
+        'llamadart_webgpu_add_next_grammar_trigger',
+        'number',
+        ['number', 'string', 'number'],
+        [trigger.type, trigger.value, trigger.token],
+      ));
+      if (triggerRc !== 0) {
+        fail(triggerRc);
+      }
+    }
+  }
+
   supportsVision() {
     return this._mmSupportsVision;
   }
@@ -3866,6 +3895,9 @@ export class LlamaWebGpuBridgeRuntime {
     try {
       if (sampling.speculative) {
         await this._setNextSpeculative(sampling.speculative, nPredict, speculativePaths);
+      }
+      if (sampling.grammarOptions) {
+        this._setNextGrammar(sampling.grammarOptions);
       }
       const beginRc = Number(
         await this._core!.ccall(

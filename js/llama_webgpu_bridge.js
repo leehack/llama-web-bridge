@@ -207,6 +207,12 @@ function trimUnstableUtf8Tail(text) {
 }
 
 // js/src/internal/completion_options.ts
+var GRAMMAR_TRIGGER_TYPES = Object.freeze({
+  token: 0,
+  word: 1,
+  pattern: 2,
+  "pattern-full": 3
+});
 var SPECULATIVE_DECODING_STRATEGIES = Object.freeze([
   "draft-simple",
   "draft-eagle3",
@@ -229,6 +235,7 @@ var NO_COMPLETION_CAPABILITIES = Object.freeze({
   minP: false,
   thinkingBudget: false,
   penaltyPromptTokens: false,
+  lazyGrammar: false,
   speculativeDecoding: Object.freeze(speculativeFlags(() => false))
 });
 var MAX_NGRAM_SIZE = 65535;
@@ -430,6 +437,60 @@ function penaltyPromptTokens(value) {
   }
   return value;
 }
+function grammarTrigger(value, index) {
+  const name = `CompletionOptions.grammarTriggers[${index}]`;
+  if (value === null || typeof value !== "object") {
+    throw new TypeError(`${name} must be an object.`);
+  }
+  const trigger = value;
+  const type = trigger.type;
+  if (typeof type !== "string" || !Object.hasOwn(GRAMMAR_TRIGGER_TYPES, type)) {
+    throw new TypeError(
+      `${name}.type must be one of ${Object.keys(GRAMMAR_TRIGGER_TYPES).join(", ")}; got ${JSON.stringify(type)}.`
+    );
+  }
+  const wireType = GRAMMAR_TRIGGER_TYPES[type];
+  if (type === "token") {
+    const token = trigger.token;
+    if (!Number.isInteger(token) || token < 0 || token > MAX_INT32) {
+      throw new RangeError(`${name}.token must be an integer from 0 to ${MAX_INT32}; got ${String(token)}.`);
+    }
+    return { type: wireType, value: "", token };
+  }
+  if (typeof trigger.value !== "string" || trigger.value.length === 0) {
+    throw new TypeError(`${name}.value must be a non-empty string.`);
+  }
+  return { type: wireType, value: withoutNul(trigger.value, `${name}.value`), token: -1 };
+}
+function grammarOptions(options) {
+  const lazy = options?.grammarLazy ?? false;
+  if (typeof lazy !== "boolean") {
+    throw new TypeError(`CompletionOptions.grammarLazy must be a boolean; got ${String(lazy)}.`);
+  }
+  const rawTriggers = options?.grammarTriggers ?? [];
+  if (!Array.isArray(rawTriggers)) {
+    throw new TypeError("CompletionOptions.grammarTriggers must be an array.");
+  }
+  const triggers = rawTriggers.map(grammarTrigger);
+  const root = options?.grammarRoot ?? "root";
+  if (typeof root !== "string" || root.length === 0) {
+    throw new TypeError("CompletionOptions.grammarRoot must be a non-empty string.");
+  }
+  withoutNul(root, "CompletionOptions.grammarRoot");
+  if (!lazy && root === "root") {
+    return null;
+  }
+  const hasGrammar = typeof options?.grammar === "string" && options.grammar.length > 0;
+  if (!hasGrammar) {
+    throw new Error(
+      `CompletionOptions.${lazy ? "grammarLazy" : "grammarRoot"} needs a non-empty CompletionOptions.grammar.`
+    );
+  }
+  if (lazy && triggers.length === 0) {
+    throw new Error("CompletionOptions.grammarLazy needs at least one CompletionOptions.grammarTriggers entry.");
+  }
+  return { root, lazy, triggers: lazy ? triggers : [] };
+}
 function resolveCompletionSamplingOptions(options) {
   const hasMediaParts = Array.isArray(options?.parts) && options.parts.length > 0;
   if (typeof options?.grammar === "string") {
@@ -445,7 +506,8 @@ function resolveCompletionSamplingOptions(options) {
       hasMediaParts,
       hasGrammar: typeof options?.grammar === "string" && options.grammar.length > 0,
       hasThinkingBudget: budget != null
-    })
+    }),
+    grammarOptions: grammarOptions(options)
   };
 }
 function completionCapabilitiesFrom(raw) {
@@ -461,6 +523,7 @@ function completionCapabilitiesFrom(raw) {
     minP: parsed?.minP === true,
     thinkingBudget: parsed?.thinkingBudget === true,
     penaltyPromptTokens: parsed?.penaltyPromptTokens === true,
+    lazyGrammar: parsed?.lazyGrammar === true,
     speculativeDecoding: speculativeFlags((strategy) => speculative?.[strategy] === true)
   };
 }
@@ -469,6 +532,8 @@ function requireCompletionCapabilities(sampling, capabilities) {
     sampling.minP !== 0 && !capabilities.minP ? "minP" : null,
     sampling.presencePenalty !== 0 && !capabilities.presencePenalty ? "presencePenalty" : null,
     sampling.thinkingBudget != null && !capabilities.thinkingBudget ? "thinkingBudget" : null,
+    sampling.grammarOptions?.lazy === true && !capabilities.lazyGrammar ? "grammarLazy" : null,
+    sampling.grammarOptions != null && sampling.grammarOptions.root !== "root" && !capabilities.lazyGrammar ? "grammarRoot" : null,
     sampling.speculative != null && !Object.values(capabilities.speculativeDecoding).includes(true) ? "speculativeDecoding" : null
   ].filter((name) => name != null);
   if (missing.length > 0) {
@@ -3577,6 +3642,34 @@ var LlamaWebGpuBridgeRuntime = class {
       throw new Error(this._coreErrorMessage("Failed to configure speculative decoding", rc));
     }
   }
+  // Passes a lazy grammar or grammar root to the core for the next
+  // begin_generation, which consumes it.
+  _setNextGrammar(grammarOptions2) {
+    const core = this._core;
+    const fail = (rc2) => {
+      throw new Error(this._coreErrorMessage("Failed to configure the grammar", rc2));
+    };
+    const rc = Number(core.ccall(
+      "llamadart_webgpu_set_next_grammar",
+      "number",
+      ["string", "number"],
+      [grammarOptions2.root, grammarOptions2.lazy ? 1 : 0]
+    ));
+    if (rc !== 0) {
+      fail(rc);
+    }
+    for (const trigger of grammarOptions2.triggers) {
+      const triggerRc = Number(core.ccall(
+        "llamadart_webgpu_add_next_grammar_trigger",
+        "number",
+        ["number", "string", "number"],
+        [trigger.type, trigger.value, trigger.token]
+      ));
+      if (triggerRc !== 0) {
+        fail(triggerRc);
+      }
+    }
+  }
   supportsVision() {
     return this._mmSupportsVision;
   }
@@ -4412,6 +4505,9 @@ var LlamaWebGpuBridgeRuntime = class {
     try {
       if (sampling.speculative) {
         await this._setNextSpeculative(sampling.speculative, nPredict, speculativePaths);
+      }
+      if (sampling.grammarOptions) {
+        this._setNextGrammar(sampling.grammarOptions);
       }
       const beginRc = Number(
         await this._core.ccall(

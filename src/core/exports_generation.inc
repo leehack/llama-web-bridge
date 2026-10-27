@@ -125,6 +125,53 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_begin_generation(
       skip_prompt_penalty);
 }
 
+// Sets the grammar root and laziness that the next begin_generation or
+// generate call consumes, and clears its triggers. A strict grammar starting
+// at "root" needs no call. Returns 0, or -1 after set_error() for an empty
+// root.
+EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_set_next_grammar(
+    const char * root,
+    int32_t lazy) {
+  clear_error();
+  g_next_grammar = grammar_request();
+  if (root == nullptr || root[0] == '\0') {
+    set_error("The grammar root is empty");
+    return -1;
+  }
+  g_next_grammar.root = root;
+  g_next_grammar.lazy = lazy != 0;
+  return 0;
+}
+
+// Adds a trigger, a common_grammar_trigger_type with its text or token, to
+// the grammar set by llamadart_webgpu_set_next_grammar. Returns 0, or -1 after
+// set_error() for an unknown type; the next grammar then reverts to a strict
+// grammar starting at "root".
+EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_add_next_grammar_trigger(
+    int32_t type,
+    const char * value,
+    int32_t token) {
+  clear_error();
+  common_grammar_trigger trigger;
+  switch (type) {
+    case COMMON_GRAMMAR_TRIGGER_TYPE_TOKEN:
+      trigger.token = token;
+      break;
+    case COMMON_GRAMMAR_TRIGGER_TYPE_WORD:
+    case COMMON_GRAMMAR_TRIGGER_TYPE_PATTERN:
+    case COMMON_GRAMMAR_TRIGGER_TYPE_PATTERN_FULL:
+      trigger.value = value == nullptr ? "" : value;
+      break;
+    default:
+      g_next_grammar = grammar_request();
+      set_error("Unknown grammar trigger type: " + std::to_string(type));
+      return -1;
+  }
+  trigger.type = static_cast<common_grammar_trigger_type>(type);
+  g_next_grammar.triggers.push_back(std::move(trigger));
+  return 0;
+}
+
 // Strategy flags report what the loaded models can run: draft-mtp needs the
 // target's MTP head, and draft-model strategies a matching draft model.
 EMSCRIPTEN_KEEPALIVE const char * llamadart_webgpu_completion_capabilities_json() {
@@ -149,7 +196,7 @@ EMSCRIPTEN_KEEPALIVE const char * llamadart_webgpu_completion_capabilities_json(
   };
   g_completion_capabilities_json =
       "{\"presencePenalty\":true,\"minP\":true,\"thinkingBudget\":true,"
-      "\"penaltyPromptTokens\":true,"
+      "\"penaltyPromptTokens\":true,\"lazyGrammar\":true,"
       "\"speculativeDecoding\":{";
   bool first = true;
   for (const auto & strategy : strategies) {

@@ -69,7 +69,19 @@ leaves a reasoning block open. With \`\`maxTokens: 8\`\` the output is the
 unbudgeted 8-token output, then the forced end tag. With \`\`maxTokens: 0\`\` it
 starts with the forced message and end tag. A grammar pauses inside the block
 and constrains the text after the forced end. A budget has no effect when the
-prompt closes the block.`;
+prompt closes the block.
+
+Then it checks lazy grammars with greedy decoding. The text of tokens 4 and 5
+of an unconstrained completion becomes the trigger of a grammar that accepts
+it followed by "yes" or "no". A word, pattern and full-pattern trigger must
+each leave the first three tokens unconstrained, then constrain the rest; the
+same grammar applied strictly starts with the trigger text instead. A token
+trigger on the first greedy token constrains everything after it, and one on
+the runner-up token leaves the output unconstrained. A grammar
+starting at a rule other than \`\`root\`\` must apply. An invalid trigger
+pattern, a token outside the vocabulary, a missing start rule and a grammar
+that rejects its own trigger text must each reject, after which the
+unconstrained completion repeats exactly.`;
 
 const MODEL_FILENAME = 'grammar-smoke-model.gguf';
 // The issue #115 repro prompt. Its ChatML markers are plain text to a model
@@ -170,7 +182,9 @@ const INVALID_SAMPLER_OPTIONS = Object.freeze([
   { presencePenalty: Number.POSITIVE_INFINITY },
 ]);
 // speculative.mjs checks the speculativeDecoding capabilities.
-export const COMPLETION_CAPABILITIES = Object.freeze(['presencePenalty', 'minP', 'thinkingBudget', 'penaltyPromptTokens']);
+export const COMPLETION_CAPABILITIES = Object.freeze([
+  'presencePenalty', 'minP', 'thinkingBudget', 'penaltyPromptTokens', 'lazyGrammar',
+]);
 // Each tag follows a space: SentencePiece vocabularies tokenize a tag at the
 // start of text with a space prefix, so only a spaced tag in the prompt
 // matches the tokenized start and end tags.
@@ -209,6 +223,25 @@ export const THINKING_RUNS = Object.freeze([
   }],
 ]);
 const INVALID_THINKING_BUDGET = { ...THINK_TAGS, maxTokens: -1 };
+// Greedy runs whose first tokens are unconstrained text; tokens
+// beforeTokens + 1 through beforeTokens + triggerTokens become the trigger.
+export const LAZY_GRAMMAR = Object.freeze({
+  prompt: 'Here is the tool call:',
+  options: { temp: 0, topK: 1, penalty: 1, seed: 5 },
+  beforeTokens: 3,
+  triggerTokens: 2,
+  nPredict: 12,
+  minGap: 0.005,
+  answers: ['yes', 'no'],
+  rootGrammar: 'root ::= "unused"\nanswer ::= "yes" | "no"',
+});
+export const LAZY_TRIGGER_RUNS = Object.freeze(['word', 'pattern', 'pattern-full']);
+const LAZY_GRAMMAR_ERRORS = Object.freeze({
+  invalidPattern: ['(invalid grammar)', 'is not a valid regular expression'],
+  outOfVocabulary: ['(invalid grammar)', 'is outside the vocabulary'],
+  missingRoot: ['(invalid grammar)', NON_THROWING_REJECTION],
+  rejectedTrigger: ['The lazy grammar rejected the text that triggered it'],
+});
 export const MEMORY_MODES = Object.freeze(['wasm32', 'wasm64']);
 const RUNTIME_MODES = Object.freeze(['direct', 'worker']);
 
@@ -229,6 +262,8 @@ export function renderHarness(nCtx, memoryModes) {
     thinkingRuns: THINKING_RUNS,
     promptPenalty: PROMPT_PENALTY,
     invalidThinkingBudget: INVALID_THINKING_BUDGET,
+    lazyGrammar: LAZY_GRAMMAR,
+    lazyTriggerRuns: LAZY_TRIGGER_RUNS,
     completionCapabilities: COMPLETION_CAPABILITIES,
     nCtx,
     memoryModes,
@@ -325,6 +360,78 @@ export function renderHarness(nCtx, memoryModes) {
         prompt += best;
       }
       return { steps: probe.maxSteps, best: null };
+    };
+
+    // Every character but ASCII letters, digits and spaces as a \U escape.
+    const gbnfLiteral = (text) => '"' + Array.from(text, (ch) => (/[A-Za-z0-9 ]/.test(ch)
+      ? ch
+      : '\\\\U' + ch.codePointAt(0).toString(16).padStart(8, '0'))).join('') + '"';
+    const regexLiteral = (text) => text.replace(/[.*+?^$()|[\\]{}\\\\]/g, '\\\\$&');
+    const errorOf = async (promise) => {
+      try {
+        await promise;
+        return null;
+      } catch (caught) {
+        return errorText(caught);
+      }
+    };
+
+    // Runs lazy grammars triggered by text the unconstrained greedy
+    // completion produces, and the rejections that must leave the core usable.
+    const probeLazyGrammar = async (bridge) => {
+      const lazy = config.lazyGrammar;
+      const run = (options, nPredict = lazy.nPredict) => bridge.createCompletion(lazy.prompt, {
+        ...lazy.options,
+        nPredict,
+        ...options,
+        tokenEventEncoding: 'text',
+      });
+      const before = await run({}, lazy.beforeTokens);
+      const through = await run({}, lazy.beforeTokens + lazy.triggerTokens);
+      const word = through.startsWith(before) ? through.slice(before.length) : '';
+      const result = { before, through, word };
+      if (word.length === 0 || through.indexOf(word) !== before.length || through.includes('\uFFFD')) {
+        return result;
+      }
+      const answers = lazy.answers.map(gbnfLiteral).join(' | ');
+      const grammar = \`root ::= \${gbnfLiteral(word)} (\${answers})\`;
+      const lazyRun = (trigger) => run({ grammar, grammarLazy: true, grammarTriggers: [trigger] });
+      const triggers = {
+        word: { type: 'word', value: word },
+        pattern: { type: 'pattern', value: regexLiteral(word) },
+        'pattern-full': { type: 'pattern-full', value: \`[\\\\s\\\\S]*?(\${regexLiteral(word)})\` },
+      };
+      result.triggered = {};
+      for (const name of config.lazyTriggerRuns) {
+        result.triggered[name] = await lazyRun(triggers[name]);
+      }
+      result.strict = await run({ grammar });
+
+      const { top } = await bridge.scoreNextToken(lazy.prompt, { topK: 2 });
+      const piece = new TextDecoder().decode(top[0].bytes);
+      if (top[0].logprob - top[1].logprob > lazy.minGap && piece.length > 0 && !piece.includes('\uFFFD')) {
+        const tokenRun = (token, nPredict) => run({
+          grammar: \`root ::= \${gbnfLiteral(piece)} (\${answers})\`,
+          grammarLazy: true,
+          grammarTriggers: [{ type: 'token', token }],
+        }, nPredict);
+        result.tokenPiece = piece;
+        result.tokenTriggered = await tokenRun(top[0].token);
+        result.tokenNotSampled = await tokenRun(top[1].token, lazy.beforeTokens + lazy.triggerTokens);
+      }
+      result.root = await run({ grammar: lazy.rootGrammar, grammarRoot: 'answer' });
+      result.errors = {
+        invalidPattern: await errorOf(lazyRun({ type: 'pattern', value: '(' })),
+        outOfVocabulary: await errorOf(lazyRun({ type: 'token', token: 2147483647 })),
+        missingRoot: await errorOf(run({ grammar, grammarRoot: 'missing' })),
+        rejectedTrigger: await errorOf(run({
+          grammar: 'root ::= ' + answers,
+          grammarLazy: true,
+          grammarTriggers: [triggers.word],
+        })),
+      };
+      result.afterErrors = await run({}, lazy.beforeTokens + lazy.triggerTokens);
+      return result;
     };
 
     const runMode = async (memoryMode, runtimeMode) => {
@@ -430,6 +537,8 @@ export function renderHarness(nCtx, memoryModes) {
           invalidThinkingBudgetError = \`\${caught && caught.name}: \${errorText(caught)}\`;
         }
 
+        const lazyGrammar = await probeLazyGrammar(bridge);
+
         const metadata = bridge.getModelMetadata();
         return {
           mode,
@@ -442,6 +551,7 @@ export function renderHarness(nCtx, memoryModes) {
           promptPenalty,
           thinkingRuns,
           invalidThinkingBudgetError,
+          lazyGrammar,
           plainCompletionError: plainError,
           execution: metadata['llamadart.webgpu.execution'] || null,
           coreVariant: metadata['llamadart.webgpu.core_variant'] || null,
@@ -547,7 +657,56 @@ export function validateSampler(entry) {
     'a seeded sample after the rejected options did not repeat the earlier one',
   );
   if (failures.length > 0) failures.push(`sampler outputs: ${pyRepr(runs)}`);
-  return [...failures, ...validatePromptPenalty(entry), ...validateThinkingBudget(entry)];
+  return [
+    ...failures,
+    ...validatePromptPenalty(entry),
+    ...validateThinkingBudget(entry),
+    ...validateLazyGrammar(entry),
+  ];
+}
+
+export function validateLazyGrammar(entry) {
+  const probe = pyGet(entry, 'lazyGrammar');
+  if (!isDict(probe) || typeof pyGet(probe, 'word') !== 'string' || !isDict(pyGet(probe, 'triggered'))) {
+    return [
+      `lazy grammar: tokens ${LAZY_GRAMMAR.beforeTokens + 1} to ${LAZY_GRAMMAR.beforeTokens + LAZY_GRAMMAR.triggerTokens} `
+        + `of the greedy completion are no usable trigger: ${pyRepr(probe)}`,
+    ];
+  }
+  const failures = [];
+  const expect = (condition, message) => {
+    if (!condition) failures.push(`lazy grammar: ${message}`);
+  };
+  const { before, word } = probe;
+  const answered = (text, prefix) => typeof text === 'string'
+    && text.startsWith(prefix)
+    && LAZY_GRAMMAR.answers.includes(text.slice(prefix.length));
+  expect(before.length > 0, 'the text before the trigger is empty, so it proves nothing');
+  for (const name of LAZY_TRIGGER_RUNS) {
+    expect(
+      answered(probe.triggered[name], before + word),
+      `a ${name} trigger did not leave the text before it unconstrained and constrain the rest`,
+    );
+  }
+  expect(answered(probe.strict, word), 'the strict grammar did not constrain the output from the first token');
+  if (typeof pyGet(probe, 'tokenPiece') === 'string') {
+    expect(answered(probe.tokenTriggered, probe.tokenPiece), 'a token trigger did not constrain the text after the token');
+    expect(probe.tokenNotSampled === probe.through, 'a token trigger that is never sampled constrained the output');
+  } else {
+    failures.push('lazy grammar: the first greedy token is a near tie or no usable text, so the token trigger was not run');
+  }
+  expect(LAZY_GRAMMAR.answers.includes(probe.root), 'the grammar did not start at grammarRoot');
+  const errors = isDict(pyGet(probe, 'errors')) ? probe.errors : {};
+  for (const [name, parts] of Object.entries(LAZY_GRAMMAR_ERRORS)) {
+    const error = pyGet(errors, name);
+    expect(
+      typeof error === 'string' && parts.every((part) => error.includes(part)),
+      `${name}: expected an error containing ${parts.map(pyRepr).join(' and ')}, got ${pyRepr(error)}`,
+    );
+  }
+  expect(probe.afterErrors === probe.through, 'the unconstrained completion changed after the rejected grammars');
+  if (failures.length > 0) failures.push(`lazy grammar outputs: ${pyRepr(probe)}`);
+  return failures;
 }
 
 export function validatePromptPenalty(entry) {
