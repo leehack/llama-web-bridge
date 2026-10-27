@@ -128,14 +128,19 @@ export function hasOtherBuildClaim(candidateRuns, { bridgeBuildSha }) {
 // satisfied by an identical release. Scans advance only the current build
 // identity and a satisfied correlation publishes nothing, so nothing
 // dispatches for such a correlation again.
-export function claimedReleaseTags(candidateRuns, {
+export function claimedReleaseTags(candidateRuns, options) {
+  return new Set(releaseTagClaims(candidateRuns, options).map(({ releaseTag }) => releaseTag));
+}
+
+// The claims behind claimedReleaseTags, as { correlationId, releaseTag }.
+export function releaseTagClaims(candidateRuns, {
   bridgeBuildSha, downstreamRuns = [], satisfiedCorrelationIds = [],
 }) {
   const inFlight = new Set(
     [...candidateRuns, ...downstreamRuns].filter((record) => record.inFlight).map(runCorrelationId),
   );
   const satisfied = new Set(satisfiedCorrelationIds);
-  const claimed = new Set();
+  const claims = [];
   for (const record of candidateRuns) {
     const match = CANDIDATE_RUN_NAME_RE.exec(record.runName);
     if (match === null) continue;
@@ -143,9 +148,9 @@ export function claimedReleaseTags(candidateRuns, {
     if (satisfied.has(correlationId) || (namesOtherBuild(correlationId, bridgeBuildSha) && !inFlight.has(correlationId))) {
       continue;
     }
-    claimed.add(match.groups.release_tag);
+    claims.push({ correlationId, releaseTag: match.groups.release_tag });
   }
-  return claimed;
+  return claims;
 }
 
 // The claimed stable tags at or above `releaseTag`, sorted.

@@ -18,6 +18,7 @@ import {
   CANDIDATE_RUN_ID,
   NATIVE_MANIFEST_SHA,
   QUALIFICATION_RUN_ID,
+  makeLegacyV0140Provenance,
   makeProvenance,
 } from './fixtures.mjs';
 
@@ -43,6 +44,23 @@ test('test_correlation_id_changes_with_governed_build_source', () => {
 test('test_correlation_id_changes_with_native_manifest', () => {
   const other = runNames.computeCorrelationId(makeProvenance({ nativeManifestSha256: 'b'.repeat(64) }));
   assert.notEqual(runNames.computeCorrelationId(makeProvenance()), other);
+});
+
+test('correlation native identity reads back what computeCorrelationId used', () => {
+  for (const nativeReleaseTag of ['v0.2.0', 'v0.7.0-2', 'v10.20.30-11']) {
+    const correlationId = runNames.computeCorrelationId(makeProvenance({ nativeReleaseTag }));
+    assert.deepEqual(runNames.correlationNativeIdentity(correlationId), {
+      nativeReleaseTag, nativeManifestPrefix: NATIVE_MANIFEST_SHA.slice(0, 16),
+    });
+  }
+  const legacy = makeLegacyV0140Provenance();
+  assert.deepEqual(runNames.correlationNativeIdentity(runNames.computeCorrelationId(legacy)), {
+    nativeReleaseTag: 'v0.3.0', nativeManifestPrefix: legacy.nativeManifestSha256.slice(0, 16),
+  });
+  for (const other of ['kanban:t_7f112b91:web-v0.1.39', 'auto-stable-b8000-2e5d29d7f98f0d71', 'auto-stable-v0.2.0-0-2e5d29d7f98f0d71',
+    'auto-stable-v0.07.0-2e5d29d7f98f0d71', null]) {
+    assert.equal(runNames.correlationNativeIdentity(other), null, String(other));
+  }
 });
 
 test('test_candidate_run_name_round_trips_persisted_binding', () => {
