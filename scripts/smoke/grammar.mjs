@@ -71,10 +71,11 @@ starts with the forced message and end tag. A grammar pauses inside the block
 and constrains the text after the forced end. A budget has no effect when the
 prompt closes the block.
 
-Then it checks lazy grammars with greedy decoding. The text of tokens 4 and 5
-of an unconstrained completion becomes the trigger of a grammar that accepts
+Then it checks lazy grammars with greedy decoding. The text of the first two
+tokens, after at least three, that an unconstrained completion has not produced
+before becomes the trigger of a grammar that accepts
 it followed by "yes" or "no". A word, pattern and full-pattern trigger must
-each leave the first three tokens unconstrained, then constrain the rest; the
+each leave the tokens before it unconstrained, then constrain the rest; the
 same grammar applied strictly starts with the trigger text instead. A token
 trigger on the first greedy token constrains everything after it, and one on
 the runner-up token leaves the output unconstrained. A grammar
@@ -223,14 +224,16 @@ export const THINKING_RUNS = Object.freeze([
   }],
 ]);
 const INVALID_THINKING_BUDGET = { ...THINK_TAGS, maxTokens: -1 };
-// Greedy runs whose first tokens are unconstrained text; tokens
-// beforeTokens + 1 through beforeTokens + triggerTokens become the trigger.
+// Greedy runs whose first tokens are unconstrained text. The first window of
+// triggerTokens tokens after at least minBeforeTokens tokens whose text does
+// not occur earlier, searched up to maxBeforeTokens, becomes the trigger.
 export const LAZY_GRAMMAR = Object.freeze({
   prompt: 'Here is the tool call:',
   options: { temp: 0, topK: 1, penalty: 1, seed: 5 },
-  beforeTokens: 3,
+  minBeforeTokens: 3,
+  maxBeforeTokens: 12,
   triggerTokens: 2,
-  nPredict: 12,
+  answerTokens: 6,
   minGap: 0.005,
   answers: ['yes', 'no'],
   rootGrammar: 'root ::= "unused"\nanswer ::= "yes" | "no"',
@@ -380,19 +383,34 @@ export function renderHarness(nCtx, memoryModes) {
     // completion produces, and the rejections that must leave the core usable.
     const probeLazyGrammar = async (bridge) => {
       const lazy = config.lazyGrammar;
-      const run = (options, nPredict = lazy.nPredict) => bridge.createCompletion(lazy.prompt, {
+      // Room for the trigger window, an answer and the end of generation.
+      let answeredTokens = 0;
+      const run = (options, nPredict = answeredTokens) => bridge.createCompletion(lazy.prompt, {
         ...lazy.options,
         nPredict,
         ...options,
         tokenEventEncoding: 'text',
       });
-      const before = await run({}, lazy.beforeTokens);
-      const through = await run({}, lazy.beforeTokens + lazy.triggerTokens);
-      const word = through.startsWith(before) ? through.slice(before.length) : '';
-      const result = { before, through, word };
-      if (word.length === 0 || through.indexOf(word) !== before.length || through.includes('\uFFFD')) {
+      const usableWindow = (before, through) => {
+        const word = through.startsWith(before) ? through.slice(before.length) : '';
+        return word.length > 0 && through.indexOf(word) === before.length && !through.includes('\uFFFD');
+      };
+      let beforeTokens = lazy.minBeforeTokens;
+      let before = await run({}, beforeTokens);
+      let through = await run({}, beforeTokens + lazy.triggerTokens);
+      while (!usableWindow(before, through) && beforeTokens < lazy.maxBeforeTokens) {
+        beforeTokens += 1;
+        before = await run({}, beforeTokens);
+        through = await run({}, beforeTokens + lazy.triggerTokens);
+      }
+      const throughTokens = beforeTokens + lazy.triggerTokens;
+      answeredTokens = throughTokens + lazy.answerTokens;
+      const result = { beforeTokens, before, through, word: through.slice(before.length) };
+      if (!usableWindow(before, through)) {
+        result.word = null;
         return result;
       }
+      const word = result.word;
       const answers = lazy.answers.map(gbnfLiteral).join(' | ');
       const grammar = \`root ::= \${gbnfLiteral(word)} (\${answers})\`;
       const lazyRun = (trigger) => run({ grammar, grammarLazy: true, grammarTriggers: [trigger] });
@@ -417,7 +435,7 @@ export function renderHarness(nCtx, memoryModes) {
         }, nPredict);
         result.tokenPiece = piece;
         result.tokenTriggered = await tokenRun(top[0].token);
-        result.tokenNotSampled = await tokenRun(top[1].token, lazy.beforeTokens + lazy.triggerTokens);
+        result.tokenNotSampled = await tokenRun(top[1].token, throughTokens);
       }
       result.root = await run({ grammar: lazy.rootGrammar, grammarRoot: 'answer' });
       result.errors = {
@@ -430,7 +448,7 @@ export function renderHarness(nCtx, memoryModes) {
           grammarTriggers: [triggers.word],
         })),
       };
-      result.afterErrors = await run({}, lazy.beforeTokens + lazy.triggerTokens);
+      result.afterErrors = await run({}, throughTokens);
       return result;
     };
 
@@ -669,8 +687,8 @@ export function validateLazyGrammar(entry) {
   const probe = pyGet(entry, 'lazyGrammar');
   if (!isDict(probe) || typeof pyGet(probe, 'word') !== 'string' || !isDict(pyGet(probe, 'triggered'))) {
     return [
-      `lazy grammar: tokens ${LAZY_GRAMMAR.beforeTokens + 1} to ${LAZY_GRAMMAR.beforeTokens + LAZY_GRAMMAR.triggerTokens} `
-        + `of the greedy completion are no usable trigger: ${pyRepr(probe)}`,
+      `lazy grammar: no ${LAZY_GRAMMAR.triggerTokens}-token window of the greedy completion after token `
+        + `${LAZY_GRAMMAR.minBeforeTokens} to ${LAZY_GRAMMAR.maxBeforeTokens} is new text: ${pyRepr(probe)}`,
     ];
   }
   const failures = [];

@@ -301,6 +301,7 @@ assert.deepEqual(webGpuLaunchArgs('linux'), [
     steps: 2, best: 'a', unpenalized: 'b', neutral: 'a', penalized: 'b', grammar: 'a', emptyGrammar: 'a', optOut: 'a',
   });
   const lazyGrammar = () => ({
+    beforeTokens: 3,
     before: 'ab',
     through: 'abcd',
     word: 'cd',
@@ -518,10 +519,10 @@ assert.deepEqual(webGpuLaunchArgs('linux'), [
     );
     assert.equal(failures.length, expected.length === 0 ? 0 : expected.length + 1);
   }
-  for (const probe of [undefined, { before: 'ab', through: 'ab', word: '' }]) {
+  for (const probe of [undefined, { beforeTokens: 12, before: 'ab', through: 'abab', word: null }]) {
     assert.match(
       grammarSmoke.validateLazyGrammar({ lazyGrammar: probe })[0],
-      /^lazy grammar: tokens 4 to 5 of the greedy completion are no usable trigger: /,
+      /^lazy grammar: no 2-token window of the greedy completion after token 3 to 12 is new text: /,
     );
   }
   const ntsCases = [
