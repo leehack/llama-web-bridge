@@ -7,6 +7,10 @@
   attempts and later model loads no longer abort the runtime. Its error names smaller
   `nBatch` and `nUbatch` or the memory64 core. A main or decision context that does not fit
   now rejects its load instead of aborting.
+- `createCompletion` takes `grammarLazy`, `grammarTriggers` (word, pattern, full-pattern and
+  token triggers) and `grammarRoot`, which apply llama.cpp's lazy grammar and start symbol;
+  `getCompletionCapabilities` reports `lazyGrammar`. An invalid trigger pattern or token rejects
+  instead of aborting the core.
 - Drop the unused reads of `__llamadartFetchBackendLastError` and `__llamadartFetchBackendStats`;
   the stock `-lwasmfs_fetch.js` never sets them, so the `model_fetch_js_error` and
   `model_fetch_stats` runtime notes were never emitted.

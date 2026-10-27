@@ -80,6 +80,20 @@ export function computeCorrelationId(provenance) {
   return requireCorrelationId(raw);
 }
 
+const CORRELATION_NATIVE_RE = new RegExp(
+  '^auto-stable-(?<native>v(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)(?:-[1-9][0-9]*)?)'
+  + '-(?<manifest>[0-9a-f]{16})(?:-build-[0-9a-f]{16})?$',
+  'u',
+);
+
+// The stable native release tag and native manifest digest prefix that
+// computeCorrelationId put in `correlationId`, as { nativeReleaseTag,
+// nativeManifestPrefix }, or null for an identity it did not compute.
+export function correlationNativeIdentity(correlationId) {
+  const match = typeof correlationId === 'string' ? CORRELATION_NATIVE_RE.exec(correlationId) : null;
+  return match === null ? null : { nativeReleaseTag: match.groups.native, nativeManifestPrefix: match.groups.manifest };
+}
+
 export function candidateRunName(correlationId, binding) {
   requireCorrelationId(correlationId);
   return requireRunName(

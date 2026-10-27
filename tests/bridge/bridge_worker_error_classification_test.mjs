@@ -910,6 +910,41 @@ const CASES = [
     assert.ok(!warnings.some((message) => message.includes('falling back')));
   }],
 
+  ['worker lazy-grammar trigger rejection with media parts keeps the worker', async () => {
+    const coreError = 'Generation step failed: The lazy grammar rejected the text that triggered it: '
+      + 'Unexpected empty grammar stack after accepting piece: x';
+    const proxy = createProxy('lazy-grammar-media', async (method) => {
+      if (method !== 'createCompletion') {
+        return { value: undefined };
+      }
+      throw new Error(coreError);
+    });
+    const { bridge, warnings } = createBridge({
+      _workerProxy: proxy,
+      _loadedModelUrl: 'model.gguf',
+      _loadedModelOptions: { nGpuLayers: 99 },
+      _loadedMmProjUrl: 'mmproj.gguf',
+      _createRuntime: () => {
+        throw new Error('no main-thread runtime may be created');
+      },
+    });
+
+    await assert.rejects(
+      bridge.createCompletion('prompt', {
+        grammar: 'root ::= "<tool_call>"',
+        grammarLazy: true,
+        grammarTriggers: [{ type: 'word', value: '<tool_call>' }],
+        parts: [{ type: 'image', bytes: new Uint8Array(1) }],
+      }),
+      (error) => error.message === coreError,
+    );
+    assert.equal(bridge._workerProxy, proxy);
+    assert.equal(proxy.disposeCalls, 0);
+    assert.equal(bridge._runtime, null);
+    assert.equal(bridge._workerFallbackReason, null);
+    assert.ok(!warnings.some((message) => message.includes('falling back')));
+  }],
+
   ['worker completion core abort still falls back to the main thread', async () => {
     const abortText = 'Aborted(undefined). Build with -sASSERTIONS for more info.';
     let completions = 0;

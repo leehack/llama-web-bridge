@@ -24,3 +24,9 @@ export const GENERATION_ALREADY_ACTIVE_MESSAGE =
 // media-parts path, which otherwise falls back for any worker error.
 export const INVALID_GRAMMAR_ERROR_TEXT =
   'Failed to initialize sampler chain (invalid grammar)';
+
+// The core puts this in the error when a lazy grammar rejects the text that
+// fired its trigger. Generation ends cleanly and a retry would sample the same
+// text, so the facade rethrows it as it does an invalid grammar.
+export const LAZY_GRAMMAR_REJECTED_ERROR_TEXT =
+  'The lazy grammar rejected the text that triggered it';

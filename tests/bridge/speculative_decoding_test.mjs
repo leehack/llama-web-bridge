@@ -611,19 +611,23 @@ const CASES = [
   ['only the grammar, LoRA, speculative and state restore wrappers and context creation catch exceptions and every new export is linked', () => {
     const allowed = cmake.match(/-sEXCEPTION_CATCHING_ALLOWED=\[([^\]]*)\]/)[1];
     const names = allowed.split(',').map((name) => name.trim().replace(/^'|'$/g, ''));
-    assert.deepEqual(names, [
-      'llamadart_webgpu_grammar_sampler_init',
-      'llamadart_webgpu_lora_adapter_init',
+    const speculativeWrappers = [
       'llamadart_webgpu_draft_model_load_file',
       'llamadart_webgpu_draft_context_init',
       'llamadart_webgpu_speculative_init',
+    ];
+    assert.deepEqual(names, [
+      'llamadart_webgpu_grammar_sampler_init',
+      'llamadart_webgpu_grammar_sampler_accept',
+      'llamadart_webgpu_lora_adapter_init',
+      ...speculativeWrappers,
       'llamadart_webgpu_state_set_data',
       'llamadart_webgpu_state_read_file',
       'llama_init_from_model',
       '_ZN13llama_contextC2ERK11llama_model20llama_context_params',
       '_ZN13llama_context13sched_reserveEv',
     ]);
-    for (const name of names.slice(2, 5)) {
+    for (const name of speculativeWrappers) {
       assert.match(wrappers, new RegExp(`extern "C" __attribute__\\(\\(noinline\\)\\)[^\\n]*\\n${name}\\(`), `${name} must stay noinline`);
     }
     const exported = cmake.match(/-sEXPORTED_FUNCTIONS=\[([^\]]*)\]/)[1];

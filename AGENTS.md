@@ -227,9 +227,11 @@ scanned stable native release; each candidate gets its own exact
 - C++ exception catching is enabled only for the functions listed in
   `EXCEPTION_CATCHING_ALLOWED` (`CMakeLists.txt`):
   `llamadart_webgpu_grammar_sampler_init` and
-  `llamadart_webgpu_lora_adapter_init`, which turn llama.cpp's grammar parser
-  and LoRA loader throws into `(invalid grammar)` and `Failed to load LoRA
-  adapter` errors, and the speculative wrappers in
+  `llamadart_webgpu_lora_adapter_init`, which turn llama.cpp's grammar parser,
+  trigger pattern and LoRA loader throws into `(invalid grammar)` and `Failed to
+  load LoRA adapter` errors, `llamadart_webgpu_grammar_sampler_accept`, which
+  turns a lazy grammar's throw on rejected trigger text into a generation error,
+  and the speculative wrappers in
   `src/llama_webgpu_speculative.cpp`, which turn draft model, draft context and
   speculative setup throws into load or generation errors, and
   `llamadart_webgpu_state_set_data` and `llamadart_webgpu_state_read_file`,

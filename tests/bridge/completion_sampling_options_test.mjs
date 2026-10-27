@@ -16,6 +16,7 @@ const SUPPORTED = {
   minP: true,
   thinkingBudget: true,
   penaltyPromptTokens: true,
+  lazyGrammar: true,
   speculativeDecoding: NO_SPECULATIVE,
 };
 const NONE = {
@@ -23,6 +24,7 @@ const NONE = {
   minP: false,
   thinkingBudget: false,
   penaltyPromptTokens: false,
+  lazyGrammar: false,
   speculativeDecoding: NO_SPECULATIVE,
 };
 const BUDGET = { maxTokens: 8, startTag: '<think>', endTag: '</think>' };
@@ -54,7 +56,7 @@ function nativeParameterNames(name) {
 function coreCapabilityJson() {
   const body = functionBody('llamadart_webgpu_completion_capabilities_json()');
   const literal = body.match(
-    /"\{\\"presencePenalty\\":true,\\"minP\\":true,\\"thinkingBudget\\":true,"\s*"\\"penaltyPromptTokens\\":true,"/,
+    /"\{\\"presencePenalty\\":true,\\"minP\\":true,\\"thinkingBudget\\":true,"\s*"\\"penaltyPromptTokens\\":true,\\"lazyGrammar\\":true,"/,
   );
   assert.ok(literal, 'the capability export must start with its fixed flags');
   const strategies = [...body.matchAll(/\{"([a-z0-9-]+)",\s*([^}]*)\}/g)];
@@ -64,6 +66,7 @@ function coreCapabilityJson() {
     minP: true,
     thinkingBudget: true,
     penaltyPromptTokens: true,
+    lazyGrammar: true,
     speculativeDecoding: Object.fromEntries(
       strategies.map(([, name, flag]) => [name, flag.trim() === 'true']),
     ),

@@ -2,6 +2,7 @@
 
 import type {
   CompletionCapabilities,
+  GrammarTrigger,
   NgramCacheSource,
   SpeculativeDecodingStrategy,
   ThinkingBudgetOptions,
@@ -14,7 +15,26 @@ export interface CompletionSamplingOptions {
   thinkingBudget: Required<ThinkingBudgetOptions> | null;
   penaltyPromptTokens: boolean;
   speculative: ResolvedSpeculativeOptions | null;
+  grammarOptions: ResolvedGrammarOptions | null;
 }
+
+/**
+ * A lazy grammar or a non-default grammar root, for the core's
+ * set_next_grammar. Null when the grammar is strict and starts at `root`.
+ */
+export interface ResolvedGrammarOptions {
+  root: string;
+  lazy: boolean;
+  triggers: { type: number; value: string; token: number }[];
+}
+
+// common_grammar_trigger_type in llama.cpp's common/common.h.
+export const GRAMMAR_TRIGGER_TYPES: Readonly<Record<GrammarTrigger['type'], number>> = Object.freeze({
+  token: 0,
+  word: 1,
+  pattern: 2,
+  'pattern-full': 3,
+});
 
 /**
  * Speculative settings as the core takes them, resolved as native llamadart
@@ -60,6 +80,7 @@ export const NO_COMPLETION_CAPABILITIES: Readonly<CompletionCapabilities> = Obje
   minP: false,
   thinkingBudget: false,
   penaltyPromptTokens: false,
+  lazyGrammar: false,
   speculativeDecoding: Object.freeze(speculativeFlags(() => false)),
 });
 
@@ -293,12 +314,73 @@ function penaltyPromptTokens(value: unknown): boolean {
   return value;
 }
 
+function grammarTrigger(value: unknown, index: number): ResolvedGrammarOptions['triggers'][number] {
+  const name = `CompletionOptions.grammarTriggers[${index}]`;
+  if (value === null || typeof value !== 'object') {
+    throw new TypeError(`${name} must be an object.`);
+  }
+  const trigger = value as Record<string, unknown>;
+  const type = trigger.type;
+  if (typeof type !== 'string' || !Object.hasOwn(GRAMMAR_TRIGGER_TYPES, type)) {
+    throw new TypeError(
+      `${name}.type must be one of ${Object.keys(GRAMMAR_TRIGGER_TYPES).join(', ')}; got ${JSON.stringify(type)}.`,
+    );
+  }
+  const wireType = GRAMMAR_TRIGGER_TYPES[type as GrammarTrigger['type']];
+  if (type === 'token') {
+    const token = trigger.token;
+    if (!Number.isInteger(token) || (token as number) < 0 || (token as number) > MAX_INT32) {
+      throw new RangeError(`${name}.token must be an integer from 0 to ${MAX_INT32}; got ${String(token)}.`);
+    }
+    return { type: wireType, value: '', token: token as number };
+  }
+  if (typeof trigger.value !== 'string' || trigger.value.length === 0) {
+    throw new TypeError(`${name}.value must be a non-empty string.`);
+  }
+  return { type: wireType, value: withoutNul(trigger.value, `${name}.value`), token: -1 };
+}
+
+function grammarOptions(options: {
+  grammar?: unknown;
+  grammarLazy?: unknown;
+  grammarTriggers?: unknown;
+  grammarRoot?: unknown;
+} | null | undefined): ResolvedGrammarOptions | null {
+  const lazy = options?.grammarLazy ?? false;
+  if (typeof lazy !== 'boolean') {
+    throw new TypeError(`CompletionOptions.grammarLazy must be a boolean; got ${String(lazy)}.`);
+  }
+  const rawTriggers = options?.grammarTriggers ?? [];
+  if (!Array.isArray(rawTriggers)) {
+    throw new TypeError('CompletionOptions.grammarTriggers must be an array.');
+  }
+  const triggers = rawTriggers.map(grammarTrigger);
+  const root = options?.grammarRoot ?? 'root';
+  if (typeof root !== 'string' || root.length === 0) {
+    throw new TypeError('CompletionOptions.grammarRoot must be a non-empty string.');
+  }
+  withoutNul(root, 'CompletionOptions.grammarRoot');
+  if (!lazy && root === 'root') {
+    return null;
+  }
+  const hasGrammar = typeof options?.grammar === 'string' && options.grammar.length > 0;
+  if (!hasGrammar) {
+    throw new Error(
+      `CompletionOptions.${lazy ? 'grammarLazy' : 'grammarRoot'} needs a non-empty CompletionOptions.grammar.`,
+    );
+  }
+  if (lazy && triggers.length === 0) {
+    throw new Error('CompletionOptions.grammarLazy needs at least one CompletionOptions.grammarTriggers entry.');
+  }
+  return { root, lazy, triggers: lazy ? triggers : [] };
+}
+
 /**
- * Resolves `minP`, `presencePenalty`, `thinkingBudget`, `penaltyPromptTokens` and `speculativeDecoding`. Throws a RangeError
- * or TypeError for an invalid value, including a number that is not finite as
- * the core's 32-bit float and a grammar or thinking tag holding U+0000, and an
- * Error for a thinking budget with media parts or a speculative configuration
- * native llamadart rejects.
+ * Resolves `minP`, `presencePenalty`, `thinkingBudget`, `penaltyPromptTokens`, `speculativeDecoding` and the lazy grammar
+ * options. Throws a RangeError or TypeError for an invalid value, including a number that is not finite as
+ * the core's 32-bit float and a grammar, grammar trigger, grammar root or thinking tag holding U+0000, and an
+ * Error for a thinking budget with media parts, a speculative configuration
+ * native llamadart rejects, or a lazy grammar without a grammar or triggers.
  */
 export function resolveCompletionSamplingOptions(
   options: {
@@ -308,6 +390,9 @@ export function resolveCompletionSamplingOptions(
     penaltyPromptTokens?: unknown;
     speculativeDecoding?: unknown;
     grammar?: unknown;
+    grammarLazy?: unknown;
+    grammarTriggers?: unknown;
+    grammarRoot?: unknown;
     parts?: unknown;
   } | null | undefined,
 ): CompletionSamplingOptions {
@@ -326,6 +411,7 @@ export function resolveCompletionSamplingOptions(
       hasGrammar: typeof options?.grammar === 'string' && options.grammar.length > 0,
       hasThinkingBudget: budget != null,
     }),
+    grammarOptions: grammarOptions(options),
   };
 }
 
@@ -343,6 +429,7 @@ export function completionCapabilitiesFrom(raw: string | null): CompletionCapabi
     minP: parsed?.minP === true,
     thinkingBudget: parsed?.thinkingBudget === true,
     penaltyPromptTokens: parsed?.penaltyPromptTokens === true,
+    lazyGrammar: parsed?.lazyGrammar === true,
     speculativeDecoding: speculativeFlags((strategy) => speculative?.[strategy] === true),
   };
 }
@@ -356,6 +443,10 @@ export function requireCompletionCapabilities(
     sampling.minP !== 0 && !capabilities.minP ? 'minP' : null,
     sampling.presencePenalty !== 0 && !capabilities.presencePenalty ? 'presencePenalty' : null,
     sampling.thinkingBudget != null && !capabilities.thinkingBudget ? 'thinkingBudget' : null,
+    sampling.grammarOptions?.lazy === true && !capabilities.lazyGrammar ? 'grammarLazy' : null,
+    sampling.grammarOptions != null && sampling.grammarOptions.root !== 'root' && !capabilities.lazyGrammar
+      ? 'grammarRoot'
+      : null,
     sampling.speculative != null && !Object.values(capabilities.speculativeDecoding).includes(true)
       ? 'speculativeDecoding'
       : null,
