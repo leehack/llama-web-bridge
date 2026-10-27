@@ -501,12 +501,16 @@ const TAG_V0141 = new model.PipelineBinding({ bridgeSourceSha: BRIDGE_SHA, relea
 const OTHER_BUILD_SHA = 'b'.repeat(40);
 const RECENT_QUALIFICATIONS = workflowRuns.recentWorkflowRunsPath(model.QUALIFICATION_WORKFLOW_FILE);
 
-// Another pipeline's candidate run claiming `binding`'s tag: the next native
-// release of this build (same build), or this native release of another build.
-function claimRun(self, { runId = '401', binding = TAG_V0140, otherBuild = false, status = 'in_progress' } = {}) {
-  const correlationId = runNames.computeCorrelationId(otherBuild
-    ? makeProvenance({ bridgeBuildSha: OTHER_BUILD_SHA })
-    : self.newerNative());
+// Another pipeline's candidate run claiming `binding`'s tag: an earlier native
+// release of this build, the next one when `newerNative`, or this native
+// release of another build.
+function claimRun(self, {
+  runId = '401', binding = TAG_V0140, otherBuild = false, newerNative = false, status = 'in_progress',
+} = {}) {
+  let claimant = makeProvenance({ nativeReleaseTag: 'v0.1.9' });
+  if (otherBuild) claimant = makeProvenance({ bridgeBuildSha: OTHER_BUILD_SHA });
+  if (newerNative) claimant = self.newerNative();
+  const correlationId = runNames.computeCorrelationId(claimant);
   const run = runPayload({
     runId,
     path: model.CANDIDATE_WORKFLOW_PATH,
@@ -596,6 +600,19 @@ test('a released claim of another build does not block its tag', withAdvancePipe
   assert.ok(!plan.reason.includes('re-planned'), plan.reason);
   // The release was decided from fresh downstream reads, not assumed.
   assert.equal(gateway.reads(RECENT_QUALIFICATIONS), 1);
+}));
+
+test('stale listing that omits a newer native claim below the fresh tag re-plans to superseded', withAdvancePipelineFixture((self) => {
+  const listed = claimRun(self, { runId: '402', binding: TAG_V0141 });
+  const { correlationId, run } = claimRun(self, { newerNative: true });
+  const gateway = new StaleGateway({
+    jsonRoutes: self.routes({ releases: [assetReleaseStub()], candidateRuns: [listed.run, run] }),
+  }).staleFor(CANDIDATE_LISTING, runsResponse([listed.run]));
+  const plan = dryRun(self, gateway);
+  assert.equal(plan.action, OrchestrationAction.SUPERSEDED);
+  assert.equal(plan.dispatchWorkflow, null);
+  assertReplanned(plan, `401 (in_progress, claiming v0.1.40 for ${correlationId})`);
+  assert.deepEqual(gateway.dispatches, []);
 }));
 
 test('a claim above the fresh tag re-plans too', withAdvancePipelineFixture((self) => {

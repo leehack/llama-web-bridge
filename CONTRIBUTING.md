@@ -432,9 +432,11 @@ query strings, and fragments before printing the location.
   a newer candidate. Publication remains ordered by native release time, so
   output tags must follow the same order: an older native with no pipeline for
   the current build identity is `superseded` when a newer native release is in
-  the scan. Where its qualification or publication would be dispatched, an
-  older pipeline bound to an output tag at or above one a newer scanned native's
-  pipeline claims is `superseded` too.
+  the scan or a newer native's pipeline still claims an output tag. Where its
+  qualification or publication would be dispatched, an older pipeline bound to
+  an output tag at or above one a newer native's pipeline claims is
+  `superseded` too. The claim comes from the candidate run name, so a targeted
+  `native_release_tag` scan of an older native obeys the same order.
   An entry without its own exact publication is `superseded` when a published
   stable asset release's `Native:` marker names a newer native release (version,
   then rebuild); the newest native release in a scan is `blocked` instead.

@@ -451,3 +451,120 @@ test('overtaken candidate is satisfied by an identical release of its own native
   assert.equal(plan.action, OrchestrationAction.SATISFIED_BY_IDENTICAL_RELEASE);
   assert.equal(plan.releaseTarget.releaseTag, 'v0.1.42');
 }));
+
+test('targeted newer-native scan then wider scans keep output tags in native order', withAdvancePipelineFixture(async (self) => {
+  const older = self.provenance;
+  const newer = self.newerNative();
+  const releases = [priorAlignment(self)];
+  const [, targeted] = await scanBacklog(self, scanGateway(self, { releases, provenances: [newer] }), [newer]);
+  assert.deepEqual(rows(targeted), [['v0.2.1', OrchestrationAction.DISPATCH_CANDIDATE, 'v0.1.41']]);
+
+  const candidate = pipeline(self, {
+    provenance: newer, releaseTag: 'v0.1.41', ids: NEWER_IDS, qualified: false,
+  });
+  const [, woken] = await scanBacklog(self, scanGateway(self, {
+    releases, provenances: [older, newer], pipelines: [candidate],
+  }), [older, newer]);
+  assert.deepEqual(rows(woken), [
+    ['v0.2.0', OrchestrationAction.SUPERSEDED, null],
+    ['v0.2.1', OrchestrationAction.DISPATCH_QUALIFICATION, 'v0.1.41'],
+  ]);
+
+  // A prior-native refresh that already holds a higher tag arrives later.
+  const [result, later] = await scanBacklog(self, scanGateway(self, {
+    releases,
+    provenances: [older, newer],
+    pipelines: [
+      pipeline(self, { provenance: older, releaseTag: 'v0.1.42', ids: OLDER_IDS }),
+      pipeline(self, { provenance: newer, releaseTag: 'v0.1.41', ids: NEWER_IDS }),
+    ],
+  }), [older, newer]);
+  assert.equal(result, 0);
+  assert.deepEqual(rows(later), [
+    ['v0.2.0', OrchestrationAction.SUPERSEDED, 'v0.1.42'],
+    ['v0.2.1', OrchestrationAction.DISPATCH_PUBLISH, 'v0.1.41'],
+  ]);
+}));
+
+test('targeted older-native scan does not start a pipeline above a newer native pipeline', withAdvancePipelineFixture(async (self) => {
+  const older = self.provenance;
+  const newer = self.newerNative();
+  for (const qualified of [true, false]) {
+    const gateway = scanGateway(self, {
+      releases: [priorAlignment(self)],
+      provenances: [older],
+      pipelines: [pipeline(self, {
+        provenance: newer, releaseTag: 'v0.1.41', ids: NEWER_IDS, qualified,
+      })],
+    });
+    const [result, backlog] = await scanBacklog(self, gateway, [older]);
+    assert.deepEqual(backlog.errors, [], `qualified=${qualified}`);
+    assert.equal(result, 0, `qualified=${qualified}`);
+    assert.deepEqual(rows(backlog), [['v0.2.0', OrchestrationAction.SUPERSEDED, null]], `qualified=${qualified}`);
+    assert.ok(backlog.plans[0].reason.includes('v0.2.1'), `qualified=${qualified}`);
+    assert.deepEqual(dispatched(backlog), [], `qualified=${qualified}`);
+  }
+}));
+
+test('targeted older-native scan supersedes its pipeline above a newer native pipeline', withAdvancePipelineFixture(async (self) => {
+  const older = self.provenance;
+  const newer = self.newerNative();
+  for (const qualified of [true, false]) {
+    const gateway = scanGateway(self, {
+      releases: [priorAlignment(self)],
+      provenances: [older],
+      pipelines: [
+        pipeline(self, {
+          provenance: older, releaseTag: 'v0.1.42', ids: OLDER_IDS, qualified,
+        }),
+        pipeline(self, {
+          provenance: newer, releaseTag: 'v0.1.41', ids: NEWER_IDS, qualified: false,
+        }),
+      ],
+    });
+    const [result, backlog] = await scanBacklog(self, gateway, [older]);
+    assert.deepEqual(backlog.errors, [], `qualified=${qualified}`);
+    assert.equal(result, 0, `qualified=${qualified}`);
+    assert.deepEqual(rows(backlog), [['v0.2.0', OrchestrationAction.SUPERSEDED, 'v0.1.42']], `qualified=${qualified}`);
+    assert.ok(backlog.plans[0].reason.includes('ordering rollback'), `qualified=${qualified}`);
+    assert.deepEqual(dispatched(backlog), [], `qualified=${qualified}`);
+  }
+}));
+
+test('targeted older-native scan still publishes a pipeline below a newer native pipeline', withAdvancePipelineFixture(async (self) => {
+  const older = self.provenance;
+  const newer = self.newerNative();
+  const gateway = scanGateway(self, {
+    releases: [priorAlignment(self)],
+    provenances: [older],
+    pipelines: [
+      pipeline(self, { provenance: older, releaseTag: 'v0.1.41', ids: OLDER_IDS }),
+      pipeline(self, {
+        provenance: newer, releaseTag: 'v0.1.42', ids: NEWER_IDS, qualified: false,
+      }),
+    ],
+  });
+  const [result, backlog] = await scanBacklog(self, gateway, [older]);
+  assert.equal(result, 0);
+  assert.deepEqual(rows(backlog), [['v0.2.0', OrchestrationAction.DISPATCH_PUBLISH, 'v0.1.41']]);
+}));
+
+test('a released newer-native claim of another build does not supersede an older native', withAdvancePipelineFixture(async (self) => {
+  const older = self.provenance;
+  const newer = replaceProvenance(self.newerNative(), { bridgeBuildSha: ADVANCED_BRIDGE_SHA });
+  const binding = new model.PipelineBinding({ bridgeSourceSha: BRIDGE_SHA, releaseTag: 'v0.1.41', releaseRebuild: 0 });
+  const failed = runPayload({
+    runId: NEWER_IDS.candidate,
+    path: model.CANDIDATE_WORKFLOW_PATH,
+    runName: runNames.candidateRunName(runNames.computeCorrelationId(newer), binding),
+    conclusion: 'failure',
+  });
+  const gateway = scanGateway(self, {
+    releases: [priorAlignment(self)],
+    provenances: [older],
+    pipelines: [{ routes: {}, blobs: {}, runs: { candidate: [failed], qualification: [], publish: [] } }],
+  });
+  const [result, backlog] = await scanBacklog(self, gateway, [older]);
+  assert.equal(result, 0);
+  assert.deepEqual(rows(backlog), [['v0.2.0', OrchestrationAction.DISPATCH_CANDIDATE, 'v0.1.41']]);
+}));
