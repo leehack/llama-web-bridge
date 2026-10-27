@@ -210,7 +210,7 @@ export interface CompletionOptions {
   grammar?: string;
   /** `true` applies `grammar` only after one of `grammarTriggers` fires, as llama.cpp's lazy grammar does: text before the trigger is unconstrained, and the grammar starts at the trigger. Needs a non-empty `grammar` and at least one trigger. Omitted or null means false. */
   grammarLazy?: boolean | null;
-  /** Activations for a lazy grammar, read only when `grammarLazy` is true. */
+  /** Activations for a lazy grammar. Always validated; applied only when `grammarLazy` is true. */
   grammarTriggers?: readonly GrammarTrigger[] | null;
   /** The `grammar` rule generation starts from. Defaults to `root`. */
   grammarRoot?: string | null;
@@ -227,8 +227,8 @@ export interface CompletionOptions {
  * the trigger text.
  *
  * - `word`: `value` appears in the output.
- * - `pattern`: the output contains a match of the ECMAScript regular expression
- *   `value`; the grammar starts at its first non-empty capture group, else at
+ * - `pattern`: the output contains a match of `value`, a C++ `std::regex`
+ *   ECMAScript expression (no lookbehind, named groups or flags); the grammar starts at its first non-empty capture group, else at
  *   the match.
  * - `pattern-full`: the whole output so far matches `value`, anchored with `^`
  *   and `$`; the grammar starts as for `pattern`.

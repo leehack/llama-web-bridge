@@ -4,6 +4,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { GRAMMAR_TRIGGER_TYPES } from '../../js/src/internal/completion_options.ts';
+import { LAZY_GRAMMAR_REJECTED_ERROR_TEXT } from '../../js/src/internal/constants.ts';
 import { createDirectBridge, createWorkerBridge } from './bridge_operation_queue_fixtures.mjs';
 import { readNativeCoreSource } from './native_core_source.mjs';
 
@@ -293,6 +294,10 @@ const CASES = [
     assert.match(
       sample,
       /if \(!g_active_grammar_lazy\) \{\s*llama_sampler_accept\(g_active_grammar, token\);\s*\} else \{\s*std::string grammar_error;\s*if \(!llamadart_webgpu_grammar_sampler_accept\(\s*g_active_grammar, token, &grammar_error\)\) \{\s*set_error\([^;]*\);\s*return LLAMA_TOKEN_NULL;/,
+    );
+    assert.ok(
+      sample.includes(`"${LAZY_GRAMMAR_REJECTED_ERROR_TEXT}: "`),
+      'the facade recognizes the core error and keeps the worker',
     );
     for (const name of ['llamadart_webgpu_grammar_sampler_init', 'llamadart_webgpu_grammar_sampler_accept']) {
       assert.match(wrappers, new RegExp(`extern "C" __attribute__\\(\\(noinline\\)\\)[^\\n]*\\n?${name}\\(`), `${name} must stay noinline`);

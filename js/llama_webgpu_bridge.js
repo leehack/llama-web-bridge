@@ -552,6 +552,7 @@ function bridgeDisposedError() {
 var GENERATION_ALREADY_ACTIVE_RC = -7;
 var GENERATION_ALREADY_ACTIVE_MESSAGE = "Generation is already active on this bridge runtime.";
 var INVALID_GRAMMAR_ERROR_TEXT = "Failed to initialize sampler chain (invalid grammar)";
+var LAZY_GRAMMAR_REJECTED_ERROR_TEXT = "The lazy grammar rejected the text that triggered it";
 
 // js/src/internal/typed_values.ts
 function toUint8Array(value) {
@@ -6955,7 +6956,8 @@ var LlamaWebGpuBridge = class {
       }
     } catch (error) {
       this._throwIfOperationCancelled(error, "Generation was cancelled.");
-      if (serializeWorkerError(error).includes(INVALID_GRAMMAR_ERROR_TEXT)) {
+      const workerError = serializeWorkerError(error);
+      if (workerError.includes(INVALID_GRAMMAR_ERROR_TEXT) || workerError.includes(LAZY_GRAMMAR_REJECTED_ERROR_TEXT)) {
         throw error;
       }
       if (this._hasMediaParts(options)) {
