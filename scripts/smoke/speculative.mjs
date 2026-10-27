@@ -128,18 +128,23 @@ export const GROUPS = Object.freeze({
       { label: 'malformed n-gram cache', strategies: ['ngram-cache'], cache: 'malformed', error: 'n-gram cache is malformed' },
       { label: 'draft-mtp without MTP layers', strategies: ['draft-mtp'], error: "draft-mtp needs the model's MTP head" },
     ],
-    // With these load options the draft context's compute buffers need more
-    // than the target leaves of the wasm32 core's 4 GiB, but fit the memory64
-    // core. A failed draft context must free what it allocated, keep the target
-    // usable and let the model load again.
+    // On the CPU, with these load options the draft context's compute buffers
+    // need more than the target leaves of the wasm32 core's 4 GiB, but fit the
+    // memory64 core; on WebGPU they live outside the heap. A failed draft
+    // context must free what it allocated, keep the target usable and let the
+    // model load again. A target context that cannot fit at all
+    // (oversizedNCtx) must reject its load the same way.
     draftContextOverflow: {
       loadOptions: { nCtx: 98304, nBatch: 2048, nUbatch: 2048, flashAttention: 0 },
       strategies: ['draft-simple'],
       draft: 'smoke_model',
       attempts: 3,
-      errors: {
+      cpuErrors: {
         wasm32: "Failed to create the speculative draft context: failed to allocate compute pp buffers. It does not fit in the wasm32 core's 4 GiB of memory: load the model with a smaller nBatch and nUbatch, or use the memory64 core",
       },
+      gpuError: 'It does not fit in memory: load the model with a smaller nBatch and nUbatch',
+      oversizedNCtx: 196608,
+      oversizedError: 'llama_init_from_model failed',
     },
   },
   smollm2: {
@@ -386,12 +391,25 @@ export function renderHarness(groups, nCtx, memoryModes, runtimeModes, gpuLayers
         const overflow = group.draftContextOverflow;
         if (overflow) {
           const label = 'draft context overflow';
-          const expected = overflow.errors[memoryMode] || null;
+          const onGpu = config.gpuLayers > 0;
+          const expected = onGpu ? null : overflow.cpuErrors[memoryMode] || null;
           const speculativeDecoding = { strategies: overflow.strategies };
           // The direct runtime's core is reachable, so its heap shows what a
           // failed draft context leaks.
-          const core = expected && runtimeMode === 'direct' && bridge._runtime ? bridge._runtime._core : null;
+          const measuresLeak = expected !== null && runtimeMode === 'direct';
+          const core = measuresLeak && bridge._runtime ? bridge._runtime._core : null;
+          check(!measuresLeak || (core && typeof core.ccall === 'function'), label + ': the direct core is not reachable for the leak check');
           const headroom = () => (core ? Number(core.ccall('llamadart_webgpu_heap_headroom_bytes', 'number', [], [])) : null);
+          if (expected !== null) {
+            let error = null;
+            try {
+              await bridge.loadModelFromUrl('/' + group.target, { ...loadOptions, ...overflow.loadOptions, nCtx: overflow.oversizedNCtx });
+            } catch (caught) {
+              error = errorText(caught);
+            }
+            check(error !== null && error.includes(overflow.oversizedError),
+              label + ': a target context that cannot fit: expected ' + JSON.stringify(overflow.oversizedError) + ', got ' + JSON.stringify(error));
+          }
           await bridge.loadModelFromUrl('/' + group.target, { ...loadOptions, ...overflow.loadOptions });
           const baseline = await complete(bridge, config.prompts.draft, null);
           await bridge.loadDraftModel('/' + overflow.draft, { useCache: false });
@@ -409,6 +427,9 @@ export function renderHarness(groups, nCtx, memoryModes, runtimeModes, gpuLayers
             if (expected) {
               check(error !== null && error.includes(expected),
                 label + ': expected ' + JSON.stringify(expected) + ', got ' + JSON.stringify(error));
+            } else if (onGpu && error !== null) {
+              check(error.includes(overflow.gpuError),
+                label + ': expected success or ' + JSON.stringify(overflow.gpuError) + ', got ' + JSON.stringify(error));
             } else {
               check(error === null && text === baseline.text, label + ': the draft context failed or changed the output: ' + JSON.stringify(error));
             }

@@ -659,11 +659,14 @@ const CASES = [
     );
 
     const overflow = smoke.GROUPS.tiny.draftContextOverflow;
-    assert.deepEqual(Object.keys(overflow.errors), ['wasm32'], 'the memory64 core fits the same draft context');
+    assert.deepEqual(Object.keys(overflow.cpuErrors), ['wasm32'], 'the memory64 core fits the same draft context');
     assert.ok(overflow.attempts > 1, 'repeated failures expose a leak');
-    const hint = overflow.errors.wasm32.split('failed to allocate compute pp buffers. ')[1];
+    const hint = overflow.cpuErrors.wasm32.split('failed to allocate compute pp buffers. ')[1];
     const create = functionBody('llama_context * create_draft_context(').replace(/"\s+"/g, '');
     assert.ok(hint && create.includes(`". ${hint}`), 'the smoke expects the core\'s wasm32 hint');
+    assert.ok(create.includes(`: ". ${overflow.gpuError}";`), 'the smoke accepts the core\'s generic hint on WebGPU');
+    assert.ok(functionBody('int32_t load_model_internal(').includes(`set_error("${overflow.oversizedError}");`),
+      'the smoke expects the target context error');
   }],
 
   ['the core validates a speculative request before it changes generation state', () => {
