@@ -120,6 +120,18 @@ test('test_finished_claim_of_another_build_is_dropped', () => {
   }
 });
 
+test('a recovery pipeline claim follows its build identity like its stranded pipeline', () => {
+  const self = claimedSetUp();
+  const other = self.other.replace('-build-', '-r1-');
+  const current = self.current.replace('-build-', '-r2-');
+  const finished = records(model.CANDIDATE_WORKFLOW_PATH, ['501', candidateName(other, 'v0.1.40', 0), 'completed', 'success']);
+  assert.equal(releaseTags.hasOtherBuildClaim(finished, { bridgeBuildSha: BRIDGE_SHA }), true);
+  assert.deepEqual(releaseTags.claimedReleaseTags(finished, { bridgeBuildSha: BRIDGE_SHA }), new Set());
+  const kept = records(model.CANDIDATE_WORKFLOW_PATH, ['502', candidateName(current, 'v0.1.41', 0), 'completed', 'failure']);
+  assert.equal(releaseTags.hasOtherBuildClaim(kept, { bridgeBuildSha: BRIDGE_SHA }), false);
+  assert.deepEqual(releaseTags.claimedReleaseTags(kept, { bridgeBuildSha: BRIDGE_SHA }), new Set(['v0.1.41']));
+});
+
 test('test_current_build_claim_is_kept', () => {
   const self = claimedSetUp();
   const runs = records(model.CANDIDATE_WORKFLOW_PATH, ['501', candidateName(self.current, 'v0.1.40', 0), 'completed', 'failure']);

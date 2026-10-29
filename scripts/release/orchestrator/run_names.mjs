@@ -63,9 +63,21 @@ function pyLen(text) {
 // The one immutable pre-automation publication keeps its historical
 // correlation only while the governed build identity is still its exact
 // bridge commit.
-export function computeCorrelationId(provenance) {
+//
+// `recovery` N > 0 names the Nth replacement pipeline of a candidate whose
+// output tag a published release overtook: the same provenance under a new
+// correlation, so it binds a fresh output tag and proves every stage again
+// without touching the stranded pipeline's runs, artifacts or attestation.
+// It replaces `-build-` with the shorter `-rN-`, so its publish run name is
+// no longer than the stranded pipeline's, which is already close to
+// MAX_RUN_NAME_CHARACTERS.
+export function computeCorrelationId(provenance, { recovery = 0 } = {}) {
+  if (!Number.isSafeInteger(recovery) || recovery < 0 || recovery > 99) {
+    throw new ContractError('recovery generation must be an integer from 0 to 99');
+  }
   if (
-    provenance.bridgeBuildSha === LEGACY_MANUAL_QUALIFICATION_BRIDGE_COMMIT
+    recovery === 0
+    && provenance.bridgeBuildSha === LEGACY_MANUAL_QUALIFICATION_BRIDGE_COMMIT
     && provenance.nativeReleaseTag === LEGACY_MANUAL_QUALIFICATION_NATIVE_TAG
     && provenance.nativeCommit === LEGACY_MANUAL_QUALIFICATION_NATIVE_COMMIT
     && provenance.upstreamTag === LEGACY_MANUAL_QUALIFICATION_UPSTREAM_TAG
@@ -76,13 +88,21 @@ export function computeCorrelationId(provenance) {
   }
   const raw = `auto-stable-${provenance.nativeReleaseTag}`
     + `-${provenance.nativeManifestSha256.slice(0, 16)}`
-    + `-build-${provenance.bridgeBuildSha.slice(0, 16)}`;
+    + `${recovery === 0 ? '-build-' : `-r${recovery}-`}${provenance.bridgeBuildSha.slice(0, 16)}`;
   return requireCorrelationId(raw);
+}
+
+const RECOVERY_BUILD_RE = /-r[1-9][0-9]?-(?<build>[0-9a-f]{16})$/u;
+
+// The correlation computeCorrelationId gave the stranded pipeline that
+// `correlationId` recovers, or `correlationId` itself.
+export function correlationRecoveryBase(correlationId) {
+  return correlationId.replace(RECOVERY_BUILD_RE, (_, build) => `-build-${build}`);
 }
 
 const CORRELATION_NATIVE_RE = new RegExp(
   '^auto-stable-(?<native>v(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)(?:-[1-9][0-9]*)?)'
-  + '-(?<manifest>[0-9a-f]{16})(?:-build-[0-9a-f]{16})?$',
+  + '-(?<manifest>[0-9a-f]{16})(?:-(?:build|r[1-9][0-9]?)-[0-9a-f]{16})?$',
   'u',
 );
 
