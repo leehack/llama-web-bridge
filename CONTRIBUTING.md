@@ -460,7 +460,17 @@ query strings, and fragments before printing the location.
   newer native release is in the scan. The newest scanned native is instead
   `satisfied_by_identical_release` when its publication files other than
   `manifest.json` match that newest release, published for another native
-  release in the same scan, and `blocked` otherwise.
+  release in the same scan. When they differ, a recovery pipeline replaces it:
+  the same provenance under its correlation with `-build-` replaced by `-rN-`,
+  which binds a fresh output tag above every published tag and live claim and
+  runs a new first-attempt candidate, qualification and publication. The
+  stranded pipeline's runs, artifacts and attestation stay as they are, and
+  once a later generation publishes, it settles the stranded one whatever its
+  bytes. A recovery pipeline overtaken in turn moves to the next generation; an
+  overtaken generation 3 is `blocked` instead. When no native release in the
+  scan published the overtaking release, its bytes cannot be compared, so the
+  pipeline is `blocked` until a scan that includes that native release, such
+  as the daily backlog scan, compares them.
   Manual `development` scans stay scan-only: they resolve exact `bNNNN`
   provenance and report it, and the orchestrator refuses non-stable provenance.
   A failed candidate or qualification is never retried automatically; after diagnosis,

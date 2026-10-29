@@ -98,7 +98,7 @@ export function claimedRebuildsOf(binding, claimed) {
   return dependents.sort(compareCodePoints);
 }
 
-const CORRELATION_BUILD_RE = /-build-(?<build>[0-9a-f]{16})$/u;
+const CORRELATION_BUILD_RE = /-(?:build|r[1-9][0-9]?)-(?<build>[0-9a-f]{16})$/u;
 
 // _run_correlation_id.
 function runCorrelationId(record) {

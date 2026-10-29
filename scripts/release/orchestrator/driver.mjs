@@ -31,7 +31,8 @@ import {
   releaseTagClaims, runNameCorrelationId, selectNextReleaseTarget,
 } from './release_tags.mjs';
 import {
-  computeCorrelationId, correlationNativeIdentity, parsePublishRunName, publishRunName, qualificationRunName,
+  computeCorrelationId, correlationNativeIdentity, correlationRecoveryBase, parsePublishRunName, publishRunName,
+  qualificationRunName,
 } from './run_names.mjs';
 import { makeDirectories, verifyCandidateRun, verifyQualificationRun } from './stage_proofs.mjs';
 import {
@@ -46,6 +47,10 @@ function isMapping(value) {
 
 export const DISPATCH_READBACK_ATTEMPTS = 12;
 export const DISPATCH_READBACK_DELAY_SECONDS = 5.0;
+// Each recovery generation follows a further publication that overtook the
+// previous one; more than this means output-tag order keeps breaking, which a
+// maintainer must diagnose.
+export const MAX_RECOVERY_GENERATIONS = 3;
 
 export function requireDefaultBranch(gateway) {
   const payload = gateway.apiJson(`repos/${BRIDGE_REPOSITORY}`);
@@ -368,17 +373,19 @@ export function advancePipeline(gateway, options) {
 // One observation and plan of advancePipeline. `evidence` is null, or the
 // StaleObservation of an earlier pass, whose runs are merged into the listing
 // of its stage; a plan that wants that stage again returns it as repeated.
-function observeAndPlan(gateway, {
-  provenance,
-  workspace,
-  dryRun = false,
-  reservedReleaseTags = [],
-  satisfiedCorrelationIds = [],
-  publicationAllowed = true,
-  publicationBarrierNativeTag = null,
-  newerNativeScanned = false,
-  scannedProvenances = [],
-}, evidence) {
+function observeAndPlan(gateway, options, evidence) {
+  const {
+    provenance,
+    workspace,
+    dryRun = false,
+    reservedReleaseTags = [],
+    satisfiedCorrelationIds = [],
+    publicationAllowed = true,
+    publicationBarrierNativeTag = null,
+    newerNativeScanned = false,
+    scannedProvenances = [],
+    recovery = 0,
+  } = options;
   requireStableProvenance(provenance);
   if (!publicationAllowed) {
     if (typeof publicationBarrierNativeTag !== 'string') {
@@ -387,7 +394,7 @@ function observeAndPlan(gateway, {
     const barrier = parseReleaseTag(publicationBarrierNativeTag);
     if (barrier.channel !== Channel.STABLE) throw new ContractError('publication barrier native tag must be stable');
   }
-  const correlationId = computeCorrelationId(provenance);
+  const correlationId = computeCorrelationId(provenance, { recovery });
   const defaultBranch = requireDefaultBranch(gateway);
   // Governance is a prerequisite for every state classification, including a
   // noop: a disabled or unreadable policy is never reported as healthy stable
@@ -499,7 +506,7 @@ function observeAndPlan(gateway, {
   let nativeReleases = null;
   const unprovenClaim = (claims) => {
     for (const claim of claims) {
-      if (scannedCorrelationIds.has(claim.correlationId)) continue;
+      if (scannedCorrelationIds.has(correlationRecoveryBase(claim.correlationId))) continue;
       nativeReleases ??= fetchNativeReleases(gateway);
       const why = unprovenNativeClaim(nativeReleases, claim);
       if (why !== null) return why;
@@ -665,18 +672,40 @@ function observeAndPlan(gateway, {
 
   // Once a published release reaches this candidate's output tag, publishing it
   // is an ordering rollback, so it is never retried. It is satisfied only by a
-  // proven byte-identical publication; otherwise it stays blocked.
+  // proven byte-identical publication, and replaced by a recovery pipeline when
+  // its bytes are proven to differ.
   const overtakenPlan = (qualificationRunId) => {
     const head = newestPublishedStableRelease(releases);
     if (head === null) return null;
     const headTag = pyStr(pyGet(head, 'tag_name'));
     if (claimsNotBelow(releaseTag, [headTag]).length === 0) return null;
-    const satisfied = satisfiedPlan(qualificationRunId);
-    if (satisfied !== null) return satisfied;
     const overtaken = (
       `published release ${headTag} is at or above output tag ${releaseTag} of `
       + `candidate ${candidate.runId}, so publishing it would be an ordering rollback`
     );
+    // The next recovery generation of this provenance: a new correlation, so a
+    // fresh output tag and new first-attempt candidate, qualification and
+    // publication.
+    const recover = (why) => {
+      const recovered = observeAndPlan(gateway, { ...options, recovery: recovery + 1 }, evidence);
+      if (recovered instanceof StaleObservation) return recovered;
+      return withReason(recovered, (
+        `${overtaken}; ${why}; recovery pipeline ${recovered.correlationId}: ${recovered.reason}`
+      ));
+    };
+    // A published later generation settles this one, whatever its bytes.
+    const laterGenerations = Array.from(
+      { length: Math.max(0, MAX_RECOVERY_GENERATIONS - recovery) },
+      (_, index) => correlationMarker(computeCorrelationId(provenance, { recovery: recovery + 1 + index })),
+    );
+    if (releases.some((release) => {
+      const body = pyGet(release, 'body');
+      return typeof body === 'string' && laterGenerations.some((marker) => body.includes(marker));
+    })) {
+      return recover('a later recovery generation of this provenance is published');
+    }
+    const satisfied = satisfiedPlan(qualificationRunId);
+    if (satisfied !== null) return satisfied;
     // Blocked, it would hold the publication barrier and starve the newer
     // native release that supersedes it anyway.
     if (newerNativeScanned) {
@@ -686,22 +715,26 @@ function observeAndPlan(gateway, {
       ), { qualificationRunId });
     }
     const blocked = (why) => retired(OrchestrationAction.BLOCKED, (
-      `${overtaken}; ${why}; nothing was dispatched, and ${provenance.nativeReleaseTag} `
-      + 'publishes only from a new governed bridge build identity'
+      `${overtaken}; ${why}; nothing was dispatched`
     ), { qualificationRunId });
     const body = pyGet(head, 'body');
-    const publisher = [...scannedProvenances].find((other) => (
-      other.nativeReleaseTag !== provenance.nativeReleaseTag
-      && typeof body === 'string'
-      && body.includes(correlationMarker(computeCorrelationId(other)))
-    ));
+    const [publisher, publisherCorrelationId] = (typeof body !== 'string' ? undefined : [...scannedProvenances]
+      .filter((other) => other.nativeReleaseTag !== provenance.nativeReleaseTag)
+      .flatMap((other) => Array.from(
+        { length: MAX_RECOVERY_GENERATIONS + 1 },
+        (_, generation) => [other, computeCorrelationId(other, { recovery: generation })],
+      ))
+      .find(([, otherCorrelationId]) => body.includes(correlationMarker(otherCorrelationId)))) ?? [];
     if (publisher === undefined) {
-      return blocked(`${headTag} is not the publication of another native release in this scan, so its bytes cannot be compared`);
+      return blocked(
+        `${headTag} is not the publication of another native release in this scan, so its bytes cannot be compared; `
+        + 'a scan that includes the native release it records compares them',
+      );
     }
     const published = verifyPublishedRelease(gateway, {
       release: head,
       provenance: publisher,
-      correlationId: computeCorrelationId(publisher),
+      correlationId: publisherCorrelationId,
       workspace,
     });
     if (published.directory === null) throw new ContractError('verified release did not retain its downloaded bytes');
@@ -709,7 +742,13 @@ function observeAndPlan(gateway, {
       candidatePublicationDigests(candidate.directory),
       candidatePublicationDigests(published.directory),
     )) {
-      return blocked(`its publication files differ from ${headTag}`);
+      if (recovery >= MAX_RECOVERY_GENERATIONS) {
+        return blocked(
+          `its publication files differ from ${headTag}, and recovery generation ${recovery} is the last automatic one; `
+          + 'a maintainer must diagnose why output tags keep being overtaken',
+        );
+      }
+      return recover(`its publication files differ from ${headTag}`);
     }
     return retired(OrchestrationAction.SATISFIED_BY_IDENTICAL_RELEASE, (
       `${overtaken}; its publication files other than manifest.json are byte-identical `

@@ -2,7 +2,8 @@
 // native releases share one scan: an older native never starts a pipeline
 // behind a newer scanned native, an older pipeline holding a higher output tag
 // than a newer native's is superseded, and a pipeline whose output tag a
-// published release overtook is satisfied or blocked instead of retried.
+// published release overtook is satisfied, superseded or replaced by a
+// recovery pipeline instead of retried.
 
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -19,6 +20,7 @@ import * as assetReleases from '../../../scripts/release/orchestrator/asset_rele
 import * as driver from '../../../scripts/release/orchestrator/driver.mjs';
 import * as model from '../../../scripts/release/orchestrator/model.mjs';
 import * as runNames from '../../../scripts/release/orchestrator/run_names.mjs';
+import * as workflowRuns from '../../../scripts/release/orchestrator/workflow_runs.mjs';
 import { ATTESTATION_ARTIFACT_NAME, CANDIDATE_ARTIFACT_NAME } from '../../../scripts/release/qualification.mjs';
 import {
   ADVANCED_BRIDGE_SHA, BRIDGE_SHA, FakeGateway, alignedReleaseStub, artifactInventory, assetReleaseStub, directoryMembers,
@@ -40,16 +42,16 @@ const NEWER_IDS = Object.freeze({
   candidate: '5201', candidateArtifact: 61, qualification: '5202', qualificationArtifact: 62, publish: '5203',
 });
 
-// A pipeline of `provenance` at the fixture's build identity bound to
-// `releaseTag`: a succeeded candidate whose artifact carries `marker` bytes,
-// a succeeded attested qualification when `qualified`, and a failed
-// publication when `publishFailed`.
+// A pipeline of `provenance` at the fixture's build identity and `recovery`
+// generation bound to `releaseTag`: a succeeded candidate whose artifact
+// carries `marker` bytes, a succeeded attested qualification when
+// `qualified`, and a failed publication when `publishFailed`.
 function pipeline(self, {
-  provenance, releaseTag, ids, marker = 'same', qualified = true, publishFailed = false,
+  provenance, releaseTag, ids, marker = 'same', qualified = true, publishFailed = false, recovery = 0,
 }) {
-  const correlationId = runNames.computeCorrelationId(provenance);
+  const correlationId = runNames.computeCorrelationId(provenance, { recovery });
   const binding = new model.PipelineBinding({ bridgeSourceSha: BRIDGE_SHA, releaseTag, releaseRebuild: 0 });
-  const directory = path.join(self.tmp, `candidate-${provenance.nativeReleaseTag}`);
+  const directory = path.join(self.tmp, `candidate-${correlationId}`);
   writeBridgeCandidate(directory, {
     releaseTag,
     releaseRebuild: 0,
@@ -171,17 +173,36 @@ function priorAlignment(self) {
   return alignedReleaseStub('v0.1.40', replaceProvenance(self.provenance, { bridgeBuildSha: ADVANCED_BRIDGE_SHA }));
 }
 
-// The older native published at this build identity as `tag`, verifiable,
-// with its publication files carrying `marker` bytes.
-function olderPublication(self, { tag, marker = 'same' }) {
-  const correlationId = runNames.computeCorrelationId(self.provenance);
-  const directory = path.join(self.tmp, 'published-older');
+// `provenance` (by default the older native) published at this build
+// identity and `recovery` generation as `tag`, verifiable, with its
+// publication files carrying `marker` bytes.
+function olderPublication(self, {
+  tag, marker = 'same', provenance = self.provenance, recovery = 0, releaseId = 4343,
+}) {
+  const correlationId = runNames.computeCorrelationId(provenance, { recovery });
+  const directory = path.join(self.tmp, `published-${correlationId}`);
   writeBridgeCandidate(directory, {
-    releaseTag: tag, releaseRebuild: 0, correlationId, runId: '777', marker: Buffer.from(marker),
+    releaseTag: tag,
+    releaseRebuild: 0,
+    correlationId,
+    runId: '777',
+    marker: Buffer.from(marker),
+    upstreamTag: provenance.upstreamTag,
+    upstreamCommit: provenance.upstreamCommit,
+    nativeReleaseTag: provenance.nativeReleaseTag,
+    nativeManifestSha256: provenance.nativeManifestSha256,
+    nativeCommit: provenance.nativeCommit,
   });
-  const [release, releaseRoutes, releaseBlobs, attestations] = alignedRelease(directory, {
-    tag, provenance: self.provenance, correlationId,
+  const [release, releaseRoutes, assetBlobs, attestations] = alignedRelease(directory, {
+    tag, provenance, correlationId, releaseId,
   });
+  // alignedRelease numbers every release's assets alike; keep each one's own.
+  const releaseBlobs = {};
+  for (const asset of release.assets) {
+    const blob = assetBlobs[`repos/${ASSETS_REPOSITORY}/releases/assets/${asset.id}`];
+    asset.id += (releaseId - 4343) * 100;
+    releaseBlobs[`repos/${ASSETS_REPOSITORY}/releases/assets/${asset.id}`] = blob;
+  }
   return {
     release, releaseRoutes, releaseBlobs, attestations,
   };
@@ -298,28 +319,208 @@ test('stranded pipeline overtaken by an identical publication is satisfied, not 
   assert.deepEqual(dispatched(backlog), []);
 }));
 
-test('stranded pipeline overtaken by a differing publication is blocked, not retried', withAdvancePipelineFixture(async (self) => {
+// Run identities of the newer native's recovery pipelines, by generation,
+// production-sized so their run names meet the real length limit.
+const recoveryIds = (generation) => Object.freeze({
+  candidate: `4066806${generation}531`,
+  candidateArtifact: 70 + generation * 2,
+  qualification: `4067066${generation}532`,
+  qualificationArtifact: 71 + generation * 2,
+  publish: `4067425${generation}533`,
+});
+
+// The issue #158 end state: the newer native's qualified v0.1.41 failed to
+// publish as an ordering rollback after a refresh of the older native took
+// v0.1.42 and published first with other bytes.
+function strandedScan(self, { pipelines = [], releases = [], qualified = true } = {}) {
   const older = self.provenance;
   const newer = self.newerNative();
   const published = olderPublication(self, { tag: 'v0.1.42', marker: 'older-bytes' });
+  const extra = releases.map((release, index) => olderPublication(self, { ...release, releaseId: 4400 + index }));
+  const gateway = scanGateway(self, {
+    releases: [priorAlignment(self), published.release, ...extra.map((item) => item.release)],
+    provenances: [older, newer],
+    pipelines: [
+      pipeline(self, {
+        provenance: newer, releaseTag: 'v0.1.41', ids: NEWER_IDS, qualified, publishFailed: qualified,
+      }),
+      ...pipelines,
+    ],
+    releaseRoutes: Object.assign({}, published.releaseRoutes, ...extra.map((item) => item.releaseRoutes)),
+    releaseBlobs: Object.assign({}, published.releaseBlobs, ...extra.map((item) => item.releaseBlobs)),
+    attestations: [...published.attestations, ...extra.flatMap((item) => item.attestations)],
+  });
+  return scanBacklog(self, gateway, [older, newer]);
+}
+
+test('stranded pipeline overtaken by a differing publication is recovered under a fresh output tag', withAdvancePipelineFixture(async (self) => {
+  const newer = self.newerNative();
+  const stranded = runNames.computeCorrelationId(newer);
+  const recovery = runNames.computeCorrelationId(newer, { recovery: 1 });
+  const ids = recoveryIds(1);
+  const newerPlan = (backlog) => backlog.plans[1];
+
+  const [result, first] = await strandedScan(self);
+  assert.deepEqual(first.errors, []);
+  assert.equal(result, 0);
+  assert.deepEqual(rows(first), [
+    ['v0.2.0', OrchestrationAction.NOOP, 'v0.1.42'],
+    ['v0.2.1', OrchestrationAction.DISPATCH_CANDIDATE, 'v0.1.43'],
+  ]);
+  assert.equal(newerPlan(first).correlation_id, recovery);
+  assert.equal(newerPlan(first).dispatch_inputs.orchestrator_correlation_id, recovery);
+  assert.equal(newerPlan(first).dispatch_inputs.native_release_tag, 'v0.2.1');
+  assert.equal(newerPlan(first).candidate_run_id, null);
+  assert.ok(newerPlan(first).reason.includes(`candidate ${NEWER_IDS.candidate}`));
+  assert.ok(newerPlan(first).reason.includes('differ from v0.1.42'));
+  assert.ok(newerPlan(first).reason.includes(`recovery pipeline ${recovery}`));
+  assert.deepEqual(dispatched(first), [[model.CANDIDATE_WORKFLOW_FILE, 'v0.1.43']]);
+
+  // Every later stage is a new first attempt of the recovery pipeline.
+  const [, second] = await strandedScan(self, {
+    pipelines: [pipeline(self, {
+      provenance: newer, releaseTag: 'v0.1.43', ids, qualified: false, recovery: 1,
+    })],
+  });
+  assert.deepEqual(rows(second)[1], ['v0.2.1', OrchestrationAction.DISPATCH_QUALIFICATION, 'v0.1.43']);
+  assert.deepEqual(newerPlan(second).dispatch_inputs, {
+    candidate_run_id: ids.candidate, orchestrator_correlation_id: recovery,
+  });
+  const [, third] = await strandedScan(self, {
+    pipelines: [pipeline(self, {
+      provenance: newer, releaseTag: 'v0.1.43', ids, recovery: 1,
+    })],
+  });
+  assert.deepEqual(rows(third)[1], ['v0.2.1', OrchestrationAction.DISPATCH_PUBLISH, 'v0.1.43']);
+  assert.equal(newerPlan(third).dispatch_inputs.candidate_run_id, ids.candidate);
+  assert.equal(newerPlan(third).dispatch_inputs.qualification_run_id, ids.qualification);
+  assert.equal(newerPlan(third).dispatch_inputs.orchestrator_correlation_id, recovery);
+
+  // Once the recovery pipeline publishes, whatever its bytes, the stranded
+  // one is settled by it.
+  for (const marker of ['same', 'rebuilt-bytes']) {
+    const [settledResult, settled] = await strandedScan(self, {
+      pipelines: [pipeline(self, {
+        provenance: newer, releaseTag: 'v0.1.43', ids, recovery: 1,
+      })],
+      releases: [{
+        tag: 'v0.1.43', provenance: newer, recovery: 1, marker,
+      }],
+    });
+    assert.deepEqual(settled.errors, [], marker);
+    assert.equal(settledResult, 0, marker);
+    assert.deepEqual(rows(settled)[1], ['v0.2.1', OrchestrationAction.NOOP, 'v0.1.43'], marker);
+    assert.equal(newerPlan(settled).correlation_id, recovery, marker);
+    assert.ok(newerPlan(settled).reason.includes(`candidate ${NEWER_IDS.candidate}`), marker);
+    assert.deepEqual(dispatched(settled), [], marker);
+  }
+  assert.notEqual(stranded, recovery);
+}));
+
+test('a stale listing that omits a live recovery candidate re-plans instead of dispatching another', withAdvancePipelineFixture((self) => {
+  const older = self.provenance;
+  const newer = self.newerNative();
+  const recovery = runNames.computeCorrelationId(newer, { recovery: 1 });
+  const published = olderPublication(self, { tag: 'v0.1.42', marker: 'older-bytes' });
+  const stranded = pipeline(self, {
+    provenance: newer, releaseTag: 'v0.1.41', ids: NEWER_IDS, publishFailed: true,
+  });
   const gateway = scanGateway(self, {
     releases: [priorAlignment(self), published.release],
-    provenances: [older, newer],
+    provenances: [newer],
+    pipelines: [stranded],
+    ...published,
+  });
+  // Only the guard's unfiltered newest page shows the recovery candidate.
+  const live = runPayload({
+    runId: recoveryIds(1).candidate,
+    path: model.CANDIDATE_WORKFLOW_PATH,
+    runName: runNames.candidateRunName(recovery, new model.PipelineBinding({
+      bridgeSourceSha: BRIDGE_SHA, releaseTag: 'v0.1.43', releaseRebuild: 0,
+    })),
+    status: 'in_progress',
+  });
+  gateway.jsonRoutes[workflowRuns.recentWorkflowRunsPath(model.CANDIDATE_WORKFLOW_FILE)] = runsResponse([
+    live, ...stranded.runs.candidate,
+  ]);
+  const plan = driver.advancePipeline(gateway, {
+    provenance: newer, workspace: self.tmp, dryRun: true, scannedProvenances: [older, newer],
+  });
+  assert.equal(plan.action, OrchestrationAction.IN_FLIGHT);
+  assert.equal(plan.correlationId, recovery);
+  assert.equal(plan.dispatchWorkflow, null);
+  assert.ok(plan.reason.includes('re-planned once'));
+}));
+
+test('an unqualified overtaken candidate is recovered instead of qualified', withAdvancePipelineFixture(async (self) => {
+  const [result, backlog] = await strandedScan(self, { qualified: false });
+  assert.equal(result, 0);
+  assert.deepEqual(rows(backlog)[1], ['v0.2.1', OrchestrationAction.DISPATCH_CANDIDATE, 'v0.1.43']);
+  assert.equal(backlog.plans[1].correlation_id, runNames.computeCorrelationId(self.newerNative(), { recovery: 1 }));
+}));
+
+test('an overtaken recovery pipeline moves to the next generation until the last one blocks', withAdvancePipelineFixture(async (self) => {
+  const newer = self.newerNative();
+  // A recovery pipeline of the older native published later still.
+  const overtaking = { tag: 'v0.1.50', marker: 'later-older-bytes', recovery: 1 };
+  const generations = (count) => Array.from({ length: count }, (_, index) => pipeline(self, {
+    provenance: newer, releaseTag: `v0.1.4${index + 3}`, ids: recoveryIds(index + 1), recovery: index + 1, publishFailed: true,
+  }));
+  for (let count = 1; count < driver.MAX_RECOVERY_GENERATIONS; count += 1) {
+    const [result, backlog] = await strandedScan(self, { pipelines: generations(count), releases: [overtaking] });
+    assert.equal(result, 0, `count=${count}`);
+    assert.deepEqual(rows(backlog)[1], ['v0.2.1', OrchestrationAction.DISPATCH_CANDIDATE, 'v0.1.51'], `count=${count}`);
+    assert.equal(backlog.plans[1].correlation_id, runNames.computeCorrelationId(newer, { recovery: count + 1 }));
+  }
+  const [result, backlog] = await strandedScan(self, {
+    pipelines: generations(driver.MAX_RECOVERY_GENERATIONS), releases: [overtaking],
+  });
+  assert.equal(result, 1);
+  const last = driver.MAX_RECOVERY_GENERATIONS;
+  assert.deepEqual(rows(backlog)[1], ['v0.2.1', OrchestrationAction.BLOCKED, `v0.1.4${last + 2}`]);
+  assert.equal(backlog.plans[1].correlation_id, runNames.computeCorrelationId(newer, { recovery: last }));
+  assert.ok(backlog.plans[1].reason.includes(`recovery generation ${last} is the last automatic one`));
+  assert.deepEqual(dispatched(backlog), []);
+}));
+
+test('a recovery publication of another scanned native is compared like its stranded pipeline', withAdvancePipelineFixture((self) => {
+  const older = self.provenance;
+  const newer = self.newerNative();
+  const published = olderPublication(self, { tag: 'v0.1.42', recovery: 1 });
+  const gateway = scanGateway(self, {
+    releases: [published.release],
+    provenances: [newer],
     pipelines: [pipeline(self, {
       provenance: newer, releaseTag: 'v0.1.41', ids: NEWER_IDS, publishFailed: true,
     })],
     ...published,
   });
-  const [result, backlog] = await scanBacklog(self, gateway, [older, newer]);
-  assert.deepEqual(backlog.errors, []);
-  assert.equal(result, 1);
-  assert.deepEqual(rows(backlog), [
-    ['v0.2.0', OrchestrationAction.NOOP, 'v0.1.42'],
-    ['v0.2.1', OrchestrationAction.BLOCKED, 'v0.1.41'],
-  ]);
-  assert.ok(backlog.plans[1].reason.includes('ordering rollback'));
-  assert.ok(backlog.plans[1].reason.includes('differ from v0.1.42'));
-  assert.deepEqual(dispatched(backlog), []);
+  const plan = driver.advancePipeline(gateway, {
+    provenance: newer, workspace: self.tmp, dryRun: true, scannedProvenances: [older, newer],
+  });
+  assert.equal(plan.action, OrchestrationAction.SATISFIED_BY_IDENTICAL_RELEASE);
+  assert.equal(plan.releaseTarget.releaseTag, 'v0.1.42');
+}));
+
+test('a recovery pipeline of a scanned newer native proves its own claim', withAdvancePipelineFixture((self) => {
+  const older = self.provenance;
+  const newer = self.newerNative();
+  const gateway = scanGateway(self, {
+    releases: [priorAlignment(self)],
+    provenances: [older, newer],
+    pipelines: [
+      pipeline(self, { provenance: older, releaseTag: 'v0.1.44', ids: OLDER_IDS }),
+      pipeline(self, {
+        provenance: newer, releaseTag: 'v0.1.43', ids: recoveryIds(1), qualified: false, recovery: 1,
+      }),
+    ],
+  });
+  const plan = driver.advancePipeline(gateway, {
+    provenance: older, workspace: self.tmp, dryRun: true, newerNativeScanned: true, scannedProvenances: [older, newer],
+  });
+  assert.equal(plan.action, OrchestrationAction.SUPERSEDED);
+  assert.ok(plan.reason.includes('v0.1.43 claimed by the pipeline of newer native release v0.2.1'));
+  assert.equal(gateway.apiPaths.includes(`repos/${NATIVE_REPOSITORY}/releases?per_page=100`), false);
 }));
 
 test('overtaken pipeline is blocked when the overtaking release is not of a scanned native', withAdvancePipelineFixture((self) => {

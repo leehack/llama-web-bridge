@@ -46,6 +46,45 @@ test('test_correlation_id_changes_with_native_manifest', () => {
   assert.notEqual(runNames.computeCorrelationId(makeProvenance()), other);
 });
 
+test('a recovery generation is a distinct correlation that reads back to its stranded pipeline', () => {
+  const base = runNames.computeCorrelationId(makeProvenance());
+  assert.equal(runNames.computeCorrelationId(makeProvenance(), { recovery: 0 }), base);
+  const recovered = [1, 2, 99].map((recovery) => runNames.computeCorrelationId(makeProvenance(), { recovery }));
+  assert.deepEqual(recovered, [1, 2, 99].map((recovery) => base.replace('-build-', `-r${recovery}-`)));
+  for (const correlationId of [base, ...recovered]) {
+    assert.equal(runNames.correlationRecoveryBase(correlationId), base);
+    assert.deepEqual(runNames.correlationNativeIdentity(correlationId), {
+      nativeReleaseTag: 'v0.2.0', nativeManifestPrefix: NATIVE_MANIFEST_SHA.slice(0, 16),
+    });
+  }
+  // Array.map passes the index as the second argument.
+  assert.deepEqual([makeProvenance(), makeProvenance()].map(runNames.computeCorrelationId), [base, base]);
+  for (const recovery of [-1, 1.5, NaN, 100]) {
+    assert.throws(() => runNames.computeCorrelationId(makeProvenance(), { recovery }), ContractError, String(recovery));
+  }
+  const legacy = makeLegacyV0140Provenance();
+  assert.equal(
+    runNames.computeCorrelationId(legacy, { recovery: 1 }),
+    `auto-stable-v0.3.0-${legacy.nativeManifestSha256.slice(0, 16)}-r1-${legacy.bridgeBuildSha.slice(0, 16)}`,
+  );
+  for (const generation of ['0', '01', '100', '']) {
+    const other = base.replace('-build-', `-r${generation}-`);
+    assert.equal(runNames.correlationNativeIdentity(other), null, other);
+    assert.equal(runNames.correlationRecoveryBase(other), other, other);
+  }
+});
+
+test('a recovery publish run name fits wherever its stranded pipeline name fits', () => {
+  // Production-size run IDs and the longest native tag shape in use.
+  const provenance = makeProvenance({ nativeReleaseTag: 'v0.10.0-12' });
+  const binding = new model.PipelineBinding({ bridgeSourceSha: BRIDGE_SHA, releaseTag: 'v0.1.100', releaseRebuild: 0 });
+  const name = (recovery) => runNames.publishRunName(
+    runNames.computeCorrelationId(provenance, { recovery }), '40668062533', '40670661678', binding,
+  );
+  for (const recovery of [1, 2, 3, 99]) assert.ok(name(recovery).length <= name(0).length, String(recovery));
+  assert.ok(name(0).length <= runNames.MAX_RUN_NAME_CHARACTERS);
+});
+
 test('correlation native identity reads back what computeCorrelationId used', () => {
   for (const nativeReleaseTag of ['v0.2.0', 'v0.7.0-2', 'v10.20.30-11']) {
     const correlationId = runNames.computeCorrelationId(makeProvenance({ nativeReleaseTag }));
