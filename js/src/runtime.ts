@@ -38,8 +38,8 @@ import { isCrossOriginIsolatedRuntime, isSafariUserAgent } from './internal/envi
 import { decodeImageBytesToRgb } from './internal/image.ts';
 import {
   EmbeddingError, EMPTY_EMBEDDING_CAPABILITIES, EMBEDDING_MEDIA_MARKER,
-  embeddingAssetVersion, embeddingCapabilitiesFrom, embeddingCoreError, missingEmbeddingCapability,
-  requireEmbeddingModalities, snapshotEmbedInput,
+  EMBED_BATCH_PROGRESS_OPTION, embeddingAssetVersion, embeddingCapabilitiesFrom, embeddingCoreError,
+  missingEmbeddingCapability, requireEmbeddingModalities, snapshotEmbedInput,
 } from './internal/embedding.ts';
 import { logLevelForName, logThresholdForConfiguredLevel } from './internal/logging.ts';
 import {
@@ -72,6 +72,7 @@ import {
 import { bufferSourceBytes, isInt32, toFloat32Array, toUint8Array } from './internal/typed_values.ts';
 import type { ResolvedGrammarOptions, ResolvedSpeculativeOptions } from './internal/completion_options.ts';
 import type { ProgressCallback } from './internal/download.ts';
+import type { EmbedBatchProgressHook } from './internal/embedding.ts';
 import type { ModelSource } from './internal/model_source.ts';
 import type { CcallArg, CcallArgType, LlamaCoreModule, LogMethod, TextBytesExport } from './internal/types.ts';
 import type {
@@ -4422,11 +4423,15 @@ export class LlamaWebGpuBridgeRuntime {
     await this._preflightEmbeddingInputs(inputs);
 
     const normalize = options?.normalize !== false;
+    const onProgress = (options as Record<string, unknown> | undefined)?.[EMBED_BATCH_PROGRESS_OPTION];
     const vectors = [];
     for (const text of inputs) {
       if (this._abortRequested) throw createAbortError('Batch embedding was cancelled.');
       vectors.push(await (typeof text === 'string'
         ? this.embed(text, { normalize }) : this._embedParts(text, { normalize })));
+      if (typeof onProgress === 'function') {
+        (onProgress as EmbedBatchProgressHook)({ completed: vectors.length, total: inputs.length });
+      }
     }
     return vectors;
   }

@@ -158,7 +158,7 @@ it.
 | `workerUrl` | `string` | URL for `llama_webgpu_bridge_worker.js`. Defaults to a sibling of the bridge module when possible. |
 | `disableWorker` | `boolean` | Force direct runtime mode. |
 | `preferMemory64` | `boolean` | Prefer the wasm64 core when available. Defaults to `true`; the runtime can still fall back to wasm32. |
-| `workerRequestTimeoutMs` | `number` | Default timeout for worker RPC calls. |
+| `workerRequestTimeoutMs` | `number` | Default timeout for worker RPC calls, 2 minutes unless a method has its own default. It also sets the `embed`/`embedBatch` budget, which defaults to 10 minutes when an input has image or audio parts. |
 | `workerInitTimeoutMs` | `number` | Timeout for worker initialization. |
 | `workerModelLoadTimeoutMs` | `number` | Timeout for model load requests sent to a worker. |
 | `workerMmprojLoadTimeoutMs` | `number` | Timeout for multimodal projector load requests sent to a worker. |
@@ -191,6 +191,16 @@ and clamped to 5 seconds–1 hour; per-method settings override the global reque
 budget. Non-positive or non-finite settings retain the existing fallback
 budgets. Worker initialization uses a 3-second–2-minute clamp (20-second
 default), and core initialization uses 10 seconds–10 minutes (90-second default).
+`embedBatch` restarts its budget after each finished input, so the budget bounds
+one input rather than the batch.
+
+When a worker request times out, crashes or aborts the core, most operations
+move to the main-thread runtime and run the request again there; CPU-mode media
+completions reject instead. A fallback logs a `falling back to main thread`
+warning at the `warn` log level and sets `llamadart.webgpu.execution` to
+`main-thread` and `llamadart.webgpu.worker_fallback_reason` in
+`getModelMetadata()`. A result returned after a fallback did not run in the
+worker.
 
 ### Static properties
 
@@ -740,7 +750,8 @@ Returns one vector per input, in input order. Empty input resolves to `[]`
 without inference. Part shapes and requested modalities across the batch are
 checked before the first embedding; expanded capacity/format is checked for
 each input before that input's inference. Execution is sequential; worker mode
-forwards the batch as one request. Each parts array is one vector.
+forwards the batch as one request, whose timeout restarts after each finished
+input. Each parts array is one vector.
 
 ## Next-token scoring
 

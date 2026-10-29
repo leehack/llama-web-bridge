@@ -14,6 +14,19 @@ export const EMPTY_EMBEDDING_CAPABILITIES: EmbeddingCapabilities = {
   apiVersion: 1, text: false, image: false, audio: false,
 };
 export const EMBEDDING_MEDIA_MARKER = '<__media__>';
+// One CPU/WASM media embedding can run for minutes, far past the generic
+// worker request budget.
+export const EMBEDDING_MEDIA_WORKER_TIMEOUT_MS = 10 * 60 * 1000;
+// The worker host's embedBatch hook. Each finished input posts a progress event
+// that re-arms the proxy's request deadline, so the deadline bounds one input
+// rather than the whole batch. Functions cannot cross postMessage, so a
+// worker-mode caller's options never carry it.
+export const EMBED_BATCH_PROGRESS_OPTION = '__llamadartEmbedBatchProgress';
+export type EmbedBatchProgressHook = (progress: { completed: number; total: number }) => void;
+
+export function hasEmbeddingMediaParts(input: unknown): boolean {
+  return Array.isArray(input) && input.some((part) => part?.type !== 'text');
+}
 
 // Versioned CDN paths identify the loaded assets. Never include URL credentials,
 // query strings, fragments or arbitrary path text in public diagnostics.

@@ -31,6 +31,11 @@ var EMPTY_EMBEDDING_CAPABILITIES = {
   audio: false
 };
 var EMBEDDING_MEDIA_MARKER = "<__media__>";
+var EMBEDDING_MEDIA_WORKER_TIMEOUT_MS = 10 * 60 * 1e3;
+var EMBED_BATCH_PROGRESS_OPTION = "__llamadartEmbedBatchProgress";
+function hasEmbeddingMediaParts(input) {
+  return Array.isArray(input) && input.some((part) => part?.type !== "text");
+}
 function embeddingAssetVersion(...sources) {
   for (const source of [...sources, import.meta.url]) {
     try {
@@ -4942,10 +4947,14 @@ var LlamaWebGpuBridgeRuntime = class {
     this._abortRequested = false;
     await this._preflightEmbeddingInputs(inputs);
     const normalize = options?.normalize !== false;
+    const onProgress = options?.[EMBED_BATCH_PROGRESS_OPTION];
     const vectors = [];
     for (const text of inputs) {
       if (this._abortRequested) throw createAbortError("Batch embedding was cancelled.");
       vectors.push(await (typeof text === "string" ? this.embed(text, { normalize }) : this._embedParts(text, { normalize })));
+      if (typeof onProgress === "function") {
+        onProgress({ completed: vectors.length, total: inputs.length });
+      }
     }
     return vectors;
   }
@@ -5395,6 +5404,12 @@ var BridgeWorkerProxy = class {
     if (method === "runDecision") {
       const sequences = Array.isArray(args?.[1]) ? args[1].length : 0;
       return clamp(explicitGlobal, 10 * 60 * 1e3 + sequences * DECISION_WORKER_TIMEOUT_PER_SEQUENCE_MS);
+    }
+    if (method === "embed" || method === "embedBatch") {
+      const inputs = method === "embed" ? [args?.[0]] : Array.isArray(args?.[0]) ? args[0] : [];
+      if (inputs.some(hasEmbeddingMediaParts)) {
+        return clamp(explicitGlobal, EMBEDDING_MEDIA_WORKER_TIMEOUT_MS);
+      }
     }
     return clamp(explicitGlobal, 12e4);
   }
@@ -8430,6 +8445,16 @@ function installBridgeWorkerHost() {
           self.postMessage({ type: "event", id, event: "progress", payload: progress || {} });
         };
         const value2 = await bridge.loadLoraAdapter(args[0], options);
+        self.postMessage({ type: "result", id, value: value2 });
+        return;
+      }
+      if (method === "embedBatch") {
+        const options = args[1] && typeof args[1] === "object" ? { ...args[1] } : {};
+        const onProgress = (progress) => {
+          self.postMessage({ type: "event", id, event: "progress", payload: progress });
+        };
+        options[EMBED_BATCH_PROGRESS_OPTION] = onProgress;
+        const value2 = await bridge.embedBatch(args[0], options);
         self.postMessage({ type: "result", id, value: value2 });
         return;
       }

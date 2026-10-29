@@ -5,7 +5,7 @@ import {
   isDecisionErrorCode,
   withDecisionErrorCode,
 } from './internal/decision.ts';
-import { EmbeddingError } from './internal/embedding.ts';
+import { EMBEDDING_MEDIA_WORKER_TIMEOUT_MS, EmbeddingError, hasEmbeddingMediaParts } from './internal/embedding.ts';
 import type { LlamaWebGpuBridgeConfig } from './llama_webgpu_bridge.d.ts';
 import { bridgeWorkerModeParam } from './worker_protocol.ts';
 import type { WorkerEventHandler, WorkerResponse } from './worker_protocol.ts';
@@ -316,6 +316,14 @@ export class BridgeWorkerProxy {
       // A run reports no progress, so its budget grows with the batch size.
       const sequences = Array.isArray(args?.[1]) ? args[1].length : 0;
       return clamp(explicitGlobal, 10 * 60 * 1000 + sequences * DECISION_WORKER_TIMEOUT_PER_SEQUENCE_MS);
+    }
+
+    if (method === 'embed' || method === 'embedBatch') {
+      // embedBatch progress re-arms this timer after each input.
+      const inputs = method === 'embed' ? [args?.[0]] : (Array.isArray(args?.[0]) ? args[0] : []);
+      if (inputs.some(hasEmbeddingMediaParts)) {
+        return clamp(explicitGlobal, EMBEDDING_MEDIA_WORKER_TIMEOUT_MS);
+      }
     }
 
     return clamp(explicitGlobal, 120000);
