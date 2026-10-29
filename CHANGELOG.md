@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- In worker mode, `embed` and `embedBatch` with image or audio parts get a 10-minute request
+  budget instead of 2 minutes, and `embedBatch`, text or media, restarts its budget after each
+  finished input.
+  A CPU/WASM media batch, such as EmbeddingGemma-2 BF16 at `nCtx`/`nBatch`/`nUbatch` 4096 on
+  memory64, no longer times out and reruns on the main thread. `workerRequestTimeoutMs` still
+  overrides the budget.
 - `loadMultimodalProjector` frees its downloaded GGUF once the projector is loaded instead of
   keeping a second copy in the wasm heap. On the wasm32 core, repeated media `embedBatch` calls
   with EmbeddingGemma-2 BF16 at `nCtx`/`nBatch`/`nUbatch` 4096 no longer abort with

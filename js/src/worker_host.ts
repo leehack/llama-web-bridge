@@ -2,7 +2,8 @@
 
 import { LlamaWebGpuBridge } from './bridge.ts';
 import { decisionErrorCodeOf } from './internal/decision.ts';
-import { EmbeddingError } from './internal/embedding.ts';
+import { EMBED_BATCH_PROGRESS_OPTION, EmbeddingError } from './internal/embedding.ts';
+import type { EmbedBatchProgressHook } from './internal/embedding.ts';
 import { toUint8Array } from './internal/typed_values.ts';
 import {
   bridgeWorkerModeParam,
@@ -17,6 +18,8 @@ import type {
   DecisionHeadOptions,
   DecisionSequence,
   DraftModelLoadOptions,
+  EmbedInput,
+  EmbedOptions,
   LoadModelOptions,
   LoraAdapterLoadOptions,
   TextToSpeechOptions,
@@ -364,6 +367,17 @@ export function installBridgeWorkerHost() {
           self.postMessage({ type: 'event', id, event: 'progress', payload: progress || {} });
         };
         const value = await bridge.loadLoraAdapter(args[0] as string | ArrayBuffer | ArrayBufferView, options);
+        self.postMessage({ type: 'result', id, value });
+        return;
+      }
+
+      if (method === 'embedBatch') {
+        const options: EmbedOptions & Record<string, unknown> = (args[1] && typeof args[1] === 'object') ? { ...args[1] } : {};
+        const onProgress: EmbedBatchProgressHook = (progress) => {
+          self.postMessage({ type: 'event', id, event: 'progress', payload: progress });
+        };
+        options[EMBED_BATCH_PROGRESS_OPTION] = onProgress;
+        const value = await bridge.embedBatch(args[0] as EmbedInput[], options);
         self.postMessage({ type: 'result', id, value });
         return;
       }
