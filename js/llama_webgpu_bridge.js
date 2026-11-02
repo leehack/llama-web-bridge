@@ -1217,6 +1217,15 @@ function unlinkFsFile(fs, filePath) {
     return false;
   }
 }
+function reservableResponseLength(response, startOffset, bigInt) {
+  if (startOffset !== 0 || bigInt || response.status !== 200 || response.headers.has("content-range")) return 0;
+  const encoding = response.headers.get("content-encoding")?.trim().toLowerCase();
+  if (encoding && encoding !== "identity") return 0;
+  const header = response.headers.get("content-length")?.trim() || "";
+  if (!/^[0-9]+$/.test(header)) return 0;
+  const length = Number(header);
+  return Number.isSafeInteger(length) && length >= 1073741824 && length <= 2147483647 ? length : 0;
+}
 async function writeResponseToFsFileWithProgress(response, fs, filePath, progressCallback, writeOptions = {}) {
   const total = parsePositiveInteger(writeOptions.totalBytes) || inferResponseTotalBytes(response, 0);
   const useBigIntPosition = writeOptions.useBigIntPosition === true;
@@ -1252,6 +1261,9 @@ async function writeResponseToFsFileWithProgress(response, fs, filePath, progres
     }
     return finalLoaded2;
   }
+  const reservedLength = reservableResponseLength(response, startOffset, useBigIntPosition);
+  const encoding = response.headers.get("content-encoding")?.trim().toLowerCase();
+  const exactLength = reservedLength > 0 && (response.type === "basic" || encoding === "identity") ? reservedLength : 0;
   const reader = response.body.getReader();
   const openMode = appendMode ? "r+" : "w";
   const stream = fs.open(filePath, openMode);
@@ -1260,6 +1272,16 @@ async function writeResponseToFsFileWithProgress(response, fs, filePath, progres
   let writePosition = startOffset;
   let writePositionBigInt = null;
   try {
+    if (reservedLength > 0) {
+      try {
+        const written = fs.write(stream, new Uint8Array(1), 0, 1, reservedLength - 1);
+        if (written !== 1) throw new Error("Filesystem reservation returned a short write.");
+      } catch (_) {
+      }
+      const reset = fs.open(filePath, "w");
+      fs.close(reset);
+      throwIfAborted(signal, abortMessage);
+    }
     while (true) {
       throwIfAborted(signal, abortMessage);
       const { done, value } = await readStreamChunkWithTimeout(
@@ -1269,10 +1291,20 @@ async function writeResponseToFsFileWithProgress(response, fs, filePath, progres
       );
       if (done) {
         throwIfAborted(signal, abortMessage);
+        if (exactLength > 0 && loaded !== exactLength) {
+          const error = new Error("Model response ended before its declared byte length.");
+          error.name = "ModelTransferLengthError";
+          throw error;
+        }
         break;
       }
       if (!value || value.length === 0) {
         continue;
+      }
+      if (exactLength > 0 && value.length > exactLength - loaded) {
+        const error = new Error("Model response exceeded its declared byte length.");
+        error.name = "ModelTransferLengthError";
+        throw error;
       }
       const chunk = value.slice ? value.slice() : new Uint8Array(value);
       throwIfAborted(signal, abortMessage);
@@ -1316,7 +1348,7 @@ async function writeResponseToFsFileWithProgress(response, fs, filePath, progres
       await reader.cancel?.();
     } catch (_) {
     }
-    if (!preservePartialOnError || signal?.aborted || error?.name === "AbortError") {
+    if (!preservePartialOnError || startOffset + loaded === 0 || signal?.aborted || error?.name === "AbortError" || error?.name === "ModelTransferLengthError") {
       try {
         fs.unlink(filePath);
       } catch (_) {

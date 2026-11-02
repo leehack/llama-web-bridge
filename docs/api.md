@@ -235,6 +235,16 @@ Loads a GGUF model from one URL, an explicit shard URL array, or an auto-expande
 split GGUF URL such as `model-00001-of-00002.gguf`. The bridge streams model
 bytes into the active WASM filesystem unless the native remote-fetch backend is
 used for a qualifying large single-file model.
+For full wasm32 responses with a valid `Content-Length` hint between 1 GiB
+and 2 GiB minus one byte, the writer attempts to reserve filesystem capacity before streaming. It resets
+the logical file length before writing and falls back to incremental writes if
+the reservation fails. A CORS response can hide compression headers, so its
+length is only an allocation hint. Short or excess bodies are rejected only
+when the decoded length is established by same-origin or visible identity
+encoding metadata; invalid partial files are removed. Visibly encoded, resumed and unknown-size
+responses keep incremental writes; this does not establish a universal model-size
+limit or guarantee that native model initialization fits memory.
+
 Relative URLs resolve against the page's base URL (`document.baseURI`, so a
 `<base href>` applies) in both runtimes; worker mode resolves them before
 posting them to the worker.

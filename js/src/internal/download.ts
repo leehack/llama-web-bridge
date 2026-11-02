@@ -367,6 +367,22 @@ export function unlinkFsFile(fs: EmscriptenFs, filePath: string): boolean {
   }
 }
 
+// WASMFS grows its vector geometrically; crossing 1 GiB can request a
+// near-2 GiB allocation. Reserve a bounded size hint, then truncate the
+// logical file while retaining its capacity. Small, visibly encoded,
+// resumed and unknown-length responses retain the incremental writer.
+function reservableResponseLength(response: Response, startOffset: number, bigInt: boolean): number {
+  if (startOffset !== 0 || bigInt || response.status !== 200
+    || response.headers.has('content-range')) return 0;
+  const encoding = response.headers.get('content-encoding')?.trim().toLowerCase();
+  if (encoding && encoding !== 'identity') return 0;
+  const header = response.headers.get('content-length')?.trim() || '';
+  if (!/^[0-9]+$/.test(header)) return 0;
+  const length = Number(header);
+  return Number.isSafeInteger(length) && length >= 1073741824 && length <= 2147483647
+    ? length : 0;
+}
+
 export async function writeResponseToFsFileWithProgress(
   response: Response,
   fs: EmscriptenFs,
@@ -415,6 +431,12 @@ export async function writeResponseToFsFileWithProgress(
     return finalLoaded;
   }
 
+  const reservedLength = reservableResponseLength(response, startOffset, useBigIntPosition);
+  // CORS can hide Content-Encoding while exposing compressed Content-Length.
+  // Constructed/cache responses can also lose the original response type.
+  const encoding = response.headers.get('content-encoding')?.trim().toLowerCase();
+  const exactLength = reservedLength > 0
+    && (response.type === 'basic' || encoding === 'identity') ? reservedLength : 0;
   const reader = response.body.getReader();
   const openMode = appendMode ? 'r+' : 'w';
   const stream = fs.open(filePath, openMode);
@@ -424,6 +446,18 @@ export async function writeResponseToFsFileWithProgress(
   let writePositionBigInt: bigint | null = null;
 
   try {
+    if (reservedLength > 0) {
+      try {
+        const written = fs.write(stream, new Uint8Array(1), 0, 1, reservedLength - 1);
+        if (written !== 1) throw new Error('Filesystem reservation returned a short write.');
+      } catch (_) {
+        // A size hint must not reject a body that incremental writes can load.
+      }
+      // A reservation (including a partial one) must never pad the file body.
+      const reset = fs.open(filePath, 'w');
+      fs.close(reset);
+      throwIfAborted(signal, abortMessage);
+    }
     while (true) {
       throwIfAborted(signal, abortMessage);
       const { done, value } = await readStreamChunkWithTimeout(
@@ -433,11 +467,22 @@ export async function writeResponseToFsFileWithProgress(
       );
       if (done) {
         throwIfAborted(signal, abortMessage);
+        if (exactLength > 0 && loaded !== exactLength) {
+          const error = new Error('Model response ended before its declared byte length.');
+          error.name = 'ModelTransferLengthError';
+          throw error;
+        }
         break;
       }
 
       if (!value || value.length === 0) {
         continue;
+      }
+
+      if (exactLength > 0 && value.length > exactLength - loaded) {
+        const error = new Error('Model response exceeded its declared byte length.');
+        error.name = 'ModelTransferLengthError';
+        throw error;
       }
 
       // Some browsers may reuse the same Uint8Array backing store across reads.
@@ -494,7 +539,9 @@ export async function writeResponseToFsFileWithProgress(
       // ignore best-effort reader cancellation failures
     }
 
-    if (!preservePartialOnError || signal?.aborted || (error as Error | null)?.name === 'AbortError') {
+    if (!preservePartialOnError || startOffset + loaded === 0 || signal?.aborted
+      || (error as Error | null)?.name === 'AbortError'
+      || (error as Error | null)?.name === 'ModelTransferLengthError') {
       try {
         fs.unlink(filePath);
       } catch (_) {
