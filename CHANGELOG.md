@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Large wasm32 streamed model files use bounded size hints to reserve filesystem capacity, avoiding geometric file-growth allocation failures at 1 GiB without treating hidden compression metadata as a decoded-size contract.
+
 - In worker mode, `embed` and `embedBatch` with image or audio parts get a 10-minute request
   budget instead of 2 minutes, and `embedBatch`, text or media, restarts its budget after each
   finished input.
