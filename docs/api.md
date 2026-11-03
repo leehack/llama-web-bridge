@@ -317,9 +317,10 @@ Common `options` keys:
 | `topK` | Top-k sampling. Defaults to `40`. |
 | `topP` | Top-p sampling. Defaults to `0.95`. |
 | `minP` | Min-P threshold from `0` to `1`, applied after top-p. Defaults to `0`, which disables it. |
-| `penalty` | Repetition penalty over the last 64 tokens of the prompt and this completion, as in native llamadart: the prompt counts only for a text prompt without a `grammar` (an empty string counts as one) and without `penaltyPromptTokens: false`. Defaults to `1.1`; `1` disables it. |
+| `penalty` | Repetition penalty over the last 64 tokens of the prompt and this completion, as in native llamadart: the prompt counts only for a text prompt without `penaltyPromptTokens: false` and either no `grammar` string or an explicit `penaltyPromptTokensWithGrammar: true`. Defaults to `1.1`; `1` disables it. |
 | `presencePenalty` | Subtracted once from the logit of each token in the same 64-token window as `penalty`. Defaults to `0`, which disables it. |
 | `penaltyPromptTokens` | `false` keeps the prompt out of the `penalty` and `presencePenalty` window, as a `grammar` does. It exists for callers that drop a grammar native llamadart keeps: llamadart drops a lazy tool-call grammar on a core without `lazyGrammar` and sets this so the output matches native, which does not count the prompt when a lazy grammar is set. Omitted or `null` means `true`; any other non-boolean rejects with a `TypeError`. A core whose `getCompletionCapabilities()` lacks `penaltyPromptTokens` never counts the prompt. |
+| `penaltyPromptTokensWithGrammar` | Explicitly counts a text prompt in the penalties window while a grammar string is attached. Only the penalties sampler receives prompt tokens; prompt trigger text cannot activate grammar or advance the reasoning sampler. Omitted, `null`, or `false` preserves grammar defaults. Requires the loaded core's same-name capability to be literal `true`; a missing/false probe rejects before generation. Missing grammar, media parts, and `penaltyPromptTokens: false` reject. |
 | `grammar` | Optional llama.cpp GBNF grammar with a `root` rule, or the `grammarRoot` rule. An invalid grammar rejects before generation starts with an error containing `(invalid grammar)`; worker mode rethrows it without falling back to the main thread. Each rejection leaks the partly parsed grammar (a few KiB at most for typical grammars), so validate generated grammars before sending them in a loop. |
 | `grammarRoot` | Rule the `grammar` starts from. Defaults to `root`; a grammar without that rule rejects with `(invalid grammar)`. |
 | `grammarLazy` | `true` applies `grammar` only after a `grammarTriggers` entry fires, as llama.cpp's lazy grammar (`llama-server`'s `grammar_lazy`) does; see [Lazy grammars](#lazy-grammars). Needs a non-empty `grammar` and at least one trigger. Omitted or `null` means `false`. |
@@ -429,9 +430,11 @@ cancelled generation once it returns.
 getCompletionCapabilities(): Promise<CompletionCapabilities>
 ```
 
-Returns `{ presencePenalty, minP, thinkingBudget, penaltyPromptTokens, lazyGrammar, speculativeDecoding }`:
+Returns `{ presencePenalty, minP, thinkingBudget, penaltyPromptTokens, penaltyPromptTokensWithGrammar, lazyGrammar, speculativeDecoding }`:
 whether the loaded core applies each `createCompletion` option. `lazyGrammar`
 covers `grammarLazy`, `grammarTriggers` and `grammarRoot`.
+`penaltyPromptTokensWithGrammar` separately permits the explicit grammar opt-in;
+interface presence and an asset tag do not prove it.
 `penaltyPromptTokens` also means the penalties count the prompt; without it they
 never do. Every flag is
 `false` until a model load initializes the core. `speculativeDecoding` maps each

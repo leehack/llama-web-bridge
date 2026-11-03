@@ -184,7 +184,7 @@ const INVALID_SAMPLER_OPTIONS = Object.freeze([
 ]);
 // speculative.mjs checks the speculativeDecoding capabilities.
 export const COMPLETION_CAPABILITIES = Object.freeze([
-  'presencePenalty', 'minP', 'thinkingBudget', 'penaltyPromptTokens', 'lazyGrammar',
+  'presencePenalty', 'minP', 'thinkingBudget', 'penaltyPromptTokens', 'penaltyPromptTokensWithGrammar', 'lazyGrammar',
 ]);
 // Each tag follows a space: SentencePiece vocabularies tokenize a tag at the
 // start of text with a space prefix, so only a spaced tag in the prompt
@@ -356,6 +356,17 @@ export function renderHarness(nCtx, memoryModes) {
               penalized,
               grammar: await run({ presencePenalty: probe.presencePenalty, grammar: probe.grammar }),
               emptyGrammar: await run({ presencePenalty: probe.presencePenalty, grammar: '' }),
+              grammarOptIn: await run({ presencePenalty: probe.presencePenalty, grammar: probe.grammar, penaltyPromptTokensWithGrammar: true }),
+              emptyGrammarOptIn: await run({ presencePenalty: probe.presencePenalty, grammar: '', penaltyPromptTokensWithGrammar: true }),
+              // The trigger appears in the prompt, and its grammar allows only
+              // a different suffix after it. Seeding must not fire it.
+              promptTriggerOptIn: await run({
+                presencePenalty: probe.presencePenalty,
+                grammar: 'root ::= ' + gbnfLiteral(prompt) + ' "__prompt_trigger_fired__"',
+                grammarLazy: true,
+                grammarTriggers: [{ type: 'word', value: prompt }],
+                penaltyPromptTokensWithGrammar: true,
+              }),
               optOut: await run({ presencePenalty: probe.presencePenalty, penaltyPromptTokens: false }),
             };
           }
@@ -423,6 +434,10 @@ export function renderHarness(nCtx, memoryModes) {
       for (const name of config.lazyTriggerRuns) {
         result.triggered[name] = await lazyRun(triggers[name]);
       }
+      result.triggeredWithPromptPenalties = await run({
+        grammar, grammarLazy: true, grammarTriggers: [triggers.word],
+        penaltyPromptTokensWithGrammar: true,
+      });
       result.strict = await run({ grammar });
 
       const { top } = await bridge.scoreNextToken(lazy.prompt, { topK: 2 });
@@ -706,6 +721,10 @@ export function validateLazyGrammar(entry) {
       `a ${name} trigger did not leave the text before it unconstrained and constrain the rest`,
     );
   }
+  expect(
+    answered(probe.triggeredWithPromptPenalties, before + word),
+    'the opt-in changed the pre-trigger prefix or failed to constrain the generated trigger',
+  );
   expect(answered(probe.strict, word), 'the strict grammar did not constrain the output from the first token');
   if (typeof pyGet(probe, 'tokenPiece') === 'string') {
     expect(answered(probe.tokenTriggered, probe.tokenPiece), 'a token trigger did not constrain the text after the token');
@@ -748,6 +767,9 @@ export function validatePromptPenalty(entry) {
   expect(probe.grammar === best, 'with a grammar the presence penalty counted the prompt, unlike native llamadart');
   expect(probe.emptyGrammar === best, 'with an empty grammar the presence penalty counted the prompt, unlike native llamadart');
   expect(probe.optOut === best, 'with penaltyPromptTokens: false the presence penalty counted the prompt');
+  for (const field of ['grammarOptIn', 'emptyGrammarOptIn', 'promptTriggerOptIn']) {
+    expect(probe[field] === probe.penalized, field + ' did not preserve the no-grammar prompt-penalty baseline');
+  }
   if (failures.length > 0) failures.push(`prompt penalty outputs: ${pyRepr(probe)}`);
   return failures;
 }

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- `createCompletion` can explicitly count prompt tokens in penalties with a grammar using `penaltyPromptTokensWithGrammar`; a matching loaded-core capability is required, and existing grammar defaults stay unchanged.
+
 - Large wasm32 streamed model files use bounded size hints to reserve filesystem capacity, avoiding geometric file-growth allocation failures at 1 GiB without treating hidden compression metadata as a decoded-size contract.
 
 - In worker mode, `embed` and `embedBatch` with image or audio parts get a 10-minute request

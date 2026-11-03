@@ -200,12 +200,14 @@ export interface CompletionOptions {
   topP?: number;
   /** Min-P threshold from 0 to 1, applied after top-p; 0, the default, disables it. A value outside that range rejects. */
   minP?: number;
-  /** Repetition penalty over the last 64 tokens of the prompt and this completion; the prompt counts only for a text prompt without a `grammar` (an empty string included) and with `penaltyPromptTokens` not false. Defaults to 1.1; 1 disables it. */
+  /** Repetition penalty over the last 64 tokens of the prompt and this completion; the prompt counts only for a text prompt with `penaltyPromptTokens` not false and either no `grammar` string or `penaltyPromptTokensWithGrammar: true`. Defaults to 1.1; 1 disables it. */
   penalty?: number;
   /** Subtracted once from the logit of each token in the same 64-token window as `penalty`. 0, the default, disables it. A value that is not finite as a 32-bit float rejects. */
   presencePenalty?: number;
   /** `false` keeps a text prompt out of the `penalty` and `presencePenalty` window, as a `grammar` does. For a caller that drops a grammar native llamadart would keep, such as llamadart dropping a lazy tool-call grammar on a core without `lazyGrammar`, so its output matches native, which does not count the prompt with a lazy grammar. Omitted or null means true; any other non-boolean rejects. */
   penaltyPromptTokens?: boolean | null;
+  /** Explicitly seeds a text prompt into only the penalties sampler while a grammar string is attached. Grammar and reasoning samplers never accept these prompt tokens. Defaults to false; needs the loaded core's matching capability. Rejects media parts, a missing grammar, or penaltyPromptTokens: false. */
+  penaltyPromptTokensWithGrammar?: boolean | null;
   /** GBNF grammar the output must match. An empty string constrains nothing. */
   grammar?: string;
   /** `true` applies `grammar` only after one of `grammarTriggers` fires, as llama.cpp's lazy grammar does: text before the trigger is unconstrained, and the grammar starts at the trigger. Needs a non-empty `grammar` and at least one trigger. Omitted or null means false. */
@@ -261,6 +263,8 @@ export interface CompletionCapabilities {
   thinkingBudget: boolean;
   /** The penalties count the prompt, and `CompletionOptions.penaltyPromptTokens` is applied. A core without it never counts the prompt, so `penaltyPromptTokens: false` holds there too. */
   penaltyPromptTokens: boolean;
+  /** The loaded core applies CompletionOptions.penaltyPromptTokensWithGrammar. Only literal true permits the opt-in. */
+  penaltyPromptTokensWithGrammar: boolean;
   /** `CompletionOptions.grammarLazy`, `grammarTriggers` and `grammarRoot` are applied. */
   lazyGrammar: boolean;
   /** Each speculative strategy the loaded models can run now: `draft-mtp` needs a model loaded with `loadMtp` that has MTP layers, and the other `draft-*` strategies a matching `loadDraftModel` draft. */

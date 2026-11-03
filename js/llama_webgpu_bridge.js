@@ -240,6 +240,7 @@ var NO_COMPLETION_CAPABILITIES = Object.freeze({
   minP: false,
   thinkingBudget: false,
   penaltyPromptTokens: false,
+  penaltyPromptTokensWithGrammar: false,
   lazyGrammar: false,
   speculativeDecoding: Object.freeze(speculativeFlags(() => false))
 });
@@ -502,11 +503,28 @@ function resolveCompletionSamplingOptions(options) {
     withoutNul(options.grammar, "CompletionOptions.grammar");
   }
   const budget = thinkingBudget(options?.thinkingBudget, hasMediaParts);
+  const promptTokens = penaltyPromptTokens(options?.penaltyPromptTokens);
+  const withGrammar = options?.penaltyPromptTokensWithGrammar ?? false;
+  if (typeof withGrammar !== "boolean") {
+    throw new TypeError("CompletionOptions.penaltyPromptTokensWithGrammar must be a boolean.");
+  }
+  if (withGrammar) {
+    if (typeof options?.grammar !== "string") {
+      throw new Error("CompletionOptions.penaltyPromptTokensWithGrammar needs a CompletionOptions.grammar string.");
+    }
+    if (!promptTokens) {
+      throw new Error("CompletionOptions.penaltyPromptTokensWithGrammar requires penaltyPromptTokens not false.");
+    }
+    if (hasMediaParts) {
+      throw new Error("CompletionOptions.penaltyPromptTokensWithGrammar supports text-only prompts.");
+    }
+  }
   return {
     minP: optionalNumber(options?.minP, "minP", (value) => value >= 0 && value <= 1, " from 0 to 1") ?? 0,
     presencePenalty: optionalNumber(options?.presencePenalty, "presencePenalty", () => true, "") ?? 0,
     thinkingBudget: budget,
-    penaltyPromptTokens: penaltyPromptTokens(options?.penaltyPromptTokens),
+    penaltyPromptTokens: promptTokens,
+    penaltyPromptTokensWithGrammar: withGrammar,
     speculative: speculativeDecoding(options?.speculativeDecoding, {
       hasMediaParts,
       hasGrammar: typeof options?.grammar === "string" && options.grammar.length > 0,
@@ -528,12 +546,14 @@ function completionCapabilitiesFrom(raw) {
     minP: parsed?.minP === true,
     thinkingBudget: parsed?.thinkingBudget === true,
     penaltyPromptTokens: parsed?.penaltyPromptTokens === true,
+    penaltyPromptTokensWithGrammar: parsed?.penaltyPromptTokensWithGrammar === true,
     lazyGrammar: parsed?.lazyGrammar === true,
     speculativeDecoding: speculativeFlags((strategy) => speculative?.[strategy] === true)
   };
 }
 function requireCompletionCapabilities(sampling, capabilities) {
   const missing = [
+    sampling.penaltyPromptTokensWithGrammar && capabilities.penaltyPromptTokensWithGrammar !== true ? "penaltyPromptTokensWithGrammar" : null,
     sampling.minP !== 0 && !capabilities.minP ? "minP" : null,
     sampling.presencePenalty !== 0 && !capabilities.presencePenalty ? "presencePenalty" : null,
     sampling.thinkingBudget != null && !capabilities.thinkingBudget ? "thinkingBudget" : null,
@@ -4584,7 +4604,7 @@ var LlamaWebGpuBridgeRuntime = class {
             sampling.thinkingBudget?.startTag ?? null,
             sampling.thinkingBudget?.endTag ?? null,
             sampling.thinkingBudget?.forcedMessage ?? null,
-            sampling.penaltyPromptTokens ? 0 : 1
+            sampling.penaltyPromptTokensWithGrammar ? 2 : sampling.penaltyPromptTokens ? 0 : 1
           ],
           { async: true }
         )
@@ -6850,7 +6870,8 @@ var LlamaWebGpuBridge = class {
     }
     try {
       await this._restoreWorkerModelIfMissing();
-      return await this._callWorker("getCompletionCapabilities", []);
+      const capabilities = await this._callWorker("getCompletionCapabilities", []);
+      return completionCapabilitiesFrom(JSON.stringify(capabilities));
     } catch (error) {
       this._throwIfOperationCancelled(error, "Completion capability probe was cancelled.");
       if (!this._isWorkerUnusableError(error)) {
@@ -6863,6 +6884,10 @@ var LlamaWebGpuBridge = class {
     }
   }
   async _createCompletionUnlocked(prompt, options = {}) {
+    const sampling = resolveCompletionSamplingOptions(options);
+    if (sampling.penaltyPromptTokensWithGrammar) {
+      requireCompletionCapabilities(sampling, await this._getCompletionCapabilitiesUnlocked());
+    }
     const isWarmup = options?.warmup === true;
     const hasRetriedEmptyMultimodal = options?.__llamadartEmptyRetryAttempted === true;
     const workerAllowed = this._config?.disableWorker !== true;
