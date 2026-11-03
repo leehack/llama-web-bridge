@@ -233,6 +233,10 @@ node scripts/smoke/multimodal.mjs \
 For sampler or grammar changes, run grammar-constrained completion, the
 seeded `minP`/`presencePenalty` checks, the prompt-penalty check and the greedy
 `thinkingBudget` checks through direct and worker runtimes on both memory modes.
+The same smoke checks the grammar prompt-penalty opt-in against the no-grammar
+baseline, including a trigger present in the prompt that must remain inactive,
+and confirms a generated trigger still constrains the suffix. Default grammar
+and empty-grammar runs remain separate controls.
 CI runs it twice: with the state-persistence model, then with the multimodal
 model. Pass each model's `--model-url` (or `--model-path`) and `--model-sha256`
 pin from the commands above; the smoke defaults to the

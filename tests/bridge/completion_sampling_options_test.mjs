@@ -16,6 +16,7 @@ const SUPPORTED = {
   minP: true,
   thinkingBudget: true,
   penaltyPromptTokens: true,
+  penaltyPromptTokensWithGrammar: true,
   lazyGrammar: true,
   speculativeDecoding: NO_SPECULATIVE,
 };
@@ -24,6 +25,7 @@ const NONE = {
   minP: false,
   thinkingBudget: false,
   penaltyPromptTokens: false,
+  penaltyPromptTokensWithGrammar: false,
   lazyGrammar: false,
   speculativeDecoding: NO_SPECULATIVE,
 };
@@ -34,7 +36,7 @@ const BUDGET_PARAMETERS = [
   'thinking_end_tag',
   'thinking_forced_message',
 ];
-const SAMPLING_PARAMETERS = ['min_p', 'presence_penalty', ...BUDGET_PARAMETERS, 'skip_prompt_penalty'];
+const SAMPLING_PARAMETERS = ['min_p', 'presence_penalty', ...BUDGET_PARAMETERS, 'prompt_penalty_mode'];
 
 function functionBody(signature) {
   const start = coreSource.indexOf(signature);
@@ -56,7 +58,7 @@ function nativeParameterNames(name) {
 function coreCapabilityJson() {
   const body = functionBody('llamadart_webgpu_completion_capabilities_json()');
   const literal = body.match(
-    /"\{\\"presencePenalty\\":true,\\"minP\\":true,\\"thinkingBudget\\":true,"\s*"\\"penaltyPromptTokens\\":true,\\"lazyGrammar\\":true,"/,
+    /"\{\\"presencePenalty\\":true,\\"minP\\":true,\\"thinkingBudget\\":true,"\s*"\\"penaltyPromptTokens\\":true,\\"penaltyPromptTokensWithGrammar\\":true,\\"lazyGrammar\\":true,"/,
   );
   assert.ok(literal, 'the capability export must start with its fixed flags');
   const strategies = [...body.matchAll(/\{"([a-z0-9-]+)",\s*([^}]*)\}/g)];
@@ -66,6 +68,7 @@ function coreCapabilityJson() {
     minP: true,
     thinkingBudget: true,
     penaltyPromptTokens: true,
+  penaltyPromptTokensWithGrammar: true,
     lazyGrammar: true,
     speculativeDecoding: Object.fromEntries(
       strategies.map(([, name, flag]) => [name, flag.trim() === 'true']),
@@ -153,7 +156,7 @@ const CASES = [
     assert.deepEqual([...arg('prompt')], [...new TextEncoder().encode('hello')]);
     assert.equal(arg('prompt_length'), 5);
     assert.deepEqual(BUDGET_PARAMETERS.map(arg), [8, '<think>', '</think>', 'Done.']);
-    assert.equal(arg('skip_prompt_penalty'), 0);
+    assert.equal(arg('prompt_penalty_mode'), 0);
     assert.deepEqual(
       SAMPLING_PARAMETERS.map(type),
       ['number', 'number', 'number', 'string', 'string', 'string', 'number'],
@@ -347,7 +350,7 @@ const CASES = [
     const speculative = at('} else if (speculative.active) {', media);
     const text = at('} else {\n    std::vector<llama_token> prompt_tokens;', speculative);
     const grammarGate = at(
-      'if (grammar != nullptr || skip_prompt_penalty != 0) {\n    penalty_prompt_tokens.clear();\n  }',
+      'if ((grammar != nullptr && prompt_penalty_mode != 2) ||\n      prompt_penalty_mode == 1) {\n    penalty_prompt_tokens.clear();\n  }',
       text,
     );
     const create = at('g_active_sampler = create_sampler(', grammarGate);
@@ -370,19 +373,19 @@ const CASES = [
     await bridge.createCompletion('hello', { penaltyPromptTokens: false });
     await bridge.createCompletion('hello', { penaltyPromptTokens: true });
     const names = nativeParameterNames('llamadart_webgpu_begin_generation_bytes');
-    assert.deepEqual(begins.map(({ args }) => args[names.indexOf('skip_prompt_penalty')]), [1, 0]);
+    assert.deepEqual(begins.map(({ args }) => args[names.indexOf('prompt_penalty_mode')]), [1, 0]);
   }],
 
-  ['every generation export forwards skip_prompt_penalty to the core', async () => {
+  ['every generation export forwards prompt_penalty_mode to the core', async () => {
     for (const name of [
       'llamadart_webgpu_generate',
       'llamadart_webgpu_begin_generation_bytes',
       'llamadart_webgpu_begin_generation',
     ]) {
-      assert.equal(nativeParameterNames(name).at(-1), 'skip_prompt_penalty', name);
+      assert.equal(nativeParameterNames(name).at(-1), 'prompt_penalty_mode', name);
       assert.match(
         functionBody(`EMSCRIPTEN_KEEPALIVE int32_t ${name}(`),
-        /begin_generation_impl\([^;]*thinking_forced_message,\s*skip_prompt_penalty\);/,
+        /begin_generation_impl\([^;]*thinking_forced_message,\s*prompt_penalty_mode\);/,
         name,
       );
     }

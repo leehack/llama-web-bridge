@@ -2,7 +2,7 @@
 
 import { createAbortError } from './internal/abort.ts';
 import { embeddingAssetVersion, embeddingCapabilitiesFrom, missingEmbeddingCapability, snapshotEmbedInput } from './internal/embedding.ts';
-import { NO_COMPLETION_CAPABILITIES, resolveCompletionSamplingOptions } from './internal/completion_options.ts';
+import { NO_COMPLETION_CAPABILITIES, completionCapabilitiesFrom, requireCompletionCapabilities, resolveCompletionSamplingOptions } from './internal/completion_options.ts';
 import {
   INVALID_GRAMMAR_ERROR_TEXT,
   LAZY_GRAMMAR_REJECTED_ERROR_TEXT,
@@ -1987,7 +1987,8 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
     }
     try {
       await this._restoreWorkerModelIfMissing();
-      return await this._callWorker<CompletionCapabilities>('getCompletionCapabilities', []);
+      const capabilities = await this._callWorker<CompletionCapabilities>('getCompletionCapabilities', []);
+      return completionCapabilitiesFrom(JSON.stringify(capabilities));
     } catch (error) {
       this._throwIfOperationCancelled(error, 'Completion capability probe was cancelled.');
       if (!this._isWorkerUnusableError(error)) {
@@ -2004,6 +2005,11 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
     prompt: string,
     options: BridgeCompletionOptions = {},
   ): Promise<string> {
+    const sampling = resolveCompletionSamplingOptions(options);
+    if (sampling.penaltyPromptTokensWithGrammar) {
+      // Probe the actual worker too: an older worker wrapper may ignore options.
+      requireCompletionCapabilities(sampling, await this._getCompletionCapabilitiesUnlocked());
+    }
     const isWarmup = options?.warmup === true;
     const hasRetriedEmptyMultimodal =
       options?.__llamadartEmptyRetryAttempted === true;

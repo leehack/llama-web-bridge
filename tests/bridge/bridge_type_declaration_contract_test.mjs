@@ -41,6 +41,7 @@ try {
       '  topK: 40,',
       '  topP: 0.95,',
       '  penalty: 1.1,',
+      '  penaltyPromptTokensWithGrammar: true,',
       "  grammar: 'root ::= \"a\"',",
       '  grammarLazy: true,',
       "  grammarTriggers: [{ type: 'word', value: '<tool_call>' }, { type: 'pattern-full', value: '.*' }, { type: 'token', token: 7 }],",

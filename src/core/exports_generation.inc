@@ -17,7 +17,7 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_generate(
     const char * thinking_start_tag,
     const char * thinking_end_tag,
     const char * thinking_forced_message,
-    int32_t skip_prompt_penalty) {
+    int32_t prompt_penalty_mode) {
   if (n_predict <= 0) {
     n_predict = 128;
   }
@@ -37,7 +37,7 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_generate(
       thinking_start_tag,
       thinking_end_tag,
       thinking_forced_message,
-      skip_prompt_penalty);
+      prompt_penalty_mode);
   if (begin_rc != 0) {
     return begin_rc;
   }
@@ -73,7 +73,7 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_begin_generation_bytes(
     const char * thinking_start_tag,
     const char * thinking_end_tag,
     const char * thinking_forced_message,
-    int32_t skip_prompt_penalty) {
+    int32_t prompt_penalty_mode) {
   return begin_generation_impl(
       prompt,
       prompt_length,
@@ -89,7 +89,7 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_begin_generation_bytes(
       thinking_start_tag,
       thinking_end_tag,
       thinking_forced_message,
-      skip_prompt_penalty);
+      prompt_penalty_mode);
 }
 
 EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_begin_generation(
@@ -106,7 +106,7 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_begin_generation(
     const char * thinking_start_tag,
     const char * thinking_end_tag,
     const char * thinking_forced_message,
-    int32_t skip_prompt_penalty) {
+    int32_t prompt_penalty_mode) {
   return begin_generation_impl(
       prompt,
       c_string_length(prompt),
@@ -122,7 +122,7 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_begin_generation(
       thinking_start_tag,
       thinking_end_tag,
       thinking_forced_message,
-      skip_prompt_penalty);
+      prompt_penalty_mode);
 }
 
 // Sets the grammar root and laziness that the next begin_generation or
@@ -196,7 +196,7 @@ EMSCRIPTEN_KEEPALIVE const char * llamadart_webgpu_completion_capabilities_json(
   };
   g_completion_capabilities_json =
       "{\"presencePenalty\":true,\"minP\":true,\"thinkingBudget\":true,"
-      "\"penaltyPromptTokens\":true,\"lazyGrammar\":true,"
+      "\"penaltyPromptTokens\":true,\"penaltyPromptTokensWithGrammar\":true,\"lazyGrammar\":true,"
       "\"speculativeDecoding\":{";
   bool first = true;
   for (const auto & strategy : strategies) {

@@ -14,6 +14,7 @@ export interface CompletionSamplingOptions {
   presencePenalty: number;
   thinkingBudget: Required<ThinkingBudgetOptions> | null;
   penaltyPromptTokens: boolean;
+  penaltyPromptTokensWithGrammar: boolean;
   speculative: ResolvedSpeculativeOptions | null;
   grammarOptions: ResolvedGrammarOptions | null;
 }
@@ -80,6 +81,7 @@ export const NO_COMPLETION_CAPABILITIES: Readonly<CompletionCapabilities> = Obje
   minP: false,
   thinkingBudget: false,
   penaltyPromptTokens: false,
+  penaltyPromptTokensWithGrammar: false,
   lazyGrammar: false,
   speculativeDecoding: Object.freeze(speculativeFlags(() => false)),
 });
@@ -388,6 +390,7 @@ export function resolveCompletionSamplingOptions(
     presencePenalty?: unknown;
     thinkingBudget?: unknown;
     penaltyPromptTokens?: unknown;
+    penaltyPromptTokensWithGrammar?: unknown;
     speculativeDecoding?: unknown;
     grammar?: unknown;
     grammarLazy?: unknown;
@@ -401,11 +404,28 @@ export function resolveCompletionSamplingOptions(
     withoutNul(options.grammar, 'CompletionOptions.grammar');
   }
   const budget = thinkingBudget(options?.thinkingBudget, hasMediaParts);
+  const promptTokens = penaltyPromptTokens(options?.penaltyPromptTokens);
+  const withGrammar = options?.penaltyPromptTokensWithGrammar ?? false;
+  if (typeof withGrammar !== 'boolean') {
+    throw new TypeError('CompletionOptions.penaltyPromptTokensWithGrammar must be a boolean.');
+  }
+  if (withGrammar) {
+    if (typeof options?.grammar !== 'string') {
+      throw new Error('CompletionOptions.penaltyPromptTokensWithGrammar needs a CompletionOptions.grammar string.');
+    }
+    if (!promptTokens) {
+      throw new Error('CompletionOptions.penaltyPromptTokensWithGrammar requires penaltyPromptTokens not false.');
+    }
+    if (hasMediaParts) {
+      throw new Error('CompletionOptions.penaltyPromptTokensWithGrammar supports text-only prompts.');
+    }
+  }
   return {
     minP: optionalNumber(options?.minP, 'minP', (value) => value >= 0 && value <= 1, ' from 0 to 1') ?? 0,
     presencePenalty: optionalNumber(options?.presencePenalty, 'presencePenalty', () => true, '') ?? 0,
     thinkingBudget: budget,
-    penaltyPromptTokens: penaltyPromptTokens(options?.penaltyPromptTokens),
+    penaltyPromptTokens: promptTokens,
+    penaltyPromptTokensWithGrammar: withGrammar,
     speculative: speculativeDecoding(options?.speculativeDecoding, {
       hasMediaParts,
       hasGrammar: typeof options?.grammar === 'string' && options.grammar.length > 0,
@@ -429,6 +449,7 @@ export function completionCapabilitiesFrom(raw: string | null): CompletionCapabi
     minP: parsed?.minP === true,
     thinkingBudget: parsed?.thinkingBudget === true,
     penaltyPromptTokens: parsed?.penaltyPromptTokens === true,
+    penaltyPromptTokensWithGrammar: parsed?.penaltyPromptTokensWithGrammar === true,
     lazyGrammar: parsed?.lazyGrammar === true,
     speculativeDecoding: speculativeFlags((strategy) => speculative?.[strategy] === true),
   };
@@ -440,6 +461,8 @@ export function requireCompletionCapabilities(
   capabilities: CompletionCapabilities,
 ): void {
   const missing = [
+    sampling.penaltyPromptTokensWithGrammar && capabilities.penaltyPromptTokensWithGrammar !== true
+      ? 'penaltyPromptTokensWithGrammar' : null,
     sampling.minP !== 0 && !capabilities.minP ? 'minP' : null,
     sampling.presencePenalty !== 0 && !capabilities.presencePenalty ? 'presencePenalty' : null,
     sampling.thinkingBudget != null && !capabilities.thinkingBudget ? 'thinkingBudget' : null,

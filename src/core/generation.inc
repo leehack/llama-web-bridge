@@ -338,7 +338,7 @@ int32_t begin_generation_impl(
     const char * thinking_start_tag,
     const char * thinking_end_tag,
     const char * thinking_forced_message,
-    const int32_t skip_prompt_penalty) {
+    const int32_t prompt_penalty_mode) {
   // Defence in depth behind the bridge's single-writer queue: reject before
   // touching any shared state, so a stray second begin cannot destroy the
   // in-flight generation's output, sampler, or g_last_error. The caller maps
@@ -397,6 +397,15 @@ int32_t begin_generation_impl(
 
   if (!std::isfinite(presence_penalty)) {
     set_error("presence_penalty must be a finite number");
+    return -2;
+  }
+
+  // 0 preserves the historical default; 1 opts out; 2 explicitly counts a
+  // text prompt with an attached grammar. Keep the existing export ABI.
+  if (prompt_penalty_mode < 0 || prompt_penalty_mode > 2 ||
+      (prompt_penalty_mode == 2 &&
+       (grammar == nullptr || !g_pending_media.empty()))) {
+    set_error("Invalid prompt penalty mode or non-text grammar opt-in");
     return -2;
   }
 
@@ -540,11 +549,10 @@ int32_t begin_generation_impl(
     penalty_prompt_tokens = std::move(prompt_tokens);
   }
 
-  // As native llamadart does, the whole text prompt, cached prefix included,
-  // seeds the penalties unless a grammar string is given, even an empty one; a
-  // multimodal prompt seeds nothing. skip_prompt_penalty lets a caller that
-  // dropped a grammar native would keep, such as a lazy one, match native.
-  if (grammar != nullptr || skip_prompt_penalty != 0) {
+  // Only mode 2 opts a grammar into prompt penalties. create_sampler seeds
+  // the penalties sampler alone, so prompt triggers never activate grammar.
+  if ((grammar != nullptr && prompt_penalty_mode != 2) ||
+      prompt_penalty_mode == 1) {
     penalty_prompt_tokens.clear();
   }
 

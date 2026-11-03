@@ -3928,7 +3928,7 @@ export class LlamaWebGpuBridgeRuntime {
             sampling.thinkingBudget?.startTag ?? null,
             sampling.thinkingBudget?.endTag ?? null,
             sampling.thinkingBudget?.forcedMessage ?? null,
-            sampling.penaltyPromptTokens ? 0 : 1,
+            sampling.penaltyPromptTokensWithGrammar ? 2 : sampling.penaltyPromptTokens ? 0 : 1,
           ],
           { async: true },
         ),
