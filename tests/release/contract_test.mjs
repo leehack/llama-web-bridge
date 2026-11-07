@@ -24,7 +24,6 @@ import {
   requireCorrelationId,
   resolveNativeManifest,
   resolveTagCommit,
-  selectStableNativeRelease,
   validateCandidatePrequalification,
   validateGithubPrerelease,
   validateImmutableReleaseGovernance,
@@ -100,18 +99,6 @@ test('test_github_prerelease_matches_native_policy', () => {
   assert.equal(validateGithubPrerelease('v0.2.0-llamadart.1', true), true);
 });
 
-test('test_stable_native_discovery_enumerates_wrappers', () => {
-  const releases = [
-    { tag_name: 'b10599', draft: false, prerelease: true },
-    { tag_name: 'v0.2.0', draft: false, prerelease: false },
-    { tag_name: 'v0.2.0-2', draft: false, prerelease: true },
-    { tag_name: 'v0.3.0-1', draft: false, prerelease: false },
-    { tag_name: 'v9.0.0', draft: false, prerelease: true },
-    { tag_name: 'v9.0.0', draft: true, prerelease: false },
-  ];
-  assert.equal(selectStableNativeRelease(releases), 'v0.2.0-2');
-});
-
 // int() refuses more than 4300 digits with ValueError, which escapes the
 // contract uncaught, as it does in Python.
 const TOO_LONG = 'ValueError: Exceeds the limit (4300 digits) for integer string conversion: value has 4301 digits; use sys.set_int_max_str_digits() to increase the limit';
@@ -125,10 +112,6 @@ test('a tag component over 4300 digits raises int()\'s ValueError, never passes'
   assert.throws(() => parseReleaseTag(`v1.0.0-llamadart.${ones}`, { allowLegacy: true }), tooLong);
   assert.throws(() => parseUpstreamTag(`v${ones}.0.0`), tooLong);
   assert.throws(() => parseUpstreamTag(`b${ones}`), tooLong);
-  assert.throws(() => selectStableNativeRelease([
-    { tag_name: 'v0.2.0', draft: false, prerelease: false },
-    { tag_name: `v${ones}.0.0`, draft: false, prerelease: false },
-  ]), tooLong);
   const result = runCli(['validate-release', '--release-tag', `v${ones}.0.0`, '--release-rebuild', '0', '--upstream-tag', 'v1.0.0']);
   assert.deepEqual(result, { returncode: 1, stdout: '', stderr: `Traceback (most recent call last):\n${TOO_LONG}\n` });
 });

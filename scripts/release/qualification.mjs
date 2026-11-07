@@ -66,7 +66,6 @@ import {
   CandidateIdentity,
   PUBLICATION_FILES,
   validateCandidate,
-  validatePublishedCandidate,
 } from './publication_state.mjs';
 import { isOSError, osErrorString, pyResolve } from './python_compat.mjs';
 import {
@@ -899,25 +898,13 @@ export function requireInt(payload, key, label) {
   return value;
 }
 
-// Validate a candidate directory against the current strict contract:
-// [manifest, fingerprint].
-export function loadCandidate(directory) {
-  return loadCandidateContract(directory);
-}
-
-// Validate immutable published bytes against an explicit historical contract.
-export function loadPublishedCandidate(directory, { expectedQualificationGates, expectedUnprovenCapabilities } = {}) {
-  return loadCandidateContract(directory, {
-    publishedManifestContract: [expectedQualificationGates, expectedUnprovenCapabilities],
-  });
-}
-
-// Validate an exact candidate directory and return its manifest and digest.
+// Validate an exact candidate directory against the current strict contract
+// and return [manifest, fingerprint].
 //
 // The candidate is validated with the same routine publication uses, so the
 // fingerprint an attestation binds is the identical fingerprint publication
 // recomputes; a divergent second definition could never be kept in step.
-export function loadCandidateContract(directory, { publishedManifestContract = null } = {}) {
+export function loadCandidate(directory) {
   const root = pyPath(String(directory));
   if (!pyIsDir(root) || pyIsSymlink(root)) throw new ContractError(`candidate directory does not exist: ${root}`);
   const names = pyListdir(root);
@@ -962,13 +949,7 @@ export function loadCandidateContract(directory, { publishedManifestContract = n
     githubRunId: requireStr(manifest, 'github_run_id', label),
     githubRunUrl: requireStr(manifest, 'github_run_url', label),
   });
-  const fingerprint = publishedManifestContract === null
-    ? validateCandidate(root, identity)
-    : validatePublishedCandidate(root, identity, {
-      expectedQualificationGates: publishedManifestContract[0],
-      expectedUnprovenCapabilities: publishedManifestContract[1],
-    });
-  return [manifest, fingerprint];
+  return [manifest, validateCandidate(root, identity)];
 }
 
 export function manifestCandidateGates(manifest) {

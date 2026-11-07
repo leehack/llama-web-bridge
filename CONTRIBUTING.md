@@ -356,7 +356,6 @@ query strings, and fragments before printing the location.
   current when changing `.github/workflows/ci.yml`,
   `.github/workflows/bridge_candidate.yml`,
   `.github/workflows/publish_assets.yml`,
-  `.github/workflows/auto_llama_cpp_update.yml`,
   `.github/workflows/bridge_qualification.yml`, or the model pins in
   `scripts/release/qualification.mjs`. It checks permissions, environment gates,
   PAT handling, pins, fail-closed guards, that CI runs the contract tests, and
@@ -416,85 +415,15 @@ query strings, and fragments before printing the location.
 - Preserve `llama_cpp.version` as the default ordinary CI/development build pin.
   It holds exactly one upstream tag in either channel, stable
   `vMAJOR.MINOR.PATCH` or development `bNNNN`; `scripts/ci/verify_ci_reliability.mjs`
-  rejects every other form. Exact release publication receives upstream identity
-  from the orchestrator and must not require a bridge pin PR.
+  rejects every other form. Exact releases take upstream identity from their
+  dispatch inputs and must not require a bridge pin PR.
 - Preserve `emsdk.version` as the single compiler source for CI and publish.
   Both workflows must verify the active `emcc` version, and published manifests
   must record that verified identity.
-- Main-branch and PR CI never dispatch publication. Stable release discovery
-  prepares an ordered `release-candidates.json` backlog for every
-  stable native release after the immutable native `v0.2.0-1` / Web-assets
-  `v0.1.39` baseline and invokes `scripts/release/orchestrator/cli.mjs` to
-  idempotently advance candidate, automated qualification, and publication
-  stages. The scan is manual-only: each owner `workflow_dispatch` discovers new
-  native releases and advances each pipeline by one idempotent stage; no
-  schedule or `workflow_run` continuation exists. The scan downloads
-  every selected `assets.json` and `SHA256SUMS` by
-  unique release-asset ID and runs the complete native release/tag/inventory
-  contract first. That contract accepts native `hook_contract_version` 1 and 2
-  and fails on any other; contract 2's `backend-*` sidecar archives (such as
-  Windows x64 CUDA) must be named
-  `llamadart-native-<platform>-<arch>-<variant>-<tag>.tar.gz` and are
-  checksum-verified like every other artifact. Each exact pipeline advances by
-  at most one stage per scan, and the complete backlog is visited so an older
-  in-flight gate does not starve a newer candidate. Publication remains ordered
-  by native release time, so output tags must follow the same order: an older native with no pipeline for
-  the current build identity is `superseded` when a newer native release is in
-  the scan or a newer native's pipeline still claims an output tag. Where its
-  qualification or publication would be dispatched, an older pipeline bound to
-  an output tag at or above one a newer native's pipeline claims is
-  `superseded` too. The claim comes from the candidate run name, so a targeted
-  `native_release_tag` scan of an older native obeys the same order. A claim
-  of a native outside the scan counts only while that native is a published,
-  non-draft stable release whose `assets.json` digest matches the claim's
-  correlation; otherwise the older native is `blocked`, naming the claim.
-  An entry without its own exact publication is `superseded` when a published
-  stable asset release's `Native:` marker names a newer native release (version,
-  then rebuild); the newest native release in a scan is `blocked` instead.
-  A proven candidate whose publication files other than `manifest.json` are
-  byte-identical to the newest published release for the same native release
-  and native manifest digest is `satisfied_by_identical_release`: nothing
-  further is dispatched and its output tag is released to later pipelines in
-  the same scan. The comparison runs only where a qualification or publication
-  would otherwise be dispatched, never while one of the correlation's runs is
-  in flight, and never across native alignments, with one exception. A
-  candidate whose output tag a published release has reached can never publish,
-  so it is never retried. Unless an identical release of its own native
-  satisfies it as above, it is `superseded`, without a byte comparison, when a
-  newer native release is in the scan. The newest scanned native is instead
-  `satisfied_by_identical_release` when its publication files other than
-  `manifest.json` match that newest release, published for another native
-  release in the same scan. When they differ, a recovery pipeline replaces it:
-  the same provenance under its correlation with `-build-` replaced by `-rN-`,
-  which binds a fresh output tag above every published tag and live claim and
-  runs a new first-attempt candidate, qualification and publication. The
-  stranded pipeline's runs, artifacts and attestation stay as they are, and
-  once a later generation publishes, it settles the stranded one whatever its
-  bytes. A recovery pipeline overtaken in turn moves to the next generation; an
-  overtaken generation 3 is `blocked` instead. When no native release in the
-  scan published the overtaking release, its bytes cannot be compared, so the
-  pipeline is `blocked` until a scan that includes that native release, such
-  as a backlog scan, compares them.
-  Manual `development` scans stay scan-only: they resolve exact `bNNNN`
-  provenance and report it, and the orchestrator refuses non-stable provenance.
-  A failed candidate or qualification is never retried automatically; after diagnosis,
-  a maintainer may deliberately dispatch one new first-attempt run with the same
-  exact binding, and a later unique success supersedes the recorded failed run.
-  On the normal path, a successful candidate is immediately followed by hosted
-  ASR/TTS qualification, then by publication after the exact attestation is
-  verified. Run recovery paginates each exact workflow's filtered
-  history with stable-count checks and splits searches at GitHub's 1,000-result
-  cap into closed time windows, so an older waiting pipeline is not lost as
-  later workflow history grows.
-- The full-history resolver records both the exact default-branch
-  source SHA that will execute a new candidate and the newest first-parent
-  commit that changed governed runtime/build inputs. Correlation uses the latter:
-  non-build orchestration/qualification/publication/CI workflow, verification,
-  test, and documentation-only commits preserve a verified terminal release.
-  The candidate workflow, manifest/release-contract/compiler inputs, and every
-  other new path are governed by default and require a new candidate plus
-  automated qualification. Bridge source changes still
-  require ordinary PRs; release orchestration never changes `llama_cpp.version`.
+- Main-branch and PR CI never dispatch publication; releases are dispatched
+  by hand (see [Publish Process](#publish-process)). A failed candidate or
+  qualification is never rerun; after diagnosis, dispatch one new first-attempt
+  run with the same inputs. Releasing never changes `llama_cpp.version`.
 - Preserve `FORCE_JAVASCRIPT_ACTIONS_TO_NODE24` in CI and publish workflows so
   GitHub Action runtime changes are detected before they become mandatory.
 - Upload state-persistence smoke diagnostics only on failure; successful CI runs
@@ -504,20 +433,71 @@ query strings, and fragments before printing the location.
 
 ## Publish Process
 
-Use `.github/workflows/publish_assets.yml` only after the publication approval
-assertion is backed by the live `bridge-assets-publication` policy. The
-bridge-owned orchestrator dispatches this
-bridge-owned, non-reusable workflow with a required correlation ID, exact bridge SHA,
-upstream tag/commit, native release tag plus `assets.json` SHA-256,
-output release tag/rebuild, distinct required `candidate_run_id` and
-`qualification_run_id`, and assets repository.
+Releases are manual: the repository owner dispatches three workflows from
+`main`, in order, each after the previous run succeeds. Every stage is
+first-attempt-only, so after a failure dispatch a new run instead of rerunning.
+Use one correlation ID for all three, 1-128 characters of `A-Za-z0-9._:-`
+starting alphanumeric, such as `manual-v0.1.83`. The input keeps its historical
+name `orchestrator_correlation_id` because published manifests and release
+notes record it.
 
-Immutable releases must already be enabled on the assets repository before the
-candidate is dispatched. Confirm it with
-`gh api repos/leehack/llama-web-bridge-assets/immutable-releases`, then dispatch
-`bridge_candidate.yml` with `assets_immutable_releases_enabled=true`; the
-candidate cannot read that setting itself and fails closed on the assertion.
-Publication downloads the exact run-owned prequalification record and binds its
+Gather the inputs. Use the newest stable `llamadart-native` release: no stage
+checks that native releases are published in order.
+
+```bash
+NATIVE_TAG=v0.8.0-1
+gh release download "$NATIVE_TAG" -R leehack/llamadart-native -p assets.json -O assets.json
+jq -r '.llama_cpp_tag, .llama_cpp_commit' assets.json  # upstream_tag, upstream_commit
+shasum -a 256 assets.json                              # native_manifest_sha256
+git ls-remote https://github.com/leehack/llama-web-bridge refs/heads/main  # bridge_source_sha
+gh api repos/leehack/llama-web-bridge-assets/releases --jq '.[].tag_name' \
+  | sort -V | tail -1  # release_tag: the next patch above this
+gh api repos/leehack/llama-web-bridge-assets/immutable-releases  # must be enabled
+```
+
+1. Build Exact Bridge Candidate:
+
+   ```bash
+   gh workflow run bridge_candidate.yml -R leehack/llama-web-bridge --ref main \
+     -f orchestrator_correlation_id=manual-v0.1.83 \
+     -f bridge_source_sha=<main SHA> \
+     -f upstream_tag=<llama_cpp_tag> -f upstream_commit=<llama_cpp_commit> \
+     -f native_release_tag="$NATIVE_TAG" -f native_manifest_sha256=<assets.json SHA-256> \
+     -f release_tag=v0.1.83 -f release_rebuild=0 \
+     -f assets_immutable_releases_enabled=true
+   ```
+
+2. Qualify Exact Bridge Candidate, with the candidate's run ID:
+
+   ```bash
+   gh workflow run bridge_qualification.yml -R leehack/llama-web-bridge --ref main \
+     -f orchestrator_correlation_id=manual-v0.1.83 -f candidate_run_id=<candidate run ID>
+   ```
+
+3. Publish Exact Qualified Bridge Assets, with the step 1 inputs except
+   `assets_immutable_releases_enabled`, plus both run IDs:
+
+   ```bash
+   gh workflow run publish_assets.yml -R leehack/llama-web-bridge --ref main \
+     -f orchestrator_correlation_id=manual-v0.1.83 \
+     -f bridge_source_sha=<main SHA> \
+     -f upstream_tag=<llama_cpp_tag> -f upstream_commit=<llama_cpp_commit> \
+     -f native_release_tag="$NATIVE_TAG" -f native_manifest_sha256=<assets.json SHA-256> \
+     -f release_tag=v0.1.83 -f release_rebuild=0 \
+     -f candidate_run_id=<candidate run ID> -f qualification_run_id=<qualification run ID> \
+     -f publish_approved=true
+   ```
+
+`gh run list -R leehack/llama-web-bridge -w <workflow file> -L 1` shows a run's
+ID. Each stage re-verifies everything it consumes: the candidate resolves the
+upstream and native tags and checks the native `assets.json` digest and
+inventory; qualification proves the candidate run and that its manifest carries
+the same correlation ID; publication re-proves both runs and binds the
+attestation to every input above.
+
+The candidate cannot read the assets repository's immutable-release setting, so
+it fails closed unless `assets_immutable_releases_enabled=true` and records the
+assertion. Publication downloads the exact run-owned prequalification record and binds its
 explicit boolean assertion to the candidate and run identities before it
 re-proves the real state through the same endpoint and before it pushes,
 requiring the exact `{enabled, enforced_by_owner}` shape with `enabled`
@@ -533,8 +513,8 @@ readback release ID, and the exact published artifact digests. A failure is repo
 `immutable-publication-unverified`. An incomplete published release is never
 filled in; the release is never deleted, retagged, overwritten, or repaired.
 
-The orchestrator must set `publish_approved=true` only after live policy
-verification. Publication remains blocked until
+`publish_approved=true` is the owner's explicit approval; the workflow still
+validates the live environment policy itself. Publication remains blocked until
 repository administrators separately create `bridge-assets-publication`, disable
 administrator bypass, restrict the custom deployment branch policy to `main`,
 and store the assets PAT as an environment-scoped secret. The solo-maintainer
@@ -568,25 +548,18 @@ redispatching a new publication run against the same `candidate_run_id` and
 comes from the candidate run, so it stays stable. A different candidate must
 never target an existing output tag.
 
-The manually dispatched orchestrator reuses that same existing secret only from a
-`bridge-assets-publication` environment job; it does not require an
-`ORCHESTRATOR_DISPATCH_TOKEN`. For orchestrated progression, the owner-bound token
-must retain Actions write permission on `leehack/llama-web-bridge` in addition
-to the assets-repository permissions publication already requires. The job token
-validates the environment policy first; the orchestrator then proves the PAT's
-owner identity and live immutable-release governance before dispatch. It adds
-`assets_immutable_releases_enabled=true` only from that governance response and
-adds `publish_approved=true` only after the live publication-environment policy
-passes. An already-published noop still resolves the exact assets tag commit,
-validates independent release reads by tag and ID, and validates the signed
-`gh release verify --format json` attestation against every downloaded asset
-digest. The scan is manual-only and requires both the initiating actor and triggering
-actor to be the repository owner before either workflow job starts, preventing
-a collaborator from using the environment PAT as a confused deputy.
+`WEBGPU_BRIDGE_ASSETS_PAT` needs only what publication uses: read access to the
+provenance repositories, plus write access and Administration read (for the
+`immutable-releases` check) on `leehack/llama-web-bridge-assets`.
+No workflow dispatches another, so it needs no Actions permission on
+`leehack/llama-web-bridge`. An already-published noop still resolves the exact
+assets tag commit, validates independent release reads by tag and ID, and
+validates the signed `gh release verify --format json` attestation against
+every downloaded asset digest.
 
 New bridge asset tags are npm-shaped `vMAJOR.MINOR.PATCH` with rebuild `0`:
-`selectNextReleaseTarget` skips a published or claimed version by taking
-the next free patch version, and `scripts/release/contract.mjs validate-release` rejects
+take the next free patch version above the newest published tag.
+`scripts/release/contract.mjs validate-release` rejects
 a new `-N` tag in the candidate and publish workflows, because npm orders
 `vMAJOR.MINOR.PATCH-N` as a prerelease. Earlier `-N` bridge tags, the native
 forms `vMAJOR.MINOR.PATCH-N`, `bNNNN` and `bNNNN-N`, historical
@@ -616,8 +589,5 @@ OS/architecture, exact Emscripten version, resolved llama.cpp commit, and build
 script/CMake/patch inputs. ccache also checks compiler contents, source inputs,
 and compile flags. Every selected build still links fresh artifacts and runs
 every CI browser smoke. Candidate and publication workflows do not consume
-this cache or this change selector, so `scripts/ci/ci_scope.mjs` is listed in
-`ORCHESTRATION_ONLY_PATHS` in `scripts/release/orchestrator/cli.mjs`. List any
-new CI-only script there too: an unclassified path is governed by default and
-advances the release build identity. Track follow-up work in
+this cache or this change selector. Track follow-up work in
 [llamadart issue #532](https://github.com/leehack/llamadart/issues/532).

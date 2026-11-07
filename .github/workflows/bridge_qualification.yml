@@ -1,7 +1,7 @@
 name: Qualify Exact Bridge Candidate
 
-# Parsed by scripts/release/orchestrator/run_names.mjs to bind this qualification to
-# the exact candidate run it proves; the runs API never echoes dispatch inputs.
+# Names the exact candidate run this qualification proves; the runs API never
+# echoes dispatch inputs.
 run-name: bridge-qualification ${{ inputs.orchestrator_correlation_id }} candidate:${{ inputs.candidate_run_id }}
 
 on:
@@ -11,13 +11,13 @@ on:
   # and uploads the canonical attestation as this run's single artifact so
   # publication can require an exact successful qualification run.
   #
-  # The orchestrator dispatches this with the same owner credential it uses for
-  # the candidate build. No maintainer ever produces or transports an
-  # attestation by hand, and this workflow holds no publication credential.
+  # The owner dispatches this after the candidate run succeeds. No maintainer
+  # produces or transports an attestation by hand, and this workflow holds no
+  # publication credential.
   workflow_dispatch:
     inputs:
       orchestrator_correlation_id:
-        description: Required central-orchestrator correlation identifier
+        description: Correlation ID shared by the candidate, qualification and publish runs of one release, e.g. manual-v0.1.83
         required: true
         type: string
       candidate_run_id:

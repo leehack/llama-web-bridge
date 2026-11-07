@@ -234,7 +234,7 @@ node scripts/ci/verify_ci_reliability.mjs
 ```
 
 The reliability contract checks the publication-safety invariants of the CI,
-candidate, qualification, publication, and orchestration workflows. It parses
+candidate, qualification, and publication workflows. It parses
 the workflows rather than matching their wording, so rewording a step or its
 comments never fails it:
 
@@ -258,7 +258,7 @@ comments never fails it:
   job may `continue-on-error` (only the publication ref mutation, whose outcome
   a live re-query classifies);
 - `WEBGPU_BRIDGE_ASSETS_PAT` is the only secret in any workflow, referenced only
-  by the publication and orchestration workflows and only through a step's
+  by the publication workflow and only through a step's
   `env`; in the publication workflow every step that binds it starts with
   `set -euo pipefail` and a fail-closed empty-token guard, and never prints it;
 - publication is dispatch-only, requires `publish_approved=true`, serializes
@@ -273,11 +273,8 @@ comments never fails it:
   ID, verifies the attestation in both jobs with the trusted validators, proves
   immutable-release governance before any ref mutation, reads the release back
   as immutable and attested, and never deletes, retags, or overwrites a release;
-- `.github/workflows/auto_llama_cpp_update.yml` fetches provenance by release
-  asset ID, gates every job on the repository owner, uses the PAT only inside the
-  validated publication environment, dispatches only through the orchestrator,
-  and never opens a PR or pushes; ordinary CI never dispatches publication or
-  holds `actions: write`;
+- no workflow dispatches another or holds `actions: write`; releases are
+  dispatched by hand;
 - CI runs the state-persistence, multimodal, grammar, and next-token-score
   browser smokes.
 
@@ -338,8 +335,8 @@ The harness:
 The automated qualification workflow performs the same provenance checks,
 downloads and digest-verifies every pinned input, runs the harness against the
 exact candidate artifact, and uploads one canonical `qualification-attestation`
-artifact. The orchestrator advances publication only after that exact
-first-attempt qualification run succeeds. No maintainer creates, transports, or
+artifact. Publication accepts only that exact successful first-attempt
+qualification run. No maintainer creates, transports, or
 submits an attestation, and the qualification workflow holds no publication PAT.
 
 `scripts/smoke/speech_to_text.mjs` and
@@ -379,28 +376,13 @@ Automated qualification workflow:
 
 - `.github/workflows/bridge_qualification.yml`
 
-Trigger modes:
-
-- The bridge-owned orchestrator dispatches candidate build, automated
-  qualification, and publication through GitHub's API using the repository
-  owner's existing authorized identity; owner checks reject other dispatch
-  actors. The orchestrator runs only when the owner manually dispatches
-  `auto_llama_cpp_update.yml`; each dispatch idempotently advances every
-  eligible pipeline by one stage. Maintainers may instead dispatch the
-  candidate, qualification, and publication workflows themselves, in that
-  order. The stage workflows are deliberately not reusable
-  because reusable job environments execute in the caller repository's context.
-
-The resolver keeps the current default-branch source SHA separate
-from the newest main-line commit that changed governed runtime/build inputs.
-Non-build orchestration/qualification/publication/CI workflow, verification,
-test, and documentation-only commits therefore preserve verified pipeline
-state. The candidate workflow and any runtime/build input change create a new
-correlation and must produce a new automatically qualified candidate.
-
-There is no push, tag, schedule, `workflow_run`, or ordinary-CI publication
-trigger. Only manual `workflow_dispatch` calls, the orchestrator's exact ones
-included, start a scan, build, qualification, or publication stage.
+Releases are manual. The repository owner dispatches the candidate,
+qualification, and publication workflows in that order;
+[CONTRIBUTING.md](CONTRIBUTING.md#publish-process) lists each one's inputs.
+Each stage refuses a non-owner dispatcher and verifies its inputs itself. The
+stage workflows are deliberately not reusable because reusable job
+environments execute in the caller repository's context. There is no push,
+tag, schedule, `workflow_run`, or ordinary-CI trigger for any stage.
 
 Immutable releases must already be enabled on `leehack/llama-web-bridge-assets`
 before a candidate is dispatched. `bridge_candidate.yml` requires
@@ -431,18 +413,17 @@ assets; publication never deletes, retags, overwrites, or repairs it.
 
 Required externally configured credentials:
 
-- `WEBGPU_BRIDGE_ASSETS_PAT` (read access to provenance repositories and write
-  access to `leehack/llama-web-bridge-assets`, stored only in the publication
-  environment). This is the only externally configured publication credential.
+- `WEBGPU_BRIDGE_ASSETS_PAT` (read access to provenance repositories, plus
+  write access and Administration read on `leehack/llama-web-bridge-assets`,
+  stored only in the publication environment). This is the only externally configured publication credential.
 
-Every request supplies a required orchestrator correlation ID, the exact bridge
+Every request supplies a required correlation ID, the exact bridge
 source SHA, upstream llama.cpp tag/commit, native release tag plus `assets.json`
 SHA-256, output release tag/rebuild, a distinct required `candidate_run_id` and
 `qualification_run_id`, and an exact assertion of the fixed assets repository.
 Dispatch values enter shell scripts only through environment variables and
-quoted expansions. The orchestrator sets `publish_approved=true` only after its
-live publication-environment policy check succeeds; no human continuation is
-part of the release pipeline.
+quoted expansions. The owner sets `publish_approved=true` explicitly, and the
+workflow still validates the live publication-environment policy itself.
 
 Publication is deliberately blocked until repository administrators externally
 configure `bridge-assets-publication` with administrator bypass disabled,
@@ -482,7 +463,7 @@ the producing qualification workflow path, run ID, first attempt, and source
 SHA -- once before entering the privileged job and again inside it.
 
 The published schema-v2 manifest carries the release tag, capabilities,
-bridge/upstream/native commits, orchestrator correlation ID, the candidate run
+bridge/upstream/native commits, correlation ID, the candidate run
 ID/URL, per-artifact SHA-256 values, `qualification_gates` recording
 `state_persistence` and `multimodal` as `passed` with `speech_to_text` and
 `text_to_speech` as `required-automated-qualification`, and `unproven_capabilities`
@@ -510,13 +491,12 @@ publication workflow run using the same `candidate_run_id` and
 overwrite an earlier one under the same output tag.
 
 New bridge asset release tags are npm-shaped `vMAJOR.MINOR.PATCH` with
-`release_rebuild` `0`. When the next version is already published or claimed by
-an unfinished pipeline, the orchestrator takes the next free patch version; it
-never appends `-N`, which npm orders as a prerelease below the plain version.
-A new tag is never lower than a published tag or a live claim; a claim released
-without publication stops counting, so its version may be taken again or stay
-unused. `scripts/release/contract.mjs validate-release`, which the candidate and publish
-workflows run, rejects a new tag with a rebuild suffix.
+`release_rebuild` `0`: take the next free patch version above the newest
+published tag, never a `-N` suffix, which npm orders as a prerelease below the
+plain version. `scripts/release/contract.mjs validate-release`, which the
+candidate and publish workflows run, rejects a new tag with a rebuild suffix,
+and publication rejects a tag that already exists or does not advance its
+channel history.
 
 Tags published before this rule, such as `v0.1.47-1`, and the shared native
 forms (`vMAJOR.MINOR.PATCH-N`, `bNNNN`, `bNNNN-N`) stay readable. Historical
@@ -543,6 +523,6 @@ Note: CDN pinning fundamentally relies on git tags in the assets repo.
 
 - `CONTRIBUTING.md`: setup, build, the runnable smoke invocations and their
   pins, workflow guardrails, and the publish process
-- `AGENTS.md`: agent PR workflow, orchestrator invariants stated nowhere else,
+- `AGENTS.md`: agent PR workflow, release invariants stated nowhere else,
   the `js/src/`-source-vs-`js/`-generated rule, cross-repo handoff, and
   regression smoke guidance

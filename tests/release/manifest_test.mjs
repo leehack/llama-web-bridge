@@ -17,10 +17,8 @@ import { artifactBytes, coreWasm } from './core_wasm_fixture.mjs';
 import * as V0_1_53 from './manifest_v0_1_53_fixture.mjs';
 import { loadCandidate } from './publication_fixtures.mjs';
 
-// The capabilities of every published schema-v2 manifest (v0.1.44 to v0.1.46).
-// The orchestrator re-verifies published releases with
-// release_qualification.load_candidate, which requires the generator's exact
-// capabilities, so a new capability needs a historical readback contract first.
+// The capabilities of every published schema-v2 manifest (v0.1.44 to v0.1.46),
+// which loadCandidate must keep accepting.
 const PUBLISHED_CAPABILITIES = {
   wasm32: true,
   memory64: true,

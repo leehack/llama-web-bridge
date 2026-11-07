@@ -682,34 +682,6 @@ export function validateNativeRelease(
   return identity;
 }
 
-// Select the highest supported stable-channel tag without GitHub latest
-// semantics. On a tie the first listed release wins, as max() keeps it.
-export function selectStableNativeRelease(releases) {
-  let selected = null;
-  let selectedKey = null;
-  for (const release of releases) {
-    if (!isDict(release) || pyGet(release, 'draft') !== false) continue;
-    const tag = pyGet(release, 'tag_name');
-    if (typeof tag !== 'string') continue;
-    let version;
-    try {
-      version = parseReleaseTag(tag, { allowLegacy: true });
-    } catch (error) {
-      if (error instanceof ContractError) continue;
-      throw error;
-    }
-    if (version.channel === Channel.STABLE && pyGet(release, 'prerelease') === version.githubPrerelease) {
-      const key = [...version.versionParts, version.rebuild];
-      if (selected === null || compareIntTuples(key, selectedKey) > 0) {
-        selected = version;
-        selectedKey = key;
-      }
-    }
-  }
-  if (selected === null) throw new ContractError('no supported non-draft stable native release exists');
-  return selected.tag;
-}
-
 // Require the exact fail-closed solo-maintainer publication policy.
 export function validatePublicationEnvironment(environment, branchPolicies) {
   if (pyGet(environment, 'name') !== 'bridge-assets-publication') {
@@ -1137,15 +1109,6 @@ export const COMMANDS = Object.freeze({
       { flag: '--previous-manifest', required: false, type: 'path' },
     ],
   },
-  'validate-native': {
-    options: [
-      required('--manifest', 'path'),
-      required('--manifest-sha256'),
-      required('--native-release-tag'),
-      required('--upstream-tag'),
-      required('--upstream-commit'),
-    ],
-  },
   'validate-native-release': {
     options: [
       required('--manifest', 'path'),
@@ -1167,9 +1130,6 @@ export const COMMANDS = Object.freeze({
     ],
   },
   'resolve-tag-commit': { options: [required('--ls-remote', 'path'), required('--tag')] },
-  'compare-upstream': { positionals: ['current', 'target'] },
-  'scan-native': { options: [required('--manifest', 'path'), required('--native-release-tag')] },
-  'select-stable-native-release': { options: [required('--releases-json', 'path')] },
   'validate-immutable-release-governance': {
     options: [required('--governance-json', 'path'), required('--repository')],
   },
@@ -1228,9 +1188,6 @@ function runCommand(command, args, write) {
       });
     }
     write(dumps(result));
-  } else if (command === 'validate-native') {
-    const identity = validateNativeFile(args.manifest, args.manifestSha256, args.nativeReleaseTag, args.upstreamTag, args.upstreamCommit);
-    write(dumps(identity.toDict()));
   } else if (command === 'validate-native-release') {
     const releasePayload = pyJsonLoads(pyReadText(args.releaseJson));
     if (!isDict(releasePayload)) throw new ContractError('native GitHub release root must be an object');
@@ -1250,15 +1207,6 @@ function runCommand(command, args, write) {
     write(dumps({ native_release_tag: nativeRelease.tag, upstream_tag: args.upstreamTag }));
   } else if (command === 'resolve-tag-commit') {
     write(`${resolveTagCommit(pyReadText(args.lsRemote), args.tag)}\n`);
-  } else if (command === 'compare-upstream') {
-    write(`${compareUpstream(args.current, args.target)}\n`);
-  } else if (command === 'scan-native') {
-    const payload = pyJsonLoads(pyReadText(args.manifest));
-    write(dumps(resolveNativeManifest(payload, args.nativeReleaseTag).toDict()));
-  } else if (command === 'select-stable-native-release') {
-    const releases = pyJsonLoads(pyReadText(args.releasesJson));
-    if (!Array.isArray(releases)) throw new ContractError('native release listing must be a JSON array');
-    write(`${selectStableNativeRelease(releases)}\n`);
   } else if (command === 'validate-immutable-release-governance') {
     const governancePayload = strictJsonLoads(pyReadText(args.governanceJson), 'immutable-release governance response');
     write(dumps(validateImmutableReleaseGovernance(governancePayload, args.repository)));

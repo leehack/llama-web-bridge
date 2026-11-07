@@ -1,17 +1,17 @@
 name: Publish Exact Qualified Bridge Assets
 
-# Parsed by scripts/release/orchestrator/run_names.mjs so a retry can prove whether
-# this exact candidate/qualification/output publication already ran.
+# Names the exact candidate, qualification and output of this publication; the
+# runs API never echoes dispatch inputs.
 run-name: publish-assets ${{ inputs.orchestrator_correlation_id }} candidate:${{ inputs.candidate_run_id }} qualification:${{ inputs.qualification_run_id }} source:${{ inputs.bridge_source_sha }} tag:${{ inputs.release_tag }} rebuild:${{ inputs.release_rebuild }}
 
 on:
-  # This workflow is intentionally bridge-owned and non-reusable. A central
-  # orchestrator may dispatch it, but the environment gate must execute in this
-  # repository rather than in the caller's repository context.
+  # This workflow is intentionally bridge-owned and non-reusable: the
+  # environment gate must execute in this repository rather than in a caller's
+  # repository context.
   workflow_dispatch:
     inputs:
       orchestrator_correlation_id:
-        description: Required central-orchestrator correlation identifier
+        description: Correlation ID shared by the candidate, qualification and publish runs of one release, e.g. manual-v0.1.83
         required: true
         type: string
       bridge_source_sha:
@@ -48,7 +48,7 @@ on:
         default: leehack/llama-web-bridge-assets
         type: string
       publish_approved:
-        description: Explicit approval recorded by the dispatching orchestrator
+        description: Owner's explicit approval to publish this exact candidate; must be true
         required: true
         type: boolean
       candidate_run_id:

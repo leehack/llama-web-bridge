@@ -1186,25 +1186,6 @@ export function pyStrptimeUtc(value) {
   return { year, month, day, hour, minute, second };
 }
 
-// datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ") as pyStrptimeUtc parses it,
-// raising the ValueError CPython 3.12 raises where pyStrptimeUtc returns null:
-// no match, unconverted data, then the datetime constructor's range checks in
-// its order (year, day, second).
-export function pyStrptimeUtcOrRaise(value) {
-  const match = UTC_FORMAT.exec(value);
-  if (!match) {
-    throw new PyException('ValueError', `time data ${pyRepr(value)} does not match format '%Y-%m-%dT%H:%M:%SZ'`);
-  }
-  if (match[0].length !== value.length) {
-    throw new PyException('ValueError', `unconverted data remains: ${value.slice(match[0].length)}`);
-  }
-  const [year, month, day, hour, minute, second] = match.slice(1).map(decimalText);
-  if (year < 1) throw new PyException('ValueError', `year ${year} is out of range`);
-  if (day > daysInMonth(year, month)) throw new PyException('ValueError', 'day is out of range for month');
-  if (second > 59) throw new PyException('ValueError', 'second must be in 0..59');
-  return { year, month, day, hour, minute, second };
-}
-
 // .strftime("%Y-%m-%dT%H:%M:%SZ") with glibc's unpadded %Y, as on the Linux
 // runners (macOS pads a year below 1000 to four digits).
 export function pyStrftimeUtc({ year, month, day, hour, minute, second }) {

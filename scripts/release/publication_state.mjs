@@ -155,18 +155,9 @@ export function validateCandidate(directory, identity) {
   });
 }
 
-// Validate immutable published bytes against an explicit historical contract.
-export function validatePublishedCandidate(directory, identity, {
-  expectedQualificationGates,
-  expectedUnprovenCapabilities,
-} = {}) {
-  return validateCandidateContract(directory, identity, { expectedQualificationGates, expectedUnprovenCapabilities });
-}
-
 // Validate candidate bytes against an already selected manifest contract.
-//
-// The public strict and published-readback entry points select the contract;
-// ordinary candidate callers cannot supply historical expectations.
+// validateCandidate selects it, so callers cannot supply historical
+// expectations.
 function validateCandidateContract(directory, identity, { expectedQualificationGates, expectedUnprovenCapabilities }) {
   const root = directoryPath(directory);
   if (!pyIsDir(root) || pyIsSymlink(root)) throw new ContractError('candidate must be a real directory');
