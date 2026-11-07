@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Static checks for the publication-safety invariants of the CI, candidate,
-// qualification, publication and orchestration workflows: permissions,
+// qualification and publication workflows: permissions,
 // immutability, environment gates, publication PAT handling, model and
 // toolchain pins, fail-closed guards, first-attempt-only runs, artifact
 // download by immutable ID, and that CI runs the contract tests.
@@ -23,7 +23,6 @@ const WORKFLOWS = {
   candidate: '.github/workflows/bridge_candidate.yml',
   qualification: '.github/workflows/bridge_qualification.yml',
   publish: '.github/workflows/publish_assets.yml',
-  autoUpdate: '.github/workflows/auto_llama_cpp_update.yml',
 };
 
 // ---------------------------------------------------------------------------
@@ -808,8 +807,6 @@ export const TEST_COMMAND = "node --test 'tests/**/*_test.mjs'";
 
 // Static imports, re-exports, bare imports and literal dynamic imports.
 const RELATIVE_IMPORT = /(?:\bfrom|\bimport)\s*\(?\s*(['"`])(\.\.?\/[^'"`$]+)\1/g;
-// Every literal module specifier, relative or not.
-const IMPORT_SPECIFIER = /(?:\bfrom|\bimport)\s*\(?\s*(['"`])([^'"`$]+)\1/g;
 
 function relativeImports(from, text) {
   return [...String(text).matchAll(RELATIVE_IMPORT)]
@@ -851,17 +848,17 @@ export function checkJsContractTestsRegistered(packageJson, testFiles, errors) {
 }
 
 // R4: the publication PAT is the only secret, referenced only by the
-// publication and orchestration workflows. Every workflow file is scanned, so a
-// new one cannot escape.
+// publication workflow. Every workflow file is scanned, so a new one cannot
+// escape.
 function checkSecretReferences(workflows, errors) {
   const reference = new RegExp(`^${PUBLICATION_PAT_REFERENCE.source}`);
   for (const workflow of workflows) {
-    const allowed = workflow.path === WORKFLOWS.publish || workflow.path === WORKFLOWS.autoUpdate;
+    const allowed = workflow.path === WORKFLOWS.publish;
     for (const match of workflow.text.matchAll(new RegExp(SECRETS_CONTEXT.source, 'gi'))) {
       if (!allowed || !reference.test(workflow.text.slice(match.index))) {
         errors.push(
           `${workflow.path}:${lineNumberAt(workflow.text, match.index)} references the secrets context; only `
-          + `${WORKFLOWS.publish} and ${WORKFLOWS.autoUpdate} may, and only as secrets.${PUBLICATION_PAT_NAME}`,
+          + `${WORKFLOWS.publish} may, and only as secrets.${PUBLICATION_PAT_NAME}`,
         );
       }
     }
@@ -1058,16 +1055,10 @@ function checkToolchainPins({ ci, candidate, publish }, files, errors) {
   );
 }
 
-// The release orchestrator: the Node CLI entry and the state-machine modules
-// beside it, and the release contract and qualification CLIs the scan
-// workflow runs.
-export const ORCHESTRATOR_DIRECTORY = 'scripts/release/orchestrator';
-export const ORCHESTRATOR_ENTRY = `${ORCHESTRATOR_DIRECTORY}/cli.mjs`;
-export const ORCHESTRATOR_COMMAND = `node ${ORCHESTRATOR_ENTRY}`;
+// The release and build CLIs the candidate, qualification and publish
+// workflows run, and the trusted-checkout forms publish-assets runs.
 export const RELEASE_CONTRACT_COMMAND = 'node scripts/release/contract.mjs';
 export const RELEASE_QUALIFICATION_COMMAND = 'node scripts/release/qualification.mjs';
-// The other release and build CLIs the candidate, qualification and publish
-// workflows run, and the trusted-checkout forms publish-assets runs.
 export const RELEASE_MANIFEST_MODULE = 'scripts/release/manifest.mjs';
 export const RELEASE_MANIFEST_COMMAND = `node ${RELEASE_MANIFEST_MODULE}`;
 export const PUBLICATION_STATE_COMMAND = 'node scripts/release/publication_state.mjs';
@@ -1079,67 +1070,6 @@ export const POLICY_PUBLICATION_STATE_COMMAND = 'node publication-policy/scripts
 export const EXTRACT_ARTIFACT_COMMAND = `${RELEASE_QUALIFICATION_COMMAND} extract-artifact`;
 // qualify runs the candidate's own harness, from its checkout.
 export const QUALIFY_COMMAND = 'node candidate-source/scripts/release/qualification.mjs qualify';
-// The shared release modules the orchestrator imports. They have their own
-// contracts, so their text is not part of the orchestrator source; any other
-// relative import would hide code from the checks and is rejected.
-export const SHARED_RELEASE_MODULES = Object.freeze([
-  'archive', 'cli', 'contract', 'json', 'manifest', 'publication_state', 'python_compat', 'qualification',
-].map((name) => `scripts/release/${name}.mjs`));
-
-/**
- * Returns the orchestrator source as { path: text }: the entry, then every
- * module it reaches through relative imports, by path. `files` maps each
- * scripts/release/orchestrator/*.mjs path to its text. A module the entry
- * does not reach, an import of a missing module, a relative import outside
- * the orchestrator and SHARED_RELEASE_MODULES, or an import whose target is
- * not a string literal is an error, so a check can neither silently widen nor
- * narrow.
- */
-export function orchestratorModules(files, errors) {
-  if (!has(files, ORCHESTRATOR_ENTRY)) {
-    errors.push(`${ORCHESTRATOR_ENTRY} is missing`);
-    return {};
-  }
-  const reached = new Set([ORCHESTRATOR_ENTRY]);
-  const pending = [ORCHESTRATOR_ENTRY];
-  while (pending.length > 0) {
-    const from = pending.pop();
-    const text = String(files[from]);
-    if (/\bimport\s*\(\s*(?!['"`][^'"`$]*['"`]\s*\))/.test(text)) {
-      errors.push(`${from} has an import() whose target is not a string literal, so the orchestrator source cannot be resolved`);
-    }
-    // Only node: builtins and relative modules, never a package, a subpath
-    // import, an absolute path or URL, or CommonJS loading, which would all
-    // load code this walk never reads.
-    for (const [, , specifier] of text.matchAll(IMPORT_SPECIFIER)) {
-      if (!/^(?:node:|\.\.?\/)/.test(specifier)) {
-        errors.push(`${from} imports ${specifier}; the orchestrator may import only node: builtins and relative modules`);
-      }
-    }
-    if (/\bcreateRequire\b|(?<![\w$.])require\s*\(/.test(text)) {
-      errors.push(`${from} loads modules through require, which the orchestrator import walk cannot follow`);
-    }
-    for (const target of relativeImports(from, text)) {
-      if (path.posix.dirname(target) === ORCHESTRATOR_DIRECTORY) {
-        if (!has(files, target)) {
-          errors.push(`${from} imports ${target}, which does not exist`);
-        } else if (!reached.has(target)) {
-          reached.add(target);
-          pending.push(target);
-        }
-      } else if (!SHARED_RELEASE_MODULES.includes(target)) {
-        errors.push(`${from} imports ${target}, which is neither a module in ${ORCHESTRATOR_DIRECTORY} nor a shared release module`);
-      }
-    }
-  }
-  const unreached = Object.keys(files).filter((relativePath) => !reached.has(relativePath)).sort();
-  if (unreached.length > 0) {
-    errors.push(`${ORCHESTRATOR_ENTRY} must reach every ${ORCHESTRATOR_DIRECTORY}/*.mjs module through its imports; unreached: ${unreached.join(', ')}`);
-  }
-  const modules = [ORCHESTRATOR_ENTRY, ...[...reached].filter((relativePath) => relativePath !== ORCHESTRATOR_ENTRY).sort()];
-  return Object.fromEntries(modules.map((relativePath) => [relativePath, files[relativePath]]));
-}
-
 const NODE_COMMAND = /(?:^|[\s;&|(`$])node\s/;
 const PACKAGE_COMMAND = /\b(?:npm|pnpm|yarn|npx|pip3?|corepack)\b/;
 
@@ -1191,158 +1121,6 @@ export function checkNodeSetup({ ci, candidate, qualification, publish }, errors
   const unlisted = PRIVILEGED_PUBLISH_JOBS.filter((name) => !has(publish.jobs, name));
   if (unlisted.length > 0) errors.push(`${publish.path} has no job ${unlisted.join(', ')}; update PRIVILEGED_PUBLISH_JOBS`);
 }
-
-// Row 53: the dispatch booleans the orchestrator may never write as a literal
-// 'true'. Each JavaScript spelling is matched: a property (`{ key: 'true' }`,
-// `"key": "true"`), an assignment (`inputs.key = 'true'`,
-// `inputs['key'] = 'true'`) and a Map entry or set (`['key', 'true']`,
-// `.set('key', 'true')`), with any quote.
-export const LIVE_PROOF_DISPATCH_BOOLEANS = ['assets_immutable_releases_enabled', 'publish_approved'];
-// The one sanctioned literal: in the driver, the approval is asserted only on
-// the statement right after the live publication-environment proof. Both
-// statements must open their own lines, so a commented-out or conditional
-// proof does not sanction the assignment.
-export const SANCTIONED_APPROVAL_MODULE = 'scripts/release/orchestrator/driver.mjs';
-export const SANCTIONED_APPROVAL = /^[ \t]*requirePublicationEnvironment\(gateway\);[ \t]*\r?\n[ \t]*inputs\.publish_approved = 'true';/gm;
-
-export function literalDispatchBooleans(source, { sanctioned = false } = {}) {
-  const text = sanctioned ? String(source).replace(SANCTIONED_APPROVAL, '') : String(source);
-  const found = [];
-  for (const key of LIVE_PROOF_DISPATCH_BOOLEANS) {
-    // The key, bare or quoted, then the literal 'true' in any quote.
-    const quotedKey = String.raw`(?:${key}\b|(['"\x60])${key}\1)`;
-    const literalTrue = String.raw`(['"\x60])true\2`;
-    const spellings = [
-      // A property: { key: 'true' } or "key": "true".
-      new RegExp(String.raw`(?<![\w$.])${quotedKey}\s*:\s*${literalTrue}`),
-      // An assignment: inputs.key = 'true' or inputs['key'] = 'true'.
-      new RegExp(String.raw`(?:\.\s*${key}\b|\[\s*(['"\x60])${key}\1\s*\])\s*=(?!=)\s*${literalTrue}`),
-      // A Map entry or Map.set: ['key', 'true'] or .set('key', 'true').
-      new RegExp(String.raw`(['"\x60])${key}\1\s*,\s*${literalTrue}`),
-    ];
-    for (const spelling of spellings) {
-      const match = spelling.exec(text);
-      if (match !== null) found.push(match[0].trim());
-    }
-  }
-  return found;
-}
-
-function checkOrchestration(autoUpdate, orchestratorSources, errors) {
-  const check = checker(errors);
-  // Row 49: provenance by immutable asset id, one credential used only inside
-  // the validated publication environment, dispatch only through the
-  // orchestrator, and development scans never publish.
-  check.includes(autoUpdate.path, autoUpdate.text, ['releases/assets/${asset_id}', "env.REQUESTED_CHANNEL != 'stable'"],
-    'download provenance by unique release-asset id and keep development scans scan-only');
-  check.excludes(autoUpdate.path, autoUpdate.text, [
-    'gh release view', 'gh release download', 'ORCHESTRATOR_DISPATCH_TOKEN',
-    'gh workflow run', 'create-pull-request', 'git push',
-  ], `fetch provenance only by asset id and dispatch only through ${ORCHESTRATOR_ENTRY}`);
-  // The native provenance is selected, resolved, scanned and validated by the
-  // Node orchestrator and release contract CLIs, and the deleted Python
-  // orchestrator is never named again. Commands are matched with shell line
-  // continuations joined.
-  const commands = shellCommands(autoUpdate.runText);
-  check.includes(autoUpdate.path, commands, [
-    `${ORCHESTRATOR_COMMAND} select-stable-native-backlog`,
-    `${ORCHESTRATOR_COMMAND} resolve-bridge-source`,
-    `${ORCHESTRATOR_COMMAND} scan-native`,
-    `${RELEASE_CONTRACT_COMMAND} resolve-tag-commit`,
-    `${RELEASE_CONTRACT_COMMAND} validate-native-release`,
-    '--native-tag-commit "${native_tag_commit}"',
-  ], 'select, resolve, scan and validate native provenance with the Node orchestrator and release contract CLIs');
-  check.excludes(autoUpdate.path, autoUpdate.text, ['stable_release_orchestrator.py', 'scripts/release_orchestrator_'],
-    'never run the deleted Python orchestrator');
-  check.require(
-    autoUpdate.patOutsideEnv.length === 0,
-    `${autoUpdate.path} must reference the publication PAT only in a step env value; found in ${autoUpdate.patOutsideEnv.join(', ')}`,
-  );
-  const patSteps = autoUpdate.steps.filter((step) => Object.values(step.env).some(containsPat));
-  check.require(
-    patSteps.length > 0
-      && patSteps.every((step) => step.env[PUBLICATION_PAT_NAME] === '${{ secrets.WEBGPU_BRIDGE_ASSETS_PAT }}'),
-    `${autoUpdate.path} must bind the publication PAT only as ${PUBLICATION_PAT_NAME}: \${{ secrets.WEBGPU_BRIDGE_ASSETS_PAT }}`,
-  );
-  for (const step of patSteps) {
-    const environment = autoUpdate.job(step.job).environment;
-    const environmentName = typeof environment === 'string' ? environment : mapping(environment).name;
-    const validated = autoUpdate.jobSteps(step.job).some((other) => other.index < step.index
-      && other.env.GH_TOKEN === '${{ github.token }}'
-      && environmentValidationMissing(shellCommands(other.run), RELEASE_CONTRACT_COMMAND).length === 0);
-    check.require(
-      environmentName === 'bridge-assets-publication' && validated,
-      `${autoUpdate.path} job ${step.job} may use the PAT only inside the bridge-assets-publication environment, after a github.token step validates that environment policy with ${RELEASE_CONTRACT_COMMAND} validate-environment`,
-    );
-    // The credential reaches only the orchestrator entry, which alone dispatches.
-    check.require(
-      shellCommands(step.run).includes(`${ORCHESTRATOR_COMMAND} orchestrate-backlog`),
-      `${autoUpdate.path} step ${step.job}/${step.name || step.index} may hand the PAT only to ${ORCHESTRATOR_COMMAND} orchestrate-backlog`,
-    );
-  }
-  // The release modules are zero-dependency: every job that runs one sets up
-  // Node.js 24 before its first node command, with no package cache, and the
-  // workflow never installs packages, so no dependency code runs beside the
-  // publication PAT.
-  for (const name of Object.keys(autoUpdate.jobs)) errors.push(...nodeSetupErrors(autoUpdate, name, { privileged: true }));
-  check.require(
-    !PACKAGE_COMMAND.test(autoUpdate.runText),
-    `${autoUpdate.path} must never install or run packages (npm, npx, pnpm, yarn, pip, corepack); the release modules are zero-dependency`,
-  );
-  // Rows 50-51: every job, and so every environment job, rejects a non-owner
-  // manual caller and an unsuccessful, non-default-branch or non-owner
-  // workflow_run before the environment exposes the credential.
-  const ownerManualGate = "github.event_name == 'workflow_dispatch' && github.actor == github.repository_owner && github.triggering_actor == github.repository_owner";
-  const ownerWorkflowRunGate = "github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success' && "
-    + 'github.event.workflow_run.head_branch == github.event.repository.default_branch && '
-    + 'github.event.workflow_run.actor.login == github.repository_owner && '
-    + 'github.event.workflow_run.triggering_actor.login == github.repository_owner';
-  const jobNames = Object.keys(autoUpdate.jobs);
-  check.require(
-    jobNames.length > 0 && jobNames.every((name) => {
-      const condition = normalizeSpace(autoUpdate.job(name).if);
-      return condition.includes(ownerManualGate) && condition.includes(ownerWorkflowRunGate);
-    }),
-    `${autoUpdate.path}: every job must gate manual runs and workflow_run continuations on the repository owner before the publication environment can expose its credential`,
-  );
-  const workflowRun = mapping(mapping(autoUpdate.data.on).workflow_run);
-  check.require(
-    sameList(sorted(Array.isArray(workflowRun.workflows) ? workflowRun.workflows : []),
-      ['Build Exact Bridge Candidate', 'Publish Exact Qualified Bridge Assets', 'Qualify Exact Bridge Candidate'])
-      && deepEqual(workflowRun.types, ['completed']),
-    `${autoUpdate.path} must listen only to completed runs of the three exact stage workflows`,
-  );
-  const proof = autoUpdate.steps.find((step) => step.name === 'Prove the exact workflow continuation before environment use');
-  check.require(
-    proof !== undefined
-      && autoUpdate.job(proof.job).environment === undefined
-      && jobNames.every((name) => autoUpdate.job(name).environment === undefined || autoUpdate.transitiveNeeds(name).has(proof.job))
-      && shellCommands(proof.run).includes(`${RELEASE_QUALIFICATION_COMMAND} verify-run`)
-      && proof.run.includes('--run-attempt 1')
-      && /\.github\/workflows\/bridge_candidate\.yml\)\s+artifact_name=exact-webgpu-bridge-dist\b/.test(proof.run)
-      && /\.github\/workflows\/bridge_qualification\.yml\)\s+artifact_name=qualification-attestation\b/.test(proof.run)
-      && /\.github\/workflows\/publish_assets\.yml\)\s+artifact_name=bridge-qualification-outcome\b/.test(proof.run),
-    `${autoUpdate.path} must prove a continuation's first attempt and exact stage artifact with ${RELEASE_QUALIFICATION_COMMAND} verify-run, in a job every environment job needs`,
-  );
-  // Row 53: the governance and approval booleans come only from live proofs.
-  check.require(
-    has(orchestratorSources, ORCHESTRATOR_ENTRY),
-    `the orchestrator source must start at ${ORCHESTRATOR_ENTRY}`,
-  );
-  for (const [relativePath, source] of Object.entries(orchestratorSources)) {
-    const literals = literalDispatchBooleans(source, { sanctioned: relativePath === SANCTIONED_APPROVAL_MODULE });
-    check.require(
-      literals.length === 0,
-      `${relativePath} must derive the governance and approval booleans only from live proofs, never a literal; found: ${quoteAll(literals)}`,
-    );
-  }
-  check.require(
-    (String(orchestratorSources[SANCTIONED_APPROVAL_MODULE] ?? '').match(SANCTIONED_APPROVAL) ?? []).length === 1,
-    `${SANCTIONED_APPROVAL_MODULE} must assert publish_approved exactly once, on the statement right after requirePublicationEnvironment(gateway)`,
-  );
-}
-
-export { checkOrchestration };
 
 function checkPublication({ publish, candidate }, errors) {
   const check = checker(errors);
@@ -1470,17 +1248,21 @@ function checkPublication({ publish, candidate }, errors) {
         && step.env.NATIVE_TAG_COMMIT === '${{ steps.native_tag.outputs.native_tag_commit }}'),
     `${publish.path} must resolve the upstream and native tag commits itself and check the manifest against the resolved native tag commit (steps.native_tag)`,
   );
-  const nativeRequest = runText.indexOf(`${RELEASE_CONTRACT_COMMAND} validate-native-request`);
-  const upstreamLookup = runText.indexOf('git ls-remote https://github.com/ggml-org/llama.cpp.git');
-  const nativeLookup = runText.indexOf('git ls-remote "https://github.com/${NATIVE_REPO}.git"');
-  const requestSpan = runText.slice(nativeRequest, nativeLookup);
-  check.require(
-    nativeRequest >= 0 && nativeRequest < upstreamLookup && upstreamLookup < nativeLookup
-      && requestSpan.includes('--native-release-tag "${NATIVE_RELEASE_TAG}"')
-      && requestSpan.includes('--upstream-commit "${UPSTREAM_COMMIT}"')
-      && requestSpan.includes('--manifest-sha256 "${NATIVE_MANIFEST_SHA256}"'),
-    `${publish.path} must validate native tag, upstream commit, and manifest SHA-256 inputs before the first native network request`,
-  );
+  // validate-native-request also rejects a development native release, so
+  // both workflows that take native inputs must run it.
+  for (const workflow of [publish, candidate]) {
+    const nativeRequest = workflow.runText.indexOf(`${RELEASE_CONTRACT_COMMAND} validate-native-request`);
+    const upstreamLookup = workflow.runText.indexOf('git ls-remote https://github.com/ggml-org/llama.cpp.git');
+    const nativeLookup = workflow.runText.indexOf('git ls-remote "https://github.com/${NATIVE_REPO}.git"');
+    const requestSpan = workflow.runText.slice(nativeRequest, nativeLookup);
+    check.require(
+      nativeRequest >= 0 && nativeRequest < upstreamLookup && upstreamLookup < nativeLookup
+        && requestSpan.includes('--native-release-tag "${NATIVE_RELEASE_TAG}"')
+        && requestSpan.includes('--upstream-commit "${UPSTREAM_COMMIT}"')
+        && requestSpan.includes('--manifest-sha256 "${NATIVE_MANIFEST_SHA256}"'),
+      `${workflow.path} must validate native tag, upstream commit, and manifest SHA-256 inputs before the first native network request`,
+    );
+  }
   // Row 76: preflight and recovery resolve existing asset tags strictly.
   for (const name of ['Verify source ancestry and classify exact remote state', 'Re-fetch and finish or safely classify partial publication']) {
     const step = publish.step('publish-assets', name);
@@ -1857,11 +1639,6 @@ export function collectErrors(overrides = {}) {
     'package.json', 'llama_cpp.version', 'emsdk.version', 'README.md', 'AGENTS.md', 'CONTRIBUTING.md',
     EMSCRIPTEN_VERIFIER, 'scripts/build/build_bridge.sh', RELEASE_MANIFEST_MODULE,
   ].map((relativePath) => [relativePath, read(relativePath)]));
-  const orchestratorSources = orchestratorModules(Object.fromEntries(
-    listRequired(ORCHESTRATOR_DIRECTORY, /\.mjs$/, errors)
-      .map((name) => `${ORCHESTRATOR_DIRECTORY}/${name}`)
-      .map((relativePath) => [relativePath, read(relativePath)]),
-  ), errors);
 
   const known = new Set(Object.values(WORKFLOWS));
   const allWorkflows = [
@@ -1886,7 +1663,6 @@ export function collectErrors(overrides = {}) {
   checkCiRunsContracts(workflows, testFiles, errors);
   checkNodeSetup(workflows, errors);
   checkToolchainPins(workflows, files, errors);
-  checkOrchestration(workflows.autoUpdate, orchestratorSources, errors);
   checkPublication(workflows, errors);
   checkCandidateAndQualification(workflows, errors);
   checkModelPins(files, workflows, errors);

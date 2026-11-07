@@ -24,7 +24,6 @@ import {
   requireCorrelationId,
   resolveNativeManifest,
   resolveTagCommit,
-  selectStableNativeRelease,
   validateCandidatePrequalification,
   validateGithubPrerelease,
   validateImmutableReleaseGovernance,
@@ -100,18 +99,6 @@ test('test_github_prerelease_matches_native_policy', () => {
   assert.equal(validateGithubPrerelease('v0.2.0-llamadart.1', true), true);
 });
 
-test('test_stable_native_discovery_enumerates_wrappers', () => {
-  const releases = [
-    { tag_name: 'b10599', draft: false, prerelease: true },
-    { tag_name: 'v0.2.0', draft: false, prerelease: false },
-    { tag_name: 'v0.2.0-2', draft: false, prerelease: true },
-    { tag_name: 'v0.3.0-1', draft: false, prerelease: false },
-    { tag_name: 'v9.0.0', draft: false, prerelease: true },
-    { tag_name: 'v9.0.0', draft: true, prerelease: false },
-  ];
-  assert.equal(selectStableNativeRelease(releases), 'v0.2.0-2');
-});
-
 // int() refuses more than 4300 digits with ValueError, which escapes the
 // contract uncaught, as it does in Python.
 const TOO_LONG = 'ValueError: Exceeds the limit (4300 digits) for integer string conversion: value has 4301 digits; use sys.set_int_max_str_digits() to increase the limit';
@@ -125,10 +112,6 @@ test('a tag component over 4300 digits raises int()\'s ValueError, never passes'
   assert.throws(() => parseReleaseTag(`v1.0.0-llamadart.${ones}`, { allowLegacy: true }), tooLong);
   assert.throws(() => parseUpstreamTag(`v${ones}.0.0`), tooLong);
   assert.throws(() => parseUpstreamTag(`b${ones}`), tooLong);
-  assert.throws(() => selectStableNativeRelease([
-    { tag_name: 'v0.2.0', draft: false, prerelease: false },
-    { tag_name: `v${ones}.0.0`, draft: false, prerelease: false },
-  ]), tooLong);
   const result = runCli(['validate-release', '--release-tag', `v${ones}.0.0`, '--release-rebuild', '0', '--upstream-tag', 'v1.0.0']);
   assert.deepEqual(result, { returncode: 1, stdout: '', stderr: `Traceback (most recent call last):\n${TOO_LONG}\n` });
 });
@@ -307,7 +290,13 @@ test('test_native_request_is_validated_before_network_use', () => {
     '2e5d29d7f98f0d71e75d3fa63b7c55f3b2a7933247cc34ea2b1c5e053d142452',
   );
   assert.equal(accepted.baseTag, 'v0.2.0');
+  for (const nativeTag of ['v0.8.0', 'v0.8.0-3']) {
+    assert.equal(validateNativeRequest(nativeTag, 'v0.8.0', 'a'.repeat(40), 'b'.repeat(64)).channel, Channel.STABLE, nativeTag);
+  }
   for (const [label, nativeTag, upstreamTag, upstreamCommit, manifestSha256] of [
+    ['development-tag', 'b10514', 'b10514', 'a'.repeat(40), 'b'.repeat(64)],
+    ['development-rebuild', 'b10514-2', 'b10514', 'a'.repeat(40), 'b'.repeat(64)],
+    ['legacy-wrapper', 'v0.2.0-llamadart.1', 'v0.2.0', 'a'.repeat(40), 'b'.repeat(64)],
     ['malformed-tag', 'v0.2.0-rc.1', 'v0.2.0', 'a'.repeat(40), 'b'.repeat(64)],
     ['wrong-upstream', 'v0.2.0-1', 'v0.2.1', 'a'.repeat(40), 'b'.repeat(64)],
     ['malformed-upstream', 'v0.2.0-1', 'main', 'a'.repeat(40), 'b'.repeat(64)],
@@ -315,6 +304,19 @@ test('test_native_request_is_validated_before_network_use', () => {
     ['malformed-sha256', 'v0.2.0-1', 'v0.2.0', 'a'.repeat(40), 'B'.repeat(64)],
   ]) {
     assert.throws(() => validateNativeRequest(nativeTag, upstreamTag, upstreamCommit, manifestSha256), ContractError, label);
+  }
+});
+
+test('validate-native-request rejects a development native release by name', () => {
+  for (const tag of ['b10514', 'b10514-2']) {
+    assert.deepEqual(runCli([
+      'validate-native-request', '--native-release-tag', tag, '--upstream-tag', 'b10514',
+      '--upstream-commit', 'a'.repeat(40), '--manifest-sha256', 'b'.repeat(64),
+    ]), {
+      returncode: 1,
+      stdout: '',
+      stderr: `error: native release tag '${tag}' is not a stable release; use vMAJOR.MINOR.PATCH or vMAJOR.MINOR.PATCH-N\n`,
+    }, tag);
   }
 });
 

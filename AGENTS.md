@@ -105,38 +105,14 @@ GGUFs or smoke artifacts.
     `bridge-candidate-prequalification`. Confirm the assertion first with
     `gh api repos/leehack/llama-web-bridge-assets/immutable-releases`.
 - Automated qualification: `.github/workflows/bridge_qualification.yml`
-  - Owner-dispatched by the orchestrator with the exact candidate run ID and
+  - Owner-dispatched with the exact candidate run ID and the candidate's
     correlation ID; no maintainer-supplied attestation input exists. It uploads
     one `qualification-attestation` artifact using repository access and no
     PAT.
-- Orchestrator: `.github/workflows/auto_llama_cpp_update.yml`
-  - A candidate run reserves its output tag for other pipelines unless its
-    correlation names another governed build identity and none of that
-    correlation's candidate, qualification or publication runs is in flight.
-  - The resolver uses full default-branch history to keep the exact source SHA
-    that executes a new candidate separate from the newest first-parent commit
-    that changed governed runtime/build inputs. `AGENTS.md`, `README.md`, and
-    `CONTRIBUTING.md` are in `ORCHESTRATION_ONLY_PATHS` and `docs/` in
-    `ORCHESTRATION_ONLY_PREFIXES` in `scripts/release/orchestrator/cli.mjs`,
-    so docs-only commits never advance the build identity; every unclassified
-    new path is governed by default.
-  - Every dispatch sends exactly the target workflow's declared
-    `workflow_dispatch` inputs (`requireExactDispatchInputs`) at the exact
-    default-branch `--ref` after a live `immutable-releases` governance read;
-    duplicate in-flight or successful runs for one stage fail closed, and a
-    run-name readback follows each dispatch.
-  - Run recovery accepts only an exact supported workflow path plus its
-    deterministic `display_title`, owner actor/triggering actor, first attempt,
-    repository, and branch. GitHub exposes a workflow's rendered `run-name` in
-    the run record's `name` field, so that field is not treated as the static
-    workflow identity. A search at GitHub's 1,000-result cap is split into
-    closed time windows; a saturated one-second window or ambiguous result
-    fails closed.
-  - The dispatch job reuses the `bridge-assets-publication` environment and its
-    `WEBGPU_BRIDGE_ASSETS_PAT`, which must identify the repository owner, read
-    assets immutable-release governance, and hold Actions write permission on
-    `leehack/llama-web-bridge`. The orchestrator proves the owner identity and
-    the governance read live and fails closed if either is absent.
+- Releases are manual: the owner dispatches candidate, qualification, then
+  publish, with the inputs in
+  [CONTRIBUTING.md](CONTRIBUTING.md#publish-process). No workflow dispatches
+  another, so each stage must verify every input it consumes on its own.
 - CI reliability contract: `scripts/ci/verify_ci_reliability.mjs`
   - Checks publication-safety invariants, not wording: it parses the workflows
     with `yaml` and reads commands from resolved `run` scripts. It covers
@@ -178,7 +154,7 @@ GGUFs or smoke artifacts.
     `immutable-publication-unverified` outcome; publication never deletes,
     retags, overwrites, or otherwise repairs the release.
 
-### Immutable Automation Baseline
+### Immutable Release Baseline
 
 The historical `v0.1.38` release is not repaired or reused. The verified
 immutable baseline is:
@@ -187,11 +163,6 @@ immutable baseline is:
 - `release_rebuild`: `0`
 - `orchestrator_correlation_id`: `kanban:t_7f112b91:web-v0.1.39`
 - `assets_immutable_releases_enabled`: `true`
-
-Daily backlog selection starts after native `v0.2.0-1`, published at
-`2026-08-25T08:57:12Z`. A scan starts a new candidate only for the newest
-scanned stable native release; each candidate gets its own exact
-`candidate_run_id`/`attestation_run_id` pair.
 
 ## Change Boundaries
 
@@ -214,14 +185,6 @@ scanned stable native release; each candidate gets its own exact
   `scripts/ci/verify_ci_reliability.mjs` fails on a Python interpreter or
   package tool, a `*.py` script, a python shell, a Python image, or a
   `setup-python`/`setup-uv` step.
-- `scripts/release/orchestrator/cli.mjs` is the orchestrator's CLI entry; the
-  state machine lives in the `scripts/release/orchestrator/<concern>.mjs`
-  modules it imports, tested by `tests/release/orchestrator/<concern>_test.mjs`
-  suites that share `tests/release/orchestrator/fixtures.mjs`. List a new module
-  in `ORCHESTRATION_ONLY_PATHS` in `cli.mjs` and in `TOOLING` in
-  `scripts/ci/ci_scope.mjs`; `scripts/ci/verify_ci_reliability.mjs` fails on a module
-  `cli.mjs` does not import. The deleted Python orchestrator's paths stay in
-  both lists.
 - Keep publishing logic in workflow only.
 - Do not edit assets repository files from here outside publish flow.
 - C++ exception catching is enabled only for the functions listed in
