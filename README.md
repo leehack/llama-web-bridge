@@ -442,7 +442,9 @@ each PAT-bearing step fails closed unless the credential is non-empty and does
 not print its value. Missing or weakened bypass, branch, credential, or PAT
 guard protection therefore fails closed.
 
-The workflow verifies that bridge source is already merged, all upstream/native
+The candidate and publish workflows accept only a stable native release
+(`vMAJOR.MINOR.PATCH` or `vMAJOR.MINOR.PATCH-N`), never a development `bNNNN`
+one. The workflow verifies that bridge source is already merged, all upstream/native
 tag and commit identities match, the native manifest checksum matches, and the
 new release advances its own channel history without collision or rollback.
 Stable releases compare only with stable history; development releases and

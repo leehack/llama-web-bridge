@@ -631,6 +631,8 @@ assertRejected(validatePublicationPatContract('jobs: [unterminated', EXPECTED_ST
     // Rows 73-76: exact provenance.
     [PUBLISH_PATH, 'node scripts/release/contract.mjs resolve-tag-commit', 'python3 scripts/release_contract.py resolve-tag-commit',
       'must resolve the upstream and native tag commits itself', { once: true }],
+    [CANDIDATE_PATH, 'node scripts/release/contract.mjs validate-native-request', 'true',
+      `${CANDIDATE_PATH} must validate native tag, upstream commit, and manifest SHA-256 inputs before the first native network request`],
     [PUBLISH_PATH, 'node scripts/release/contract.mjs validate-native-request', 'python3 scripts/release_contract.py validate-native-request',
       'must validate native tag, upstream commit, and manifest SHA-256 inputs before the first native network request'],
     [PUBLISH_PATH, 'node scripts/release/contract.mjs validate-native-release', 'python3 scripts/release_contract.py validate-native-release',

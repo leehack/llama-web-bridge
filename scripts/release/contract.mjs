@@ -360,8 +360,15 @@ export function validateNativeIdentity(nativeReleaseTag, rebuild, upstreamTag) {
 }
 
 // Validate native release inputs before using them in network requests.
+// The candidate and publish requests: bridge assets are built only from a
+// stable native release, never a development (bNNNN) one.
 export function validateNativeRequest(nativeReleaseTag, upstreamTag, upstreamCommit, manifestSha256) {
   const nativeRelease = parseReleaseTag(nativeReleaseTag);
+  if (nativeRelease.channel !== Channel.STABLE) {
+    throw new ContractError(
+      `native release tag ${pyRepr(nativeReleaseTag)} is not a stable release; use vMAJOR.MINOR.PATCH or vMAJOR.MINOR.PATCH-N`,
+    );
+  }
   validateNativeIdentity(nativeReleaseTag, nativeRelease.rebuild, upstreamTag);
   requireCommit(upstreamCommit, 'upstream_commit');
   requireSha256(manifestSha256, 'native_manifest_sha256');

@@ -441,8 +441,9 @@ starting alphanumeric, such as `manual-v0.1.83`. The input keeps its historical
 name `orchestrator_correlation_id` because published manifests and release
 notes record it.
 
-Gather the inputs. Use the newest stable `llamadart-native` release: no stage
-checks that native releases are published in order.
+Gather the inputs. Use the newest stable `llamadart-native` release: the
+candidate and publish workflows reject a development (`bNNNN`) native tag, but
+nothing checks that native releases are published in order.
 
 ```bash
 NATIVE_TAG=v0.8.0-1

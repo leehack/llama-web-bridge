@@ -290,7 +290,13 @@ test('test_native_request_is_validated_before_network_use', () => {
     '2e5d29d7f98f0d71e75d3fa63b7c55f3b2a7933247cc34ea2b1c5e053d142452',
   );
   assert.equal(accepted.baseTag, 'v0.2.0');
+  for (const nativeTag of ['v0.8.0', 'v0.8.0-3']) {
+    assert.equal(validateNativeRequest(nativeTag, 'v0.8.0', 'a'.repeat(40), 'b'.repeat(64)).channel, Channel.STABLE, nativeTag);
+  }
   for (const [label, nativeTag, upstreamTag, upstreamCommit, manifestSha256] of [
+    ['development-tag', 'b10514', 'b10514', 'a'.repeat(40), 'b'.repeat(64)],
+    ['development-rebuild', 'b10514-2', 'b10514', 'a'.repeat(40), 'b'.repeat(64)],
+    ['legacy-wrapper', 'v0.2.0-llamadart.1', 'v0.2.0', 'a'.repeat(40), 'b'.repeat(64)],
     ['malformed-tag', 'v0.2.0-rc.1', 'v0.2.0', 'a'.repeat(40), 'b'.repeat(64)],
     ['wrong-upstream', 'v0.2.0-1', 'v0.2.1', 'a'.repeat(40), 'b'.repeat(64)],
     ['malformed-upstream', 'v0.2.0-1', 'main', 'a'.repeat(40), 'b'.repeat(64)],
@@ -298,6 +304,19 @@ test('test_native_request_is_validated_before_network_use', () => {
     ['malformed-sha256', 'v0.2.0-1', 'v0.2.0', 'a'.repeat(40), 'B'.repeat(64)],
   ]) {
     assert.throws(() => validateNativeRequest(nativeTag, upstreamTag, upstreamCommit, manifestSha256), ContractError, label);
+  }
+});
+
+test('validate-native-request rejects a development native release by name', () => {
+  for (const tag of ['b10514', 'b10514-2']) {
+    assert.deepEqual(runCli([
+      'validate-native-request', '--native-release-tag', tag, '--upstream-tag', 'b10514',
+      '--upstream-commit', 'a'.repeat(40), '--manifest-sha256', 'b'.repeat(64),
+    ]), {
+      returncode: 1,
+      stdout: '',
+      stderr: `error: native release tag '${tag}' is not a stable release; use vMAJOR.MINOR.PATCH or vMAJOR.MINOR.PATCH-N\n`,
+    }, tag);
   }
 });
 

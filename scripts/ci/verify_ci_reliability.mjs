@@ -1248,17 +1248,21 @@ function checkPublication({ publish, candidate }, errors) {
         && step.env.NATIVE_TAG_COMMIT === '${{ steps.native_tag.outputs.native_tag_commit }}'),
     `${publish.path} must resolve the upstream and native tag commits itself and check the manifest against the resolved native tag commit (steps.native_tag)`,
   );
-  const nativeRequest = runText.indexOf(`${RELEASE_CONTRACT_COMMAND} validate-native-request`);
-  const upstreamLookup = runText.indexOf('git ls-remote https://github.com/ggml-org/llama.cpp.git');
-  const nativeLookup = runText.indexOf('git ls-remote "https://github.com/${NATIVE_REPO}.git"');
-  const requestSpan = runText.slice(nativeRequest, nativeLookup);
-  check.require(
-    nativeRequest >= 0 && nativeRequest < upstreamLookup && upstreamLookup < nativeLookup
-      && requestSpan.includes('--native-release-tag "${NATIVE_RELEASE_TAG}"')
-      && requestSpan.includes('--upstream-commit "${UPSTREAM_COMMIT}"')
-      && requestSpan.includes('--manifest-sha256 "${NATIVE_MANIFEST_SHA256}"'),
-    `${publish.path} must validate native tag, upstream commit, and manifest SHA-256 inputs before the first native network request`,
-  );
+  // validate-native-request also rejects a development native release, so
+  // both workflows that take native inputs must run it.
+  for (const workflow of [publish, candidate]) {
+    const nativeRequest = workflow.runText.indexOf(`${RELEASE_CONTRACT_COMMAND} validate-native-request`);
+    const upstreamLookup = workflow.runText.indexOf('git ls-remote https://github.com/ggml-org/llama.cpp.git');
+    const nativeLookup = workflow.runText.indexOf('git ls-remote "https://github.com/${NATIVE_REPO}.git"');
+    const requestSpan = workflow.runText.slice(nativeRequest, nativeLookup);
+    check.require(
+      nativeRequest >= 0 && nativeRequest < upstreamLookup && upstreamLookup < nativeLookup
+        && requestSpan.includes('--native-release-tag "${NATIVE_RELEASE_TAG}"')
+        && requestSpan.includes('--upstream-commit "${UPSTREAM_COMMIT}"')
+        && requestSpan.includes('--manifest-sha256 "${NATIVE_MANIFEST_SHA256}"'),
+      `${workflow.path} must validate native tag, upstream commit, and manifest SHA-256 inputs before the first native network request`,
+    );
+  }
   // Row 76: preflight and recovery resolve existing asset tags strictly.
   for (const name of ['Verify source ancestry and classify exact remote state', 'Re-fetch and finish or safely classify partial publication']) {
     const step = publish.step('publish-assets', name);
