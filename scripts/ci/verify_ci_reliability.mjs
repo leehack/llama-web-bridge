@@ -1289,40 +1289,17 @@ function checkOrchestration(autoUpdate, orchestratorSources, errors) {
     !PACKAGE_COMMAND.test(autoUpdate.runText),
     `${autoUpdate.path} must never install or run packages (npm, npx, pnpm, yarn, pip, corepack); the release modules are zero-dependency`,
   );
-  // Rows 50-51: every job, and so every environment job, rejects a non-owner
-  // manual caller and an unsuccessful, non-default-branch or non-owner
-  // workflow_run before the environment exposes the credential.
+  // Rows 50-51: the scan is manual-only, and every job rejects a non-owner
+  // caller before the environment exposes the credential.
   const ownerManualGate = "github.event_name == 'workflow_dispatch' && github.actor == github.repository_owner && github.triggering_actor == github.repository_owner";
-  const ownerWorkflowRunGate = "github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success' && "
-    + 'github.event.workflow_run.head_branch == github.event.repository.default_branch && '
-    + 'github.event.workflow_run.actor.login == github.repository_owner && '
-    + 'github.event.workflow_run.triggering_actor.login == github.repository_owner';
   const jobNames = Object.keys(autoUpdate.jobs);
   check.require(
-    jobNames.length > 0 && jobNames.every((name) => {
-      const condition = normalizeSpace(autoUpdate.job(name).if);
-      return condition.includes(ownerManualGate) && condition.includes(ownerWorkflowRunGate);
-    }),
-    `${autoUpdate.path}: every job must gate manual runs and workflow_run continuations on the repository owner before the publication environment can expose its credential`,
+    jobNames.length > 0 && jobNames.every((name) => normalizeSpace(autoUpdate.job(name).if).includes(ownerManualGate)),
+    `${autoUpdate.path}: every job must gate manual runs on the repository owner before the publication environment can expose its credential`,
   );
-  const workflowRun = mapping(mapping(autoUpdate.data.on).workflow_run);
   check.require(
-    sameList(sorted(Array.isArray(workflowRun.workflows) ? workflowRun.workflows : []),
-      ['Build Exact Bridge Candidate', 'Publish Exact Qualified Bridge Assets', 'Qualify Exact Bridge Candidate'])
-      && deepEqual(workflowRun.types, ['completed']),
-    `${autoUpdate.path} must listen only to completed runs of the three exact stage workflows`,
-  );
-  const proof = autoUpdate.steps.find((step) => step.name === 'Prove the exact workflow continuation before environment use');
-  check.require(
-    proof !== undefined
-      && autoUpdate.job(proof.job).environment === undefined
-      && jobNames.every((name) => autoUpdate.job(name).environment === undefined || autoUpdate.transitiveNeeds(name).has(proof.job))
-      && shellCommands(proof.run).includes(`${RELEASE_QUALIFICATION_COMMAND} verify-run`)
-      && proof.run.includes('--run-attempt 1')
-      && /\.github\/workflows\/bridge_candidate\.yml\)\s+artifact_name=exact-webgpu-bridge-dist\b/.test(proof.run)
-      && /\.github\/workflows\/bridge_qualification\.yml\)\s+artifact_name=qualification-attestation\b/.test(proof.run)
-      && /\.github\/workflows\/publish_assets\.yml\)\s+artifact_name=bridge-qualification-outcome\b/.test(proof.run),
-    `${autoUpdate.path} must prove a continuation's first attempt and exact stage artifact with ${RELEASE_QUALIFICATION_COMMAND} verify-run, in a job every environment job needs`,
+    sameList(Object.keys(mapping(autoUpdate.data.on)), ['workflow_dispatch']),
+    `${autoUpdate.path} must be triggered only by workflow_dispatch (no schedule or workflow_run)`,
   );
   // Row 53: the governance and approval booleans come only from live proofs.
   check.require(

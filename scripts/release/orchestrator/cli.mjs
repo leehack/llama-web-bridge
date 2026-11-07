@@ -1,13 +1,12 @@
 #!/usr/bin/env node
-// Artifact-driven automatic stable Web bridge release state machine: the CLI
+// Artifact-driven stable Web bridge release state machine: the CLI
 // entry that .github/workflows/auto_llama_cpp_update.yml runs. It replaced
 // the Python scripts/stable_release_orchestrator.py.
 //
-// Each event-driven scan resolves every stable native release after the
+// Each manually dispatched scan resolves every stable native release after the
 // immutable automation baseline, then idempotently advances each three-stage
 // pipeline. A native release older than one a published asset release
-// already records is superseded, not rebuilt. A daily scheduled scan provides
-// repair fallback:
+// already records is superseded, not rebuilt:
 //
 // 1. Build Exact Bridge Candidate      (.github/workflows/bridge_candidate.yml)
 // 2. Qualify Exact Bridge Candidate    (.github/workflows/bridge_qualification.yml)
@@ -259,7 +258,7 @@ export function gitOutput(repository, ...args) {
 
 // Resolve HEAD and the newest first-parent governed build change.
 //
-// The scheduled checkout must have complete history. Walking first-parent
+// The scan checkout must have complete history. Walking first-parent
 // makes the selected build identity a commit on the exact default-branch
 // line, including merge commits that introduce governed files. `repository`
 // is a path string.
@@ -296,25 +295,15 @@ export function resolveBridgeSourceIdentity(repository, head = 'HEAD') {
 
 // Keep untrusted callers from turning the environment PAT into a deputy.
 //
-// Scheduled executions are authorized by the trusted default-branch workflow.
-// A workflow_run continuation and a manual dispatch additionally require both
-// GitHub actor identities to be the repository owner before any
-// environment-scoped credential is used. A workflow_run event always executes
-// the default-branch workflow definition, so the continuation cannot be
-// redefined from a pull request or a fork.
+// A manual dispatch requires both GitHub actor identities to be the
+// repository owner before any environment-scoped credential is used.
 export function requireOrchestrationCaller(eventName, actor, triggeringActor) {
-  if (eventName === 'schedule') return;
-  if (
-    (eventName === 'workflow_dispatch' || eventName === 'workflow_run')
-    && actor === REPOSITORY_OWNER
-    && triggeringActor === REPOSITORY_OWNER
-  ) {
+  if (eventName === 'workflow_dispatch' && actor === REPOSITORY_OWNER && triggeringActor === REPOSITORY_OWNER) {
     return;
   }
   throw new ContractError(
-    'stable orchestration requires a schedule event, or an owner-initiated '
-    + 'workflow_dispatch or workflow_run continuation with owner actor and '
-    + 'triggering_actor',
+    'stable orchestration requires an owner-initiated workflow_dispatch with '
+    + 'owner actor and triggering_actor',
   );
 }
 

@@ -24,7 +24,7 @@ import {
 } from '../../../scripts/release/qualification.mjs';
 import { releaseAttestation } from '../contract_fixtures.mjs';
 import {
-  ADVANCED_BRIDGE_SHA, ASSETS_TAG_COMMIT, BRIDGE_SHA, CANDIDATE_ARTIFACT_ID, CANDIDATE_RUN_ID, DEFAULT_BRANCH, FakeGateway,
+  ADVANCED_BRIDGE_SHA, ASSETS_TAG_COMMIT, OWNER, BRIDGE_SHA, CANDIDATE_ARTIFACT_ID, CANDIDATE_RUN_ID, DEFAULT_BRANCH, FakeGateway,
   HEAD_SHA, LEGACY_BRIDGE_SHA, LEGACY_CANDIDATE_RUN_ID, LEGACY_MANUAL_QUALIFICATION_GATES, LEGACY_MANUAL_UNPROVEN_CAPABILITIES,
   LEGACY_NATIVE_COMMIT, LEGACY_NATIVE_MANIFEST_SHA, LEGACY_UPSTREAM_COMMIT, QUALIFICATION_ARTIFACT_ID, QUALIFICATION_RUN_ID,
   alignedReleaseStub, artifactInventory, assetReleaseStub, directoryMembers, flatZip, makeLegacyV0140Provenance,
@@ -195,9 +195,9 @@ test('test_later_qualified_provenance_waits_for_earlier_immutable_publication', 
     ], {
       env: {
         ...process.env,
-        GITHUB_EVENT_NAME: 'schedule',
-        GITHUB_ACTOR: 'github-actions',
-        GITHUB_TRIGGERING_ACTOR: 'github-actions',
+        GITHUB_EVENT_NAME: 'workflow_dispatch',
+        GITHUB_ACTOR: OWNER,
+        GITHUB_TRIGGERING_ACTOR: OWNER,
       },
       createGateway: () => gateway,
       stdout: () => {},

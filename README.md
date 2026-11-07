@@ -384,22 +384,23 @@ Trigger modes:
 - The bridge-owned orchestrator dispatches candidate build, automated
   qualification, and publication through GitHub's API using the repository
   owner's existing authorized identity; owner checks reject other dispatch
-  actors. A successful candidate, qualification, or publication run triggers an
-  immediate idempotent continuation scan. The daily schedule performs initial
-  native-release discovery and repairs missed or delayed event delivery. The
-  stage workflows are deliberately not reusable
+  actors. The orchestrator runs only when the owner manually dispatches
+  `auto_llama_cpp_update.yml`; each dispatch idempotently advances every
+  eligible pipeline by one stage. Maintainers may instead dispatch the
+  candidate, qualification, and publication workflows themselves, in that
+  order. The stage workflows are deliberately not reusable
   because reusable job environments execute in the caller repository's context.
 
-The scheduled resolver keeps the current default-branch source SHA separate
+The resolver keeps the current default-branch source SHA separate
 from the newest main-line commit that changed governed runtime/build inputs.
 Non-build orchestration/qualification/publication/CI workflow, verification,
 test, and documentation-only commits therefore preserve verified pipeline
 state. The candidate workflow and any runtime/build input change create a new
 correlation and must produce a new automatically qualified candidate.
 
-There is no push, tag, or ordinary-CI publication trigger. The schedule and
-`workflow_run` events wake the orchestrator; only its exact `workflow_dispatch`
-calls start a build, qualification, or publication stage.
+There is no push, tag, schedule, `workflow_run`, or ordinary-CI publication
+trigger. Only manual `workflow_dispatch` calls, the orchestrator's exact ones
+included, start a scan, build, qualification, or publication stage.
 
 Immutable releases must already be enabled on `leehack/llama-web-bridge-assets`
 before a candidate is dispatched. `bridge_candidate.yml` requires

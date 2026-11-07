@@ -596,8 +596,6 @@ assertRejected(validatePublicationPatContract('jobs: [unterminated', EXPECTED_ST
 
   // Each command needle: the Python command it replaced is rejected.
   for (const [nodeCommand, pythonCommand, fragment] of [
-    [`${RELEASE_QUALIFICATION_COMMAND} verify-run`, 'python3 scripts/release_qualification.py verify-run',
-      `with ${RELEASE_QUALIFICATION_COMMAND} verify-run`],
     [`${RELEASE_CONTRACT_COMMAND} validate-environment`, 'python3 scripts/release_contract.py validate-environment',
       `with ${RELEASE_CONTRACT_COMMAND} validate-environment`],
     [`${RELEASE_CONTRACT_COMMAND} resolve-tag-commit`, 'python3 scripts/release_contract.py resolve-tag-commit',
@@ -622,6 +620,11 @@ assertRejected(validatePublicationPatContract('jobs: [unterminated', EXPECTED_ST
   'never run the deleted Python orchestrator');
   assertRejected(orchestrationErrors(`${workflowText}# scripts/release_orchestrator_driver.py\n`),
     'never run the deleted Python orchestrator');
+  // The scan is manual-only: an automatic trigger is rejected.
+  for (const trigger of ['schedule:\n    - cron: \'23 3 * * *\'', 'workflow_run:\n    workflows: [Build Exact Bridge Candidate]\n    types: [completed]']) {
+    assertRejected(orchestrationErrors(mutate('on:\n  workflow_dispatch:', `on:\n  ${trigger}\n  workflow_dispatch:`)),
+      'must be triggered only by workflow_dispatch');
+  }
   // Dispatch goes only through the orchestrator entry.
   assertRejected(orchestrationErrors(mutate('set -euo pipefail\n          dry_run_flag=()',
     'set -euo pipefail\n          gh workflow run bridge_candidate.yml\n          dry_run_flag=()')),
@@ -649,9 +652,9 @@ assertRejected(validatePublicationPatContract('jobs: [unterminated', EXPECTED_ST
   assertRejected(orchestrationErrors(mutate('node-version: 24', 'node-version: 22')), 'must set up Node.js 24');
   assertRejected(orchestrationErrors(mutate(setupNode, `${setupNode}          cache: npm\n`)), 'without a package cache');
   // Set up only after the first node command.
-  assertRejected(orchestrationErrors(mutate(`${setupNode}\n      - name: Prove the exact workflow continuation before environment use\n`,
-    '      - name: Prove the exact workflow continuation before environment use\n')
-    .replace('      - name: Resolve native-aligned candidate\n', `${setupNode}\n      - name: Resolve native-aligned candidate\n`)),
+  assertRejected(orchestrationErrors(mutate(`${setupNode}\n      - name: Resolve native-aligned candidate\n`,
+    '      - name: Resolve native-aligned candidate\n')
+    .replace('      - name: Report development scan without orchestrating\n', `${setupNode}\n      - name: Report development scan without orchestrating\n`)),
   'job prepare_release_candidate must set up Node.js 24 with actions/setup-node@v4 before its first node command');
   // Another major version could turn on package caching without a cache input.
   assertRejected(orchestrationErrors(mutate('actions/setup-node@v4', 'actions/setup-node@v5')), 'with actions/setup-node@v4');

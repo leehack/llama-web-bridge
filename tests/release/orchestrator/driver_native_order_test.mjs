@@ -23,7 +23,7 @@ import * as runNames from '../../../scripts/release/orchestrator/run_names.mjs';
 import * as workflowRuns from '../../../scripts/release/orchestrator/workflow_runs.mjs';
 import { ATTESTATION_ARTIFACT_NAME, CANDIDATE_ARTIFACT_NAME } from '../../../scripts/release/qualification.mjs';
 import {
-  ADVANCED_BRIDGE_SHA, BRIDGE_SHA, FakeGateway, alignedReleaseStub, artifactInventory, assetReleaseStub, directoryMembers,
+  ADVANCED_BRIDGE_SHA, BRIDGE_SHA, FakeGateway, OWNER, alignedReleaseStub, artifactInventory, assetReleaseStub, directoryMembers,
   flatZip, provenanceToDict, runPayload, runsResponse, withAdvancePipelineFixture, writeBridgeCandidate,
 } from './fixtures.mjs';
 import {
@@ -154,7 +154,7 @@ async function scanBacklog(self, gateway, provenances) {
     '--dry-run',
   ], {
     env: {
-      ...process.env, GITHUB_EVENT_NAME: 'schedule', GITHUB_ACTOR: 'github-actions', GITHUB_TRIGGERING_ACTOR: 'github-actions',
+      ...process.env, GITHUB_EVENT_NAME: 'workflow_dispatch', GITHUB_ACTOR: OWNER, GITHUB_TRIGGERING_ACTOR: OWNER,
     },
     createGateway: () => gateway,
     stdout: () => {},

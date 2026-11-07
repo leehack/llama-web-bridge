@@ -136,6 +136,6 @@ test('runBacklog drives an injected CLI entry', async () => {
     assert.equal(result, 0);
     assert.deepEqual(plan, { plans: ['v0.2.0', 'v0.2.1'] });
   }, { orchestrator })();
-  assert.deepEqual(calls, [['orchestrate-backlog', 'schedule', gateway]]);
+  assert.deepEqual(calls, [['orchestrate-backlog', 'workflow_dispatch', gateway]]);
   await assert.rejects(withAdvancePipelineFixture((self) => self.runBacklog(gateway, [])));
 });

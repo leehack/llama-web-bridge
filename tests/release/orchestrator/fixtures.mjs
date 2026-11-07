@@ -495,9 +495,9 @@ export class AdvancePipelineFixture {
     const outputPlan = path.join(this.tmp, 'orchestration-plan.json');
     const env = {
       ...process.env,
-      GITHUB_EVENT_NAME: 'schedule',
-      GITHUB_ACTOR: 'github-actions',
-      GITHUB_TRIGGERING_ACTOR: 'github-actions',
+      GITHUB_EVENT_NAME: 'workflow_dispatch',
+      GITHUB_ACTOR: OWNER,
+      GITHUB_TRIGGERING_ACTOR: OWNER,
     };
     const result = await orchestrator.main([
       'orchestrate-backlog',

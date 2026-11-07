@@ -188,7 +188,7 @@ immutable baseline is:
 - `orchestrator_correlation_id`: `kanban:t_7f112b91:web-v0.1.39`
 - `assets_immutable_releases_enabled`: `true`
 
-Daily backlog selection starts after native `v0.2.0-1`, published at
+Backlog selection starts after native `v0.2.0-1`, published at
 `2026-08-25T08:57:12Z`. A scan starts a new candidate only for the newest
 scanned stable native release; each candidate gets its own exact
 `candidate_run_id`/`attestation_run_id` pair.

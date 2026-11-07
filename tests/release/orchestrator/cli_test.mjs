@@ -289,21 +289,22 @@ test('test_path_contract_is_fail_closed_for_runtime_and_new_inputs', () => {
 
 const WORKFLOW = path.join(ROOT, '.github', 'workflows', 'auto_llama_cpp_update.yml');
 
-test('test_schedule_owner_manual_and_owner_continuation_are_authorized', () => {
-  sro.requireOrchestrationCaller('schedule', 'github-actions', 'github-actions');
+test('test_owner_manual_dispatch_is_authorized', () => {
   sro.requireOrchestrationCaller('workflow_dispatch', OWNER, OWNER);
-  sro.requireOrchestrationCaller('workflow_run', OWNER, OWNER);
 });
 
-test('test_non_owner_manual_or_continuation_is_rejected', () => {
-  for (const event of ['workflow_dispatch', 'workflow_run']) {
-    for (const [actor, triggeringActor] of [['collaborator', OWNER], [OWNER, 'collaborator']]) {
-      assert.throws(() => sro.requireOrchestrationCaller(event, actor, triggeringActor), ContractError, `${event} ${actor}`);
-    }
+test('test_non_owner_or_automatic_callers_are_rejected', () => {
+  for (const [event, actor, triggeringActor] of [
+    ['workflow_dispatch', 'collaborator', OWNER],
+    ['workflow_dispatch', OWNER, 'collaborator'],
+    ['schedule', 'github-actions', 'github-actions'],
+    ['workflow_run', OWNER, OWNER],
+  ]) {
+    assert.throws(() => sro.requireOrchestrationCaller(event, actor, triggeringActor), ContractError, `${event} ${actor}`);
   }
 });
 
-test('test_workflow_run_trigger_and_both_job_gates_are_exact', () => {
+test('test_manual_only_trigger_and_both_job_gates_are_exact', () => {
   const workflow = fs.readFileSync(WORKFLOW, 'utf8');
   const count = (needle) => workflow.split(needle).length - 1;
   assert.ok(workflow.includes('fetch-depth: 0'));
@@ -314,41 +315,10 @@ test('test_workflow_run_trigger_and_both_job_gates_are_exact', () => {
     + 'github.actor == github.repository_owner && '
     + 'github.triggering_actor == github.repository_owner'
   );
-  const continuationGate = (
-    "github.event_name == 'workflow_run' && "
-    + "github.event.workflow_run.conclusion == 'success' && "
-    + 'github.event.workflow_run.head_branch == '
-    + 'github.event.repository.default_branch && '
-    + 'github.event.workflow_run.actor.login == github.repository_owner && '
-    + 'github.event.workflow_run.triggering_actor.login == '
-    + 'github.repository_owner'
-  );
-  for (const trigger of [
-    '- Build Exact Bridge Candidate',
-    '- Qualify Exact Bridge Candidate',
-    '- Publish Exact Qualified Bridge Assets',
-    'types: [completed]',
-  ]) {
-    assert.ok(workflow.includes(trigger), trigger);
-  }
+  assert.ok(!workflow.includes('schedule:'));
+  assert.ok(!workflow.includes('workflow_run'));
   assert.equal(count(manualGate), 2);
-  assert.equal(count(continuationGate), 2);
   assert.ok(workflow.lastIndexOf(manualGate) < workflow.indexOf('environment:'));
-  assert.ok(workflow.lastIndexOf(continuationGate) < workflow.indexOf('environment:'));
-  const proof = 'Prove the exact workflow continuation before environment use';
-  assert.ok(workflow.includes(proof));
-  const marker = `      - name: ${proof}\n`;
-  const proofBlock = workflow.slice(workflow.indexOf(marker) + marker.length).split('\n      - name:')[0];
-  assert.ok(proofBlock.includes('node scripts/release/qualification.mjs verify-run'));
-  assert.ok(proofBlock.includes('--run-attempt 1'));
-  for (const exactMapping of [
-    '.github/workflows/bridge_candidate.yml)\n              artifact_name=exact-webgpu-bridge-dist',
-    '.github/workflows/bridge_qualification.yml)\n              artifact_name=qualification-attestation',
-    '.github/workflows/publish_assets.yml)\n              artifact_name=bridge-qualification-outcome',
-  ]) {
-    assert.ok(proofBlock.includes(exactMapping), exactMapping);
-  }
-  assert.ok(workflow.indexOf(proof) < workflow.indexOf('environment:'));
 });
 
 // --- Node only ------------------------------------------------------------------
@@ -446,8 +416,8 @@ test('the caller gate names the accepted callers', () => {
   assert.throws(
     () => sro.requireOrchestrationCaller('push', OWNER, OWNER),
     new ContractError(
-      'stable orchestration requires a schedule event, or an owner-initiated '
-      + 'workflow_dispatch or workflow_run continuation with owner actor and triggering_actor',
+      'stable orchestration requires an owner-initiated workflow_dispatch with '
+      + 'owner actor and triggering_actor',
     ),
   );
 });
@@ -503,7 +473,7 @@ test('runMain reports errors as the Python entry does', () => {
   };
   const denied = run(['orchestrate', '--provenance-json', 'p', '--workspace', 'w'], { GITHUB_EVENT_NAME: 'push' });
   assert.equal(denied.status, 1);
-  assert.match(denied.stderr, /^error: stable orchestration requires a schedule event/u);
+  assert.match(denied.stderr, /^error: stable orchestration requires an owner-initiated workflow_dispatch/u);
   const bogus = run(['bogus']);
   assert.equal(bogus.status, 2);
   assert.match(bogus.stderr, /error: argument subcommand: invalid choice: 'bogus'/u);

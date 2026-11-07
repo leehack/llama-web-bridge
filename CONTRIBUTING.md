@@ -426,9 +426,9 @@ query strings, and fragments before printing the location.
   stable native release after the immutable native `v0.2.0-1` / Web-assets
   `v0.1.39` baseline and invokes `scripts/release/orchestrator/cli.mjs` to
   idempotently advance candidate, automated qualification, and publication
-  stages. Each successful stage wakes an immediate `workflow_run` continuation;
-  the daily schedule discovers new native releases and is the idempotent repair
-  fallback. The scan downloads
+  stages. The scan is manual-only: each owner `workflow_dispatch` discovers new
+  native releases and advances each pipeline by one idempotent stage; no
+  schedule or `workflow_run` continuation exists. The scan downloads
   every selected `assets.json` and `SHA256SUMS` by
   unique release-asset ID and runs the complete native release/tag/inventory
   contract first. That contract accepts native `hook_contract_version` 1 and 2
@@ -474,7 +474,7 @@ query strings, and fragments before printing the location.
   overtaken generation 3 is `blocked` instead. When no native release in the
   scan published the overtaking release, its bytes cannot be compared, so the
   pipeline is `blocked` until a scan that includes that native release, such
-  as the daily backlog scan, compares them.
+  as a backlog scan, compares them.
   Manual `development` scans stay scan-only: they resolve exact `bNNNN`
   provenance and report it, and the orchestrator refuses non-stable provenance.
   A failed candidate or qualification is never retried automatically; after diagnosis,
@@ -486,7 +486,7 @@ query strings, and fragments before printing the location.
   history with stable-count checks and splits searches at GitHub's 1,000-result
   cap into closed time windows, so an older waiting pipeline is not lost as
   later workflow history grows.
-- The full-history scheduled resolver records both the exact default-branch
+- The full-history resolver records both the exact default-branch
   source SHA that will execute a new candidate and the newest first-parent
   commit that changed governed runtime/build inputs. Correlation uses the latter:
   non-build orchestration/qualification/publication/CI workflow, verification,
@@ -568,9 +568,9 @@ redispatching a new publication run against the same `candidate_run_id` and
 comes from the candidate run, so it stays stable. A different candidate must
 never target an existing output tag.
 
-The event-driven orchestrator and its scheduled repair fallback reuse that same existing secret only from a
+The manually dispatched orchestrator reuses that same existing secret only from a
 `bridge-assets-publication` environment job; it does not require an
-`ORCHESTRATOR_DISPATCH_TOKEN`. For automatic progression, the owner-bound token
+`ORCHESTRATOR_DISPATCH_TOKEN`. For orchestrated progression, the owner-bound token
 must retain Actions write permission on `leehack/llama-web-bridge` in addition
 to the assets-repository permissions publication already requires. The job token
 validates the environment policy first; the orchestrator then proves the PAT's
@@ -580,12 +580,9 @@ adds `publish_approved=true` only after the live publication-environment policy
 passes. An already-published noop still resolves the exact assets tag commit,
 validates independent release reads by tag and ID, and validates the signed
 `gh release verify --format json` attestation against every downloaded asset
-digest. Manual runs require both the initiating actor and triggering actor to be
-the repository owner before either workflow job starts, preventing a
-collaborator from using the environment PAT as a confused deputy. Trusted
-default-branch schedule events remain automatic; `workflow_run` continuations
-also require a successful stage run on the default branch with owner actor and
-triggering actor before either job starts.
+digest. The scan is manual-only and requires both the initiating actor and triggering
+actor to be the repository owner before either workflow job starts, preventing
+a collaborator from using the environment PAT as a confused deputy.
 
 New bridge asset tags are npm-shaped `vMAJOR.MINOR.PATCH` with rebuild `0`:
 `selectNextReleaseTarget` skips a published or claimed version by taking
