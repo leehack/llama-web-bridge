@@ -109,11 +109,31 @@ uint32_t capabilities_for(
            : 0u);
 }
 
-llama_sampler * init_sampler(const llama_webgpu_tts_request & request) {
+llama_sampler * init_sampler(
+    const llama_vocab * vocab,
+    const llama_webgpu_tts_request & request) {
   llama_sampler * sampler =
       llama_sampler_chain_init(llama_sampler_chain_default_params());
   if (sampler == nullptr) {
     return nullptr;
+  }
+  // As in upstream common_sampler, suppressed tokens (for Qwen3-TTS the codec's
+  // control tokens, which code2wav rejects as out-of-range codes) get a -inf bias first.
+  int32_t n_suppress = 0;
+  const llama_token * suppress =
+      llama_vocab_get_suppress_tokens(vocab, &n_suppress);
+  if (suppress != nullptr && n_suppress > 0) {
+    std::vector<llama_logit_bias> bias;
+    bias.reserve(static_cast<size_t>(n_suppress));
+    for (int32_t i = 0; i < n_suppress; ++i) {
+      bias.push_back({suppress[i], -INFINITY});
+    }
+    llama_sampler_chain_add(
+        sampler,
+        llama_sampler_init_logit_bias(
+            llama_vocab_n_tokens(vocab),
+            static_cast<int32_t>(bias.size()),
+            bias.data()));
   }
   llama_sampler_chain_add(sampler, llama_sampler_init_top_k(request.top_k));
   llama_sampler_chain_add(sampler, llama_sampler_init_top_p(request.top_p, 1));
@@ -307,7 +327,8 @@ llama_webgpu_tts_status llama_webgpu_tts_start(
     tts->speaker = wrapper.bitmap;
   }
 
-  tts->sampler = init_sampler(request);
+  tts->sampler = init_sampler(
+      llama_model_get_vocab(llama_get_model(tts->llama)), request);
   if (tts->sampler == nullptr) {
     return fail(
         tts,

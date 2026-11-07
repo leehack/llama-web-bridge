@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- WebGPU text-to-speech applies the GGUF's suppress tokens in the talker sampler, as upstream does.
+  Qwen3-TTS no longer fails with `code out of range` when a codec control token is sampled.
 - `createCompletion` can explicitly count prompt tokens in penalties with a grammar using `penaltyPromptTokensWithGrammar`; a matching loaded-core capability is required, and existing grammar defaults stay unchanged.
 
 - Large wasm32 streamed model files use bounded size hints to reserve filesystem capacity, avoiding geometric file-growth allocation failures at 1 GiB without treating hidden compression metadata as a decoded-size contract.
