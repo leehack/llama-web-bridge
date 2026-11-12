@@ -51,7 +51,10 @@ With a thinking budget it checks that a grammar pauses inside the reasoning
 block by default; that \`\`pauseGrammar: false\`\` keeps a grammar that takes the
 block and its end tag itself applied through the forced end tag; and that a
 grammar rejecting the forced end tag fails with the grammar-rejection error
-instead of finishing the block without it.
+instead of finishing the block without it. Only the Qwen3.5 run reproduces the
+original bug (the end-tag-rejecting grammar finishing the block without its end
+tag); the tiny-model run passes with or without the fix, so CI must keep the
+Qwen3.5 run.
 
 It then checks \`\`minP\`\` and \`\`presencePenalty\`\` with a fixed seed. Every
 compared completion reuses the same cached prompt, so each run starts from the
