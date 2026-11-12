@@ -2006,7 +2006,7 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
     options: BridgeCompletionOptions = {},
   ): Promise<string> {
     const sampling = resolveCompletionSamplingOptions(options);
-    if (sampling.penaltyPromptTokensWithGrammar) {
+    if (sampling.penaltyPromptTokensWithGrammar || sampling.thinkingBudget?.pauseGrammar === false) {
       // Probe the actual worker too: an older worker wrapper may ignore options.
       requireCompletionCapabilities(sampling, await this._getCompletionCapabilitiesUnlocked());
     }

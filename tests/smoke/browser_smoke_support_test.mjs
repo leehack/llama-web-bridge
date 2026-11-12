@@ -292,6 +292,9 @@ assert.deepEqual(webGpuLaunchArgs('linux'), [
     'open-budget': 'T </think>x',
     'open-budget-zero': ' Done.</think>x',
     'open-budget-grammar': 'T</think>yes',
+    'open-budget-taking-grammar': 'T</think>no',
+    'open-budget-rejecting-grammar': 'ERR Error: Generation step failed: Grammar rejected every candidate token',
+    'open-budget-after-rejecting': 'T</think>yes',
     'closed-first': 'c',
     'closed-plain': 'c',
     'closed-budget-zero': 'c',
@@ -430,12 +433,15 @@ assert.deepEqual(webGpuLaunchArgs('linux'), [
     };
     return [
       runsCase(
-        { 'open-prefix': 'T</think>', 'open-budget': 'T</think></think>', 'open-budget-grammar': 'T</think></think>yes' },
+        { 'open-prefix': 'T</think>', 'open-budget': 'T</think></think>', 'open-budget-grammar': 'T</think></think>yes', 'open-budget-taking-grammar': 'T</think></think>no', 'open-budget-after-rejecting': 'T</think></think>yes' },
         'the model closed the block itself, so the budget proves nothing',
       ),
       runsCase({ 'open-budget': 'T more' }, "maxTokens 8 did not force '</think>' after the unbudgeted prefix"),
       runsCase({ 'open-budget-zero': '</think>Done.' }, "maxTokens 0 did not start with the forced 'Done.</think>'"),
       runsCase({ 'open-budget-grammar': 'T</think>maybe' }, 'the grammar did not pause inside the block and constrain the text after it'),
+      runsCase({ 'open-budget-taking-grammar': 'T</think>maybe' }, 'the grammar did not stay applied inside the block through the forced end tag'),
+      runsCase({ 'open-budget-rejecting-grammar': 'T</think>' }, 'a grammar rejecting the forced end tag did not fail with the grammar-rejection error'),
+      runsCase({ 'open-budget-after-rejecting': 'T</think>maybe' }, 'the default pausing grammar changed after a rejected forced end tag'),
       runsCase({ 'closed-budget-zero': 'd' }, 'a budget changed output after the prompt closed the block'),
       [mutate(grammarPayload(), (p) => { p.modeResults[0].invalidThinkingBudgetError = null; }), both, [
         'wasm32 direct: invalid thinking budget: expected a RangeError, got None',
@@ -481,7 +487,7 @@ assert.deepEqual(webGpuLaunchArgs('linux'), [
         p.modeResults[3].capabilitiesBeforeLoad.minP = true;
         p.modeResults[3].capabilitiesAfterLoad = null;
       }), both, [
-        "wasm64 worker: capabilities before the load: expected none, got {'presencePenalty': False, 'minP': True, 'thinkingBudget': False, "
+        "wasm64 worker: capabilities before the load: expected none, got {'presencePenalty': False, 'minP': True, 'thinkingBudget': False, 'thinkingBudgetPauseGrammar': False, "
           + "'penaltyPromptTokens': False, 'penaltyPromptTokensWithGrammar': False, 'lazyGrammar': False}",
         'wasm64 worker: capabilities after the load: expected all, got None',
         `wasm64 worker: sampler outputs: {${Object.entries(samplerRuns()).map(([n, t]) => `'${n}': '${t}'`).join(', ')}}`,

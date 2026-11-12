@@ -172,6 +172,14 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_add_next_grammar_trigger(
   return 0;
 }
 
+// Sets whether the grammar of the next begin_generation or generate call
+// pauses inside a thinking-budget reasoning block. Call it after
+// llamadart_webgpu_set_next_grammar, which restores the default, pausing.
+EMSCRIPTEN_KEEPALIVE void llamadart_webgpu_set_next_grammar_reasoning_pause(
+    int32_t pause) {
+  g_next_grammar.pause_while_reasoning = pause != 0;
+}
+
 // Strategy flags report what the loaded models can run: draft-mtp needs the
 // target's MTP head, and draft-model strategies a matching draft model.
 EMSCRIPTEN_KEEPALIVE const char * llamadart_webgpu_completion_capabilities_json() {
@@ -196,6 +204,7 @@ EMSCRIPTEN_KEEPALIVE const char * llamadart_webgpu_completion_capabilities_json(
   };
   g_completion_capabilities_json =
       "{\"presencePenalty\":true,\"minP\":true,\"thinkingBudget\":true,"
+      "\"thinkingBudgetPauseGrammar\":true,"
       "\"penaltyPromptTokens\":true,\"penaltyPromptTokensWithGrammar\":true,\"lazyGrammar\":true,"
       "\"speculativeDecoding\":{";
   bool first = true;

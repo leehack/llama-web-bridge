@@ -54,12 +54,14 @@ llama_sampler * create_sampler(
 }
 
 // Mirrors llamadart-native's reasoning-budget sampler: the grammar pauses
-// while a reasoning block is open or its end is being forced.
+// while a reasoning block is open or its end is being forced, unless the
+// request keeps it applied (pause_grammar_while_reasoning there).
 bool grammar_is_active() {
   if (g_active_grammar == nullptr) {
     return false;
   }
-  if (g_active_reasoning_budget == nullptr) {
+  if (g_active_reasoning_budget == nullptr ||
+      !g_active_grammar_pauses_while_reasoning) {
     return true;
   }
   const common_reasoning_budget_state state =
@@ -132,8 +134,11 @@ llama_token sample_next_token(const int32_t batch_index = -1) {
     }
     token = cur_p.data[cur_p.selected].id;
     // Every candidate is rejected only when the grammar can't be continued
-    // with this vocabulary; accepting the token would abort.
-    if (!grammar_accepts_token(token)) {
+    // with this vocabulary; accepting the token would abort. A -inf pick means
+    // the grammar and the reasoning budget's forced end tag excluded each other,
+    // and the budget would otherwise finish the block without its end tag.
+    if (cur_p.data[cur_p.selected].logit == -INFINITY ||
+        !grammar_accepts_token(token)) {
       set_error("Grammar rejected every candidate token");
       return LLAMA_TOKEN_NULL;
     }
@@ -576,6 +581,7 @@ int32_t begin_generation_impl(
   g_active_reasoning_budget = reasoning_budget_ptr;
   g_active_grammar = grammar_sampler.release();
   g_active_grammar_lazy = g_active_grammar != nullptr && grammar_options.lazy;
+  g_active_grammar_pauses_while_reasoning = grammar_options.pause_while_reasoning;
   g_generation_active = true;
   return 0;
 }

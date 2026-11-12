@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- `CompletionOptions.thinkingBudget.pauseGrammar: false` keeps a grammar applied inside a reasoning block, so a grammar that takes the block and its end tag itself, such as one for a prompt that ends inside the block, sees the budget's forced `</think>`. It needs the new `thinkingBudgetPauseGrammar` capability; omitted, the grammar pauses as before.
 - WebGPU text-to-speech applies the GGUF's suppress tokens in the talker sampler, as upstream does.
   Qwen3-TTS no longer fails with `code out of range` when a codec control token is sampled.
 - `createCompletion` can explicitly count prompt tokens in penalties with a grammar using `penaltyPromptTokensWithGrammar`; a matching loaded-core capability is required, and existing grammar defaults stay unchanged.

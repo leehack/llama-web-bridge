@@ -12,11 +12,19 @@ import { withoutNul } from './text.ts';
 export interface CompletionSamplingOptions {
   minP: number;
   presencePenalty: number;
-  thinkingBudget: Required<ThinkingBudgetOptions> | null;
+  thinkingBudget: ResolvedThinkingBudget | null;
   penaltyPromptTokens: boolean;
   penaltyPromptTokensWithGrammar: boolean;
   speculative: ResolvedSpeculativeOptions | null;
   grammarOptions: ResolvedGrammarOptions | null;
+}
+
+export interface ResolvedThinkingBudget {
+  maxTokens: number;
+  startTag: string;
+  endTag: string;
+  forcedMessage: string;
+  pauseGrammar: boolean;
 }
 
 /**
@@ -80,6 +88,7 @@ export const NO_COMPLETION_CAPABILITIES: Readonly<CompletionCapabilities> = Obje
   presencePenalty: false,
   minP: false,
   thinkingBudget: false,
+  thinkingBudgetPauseGrammar: false,
   penaltyPromptTokens: false,
   penaltyPromptTokensWithGrammar: false,
   lazyGrammar: false,
@@ -109,7 +118,7 @@ function tag(budget: Record<string, unknown>, name: 'startTag' | 'endTag'): stri
   return withoutNul(value, `CompletionOptions.thinkingBudget.${name}`);
 }
 
-function thinkingBudget(value: unknown, hasMediaParts: boolean): Required<ThinkingBudgetOptions> | null {
+function thinkingBudget(value: unknown, hasMediaParts: boolean): ResolvedThinkingBudget | null {
   if (value == null) {
     return null;
   }
@@ -131,10 +140,16 @@ function thinkingBudget(value: unknown, hasMediaParts: boolean): Required<Thinki
     throw new TypeError('CompletionOptions.thinkingBudget.forcedMessage must be a string.');
   }
   withoutNul(forcedMessage, 'CompletionOptions.thinkingBudget.forcedMessage');
+  const pauseGrammar = budget.pauseGrammar ?? true;
+  if (typeof pauseGrammar !== 'boolean') {
+    throw new TypeError(
+      `CompletionOptions.thinkingBudget.pauseGrammar must be a boolean; got ${String(pauseGrammar)}.`,
+    );
+  }
   if (hasMediaParts) {
     throw new Error('CompletionOptions.thinkingBudget supports text-only prompts; remove the media parts.');
   }
-  return { maxTokens: maxTokens as number, startTag, endTag, forcedMessage };
+  return { maxTokens: maxTokens as number, startTag, endTag, forcedMessage, pauseGrammar };
 }
 
 function speculativeInteger(
@@ -448,6 +463,7 @@ export function completionCapabilitiesFrom(raw: string | null): CompletionCapabi
     presencePenalty: parsed?.presencePenalty === true,
     minP: parsed?.minP === true,
     thinkingBudget: parsed?.thinkingBudget === true,
+    thinkingBudgetPauseGrammar: parsed?.thinkingBudgetPauseGrammar === true,
     penaltyPromptTokens: parsed?.penaltyPromptTokens === true,
     penaltyPromptTokensWithGrammar: parsed?.penaltyPromptTokensWithGrammar === true,
     lazyGrammar: parsed?.lazyGrammar === true,
@@ -466,6 +482,9 @@ export function requireCompletionCapabilities(
     sampling.minP !== 0 && !capabilities.minP ? 'minP' : null,
     sampling.presencePenalty !== 0 && !capabilities.presencePenalty ? 'presencePenalty' : null,
     sampling.thinkingBudget != null && !capabilities.thinkingBudget ? 'thinkingBudget' : null,
+    sampling.thinkingBudget?.pauseGrammar === false && !capabilities.thinkingBudgetPauseGrammar
+      ? 'thinkingBudget.pauseGrammar'
+      : null,
     sampling.grammarOptions?.lazy === true && !capabilities.lazyGrammar ? 'grammarLazy' : null,
     sampling.grammarOptions != null && sampling.grammarOptions.root !== 'root' && !capabilities.lazyGrammar
       ? 'grammarRoot'
