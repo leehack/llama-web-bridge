@@ -3906,6 +3906,10 @@ export class LlamaWebGpuBridgeRuntime {
       if (sampling.grammarOptions) {
         this._setNextGrammar(sampling.grammarOptions);
       }
+      if (sampling.thinkingBudget?.pauseGrammar === false) {
+        // After _setNextGrammar, which restores the default.
+        this._core!.ccall('llamadart_webgpu_set_next_grammar_reasoning_pause', null, ['number'], [0]);
+      }
       const beginRc = Number(
         await this._core!.ccall(
           input.exportName,

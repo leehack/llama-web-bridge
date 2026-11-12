@@ -28,6 +28,9 @@ llama_sampler * g_active_grammar = nullptr;
 // A lazy grammar can reject its trigger text when the trigger fires inside
 // llama_sampler_accept, which throws.
 bool g_active_grammar_lazy = false;
+// False for a grammar that takes the reasoning block itself, so it stays
+// applied while g_active_reasoning_budget counts or forces the block's end.
+bool g_active_grammar_pauses_while_reasoning = true;
 // Borrowed from g_active_sampler's chain, which owns and frees it.
 llama_sampler * g_active_reasoning_budget = nullptr;
 std::vector<llama_token_data> g_sampler_candidates;
@@ -120,6 +123,7 @@ speculative_request g_next_speculative;
 struct grammar_request {
   std::string root = "root";
   bool lazy = false;
+  bool pause_while_reasoning = true;
   std::vector<common_grammar_trigger> triggers;
 };
 grammar_request g_next_grammar;

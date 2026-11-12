@@ -54,12 +54,14 @@ llama_sampler * create_sampler(
 }
 
 // Mirrors llamadart-native's reasoning-budget sampler: the grammar pauses
-// while a reasoning block is open or its end is being forced.
+// while a reasoning block is open or its end is being forced, unless the
+// request keeps it applied (pause_grammar_while_reasoning there).
 bool grammar_is_active() {
   if (g_active_grammar == nullptr) {
     return false;
   }
-  if (g_active_reasoning_budget == nullptr) {
+  if (g_active_reasoning_budget == nullptr ||
+      !g_active_grammar_pauses_while_reasoning) {
     return true;
   }
   const common_reasoning_budget_state state =
@@ -576,6 +578,7 @@ int32_t begin_generation_impl(
   g_active_reasoning_budget = reasoning_budget_ptr;
   g_active_grammar = grammar_sampler.release();
   g_active_grammar_lazy = g_active_grammar != nullptr && grammar_options.lazy;
+  g_active_grammar_pauses_while_reasoning = grammar_options.pause_while_reasoning;
   g_generation_active = true;
   return 0;
 }

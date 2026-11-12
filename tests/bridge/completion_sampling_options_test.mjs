@@ -15,6 +15,7 @@ const SUPPORTED = {
   presencePenalty: true,
   minP: true,
   thinkingBudget: true,
+  thinkingBudgetPauseGrammar: true,
   penaltyPromptTokens: true,
   penaltyPromptTokensWithGrammar: true,
   lazyGrammar: true,
@@ -24,6 +25,7 @@ const NONE = {
   presencePenalty: false,
   minP: false,
   thinkingBudget: false,
+  thinkingBudgetPauseGrammar: false,
   penaltyPromptTokens: false,
   penaltyPromptTokensWithGrammar: false,
   lazyGrammar: false,
@@ -58,7 +60,7 @@ function nativeParameterNames(name) {
 function coreCapabilityJson() {
   const body = functionBody('llamadart_webgpu_completion_capabilities_json()');
   const literal = body.match(
-    /"\{\\"presencePenalty\\":true,\\"minP\\":true,\\"thinkingBudget\\":true,"\s*"\\"penaltyPromptTokens\\":true,\\"penaltyPromptTokensWithGrammar\\":true,\\"lazyGrammar\\":true,"/,
+    /"\{\\"presencePenalty\\":true,\\"minP\\":true,\\"thinkingBudget\\":true,"\s*"\\"thinkingBudgetPauseGrammar\\":true,"\s*"\\"penaltyPromptTokens\\":true,\\"penaltyPromptTokensWithGrammar\\":true,\\"lazyGrammar\\":true,"/,
   );
   assert.ok(literal, 'the capability export must start with its fixed flags');
   const strategies = [...body.matchAll(/\{"([a-z0-9-]+)",\s*([^}]*)\}/g)];
@@ -67,6 +69,7 @@ function coreCapabilityJson() {
     presencePenalty: true,
     minP: true,
     thinkingBudget: true,
+    thinkingBudgetPauseGrammar: true,
     penaltyPromptTokens: true,
   penaltyPromptTokensWithGrammar: true,
     lazyGrammar: true,
@@ -238,6 +241,70 @@ const CASES = [
     assert.equal(structuredClone(sent).minP, 0.1);
     assert.equal(structuredClone(sent).presencePenalty, 0.5);
     assert.deepEqual(structuredClone(sent).thinkingBudget, BUDGET);
+  }],
+
+  ['thinkingBudget.pauseGrammar false is sent to the core after the grammar and before begin', async () => {
+    const pauseBudget = (pauseGrammar) => ({ ...BUDGET, pauseGrammar });
+    const grammar = 'root ::= think-body "</think>" "ok"\nthink-body ::= [^<]*\ncall ::= "ok"';
+    const caps = '{"thinkingBudget":true,"thinkingBudgetPauseGrammar":true,"lazyGrammar":true}';
+    const trace = (capabilityJson) => {
+      const { bridge, core } = directBridge(capabilityJson);
+      const calls = [];
+      const ccall = core.ccall.bind(core);
+      core.ccall = (name, returnType, argTypes, args) => {
+        if (name === 'llamadart_webgpu_set_next_grammar') {
+          calls.push([name, args]);
+          return 0;
+        }
+        if (name === 'llamadart_webgpu_set_next_grammar_reasoning_pause') {
+          calls.push([name, args]);
+          return undefined;
+        }
+        if (name === 'llamadart_webgpu_begin_generation_bytes') {
+          calls.push([name]);
+        }
+        return ccall(name, returnType, argTypes, args);
+      };
+      return { bridge, calls };
+    };
+    {
+      const { bridge, calls } = trace(caps);
+      await bridge.createCompletion('hello', { grammar, grammarRoot: 'call', thinkingBudget: pauseBudget(false) });
+      assert.deepEqual(calls, [
+        ['llamadart_webgpu_set_next_grammar', ['call', 0]],
+        ['llamadart_webgpu_set_next_grammar_reasoning_pause', [0]],
+        ['llamadart_webgpu_begin_generation_bytes'],
+      ]);
+    }
+    for (const pauseGrammar of [undefined, null, true]) {
+      const { bridge, calls } = trace(caps);
+      await bridge.createCompletion('hello', { grammar, thinkingBudget: pauseBudget(pauseGrammar) });
+      assert.deepEqual(calls, [['llamadart_webgpu_begin_generation_bytes']]);
+    }
+    const { bridge, calls } = trace('{"thinkingBudget":true}');
+    await assert.rejects(
+      bridge.createCompletion('hello', { grammar, thinkingBudget: pauseBudget(false) }),
+      /^Error: The loaded WebGPU core does not support CompletionOptions\.thinkingBudget\.pauseGrammar\.$/,
+    );
+    await bridge.createCompletion('hello', { grammar, thinkingBudget: pauseBudget(true) });
+    assert.deepEqual(calls, [['llamadart_webgpu_begin_generation_bytes']]);
+    await assert.rejects(
+      bridge.createCompletion('hello', { thinkingBudget: pauseBudget(0) }),
+      /^TypeError: CompletionOptions\.thinkingBudget\.pauseGrammar must be a boolean; got 0\.$/,
+    );
+    assert.equal((await bridge.getCompletionCapabilities()).thinkingBudgetPauseGrammar, false);
+  }],
+
+  ['a worker completion forwards thinkingBudget.pauseGrammar', async () => {
+    let sent = null;
+    const bridge = createWorkerBridge({
+      _callWorker: async (method, args) => {
+        sent = args[1];
+        return 'x';
+      },
+    });
+    await bridge.createCompletion('hello', { thinkingBudget: { ...BUDGET, pauseGrammar: false } });
+    assert.deepEqual(structuredClone(sent).thinkingBudget, { ...BUDGET, pauseGrammar: false });
   }],
 
   ['a core without the probe reports nothing and rejects a nonzero option', async () => {
@@ -430,6 +497,7 @@ const CASES = [
 
   ['the native grammar pauses while the reasoning budget is inside a block', async () => {
     const gate = functionBody('bool grammar_is_active()');
+    assert.match(gate, /!g_active_grammar_pauses_while_reasoning/);
     assert.match(gate, /return state == REASONING_BUDGET_IDLE \|\| state == REASONING_BUDGET_DONE;/);
     const sample = functionBody('llama_token sample_next_token(');
     const gateIndex = sample.indexOf('const bool use_grammar = grammar_is_active();');

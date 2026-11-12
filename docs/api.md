@@ -326,7 +326,7 @@ Common `options` keys:
 | `grammarLazy` | `true` applies `grammar` only after a `grammarTriggers` entry fires, as llama.cpp's lazy grammar (`llama-server`'s `grammar_lazy`) does; see [Lazy grammars](#lazy-grammars). Needs a non-empty `grammar` and at least one trigger. Omitted or `null` means `false`. |
 | `grammarTriggers` | Array of `{ type: 'word' \| 'pattern' \| 'pattern-full', value }` or `{ type: 'token', token }` that fire a lazy grammar. Always validated; applied only when `grammarLazy` is `true`. |
 | `seed` | Integer seed; random when omitted. |
-| `thinkingBudget` | `{ maxTokens, startTag, endTag, forcedMessage? }`: llama.cpp's reasoning budget. After `maxTokens` tokens inside a block opened by `startTag`, plus any that finish a UTF-8 character, the sampler forces `forcedMessage` (default empty) and `endTag`. A block the prompt leaves open counts from the start of generation, so `maxTokens: 0` forces the end at once. Each new `startTag` gets a fresh budget. A grammar constrains `startTag` like any other text, then pauses until `endTag` completes. `maxTokens` is an integer from `0` to `2147483647`; the tags must be non-empty. Each tag is tokenized on its own, as native llamadart does: with a vocabulary that adds a leading space to text, such as Llama 2's SentencePiece, a tag in the prompt matches only after a space, and the forced end tag starts with one. Text-only prompts: with `parts` it rejects. |
+| `thinkingBudget` | `{ maxTokens, startTag, endTag, forcedMessage?, pauseGrammar? }`: llama.cpp's reasoning budget. After `maxTokens` tokens inside a block opened by `startTag`, plus any that finish a UTF-8 character, the sampler forces `forcedMessage` (default empty) and `endTag`. A block the prompt leaves open counts from the start of generation, so `maxTokens: 0` forces the end at once. Each new `startTag` gets a fresh budget. A grammar constrains `startTag` like any other text, then pauses until `endTag` completes, unless `pauseGrammar` is `false`: that keeps the grammar applied inside the block, for one that takes the block and `endTag` itself (such as one written for a prompt that ends inside the block; paused, it resumes at its start and takes the reply as reasoning) and so accepts `forcedMessage` and `endTag` wherever the budget can run out. Omitted, `null` or `true` pauses it; `false` needs the `thinkingBudgetPauseGrammar` capability. `maxTokens` is an integer from `0` to `2147483647`; the tags must be non-empty. Each tag is tokenized on its own, as native llamadart does: with a vocabulary that adds a leading space to text, such as Llama 2's SentencePiece, a tag in the prompt matches only after a space, and the forced end tag starts with one. Text-only prompts: with `parts` it rejects. |
 | `onUsage(usage)` | Called at most once, with the `CompletionUsage` of the last attempt whose generation returned, before the promise resolves or rejects with an `AbortError`. Not called when no generation returned: other rejections, a skipped multimodal warmup, or a worker failure after a cancel. |
 | `onToken(piece, currentText)` | Token callback. By default `piece` is a `Uint8Array` containing complete UTF-8 characters; see [Streamed text](#streamed-text). `currentText` is the text streamed so far. Direct runtime mode provides it by default; worker mode provides `''` unless `emitCurrentTextOnToken: true` is set. |
 | `signal` | `AbortSignal`; aborting cancels this operation and rejects with `AbortError`. |
@@ -365,7 +365,7 @@ An invalid `minP`, a `presencePenalty` that is not finite as a 32-bit float,
 an invalid `thinkingBudget`, or a malformed `grammarLazy`, `grammarTriggers` or
 `grammarRoot` rejects with a `RangeError` or `TypeError` before generation
 starts, and `grammarLazy: true` or another `grammarRoot` without a non-empty
-`grammar`, or a lazy grammar without triggers, with an `Error`. A nonzero `minP` or `presencePenalty`, any `thinkingBudget`, and
+`grammar`, or a lazy grammar without triggers, with an `Error`. A nonzero `minP` or `presencePenalty`, any `thinkingBudget`, `thinkingBudget.pauseGrammar: false`, and
 `grammarLazy: true` or a `grammarRoot` other than `root` reject when the loaded
 core does not apply that option.
 
@@ -400,7 +400,7 @@ completion rejects with `The lazy grammar rejected the text that triggered it`.
 The core stays usable after either, and worker mode rethrows both without
 falling back to the main thread; like an invalid grammar, each rejection leaks
 a few KiB at most. Triggers match only generated text, not the
-prompt, and a `thinkingBudget` block pauses a lazy grammar, so text inside the
+prompt, and a `thinkingBudget` block pauses a lazy grammar (unless `pauseGrammar` is `false`), so text inside the
 block fires no trigger. The bridge streams every special token's text, so
 llama.cpp's `preserved_tokens` has no equivalent here.
 
@@ -430,7 +430,7 @@ cancelled generation once it returns.
 getCompletionCapabilities(): Promise<CompletionCapabilities>
 ```
 
-Returns `{ presencePenalty, minP, thinkingBudget, penaltyPromptTokens, penaltyPromptTokensWithGrammar, lazyGrammar, speculativeDecoding }`:
+Returns `{ presencePenalty, minP, thinkingBudget, thinkingBudgetPauseGrammar, penaltyPromptTokens, penaltyPromptTokensWithGrammar, lazyGrammar, speculativeDecoding }`:
 whether the loaded core applies each `createCompletion` option. `lazyGrammar`
 covers `grammarLazy`, `grammarTriggers` and `grammarRoot`.
 `penaltyPromptTokensWithGrammar` separately permits the explicit grammar opt-in;

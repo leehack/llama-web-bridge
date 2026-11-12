@@ -346,6 +346,7 @@ void end_generation_state() {
     g_active_grammar = nullptr;
   }
   g_active_grammar_lazy = false;
+  g_active_grammar_pauses_while_reasoning = true;
   g_generation_active = false;
   g_last_piece.clear();
   g_cancel_requested = false;

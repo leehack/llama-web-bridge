@@ -184,7 +184,7 @@ const INVALID_SAMPLER_OPTIONS = Object.freeze([
 ]);
 // speculative.mjs checks the speculativeDecoding capabilities.
 export const COMPLETION_CAPABILITIES = Object.freeze([
-  'presencePenalty', 'minP', 'thinkingBudget', 'penaltyPromptTokens', 'penaltyPromptTokensWithGrammar', 'lazyGrammar',
+  'presencePenalty', 'minP', 'thinkingBudget', 'thinkingBudgetPauseGrammar', 'penaltyPromptTokens', 'penaltyPromptTokensWithGrammar', 'lazyGrammar',
 ]);
 // Each tag follows a space: SentencePiece vocabularies tokenize a tag at the
 // start of text with a space prefix, so only a spaced tag in the prompt
@@ -195,6 +195,10 @@ const THINK_GREEDY = { temp: 0, topK: 1, penalty: 1, seed: 3 };
 const THINK_TAGS = { startTag: '<think>', endTag: '</think>' };
 const THINK_BUDGET_TOKENS = 8;
 const FORCED_MESSAGE = 'Done.';
+// Takes the reasoning block and its end tag itself, as one written for a prompt
+// that ends inside the block does.
+const THINK_BODY_GRAMMAR = String.raw`root ::= think-body "</think>" ("yes" | "no")
+think-body ::= ( [^<] | "<" [^/] )*`;
 // Each run's prompt and options; each "-first" run warms the prompt cache.
 export const THINKING_RUNS = Object.freeze([
   ['open-first', THINK_PROMPT, { ...THINK_GREEDY, nPredict: 1 }],
@@ -214,6 +218,12 @@ export const THINKING_RUNS = Object.freeze([
     nPredict: 16,
     grammar: YES_NO_GRAMMAR,
     thinkingBudget: { ...THINK_TAGS, maxTokens: THINK_BUDGET_TOKENS },
+  }],
+  ['open-budget-taking-grammar', THINK_PROMPT, {
+    ...THINK_GREEDY,
+    nPredict: 24,
+    grammar: THINK_BODY_GRAMMAR,
+    thinkingBudget: { ...THINK_TAGS, maxTokens: THINK_BUDGET_TOKENS, pauseGrammar: false },
   }],
   ['closed-first', CLOSED_THINK_PROMPT, { ...THINK_GREEDY, nPredict: 1 }],
   ['closed-plain', CLOSED_THINK_PROMPT, { ...THINK_GREEDY, nPredict: 4 }],
@@ -800,6 +810,10 @@ export function validateThinkingBudget(entry) {
   expect(
     [`${endTag}yes`, `${endTag}no`].includes(afterPrefix(runs['open-budget-grammar'])),
     'the grammar did not pause inside the block and constrain the text after it',
+  );
+  expect(
+    [`${endTag}yes`, `${endTag}no`].includes(afterPrefix(runs['open-budget-taking-grammar'])),
+    'the grammar did not stay applied inside the block through the forced end tag',
   );
   expect(runs['closed-budget-zero'] === runs['closed-plain'], 'a budget changed output after the prompt closed the block');
   const error = pyGet(entry, 'invalidThinkingBudgetError');
