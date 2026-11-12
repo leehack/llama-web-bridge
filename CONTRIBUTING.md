@@ -241,7 +241,8 @@ CI runs it twice: with the state-persistence model, then with the multimodal
 model. Pass each model's `--model-url` (or `--model-path`) and `--model-sha256`
 pin from the commands above; the smoke defaults to the
 `LLAMA_WEBGPU_SMOKE_MODEL_URL` and `LLAMA_WEBGPU_SMOKE_MODEL_SHA256` environment
-variables:
+variables. Its end-tag-rejecting grammar check reproduces the original bug
+only with the multimodal (Qwen3.5) model; the tiny model passes it either way:
 
 ```bash
 node scripts/smoke/grammar.mjs \
