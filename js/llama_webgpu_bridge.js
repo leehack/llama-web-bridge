@@ -6897,7 +6897,7 @@ var LlamaWebGpuBridge = class {
   }
   async _createCompletionUnlocked(prompt, options = {}) {
     const sampling = resolveCompletionSamplingOptions(options);
-    if (sampling.penaltyPromptTokensWithGrammar) {
+    if (sampling.penaltyPromptTokensWithGrammar || sampling.thinkingBudget?.pauseGrammar === false) {
       requireCompletionCapabilities(sampling, await this._getCompletionCapabilitiesUnlocked());
     }
     const isWarmup = options?.warmup === true;

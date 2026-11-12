@@ -295,10 +295,29 @@ const CASES = [
     assert.equal((await bridge.getCompletionCapabilities()).thinkingBudgetPauseGrammar, false);
   }],
 
+  ['an older worker wrapper cannot silently ignore thinkingBudget.pauseGrammar false', async () => {
+    const calls = [];
+    const bridge = createWorkerBridge({
+      _callWorker: async (method) => {
+        calls.push(method);
+        return method === 'getCompletionCapabilities' ? { thinkingBudget: true } : 'ignored';
+      },
+    });
+    calls.length = 0;
+    await assert.rejects(
+      bridge.createCompletion('hello', { thinkingBudget: { ...BUDGET, pauseGrammar: false } }),
+      /CompletionOptions\.thinkingBudget\.pauseGrammar\.$/,
+    );
+    assert.deepEqual(calls, ['getCompletionCapabilities']);
+  }],
+
   ['a worker completion forwards thinkingBudget.pauseGrammar', async () => {
     let sent = null;
     const bridge = createWorkerBridge({
       _callWorker: async (method, args) => {
+        if (method === 'getCompletionCapabilities') {
+          return { thinkingBudget: true, thinkingBudgetPauseGrammar: true };
+        }
         sent = args[1];
         return 'x';
       },

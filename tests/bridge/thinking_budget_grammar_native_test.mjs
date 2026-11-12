@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { readNativeCoreSource } from './native_core_source.mjs';
@@ -74,3 +74,20 @@ try {
 // A request sets the flag for its own generation only.
 assert.match(begin, /g_active_grammar_pauses_while_reasoning = grammar_options\.pause_while_reasoning;/);
 assert.match(end, /g_active_grammar_pauses_while_reasoning = true;/);
+
+const cmake = readFileSync(new URL('../../CMakeLists.txt', import.meta.url), 'utf8');
+const exported = cmake.match(/-sEXPORTED_FUNCTIONS=\[([^\]]*)\]/)[1];
+assert.ok(
+  exported.includes("'_llamadart_webgpu_set_next_grammar_reasoning_pause'"),
+  'llamadart_webgpu_set_next_grammar_reasoning_pause is not in EXPORTED_FUNCTIONS',
+);
+
+// A grammar that rejects the budget's forced token leaves every logit at -inf
+// after the grammar-first resample; the sampler must fail instead of letting
+// the budget finish the block without its end tag.
+const sample = body('llama_token sample_next_token(');
+assert.match(sample, /cur_p\.data\[cur_p\.selected\]\.logit == -INFINITY/);
+assert.ok(
+  sample.indexOf('.logit == -INFINITY') < sample.indexOf('Grammar rejected every candidate token'),
+  'the -inf pick is rejected with the grammar-rejection error',
+);

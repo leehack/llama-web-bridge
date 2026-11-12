@@ -47,6 +47,12 @@ and leave the runtime usable for the valid cases that follow. The worker
 runtime must still own the model afterwards: an abort there used to move the
 bridge to the main thread for the rest of the session.
 
+With a thinking budget it checks that a grammar pauses inside the reasoning
+block by default; that \`\`pauseGrammar: false\`\` keeps a grammar that takes the
+block and its end tag itself applied through the forced end tag; and that a
+grammar rejecting the forced end tag fails with the grammar-rejection error
+instead of finishing the block without it.
+
 It then checks \`\`minP\`\` and \`\`presencePenalty\`\` with a fixed seed. Every
 compared completion reuses the same cached prompt, so each run starts from the
 same logits. \`\`minP: 1\`\` keeps only the most probable token and so matches
@@ -224,6 +230,18 @@ export const THINKING_RUNS = Object.freeze([
     nPredict: 24,
     grammar: THINK_BODY_GRAMMAR,
     thinkingBudget: { ...THINK_TAGS, maxTokens: THINK_BUDGET_TOKENS, pauseGrammar: false },
+  }],
+  ['open-budget-rejecting-grammar', THINK_PROMPT, {
+    ...THINK_GREEDY,
+    nPredict: 24,
+    grammar: String.raw`root ::= [^<]*`,
+    thinkingBudget: { ...THINK_TAGS, maxTokens: THINK_BUDGET_TOKENS, pauseGrammar: false },
+  }],
+  ['open-budget-after-rejecting', THINK_PROMPT, {
+    ...THINK_GREEDY,
+    nPredict: 16,
+    grammar: YES_NO_GRAMMAR,
+    thinkingBudget: { ...THINK_TAGS, maxTokens: THINK_BUDGET_TOKENS },
   }],
   ['closed-first', CLOSED_THINK_PROMPT, { ...THINK_GREEDY, nPredict: 1 }],
   ['closed-plain', CLOSED_THINK_PROMPT, { ...THINK_GREEDY, nPredict: 4 }],
@@ -565,10 +583,15 @@ export function renderHarness(nCtx, memoryModes) {
 
         const thinkingRuns = {};
         for (const [name, prompt, options] of config.thinkingRuns) {
-          thinkingRuns[name] = await bridge.createCompletion(prompt, {
-            ...options,
-            tokenEventEncoding: 'text',
-          });
+          try {
+            thinkingRuns[name] = await bridge.createCompletion(prompt, {
+              ...options,
+              tokenEventEncoding: 'text',
+            });
+          } catch (caught) {
+            if (name !== 'open-budget-rejecting-grammar') throw caught;
+            thinkingRuns[name] = \`ERR \${caught && caught.name}: \${errorText(caught)}\`;
+          }
         }
         let invalidThinkingBudgetError = null;
         try {
@@ -814,6 +837,14 @@ export function validateThinkingBudget(entry) {
   expect(
     [`${endTag}yes`, `${endTag}no`].includes(afterPrefix(runs['open-budget-taking-grammar'])),
     'the grammar did not stay applied inside the block through the forced end tag',
+  );
+  expect(
+    /^ERR .*Grammar rejected every candidate token/.test(runs['open-budget-rejecting-grammar']),
+    'a grammar rejecting the forced end tag did not fail with the grammar-rejection error',
+  );
+  expect(
+    [`${endTag}yes`, `${endTag}no`].includes(afterPrefix(runs['open-budget-after-rejecting'])),
+    'the default pausing grammar changed after a rejected forced end tag',
   );
   expect(runs['closed-budget-zero'] === runs['closed-plain'], 'a budget changed output after the prompt closed the block');
   const error = pyGet(entry, 'invalidThinkingBudgetError');

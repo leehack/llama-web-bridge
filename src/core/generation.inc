@@ -134,8 +134,11 @@ llama_token sample_next_token(const int32_t batch_index = -1) {
     }
     token = cur_p.data[cur_p.selected].id;
     // Every candidate is rejected only when the grammar can't be continued
-    // with this vocabulary; accepting the token would abort.
-    if (!grammar_accepts_token(token)) {
+    // with this vocabulary; accepting the token would abort. A -inf pick means
+    // the grammar and the reasoning budget's forced end tag excluded each other,
+    // and the budget would otherwise finish the block without its end tag.
+    if (cur_p.data[cur_p.selected].logit == -INFINITY ||
+        !grammar_accepts_token(token)) {
       set_error("Grammar rejected every candidate token");
       return LLAMA_TOKEN_NULL;
     }
