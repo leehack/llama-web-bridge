@@ -154,10 +154,9 @@ it.
 | `coreModuleUrlMem64` | `string` | URL for the optional wasm64 Emscripten JS loader. |
 | `wasmUrl` | `string` | URL for the wasm32 `llama_webgpu_core.wasm` binary. |
 | `wasmUrlMem64` | `string` | URL for the optional wasm64 wasm binary. |
-| `coreModuleFactory` | `function \| Promise<function>` | Preloaded Emscripten factory. Supplying this disables worker mode because factories cannot be transferred to the worker. |
+| `coreModuleFactory` | `LlamaCoreModuleFactory \| Promise<LlamaCoreModuleFactory>` | Preloaded Emscripten factory. Supplying this disables worker mode because factories cannot be transferred to the worker. It also skips the cross-origin isolation check, so a custom pthread core on a page that is not isolated still waits for `coreInitTimeoutMs`. |
 | `workerUrl` | `string` | URL for `llama_webgpu_bridge_worker.js`. Defaults to a sibling of the bridge module when possible. |
 | `disableWorker` | `boolean` | Force direct runtime mode. |
-| `coreModuleFactory` | `LlamaCoreModuleFactory` | Custom core factory. It skips the cross-origin isolation check, so a custom pthread core on a page that is not isolated still waits for `coreInitTimeoutMs`. Forces the main-thread runtime. |
 | `allowSingleThreadCore` | `boolean` | Set for a `coreModuleUrl` core built without pthreads (`WEBGPU_BRIDGE_PTHREADS=0`). It then loads on a page that is not cross-origin isolated, capped to one thread (`threads_capped_no_coi`), instead of rejecting with `CrossOriginIsolationError`. |
 | `preferMemory64` | `boolean` | Prefer the wasm64 core when available. Defaults to `true`; the runtime can still fall back to wasm32. |
 | `workerRequestTimeoutMs` | `number` | Default timeout for worker RPC calls, 2 minutes unless a method has its own default. It also sets the `embed`/`embedBatch` budget, which defaults to 10 minutes when an input has image or audio parts. |
