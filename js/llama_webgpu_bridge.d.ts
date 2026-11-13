@@ -7,7 +7,10 @@ export interface LlamaWebGpuBridgeConfig {
   coreModuleUrlMem64?: string;
   wasmUrl?: string;
   wasmUrlMem64?: string;
+  /** A custom factory skips the cross-origin isolation check, so a custom pthread core on a page that is not isolated still waits for `coreInitTimeoutMs`. */
   coreModuleFactory?: LlamaCoreModuleFactory | Promise<LlamaCoreModuleFactory>;
+  /** Set for a `coreModuleUrl` core built without pthreads (`WEBGPU_BRIDGE_PTHREADS=0`): it loads on a page that is not cross-origin isolated, capped to one thread, instead of rejecting with `CrossOriginIsolationError`. */
+  allowSingleThreadCore?: boolean;
   workerUrl?: string;
   disableWorker?: boolean;
   preferMemory64?: boolean;
@@ -296,6 +299,13 @@ export type EmbeddingErrorCode = 'INVALID_EMBEDDING_INPUT' | 'EMBEDDING_CAPABILI
 export class EmbeddingError extends Error {
   code: EmbeddingErrorCode;
   constructor(code: EmbeddingErrorCode, message: string);
+}
+
+export type CrossOriginIsolationErrorCode = 'CROSS_ORIGIN_ISOLATION_REQUIRED';
+/** Thrown by a load or core init on a page that cannot share memory with workers, before the core starts. */
+export class CrossOriginIsolationError extends Error {
+  code: CrossOriginIsolationErrorCode;
+  constructor(message?: string);
 }
 
 export interface NextTokenScoreOptions {

@@ -21,6 +21,7 @@ export interface WorkerResponse {
   message?: string;
   embeddingErrorCode?: EmbeddingErrorCode;
   decisionErrorCode?: DecisionErrorCode;
+  errorCode?: 'CROSS_ORIGIN_ISOLATION_REQUIRED';
   event?: string;
   payload?: unknown;
 }

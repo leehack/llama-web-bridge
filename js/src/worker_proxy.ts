@@ -6,6 +6,7 @@ import {
   withDecisionErrorCode,
 } from './internal/decision.ts';
 import { EMBEDDING_MEDIA_WORKER_TIMEOUT_MS, EmbeddingError, hasEmbeddingMediaParts } from './internal/embedding.ts';
+import { CROSS_ORIGIN_ISOLATION_REQUIRED, CrossOriginIsolationError } from './internal/isolation.ts';
 import type { LlamaWebGpuBridgeConfig } from './llama_webgpu_bridge.d.ts';
 import { bridgeWorkerModeParam } from './worker_protocol.ts';
 import type { WorkerEventHandler, WorkerResponse } from './worker_protocol.ts';
@@ -160,7 +161,9 @@ export class BridgeWorkerProxy {
       if (type === 'error') {
         const errorMessage = String(message.message || 'Worker request failed');
         const workerError: Error & { state?: unknown } = message.embeddingErrorCode
-          ? new EmbeddingError(message.embeddingErrorCode, errorMessage) : new Error(errorMessage);
+          ? new EmbeddingError(message.embeddingErrorCode, errorMessage)
+          : message.errorCode === CROSS_ORIGIN_ISOLATION_REQUIRED
+            ? new CrossOriginIsolationError(errorMessage) : new Error(errorMessage);
         if (isDecisionErrorCode(message.decisionErrorCode)) {
           withDecisionErrorCode(workerError, message.decisionErrorCode);
         }

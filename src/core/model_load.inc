@@ -59,6 +59,18 @@ int32_t load_model_internal(
     mparams.main_gpu = main_gpu;
   }
 
+  // With no layer offloaded, keep WebGPU out of the model and context backends:
+  // ggml-webgpu waits on queue work at every sync, and Firefox resolves those
+  // waits on a 100 ms tick. Static because draft models reuse g_model_params.
+  static ggml_backend_dev_t cpu_only_devices[] = {nullptr};
+  if (n_gpu_layers == 0) {
+    mparams.devices = cpu_only_devices;
+    // Tensor split needs at least one device, and the empty list has none.
+    if (mparams.split_mode == LLAMA_SPLIT_MODE_TENSOR) {
+      mparams.split_mode = LLAMA_SPLIT_MODE_LAYER;
+    }
+  }
+
   g_state.model = llama_model_load_from_file(model_path, mparams);
   if (g_state.model == nullptr) {
     set_error("llama_model_load_from_file failed");

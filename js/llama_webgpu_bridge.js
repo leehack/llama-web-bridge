@@ -1402,15 +1402,52 @@ function isSafariUserAgent(userAgent) {
   const hasOtherBrowserToken = /(Chrome|Chromium|CriOS|Edg|OPR|Firefox|FxiOS)\//.test(userAgent);
   return hasSafariToken && !hasOtherBrowserToken;
 }
-function isCrossOriginIsolatedRuntime() {
-  try {
-    if (typeof globalThis.crossOriginIsolated === "boolean") {
-      return globalThis.crossOriginIsolated;
-    }
-  } catch (_) {
+function canPostSharedMemory() {
+  if (typeof MessageChannel !== "function" || typeof WebAssembly === "undefined") {
+    return true;
   }
-  return true;
+  let channel = null;
+  try {
+    channel = new MessageChannel();
+    channel.port1.postMessage(new WebAssembly.Memory({ initial: 1, maximum: 1, shared: true }));
+    return true;
+  } catch (_) {
+    return false;
+  } finally {
+    channel?.port1.close();
+    channel?.port2.close();
+  }
 }
+async function describeWebGpuUnavailable() {
+  const gpu = globalThis.navigator?.gpu;
+  if (!gpu || typeof gpu.requestAdapter !== "function") {
+    return { reason: "no_webgpu", adapter: "" };
+  }
+  let adapter = null;
+  try {
+    adapter = await gpu.requestAdapter();
+  } catch (_) {
+    adapter = null;
+  }
+  if (!adapter) {
+    return { reason: "no_adapter", adapter: "" };
+  }
+  return {
+    reason: adapter.features?.has?.("shader-f16") ? "unknown" : "adapter_missing_shader_f16",
+    adapter: [adapter.info?.vendor, adapter.info?.architecture].filter(Boolean).join("/")
+  };
+}
+
+// js/src/internal/isolation.ts
+var CROSS_ORIGIN_ISOLATION_REQUIRED = "CROSS_ORIGIN_ISOLATION_REQUIRED";
+var CrossOriginIsolationError = class extends Error {
+  constructor(message = CROSS_ORIGIN_ISOLATION_MESSAGE) {
+    super(message);
+    this.name = "CrossOriginIsolationError";
+    this.code = CROSS_ORIGIN_ISOLATION_REQUIRED;
+  }
+};
+var CROSS_ORIGIN_ISOLATION_MESSAGE = 'The llama.cpp web core needs shared memory, which this page cannot use because it is not cross-origin isolated. Serve the page with "Cross-Origin-Opener-Policy: same-origin" and "Cross-Origin-Embedder-Policy: require-corp". "credentialless" does not isolate Safari.';
 
 // js/src/internal/image.ts
 async function decodeImageBytesToRgb(bytes, options = {}) {
@@ -2751,6 +2788,9 @@ var LlamaWebGpuBridgeRuntime = class {
       this._applyCoreLogLevel();
       return this._core;
     }
+    if (!this._config.coreModuleFactory && this._config.allowSingleThreadCore !== true && !canPostSharedMemory()) {
+      throw new CrossOriginIsolationError();
+    }
     const candidates = [];
     if (this._config.coreModuleFactory) {
       candidates.push({
@@ -2942,6 +2982,18 @@ var LlamaWebGpuBridgeRuntime = class {
     if (Number.isFinite(requestedGpuLayers)) {
       this._nGpuLayers = Math.trunc(requestedGpuLayers);
     }
+    if (this._nGpuLayers > 0 && !this._gpuActive) {
+      const unavailable = await describeWebGpuUnavailable();
+      throwIfAborted(operationSignal, abortMessage);
+      this._pushRuntimeNote(`gpu_unavailable:${unavailable.reason}`);
+      const detail = {
+        no_webgpu: "this browser has no navigator.gpu",
+        no_adapter: "the browser returned no WebGPU adapter",
+        adapter_missing_shader_f16: `the ${unavailable.adapter || "WebGPU"} adapter lacks shader-f16`,
+        unknown: "the core registered no WebGPU device"
+      }[unavailable.reason];
+      this._emitLogger("warn", `WebGPU is unavailable (${detail}); loading on the WebAssembly CPU runtime.`);
+    }
     const isCpuModelMode = this._nGpuLayers === 0;
     const requestedBatch = Number(options.nBatch);
     this._nBatch = Number.isFinite(requestedBatch) && requestedBatch > 0 ? Math.max(32, Math.trunc(requestedBatch)) : isCpuModelMode ? Math.min(this._nCtx, 512) : 0;
@@ -2963,14 +3015,10 @@ var LlamaWebGpuBridgeRuntime = class {
     if (Number.isFinite(this._threadPoolSizeHint) && this._threadPoolSizeHint > 0) {
       this._pushRuntimeNote(`thread_pool_size:${this._threadPoolSizeHint}`);
     }
-    if (!isCrossOriginIsolatedRuntime()) {
+    if (!canPostSharedMemory()) {
       this._runtimeNotes.push("threads_capped_no_coi");
-      if (this._threads > 1) {
-        this._threads = 1;
-      }
-      if (this._threadsBatch > 1) {
-        this._threadsBatch = 1;
-      }
+      this._threads = Math.min(this._threads, 1);
+      this._threadsBatch = Math.min(this._threadsBatch, 1);
     }
     this._pushRuntimeNote(`threads_batch:${this._threadsBatch}`);
     if (this._nBatch > 0) {
@@ -5346,7 +5394,7 @@ var BridgeWorkerProxy = class {
       this._pending.delete(id);
       if (type === "error") {
         const errorMessage = String(message.message || "Worker request failed");
-        const workerError = message.embeddingErrorCode ? new EmbeddingError(message.embeddingErrorCode, errorMessage) : new Error(errorMessage);
+        const workerError = message.embeddingErrorCode ? new EmbeddingError(message.embeddingErrorCode, errorMessage) : message.errorCode === CROSS_ORIGIN_ISOLATION_REQUIRED ? new CrossOriginIsolationError(errorMessage) : new Error(errorMessage);
         if (isDecisionErrorCode(message.decisionErrorCode)) {
           withDecisionErrorCode(workerError, message.decisionErrorCode);
         }
@@ -6472,6 +6520,7 @@ var LlamaWebGpuBridge = class {
       coreModuleUrl: typeof config.coreModuleUrl === "string" ? config.coreModuleUrl : void 0,
       coreModuleUrlMem64: typeof config.coreModuleUrlMem64 === "string" ? config.coreModuleUrlMem64 : void 0,
       preferMemory64: typeof config.preferMemory64 === "boolean" ? config.preferMemory64 : void 0,
+      allowSingleThreadCore: config.allowSingleThreadCore === true ? true : void 0,
       threads: Number(config.threads) > 0 ? Number(config.threads) : void 0,
       threadsBatch: Number(config.threadsBatch) > 0 ? Number(config.threadsBatch) : void 0,
       threadPoolSize: Number(config.threadPoolSize) > 0 ? Number(config.threadPoolSize) : void 0,
@@ -8261,6 +8310,7 @@ function installBridgeWorkerHost() {
       id,
       message: serializeWorkerError(error),
       ...error instanceof EmbeddingError ? { embeddingErrorCode: error.code } : {},
+      ...error instanceof CrossOriginIsolationError ? { errorCode: CROSS_ORIGIN_ISOLATION_REQUIRED } : {},
       ...decisionErrorCode ? { decisionErrorCode } : {},
       state
     });
@@ -8628,6 +8678,7 @@ if (typeof window !== "undefined") {
   }
 }
 export {
+  CrossOriginIsolationError,
   EmbeddingError,
   LlamaWebGpuBridge,
   enableBridgeWorkerHost
