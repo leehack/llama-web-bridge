@@ -34,7 +34,7 @@ import {
   unlinkFsFile,
   writeResponseToFsFileWithProgress,
 } from './internal/download.ts';
-import { canPostSharedMemory, isSafariUserAgent } from './internal/environment.ts';
+import { canPostSharedMemory, describeWebGpuUnavailable, isSafariUserAgent } from './internal/environment.ts';
 import { CrossOriginIsolationError } from './internal/isolation.ts';
 import { decodeImageBytesToRgb } from './internal/image.ts';
 import {
@@ -1778,7 +1778,7 @@ export class LlamaWebGpuBridgeRuntime {
       return this._core;
     }
 
-    if (!this._config.coreModuleFactory && !canPostSharedMemory()) {
+    if (!this._config.coreModuleFactory && this._config.allowSingleThreadCore !== true && !canPostSharedMemory()) {
       throw new CrossOriginIsolationError();
     }
 
@@ -2021,6 +2021,19 @@ export class LlamaWebGpuBridgeRuntime {
       this._nGpuLayers = Math.trunc(requestedGpuLayers);
     }
 
+    if (this._nGpuLayers > 0 && !this._gpuActive) {
+      const unavailable = await describeWebGpuUnavailable();
+      throwIfAborted(operationSignal, abortMessage);
+      this._pushRuntimeNote(`gpu_unavailable:${unavailable.reason}`);
+      const detail = {
+        no_webgpu: 'this browser has no navigator.gpu',
+        no_adapter: 'the browser returned no WebGPU adapter',
+        adapter_missing_shader_f16: `the ${unavailable.adapter || 'WebGPU'} adapter lacks shader-f16`,
+        unknown: 'the core registered no WebGPU device',
+      }[unavailable.reason];
+      this._emitLogger('warn', `WebGPU is unavailable (${detail}); loading on the WebAssembly CPU runtime.`);
+    }
+
     const isCpuModelMode = this._nGpuLayers === 0;
 
     const requestedBatch = Number(options.nBatch);
@@ -2051,6 +2064,13 @@ export class LlamaWebGpuBridgeRuntime {
 
     if (Number.isFinite(this._threadPoolSizeHint) && this._threadPoolSizeHint! > 0) {
       this._pushRuntimeNote(`thread_pool_size:${this._threadPoolSizeHint}`);
+    }
+
+    // Only a core that never posts shared memory gets here without isolation.
+    if (!canPostSharedMemory()) {
+      this._runtimeNotes.push('threads_capped_no_coi');
+      this._threads = Math.min(this._threads, 1);
+      this._threadsBatch = Math.min(this._threadsBatch, 1);
     }
 
     this._pushRuntimeNote(`threads_batch:${this._threadsBatch}`);

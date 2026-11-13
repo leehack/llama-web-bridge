@@ -130,9 +130,45 @@ await withStubWorkerEnvironment(async ({ workers }) => {
   await bridge.dispose().catch(() => {});
 });
 
-// The note claimed a single-thread fallback that does not exist.
+// A core built without pthreads never posts shared memory, so a page that
+// opts out loads it on a non-isolated page, capped to one thread.
+await withUnpostableSharedMemory(async () => {
+  const bridge = directBridge(REACHED_CORE, { allowSingleThreadCore: true });
+  await assert.rejects(
+    bridge.loadModelFromUrl('https://models.test/m.gguf', { nGpuLayers: 0 }),
+    /core factory reached/,
+  );
+  await bridge.dispose();
+
+  const { createDirectBridge } = await import('./bridge_operation_queue_fixtures.mjs');
+  const { bridge: loaded, core } = createDirectBridge();
+  const runtime = loaded._runtime;
+  runtime._modelBytes = 0;
+  const loads = [];
+  const ccall = core.ccall.bind(core);
+  core.ccall = (name, type, types, args = []) => {
+    if (name === 'llamadart_webgpu_load_model') { loads.push([...args]); return 0; }
+    if (name === 'llamadart_webgpu_free_model') return 0;
+    if (name === 'llamadart_webgpu_get_context_size') return 128;
+    return ccall(name, type, types, args);
+  };
+  runtime._probeBackends = async () => {};
+  runtime._ensureCore = async () => core;
+  runtime._coreSupportsPthreads = () => true;
+  runtime._syncThreadPoolSizeHintFromCore = () => { runtime._threadPoolSizeHint = 4; };
+  runtime._getCachedModelResponse = async () => new Response(new Uint8Array([1, 2, 3]));
+  runtime._emitLogger = () => {};
+  await loaded.loadModelFromUrl('https://models.test/m.gguf', {
+    nCtx: 128, nThreads: 4, nThreadsBatch: 4, nGpuLayers: 0, forceRemoteFetchBackend: false, useCache: false,
+  });
+  assert.equal(loads[0][2], 1);
+  assert.equal(loads[0][3], 1);
+  assert.match(loaded.getModelMetadata()['llamadart.webgpu.runtime_notes'], /threads_capped_no_coi/);
+});
+
+// The opt-out reaches the worker host.
 {
-  const { readFileSync } = await import('node:fs');
-  const source = readFileSync(new URL('../../js/src/runtime.ts', import.meta.url), 'utf8');
-  assert.doesNotMatch(source, /threads_capped_no_coi/);
+  const bridge = directBridge(REACHED_CORE, { allowSingleThreadCore: true });
+  assert.equal(bridge._workerConfig().allowSingleThreadCore, true);
+  assert.equal(directBridge(REACHED_CORE)._workerConfig().allowSingleThreadCore, undefined);
 }

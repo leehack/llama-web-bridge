@@ -1418,6 +1418,25 @@ function canPostSharedMemory() {
     channel?.port2.close();
   }
 }
+async function describeWebGpuUnavailable() {
+  const gpu = globalThis.navigator?.gpu;
+  if (!gpu || typeof gpu.requestAdapter !== "function") {
+    return { reason: "no_webgpu", adapter: "" };
+  }
+  let adapter = null;
+  try {
+    adapter = await gpu.requestAdapter();
+  } catch (_) {
+    adapter = null;
+  }
+  if (!adapter) {
+    return { reason: "no_adapter", adapter: "" };
+  }
+  return {
+    reason: adapter.features?.has?.("shader-f16") ? "unknown" : "adapter_missing_shader_f16",
+    adapter: [adapter.info?.vendor, adapter.info?.architecture].filter(Boolean).join("/")
+  };
+}
 
 // js/src/internal/isolation.ts
 var CROSS_ORIGIN_ISOLATION_REQUIRED = "CROSS_ORIGIN_ISOLATION_REQUIRED";
@@ -2769,7 +2788,7 @@ var LlamaWebGpuBridgeRuntime = class {
       this._applyCoreLogLevel();
       return this._core;
     }
-    if (!this._config.coreModuleFactory && !canPostSharedMemory()) {
+    if (!this._config.coreModuleFactory && this._config.allowSingleThreadCore !== true && !canPostSharedMemory()) {
       throw new CrossOriginIsolationError();
     }
     const candidates = [];
@@ -2963,6 +2982,18 @@ var LlamaWebGpuBridgeRuntime = class {
     if (Number.isFinite(requestedGpuLayers)) {
       this._nGpuLayers = Math.trunc(requestedGpuLayers);
     }
+    if (this._nGpuLayers > 0 && !this._gpuActive) {
+      const unavailable = await describeWebGpuUnavailable();
+      throwIfAborted(operationSignal, abortMessage);
+      this._pushRuntimeNote(`gpu_unavailable:${unavailable.reason}`);
+      const detail = {
+        no_webgpu: "this browser has no navigator.gpu",
+        no_adapter: "the browser returned no WebGPU adapter",
+        adapter_missing_shader_f16: `the ${unavailable.adapter || "WebGPU"} adapter lacks shader-f16`,
+        unknown: "the core registered no WebGPU device"
+      }[unavailable.reason];
+      this._emitLogger("warn", `WebGPU is unavailable (${detail}); loading on the WebAssembly CPU runtime.`);
+    }
     const isCpuModelMode = this._nGpuLayers === 0;
     const requestedBatch = Number(options.nBatch);
     this._nBatch = Number.isFinite(requestedBatch) && requestedBatch > 0 ? Math.max(32, Math.trunc(requestedBatch)) : isCpuModelMode ? Math.min(this._nCtx, 512) : 0;
@@ -2983,6 +3014,11 @@ var LlamaWebGpuBridgeRuntime = class {
     }
     if (Number.isFinite(this._threadPoolSizeHint) && this._threadPoolSizeHint > 0) {
       this._pushRuntimeNote(`thread_pool_size:${this._threadPoolSizeHint}`);
+    }
+    if (!canPostSharedMemory()) {
+      this._runtimeNotes.push("threads_capped_no_coi");
+      this._threads = Math.min(this._threads, 1);
+      this._threadsBatch = Math.min(this._threadsBatch, 1);
     }
     this._pushRuntimeNote(`threads_batch:${this._threadsBatch}`);
     if (this._nBatch > 0) {
@@ -6484,6 +6520,7 @@ var LlamaWebGpuBridge = class {
       coreModuleUrl: typeof config.coreModuleUrl === "string" ? config.coreModuleUrl : void 0,
       coreModuleUrlMem64: typeof config.coreModuleUrlMem64 === "string" ? config.coreModuleUrlMem64 : void 0,
       preferMemory64: typeof config.preferMemory64 === "boolean" ? config.preferMemory64 : void 0,
+      allowSingleThreadCore: config.allowSingleThreadCore === true ? true : void 0,
       threads: Number(config.threads) > 0 ? Number(config.threads) : void 0,
       threadsBatch: Number(config.threadsBatch) > 0 ? Number(config.threadsBatch) : void 0,
       threadPoolSize: Number(config.threadPoolSize) > 0 ? Number(config.threadPoolSize) : void 0,

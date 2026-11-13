@@ -65,6 +65,10 @@ int32_t load_model_internal(
   static ggml_backend_dev_t cpu_only_devices[] = {nullptr};
   if (n_gpu_layers == 0) {
     mparams.devices = cpu_only_devices;
+    // Tensor split needs at least one device, and the empty list has none.
+    if (mparams.split_mode == LLAMA_SPLIT_MODE_TENSOR) {
+      mparams.split_mode = LLAMA_SPLIT_MODE_LAYER;
+    }
   }
 
   g_state.model = llama_model_load_from_file(model_path, mparams);

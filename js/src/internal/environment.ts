@@ -32,3 +32,33 @@ export function canPostSharedMemory(): boolean {
     channel?.port2.close();
   }
 }
+
+export type WebGpuUnavailable = {
+  reason: 'no_webgpu' | 'no_adapter' | 'adapter_missing_shader_f16' | 'unknown';
+  adapter: string;
+};
+
+// ggml-webgpu registers its device only for an adapter with shader-f16 and
+// logs nothing otherwise, so the page-side adapter is the only place that
+// can say why a GPU load runs on the CPU.
+export async function describeWebGpuUnavailable(): Promise<WebGpuUnavailable> {
+  const gpu = (globalThis.navigator as { gpu?: { requestAdapter?: () => Promise<any> } } | undefined)?.gpu;
+  if (!gpu || typeof gpu.requestAdapter !== 'function') {
+    return { reason: 'no_webgpu', adapter: '' };
+  }
+
+  let adapter = null;
+  try {
+    adapter = await gpu.requestAdapter();
+  } catch (_) {
+    adapter = null;
+  }
+  if (!adapter) {
+    return { reason: 'no_adapter', adapter: '' };
+  }
+
+  return {
+    reason: adapter.features?.has?.('shader-f16') ? 'unknown' : 'adapter_missing_shader_f16',
+    adapter: [adapter.info?.vendor, adapter.info?.architecture].filter(Boolean).join('/'),
+  };
+}

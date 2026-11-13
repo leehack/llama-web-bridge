@@ -11,11 +11,18 @@ const body = loader.slice(0, loader.indexOf('llama_model_load_from_file('));
 
 assert.match(
   body,
-  /if \(n_gpu_layers == 0\) \{\s*mparams\.devices = [A-Za-z_]+;\s*\}/,
+  /if \(n_gpu_layers == 0\) \{\s*mparams\.devices = [A-Za-z_]+;/,
   'a zero-layer load must pass an empty device list',
 );
 assert.match(
   body,
   /static ggml_backend_dev_t [A-Za-z_]+\[\] = \{nullptr\};/,
   'the empty list outlives the call: draft models reuse g_model_params',
+);
+
+// Tensor split needs a device, and an empty list has none.
+assert.match(
+  body,
+  /if \(n_gpu_layers == 0\) \{[^}]*LLAMA_SPLIT_MODE_TENSOR[^}]*LLAMA_SPLIT_MODE_LAYER/,
+  'a zero-layer load must not ask for tensor split',
 );

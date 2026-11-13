@@ -1460,6 +1460,7 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
       preferMemory64: typeof config.preferMemory64 === 'boolean'
         ? config.preferMemory64
         : undefined,
+      allowSingleThreadCore: config.allowSingleThreadCore === true ? true : undefined,
       threads: Number(config.threads) > 0 ? Number(config.threads) : undefined,
       threadsBatch: Number(config.threadsBatch) > 0
         ? Number(config.threadsBatch)
