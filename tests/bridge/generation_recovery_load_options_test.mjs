@@ -32,9 +32,7 @@ function fixture() {
   return { bridge, runtime, core, loads };
 }
 
-const oldIsolation = Object.getOwnPropertyDescriptor(globalThis, 'crossOriginIsolated');
-Object.defineProperty(globalThis, 'crossOriginIsolated', { configurable: true, value: true });
-try {
+{
   for (const custom of [
     {},
     { nSeqMax: 3, useMmap: true, useMlock: true, flashAttention: 1, cacheTypeK: 8, cacheTypeV: 2, kvUnified: false,
@@ -59,29 +57,22 @@ try {
     assert.deepEqual(loads[1], expected, 'recovery must preserve every resolved native load argument');
     assert.equal(runtime._preferMemory64, preferMemory64);
   }
-  for (const loseIsolation of [false, true]) {
+  {
     const { bridge, runtime, loads } = fixture();
     runtime._syncThreadPoolSizeHintFromCore = () => {
       runtime._threadPoolSizeHint = loads.length === 0 ? 4 : 2;
-      if (loseIsolation && loads.length > 0) {
-        Object.defineProperty(globalThis, 'crossOriginIsolated', { configurable: true, value: false });
-      }
     };
-    try {
-      await bridge.loadModelFromUrl('https://models.test/pool.gguf', {
-        nCtx: 128, nGpuLayers: 99, nThreads: 4, nThreadsBatch: 3,
-        nBatch: 96, nUbatch: 64, ropeFrequencyScale: 0.5, forceRemoteFetchBackend: false,
-      });
-      assert.equal(await bridge.createCompletion('hello', { nPredict: 2 }), 'OK');
-      assert.equal(loads.length, 2);
-      const expected = [...loads[0]];
-      expected[2] = loseIsolation ? 1 : 2;
-      expected[3] = loseIsolation ? 1 : 2;
-      expected[6] = 0;
-      assert.deepEqual(loads[1], expected, 'recovery must respect replacement pool and isolation limits');
-    } finally {
-      Object.defineProperty(globalThis, 'crossOriginIsolated', { configurable: true, value: true });
-    }
+    await bridge.loadModelFromUrl('https://models.test/pool.gguf', {
+      nCtx: 128, nGpuLayers: 99, nThreads: 4, nThreadsBatch: 3,
+      nBatch: 96, nUbatch: 64, ropeFrequencyScale: 0.5, forceRemoteFetchBackend: false,
+    });
+    assert.equal(await bridge.createCompletion('hello', { nPredict: 2 }), 'OK');
+    assert.equal(loads.length, 2);
+    const expected = [...loads[0]];
+    expected[2] = 2;
+    expected[3] = 2;
+    expected[6] = 0;
+    assert.deepEqual(loads[1], expected, 'recovery must respect the replacement pool limit');
   }
   const { bridge, runtime, loads } = fixture();
   await bridge.loadModelFromUrl('https://models.test/model.gguf', { nGpuLayers: 99, forceRemoteFetchBackend: false });
@@ -133,9 +124,6 @@ try {
     if (oldSelf === undefined) delete globalThis.self;
     else globalThis.self = oldSelf;
   }
-} finally {
-  if (oldIsolation) Object.defineProperty(globalThis, 'crossOriginIsolated', oldIsolation);
-  else delete globalThis.crossOriginIsolated;
 }
 
 console.log('Generation recovery load option tests passed');

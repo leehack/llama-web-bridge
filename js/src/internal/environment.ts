@@ -10,15 +10,25 @@ export function isSafariUserAgent(userAgent: unknown): boolean {
   return hasSafariToken && !hasOtherBrowserToken;
 }
 
-export function isCrossOriginIsolatedRuntime(): boolean {
-  try {
-    if (typeof globalThis.crossOriginIsolated === 'boolean') {
-      return globalThis.crossOriginIsolated;
-    }
-  } catch (_) {
-    // ignore environment probing failures
+// A pthread core preallocates workers and posts its shared memory to them.
+// Browsers refuse that post (DataCloneError) unless the page is cross-origin
+// isolated, and core init then never settles. Probing the post itself, rather
+// than `crossOriginIsolated`, also accepts pages that enable shared memory
+// another way, such as Chrome's SharedArrayBufferUnrestrictedAccessAllowed.
+export function canPostSharedMemory(): boolean {
+  if (typeof MessageChannel !== 'function' || typeof WebAssembly === 'undefined') {
+    return true;
   }
 
-  // Assume isolated in runtimes that do not expose the signal.
-  return true;
+  let channel: MessageChannel | null = null;
+  try {
+    channel = new MessageChannel();
+    channel.port1.postMessage(new WebAssembly.Memory({ initial: 1, maximum: 1, shared: true }));
+    return true;
+  } catch (_) {
+    return false;
+  } finally {
+    channel?.port1.close();
+    channel?.port2.close();
+  }
 }

@@ -1242,7 +1242,10 @@ this function themselves.
 - Large single-file model loads and pthread-backed runtime paths require
   cross-origin isolation (`Cross-Origin-Opener-Policy: same-origin` and
   `Cross-Origin-Embedder-Policy: require-corp`) so `SharedArrayBuffer` is
-  available.
+  available. `credentialless` does not isolate Safari. On a page that cannot
+  share memory with workers, a load rejects immediately with
+  `CrossOriginIsolationError` (`code: 'CROSS_ORIGIN_ISOLATION_REQUIRED'`)
+  instead of waiting for the core init timeout.
 - Serve `llama_webgpu_core.js` and `llama_webgpu_core.wasm` from URLs reachable
   by both the page and worker. If using wasm64, also serve the `_mem64` files.
 - Keep `llama_webgpu_bridge.js`, `llama_webgpu_bridge_worker.js`, the core JS,

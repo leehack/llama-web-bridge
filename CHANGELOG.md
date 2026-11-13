@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- A load on a page that is not cross-origin isolated rejects at once with `CrossOriginIsolationError`, which names `Cross-Origin-Embedder-Policy: require-corp` and that `credentialless` does not isolate Safari, instead of hanging until the core init timeout. The `threads_capped_no_coi` runtime note, which promised a single-thread fallback the core never had, is gone.
+- A load with `nGpuLayers: 0` keeps WebGPU out of the model and context backends, so CPU decoding on Firefox no longer waits on its 100 ms WebGPU queue ticks at every sync (about 50x faster on a small model).
 - `CompletionOptions.thinkingBudget.pauseGrammar: false` keeps a grammar applied inside a reasoning block, so a grammar that takes the block and its end tag itself, such as one for a prompt that ends inside the block, sees the budget's forced `</think>`. It needs the new `thinkingBudgetPauseGrammar` capability; omitted, the grammar pauses as before.
 - WebGPU text-to-speech applies the GGUF's suppress tokens in the talker sampler, as upstream does.
   Qwen3-TTS no longer fails with `code out of range` when a codec control token is sampled.

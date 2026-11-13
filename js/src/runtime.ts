@@ -34,7 +34,8 @@ import {
   unlinkFsFile,
   writeResponseToFsFileWithProgress,
 } from './internal/download.ts';
-import { isCrossOriginIsolatedRuntime, isSafariUserAgent } from './internal/environment.ts';
+import { canPostSharedMemory, isSafariUserAgent } from './internal/environment.ts';
+import { CrossOriginIsolationError } from './internal/isolation.ts';
 import { decodeImageBytesToRgb } from './internal/image.ts';
 import {
   EmbeddingError, EMPTY_EMBEDDING_CAPABILITIES, EMBEDDING_MEDIA_MARKER,
@@ -1777,6 +1778,10 @@ export class LlamaWebGpuBridgeRuntime {
       return this._core;
     }
 
+    if (!this._config.coreModuleFactory && !canPostSharedMemory()) {
+      throw new CrossOriginIsolationError();
+    }
+
     const candidates = [];
     if (this._config.coreModuleFactory) {
       candidates.push({
@@ -2046,16 +2051,6 @@ export class LlamaWebGpuBridgeRuntime {
 
     if (Number.isFinite(this._threadPoolSizeHint) && this._threadPoolSizeHint! > 0) {
       this._pushRuntimeNote(`thread_pool_size:${this._threadPoolSizeHint}`);
-    }
-
-    if (!isCrossOriginIsolatedRuntime()) {
-      this._runtimeNotes.push('threads_capped_no_coi');
-      if (this._threads > 1) {
-        this._threads = 1;
-      }
-      if (this._threadsBatch > 1) {
-        this._threadsBatch = 1;
-      }
     }
 
     this._pushRuntimeNote(`threads_batch:${this._threadsBatch}`);

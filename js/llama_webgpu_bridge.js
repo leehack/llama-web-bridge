@@ -1402,15 +1402,33 @@ function isSafariUserAgent(userAgent) {
   const hasOtherBrowserToken = /(Chrome|Chromium|CriOS|Edg|OPR|Firefox|FxiOS)\//.test(userAgent);
   return hasSafariToken && !hasOtherBrowserToken;
 }
-function isCrossOriginIsolatedRuntime() {
-  try {
-    if (typeof globalThis.crossOriginIsolated === "boolean") {
-      return globalThis.crossOriginIsolated;
-    }
-  } catch (_) {
+function canPostSharedMemory() {
+  if (typeof MessageChannel !== "function" || typeof WebAssembly === "undefined") {
+    return true;
   }
-  return true;
+  let channel = null;
+  try {
+    channel = new MessageChannel();
+    channel.port1.postMessage(new WebAssembly.Memory({ initial: 1, maximum: 1, shared: true }));
+    return true;
+  } catch (_) {
+    return false;
+  } finally {
+    channel?.port1.close();
+    channel?.port2.close();
+  }
 }
+
+// js/src/internal/isolation.ts
+var CROSS_ORIGIN_ISOLATION_REQUIRED = "CROSS_ORIGIN_ISOLATION_REQUIRED";
+var CrossOriginIsolationError = class extends Error {
+  constructor(message = CROSS_ORIGIN_ISOLATION_MESSAGE) {
+    super(message);
+    this.name = "CrossOriginIsolationError";
+    this.code = CROSS_ORIGIN_ISOLATION_REQUIRED;
+  }
+};
+var CROSS_ORIGIN_ISOLATION_MESSAGE = 'The llama.cpp web core needs shared memory, which this page cannot use because it is not cross-origin isolated. Serve the page with "Cross-Origin-Opener-Policy: same-origin" and "Cross-Origin-Embedder-Policy: require-corp". "credentialless" does not isolate Safari.';
 
 // js/src/internal/image.ts
 async function decodeImageBytesToRgb(bytes, options = {}) {
@@ -2751,6 +2769,9 @@ var LlamaWebGpuBridgeRuntime = class {
       this._applyCoreLogLevel();
       return this._core;
     }
+    if (!this._config.coreModuleFactory && !canPostSharedMemory()) {
+      throw new CrossOriginIsolationError();
+    }
     const candidates = [];
     if (this._config.coreModuleFactory) {
       candidates.push({
@@ -2962,15 +2983,6 @@ var LlamaWebGpuBridgeRuntime = class {
     }
     if (Number.isFinite(this._threadPoolSizeHint) && this._threadPoolSizeHint > 0) {
       this._pushRuntimeNote(`thread_pool_size:${this._threadPoolSizeHint}`);
-    }
-    if (!isCrossOriginIsolatedRuntime()) {
-      this._runtimeNotes.push("threads_capped_no_coi");
-      if (this._threads > 1) {
-        this._threads = 1;
-      }
-      if (this._threadsBatch > 1) {
-        this._threadsBatch = 1;
-      }
     }
     this._pushRuntimeNote(`threads_batch:${this._threadsBatch}`);
     if (this._nBatch > 0) {
@@ -5346,7 +5358,7 @@ var BridgeWorkerProxy = class {
       this._pending.delete(id);
       if (type === "error") {
         const errorMessage = String(message.message || "Worker request failed");
-        const workerError = message.embeddingErrorCode ? new EmbeddingError(message.embeddingErrorCode, errorMessage) : new Error(errorMessage);
+        const workerError = message.embeddingErrorCode ? new EmbeddingError(message.embeddingErrorCode, errorMessage) : message.errorCode === CROSS_ORIGIN_ISOLATION_REQUIRED ? new CrossOriginIsolationError(errorMessage) : new Error(errorMessage);
         if (isDecisionErrorCode(message.decisionErrorCode)) {
           withDecisionErrorCode(workerError, message.decisionErrorCode);
         }
@@ -8261,6 +8273,7 @@ function installBridgeWorkerHost() {
       id,
       message: serializeWorkerError(error),
       ...error instanceof EmbeddingError ? { embeddingErrorCode: error.code } : {},
+      ...error instanceof CrossOriginIsolationError ? { errorCode: CROSS_ORIGIN_ISOLATION_REQUIRED } : {},
       ...decisionErrorCode ? { decisionErrorCode } : {},
       state
     });
@@ -8628,6 +8641,7 @@ if (typeof window !== "undefined") {
   }
 }
 export {
+  CrossOriginIsolationError,
   EmbeddingError,
   LlamaWebGpuBridge,
   enableBridgeWorkerHost

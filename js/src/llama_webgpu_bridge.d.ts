@@ -296,6 +296,13 @@ export class EmbeddingError extends Error {
   constructor(code: EmbeddingErrorCode, message: string);
 }
 
+export type CrossOriginIsolationErrorCode = 'CROSS_ORIGIN_ISOLATION_REQUIRED';
+/** Thrown by a load or core init on a page that cannot share memory with workers, before the core starts. */
+export class CrossOriginIsolationError extends Error {
+  code: CrossOriginIsolationErrorCode;
+  constructor(message?: string);
+}
+
 export interface NextTokenScoreOptions {
   /** Token ids to score, in the order the result lists them. */
   candidates?: ArrayLike<number>;
