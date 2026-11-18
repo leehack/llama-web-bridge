@@ -22,6 +22,8 @@ set(LLAMA_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(LLAMA_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(LLAMA_BUILD_SERVER OFF CACHE BOOL "" FORCE)
 set(LLAMA_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
+set(LLAMA_BUILD_MTMD ON CACHE BOOL "" FORCE)
+set(MTMD_VIDEO OFF CACHE BOOL "" FORCE)
 set(LLAMA_HTTPLIB OFF CACHE BOOL "" FORCE)
 set(LLAMA_OPENSSL OFF CACHE BOOL "" FORCE)
 set(LLAMA_BUILD_HTML OFF CACHE BOOL "" FORCE)
@@ -108,48 +110,45 @@ int main() { return 0; }
 " LLAMADART_WEBGPU_SPECULATIVE_HAS_COMMON_BATCH)
 cmake_pop_check_state()
 
-find_package(Threads REQUIRED)
-
-set(MTMD_AUDIO_SRC "${LLAMA_CPP_DIR}/tools/mtmd/mtmd-audio.cpp")
-set(MTMD_AUDIO_PATCHED "${CMAKE_BINARY_DIR}/generated/mtmd-audio-single-thread.cpp")
-
-file(GLOB LLAMADART_MTMD_MODEL_SOURCES
-    "${LLAMA_CPP_DIR}/tools/mtmd/models/*.cpp")
-
+set(MTMD_DIR "${LLAMA_CPP_DIR}/tools/mtmd")
+set(MTMD_AUDIO_SRC "${MTMD_DIR}/mtmd-audio.cpp")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${MTMD_AUDIO_SRC}")
 file(READ "${MTMD_AUDIO_SRC}" MTMD_AUDIO_CONTENT)
 string(FIND "${MTMD_AUDIO_CONTENT}" "4,  // n_threads" MTMD_AUDIO_THREAD_MARKER_INDEX)
-if (MTMD_AUDIO_THREAD_MARKER_INDEX EQUAL -1)
-    message(FATAL_ERROR "mtmd-audio.cpp thread marker not found; update single-thread wasm patch")
+if (NOT MTMD_AUDIO_THREAD_MARKER_INDEX EQUAL -1)
+    # Older mtmd starts its own mel workers outside the configured thread budget.
+    set(MTMD_REPLACED_SOURCE "${MTMD_AUDIO_SRC}")
+    set(MTMD_PATCHED_NAME "mtmd-audio-single-thread.cpp")
+    string(REPLACE "4,  // n_threads" "1,  // n_threads (patched for wasm)"
+        MTMD_PATCHED_CONTENT "${MTMD_AUDIO_CONTENT}")
+else()
+    string(FIND "${MTMD_AUDIO_CONTENT}" "mtmd_audio_log_mel(params," MTMD_AUDIO_SCHEDULER_INDEX)
+    if (MTMD_AUDIO_SCHEDULER_INDEX EQUAL -1)
+        message(FATAL_ERROR "mtmd-audio.cpp thread markers not found; recheck the wasm thread budget")
+    endif()
+
+    # A persistent projector pool holds workers needed by text decode on the same core.
+    # Leave ggml to allocate workers per graph with the configured thread count.
+    set(MTMD_REPLACED_SOURCE "${MTMD_DIR}/mtmd-subcontext.cpp")
+    set(MTMD_PATCHED_NAME "mtmd-subcontext-disposable-threads.cpp")
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${MTMD_REPLACED_SOURCE}")
+    file(READ "${MTMD_REPLACED_SOURCE}" MTMD_SUBCONTEXT_CONTENT)
+    string(REGEX MATCHALL "threadpool = mtmd_threadpool_init\\(n_threads\\);"
+        MTMD_THREADPOOL_INIT_MATCHES "${MTMD_SUBCONTEXT_CONTENT}")
+    if (NOT MTMD_THREADPOOL_INIT_MATCHES STREQUAL "threadpool = mtmd_threadpool_init(n_threads);")
+        message(FATAL_ERROR "mtmd-subcontext.cpp pool initialization changed; recheck the wasm thread budget")
+    endif()
+    string(REPLACE "threadpool = mtmd_threadpool_init(n_threads);" "(void) n_threads;"
+        MTMD_PATCHED_CONTENT "${MTMD_SUBCONTEXT_CONTENT}")
 endif()
-string(REPLACE
-    "4,  // n_threads"
-    "1,  // n_threads (patched for single-threaded wasm)"
-    MTMD_AUDIO_CONTENT
-    "${MTMD_AUDIO_CONTENT}")
-file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/generated")
-file(WRITE "${MTMD_AUDIO_PATCHED}" "${MTMD_AUDIO_CONTENT}")
 
-add_library(llamadart_mtmd STATIC
-    "${LLAMA_CPP_DIR}/tools/mtmd/mtmd.cpp"
-    "${MTMD_AUDIO_PATCHED}"
-    "${LLAMA_CPP_DIR}/tools/mtmd/mtmd-image.cpp"
-    "${LLAMA_CPP_DIR}/tools/mtmd/mtmd-helper.cpp"
-    "${LLAMA_CPP_DIR}/tools/mtmd/mtmd-helper-gen.cpp"
-    "${LLAMA_CPP_DIR}/tools/mtmd/clip.cpp"
-    ${LLAMADART_MTMD_MODEL_SOURCES}
-)
-
-target_compile_features(llamadart_mtmd PRIVATE cxx_std_17)
-target_include_directories(llamadart_mtmd PRIVATE
-    "${LLAMA_CPP_DIR}/tools/mtmd"
-    "${LLAMA_CPP_DIR}"
-    "${LLAMA_CPP_DIR}/vendor"
-)
-target_link_libraries(llamadart_mtmd PRIVATE ggml llama Threads::Threads vendor::hash)
-
-if (NOT MSVC)
-    target_compile_options(llamadart_mtmd PRIVATE -Wno-cast-qual)
-endif()
+set(MTMD_PATCHED_SOURCE "${CMAKE_BINARY_DIR}/generated/${MTMD_PATCHED_NAME}")
+file(CONFIGURE OUTPUT "${MTMD_PATCHED_SOURCE}" CONTENT "${MTMD_PATCHED_CONTENT}" @ONLY)
+set_source_files_properties("${MTMD_REPLACED_SOURCE}" DIRECTORY "${MTMD_DIR}"
+    PROPERTIES HEADER_FILE_ONLY TRUE)
+set_source_files_properties("${MTMD_PATCHED_SOURCE}" DIRECTORY "${MTMD_DIR}"
+    PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON)
+target_sources(mtmd PRIVATE "${MTMD_PATCHED_SOURCE}")
 
 add_executable(llama_webgpu_core
     src/llama_webgpu_core.cpp
@@ -222,7 +221,7 @@ target_include_directories(llama_webgpu_core PRIVATE
     "${LLAMA_CPP_DIR}/src"
 )
 
-target_link_libraries(llama_webgpu_core PRIVATE llama llama-common llamadart_mtmd)
+target_link_libraries(llama_webgpu_core PRIVATE llama llama-common mtmd)
 
 set(LLAMADART_WEBGPU_LINK_OPTIONS
     "-sWASMFS=1"
