@@ -1074,6 +1074,34 @@ function createModelTransferLengthError(message) {
   error.name = "ModelTransferLengthError";
   return error;
 }
+function readNormalizedHeader(response, headerName) {
+  const raw = response.headers?.get(headerName);
+  return typeof raw === "string" ? raw.trim() : "";
+}
+function captureResumeValidators(response) {
+  const etag = readNormalizedHeader(response, "etag");
+  const lastModified = readNormalizedHeader(response, "last-modified");
+  const strongEtag = etag.length > 0 && !/^w\//i.test(etag) ? etag : "";
+  const ifRange = strongEtag || lastModified;
+  return { etag, lastModified, ifRange };
+}
+function validateResumedValidators(initial, response) {
+  if (!initial) {
+    return;
+  }
+  const resumedEtag = readNormalizedHeader(response, "etag");
+  if (initial.etag && resumedEtag && resumedEtag !== initial.etag) {
+    throw createModelTransferLengthError(
+      "Resumed 206 ETag validator changed; refusing to splice partial model bytes."
+    );
+  }
+  const resumedLastModified = readNormalizedHeader(response, "last-modified");
+  if (initial.lastModified && resumedLastModified && resumedLastModified !== initial.lastModified) {
+    throw createModelTransferLengthError(
+      "Resumed 206 Last-Modified validator changed; refusing to splice partial model bytes."
+    );
+  }
+}
 function parseContentRangeHeader(contentRangeHeader) {
   if (typeof contentRangeHeader !== "string") {
     return null;
@@ -1771,10 +1799,36 @@ function scoredTokensFrom(entries) {
 // js/src/runtime.ts
 var pendingModelCacheStores = /* @__PURE__ */ new WeakMap();
 var textEncoder = new TextEncoder();
+function errorNameOf(error) {
+  if (!error || typeof error !== "object") {
+    return "";
+  }
+  const named = error.name;
+  return typeof named === "string" ? named : "";
+}
+function isBridgeTypedError(error) {
+  const name = errorNameOf(error);
+  return name === "AbortError" || name === "ModelStagingError" || name === "ModelTransferLengthError" || name === "EmbeddingError" || name === "CrossOriginIsolationError" || Boolean(decisionErrorCodeOf(error));
+}
+function isNativeAbortException(error, fromNativeCall = true) {
+  if (isBridgeTypedError(error)) {
+    return false;
+  }
+  if (fromNativeCall) {
+    return true;
+  }
+  const name = errorNameOf(error);
+  const tag2 = Object.prototype.toString.call(error);
+  const text = `${name} ${String(error || "")}`;
+  return name === "RuntimeError" || /\babort(?:ed)?\b|\bunreachable\b|\bmemory access out of bounds\b/i.test(text) || tag2 === "[object Error]" && /\bRuntimeError\b/i.test(text);
+}
 var LlamaWebGpuBridgeRuntime = class {
   constructor(config = {}) {
     this._config = config;
     this._core = null;
+    this._coreGeneration = 0;
+    this._decisionHeadGenerations = /* @__PURE__ */ new Map();
+    this._loraAdapterGenerations = /* @__PURE__ */ new Map();
     this._backendLabels = [];
     this._gpuActive = false;
     this._modelPath = null;
@@ -2646,8 +2700,50 @@ var LlamaWebGpuBridgeRuntime = class {
     }
     return unlinkFsFile(this._core.FS, path);
   }
+  _decisionHeadGenerationMap() {
+    if (!(this._decisionHeadGenerations instanceof Map)) {
+      this._decisionHeadGenerations = /* @__PURE__ */ new Map();
+    }
+    return this._decisionHeadGenerations;
+  }
+  _loraAdapterGenerationMap() {
+    if (!(this._loraAdapterGenerations instanceof Map)) {
+      this._loraAdapterGenerations = /* @__PURE__ */ new Map();
+    }
+    return this._loraAdapterGenerations;
+  }
+  _terminateCorePthreads(core) {
+    const pThread = core?.PThread;
+    if (!pThread || typeof pThread !== "object") {
+      return;
+    }
+    try {
+      if (typeof pThread.terminateAllThreads === "function") {
+        pThread.terminateAllThreads();
+        return;
+      }
+    } catch (_) {
+    }
+    const workers = [
+      ...Array.isArray(pThread.unusedWorkers) ? pThread.unusedWorkers : [],
+      ...Array.isArray(pThread.runningWorkers) ? pThread.runningWorkers : [],
+      ...pThread.pthreads && typeof pThread.pthreads === "object" ? Object.values(pThread.pthreads) : []
+    ];
+    for (const worker of workers) {
+      try {
+        if (worker && typeof worker.terminate === "function") {
+          worker.terminate();
+        }
+      } catch (_) {
+      }
+    }
+  }
   _resetCoreAfterAbort() {
+    const abortedCore = this._core;
+    this._releaseJsModelStaging(abortedCore);
+    this._terminateCorePthreads(abortedCore);
     this._core = null;
+    this._coreGeneration = (Number(this._coreGeneration) || 0) + 1;
     this._coreVariant = "uninitialized";
     this._modelPath = null;
     this._modelPaths = [];
@@ -3220,6 +3316,7 @@ var LlamaWebGpuBridgeRuntime = class {
             }, initTimeoutMs);
           })
         ]);
+        this._coreGeneration = (Number(this._coreGeneration) || 0) + 1;
         this._coreVariant = candidate.variant === "wasm64" ? "wasm64" : "wasm32";
         if (candidate.variant === "wasm64") {
           this._runtimeNotes.push("core_mem64_active");
@@ -3427,9 +3524,13 @@ var LlamaWebGpuBridgeRuntime = class {
           let resumeAttempt = 0;
           let activeShardUrl = shardUrl;
           let knownTotalBytes = 0;
+          let resumeValidators = null;
           while (true) {
             throwIfAborted(operationSignal, abortMessage);
-            const requestHeaders = resumeOffset > 0 ? { Range: `bytes=${resumeOffset}-` } : null;
+            const requestHeaders = resumeOffset > 0 ? {
+              Range: `bytes=${resumeOffset}-`,
+              ...resumeValidators?.ifRange ? { "If-Range": resumeValidators.ifRange } : {}
+            } : null;
             const response = await this._getCachedModelResponse(activeShardUrl, {
               ...options,
               requireReadableStream: true,
@@ -3453,12 +3554,15 @@ var LlamaWebGpuBridgeRuntime = class {
             if (resumeOffset > 0) {
               if (response.status !== 206) {
                 this._runtimeNotes.push(`model_stream_resume_status:${response.status}`);
-                throw new Error(
-                  `Range resume not honored for model shard: ${response.status} ${response.statusText}`
-                );
+                const statusMessage = `Range resume not honored for model shard: ${response.status} ${response.statusText}`;
+                if (response.status === 200) {
+                  throw createModelTransferLengthError(statusMessage);
+                }
+                throw new Error(statusMessage);
               }
               let validatedRange;
               try {
+                validateResumedValidators(resumeValidators, response);
                 validatedRange = validateResumedPartialResponse(
                   response,
                   resumeOffset,
@@ -3473,6 +3577,8 @@ var LlamaWebGpuBridgeRuntime = class {
                 knownTotalBytes = validatedRange.total;
                 shardTotals[shardIndex] = validatedRange.total;
               }
+            } else {
+              resumeValidators = captureResumeValidators(response);
             }
             if (!hasReadableResponseStream(response)) {
               this._runtimeNotes.push("model_response_nostream");
@@ -3625,23 +3731,16 @@ var LlamaWebGpuBridgeRuntime = class {
             throw createAbortError(abortMessage);
           }
         } catch (error) {
-          if (operationSignal?.aborted && nativeLoadStarted && !nativeAbortCleanupDone) {
-            try {
-              await core.ccall("llamadart_webgpu_shutdown", null, [], [], { async: true });
-              nativeAbortCleanupDone = true;
-            } catch (_) {
-            }
-            error = createAbortError(abortMessage);
-          }
+          const nativeErrorText = String(error || "");
           const combinedText = [
-            String(error || ""),
+            nativeErrorText,
             String(this._lastWasm32TensorLimitError || ""),
             String(this._lastCoreErrorHint || ""),
             String(this._lastCoreErrorText || "")
           ].join(" ");
-          const text = String(error || "").toLowerCase();
-          const aborted = error instanceof Error && error.name === "RuntimeError" || /\babort(?:ed)?\b/i.test(text);
-          if (text.includes("bigint")) {
+          const aborted = nativeLoadStarted && isNativeAbortException(error, true);
+          const loweredNativeText = nativeErrorText.toLowerCase();
+          if (loweredNativeText.includes("bigint")) {
             this._runtimeNotes.push("model_load_ccall_bigint_error");
           } else if (aborted) {
             this._runtimeNotes.push("model_load_ccall_abort");
@@ -3650,6 +3749,16 @@ var LlamaWebGpuBridgeRuntime = class {
           }
           if (aborted) {
             this._resetCoreAfterAbort();
+          } else if (operationSignal?.aborted && nativeLoadStarted && !nativeAbortCleanupDone) {
+            try {
+              await core.ccall("llamadart_webgpu_shutdown", null, [], [], { async: true });
+              nativeAbortCleanupDone = true;
+            } catch (_) {
+              this._resetCoreAfterAbort();
+            }
+          }
+          if (operationSignal?.aborted) {
+            throw createAbortError(abortMessage);
           }
           if (isWasm32TensorLimitText(combinedText)) {
             throw new ModelStagingError(
@@ -3910,9 +4019,7 @@ var LlamaWebGpuBridgeRuntime = class {
             )
           );
         } catch (loadError) {
-          const loadText = String(loadError || "").toLowerCase();
-          const aborted = loadError instanceof Error && loadError.name === "RuntimeError" || /\babort(?:ed)?\b/i.test(loadText);
-          if (aborted) {
+          if (isNativeAbortException(loadError, true)) {
             this._runtimeNotes.push("mmproj_load_ccall_abort");
             this._resetCoreAfterAbort();
           }
@@ -4541,6 +4648,7 @@ var LlamaWebGpuBridgeRuntime = class {
           this._coreErrorMessage("Failed to load decision head", handle)
         );
       }
+      this._decisionHeadGenerationMap().set(handle, this._coreGeneration);
       const raw = core.ccall(
         "llamadart_webgpu_decision_head_info_json",
         "string",
@@ -4558,6 +4666,13 @@ var LlamaWebGpuBridgeRuntime = class {
     const input = encodeDecisionSequences(sequences);
     if (!this._core || this._modelBytes <= 0) {
       throw decisionError("no-model", "No model loaded. Call loadModelFromUrl first.");
+    }
+    const recordedGen = this._decisionHeadGenerationMap().get(nativeHandle);
+    if (recordedGen !== void 0 && recordedGen !== this._coreGeneration) {
+      throw decisionError(
+        "head-lost",
+        `Decision head ${nativeHandle} is not loaded; its core was reset. Load the decision head again.`
+      );
     }
     const core = this._core;
     this._ensureDecisionDir();
@@ -4589,7 +4704,9 @@ var LlamaWebGpuBridgeRuntime = class {
   }
   async freeDecisionHead(handle) {
     const nativeHandle = decisionHandleFrom(handle);
-    if (!this._core) {
+    const recordedGen = this._decisionHeadGenerationMap().get(nativeHandle);
+    this._decisionHeadGenerationMap().delete(nativeHandle);
+    if (!this._core || recordedGen !== void 0 && recordedGen !== this._coreGeneration) {
       return;
     }
     await this._core.ccall(
@@ -4751,6 +4868,7 @@ var LlamaWebGpuBridgeRuntime = class {
       if (handle <= 0) {
         throw new Error(this._coreErrorMessage("Failed to load LoRA adapter", handle));
       }
+      this._loraAdapterGenerationMap().set(handle, this._coreGeneration);
       this._loraAdaptersLoaded = true;
       return { handle };
     } finally {
@@ -4765,18 +4883,28 @@ var LlamaWebGpuBridgeRuntime = class {
     }
   }
   async setLoraAdapter(handle, scale = 1) {
+    const nativeHandle = loraHandleFrom(handle);
+    const recordedGen = this._loraAdapterGenerationMap().get(nativeHandle);
+    if (recordedGen !== void 0 && recordedGen !== this._coreGeneration) {
+      throw staleLoraAdapterError(nativeHandle);
+    }
     await this._callLoraCore(
       "llamadart_webgpu_lora_set",
       ["number", "number"],
-      [loraHandleFrom(handle), loraScaleFrom(scale)],
+      [nativeHandle, loraScaleFrom(scale)],
       "Failed to apply LoRA adapter"
     );
   }
   async removeLoraAdapter(handle) {
+    const nativeHandle = loraHandleFrom(handle);
+    const recordedGen = this._loraAdapterGenerationMap().get(nativeHandle);
+    if (recordedGen !== void 0 && recordedGen !== this._coreGeneration) {
+      throw staleLoraAdapterError(nativeHandle);
+    }
     await this._callLoraCore(
       "llamadart_webgpu_lora_remove",
       ["number"],
-      [loraHandleFrom(handle)],
+      [nativeHandle],
       "Failed to remove LoRA adapter"
     );
   }
@@ -5696,7 +5824,8 @@ function emptyBridgeState() {
     gpuActive: false,
     backendName: "WASM (Prototype bridge)",
     supportsVision: false,
-    supportsAudio: false
+    supportsAudio: false,
+    coreGeneration: 0
   };
 }
 function snapshotBridgeState(target) {
@@ -5706,7 +5835,8 @@ function snapshotBridgeState(target) {
     gpuActive: target.isGpuActive(),
     backendName: target.getBackendName(),
     supportsVision: target.supportsVision(),
-    supportsAudio: target.supportsAudio()
+    supportsAudio: target.supportsAudio(),
+    coreGeneration: typeof target._currentCoreGeneration === "function" ? Number(target._currentCoreGeneration()) || 0 : 0
   };
 }
 
@@ -5822,7 +5952,7 @@ var BridgeWorkerProxy = class {
       this._pending.delete(id);
       if (type === "error") {
         const errorMessage = String(message.message || "Worker request failed");
-        const workerError = message.embeddingErrorCode ? new EmbeddingError(message.embeddingErrorCode, errorMessage) : isModelStagingErrorCode(message.modelStagingErrorCode) ? new ModelStagingError(message.modelStagingErrorCode, errorMessage) : message.errorCode === CROSS_ORIGIN_ISOLATION_REQUIRED ? new CrossOriginIsolationError(errorMessage) : new Error(errorMessage);
+        const workerError = message.embeddingErrorCode ? new EmbeddingError(message.embeddingErrorCode, errorMessage) : isModelStagingErrorCode(message.modelStagingErrorCode) ? new ModelStagingError(message.modelStagingErrorCode, errorMessage) : message.errorCode === CROSS_ORIGIN_ISOLATION_REQUIRED ? new CrossOriginIsolationError(errorMessage) : message.errorName === "ModelTransferLengthError" ? createModelTransferLengthError(errorMessage) : new Error(errorMessage);
         if (isDecisionErrorCode(message.decisionErrorCode)) {
           withDecisionErrorCode(workerError, message.decisionErrorCode);
         }
@@ -5991,6 +6121,7 @@ var LlamaWebGpuBridge = class {
     this._runtime = null;
     this._workerProxy = null;
     this._workerGeneration = 0;
+    this._workerCoreGeneration = 0;
     this._workerDisposePromise = null;
     this._retiringWorkerDisposals = /* @__PURE__ */ new Set();
     this._retiredWorkerProxies = /* @__PURE__ */ new WeakSet();
@@ -6601,7 +6732,20 @@ var LlamaWebGpuBridge = class {
     this._multimodalWorkerCpuMode = false;
     this._workerModelMissing = true;
   }
+  _isNonRecoverableStagingOrTransferError(error) {
+    if (!error || typeof error !== "object") {
+      return false;
+    }
+    if (error instanceof ModelStagingError) {
+      return true;
+    }
+    const name = error.name;
+    return name === "ModelStagingError" || name === "ModelTransferLengthError";
+  }
   _isRecoverableWorkerFsError(error) {
+    if (this._isNonRecoverableStagingOrTransferError(error)) {
+      return false;
+    }
     const text = serializeWorkerError(error).toLowerCase();
     if (text.includes("model shard:")) {
       return false;
@@ -6649,6 +6793,9 @@ var LlamaWebGpuBridge = class {
       if (this._isOperationCancellation(error)) {
         this._workerModelMissing = true;
         throw createAbortError("Bridge operation was cancelled.");
+      }
+      if (this._isNonRecoverableStagingOrTransferError(error)) {
+        throw error;
       }
       this._emitBridgeWarn(
         `llamadart: multimodal worker setup failed once; restarting worker (${serializeWorkerError(error)}).`
@@ -6989,9 +7136,12 @@ var LlamaWebGpuBridge = class {
     if (typeof state.supportsAudio === "boolean") {
       this._supportsAudio = state.supportsAudio;
     }
+    if (Number.isFinite(state.coreGeneration)) {
+      this._workerCoreGeneration = Number(state.coreGeneration);
+    }
   }
   _shouldFallbackToMainThread(error) {
-    if (error instanceof ModelStagingError) {
+    if (this._isNonRecoverableStagingOrTransferError(error)) {
       return false;
     }
     const text = serializeWorkerError(error).toLowerCase();
@@ -7591,7 +7741,12 @@ var LlamaWebGpuBridge = class {
       return result;
     } catch (error) {
       this._throwIfOperationCancelled(error, "Projector operation was cancelled.");
-      if (!startedWithWorker) {
+      if (!this._workerProxy && !(Number(this._runtime?._modelBytes) > 0)) {
+        this._forgetLoadedModel();
+        this._supportsVision = false;
+        this._supportsAudio = false;
+      }
+      if (!startedWithWorker || this._isNonRecoverableStagingOrTransferError(error)) {
         throw error;
       }
       const reason = serializeWorkerError(error);
@@ -7869,10 +8024,17 @@ var LlamaWebGpuBridge = class {
     }
     return this._decisionHeads;
   }
+  _currentCoreGeneration() {
+    return this._workerProxy ? Number(this._workerCoreGeneration) || 0 : Number(this._runtime?._coreGeneration) || 0;
+  }
   _registerDecisionHead(owner, info) {
     const heads = this._decisionHeadMap();
     const handle = this._nextDecisionHandle++;
-    heads.set(handle, { owner, handle: Number(info?.handle) });
+    heads.set(handle, {
+      owner,
+      coreGeneration: this._currentCoreGeneration(),
+      handle: Number(info?.handle)
+    });
     return { ...info, handle };
   }
   _decisionOwner() {
@@ -7891,7 +8053,7 @@ var LlamaWebGpuBridge = class {
     if (!entry) {
       return null;
     }
-    if (entry.owner !== this._decisionOwner()) {
+    if (entry.owner !== this._decisionOwner() || entry.coreGeneration !== this._currentCoreGeneration()) {
       heads.delete(handle);
       return null;
     }
@@ -8153,7 +8315,7 @@ var LlamaWebGpuBridge = class {
   }
   // Reloads an adapter its owner lost, into the current owner.
   async _ensureLoraAdapterOnOwner(handle, entry) {
-    if (entry.owner === this._loraOwner()) {
+    if (entry.owner === this._loraOwner() && entry.coreGeneration === this._currentCoreGeneration()) {
       return;
     }
     if (entry.source === null) {
@@ -8163,6 +8325,7 @@ var LlamaWebGpuBridge = class {
     }
     const loaded = await this._loadLoraAdapterIntoOwner(entry.source, entry.cacheOptions);
     entry.owner = loaded.owner;
+    entry.coreGeneration = this._currentCoreGeneration();
     entry.handle = loaded.handle;
   }
   async _callLoraOwner(method, args) {
@@ -8187,7 +8350,8 @@ var LlamaWebGpuBridge = class {
    */
   async _restoreLoraAdapters() {
     const owner = this._loraOwner();
-    if (![...this._loraAdapterMap().values()].some((entry) => entry.owner !== owner)) {
+    const currentGen = this._currentCoreGeneration();
+    if (![...this._loraAdapterMap().values()].some((entry) => entry.owner !== owner || entry.coreGeneration !== currentGen)) {
       return;
     }
     await this._callLoraOwner("clearLoraAdapters", []);
@@ -8269,6 +8433,7 @@ var LlamaWebGpuBridge = class {
     const handle = this._nextLoraHandle++;
     this._loraAdapterMap().set(handle, {
       owner: loaded.owner,
+      coreGeneration: this._currentCoreGeneration(),
       handle: loaded.handle,
       source: retained,
       cacheOptions: { useCache: options.useCache, cacheName: options.cacheName }
@@ -8301,7 +8466,7 @@ var LlamaWebGpuBridge = class {
   async _removeLoraAdapterUnlocked(handle) {
     const entry = this._loraAdapterEntry(handle);
     await this._runLoraCall(async () => {
-      if (entry.owner === this._loraOwner()) {
+      if (entry.owner === this._loraOwner() && entry.coreGeneration === this._currentCoreGeneration()) {
         await this._callLoraOwner("removeLoraAdapter", [entry.handle]);
       }
     }, "LoRA adapter update was cancelled.");
@@ -8737,6 +8902,9 @@ function installBridgeWorkerHost() {
       state = void 0;
     }
     const decisionErrorCode = decisionErrorCodeOf(error);
+    const isTransferLengthError = Boolean(
+      error && typeof error === "object" && error.name === "ModelTransferLengthError"
+    );
     self.postMessage({
       type: "error",
       id,
@@ -8744,6 +8912,7 @@ function installBridgeWorkerHost() {
       ...error instanceof EmbeddingError ? { embeddingErrorCode: error.code } : {},
       ...error instanceof CrossOriginIsolationError ? { errorCode: CROSS_ORIGIN_ISOLATION_REQUIRED } : {},
       ...error instanceof ModelStagingError ? { modelStagingErrorCode: error.code } : {},
+      ...isTransferLengthError ? { errorName: "ModelTransferLengthError" } : {},
       ...decisionErrorCode ? { decisionErrorCode } : {},
       state
     });

@@ -17,6 +17,7 @@ import {
   DECISION_API_VERSION,
   decisionCoreStatusCode,
   decisionError,
+  decisionErrorCodeOf,
   decisionHandleFrom,
   decodeDecisionOutputs,
   encodeDecisionSequences,
@@ -25,6 +26,9 @@ import {
 } from './internal/decision.ts';
 import {
   type DirectFileChunkWriter,
+  type ResumeValidators,
+  captureResumeValidators,
+  createModelTransferLengthError,
   drainResponseWithProgress,
   ensureFsDirectory,
   hasReadableResponseStream,
@@ -34,6 +38,7 @@ import {
   teeResponseForCache,
   unlinkFsFile,
   validateResumedPartialResponse,
+  validateResumedValidators,
   writeResponseToFsFileWithProgress,
 } from './internal/download.ts';
 import { canPostSharedMemory, describeWebGpuUnavailable, isSafariUserAgent } from './internal/environment.ts';
@@ -50,6 +55,7 @@ import {
   LORA_LOAD_ABORT_MESSAGE,
   loraHandleFrom,
   loraScaleFrom,
+  staleLoraAdapterError,
 } from './internal/lora.ts';
 import {
   basenameFromUrl,
@@ -84,7 +90,14 @@ import type { ResolvedGrammarOptions, ResolvedSpeculativeOptions } from './inter
 import type { ProgressCallback } from './internal/download.ts';
 import type { EmbedBatchProgressHook } from './internal/embedding.ts';
 import type { ModelSource } from './internal/model_source.ts';
-import type { CcallArg, CcallArgType, LlamaCoreModule, LogMethod, TextBytesExport } from './internal/types.ts';
+import type {
+  CcallArg,
+  CcallArgType,
+  LlamaCoreModule,
+  LlamaCorePThread,
+  LogMethod,
+  TextBytesExport,
+} from './internal/types.ts';
 import type {
   CompletionCapabilities,
   CompletionFinishReason,
@@ -189,9 +202,48 @@ interface RemoteFetchProbe {
 
 const textEncoder = new TextEncoder();
 
+function errorNameOf(error: unknown): string {
+  if (!error || typeof error !== 'object') {
+    return '';
+  }
+  const named = (error as { name?: unknown }).name;
+  return typeof named === 'string' ? named : '';
+}
+
+function isBridgeTypedError(error: unknown): boolean {
+  const name = errorNameOf(error);
+  return name === 'AbortError'
+    || name === 'ModelStagingError'
+    || name === 'ModelTransferLengthError'
+    || name === 'EmbeddingError'
+    || name === 'CrossOriginIsolationError'
+    || Boolean(decisionErrorCodeOf(error));
+}
+
+// Native ccalls can throw Wasm traps or aborts constructed in another realm
+// (e.g., same-origin iframe WebAssembly.RuntimeError). Any exception escaping a
+// native boundary that is not one of our typed bridge errors indicates an abort.
+function isNativeAbortException(error: unknown, fromNativeCall = true): boolean {
+  if (isBridgeTypedError(error)) {
+    return false;
+  }
+  if (fromNativeCall) {
+    return true;
+  }
+  const name = errorNameOf(error);
+  const tag = Object.prototype.toString.call(error);
+  const text = `${name} ${String(error || '')}`;
+  return name === 'RuntimeError'
+    || /\babort(?:ed)?\b|\bunreachable\b|\bmemory access out of bounds\b/i.test(text)
+    || (tag === '[object Error]' && /\bRuntimeError\b/i.test(text));
+}
+
 export class LlamaWebGpuBridgeRuntime {
   declare _config: LlamaWebGpuBridgeConfig;
   declare _core: LlamaCoreModule | null;
+  declare _coreGeneration: number;
+  declare _decisionHeadGenerations: Map<number, number>;
+  declare _loraAdapterGenerations: Map<number, number>;
   declare _backendLabels: string[];
   declare _gpuActive: boolean;
   declare _modelPath: string | null;
@@ -258,6 +310,9 @@ export class LlamaWebGpuBridgeRuntime {
   constructor(config: LlamaWebGpuBridgeConfig = {}) {
     this._config = config;
     this._core = null;
+    this._coreGeneration = 0;
+    this._decisionHeadGenerations = new Map();
+    this._loraAdapterGenerations = new Map();
     this._backendLabels = [];
     this._gpuActive = false;
     this._modelPath = null;
@@ -1371,8 +1426,58 @@ export class LlamaWebGpuBridgeRuntime {
     return unlinkFsFile(this._core.FS, path);
   }
 
+  _decisionHeadGenerationMap() {
+    if (!(this._decisionHeadGenerations instanceof Map)) {
+      this._decisionHeadGenerations = new Map();
+    }
+    return this._decisionHeadGenerations;
+  }
+
+  _loraAdapterGenerationMap() {
+    if (!(this._loraAdapterGenerations instanceof Map)) {
+      this._loraAdapterGenerations = new Map();
+    }
+    return this._loraAdapterGenerations;
+  }
+
+  _terminateCorePthreads(core: LlamaCoreModule | null) {
+    const pThread = core?.PThread as (LlamaCorePThread & {
+      terminateAllThreads?: () => void;
+      pthreads?: Record<string, { terminate?: () => void }>;
+    }) | undefined;
+    if (!pThread || typeof pThread !== 'object') {
+      return;
+    }
+    try {
+      if (typeof pThread.terminateAllThreads === 'function') {
+        pThread.terminateAllThreads();
+        return;
+      }
+    } catch (_) {
+      // Fall through to manual worker termination.
+    }
+    const workers = [
+      ...(Array.isArray(pThread.unusedWorkers) ? pThread.unusedWorkers : []),
+      ...(Array.isArray(pThread.runningWorkers) ? pThread.runningWorkers : []),
+      ...(pThread.pthreads && typeof pThread.pthreads === 'object' ? Object.values(pThread.pthreads) : []),
+    ];
+    for (const worker of workers) {
+      try {
+        if (worker && typeof (worker as { terminate?: () => void }).terminate === 'function') {
+          (worker as { terminate: () => void }).terminate();
+        }
+      } catch (_) {
+        // Ignore best-effort pthread worker termination failures.
+      }
+    }
+  }
+
   _resetCoreAfterAbort() {
+    const abortedCore = this._core;
+    this._releaseJsModelStaging(abortedCore);
+    this._terminateCorePthreads(abortedCore);
     this._core = null;
+    this._coreGeneration = (Number(this._coreGeneration) || 0) + 1;
     this._coreVariant = 'uninitialized';
     this._modelPath = null;
     this._modelPaths = [];
@@ -2063,6 +2168,7 @@ export class LlamaWebGpuBridgeRuntime {
           }),
         ]) as LlamaCoreModule;
 
+        this._coreGeneration = (Number(this._coreGeneration) || 0) + 1;
         this._coreVariant = candidate.variant === 'wasm64' ? 'wasm64' : 'wasm32';
         if (candidate.variant === 'wasm64') {
           this._runtimeNotes.push('core_mem64_active');
@@ -2329,11 +2435,15 @@ export class LlamaWebGpuBridgeRuntime {
           let resumeAttempt = 0;
           let activeShardUrl = shardUrl;
           let knownTotalBytes = 0;
+          let resumeValidators: ResumeValidators | null = null;
 
           while (true) {
             throwIfAborted(operationSignal, abortMessage);
             const requestHeaders = resumeOffset > 0
-              ? { Range: `bytes=${resumeOffset}-` }
+              ? {
+                  Range: `bytes=${resumeOffset}-`,
+                  ...(resumeValidators?.ifRange ? { 'If-Range': resumeValidators.ifRange } : {}),
+                }
               : null;
 
             const response = await this._getCachedModelResponse(activeShardUrl, {
@@ -2364,12 +2474,15 @@ export class LlamaWebGpuBridgeRuntime {
             if (resumeOffset > 0) {
               if (response.status !== 206) {
                 this._runtimeNotes.push(`model_stream_resume_status:${response.status}`);
-                throw new Error(
-                  `Range resume not honored for model shard: ${response.status} ${response.statusText}`,
-                );
+                const statusMessage = `Range resume not honored for model shard: ${response.status} ${response.statusText}`;
+                if (response.status === 200) {
+                  throw createModelTransferLengthError(statusMessage);
+                }
+                throw new Error(statusMessage);
               }
               let validatedRange;
               try {
+                validateResumedValidators(resumeValidators, response);
                 validatedRange = validateResumedPartialResponse(
                   response,
                   resumeOffset,
@@ -2384,6 +2497,8 @@ export class LlamaWebGpuBridgeRuntime {
                 knownTotalBytes = validatedRange.total;
                 shardTotals[shardIndex] = validatedRange.total;
               }
+            } else {
+              resumeValidators = captureResumeValidators(response);
             }
 
             if (!hasReadableResponseStream(response)) {
@@ -2557,25 +2672,16 @@ export class LlamaWebGpuBridgeRuntime {
             throw createAbortError(abortMessage);
           }
         } catch (error) {
-          if (operationSignal?.aborted && nativeLoadStarted && !nativeAbortCleanupDone) {
-            try {
-              await core.ccall('llamadart_webgpu_shutdown', null, [], [], { async: true });
-              nativeAbortCleanupDone = true;
-            } catch (_) {
-              // best-effort cleanup after an unpreemptible native load
-            }
-            error = createAbortError(abortMessage);
-          }
+          const nativeErrorText = String(error || '');
           const combinedText = [
-            String(error || ''),
+            nativeErrorText,
             String(this._lastWasm32TensorLimitError || ''),
             String(this._lastCoreErrorHint || ''),
             String(this._lastCoreErrorText || ''),
           ].join(' ');
-          const text = String(error || '').toLowerCase();
-          const aborted = (error instanceof Error && error.name === 'RuntimeError')
-            || /\babort(?:ed)?\b/i.test(text);
-          if (text.includes('bigint')) {
+          const aborted = nativeLoadStarted && isNativeAbortException(error, true);
+          const loweredNativeText = nativeErrorText.toLowerCase();
+          if (loweredNativeText.includes('bigint')) {
             this._runtimeNotes.push('model_load_ccall_bigint_error');
           } else if (aborted) {
             this._runtimeNotes.push('model_load_ccall_abort');
@@ -2584,6 +2690,16 @@ export class LlamaWebGpuBridgeRuntime {
           }
           if (aborted) {
             this._resetCoreAfterAbort();
+          } else if (operationSignal?.aborted && nativeLoadStarted && !nativeAbortCleanupDone) {
+            try {
+              await core.ccall('llamadart_webgpu_shutdown', null, [], [], { async: true });
+              nativeAbortCleanupDone = true;
+            } catch (_) {
+              this._resetCoreAfterAbort();
+            }
+          }
+          if (operationSignal?.aborted) {
+            throw createAbortError(abortMessage);
           }
           if (isWasm32TensorLimitText(combinedText)) {
             throw new ModelStagingError(
@@ -2891,10 +3007,7 @@ export class LlamaWebGpuBridgeRuntime {
             ),
           );
         } catch (loadError) {
-          const loadText = String(loadError || '').toLowerCase();
-          const aborted = (loadError instanceof Error && loadError.name === 'RuntimeError')
-            || /\babort(?:ed)?\b/i.test(loadText);
-          if (aborted) {
+          if (isNativeAbortException(loadError, true)) {
             this._runtimeNotes.push('mmproj_load_ccall_abort');
             this._resetCoreAfterAbort();
           }
@@ -3596,6 +3709,7 @@ export class LlamaWebGpuBridgeRuntime {
           this._coreErrorMessage('Failed to load decision head', handle),
         );
       }
+      this._decisionHeadGenerationMap().set(handle, this._coreGeneration);
       const raw = core.ccall(
         'llamadart_webgpu_decision_head_info_json',
         'string',
@@ -3614,6 +3728,13 @@ export class LlamaWebGpuBridgeRuntime {
     const input = encodeDecisionSequences(sequences);
     if (!this._core || this._modelBytes <= 0) {
       throw decisionError('no-model', 'No model loaded. Call loadModelFromUrl first.');
+    }
+    const recordedGen = this._decisionHeadGenerationMap().get(nativeHandle);
+    if (recordedGen !== undefined && recordedGen !== this._coreGeneration) {
+      throw decisionError(
+        'head-lost',
+        `Decision head ${nativeHandle} is not loaded; its core was reset. Load the decision head again.`,
+      );
     }
     const core = this._core;
     this._ensureDecisionDir();
@@ -3646,7 +3767,9 @@ export class LlamaWebGpuBridgeRuntime {
 
   async freeDecisionHead(handle: number) {
     const nativeHandle = decisionHandleFrom(handle);
-    if (!this._core) {
+    const recordedGen = this._decisionHeadGenerationMap().get(nativeHandle);
+    this._decisionHeadGenerationMap().delete(nativeHandle);
+    if (!this._core || (recordedGen !== undefined && recordedGen !== this._coreGeneration)) {
       return;
     }
     await this._core.ccall(
@@ -3822,6 +3945,7 @@ export class LlamaWebGpuBridgeRuntime {
       if (handle <= 0) {
         throw new Error(this._coreErrorMessage('Failed to load LoRA adapter', handle));
       }
+      this._loraAdapterGenerationMap().set(handle, this._coreGeneration);
       this._loraAdaptersLoaded = true;
       return { handle };
     } finally {
@@ -3838,19 +3962,29 @@ export class LlamaWebGpuBridgeRuntime {
   }
 
   async setLoraAdapter(handle: number, scale = 1) {
+    const nativeHandle = loraHandleFrom(handle);
+    const recordedGen = this._loraAdapterGenerationMap().get(nativeHandle);
+    if (recordedGen !== undefined && recordedGen !== this._coreGeneration) {
+      throw staleLoraAdapterError(nativeHandle);
+    }
     await this._callLoraCore(
       'llamadart_webgpu_lora_set',
       ['number', 'number'],
-      [loraHandleFrom(handle), loraScaleFrom(scale)],
+      [nativeHandle, loraScaleFrom(scale)],
       'Failed to apply LoRA adapter',
     );
   }
 
   async removeLoraAdapter(handle: number) {
+    const nativeHandle = loraHandleFrom(handle);
+    const recordedGen = this._loraAdapterGenerationMap().get(nativeHandle);
+    if (recordedGen !== undefined && recordedGen !== this._coreGeneration) {
+      throw staleLoraAdapterError(nativeHandle);
+    }
     await this._callLoraCore(
       'llamadart_webgpu_lora_remove',
       ['number'],
-      [loraHandleFrom(handle)],
+      [nativeHandle],
       'Failed to remove LoRA adapter',
     );
   }

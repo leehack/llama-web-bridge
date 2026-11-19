@@ -154,6 +154,7 @@ interface WorkerTokenPayload {
 // runtime that loaded it.
 interface DecisionHeadEntry {
   owner: object;
+  coreGeneration: number;
   handle: number;
 }
 
@@ -162,6 +163,7 @@ interface DecisionHeadEntry {
 // workers are disabled, since the owner then never changes.
 interface LoraAdapterEntry {
   owner: object | null;
+  coreGeneration: number;
   handle: number;
   source: string | Uint8Array | null;
   cacheOptions: Pick<LoraAdapterLoadOptions, 'useCache' | 'cacheName'>;
@@ -190,6 +192,7 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
   declare _runtime: LlamaWebGpuBridgeRuntime | null;
   declare _workerProxy: BridgeWorkerProxy | null;
   declare _workerGeneration: number;
+  declare _workerCoreGeneration: number;
   declare _workerDisposePromise: Promise<void> | null;
   declare _retiringWorkerDisposals: Set<Promise<void>>;
   declare _retiredWorkerProxies: WeakSet<object>;
@@ -232,6 +235,7 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
     this._runtime = null;
     this._workerProxy = null;
     this._workerGeneration = 0;
+    this._workerCoreGeneration = 0;
     this._workerDisposePromise = null;
     this._retiringWorkerDisposals = new Set();
     this._retiredWorkerProxies = new WeakSet();
@@ -980,7 +984,21 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
     this._workerModelMissing = true;
   }
 
+  _isNonRecoverableStagingOrTransferError(error: unknown) {
+    if (!error || typeof error !== 'object') {
+      return false;
+    }
+    if (error instanceof ModelStagingError) {
+      return true;
+    }
+    const name = (error as { name?: unknown }).name;
+    return name === 'ModelStagingError' || name === 'ModelTransferLengthError';
+  }
+
   _isRecoverableWorkerFsError(error: unknown) {
+    if (this._isNonRecoverableStagingOrTransferError(error)) {
+      return false;
+    }
     const text = serializeWorkerError(error).toLowerCase();
     // An HTTP status from the model host ("404 Not Found") is deterministic: a
     // fresh worker gets the same answer, so a restart only discards the model
@@ -1050,6 +1068,9 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
         // The cancelled load may already have released the worker's model.
         this._workerModelMissing = true;
         throw createAbortError('Bridge operation was cancelled.');
+      }
+      if (this._isNonRecoverableStagingOrTransferError(error)) {
+        throw error;
       }
       this._emitBridgeWarn(
         `llamadart: multimodal worker setup failed once; restarting worker (${serializeWorkerError(error)}).`,
@@ -1518,10 +1539,13 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
     if (typeof state.supportsAudio === 'boolean') {
       this._supportsAudio = state.supportsAudio;
     }
+    if (Number.isFinite(state.coreGeneration)) {
+      this._workerCoreGeneration = Number(state.coreGeneration);
+    }
   }
 
   _shouldFallbackToMainThread(error: unknown) {
-    if (error instanceof ModelStagingError) {
+    if (this._isNonRecoverableStagingOrTransferError(error)) {
       return false;
     }
 
@@ -2281,7 +2305,12 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
       return result;
     } catch (error) {
       this._throwIfOperationCancelled(error, 'Projector operation was cancelled.');
-      if (!startedWithWorker) {
+      if (!this._workerProxy && !(Number(this._runtime?._modelBytes) > 0)) {
+        this._forgetLoadedModel();
+        this._supportsVision = false;
+        this._supportsAudio = false;
+      }
+      if (!startedWithWorker || this._isNonRecoverableStagingOrTransferError(error)) {
         throw error;
       }
       const reason = serializeWorkerError(error);
@@ -2594,10 +2623,20 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
     return this._decisionHeads;
   }
 
+  _currentCoreGeneration() {
+    return this._workerProxy
+      ? (Number(this._workerCoreGeneration) || 0)
+      : (Number(this._runtime?._coreGeneration) || 0);
+  }
+
   _registerDecisionHead(owner: object, info: DecisionHeadInfo) {
     const heads = this._decisionHeadMap();
     const handle = this._nextDecisionHandle++;
-    heads.set(handle, { owner, handle: Number(info?.handle) });
+    heads.set(handle, {
+      owner,
+      coreGeneration: this._currentCoreGeneration(),
+      handle: Number(info?.handle),
+    });
     return { ...info, handle };
   }
 
@@ -2620,7 +2659,10 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
     if (!entry) {
       return null;
     }
-    if (entry.owner !== this._decisionOwner()) {
+    if (
+      entry.owner !== this._decisionOwner()
+      || entry.coreGeneration !== this._currentCoreGeneration()
+    ) {
       heads.delete(handle);
       return null;
     }
@@ -2919,7 +2961,10 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
 
   // Reloads an adapter its owner lost, into the current owner.
   async _ensureLoraAdapterOnOwner(handle: number, entry: LoraAdapterEntry) {
-    if (entry.owner === this._loraOwner()) {
+    if (
+      entry.owner === this._loraOwner()
+      && entry.coreGeneration === this._currentCoreGeneration()
+    ) {
       return;
     }
     if (entry.source === null) {
@@ -2929,6 +2974,7 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
     }
     const loaded = await this._loadLoraAdapterIntoOwner(entry.source, entry.cacheOptions);
     entry.owner = loaded.owner;
+    entry.coreGeneration = this._currentCoreGeneration();
     entry.handle = loaded.handle;
   }
 
@@ -2955,7 +3001,8 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
    */
   async _restoreLoraAdapters() {
     const owner = this._loraOwner();
-    if (![...this._loraAdapterMap().values()].some((entry) => entry.owner !== owner)) {
+    const currentGen = this._currentCoreGeneration();
+    if (![...this._loraAdapterMap().values()].some((entry) => entry.owner !== owner || entry.coreGeneration !== currentGen)) {
       return;
     }
     await this._callLoraOwner('clearLoraAdapters', []);
@@ -3053,6 +3100,7 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
     const handle = this._nextLoraHandle++;
     this._loraAdapterMap().set(handle, {
       owner: loaded.owner,
+      coreGeneration: this._currentCoreGeneration(),
       handle: loaded.handle,
       source: retained,
       cacheOptions: { useCache: options.useCache, cacheName: options.cacheName },
@@ -3090,7 +3138,7 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
     const entry = this._loraAdapterEntry(handle);
     await this._runLoraCall(async () => {
       // An owner that never loaded this adapter does not apply it.
-      if (entry.owner === this._loraOwner()) {
+      if (entry.owner === this._loraOwner() && entry.coreGeneration === this._currentCoreGeneration()) {
         await this._callLoraOwner('removeLoraAdapter', [entry.handle]);
       }
     }, 'LoRA adapter update was cancelled.');

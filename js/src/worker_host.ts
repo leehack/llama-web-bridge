@@ -52,6 +52,9 @@ export function installBridgeWorkerHost() {
     }
 
     const decisionErrorCode = decisionErrorCodeOf(error);
+    const isTransferLengthError = Boolean(
+      error && typeof error === 'object' && (error as { name?: unknown }).name === 'ModelTransferLengthError',
+    );
     self.postMessage({
       type: 'error',
       id,
@@ -59,6 +62,7 @@ export function installBridgeWorkerHost() {
       ...(error instanceof EmbeddingError ? { embeddingErrorCode: error.code } : {}),
       ...(error instanceof CrossOriginIsolationError ? { errorCode: CROSS_ORIGIN_ISOLATION_REQUIRED } : {}),
       ...(error instanceof ModelStagingError ? { modelStagingErrorCode: error.code } : {}),
+      ...(isTransferLengthError ? { errorName: 'ModelTransferLengthError' as const } : {}),
       ...(decisionErrorCode ? { decisionErrorCode } : {}),
       state,
     });

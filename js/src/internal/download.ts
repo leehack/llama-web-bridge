@@ -56,6 +56,12 @@ export interface ValidatedPartialRange extends ParsedContentRange {
   expectedTailLength: number;
 }
 
+export interface ResumeValidators {
+  etag: string;
+  lastModified: string;
+  ifRange: string;
+}
+
 // A transfer failure annotated with how far the file got, for resumable loads.
 type TransferError = Error & { llamadartLoadedBytes?: number; llamadartFilePath?: string };
 
@@ -78,10 +84,45 @@ export function sumProgressValues(values: Iterable<unknown> | null | undefined):
   return total;
 }
 
-function createModelTransferLengthError(message: string): Error {
+export function createModelTransferLengthError(message: string): Error {
   const error = new Error(message);
   error.name = 'ModelTransferLengthError';
   return error;
+}
+
+function readNormalizedHeader(response: Response, headerName: string): string {
+  const raw = response.headers?.get(headerName);
+  return typeof raw === 'string' ? raw.trim() : '';
+}
+
+export function captureResumeValidators(response: Response): ResumeValidators {
+  const etag = readNormalizedHeader(response, 'etag');
+  const lastModified = readNormalizedHeader(response, 'last-modified');
+  // Weak ETags (W/...) are invalid in If-Range (RFC 9110); fall back to Last-Modified.
+  const strongEtag = etag.length > 0 && !/^w\//i.test(etag) ? etag : '';
+  const ifRange = strongEtag || lastModified;
+  return { etag, lastModified, ifRange };
+}
+
+export function validateResumedValidators(
+  initial: ResumeValidators | null | undefined,
+  response: Response,
+): void {
+  if (!initial) {
+    return;
+  }
+  const resumedEtag = readNormalizedHeader(response, 'etag');
+  if (initial.etag && resumedEtag && resumedEtag !== initial.etag) {
+    throw createModelTransferLengthError(
+      'Resumed 206 ETag validator changed; refusing to splice partial model bytes.',
+    );
+  }
+  const resumedLastModified = readNormalizedHeader(response, 'last-modified');
+  if (initial.lastModified && resumedLastModified && resumedLastModified !== initial.lastModified) {
+    throw createModelTransferLengthError(
+      'Resumed 206 Last-Modified validator changed; refusing to splice partial model bytes.',
+    );
+  }
 }
 
 export function parseContentRangeHeader(

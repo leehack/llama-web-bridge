@@ -622,9 +622,20 @@ test('direct JS chunk writer accepts cross-realm Uint8Array chunks and rejects n
   const foreignInt8 = vm.runInNewContext('new Int8Array([1, 2, 3])', {});
   const foreignView = vm.runInNewContext('new DataView(new ArrayBuffer(4))', {});
   const spoofedTag = { length: 4, byteLength: 4, [Symbol.toStringTag]: 'Uint8Array' };
+  const relabelledU16 = new Uint16Array([1, 2]);
+  Object.defineProperty(relabelledU16, Symbol.toStringTag, { value: 'Uint8Array' });
+  const relabelledForeignU16 = vm.runInNewContext(
+    'const a = new Uint16Array([3, 4]); Object.defineProperty(a, Symbol.toStringTag, { value: "Uint8Array" }); a',
+    {},
+  );
+  const relabelledI8 = new Int8Array([1, 2]);
+  Object.defineProperty(relabelledI8, Symbol.toStringTag, { value: 'Uint8Array' });
   assert.equal(writeDirect(handle, foreignInt8, 0), -cDefs.EINVAL);
   assert.equal(writeDirect(handle, foreignView, 0), -cDefs.EINVAL);
   assert.equal(writeDirect(handle, spoofedTag, 0), -cDefs.EINVAL);
+  assert.equal(writeDirect(handle, relabelledU16, 0), -cDefs.EINVAL);
+  assert.equal(writeDirect(handle, relabelledForeignU16, 0), -cDefs.EINVAL);
+  assert.equal(writeDirect(handle, relabelledI8, 0), -cDefs.EINVAL);
 
   callNative('_llamadart_js_model_fs_unbind_direct', [handle]);
   callNative('_llamadart_js_model_fs_free_file', [fileId]);

@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
+import vm from 'node:vm';
 
 import { LlamaWebGpuBridge, ModelStagingError } from '../../js/src/llama_webgpu_bridge.js';
 import { writeResponseToFsFileWithProgress } from '../../js/src/internal/download.ts';
@@ -1230,4 +1231,523 @@ test('loadMultimodalProjector uses JS-backed direct staging when jsBackedModelSt
   );
   assert.equal(abortHarness.runtime._core, null);
   assert.deepEqual(abortHarness.fs.unmountedPaths, ['/jsmodels']);
+});
+
+test('stale decision-head and LoRA handles reject after core abort and reload instead of targeting replacement handles', async () => {
+  const decisionCalls = [];
+  const loraCalls = [];
+  let coreInits = 0;
+  let abortNextModelLoad = false;
+
+  const makeFactory = () => async () => {
+    const coreId = ++coreInits;
+    let nextHeadId = 1;
+    let nextLoraId = 1;
+    const files = new Map();
+    return {
+      FS: {
+        mkdir() {},
+        readdir() { return ['.', '..']; },
+        unlink(p) { files.delete(p); },
+        open() { return 1; },
+        write() { return 0; },
+        close() {},
+        writeFile(p, bytes) { files.set(p, new Uint8Array(bytes)); },
+        readFile(p) { return files.get(p) || new Uint8Array(0); },
+      },
+      ccall(name, _ret, _types, args = []) {
+        if (name === 'llamadart_webgpu_probe') return 0;
+        if (name === 'llamadart_webgpu_backends_json') return '["CPU"]';
+        if (name === 'llamadart_webgpu_supports_pthreads') return 0;
+        if (name === 'llamadart_webgpu_pthread_pool_size') return 1;
+        if (name === 'llamadart_webgpu_device_backend_name') return 'WASM';
+        if (name === 'llamadart_webgpu_get_context_size') return 2048;
+        if (name === 'llamadart_webgpu_model_meta_json') return '{}';
+        if (name === 'llamadart_webgpu_decision_api_version') return 1;
+        if (name === 'llamadart_webgpu_decision_capabilities_json') {
+          return JSON.stringify({ apiVersion: 1, supported: true, reason: null });
+        }
+        if (name === 'llamadart_webgpu_lora_api_version') return 1;
+        if (name === 'llamadart_webgpu_load_model') {
+          if (abortNextModelLoad) {
+            abortNextModelLoad = false;
+            throw new WebAssembly.RuntimeError('Aborted(load failure)');
+          }
+          return 0;
+        }
+        if (name === 'llamadart_webgpu_decision_load') {
+          return nextHeadId++;
+        }
+        if (name === 'llamadart_webgpu_decision_head_info_json') {
+          return JSON.stringify({
+            handle: Number(args[0]),
+            label: `head-${coreId}`,
+            scoreNames: ['ok'],
+            hiddenDim: 4,
+            outputDim: 1,
+          });
+        }
+        if (name === 'llamadart_webgpu_decision_run') {
+          decisionCalls.push(['run', coreId, Number(args[0])]);
+          const outPath = args[2];
+          // count=0 empty output binary (0 bytes)
+          files.set(outPath, new Uint8Array(0));
+          return 0;
+        }
+        if (name === 'llamadart_webgpu_decision_free') {
+          decisionCalls.push(['free', coreId, Number(args[0])]);
+          return 0;
+        }
+        if (name === 'llamadart_webgpu_lora_load') {
+          return nextLoraId++;
+        }
+        if (name === 'llamadart_webgpu_lora_set') {
+          loraCalls.push(['set', coreId, Number(args[0])]);
+          return 0;
+        }
+        if (name === 'llamadart_webgpu_lora_remove') {
+          loraCalls.push(['remove', coreId, Number(args[0])]);
+          return 0;
+        }
+        if (name === 'llamadart_webgpu_lora_clear') {
+          return 0;
+        }
+        return 0;
+      },
+      _llamadart_webgpu_decision_capabilities_json() {},
+      _llamadart_webgpu_lora_api_version() {},
+    };
+  };
+
+  const bridge = new LlamaWebGpuBridge({
+    disableWorker: true,
+    allowSingleThreadCore: true,
+    preferMemory64: false,
+    coreInitTimeoutMs: 50,
+    coreModuleFactory: makeFactory(),
+  });
+  const stubResponse = () => new Response(new Uint8Array([1, 2, 3, 4]), {
+    status: 200,
+    headers: { 'content-length': '4', 'content-encoding': 'identity' },
+  });
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    if (String(url).startsWith('https://models.test/')) {
+      return stubResponse();
+    }
+    return origFetch(url);
+  };
+  try {
+    await bridge.loadModelFromUrl('https://models.test/m1.gguf', {
+      nCtx: 2048,
+      nGpuLayers: 0,
+      useCache: false,
+      forceRemoteFetchBackend: false,
+    });
+    const h1 = await bridge.loadDecisionHead(new Uint8Array([1, 2, 3, 4]));
+    const l1 = await bridge.loadLoraAdapter(new Uint8Array([1, 2, 3, 4]));
+
+    // Force abort during replacement model load, then reload on new core.
+    abortNextModelLoad = true;
+    await assert.rejects(
+      bridge.loadModelFromUrl('https://models.test/fault.gguf', {
+        nCtx: 2048,
+        nGpuLayers: 0,
+        useCache: false,
+        forceRemoteFetchBackend: false,
+      }),
+      { name: 'RuntimeError' },
+    );
+    assert.equal(coreInits, 1);
+
+    await bridge.loadModelFromUrl('https://models.test/m2.gguf', {
+      nCtx: 2048,
+      nGpuLayers: 0,
+      useCache: false,
+      forceRemoteFetchBackend: false,
+    });
+    assert.equal(coreInits, 2);
+
+    const h2 = await bridge.loadDecisionHead(new Uint8Array([1, 2, 3, 4]));
+    const l2 = await bridge.loadLoraAdapter(new Uint8Array([5, 6, 7, 8]));
+    assert.equal(h1.handle, 1);
+    assert.equal(h2.handle, 2);
+
+    await assert.rejects(
+      bridge.runDecision(h1.handle, []),
+      (err) => err?.code === 'head-lost',
+    );
+    await bridge.freeDecisionHead(h1.handle);
+    assert.equal(decisionCalls.length, 0, 'stale handle must never call native decision_run or decision_free on new head');
+
+    await bridge.runDecision(h2.handle, []);
+    assert.deepEqual(decisionCalls, [['run', 2, 1]]);
+
+    await assert.rejects(
+      bridge.setLoraAdapter(l1.handle, 1),
+      /LoRA adapter \d+ is not loaded/,
+    );
+    await bridge.setLoraAdapter(l2.handle, 0.5);
+    assert.deepEqual(loraCalls, [['set', 2, 1]]);
+  } finally {
+    globalThis.fetch = origFetch;
+    await bridge.dispose().catch(() => {});
+  }
+});
+
+test('core reset after abort terminates the aborted core PThread pool', async () => {
+  const terminatedWorkers = [];
+  let coreInits = 0;
+  const harness = createStagingHarness({
+    jsBackedModelStaging: true,
+    pthreads: true,
+    onLoadModel: () => {
+      if (coreInits === 1) {
+        throw new WebAssembly.RuntimeError('Aborted(pool leak check)');
+      }
+      return 0;
+    },
+  });
+
+  const makeMockPool = (id) => {
+    let terminateAllCount = 0;
+    const workers = [0, 1, 2, 3].map((idx) => ({
+      id: `${id}:${idx}`,
+      terminate() {
+        terminatedWorkers.push(`${id}:${idx}`);
+      },
+    }));
+    return {
+      terminateAllCount: () => terminateAllCount,
+      PThread: {
+        unusedWorkers: [...workers],
+        runningWorkers: [],
+        terminateAllThreads() {
+          terminateAllCount += 1;
+          for (const w of this.unusedWorkers) {
+            w.terminate();
+          }
+          this.unusedWorkers = [];
+        },
+      },
+    };
+  };
+
+  let activePool = null;
+  let firstPool = null;
+  delete harness.runtime._ensureCore;
+  harness.runtime._core = null;
+  harness.runtime._coreVariant = 'uninitialized';
+  harness.runtime._coreGeneration = 0;
+  harness.runtime._config.coreInitTimeoutMs = 50;
+  harness.runtime._config.allowSingleThreadCore = true;
+  harness.runtime._probeBackends = async () => false;
+  harness.runtime._syncThreadPoolSizeHintFromCore = () => {};
+  harness.runtime._resolveNativeLoadOptions = () => {};
+  harness.runtime._config.coreModuleFactory = async () => {
+    coreInits += 1;
+    activePool = makeMockPool(coreInits);
+    if (coreInits === 1) {
+      firstPool = activePool;
+    }
+    harness.core.PThread = activePool.PThread;
+    return {
+      ...harness.core,
+      PThread: activePool.PThread,
+    };
+  };
+
+  await assert.rejects(
+    harness.runtime.loadModelFromUrl('https://models.test/abort.gguf', {
+      nCtx: 2048,
+      nGpuLayers: 0,
+      useCache: false,
+      forceRemoteFetchBackend: false,
+    }),
+    { name: 'RuntimeError' },
+  );
+
+  assert.equal(firstPool.terminateAllCount(), 1);
+  assert.deepEqual(terminatedWorkers, ['1:0', '1:1', '1:2', '1:3']);
+
+  await harness.runtime.loadModelFromUrl('https://models.test/ok.gguf', {
+    nCtx: 2048,
+    nGpuLayers: 0,
+    useCache: false,
+    forceRemoteFetchBackend: false,
+  });
+  assert.equal(coreInits, 2);
+  assert.equal(activePool.terminateAllCount(), 0);
+});
+
+test('cross-realm WebAssembly.RuntimeError resets dead core on model and projector native loads', async () => {
+  for (const kind of ['model', 'mmproj']) {
+    let attempts = 0;
+    const harness = createStagingHarness({
+      jsBackedModelStaging: true,
+      onLoadModel: () => {
+        attempts += 1;
+        if (kind === 'model' && attempts === 1) {
+          throw vm.runInNewContext('new WebAssembly.RuntimeError("unreachable")', {});
+        }
+        return 0;
+      },
+    });
+    const origCcall = harness.core.ccall.bind(harness.core);
+    harness.core.ccall = (name, ...rest) => {
+      if (kind === 'mmproj' && name === 'llamadart_webgpu_mmproj_load') {
+        attempts += 1;
+        throw vm.runInNewContext('new WebAssembly.RuntimeError("unreachable")', {});
+      }
+      return origCcall(name, ...rest);
+    };
+
+    let coreInits = 0;
+    harness.runtime._ensureCore = async () => {
+      coreInits += 1;
+      harness.runtime._core = harness.core;
+      harness.runtime._coreGeneration += 1;
+      harness.runtime._coreVariant = 'wasm32';
+      return harness.core;
+    };
+
+    if (kind === 'model') {
+      await assert.rejects(
+        harness.runtime.loadModelFromUrl('https://models.test/iframe-trap.gguf', {
+          nCtx: 2048,
+          nGpuLayers: 0,
+          useCache: false,
+          forceRemoteFetchBackend: false,
+        }),
+        /unreachable/,
+      );
+      assert.equal(harness.runtime._core, null);
+      await harness.runtime.loadModelFromUrl('https://models.test/ok.gguf', {
+        nCtx: 2048,
+        nGpuLayers: 0,
+        useCache: false,
+        forceRemoteFetchBackend: false,
+      });
+      assert.equal(coreInits, 2);
+    } else {
+      harness.runtime._core = harness.core;
+      harness.runtime._coreGeneration = 1;
+      harness.runtime._modelBytes = 1024;
+      harness.runtime._fetchWithTimeout = async () => new Response(new Uint8Array([1, 2, 3]), {
+        status: 200,
+        headers: { 'content-length': '3', 'content-encoding': 'identity' },
+      });
+      await assert.rejects(
+        harness.runtime.loadMultimodalProjector('https://models.test/trap-mmproj.gguf'),
+        /unreachable/,
+      );
+      assert.equal(harness.runtime._core, null);
+    }
+  }
+});
+
+test('worker-mode loadMultimodalProjector preserves ModelStagingError without restarting or retrying worker', async () => {
+  await withStubWorkerEnvironment(async ({ workers }) => {
+    const bridge = createRealWorkerBridge({ jsBackedModelStaging: true });
+    const proxy = bridge._workerProxy;
+    const driver = workerDriver(proxy, workers[0]);
+    driver.ready();
+
+    const loadPromise = bridge.loadModelFromUrl('https://models.test/cpu-model.gguf', {
+      nCtx: 2048,
+      nGpuLayers: 0,
+      useCache: false,
+    });
+    await driver.settle();
+    const loadReq = driver.calls('loadModelFromUrl').at(-1);
+    proxy._worker.onmessage({
+      data: {
+        type: 'result',
+        id: loadReq.id,
+        value: 1,
+        state: {
+          metadata: { 'llamadart.webgpu.model_bytes': 1024 },
+          contextSize: 2048,
+          gpuActive: false,
+          backendName: 'WASM (CPU)',
+          supportsVision: false,
+          supportsAudio: false,
+          coreGeneration: 1,
+        },
+      },
+    });
+    await loadPromise;
+
+    const projPromise = bridge.loadMultimodalProjector('https://models.test/oom-mmproj.gguf');
+    await driver.settle();
+    // _ensureWorkerMultimodalCpuMode only reloads when !_multimodalWorkerCpuMode; it already is false after loadModelFromUrl.
+    const secondLoad = driver.calls('loadModelFromUrl');
+    if (secondLoad.length > 1) {
+      proxy._worker.onmessage({
+        data: {
+          type: 'result',
+          id: secondLoad.at(-1).id,
+          value: 1,
+          state: {
+            metadata: { 'llamadart.webgpu.model_bytes': 1024 },
+            contextSize: 2048,
+            gpuActive: false,
+            backendName: 'WASM (CPU)',
+            supportsVision: false,
+            supportsAudio: false,
+            coreGeneration: 1,
+          },
+        },
+      });
+      await driver.settle();
+    }
+    const projReq = driver.calls('loadMultimodalProjector').at(-1);
+    proxy._worker.onmessage({
+      data: {
+        type: 'error',
+        id: projReq.id,
+        message: 'Failed to allocate JavaScript memory while staging the model.',
+        modelStagingErrorCode: 'MODEL_STAGING_ALLOCATION_FAILED',
+      },
+    });
+
+    const err = await projPromise.then(() => assert.fail('must reject with ModelStagingError'), (e) => e);
+    assert.ok(err instanceof ModelStagingError, String(err));
+    assert.equal(err.code, 'MODEL_STAGING_ALLOCATION_FAILED');
+    assert.equal(workers.length, 1, 'must not spawn a replacement worker after ModelStagingError');
+    assert.equal(driver.calls('loadMultimodalProjector').length, 1, 'must not retry projector load after ModelStagingError');
+    assert.equal(bridge._workerProxy, proxy, 'must not fall back to main thread after ModelStagingError');
+
+    proxy._worker.onmessage({ data: { type: 'result', id: 0 } });
+    await bridge.dispose().catch(() => {});
+  });
+});
+
+test('resume requests send If-Range when available and reject 200 or changed validators before native load', async () => {
+  const fullPayload = Uint8Array.from({ length: 10 }, (_, i) => 20 + i);
+  const makeCutResponse = (headers) => {
+    let chunkSent = false;
+    return new Response(new ReadableStream({
+      pull(controller) {
+        if (!chunkSent) {
+          chunkSent = true;
+          controller.enqueue(fullPayload.subarray(0, 4));
+          return;
+        }
+        controller.error(new Error('network error'));
+      },
+    }), { status: 200, headers });
+  };
+
+  // 1) Strong ETag triggers If-Range and changed weak ETag / Last-Modified / 200 fail with ModelTransferLengthError.
+  const scenarios = [
+    {
+      name: 'strong-etag-200',
+      initialHeaders: { 'content-length': '10', etag: '"v1"', 'last-modified': 'Wed, 01 Jan 2025 00:00:00 GMT' },
+      expectedIfRange: '"v1"',
+      resumeResponse: () => new Response(fullPayload, { status: 200, headers: { 'content-length': '10', etag: '"v2"' } }),
+      expectedPattern: /Range resume not honored for model shard: 200/,
+    },
+    {
+      name: 'weak-etag-falls-back-to-last-modified-and-catches-weak-change',
+      initialHeaders: { 'content-length': '10', etag: 'W/"weak-1"', 'last-modified': 'Wed, 01 Jan 2025 00:00:00 GMT' },
+      expectedIfRange: 'Wed, 01 Jan 2025 00:00:00 GMT',
+      resumeResponse: () => new Response(fullPayload.subarray(4), {
+        status: 206,
+        headers: {
+          'content-range': 'bytes 4-9/10',
+          'content-length': '6',
+          etag: 'W/"weak-2"',
+          'last-modified': 'Wed, 01 Jan 2025 00:00:00 GMT',
+        },
+      }),
+      expectedPattern: /ETag validator changed/,
+    },
+    {
+      name: 'weak-etag-only-catches-changed-weak-etag-without-if-range',
+      initialHeaders: { 'content-length': '10', etag: 'W/"weak-1"' },
+      expectedIfRange: undefined,
+      resumeResponse: () => new Response(fullPayload.subarray(4), {
+        status: 206,
+        headers: {
+          'content-range': 'bytes 4-9/10',
+          'content-length': '6',
+          etag: 'W/"weak-2"',
+        },
+      }),
+      expectedPattern: /ETag validator changed/,
+    },
+  ];
+
+  for (const s of scenarios) {
+    let nativeLoads = 0;
+    const seenHeaders = [];
+    const harness = createStagingHarness({
+      jsBackedModelStaging: true,
+      onLoadModel: () => {
+        nativeLoads += 1;
+        return 0;
+      },
+    });
+    let call = 0;
+    harness.runtime._getCachedModelResponse = async (_url, opts) => {
+      call += 1;
+      seenHeaders.push(opts?.requestHeaders || null);
+      return call === 1 ? makeCutResponse(s.initialHeaders) : s.resumeResponse();
+    };
+    const err = await harness.runtime.loadModelFromUrl(`https://models.test/${s.name}.gguf`, {
+      nCtx: 2048,
+      nGpuLayers: 0,
+      useCache: false,
+      forceRemoteFetchBackend: false,
+    }).then(() => assert.fail(`must reject (${s.name})`), (e) => e);
+    assert.equal(err.name, 'ModelTransferLengthError', s.name);
+    assert.match(err.message, s.expectedPattern, s.name);
+    assert.equal(nativeLoads, 0, `${s.name} must fail before native load`);
+    assert.equal(seenHeaders[1]?.['If-Range'], s.expectedIfRange, s.name);
+  }
+});
+
+test('cancellation during native abort still resets dead core before rejecting AbortError', async () => {
+  const cancel = new AbortController();
+  let coreInits = 0;
+  let loadAttempts = 0;
+  const harness = createStagingHarness({
+    jsBackedModelStaging: true,
+    onLoadModel: () => {
+      loadAttempts += 1;
+      if (loadAttempts === 1) {
+        cancel.abort();
+        throw new WebAssembly.RuntimeError('Aborted(coincident abort + cancel)');
+      }
+      return 0;
+    },
+  });
+  harness.runtime._ensureCore = async () => {
+    coreInits += 1;
+    harness.runtime._core = harness.core;
+    harness.runtime._coreGeneration += 1;
+    harness.runtime._coreVariant = 'wasm32';
+    return harness.core;
+  };
+
+  await assert.rejects(
+    harness.runtime.loadModelFromUrl('https://models.test/cancel-abort.gguf', {
+      nCtx: 2048,
+      nGpuLayers: 0,
+      useCache: false,
+      forceRemoteFetchBackend: false,
+      signal: cancel.signal,
+    }),
+    { name: 'AbortError' },
+  );
+  assert.equal(harness.runtime._core, null, 'coincident abort must reset _core despite cancellation');
+
+  await harness.runtime.loadModelFromUrl('https://models.test/ok.gguf', {
+    nCtx: 2048,
+    nGpuLayers: 0,
+    useCache: false,
+    forceRemoteFetchBackend: false,
+  });
+  assert.equal(coreInits, 2, 'subsequent load after coincident abort+cancel must initialize fresh core');
 });
