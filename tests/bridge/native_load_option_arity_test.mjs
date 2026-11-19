@@ -128,7 +128,7 @@ function readArrayLiteral(source, start) {
 
 function ccallSites(source, name) {
   const sites = [];
-  const pattern = new RegExp(`ccall\\(\\s*["']${name}["']\\s*,\\s*["']number["']\\s*,`, 'g');
+  const pattern = new RegExp(`(?:ccall|_callCoreAsync)\\(\\s*["']${name}["']\\s*,\\s*["']number["']\\s*,`, 'g');
   for (const match of source.matchAll(pattern)) {
     const types = readArrayLiteral(source, match.index + match[0].length);
     const values = readArrayLiteral(source, types.end);

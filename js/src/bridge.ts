@@ -276,21 +276,49 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
     this._nextLoraHandle = 1;
 
     if (this._shouldUseWorker()) {
-      try {
-        this._workerProxy = this._createWorkerProxy();
-      } catch (error) {
-        this._disableWorkerFallback(error);
-      }
-    }
-
-    if (this._workerProxy) {
-      this._workerGeneration = 1;
+      this._installWorkerProxy({ fallbackToDirect: true });
     }
 
     if (!this._workerProxy) {
       this._runtime = this._createRuntime();
       this._captureDirectRuntimeState();
     }
+  }
+
+  _installWorkerProxy({
+    fallbackToDirect = false,
+    advanceGeneration = false,
+    rethrowCreateError = false,
+  }: {
+    fallbackToDirect?: boolean;
+    advanceGeneration?: boolean;
+    rethrowCreateError?: boolean;
+  } = {}) {
+    let proxy: ReturnType<LlamaWebGpuBridge['_createWorkerProxy']>;
+    try {
+      proxy = this._createWorkerProxy();
+    } catch (error) {
+      if (fallbackToDirect) {
+        this._disableWorkerFallback(error);
+      }
+      if (rethrowCreateError) {
+        throw error;
+      }
+      return null;
+    }
+    try {
+      this._throwIfDisposed();
+    } catch (error) {
+      this._retireWorkerProxy(proxy);
+      throw error;
+    }
+    if (advanceGeneration) {
+      this._advanceWorkerGeneration();
+    } else if (!this._workerGeneration) {
+      this._workerGeneration = 1;
+    }
+    this._workerProxy = proxy;
+    return proxy;
   }
 
   _createRuntime() {
@@ -953,32 +981,11 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
       this._throwIfDisposed();
     }
 
-    let replacement;
-    try {
-      replacement = this._createWorkerProxy();
-    } catch (error) {
-      // The constructor throws synchronously when no worker can be created
-      // (for example a CSP SecurityError), and any previous proxy is already
-      // detached. Fall back before rethrowing so an open bridge keeps a direct
-      // runtime whichever catch the caller takes; the fallback itself refuses
-      // to recreate a runtime once disposal owns teardown.
-      this._disableWorkerFallback(error);
-      throw error;
-    }
-    try {
-      // Same gate as every other helper: the owner that already holds the slot
-      // may still install its replacement while disposal is queued behind it,
-      // and queued teardown retires whatever is current. Any other caller is
-      // rejected and must not leak the proxy it just constructed.
-      this._throwIfDisposed();
-    } catch (error) {
-      this._retireWorkerProxy(replacement);
-      throw error;
-    }
-    if (!hadWorkerProxy) {
-      this._advanceWorkerGeneration();
-    }
-    this._workerProxy = replacement;
+    const replacement = this._installWorkerProxy({
+      fallbackToDirect: true,
+      advanceGeneration: !hadWorkerProxy,
+      rethrowCreateError: true,
+    })!;
     this._recordWorkerGeneration(this._activeOperation, replacement);
     this._multimodalWorkerCpuMode = false;
     this._workerModelMissing = true;
@@ -2073,6 +2080,9 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
           `llamadart: unable to prepare multimodal worker CPU mode (${reason}).`,
         );
 
+        if (this._isNonRecoverableStagingOrTransferError(error)) {
+          throw error;
+        }
         if (this._isCpuModelMode()) {
           throw new Error(
             `CPU multimodal worker setup failed (${reason}). `
@@ -2239,6 +2249,9 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
           return '';
         }
 
+        if (this._isNonRecoverableStagingOrTransferError(error)) {
+          throw error;
+        }
         if (this._isCpuModelMode()) {
           this._emitBridgeWarn(
             `llamadart: CPU multimodal worker request failed (${reason}); skipping main-thread fallback.`,
@@ -2329,6 +2342,10 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
           );
           return retryResult;
         } catch (retryError) {
+          this._throwIfOperationCancelled(retryError, 'Projector operation was cancelled.');
+          if (this._isNonRecoverableStagingOrTransferError(retryError)) {
+            throw retryError;
+          }
           const retryReason = serializeWorkerError(retryError);
           throw new Error(
             `CPU multimodal projector setup failed (${retryReason}). `

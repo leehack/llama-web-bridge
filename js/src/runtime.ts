@@ -93,6 +93,7 @@ import type { ModelSource } from './internal/model_source.ts';
 import type {
   CcallArg,
   CcallArgType,
+  CcallReturnType,
   LlamaCoreModule,
   LlamaCorePThread,
   LogMethod,
@@ -220,27 +221,53 @@ function isBridgeTypedError(error: unknown): boolean {
     || Boolean(decisionErrorCodeOf(error));
 }
 
-// Native ccalls can throw Wasm traps or aborts constructed in another realm
-// (e.g., same-origin iframe WebAssembly.RuntimeError). Any exception escaping a
-// native boundary that is not one of our typed bridge errors indicates an abort.
-function isNativeAbortException(error: unknown, fromNativeCall = true): boolean {
-  if (isBridgeTypedError(error)) {
+function isCrossRealmWasmRuntimeError(error: unknown): boolean {
+  if (!error || typeof error !== 'object') {
     return false;
   }
-  if (fromNativeCall) {
+  if (
+    typeof WebAssembly !== 'undefined'
+    && typeof WebAssembly.RuntimeError === 'function'
+    && error instanceof WebAssembly.RuntimeError
+  ) {
     return true;
   }
   const name = errorNameOf(error);
+  if (name === 'RuntimeError') {
+    return true;
+  }
+  const ctor = (error as { constructor?: { name?: unknown } }).constructor;
+  return typeof ctor?.name === 'string' && ctor.name === 'RuntimeError';
+}
+
+// Native ccalls can throw Wasm traps or aborts constructed in another realm
+// (e.g., same-origin iframe WebAssembly.RuntimeError). Match Wasm traps and
+// Emscripten aborts across realms without false-triggering on plain JS errors.
+function isNativeAbortException(error: unknown): boolean {
+  if (isBridgeTypedError(error)) {
+    return false;
+  }
+  if (isCrossRealmWasmRuntimeError(error)) {
+    return true;
+  }
+  if (error == null || typeof error !== 'object') {
+    return true;
+  }
+  const name = errorNameOf(error);
+  if (name === 'ExitStatus') {
+    return true;
+  }
   const tag = Object.prototype.toString.call(error);
   const text = `${name} ${String(error || '')}`;
-  return name === 'RuntimeError'
-    || /\babort(?:ed)?\b|\bunreachable\b|\bmemory access out of bounds\b/i.test(text)
+  return /\babort(?:ed)?\b|\bunreachable\b|\bmemory access out of bounds\b|\bnull function\b|\bindirect call\b|\binteger divide by zero\b|\binteger overflow\b|\btable index\b/i.test(text)
     || (tag === '[object Error]' && /\bRuntimeError\b/i.test(text));
 }
 
 export class LlamaWebGpuBridgeRuntime {
   declare _config: LlamaWebGpuBridgeConfig;
   declare _core: LlamaCoreModule | null;
+  declare _abortedCores: WeakSet<LlamaCoreModule>;
+  declare _resetCores: WeakSet<LlamaCoreModule>;
   declare _coreGeneration: number;
   declare _decisionHeadGenerations: Map<number, number>;
   declare _loraAdapterGenerations: Map<number, number>;
@@ -310,6 +337,8 @@ export class LlamaWebGpuBridgeRuntime {
   constructor(config: LlamaWebGpuBridgeConfig = {}) {
     this._config = config;
     this._core = null;
+    this._abortedCores = new WeakSet();
+    this._resetCores = new WeakSet();
     this._coreGeneration = 0;
     this._decisionHeadGenerations = new Map();
     this._loraAdapterGenerations = new Map();
@@ -433,13 +462,16 @@ export class LlamaWebGpuBridgeRuntime {
     try {
       if (typeof core.ccall === 'function') {
         const compiledPoolSize = Number(
-          core.ccall('llamadart_webgpu_pthread_pool_size', 'number', [], []),
+          this._callCoreSync('llamadart_webgpu_pthread_pool_size', 'number', [], [], core),
         );
         if (Number.isFinite(compiledPoolSize) && compiledPoolSize > 0) {
           return Math.max(1, Math.trunc(compiledPoolSize));
         }
       }
-    } catch (_) {
+    } catch (error) {
+      if (this._isCoreAborted(core) || isNativeAbortException(error)) {
+        throw error;
+      }
       // Ignore lookup failures and fall back to runtime heuristics.
     }
 
@@ -471,13 +503,16 @@ export class LlamaWebGpuBridgeRuntime {
     try {
       if (typeof core.ccall === 'function') {
         const compiledWithPthreads = Number(
-          core.ccall('llamadart_webgpu_supports_pthreads', 'number', [], []),
+          this._callCoreSync('llamadart_webgpu_supports_pthreads', 'number', [], [], core),
         );
         if (Number.isFinite(compiledWithPthreads)) {
           return compiledWithPthreads !== 0;
         }
       }
-    } catch (_) {
+    } catch (error) {
+      if (this._isCoreAborted(core) || isNativeAbortException(error)) {
+        throw error;
+      }
       // Ignore lookup failures and fall back to runtime heuristics.
     }
 
@@ -807,30 +842,38 @@ export class LlamaWebGpuBridgeRuntime {
   }
 
   _applyCoreLogLevel() {
-    if (!this._core) {
+    const core = this._core;
+    if (!core) {
       return;
     }
 
     try {
-      this._core.ccall(
+      this._callCoreSync(
         'llamadart_webgpu_set_log_level',
         null,
         ['number'],
         [this._logLevel],
+        core,
       );
-    } catch (_) {
+    } catch (error) {
+      if (this._isCoreAborted(core) || isNativeAbortException(error)) {
+        throw error;
+      }
       // Older core builds may not expose log-level setter.
     }
   }
 
   _coreErrorMessage(prefix: string, fallbackCode = 0) {
-    try {
-      const err = this._core?.ccall('llamadart_webgpu_last_error', 'string', [], []);
-      if (err) {
-        return `${prefix}: ${err}`;
+    const core = this._core;
+    if (core && !this._isCoreAborted(core)) {
+      try {
+        const err = this._callCoreSync('llamadart_webgpu_last_error', 'string', [], [], core);
+        if (err) {
+          return `${prefix}: ${err}`;
+        }
+      } catch (_) {
+        // Ignore nested error retrieval failures; any core abort already reset it.
       }
-    } catch (_) {
-      // Ignore nested error retrieval failures.
     }
     return `${prefix} (code=${fallbackCode})`;
   }
@@ -1141,7 +1184,7 @@ export class LlamaWebGpuBridgeRuntime {
 
     try {
       const rc = Number(
-        await core.ccall(
+        await this._callCoreAsync(
           'llamadart_webgpu_load_model_from_url',
           'number',
           [
@@ -1166,7 +1209,7 @@ export class LlamaWebGpuBridgeRuntime {
             chunkBytes,
             ...this._nativeLoadOptionValues(),
           ],
-          { async: true },
+          core,
         ),
       );
 
@@ -1191,7 +1234,7 @@ export class LlamaWebGpuBridgeRuntime {
     } catch (error) {
       const text = String(error || '').toLowerCase();
 
-      if (text.includes('aborted(native code called abort())')) {
+      if (this._resetCores.has(core) || isNativeAbortException(error)) {
         try {
           const stderrText = String(
             this._lastCoreErrorHint || this._lastCoreErrorText || '',
@@ -1209,21 +1252,23 @@ export class LlamaWebGpuBridgeRuntime {
           // ignore stderr capture failures on abort path
         }
 
-        try {
-          const coreError = String(
-            this._core?.ccall('llamadart_webgpu_last_error', 'string', [], []) || '',
-          ).trim();
-          if (coreError.length > 0) {
-            const token = coreError
-              .slice(0, 120)
-              .replace(/[\s;=]+/g, '_')
-              .replace(/[^a-zA-Z0-9._:-]/g, '');
-            if (token.length > 0) {
-              this._runtimeNotes.push(`model_fetch_core_error:${token}`);
+        if (this._core && !this._isCoreAborted(this._core)) {
+          try {
+            const coreError = String(
+              this._callCoreSync('llamadart_webgpu_last_error', 'string', [], []) || '',
+            ).trim();
+            if (coreError.length > 0) {
+              const token = coreError
+                .slice(0, 120)
+                .replace(/[\s;=]+/g, '_')
+                .replace(/[^a-zA-Z0-9._:-]/g, '');
+              if (token.length > 0) {
+                this._runtimeNotes.push(`model_fetch_core_error:${token}`);
+              }
             }
+          } catch (_) {
+            // ignore last-error probing failures on abort path
           }
-        } catch (_) {
-          // ignore last-error probing failures on abort path
         }
 
         this._runtimeNotes.push('model_fetch_backend_abort');
@@ -1472,24 +1517,144 @@ export class LlamaWebGpuBridgeRuntime {
     }
   }
 
-  _resetCoreAfterAbort() {
-    const abortedCore = this._core;
-    this._releaseJsModelStaging(abortedCore);
-    this._terminateCorePthreads(abortedCore);
-    this._core = null;
-    this._coreGeneration = (Number(this._coreGeneration) || 0) + 1;
-    this._coreVariant = 'uninitialized';
-    this._modelPath = null;
-    this._modelPaths = [];
-    this._modelBytes = 0;
-    this._loadedModelUrl = null;
-    this._mmProjPath = null;
-    this._mmProjSourceUrl = null;
-    this._mmSupportsVision = false;
-    this._mmSupportsAudio = false;
-    this._loraAdaptersLoaded = false;
-    this._draftModel = null;
-    this._stagedMediaPaths = [];
+  _isCoreAborted(core: LlamaCoreModule | null | undefined): boolean {
+    if (!core || typeof core !== 'object') {
+      return false;
+    }
+    return this._abortedCores.has(core)
+      || (core as { ABORT?: unknown }).ABORT === true;
+  }
+
+  _resetCoreAfterAbort(targetCore: LlamaCoreModule | null = this._core): boolean {
+    const core = targetCore ?? this._core;
+    if (core && this._resetCores.has(core)) {
+      return false;
+    }
+    if (core) {
+      this._resetCores.add(core);
+    }
+    const activeCoreWasTarget = !targetCore || this._core === targetCore;
+    if (activeCoreWasTarget) {
+      this._core = null;
+      this._coreGeneration = (Number(this._coreGeneration) || 0) + 1;
+      this._coreVariant = 'uninitialized';
+      this._modelPath = null;
+      this._modelPaths = [];
+      this._modelBytes = 0;
+      this._loadedModelUrl = null;
+      this._mmProjPath = null;
+      this._mmProjSourceUrl = null;
+      this._mmSupportsVision = false;
+      this._mmSupportsAudio = false;
+      this._loraAdaptersLoaded = false;
+      this._draftModel = null;
+      this._stagedMediaPaths = [];
+      this._nCtx = 0;
+      this._gpuActive = false;
+      this._backendLabels = [];
+    }
+    this._releaseJsModelStaging(core);
+    this._terminateCorePthreads(core);
+    return true;
+  }
+
+  // Single native ccall funnel for the runtime so every Wasm abort/trap
+  // resets the core instance and its pthread pool exactly once before escaping.
+  _callCoreNative<T = unknown>(
+    core: LlamaCoreModule | null | undefined,
+    ident: string,
+    returnType: CcallReturnType,
+    argTypes: CcallArgType[],
+    args: CcallArg[],
+    asyncCall = false,
+    allowDuringReset = false,
+  ): T | Promise<T> {
+    if (!core || typeof core.ccall !== 'function') {
+      throw new Error('WebGPU core is not initialized');
+    }
+    if (!allowDuringReset) {
+      if (this._isCoreAborted(core) || (this._resetCores.has(core) && this._core !== core)) {
+        this._resetCoreAfterAbort(core);
+        throw new WebAssembly.RuntimeError('Aborted(native core was already aborted)');
+      }
+      if (this._resetCores.has(core) && this._core === core) {
+        // Test harnesses or custom _ensureCore hooks can re-attach a clean core object.
+        this._resetCores.delete(core);
+      }
+    }
+
+    const validateResult = (value: unknown): T => {
+      if (!allowDuringReset && this._isCoreAborted(core)) {
+        this._resetCoreAfterAbort(core);
+        throw new WebAssembly.RuntimeError('Aborted(native call aborted)');
+      }
+      return value as T;
+    };
+    const handleError = (error: unknown): never => {
+      if (!allowDuringReset && (this._isCoreAborted(core) || isNativeAbortException(error))) {
+        this._resetCoreAfterAbort(core);
+      }
+      throw error;
+    };
+
+    try {
+      const raw = asyncCall
+        ? core.ccall(ident, returnType, argTypes, args, { async: true })
+        : core.ccall(ident, returnType, argTypes, args);
+      if (asyncCall || (raw != null && typeof (raw as PromiseLike<unknown>).then === 'function')) {
+        return Promise.resolve(raw).then(validateResult, handleError);
+      }
+      return validateResult(raw);
+    } catch (error) {
+      return handleError(error);
+    }
+  }
+
+  _callCoreSync<T = unknown>(
+    ident: string,
+    returnType: CcallReturnType,
+    argTypes: CcallArgType[],
+    args: CcallArg[],
+    core: LlamaCoreModule | null = this._core,
+  ): T {
+    return this._callCoreNative<T>(core, ident, returnType, argTypes, args, false) as T;
+  }
+
+  _callCoreAsync<T = unknown>(
+    ident: string,
+    returnType: CcallReturnType,
+    argTypes: CcallArgType[],
+    args: CcallArg[],
+    core: LlamaCoreModule | null = this._core,
+  ): Promise<T> {
+    return Promise.resolve(
+      this._callCoreNative<T>(core, ident, returnType, argTypes, args, true),
+    );
+  }
+
+  _coreHeapAlloc(core: LlamaCoreModule, bytes: number): number {
+    try {
+      return Number(core._malloc!(bytes));
+    } catch (error) {
+      if (this._isCoreAborted(core) || isNativeAbortException(error)) {
+        this._resetCoreAfterAbort(core);
+      }
+      throw error;
+    }
+  }
+
+  _coreHeapFree(core: LlamaCoreModule | null, ptr: number): void {
+    if (!core || this._isCoreAborted(core) || this._resetCores.has(core) || typeof core._free !== 'function') {
+      return;
+    }
+    try {
+      core._free(ptr);
+    } catch (error) {
+      if (this._isCoreAborted(core) || isNativeAbortException(error)) {
+        this._resetCoreAfterAbort(core);
+      }
+      throw error;
+    }
   }
 
   _mountJsBackedStaging(core: LlamaCoreModule, noteTag: string): string {
@@ -1502,7 +1667,7 @@ export class LlamaWebGpuBridgeRuntime {
       );
     }
     const mountRc = Number(
-      core.ccall('llamadart_webgpu_mount_js_model_fs', 'number', ['string'], ['/jsmodels']),
+      this._callCoreSync('llamadart_webgpu_mount_js_model_fs', 'number', ['string'], ['/jsmodels'], core),
     );
     if (mountRc !== 0) {
       this._pushRuntimeNote('model_staging_mount_failed');
@@ -1526,11 +1691,12 @@ export class LlamaWebGpuBridgeRuntime {
     append: boolean,
   ): DirectFileChunkWriter {
     const directHandle = Number(
-      core.ccall(
+      this._callCoreSync(
         'llamadart_webgpu_js_model_fs_open_direct',
         'number',
         ['string', 'number', 'number'],
         [filePath, preallocBytes, append ? 1 : 0],
+        core,
       ),
     );
     if (!Number.isInteger(directHandle) || directHandle <= 0) {
@@ -1551,12 +1717,16 @@ export class LlamaWebGpuBridgeRuntime {
         return;
       }
       closed = true;
+      if (this._isCoreAborted(core) || this._resetCores.has(core)) {
+        return;
+      }
       try {
-        core.ccall(
+        this._callCoreSync(
           'llamadart_webgpu_js_model_fs_close_direct',
           null,
           ['number'],
           [directHandle],
+          core,
         );
       } catch (_) {
         // ignore best-effort direct handle cleanup
@@ -1592,7 +1762,7 @@ export class LlamaWebGpuBridgeRuntime {
     let jsOomBytes = 0;
     try {
       jsOomBytes = Number(
-        core.ccall('llamadart_webgpu_js_model_fs_consume_oom_bytes', 'number', [], []),
+        this._callCoreSync('llamadart_webgpu_js_model_fs_consume_oom_bytes', 'number', [], [], core),
       ) || 0;
     } catch (_) {
       jsOomBytes = 0;
@@ -1616,8 +1786,19 @@ export class LlamaWebGpuBridgeRuntime {
     }
 
     this._jsBackedStagingMounted = false;
+    if ((core as { ABORT?: unknown }).ABORT === true) {
+      return;
+    }
     try {
-      core.ccall('llamadart_webgpu_unmount_js_model_fs', 'number', ['string'], ['/jsmodels']);
+      this._callCoreNative(
+        core,
+        'llamadart_webgpu_unmount_js_model_fs',
+        'number',
+        ['string'],
+        ['/jsmodels'],
+        false,
+        true,
+      );
     } catch (_) {
       // Ignore cleanup failures against a dead or custom core missing unmount.
     }
@@ -1653,7 +1834,7 @@ export class LlamaWebGpuBridgeRuntime {
 
     // Freeing a WebGPU context synchronizes the device, which suspends the core
     // under ASYNCIFY; a synchronous ccall would return before the free finished.
-    const rc = Number(await core.ccall('llamadart_webgpu_free_model', 'number', [], [], { async: true }));
+    const rc = Number(await this._callCoreAsync('llamadart_webgpu_free_model', 'number', [], [], core));
     if (rc !== 0) {
       throw new Error(this._coreErrorMessage('Failed to release the loaded model', rc));
     }
@@ -2084,7 +2265,10 @@ export class LlamaWebGpuBridgeRuntime {
       try {
         const moduleFactory = await candidate.factoryPromise;
         const initTimeoutMs = this._resolveCoreInitTimeoutMs();
-        this._core = await Promise.race([
+        let initializedCore: LlamaCoreModule | null = null;
+        let abortedDuringInit = false;
+        let initTimer: ReturnType<typeof setTimeout> | null = null;
+        const resolvedCore = await Promise.race([
           moduleFactory({
           locateFile: (path: string, prefix: string) => {
             if (path.endsWith('.wasm') && candidate.wasmUrl) {
@@ -2145,6 +2329,11 @@ export class LlamaWebGpuBridgeRuntime {
             this._emitLogger('error', trimmed.length > 0 ? trimmed : text);
           },
           onAbort: (reason: unknown) => {
+            abortedDuringInit = abortedDuringInit || initializedCore == null;
+            const abortedCore = initializedCore || this._core;
+            if (abortedCore) {
+              this._abortedCores.add(abortedCore);
+            }
             const text = String(reason ?? '').trim();
             if (text.length > 0) {
               const token = text
@@ -2162,11 +2351,25 @@ export class LlamaWebGpuBridgeRuntime {
           },
           }),
           new Promise((_, reject) => {
-            globalThis.setTimeout(() => {
+            initTimer = globalThis.setTimeout(() => {
               reject(new Error(`Bridge core init timeout (${initTimeoutMs}ms)`));
             }, initTimeoutMs);
           }),
-        ]) as LlamaCoreModule;
+        ]).finally(() => {
+          if (initTimer !== null) {
+            globalThis.clearTimeout(initTimer);
+            initTimer = null;
+          }
+        }) as LlamaCoreModule;
+        initializedCore = resolvedCore;
+        if (abortedDuringInit || this._isCoreAborted(initializedCore)) {
+          this._abortedCores.add(initializedCore);
+          this._resetCoreAfterAbort(initializedCore);
+          throw new WebAssembly.RuntimeError('Aborted(core aborted during initialization)');
+        }
+        this._abortedCores.delete(initializedCore);
+        this._resetCores.delete(initializedCore);
+        this._core = initializedCore;
 
         this._coreGeneration = (Number(this._coreGeneration) || 0) + 1;
         this._coreVariant = candidate.variant === 'wasm64' ? 'wasm64' : 'wasm32';
@@ -2197,12 +2400,13 @@ export class LlamaWebGpuBridgeRuntime {
   }
 
   async _probeBackends() {
+    let core: LlamaCoreModule | null = null;
     try {
-      const core = await this._ensureCore();
+      core = await this._ensureCore();
       const probeResult = Number(
-        await core.ccall('llamadart_webgpu_probe', 'number', [], [], { async: true }),
+        await this._callCoreAsync('llamadart_webgpu_probe', 'number', [], [], core),
       );
-      const json = core.ccall('llamadart_webgpu_backends_json', 'string', [], []);
+      const json = this._callCoreSync<string>('llamadart_webgpu_backends_json', 'string', [], [], core);
 
       let parsed = [];
       try {
@@ -2215,7 +2419,10 @@ export class LlamaWebGpuBridgeRuntime {
         ? parsed.map((v) => String(v))
         : [];
       this._gpuActive = probeResult === 1;
-    } catch (_err) {
+    } catch (error) {
+      if (this._isCoreAborted(core) || isNativeAbortException(error)) {
+        throw error;
+      }
       this._backendLabels = [];
       this._gpuActive = false;
     }
@@ -2437,12 +2644,22 @@ export class LlamaWebGpuBridgeRuntime {
           let knownTotalBytes = 0;
           let resumeValidators: ResumeValidators | null = null;
 
+          const resetStagedShardForFullRetry = () => {
+            this._deleteFsFile(modelPath);
+            resumeOffset = 0;
+            knownTotalBytes = 0;
+            shardLoaded[shardIndex] = 0;
+            shardTotals[shardIndex] = 0;
+            resumeValidators = null;
+            emitAggregateProgress();
+          };
+
           while (true) {
             throwIfAborted(operationSignal, abortMessage);
-            const requestHeaders = resumeOffset > 0
+            const canSendRange = resumeOffset > 0 && resumeValidators != null;
+            const requestHeaders = canSendRange
               ? {
                   Range: `bytes=${resumeOffset}-`,
-                  ...(resumeValidators?.ifRange ? { 'If-Range': resumeValidators.ifRange } : {}),
                 }
               : null;
 
@@ -2474,15 +2691,34 @@ export class LlamaWebGpuBridgeRuntime {
             if (resumeOffset > 0) {
               if (response.status !== 206) {
                 this._runtimeNotes.push(`model_stream_resume_status:${response.status}`);
+                response.body?.cancel?.().catch(() => {});
                 const statusMessage = `Range resume not honored for model shard: ${response.status} ${response.statusText}`;
                 if (response.status === 200) {
+                  if (resumeAttempt < maxStreamResumeRetries) {
+                    resetStagedShardForFullRetry();
+                    resumeAttempt += 1;
+                    this._runtimeNotes.push(`model_stream_resume_retry:${resumeAttempt}`);
+                    continue;
+                  }
                   throw createModelTransferLengthError(statusMessage);
                 }
                 throw new Error(statusMessage);
               }
+              if (!validateResumedValidators(resumeValidators, response)) {
+                this._runtimeNotes.push('model_stream_resume_validator_mismatch');
+                response.body?.cancel?.().catch(() => {});
+                if (resumeAttempt < maxStreamResumeRetries) {
+                  resetStagedShardForFullRetry();
+                  resumeAttempt += 1;
+                  this._runtimeNotes.push(`model_stream_resume_retry:${resumeAttempt}`);
+                  continue;
+                }
+                throw createModelTransferLengthError(
+                  'Resumed 206 validator missing or changed; refusing to splice partial model bytes.',
+                );
+              }
               let validatedRange;
               try {
-                validateResumedValidators(resumeValidators, response);
                 validatedRange = validateResumedPartialResponse(
                   response,
                   resumeOffset,
@@ -2582,15 +2818,23 @@ export class LlamaWebGpuBridgeRuntime {
                   )
                 : null;
 
-              const shouldRetryResume =
+              const shouldRetryNetworkDrop =
                 !stagingAllocError
                 && isRetryableStreamNetworkError(error)
                 && resumeOffset > 0
                 && resumeAttempt < maxStreamResumeRetries;
-              if (shouldRetryResume) {
+              if (shouldRetryNetworkDrop && resumeValidators != null) {
                 resumeAttempt += 1;
                 this._runtimeNotes.push(`model_stream_resume_retry:${resumeAttempt}`);
                 this._runtimeNotes.push(`model_stream_resume_offset:${resumeOffset}`);
+                continue;
+              }
+              if (shouldRetryNetworkDrop) {
+                // Without a usable strong validator, discard the partial shard and restart from 0.
+                resetStagedShardForFullRetry();
+                resumeAttempt += 1;
+                this._runtimeNotes.push('model_stream_restart_no_validator');
+                this._runtimeNotes.push(`model_stream_resume_retry:${resumeAttempt}`);
                 continue;
               }
 
@@ -2636,7 +2880,7 @@ export class LlamaWebGpuBridgeRuntime {
           throwIfAborted(operationSignal, abortMessage);
           nativeLoadStarted = true;
           rc = Number(
-            await core.ccall(
+            await this._callCoreAsync(
               'llamadart_webgpu_load_model',
               'number',
               [
@@ -2659,15 +2903,15 @@ export class LlamaWebGpuBridgeRuntime {
                 this._nGpuLayers,
                 ...this._nativeLoadOptionValues(),
               ],
-              { async: true },
+              core,
             ),
           );
           if (operationSignal?.aborted) {
             try {
-              await core.ccall('llamadart_webgpu_shutdown', null, [], [], { async: true });
+              await this._callCoreAsync('llamadart_webgpu_shutdown', null, [], [], core);
               nativeAbortCleanupDone = true;
             } catch (_) {
-              // best-effort cleanup after an unpreemptible native load
+              // best-effort cleanup after an unpreemptible native load; core aborts reset in funnel
             }
             throw createAbortError(abortMessage);
           }
@@ -2679,7 +2923,7 @@ export class LlamaWebGpuBridgeRuntime {
             String(this._lastCoreErrorHint || ''),
             String(this._lastCoreErrorText || ''),
           ].join(' ');
-          const aborted = nativeLoadStarted && isNativeAbortException(error, true);
+          const aborted = this._resetCores.has(core) || (nativeLoadStarted && isNativeAbortException(error));
           const loweredNativeText = nativeErrorText.toLowerCase();
           if (loweredNativeText.includes('bigint')) {
             this._runtimeNotes.push('model_load_ccall_bigint_error');
@@ -2689,13 +2933,13 @@ export class LlamaWebGpuBridgeRuntime {
             this._runtimeNotes.push('model_load_ccall_failed');
           }
           if (aborted) {
-            this._resetCoreAfterAbort();
-          } else if (operationSignal?.aborted && nativeLoadStarted && !nativeAbortCleanupDone) {
+            this._resetCoreAfterAbort(core);
+          } else if (operationSignal?.aborted && nativeLoadStarted && !nativeAbortCleanupDone && this._core === core) {
             try {
-              await core.ccall('llamadart_webgpu_shutdown', null, [], [], { async: true });
+              await this._callCoreAsync('llamadart_webgpu_shutdown', null, [], [], core);
               nativeAbortCleanupDone = true;
             } catch (_) {
-              this._resetCoreAfterAbort();
+              this._resetCoreAfterAbort(core);
             }
           }
           if (operationSignal?.aborted) {
@@ -2803,8 +3047,11 @@ export class LlamaWebGpuBridgeRuntime {
         let stabilized = false;
         for (const candidateLayers of retryCandidates) {
           try {
-            await core.ccall('llamadart_webgpu_shutdown', null, [], [], { async: true });
-          } catch (_) {
+            await this._callCoreAsync('llamadart_webgpu_shutdown', null, [], [], core);
+          } catch (shutdownErr) {
+            if (this._isCoreAborted(core) || this._resetCores.has(core) || isNativeAbortException(shutdownErr)) {
+              throw shutdownErr;
+            }
             // ignore shutdown retries
           }
 
@@ -2817,7 +3064,7 @@ export class LlamaWebGpuBridgeRuntime {
 
             this._runtimeNotes.push(`safari_probe_remote_fetch_retry:${candidateLayers}`);
             retryRc = Number(
-              await core.ccall(
+              await this._callCoreAsync(
                 'llamadart_webgpu_load_model_from_url',
                 'number',
                 [
@@ -2842,12 +3089,12 @@ export class LlamaWebGpuBridgeRuntime {
                   remoteFetchReloadChunkBytes,
                   ...this._nativeLoadOptionValues(),
                 ],
-                { async: true },
+                core,
               ),
             );
           } else {
             retryRc = Number(
-              await core.ccall(
+              await this._callCoreAsync(
                 'llamadart_webgpu_load_model',
                 'number',
                 [
@@ -2870,7 +3117,7 @@ export class LlamaWebGpuBridgeRuntime {
                   candidateLayers,
                   ...this._nativeLoadOptionValues(),
                 ],
-                { async: true },
+                core,
               ),
             );
           }
@@ -2914,11 +3161,14 @@ export class LlamaWebGpuBridgeRuntime {
     }
 
     try {
-      const effectiveNctx = Number(core.ccall('llamadart_webgpu_get_context_size', 'number', [], []));
+      const effectiveNctx = Number(this._callCoreSync('llamadart_webgpu_get_context_size', 'number', [], [], core));
       if (effectiveNctx > 0) {
         this._nCtx = effectiveNctx;
       }
-    } catch (_) {
+    } catch (error) {
+      if (this._isCoreAborted(core) || this._resetCores.has(core) || isNativeAbortException(error)) {
+        throw error;
+      }
       // Keep requested nCtx if runtime query is unavailable.
     }
 
@@ -2998,18 +3248,18 @@ export class LlamaWebGpuBridgeRuntime {
         let rc = 0;
         try {
           rc = Number(
-            await core.ccall(
+            await this._callCoreAsync(
               'llamadart_webgpu_mmproj_load',
               'number',
               ['string'],
               [this._mmProjPath],
-              { async: true },
+              core,
             ),
           );
         } catch (loadError) {
-          if (isNativeAbortException(loadError, true)) {
+          if (this._resetCores.has(core) || isNativeAbortException(loadError)) {
             this._runtimeNotes.push('mmproj_load_ccall_abort');
-            this._resetCoreAfterAbort();
+            this._resetCoreAfterAbort(core);
           }
           throw loadError;
         }
@@ -3018,10 +3268,10 @@ export class LlamaWebGpuBridgeRuntime {
         }
 
         this._mmSupportsVision = Number(
-          core.ccall('llamadart_webgpu_mmproj_supports_vision', 'number', [], []),
+          this._callCoreSync('llamadart_webgpu_mmproj_supports_vision', 'number', [], [], core),
         ) === 1;
         this._mmSupportsAudio = Number(
-          core.ccall('llamadart_webgpu_mmproj_supports_audio', 'number', [], []),
+          this._callCoreSync('llamadart_webgpu_mmproj_supports_audio', 'number', [], [], core),
         ) === 1;
         this._mmProjSourceUrl = url;
         // mtmd has copied the tensors into its own buffers. A resident GGUF
@@ -3077,7 +3327,7 @@ export class LlamaWebGpuBridgeRuntime {
 
     const mmprojPath = this._mmProjPath;
     const rc = Number(
-      this._core.ccall('llamadart_webgpu_mmproj_free', 'number', [], []),
+      this._callCoreSync('llamadart_webgpu_mmproj_free', 'number', [], []),
     );
     if (rc !== 0) {
       throw new Error(this._coreErrorMessage('Failed to unload multimodal projector', rc));
@@ -3093,9 +3343,12 @@ export class LlamaWebGpuBridgeRuntime {
   // probe.
   _heapHeadroomBytes(core: LlamaCoreModule): number | null {
     try {
-      const value = Number(core.ccall('llamadart_webgpu_heap_headroom_bytes', 'number', [], []));
+      const value = Number(this._callCoreSync('llamadart_webgpu_heap_headroom_bytes', 'number', [], [], core));
       return Number.isFinite(value) && value >= 0 ? value : null;
-    } catch (_) {
+    } catch (error) {
+      if (this._isCoreAborted(core) || this._resetCores.has(core) || isNativeAbortException(error)) {
+        throw error;
+      }
       return null;
     }
   }
@@ -3131,7 +3384,7 @@ export class LlamaWebGpuBridgeRuntime {
 
     // Async: freeing a draft context waits for the WebGPU device, which
     // suspends the core under ASYNCIFY.
-    const rc = Number(await core.ccall('llamadart_webgpu_draft_model_free', 'number', [], [], { async: true }));
+    const rc = Number(await this._callCoreAsync('llamadart_webgpu_draft_model_free', 'number', [], [], core));
     if (rc !== 0) {
       throw new Error(this._coreErrorMessage('Failed to release the draft model', rc));
     }
@@ -3189,12 +3442,12 @@ export class LlamaWebGpuBridgeRuntime {
       throwIfAborted(signal, abortMessage);
 
       const loadRc = Number(
-        await core.ccall(
+        await this._callCoreAsync(
           'llamadart_webgpu_draft_model_load',
           'number',
           ['string'],
           [draftPath],
-          { async: true },
+          core,
         ),
       );
       if (loadRc !== 0) {
@@ -3205,7 +3458,7 @@ export class LlamaWebGpuBridgeRuntime {
         throw new Error(message);
       }
       const info = JSON.parse(
-        core.ccall('llamadart_webgpu_draft_model_info_json', 'string', [], []) || '{}',
+        this._callCoreSync<string>('llamadart_webgpu_draft_model_info_json', 'string', [], [], core) || '{}',
       ) as DraftModelInfo;
       this._draftModel = {
         url,
@@ -3230,7 +3483,7 @@ export class LlamaWebGpuBridgeRuntime {
       return;
     }
     const rc = Number(
-      await this._core.ccall('llamadart_webgpu_draft_model_free', 'number', [], [], { async: true }),
+      await this._callCoreAsync('llamadart_webgpu_draft_model_free', 'number', [], []),
     );
     if (rc !== 0) {
       throw new Error(this._coreErrorMessage('Failed to unload the draft model', rc));
@@ -3284,7 +3537,7 @@ export class LlamaWebGpuBridgeRuntime {
     if (dynamicPath) {
       stagedPaths.push(dynamicPath);
     }
-    const rc = Number(core.ccall(
+    const rc = Number(this._callCoreSync(
       'llamadart_webgpu_set_next_speculative',
       'number',
       [
@@ -3307,6 +3560,7 @@ export class LlamaWebGpuBridgeRuntime {
         dynamicPath,
         maxTokens,
       ],
+      core,
     ));
     if (rc !== 0) {
       throw new Error(this._coreErrorMessage('Failed to configure speculative decoding', rc));
@@ -3320,21 +3574,23 @@ export class LlamaWebGpuBridgeRuntime {
     const fail = (rc: number) => {
       throw new Error(this._coreErrorMessage('Failed to configure the grammar', rc));
     };
-    const rc = Number(core.ccall(
+    const rc = Number(this._callCoreSync(
       'llamadart_webgpu_set_next_grammar',
       'number',
       ['string', 'number'],
       [grammarOptions.root, grammarOptions.lazy ? 1 : 0],
+      core,
     ));
     if (rc !== 0) {
       fail(rc);
     }
     for (const trigger of grammarOptions.triggers) {
-      const triggerRc = Number(core.ccall(
+      const triggerRc = Number(this._callCoreSync(
         'llamadart_webgpu_add_next_grammar_trigger',
         'number',
         ['number', 'string', 'number'],
         [trigger.type, trigger.value, trigger.token],
+        core,
       ));
       if (triggerRc !== 0) {
         fail(triggerRc);
@@ -3364,7 +3620,7 @@ export class LlamaWebGpuBridgeRuntime {
         reason: 'WebGPU core is not initialized',
       };
     }
-    const raw = this._core.ccall(
+    const raw = this._callCoreSync<string>(
       'llamadart_webgpu_tts_info_json',
       'string',
       [],
@@ -3449,11 +3705,12 @@ export class LlamaWebGpuBridgeRuntime {
     this._textToSpeechDone = new Promise<void>((resolve) => {
       this._resolveTextToSpeechDone = resolve;
     });
+    const ttsCore = this._core!;
 
     try {
       this._abortRequested = false;
       const startRc = Number(
-        await this._core!.ccall(
+        await this._callCoreAsync(
           'llamadart_webgpu_tts_start',
           'number',
           ['string', 'string', 'string', 'number', 'number', 'number', 'number', 'number', 'number', 'number'],
@@ -3469,7 +3726,7 @@ export class LlamaWebGpuBridgeRuntime {
             temperature,
             seed,
           ],
-          { async: true },
+          ttsCore,
         ),
       );
       if (startRc !== 0) {
@@ -3484,19 +3741,20 @@ export class LlamaWebGpuBridgeRuntime {
           this.cancel();
         }
         const stepRc = Number(
-          await this._core!.ccall(
+          await this._callCoreAsync(
             'llamadart_webgpu_tts_step',
             'number',
             [],
             [],
-            { async: true },
+            ttsCore,
           ),
         );
-        const rawProgress = this._core!.ccall(
+        const rawProgress = this._callCoreSync<string>(
           'llamadart_webgpu_tts_progress_json',
           'string',
           [],
           [],
+          ttsCore,
         ) || '{}';
         progress = JSON.parse(rawProgress);
         options.onProgress?.(progress);
@@ -3513,17 +3771,18 @@ export class LlamaWebGpuBridgeRuntime {
       }
 
       const outputRc = Number(
-        this._core!.ccall(
+        this._callCoreSync(
           'llamadart_webgpu_tts_write_pcm',
           'number',
           ['string'],
           [outputPath],
+          ttsCore,
         ),
       );
       if (outputRc !== 0) {
         throw new Error(this._coreErrorMessage('Failed to read synthesized speech', outputRc));
       }
-      const bytes = this._core!.FS.readFile(outputPath);
+      const bytes = ttsCore.FS.readFile(outputPath);
       if (!(bytes instanceof Uint8Array) || bytes.byteLength === 0 || (bytes.byteLength % 4) !== 0) {
         throw new Error('Synthesized PCM output is empty or malformed.');
       }
@@ -3538,10 +3797,13 @@ export class LlamaWebGpuBridgeRuntime {
         truncated: progress.truncated === true,
       };
     } finally {
-      if (started) {
+      if (started && this._core === ttsCore && !this._isCoreAborted(ttsCore)) {
         try {
-          this._core!.ccall('llamadart_webgpu_tts_reset', 'number', [], []);
-        } catch (_) {
+          this._callCoreSync('llamadart_webgpu_tts_reset', 'number', [], [], ttsCore);
+        } catch (resetErr) {
+          if (this._isCoreAborted(ttsCore) || this._resetCores.has(ttsCore) || isNativeAbortException(resetErr)) {
+            this._resetCoreAfterAbort(ttsCore);
+          }
           // best-effort task cleanup
         }
       }
@@ -3568,7 +3830,7 @@ export class LlamaWebGpuBridgeRuntime {
       return unsupported('This WebGPU core build does not include decision heads.');
     }
     const coreVersion = Number(
-      core.ccall('llamadart_webgpu_decision_api_version', 'number', [], []),
+      this._callCoreSync('llamadart_webgpu_decision_api_version', 'number', [], [], core),
     );
     if (coreVersion !== DECISION_API_VERSION) {
       return unsupported(
@@ -3576,11 +3838,12 @@ export class LlamaWebGpuBridgeRuntime {
         + `this bridge needs version ${DECISION_API_VERSION}.`,
       );
     }
-    const raw = core.ccall(
+    const raw = this._callCoreSync<string>(
       'llamadart_webgpu_decision_capabilities_json',
       'string',
       [],
       [],
+      core,
     ) || '{}';
     try {
       return JSON.parse(raw) as DecisionCapabilities;
@@ -3695,12 +3958,12 @@ export class LlamaWebGpuBridgeRuntime {
         core.FS.writeFile(configPath, textEncoder.encode(configJson!));
       }
       const handle = Number(
-        await core.ccall(
+        await this._callCoreAsync(
           'llamadart_webgpu_decision_load',
           'number',
           ['string', 'string', 'string'],
           [headPath, label, configPath],
-          { async: true },
+          core,
         ),
       );
       if (handle <= 0) {
@@ -3710,11 +3973,12 @@ export class LlamaWebGpuBridgeRuntime {
         );
       }
       this._decisionHeadGenerationMap().set(handle, this._coreGeneration);
-      const raw = core.ccall(
+      const raw = this._callCoreSync<string>(
         'llamadart_webgpu_decision_head_info_json',
         'string',
         ['number'],
         [handle],
+        core,
       ) || '{}';
       return JSON.parse(raw) as DecisionHeadInfo;
     } finally {
@@ -3744,12 +4008,12 @@ export class LlamaWebGpuBridgeRuntime {
     try {
       core.FS.writeFile(inputPath, input);
       const count = Number(
-        await core.ccall(
+        await this._callCoreAsync(
           'llamadart_webgpu_decision_run',
           'number',
           ['number', 'string', 'string'],
           [nativeHandle, inputPath, outputPath],
-          { async: true },
+          core,
         ),
       );
       if (count < 0) {
@@ -3772,12 +4036,11 @@ export class LlamaWebGpuBridgeRuntime {
     if (!this._core || (recordedGen !== undefined && recordedGen !== this._coreGeneration)) {
       return;
     }
-    await this._core.ccall(
+    await this._callCoreAsync(
       'llamadart_webgpu_decision_free',
       'number',
       ['number'],
       [nativeHandle],
-      { async: true },
     );
   }
 
@@ -3795,7 +4058,7 @@ export class LlamaWebGpuBridgeRuntime {
       return unsupported('This WebGPU core build does not include LoRA adapters.');
     }
     const coreVersion = Number(
-      core.ccall('llamadart_webgpu_lora_api_version', 'number', [], []),
+      this._callCoreSync('llamadart_webgpu_lora_api_version', 'number', [], [], core),
     );
     if (coreVersion !== LORA_API_VERSION) {
       return unsupported(
@@ -3934,12 +4197,12 @@ export class LlamaWebGpuBridgeRuntime {
       }
       throwIfAborted(signal, LORA_LOAD_ABORT_MESSAGE);
       const handle = Number(
-        await core.ccall(
+        await this._callCoreAsync(
           'llamadart_webgpu_lora_load',
           'number',
           ['string'],
           [adapterPath],
-          { async: true },
+          core,
         ),
       );
       if (handle <= 0) {
@@ -3955,7 +4218,7 @@ export class LlamaWebGpuBridgeRuntime {
 
   async _callLoraCore(name: string, argTypes: CcallArgType[], args: number[], failure: string) {
     const core = this._requireLoraCore();
-    const rc = Number(await core.ccall(name, 'number', argTypes, args, { async: true }));
+    const rc = Number(await this._callCoreAsync(name, 'number', argTypes, args, core));
     if (rc !== 0) {
       throw new Error(this._coreErrorMessage(failure, rc));
     }
@@ -4016,7 +4279,9 @@ export class LlamaWebGpuBridgeRuntime {
   }
 
   _clearPendingMedia() {
-    this._core?.ccall('llamadart_webgpu_media_clear_pending', null, [], []);
+    if (this._core && !this._isCoreAborted(this._core)) {
+      this._callCoreSync('llamadart_webgpu_media_clear_pending', null, [], []);
+    }
     this._clearStagedMediaFiles();
   }
 
@@ -4044,7 +4309,7 @@ export class LlamaWebGpuBridgeRuntime {
 
   _addMediaFile(mediaPath: string) {
     const rc = Number(
-      this._core!.ccall(
+      this._callCoreSync(
         'llamadart_webgpu_media_add_file',
         'number',
         ['string'],
@@ -4057,36 +4322,38 @@ export class LlamaWebGpuBridgeRuntime {
   }
 
   _addRawRgbMediaBytes(bytes: Uint8Array, width: number, height: number) {
+    const core = this._core;
     const useHeapBuffer =
-      this._core
-      && typeof this._core._malloc === 'function'
-      && typeof this._core._free === 'function'
-      && this._core.HEAPU8
-      && typeof this._core.HEAPU8.set === 'function';
+      core
+      && typeof core._malloc === 'function'
+      && typeof core._free === 'function'
+      && core.HEAPU8
+      && typeof core.HEAPU8.set === 'function';
 
     let rc = 0;
     if (useHeapBuffer) {
-      const ptr = this._core!._malloc!(bytes.length);
+      const ptr = this._coreHeapAlloc(core, bytes.length);
       if (!Number.isFinite(ptr) || ptr <= 0) {
         throw new Error('Failed to allocate core heap buffer for RGB media bytes');
       }
 
       try {
-        this._core!.HEAPU8!.set(bytes, ptr);
+        core.HEAPU8!.set(bytes, ptr);
         rc = Number(
-          this._core!.ccall(
+          this._callCoreSync(
             'llamadart_webgpu_media_add_rgb',
             'number',
             ['number', 'number', 'number', 'number'],
             [width, height, ptr, bytes.length],
+            core,
           ),
         );
       } finally {
-        this._core!._free!(ptr);
+        this._coreHeapFree(core, ptr);
       }
     } else {
       rc = Number(
-        this._core!.ccall(
+        this._callCoreSync(
           'llamadart_webgpu_media_add_rgb',
           'number',
           ['number', 'number', 'array', 'number'],
@@ -4102,36 +4369,38 @@ export class LlamaWebGpuBridgeRuntime {
 
   _addAudioSamples(samples: Float32Array) {
     const sampleBytes = new Uint8Array(samples.buffer, samples.byteOffset, samples.byteLength);
+    const core = this._core;
     const useHeapBuffer =
-      this._core
-      && typeof this._core._malloc === 'function'
-      && typeof this._core._free === 'function'
-      && this._core.HEAPU8
-      && typeof this._core.HEAPU8.set === 'function';
+      core
+      && typeof core._malloc === 'function'
+      && typeof core._free === 'function'
+      && core.HEAPU8
+      && typeof core.HEAPU8.set === 'function';
 
     let rc = 0;
     if (useHeapBuffer) {
-      const ptr = this._core!._malloc!(sampleBytes.length);
+      const ptr = this._coreHeapAlloc(core, sampleBytes.length);
       if (!Number.isFinite(ptr) || ptr <= 0) {
         throw new Error('Failed to allocate core heap buffer for audio samples');
       }
 
       try {
-        this._core!.HEAPU8!.set(sampleBytes, ptr);
+        core.HEAPU8!.set(sampleBytes, ptr);
         rc = Number(
-          this._core!.ccall(
+          this._callCoreSync(
             'llamadart_webgpu_media_add_audio_f32',
             'number',
             ['number', 'number'],
             [ptr, samples.length],
+            core,
           ),
         );
       } finally {
-        this._core!._free!(ptr);
+        this._coreHeapFree(core, ptr);
       }
     } else {
       rc = Number(
-        this._core!.ccall(
+        this._callCoreSync(
           'llamadart_webgpu_media_add_audio_f32',
           'number',
           ['array', 'number'],
@@ -4275,7 +4544,7 @@ export class LlamaWebGpuBridgeRuntime {
       return { ...NO_COMPLETION_CAPABILITIES };
     }
     return completionCapabilitiesFrom(
-      core.ccall('llamadart_webgpu_completion_capabilities_json', 'string', [], []),
+      this._callCoreSync<string>('llamadart_webgpu_completion_capabilities_json', 'string', [], [], core),
     );
   }
 
@@ -4322,6 +4591,7 @@ export class LlamaWebGpuBridgeRuntime {
 
     let generationStarted = false;
     const speculativePaths: string[] = [];
+    const completionCore = this._core!;
 
     try {
       if (sampling.speculative) {
@@ -4332,10 +4602,16 @@ export class LlamaWebGpuBridgeRuntime {
       }
       if (sampling.thinkingBudget?.pauseGrammar === false) {
         // After _setNextGrammar, which restores the default.
-        this._core!.ccall('llamadart_webgpu_set_next_grammar_reasoning_pause', null, ['number'], [0]);
+        this._callCoreSync(
+          'llamadart_webgpu_set_next_grammar_reasoning_pause',
+          null,
+          ['number'],
+          [0],
+          completionCore,
+        );
       }
       const beginRc = Number(
-        await this._core!.ccall(
+        await this._callCoreAsync(
           input.exportName,
           'number',
           [
@@ -4358,7 +4634,7 @@ export class LlamaWebGpuBridgeRuntime {
             sampling.thinkingBudget?.forcedMessage ?? null,
             sampling.penaltyPromptTokensWithGrammar ? 2 : sampling.penaltyPromptTokens ? 0 : 1,
           ],
-          { async: true },
+          completionCore,
         ),
       );
 
@@ -4396,7 +4672,7 @@ export class LlamaWebGpuBridgeRuntime {
       let text = '';
       const readOutputDelta = (final: boolean): string => {
         if (!readsOutputBytes) {
-          text = this._core!.ccall('llamadart_webgpu_last_output', 'string', [], []) || (final ? text : '');
+          text = this._callCoreSync<string>('llamadart_webgpu_last_output', 'string', [], [], completionCore) || (final ? text : '');
           const stableText = final ? text : trimUnstableUtf8Tail(text);
           if (!stableText.startsWith(legacyEmittedText)) {
             if (final) {
@@ -4423,12 +4699,12 @@ export class LlamaWebGpuBridgeRuntime {
         }
 
         const stepRc = Number(
-          await this._core!.ccall(
+          await this._callCoreAsync(
             'llamadart_webgpu_next_token',
             'number',
             [],
             [],
-            { async: true },
+            completionCore,
           ),
         );
         if (stepRc === 0) {
@@ -4456,10 +4732,13 @@ export class LlamaWebGpuBridgeRuntime {
           ) {
             const recovered = await this._recoverGenerationWithCpuFallback(options);
             if (recovered) {
-              if (generationStarted) {
+              if (generationStarted && this._core === completionCore && !this._isCoreAborted(completionCore)) {
                 try {
-                  this._core!.ccall('llamadart_webgpu_end_generation', null, [], []);
-                } catch (_) {
+                  this._callCoreSync('llamadart_webgpu_end_generation', null, [], [], completionCore);
+                } catch (endErr) {
+                  if (this._isCoreAborted(completionCore) || this._resetCores.has(completionCore) || isNativeAbortException(endErr)) {
+                    this._resetCoreAfterAbort(completionCore);
+                  }
                   // best-effort cleanup before retry
                 }
                 generationStarted = false;
@@ -4508,7 +4787,7 @@ export class LlamaWebGpuBridgeRuntime {
       }
       if (typeof options.onUsage === 'function') {
         const counts = JSON.parse(
-          this._core!.ccall('llamadart_webgpu_last_generation_usage_json', 'string', [], []) || '{}',
+          this._callCoreSync<string>('llamadart_webgpu_last_generation_usage_json', 'string', [], [], completionCore) || '{}',
         );
         const speculative = counts?.speculative;
         options.onUsage({
@@ -4533,11 +4812,11 @@ export class LlamaWebGpuBridgeRuntime {
       }
       return text;
     } finally {
-      if (generationStarted) {
+      if (generationStarted && this._core === completionCore && !this._isCoreAborted(completionCore)) {
         // Async: ending a speculative generation frees its draft context,
         // which waits for the WebGPU device and suspends the core under
         // ASYNCIFY. A synchronous ccall would return before the free ends.
-        await this._core!.ccall('llamadart_webgpu_end_generation', null, [], [], { async: true });
+        await this._callCoreAsync('llamadart_webgpu_end_generation', null, [], [], completionCore);
       }
       for (const path of speculativePaths) {
         this._deleteFsFile(path);
@@ -4553,12 +4832,11 @@ export class LlamaWebGpuBridgeRuntime {
 
     const input = this._coreText(String(text), 'llamadart_webgpu_tokenize_bytes_to_json', 'llamadart_webgpu_tokenize_to_json');
     const rc = Number(
-      await this._core!.ccall(
+      await this._callCoreAsync(
         input.exportName,
         'number',
         [...input.argTypes, 'number'],
         [...input.args, _addSpecial ? 1 : 0],
-        { async: true },
       ),
     );
 
@@ -4566,7 +4844,7 @@ export class LlamaWebGpuBridgeRuntime {
       throw new Error(this._coreErrorMessage('Tokenization failed', rc));
     }
 
-    const raw = this._core!.ccall('llamadart_webgpu_last_tokens_json', 'string', [], []) || '[]';
+    const raw = this._callCoreSync<string>('llamadart_webgpu_last_tokens_json', 'string', [], []) || '[]';
     const parsed = JSON.parse(raw);
     return Array.isArray(parsed)
       ? parsed.map((v) => Number(v) | 0)
@@ -4606,12 +4884,11 @@ export class LlamaWebGpuBridgeRuntime {
     const normalized = this._normalizeStateTokens(tokens);
     const tokenText = JSON.stringify(normalized);
     const rc = Number(
-      await this._core!.ccall(
+      await this._callCoreAsync(
         'llamadart_webgpu_state_save_file',
         'number',
         ['string', 'string'],
         [path, tokenText],
-        { async: true },
       ),
     );
 
@@ -4634,12 +4911,11 @@ export class LlamaWebGpuBridgeRuntime {
       ? Math.trunc(Number(tokenCapacity))
       : this.getContextSize();
     const rc = Number(
-      await this._core!.ccall(
+      await this._callCoreAsync(
         'llamadart_webgpu_state_load_file',
         'number',
         ['string', 'number'],
         [path, capacity],
-        { async: true },
       ),
     );
 
@@ -4647,7 +4923,7 @@ export class LlamaWebGpuBridgeRuntime {
       throw new Error(this._coreErrorMessage('State load failed', rc));
     }
 
-    const raw = this._core!.ccall('llamadart_webgpu_last_tokens_json', 'string', [], []) || '[]';
+    const raw = this._callCoreSync<string>('llamadart_webgpu_last_tokens_json', 'string', [], []) || '[]';
     const parsed = JSON.parse(raw);
     const restoredTokens = Array.isArray(parsed)
       ? parsed.map((v) => Number(v) | 0)
@@ -4704,12 +4980,11 @@ export class LlamaWebGpuBridgeRuntime {
     const tokenText = JSON.stringify(normalized.map((v) => Number(v) | 0));
 
     const rc = Number(
-      await this._core!.ccall(
+      await this._callCoreAsync(
         'llamadart_webgpu_detokenize_from_json',
         'number',
         ['string', 'number'],
         [tokenText, _special ? 1 : 0],
-        { async: true },
       ),
     );
 
@@ -4721,7 +4996,7 @@ export class LlamaWebGpuBridgeRuntime {
       return new TextDecoder('utf-8', { ignoreBOM: true })
         .decode(this._coreTextBytes('llamadart_webgpu_last_detokenized_bytes_json'));
     }
-    return this._core!.ccall('llamadart_webgpu_last_detokenized', 'string', [], []) || '';
+    return this._callCoreSync<string>('llamadart_webgpu_last_detokenized', 'string', [], []) || '';
   }
 
   // A 'string' ccall argument reaches the core as a C string, which ends at the
@@ -4750,7 +5025,7 @@ export class LlamaWebGpuBridgeRuntime {
   // code points instead of U+FFFD.
   _coreTextBytes(exportName: string, args: number[] = []): Uint8Array {
     const argTypes = args.map((): CcallArgType => 'number');
-    return Uint8Array.from(JSON.parse(this._core!.ccall(exportName, 'string', argTypes, args) || '[]'));
+    return Uint8Array.from(JSON.parse(this._callCoreSync<string>(exportName, 'string', argTypes, args) || '[]'));
   }
 
   _embeddingAssetVersion() {
@@ -4765,7 +5040,7 @@ export class LlamaWebGpuBridgeRuntime {
       throw missingEmbeddingCapability(this._embeddingAssetVersion());
     }
     return embeddingCapabilitiesFrom(
-      this._core.ccall('llamadart_webgpu_embedding_capabilities_json', 'string', [], []),
+      this._callCoreSync<string>('llamadart_webgpu_embedding_capabilities_json', 'string', [], []),
       this._embeddingAssetVersion(),
     );
   }
@@ -4780,19 +5055,27 @@ export class LlamaWebGpuBridgeRuntime {
     const prompt = parts.map((part) => part.type === 'text' ? part.text : EMBEDDING_MEDIA_MARKER).join('');
     const promptBytes = textEncoder.encode(prompt);
     const media = parts.filter((part) => part.type !== 'text');
+    const embedCore = this._core;
     try {
       await this._stageMultimodalParts(media);
       if (this._abortRequested) throw createAbortError('Embedding was cancelled.');
-      const rc = Number(await this._core!.ccall('llamadart_webgpu_embed_parts_to_json', 'number',
-        ['array', 'number', 'number'], [promptBytes, options?.normalize !== false ? 1 : 0, promptBytes.length], { async: true }));
+      const rc = Number(await this._callCoreAsync(
+        'llamadart_webgpu_embed_parts_to_json',
+        'number',
+        ['array', 'number', 'number'],
+        [promptBytes, options?.normalize !== false ? 1 : 0, promptBytes.length],
+        embedCore,
+      ));
       if (this._abortRequested) throw createAbortError('Embedding was cancelled.');
       if (rc < 0) throw embeddingCoreError(rc, this._embeddingAssetVersion());
-      const raw = this._core!.ccall('llamadart_webgpu_last_embedding_json', 'string', [], []) || '[]';
+      const raw = this._callCoreSync<string>('llamadart_webgpu_last_embedding_json', 'string', [], [], embedCore) || '[]';
       const parsed = JSON.parse(raw);
       return Array.isArray(parsed) ? parsed.map((v) => Number.isFinite(Number(v)) ? Number(v) : 0) : [];
     } catch (error) {
-      if (error instanceof WebAssembly.RuntimeError) throw error;
-      if (error instanceof EmbeddingError || (error as Error)?.name === 'AbortError') throw error;
+      if (this._isCoreAborted(embedCore) || (embedCore && this._resetCores.has(embedCore)) || isNativeAbortException(error)) {
+        throw error;
+      }
+      if (error instanceof EmbeddingError || errorNameOf(error) === 'AbortError') throw error;
       // Decoders/fetchers can include URLs or paths; never expose those here.
       throw new EmbeddingError('EMBEDDING_FAILED', 'Embedding media preparation or execution failed.');
     } finally {
@@ -4815,12 +5098,11 @@ export class LlamaWebGpuBridgeRuntime {
     const normalize = options?.normalize !== false;
     const input = this._coreText(String(text), 'llamadart_webgpu_embed_bytes_to_json', 'llamadart_webgpu_embed_to_json');
     const rc = Number(
-      await this._core!.ccall(
+      await this._callCoreAsync(
         input.exportName,
         'number',
         [...input.argTypes, 'number'],
         [...input.args, normalize ? 1 : 0],
-        { async: true },
       ),
     );
 
@@ -4828,7 +5110,7 @@ export class LlamaWebGpuBridgeRuntime {
       throw new Error(this._coreErrorMessage('Embedding generation failed', rc));
     }
 
-    const raw = this._core!.ccall('llamadart_webgpu_last_embedding_json', 'string', [], []) || '[]';
+    const raw = this._callCoreSync<string>('llamadart_webgpu_last_embedding_json', 'string', [], []) || '[]';
     const parsed = JSON.parse(raw);
     return Array.isArray(parsed)
       ? parsed.map((v) => {
@@ -4885,12 +5167,11 @@ export class LlamaWebGpuBridgeRuntime {
       'llamadart_webgpu_score_next_token_to_json',
     );
     const rc = Number(
-      await this._core!.ccall(
+      await this._callCoreAsync(
         input.exportName,
         'number',
         [...input.argTypes, 'string', 'number', 'number'],
         [...input.args, JSON.stringify(candidates), topK, reusePromptPrefix ? 1 : 0],
-        { async: true },
       ),
     );
 
@@ -4898,7 +5179,7 @@ export class LlamaWebGpuBridgeRuntime {
       throw new Error(this._coreErrorMessage('Next-token scoring failed', rc));
     }
 
-    const raw = this._core!.ccall('llamadart_webgpu_last_next_token_scores_json', 'string', [], []) || '{}';
+    const raw = this._callCoreSync<string>('llamadart_webgpu_last_next_token_scores_json', 'string', [], []) || '{}';
     const parsed = JSON.parse(raw);
     return {
       candidates: scoredTokensFrom(parsed?.candidates),
@@ -4909,17 +5190,23 @@ export class LlamaWebGpuBridgeRuntime {
 
   getModelMetadata() {
     let modelMetadata = {};
+    const core = this._core;
 
-    try {
-      const raw = this._core?.ccall('llamadart_webgpu_model_meta_json', 'string', [], []);
-      if (raw) {
-        const parsed = JSON.parse(raw);
-        if (parsed && typeof parsed === 'object') {
-          modelMetadata = parsed;
+    if (core && !this._isCoreAborted(core)) {
+      try {
+        const raw = this._callCoreSync<string>('llamadart_webgpu_model_meta_json', 'string', [], [], core);
+        if (raw) {
+          const parsed = JSON.parse(raw);
+          if (parsed && typeof parsed === 'object') {
+            modelMetadata = parsed;
+          }
         }
+      } catch (error) {
+        if (this._isCoreAborted(core) || this._resetCores.has(core) || isNativeAbortException(error)) {
+          throw error;
+        }
+        // Keep fallback metadata only.
       }
-    } catch (_) {
-      // Keep fallback metadata only.
     }
 
     return {
@@ -4962,13 +5249,19 @@ export class LlamaWebGpuBridgeRuntime {
   }
 
   getContextSize() {
-    try {
-      const nctx = Number(this._core?.ccall('llamadart_webgpu_get_context_size', 'number', [], []));
-      if (nctx > 0) {
-        return nctx;
+    const core = this._core;
+    if (core && !this._isCoreAborted(core)) {
+      try {
+        const nctx = Number(this._callCoreSync('llamadart_webgpu_get_context_size', 'number', [], [], core));
+        if (nctx > 0) {
+          return nctx;
+        }
+      } catch (error) {
+        if (this._isCoreAborted(core) || this._resetCores.has(core) || isNativeAbortException(error)) {
+          throw error;
+        }
+        // fall through to cached value
       }
-    } catch (_) {
-      // fall through to cached value
     }
 
     return this._nCtx;
@@ -5010,10 +5303,13 @@ export class LlamaWebGpuBridgeRuntime {
       this._activeTransferAbortController = null;
     }
 
-    try {
-      this._core?.ccall('llamadart_webgpu_request_cancel', null, [], []);
-    } catch (_) {
-      // ignore best-effort cancel failures
+    const core = this._core;
+    if (core && !this._isCoreAborted(core)) {
+      try {
+        this._callCoreSync('llamadart_webgpu_request_cancel', null, [], [], core);
+      } catch (_) {
+        // ignore best-effort cancel failures; any abort already reset core
+      }
     }
   }
 
@@ -5033,18 +5329,23 @@ export class LlamaWebGpuBridgeRuntime {
     }
 
     if (this._core) {
+      const disposeCore = this._core;
       this._clearPendingMedia();
       const mmprojPath = this._mmProjPath;
-      const mmprojFreeRc = Number(
-        this._core.ccall('llamadart_webgpu_mmproj_free', 'number', [], []),
-      );
-      if (mmprojFreeRc !== 0) {
-        this._emitLogger(
-          'warn',
-          this._coreErrorMessage('Failed to unload multimodal projector during dispose', mmprojFreeRc),
+      if (this._core === disposeCore && !this._isCoreAborted(disposeCore)) {
+        const mmprojFreeRc = Number(
+          this._callCoreSync('llamadart_webgpu_mmproj_free', 'number', [], [], disposeCore),
         );
+        if (mmprojFreeRc !== 0) {
+          this._emitLogger(
+            'warn',
+            this._coreErrorMessage('Failed to unload multimodal projector during dispose', mmprojFreeRc),
+          );
+        }
       }
-      await this._core.ccall('llamadart_webgpu_shutdown', null, [], [], { async: true });
+      if (this._core === disposeCore && !this._isCoreAborted(disposeCore)) {
+        await this._callCoreAsync('llamadart_webgpu_shutdown', null, [], [], disposeCore);
+      }
       this._deleteFsFile(mmprojPath);
       this._releaseModelFiles();
     }

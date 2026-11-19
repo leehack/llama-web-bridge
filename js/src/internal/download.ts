@@ -56,11 +56,9 @@ export interface ValidatedPartialRange extends ParsedContentRange {
   expectedTailLength: number;
 }
 
-export interface ResumeValidators {
-  etag: string;
-  lastModified: string;
-  ifRange: string;
-}
+export type ResumeValidators =
+  | { kind: 'etag'; value: string }
+  | { kind: 'last-modified'; value: string };
 
 // A transfer failure annotated with how far the file got, for resumable loads.
 type TransferError = Error & { llamadartLoadedBytes?: number; llamadartFilePath?: string };
@@ -95,34 +93,35 @@ function readNormalizedHeader(response: Response, headerName: string): string {
   return typeof raw === 'string' ? raw.trim() : '';
 }
 
-export function captureResumeValidators(response: Response): ResumeValidators {
+export function captureResumeValidators(response: Response): ResumeValidators | null {
   const etag = readNormalizedHeader(response, 'etag');
+  if (etag.length > 0) {
+    // Weak ETags cannot validate byte-range splicing, and RFC 9110 §13.1.5
+    // forbids falling back to Last-Modified when ETag is present.
+    return /^w\//i.test(etag) ? null : { kind: 'etag', value: etag };
+  }
   const lastModified = readNormalizedHeader(response, 'last-modified');
-  // Weak ETags (W/...) are invalid in If-Range (RFC 9110); fall back to Last-Modified.
-  const strongEtag = etag.length > 0 && !/^w\//i.test(etag) ? etag : '';
-  const ifRange = strongEtag || lastModified;
-  return { etag, lastModified, ifRange };
+  return lastModified.length > 0 ? { kind: 'last-modified', value: lastModified } : null;
 }
 
 export function validateResumedValidators(
   initial: ResumeValidators | null | undefined,
   response: Response,
-): void {
+): boolean {
   if (!initial) {
-    return;
+    return false;
   }
-  const resumedEtag = readNormalizedHeader(response, 'etag');
-  if (initial.etag && resumedEtag && resumedEtag !== initial.etag) {
-    throw createModelTransferLengthError(
-      'Resumed 206 ETag validator changed; refusing to splice partial model bytes.',
-    );
+  if (initial.kind === 'etag') {
+    const resumedEtag = readNormalizedHeader(response, 'etag');
+    return resumedEtag.length > 0
+      && !/^w\//i.test(resumedEtag)
+      && resumedEtag === initial.value;
+  }
+  if (readNormalizedHeader(response, 'etag').length > 0) {
+    return false;
   }
   const resumedLastModified = readNormalizedHeader(response, 'last-modified');
-  if (initial.lastModified && resumedLastModified && resumedLastModified !== initial.lastModified) {
-    throw createModelTransferLengthError(
-      'Resumed 206 Last-Modified validator changed; refusing to splice partial model bytes.',
-    );
-  }
+  return resumedLastModified.length > 0 && resumedLastModified === initial.value;
 }
 
 export function parseContentRangeHeader(

@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -964,7 +965,7 @@ test('resumed 206 validates Content-Range start, end, and total before native lo
       },
     }), {
       status: 200,
-      headers: { 'content-length': '10', 'content-encoding': 'identity' },
+      headers: { 'content-length': '10', 'content-encoding': 'identity', etag: '"v1"' },
     });
   };
 
@@ -995,7 +996,7 @@ test('resumed 206 validates Content-Range start, end, and total before native lo
       if (attempt === 2) {
         return new Response(invalid.body, {
           status: 206,
-          headers: { 'content-range': invalid.contentRange, 'content-length': invalid.cl },
+          headers: { 'content-range': invalid.contentRange, 'content-length': invalid.cl, etag: '"v1"' },
         });
       }
       return new Response(fullPayload, {
@@ -1048,6 +1049,7 @@ test('resumed 206 validates Content-Range start, end, and total before native lo
         'content-range': 'bytes 4-9/10',
         'content-length': '6',
         'content-encoding': 'identity',
+        etag: '"v1"',
       },
     });
   };
@@ -1623,15 +1625,16 @@ test('worker-mode loadMultimodalProjector preserves ModelStagingError without re
   });
 });
 
-test('resume requests send If-Range when available and reject 200 or changed validators before native load', async () => {
-  const fullPayload = Uint8Array.from({ length: 10 }, (_, i) => 20 + i);
-  const makeCutResponse = (headers) => {
+test('resume safety: never sends If-Range, validates RFC 9110 strong validators on 206, and restarts from 0 without splicing', async () => {
+  const revA = Uint8Array.from({ length: 10 }, (_, i) => 10 + i);
+  const revB = Uint8Array.from({ length: 10 }, (_, i) => 100 + i);
+  const makeCutResponse = (payload, headers, cutAt = 4) => {
     let chunkSent = false;
     return new Response(new ReadableStream({
       pull(controller) {
         if (!chunkSent) {
           chunkSent = true;
-          controller.enqueue(fullPayload.subarray(0, 4));
+          controller.enqueue(payload.subarray(0, cutAt));
           return;
         }
         controller.error(new Error('network error'));
@@ -1639,72 +1642,241 @@ test('resume requests send If-Range when available and reject 200 or changed val
     }), { status: 200, headers });
   };
 
-  // 1) Strong ETag triggers If-Range and changed weak ETag / Last-Modified / 200 fail with ModelTransferLengthError.
-  const scenarios = [
+  // Helper to collect the exact bytes written to /jsmodels/model.gguf.
+  const collectStagedBytes = (harness) => {
+    const out = new Uint8Array(revB.byteLength);
+    let maxEnd = 0;
+    for (const w of harness.directWrites) {
+      out.set(w.chunkRef, w.position);
+      maxEnd = Math.max(maxEnd, w.position + w.length);
+    }
+    return out.subarray(0, maxEnd);
+  };
+
+  // 1) Cases that drop on initial GET and restart/recover cleanly with full revision B:
+  // - no validator (e.g. CORS-hidden or missing headers) -> never sends Range, restarts from 0
+  // - weak ETag alone, or weak ETag + Last-Modified (RFC 9110 §13.1.5 forbids Last-Modified fallback) -> never sends Range
+  // - strong ETag returning 200 on Range -> discards partial A, restarts from 0 with GET
+  // - strong ETag returning 206 with changed ETag / weak ETag / missing ETag -> restarts from 0
+  // - Last-Modified (no ETag) returning 206 with changed Last-Modified -> restarts from 0
+  const restartScenarios = [
     {
-      name: 'strong-etag-200',
-      initialHeaders: { 'content-length': '10', etag: '"v1"', 'last-modified': 'Wed, 01 Jan 2025 00:00:00 GMT' },
-      expectedIfRange: '"v1"',
-      resumeResponse: () => new Response(fullPayload, { status: 200, headers: { 'content-length': '10', etag: '"v2"' } }),
-      expectedPattern: /Range resume not honored for model shard: 200/,
+      name: 'same-length-revisions-no-validator',
+      responses: [
+        () => makeCutResponse(revA, { 'content-length': '10' }),
+        () => new Response(revB, { status: 200, headers: { 'content-length': '10' } }),
+      ],
+      expectRangeSent: false,
     },
     {
-      name: 'weak-etag-falls-back-to-last-modified-and-catches-weak-change',
-      initialHeaders: { 'content-length': '10', etag: 'W/"weak-1"', 'last-modified': 'Wed, 01 Jan 2025 00:00:00 GMT' },
-      expectedIfRange: 'Wed, 01 Jan 2025 00:00:00 GMT',
-      resumeResponse: () => new Response(fullPayload.subarray(4), {
-        status: 206,
-        headers: {
-          'content-range': 'bytes 4-9/10',
-          'content-length': '6',
-          etag: 'W/"weak-2"',
+      name: 'weak-etag-only',
+      responses: [
+        () => makeCutResponse(revA, { 'content-length': '10', etag: 'W/"v1"' }),
+        () => new Response(revB, { status: 200, headers: { 'content-length': '10', etag: 'W/"v2"' } }),
+      ],
+      expectRangeSent: false,
+    },
+    {
+      name: 'weak-etag-with-last-modified-no-fallback',
+      responses: [
+        () => makeCutResponse(revA, {
+          'content-length': '10',
+          etag: 'W/"v1"',
           'last-modified': 'Wed, 01 Jan 2025 00:00:00 GMT',
-        },
-      }),
-      expectedPattern: /ETag validator changed/,
+        }),
+        () => new Response(revB, {
+          status: 200,
+          headers: {
+            'content-length': '10',
+            etag: 'W/"v2"',
+            'last-modified': 'Wed, 01 Jan 2025 00:00:00 GMT',
+          },
+        }),
+      ],
+      expectRangeSent: false,
     },
     {
-      name: 'weak-etag-only-catches-changed-weak-etag-without-if-range',
-      initialHeaders: { 'content-length': '10', etag: 'W/"weak-1"' },
-      expectedIfRange: undefined,
-      resumeResponse: () => new Response(fullPayload.subarray(4), {
-        status: 206,
-        headers: {
-          'content-range': 'bytes 4-9/10',
-          'content-length': '6',
-          etag: 'W/"weak-2"',
-        },
-      }),
-      expectedPattern: /ETag validator changed/,
+      name: 'strong-etag-range-gets-200',
+      responses: [
+        () => makeCutResponse(revA, { 'content-length': '10', etag: '"v1"' }),
+        () => new Response(revB, { status: 200, headers: { 'content-length': '10', etag: '"v2"' } }),
+        () => new Response(revB, { status: 200, headers: { 'content-length': '10', etag: '"v2"' } }),
+      ],
+      expectRangeSent: true,
+    },
+    {
+      name: 'strong-etag-range-gets-changed-etag-206',
+      responses: [
+        () => makeCutResponse(revA, { 'content-length': '10', etag: '"v1"' }),
+        () => new Response(revB.subarray(4), {
+          status: 206,
+          headers: { 'content-range': 'bytes 4-9/10', 'content-length': '6', etag: '"v2"' },
+        }),
+        () => new Response(revB, { status: 200, headers: { 'content-length': '10', etag: '"v2"' } }),
+      ],
+      expectRangeSent: true,
+    },
+    {
+      name: 'strong-etag-range-gets-weak-etag-206',
+      responses: [
+        () => makeCutResponse(revA, { 'content-length': '10', etag: '"v1"' }),
+        () => new Response(revB.subarray(4), {
+          status: 206,
+          headers: { 'content-range': 'bytes 4-9/10', 'content-length': '6', etag: 'W/"v1"' },
+        }),
+        () => new Response(revB, { status: 200, headers: { 'content-length': '10', etag: '"v2"' } }),
+      ],
+      expectRangeSent: true,
+    },
+    {
+      name: 'strong-etag-range-gets-missing-validator-206',
+      responses: [
+        () => makeCutResponse(revA, { 'content-length': '10', etag: '"v1"' }),
+        () => new Response(revB.subarray(4), {
+          status: 206,
+          headers: { 'content-range': 'bytes 4-9/10', 'content-length': '6' },
+        }),
+        () => new Response(revB, { status: 200, headers: { 'content-length': '10', etag: '"v2"' } }),
+      ],
+      expectRangeSent: true,
+    },
+    {
+      name: 'last-modified-range-gets-changed-date-206',
+      responses: [
+        () => makeCutResponse(revA, {
+          'content-length': '10',
+          'last-modified': 'Wed, 01 Jan 2025 00:00:00 GMT',
+        }),
+        () => new Response(revB.subarray(4), {
+          status: 206,
+          headers: {
+            'content-range': 'bytes 4-9/10',
+            'content-length': '6',
+            'last-modified': 'Thu, 02 Jan 2025 00:00:00 GMT',
+          },
+        }),
+        () => new Response(revB, {
+          status: 200,
+          headers: {
+            'content-length': '10',
+            'last-modified': 'Thu, 02 Jan 2025 00:00:00 GMT',
+          },
+        }),
+      ],
+      expectRangeSent: true,
     },
   ];
 
-  for (const s of scenarios) {
-    let nativeLoads = 0;
+  for (const s of restartScenarios) {
     const seenHeaders = [];
     const harness = createStagingHarness({
       jsBackedModelStaging: true,
-      onLoadModel: () => {
-        nativeLoads += 1;
-        return 0;
-      },
+      onLoadModel: () => 0,
+    });
+    // Record full chunk copies so collectStagedBytes sees final content cleanly.
+    const writtenChunks = new Map();
+    const origWrite = harness.core.llamadartJsModelFsWriteDirect.bind(harness.core);
+    harness.core.llamadartJsModelFsWriteDirect = (handle, chunk, position) => {
+      const rc = origWrite(handle, chunk, position);
+      if (rc > 0) {
+        if (position === 0) {
+          writtenChunks.set(handle, []);
+        }
+        const list = writtenChunks.get(handle) || [];
+        list.push({ position, bytes: new Uint8Array(chunk) });
+        writtenChunks.set(handle, list);
+      }
+      return rc;
+    };
+    let call = 0;
+    harness.runtime._getCachedModelResponse = async (_url, opts) => {
+      const idx = call++;
+      seenHeaders.push(opts?.requestHeaders || null);
+      return s.responses[idx]();
+    };
+    await harness.runtime.loadModelFromUrl(`https://models.test/${s.name}.gguf`, {
+      nCtx: 2048,
+      nGpuLayers: 0,
+      useCache: false,
+      forceRemoteFetchBackend: false,
+    });
+    assert.equal(call, s.responses.length, s.name);
+    for (const hdr of seenHeaders) {
+      assert.equal(hdr?.['If-Range'], undefined, `${s.name} must never send If-Range`);
+    }
+    if (!s.expectRangeSent) {
+      for (const hdr of seenHeaders) {
+        assert.equal(hdr?.Range, undefined, `${s.name} must not send Range without strong validator`);
+      }
+    } else {
+      assert.equal(seenHeaders[1]?.Range, 'bytes=4-', s.name);
+      assert.equal(seenHeaders[2]?.Range, undefined, `${s.name} full restart must omit Range`);
+    }
+    const lastHandle = [...writtenChunks.keys()].at(-1);
+    const assembled = new Uint8Array(revB.byteLength);
+    for (const part of writtenChunks.get(lastHandle)) {
+      assembled.set(part.bytes, part.position);
+    }
+    assert.deepEqual(assembled, revB, `${s.name} must hold complete revision B with zero spliced bytes from A`);
+  }
+
+  // 2) Exhausting streamResumeRetries after validator mismatch fails with ModelTransferLengthError.
+  const limitHarness = createStagingHarness({
+    jsBackedModelStaging: true,
+    onLoadModel: () => 0,
+  });
+  let limitCall = 0;
+  limitHarness.runtime._getCachedModelResponse = async () => {
+    limitCall += 1;
+    return limitCall === 1
+      ? makeCutResponse(revA, { 'content-length': '10', etag: '"v1"' })
+      : new Response(revB.subarray(4), {
+          status: 206,
+          headers: { 'content-range': 'bytes 4-9/10', 'content-length': '6', etag: '"v2"' },
+        });
+  };
+  await assert.rejects(
+    limitHarness.runtime.loadModelFromUrl('https://models.test/limit.gguf', {
+      nCtx: 2048,
+      nGpuLayers: 0,
+      useCache: false,
+      forceRemoteFetchBackend: false,
+      streamResumeRetries: 1,
+    }),
+    { name: 'ModelTransferLengthError' },
+  );
+
+  // 3) Matching strong ETag and matching Last-Modified (when no ETag) do resume cleanly with Range only.
+  for (const okCase of [
+    { name: 'strong-ok', headers: { etag: '"v1"' } },
+    { name: 'date-ok', headers: { 'last-modified': 'Wed, 01 Jan 2025 00:00:00 GMT' } },
+  ]) {
+    const seenHeaders = [];
+    const harness = createStagingHarness({
+      jsBackedModelStaging: true,
+      onLoadModel: () => 0,
     });
     let call = 0;
     harness.runtime._getCachedModelResponse = async (_url, opts) => {
       call += 1;
       seenHeaders.push(opts?.requestHeaders || null);
-      return call === 1 ? makeCutResponse(s.initialHeaders) : s.resumeResponse();
+      return call === 1
+        ? makeCutResponse(revB, { 'content-length': '10', ...okCase.headers })
+        : new Response(revB.subarray(4), {
+            status: 206,
+            headers: { 'content-range': 'bytes 4-9/10', 'content-length': '6', ...okCase.headers },
+          });
     };
-    const err = await harness.runtime.loadModelFromUrl(`https://models.test/${s.name}.gguf`, {
+    await harness.runtime.loadModelFromUrl(`https://models.test/${okCase.name}.gguf`, {
       nCtx: 2048,
       nGpuLayers: 0,
       useCache: false,
       forceRemoteFetchBackend: false,
-    }).then(() => assert.fail(`must reject (${s.name})`), (e) => e);
-    assert.equal(err.name, 'ModelTransferLengthError', s.name);
-    assert.match(err.message, s.expectedPattern, s.name);
-    assert.equal(nativeLoads, 0, `${s.name} must fail before native load`);
-    assert.equal(seenHeaders[1]?.['If-Range'], s.expectedIfRange, s.name);
+    });
+    assert.equal(call, 2, okCase.name);
+    assert.equal(seenHeaders[1]?.Range, 'bytes=4-', okCase.name);
+    assert.equal(seenHeaders[1]?.['If-Range'], undefined, okCase.name);
+    assert.deepEqual(collectStagedBytes(harness), revB, okCase.name);
   }
 });
 
@@ -1750,4 +1922,376 @@ test('cancellation during native abort still resets dead core before rejecting A
     forceRemoteFetchBackend: false,
   });
   assert.equal(coreInits, 2, 'subsequent load after coincident abort+cancel must initialize fresh core');
+});
+
+test('static contract: js/src/ invokes .ccall/.cwrap/raw core exports only inside the single native-call funnel', () => {
+  const require = createRequire(import.meta.url);
+  const ts = require('typescript');
+  const srcRoot = path.join(rootDir, 'js', 'src');
+  const collectFiles = (dir) => {
+    const out = [];
+    for (const name of readdirSync(dir)) {
+      const full = path.join(dir, name);
+      if (statSync(full).isDirectory()) {
+        out.push(...collectFiles(full));
+      } else if (full.endsWith('.ts') || full.endsWith('.js')) {
+        out.push(full);
+      }
+    }
+    return out;
+  };
+
+  const allowedFunnels = {
+    '_callCoreNative': new Set(['ccall']),
+    '_coreHeapAlloc': new Set(['_malloc']),
+    '_coreHeapFree': new Set(['_free']),
+  };
+
+  const enclosingMethodName = (node) => {
+    let cur = node.parent;
+    while (cur) {
+      if (ts.isMethodDeclaration(cur) && cur.name && ts.isIdentifier(cur.name)) {
+        return cur.name.text;
+      }
+      cur = cur.parent;
+    }
+    return '';
+  };
+
+  const violations = [];
+  for (const file of collectFiles(srcRoot)) {
+    const text = readFileSync(file, 'utf8');
+    const sourceFile = ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true);
+    const visit = (node) => {
+      if (ts.isCallExpression(node)) {
+        let propName = null;
+        if (ts.isPropertyAccessExpression(node.expression)) {
+          propName = node.expression.name.text;
+        } else if (
+          ts.isElementAccessExpression(node.expression)
+          && ts.isStringLiteralLike(node.expression.argumentExpression)
+        ) {
+          propName = node.expression.argumentExpression.text;
+        }
+        if (
+          propName
+          && (
+            propName === 'ccall'
+            || propName === 'cwrap'
+            || propName === 'wasmExports'
+            || propName === '_malloc'
+            || propName === '_free'
+            || propName.startsWith('_llamadart_')
+          )
+        ) {
+          const method = path.relative(rootDir, file) === 'js/src/runtime.ts'
+            ? enclosingMethodName(node)
+            : '';
+          const allowed = allowedFunnels[method];
+          if (!allowed || !allowed.has(propName)) {
+            const { line } = sourceFile.getLineAndCharacterOfPosition(node.getStart(sourceFile));
+            violations.push(`${path.relative(rootDir, file)}:${line + 1} (${propName})`);
+          }
+        }
+      }
+      ts.forEachChild(node, visit);
+    };
+    visit(sourceFile);
+  }
+
+  assert.deepEqual(violations, [], `Direct native calls outside funnel: ${violations.join(', ')}`);
+});
+
+test('decode-step abort in next_token resets core, skips end_generation on dead core, terminates pthreads, and allows reload', async () => {
+  const { LlamaWebGpuBridgeRuntime } = await import('../../js/src/runtime.ts');
+  const ForeignError = vm.runInNewContext('Error');
+  const runtime = new LlamaWebGpuBridgeRuntime({ jsBackedModelStaging: false });
+  let terminatedPools = 0;
+  let endGenerationCalls = 0;
+  let coreInits = 0;
+  let decodeStep = 0;
+
+  const makeMockCore = (id) => {
+    const fs = createStubFs();
+    const openHandles = new Set();
+    let nextHandle = 1;
+    let outputText = '';
+    const core = {
+      FS: fs,
+      PThread: {
+        unusedWorkers: [{ terminate() {} }],
+        runningWorkers: [],
+        terminateAllThreads() {
+          terminatedPools += 1;
+        },
+      },
+      _llamadart_webgpu_completion_capabilities_json: () => 1,
+      llamadartJsModelFsWriteDirect(h, chunk) {
+        if (!openHandles.has(h)) return -8;
+        return chunk.byteLength;
+      },
+      ccall(name, _ret, _types, args = []) {
+        if (name === 'llamadart_webgpu_mount_js_model_fs') {
+          fs.dirs.add(args[0]);
+          return 0;
+        }
+        if (name === 'llamadart_webgpu_unmount_js_model_fs') {
+          fs.dirs.delete(args[0]);
+          return 0;
+        }
+        if (name === 'llamadart_webgpu_js_model_fs_open_direct') {
+          const h = nextHandle++;
+          openHandles.add(h);
+          return h;
+        }
+        if (name === 'llamadart_webgpu_js_model_fs_close_direct') {
+          openHandles.delete(args[0]);
+          return 0;
+        }
+        if (name === 'llamadart_webgpu_load_model' || name === 'llamadart_webgpu_free_model') {
+          return 0;
+        }
+        if (name === 'llamadart_webgpu_probe') return 0;
+        if (name === 'llamadart_webgpu_backends_json') return '["CPU"]';
+        if (name === 'llamadart_webgpu_get_context_size') return 512;
+        if (name === 'llamadart_webgpu_completion_capabilities_json') return '{}';
+        if (name === 'llamadart_webgpu_begin_generation') {
+          decodeStep = 0;
+          outputText = 'ok';
+          return 0;
+        }
+        if (name === 'llamadart_webgpu_next_token') {
+          decodeStep += 1;
+          if (id === 1 && decodeStep === 2) {
+            const foreignRuntimeErr = new ForeignError('Aborted(decode abort)');
+            foreignRuntimeErr.name = 'RuntimeError';
+            throw foreignRuntimeErr;
+          }
+          return decodeStep === 1 ? 1 : 0;
+        }
+        if (name === 'llamadart_webgpu_last_output') return outputText;
+        if (name === 'llamadart_webgpu_end_generation') {
+          endGenerationCalls += 1;
+          return 0;
+        }
+        return 0;
+      },
+    };
+    return core;
+  };
+
+  runtime._ensureCore = async () => {
+    if (runtime._core) return runtime._core;
+    coreInits += 1;
+    runtime._core = makeMockCore(coreInits);
+    runtime._coreGeneration += 1;
+    runtime._coreVariant = 'wasm32';
+    return runtime._core;
+  };
+  runtime._getCachedModelResponse = async () => new Response(new Uint8Array(32), {
+    status: 200,
+    headers: { 'content-length': '32' },
+  });
+
+  await runtime.loadModelFromUrl('https://models.test/decode.gguf', {
+    nCtx: 512,
+    nGpuLayers: 0,
+    useCache: false,
+    forceRemoteFetchBackend: false,
+  });
+  await assert.rejects(
+    runtime.createCompletion('hi', { nPredict: 4 }),
+    { name: 'RuntimeError' },
+  );
+  assert.equal(runtime._core, null, 'decode abort must reset dead core');
+  assert.equal(terminatedPools, 1, 'decode abort must terminate pthread pool once');
+  assert.equal(endGenerationCalls, 0, 'finally must skip end_generation on aborted core');
+  assert.equal(runtime.getContextSize(), 0, 'aborted core must clear stale cached nCtx');
+
+  await runtime.loadModelFromUrl('https://models.test/decode.gguf', {
+    nCtx: 512,
+    nGpuLayers: 0,
+    useCache: false,
+    forceRemoteFetchBackend: false,
+  });
+  const reply = await runtime.createCompletion('hi', { nPredict: 2 });
+  assert.equal(reply, 'ok');
+  assert.equal(coreInits, 2);
+});
+
+test('shutdown abort during cancelled loadModelFromUrl cleanup resets dead core before rejecting AbortError', async () => {
+  const cancel = new AbortController();
+  let coreInits = 0;
+  let loadCalls = 0;
+  let shutdownCalls = 0;
+  const harness = createStagingHarness({
+    jsBackedModelStaging: true,
+    onLoadModel: () => {
+      loadCalls += 1;
+      if (loadCalls === 1) {
+        cancel.abort();
+      }
+      return 0;
+    },
+  });
+  const origCcall = harness.core.ccall.bind(harness.core);
+  harness.core.ccall = (name, returnType, argTypes, args = [], opts) => {
+    if (name === 'llamadart_webgpu_shutdown') {
+      shutdownCalls += 1;
+      if (shutdownCalls === 1) {
+        throw new WebAssembly.RuntimeError('Aborted(shutdown during cancel cleanup)');
+      }
+      return 0;
+    }
+    return origCcall(name, returnType, argTypes, args, opts);
+  };
+  harness.runtime._ensureCore = async () => {
+    coreInits += 1;
+    harness.runtime._core = harness.core;
+    harness.runtime._coreGeneration += 1;
+    harness.runtime._coreVariant = 'wasm32';
+    return harness.core;
+  };
+
+  await assert.rejects(
+    harness.runtime.loadModelFromUrl('https://models.test/cancel-cleanup.gguf', {
+      nCtx: 512,
+      nGpuLayers: 0,
+      useCache: false,
+      forceRemoteFetchBackend: false,
+      signal: cancel.signal,
+    }),
+    { name: 'AbortError' },
+  );
+  assert.equal(shutdownCalls, 1);
+  assert.equal(harness.runtime._core, null, 'shutdown abort during cancel cleanup must reset core');
+
+  await harness.runtime.loadModelFromUrl('https://models.test/ok.gguf', {
+    nCtx: 512,
+    nGpuLayers: 0,
+    useCache: false,
+    forceRemoteFetchBackend: false,
+  });
+  assert.equal(coreInits, 2);
+});
+
+test('projector ENOMEM after 503 worker-replacement retry preserves ModelStagingError code', async () => {
+  let projectorCalls = 0;
+  let proxyCreations = 0;
+  const b = new LlamaWebGpuBridge({ disableWorker: true, jsBackedModelStaging: true });
+  b._shouldUseWorker = () => true;
+  b._createWorkerProxy = () => {
+    const gen = ++proxyCreations;
+    const state = {
+      modelBytes: 0,
+      coreGeneration: gen,
+      metadata: {},
+      contextSize: 128,
+      gpuActive: false,
+      backendName: 'WASM',
+      supportsVision: false,
+      supportsAudio: false,
+    };
+    return {
+      dispose() {},
+      terminate() {},
+      async call(method) {
+        if (method === 'loadModelFromUrl') {
+          state.modelBytes = 1024;
+          state.metadata = { 'llamadart.webgpu.model_bytes': '1024' };
+          return { result: 1, state: { ...state } };
+        }
+        if (method === 'loadMultimodalProjector') {
+          projectorCalls += 1;
+          if (projectorCalls <= 1) {
+            throw new Error('Failed to fetch multimodal projector: 503 Service Unavailable');
+          }
+          throw new ModelStagingError(
+            'MODEL_STAGING_ALLOCATION_FAILED',
+            'Failed to allocate JavaScript memory while staging the model (48 bytes).',
+          );
+        }
+        return { result: 1, state: { ...state } };
+      },
+    };
+  };
+  b._runtime = null;
+  b._installWorkerProxy({ fallbackToDirect: true });
+
+  await b.loadModelFromUrl('https://models.test/tiny.gguf', { nCtx: 128, nGpuLayers: 0 });
+  const err = await b.loadMultimodalProjector('https://models.test/retry-oom.gguf')
+    .then(() => assert.fail('must reject with ModelStagingError'), (e) => e);
+  assert.equal(proxyCreations, 2, 'must replace worker proxy once before retry');
+  assert.equal(err instanceof ModelStagingError, true, `Expected ModelStagingError, got ${err?.name}: ${err?.message}`);
+  assert.equal(err.code, 'MODEL_STAGING_ALLOCATION_FAILED');
+  await b.dispose();
+});
+
+test('LoRA adapter coreGeneration guards reject stale handles directly in runtime and bridge without clearing maps', async () => {
+  const { LlamaWebGpuBridgeRuntime } = await import('../../js/src/runtime.ts');
+  // 1) Direct runtime LoRA generation guard (kills removal in setLoraAdapter / removeLoraAdapter).
+  const runtime = new LlamaWebGpuBridgeRuntime({});
+  let nextLoraHandle = 1;
+  const nativeCalls = [];
+  runtime._core = {
+    FS: createStubFs(),
+    _llamadart_webgpu_lora_api_version: () => 1,
+    ccall(name, _r, _t, args = []) {
+      nativeCalls.push([name, ...args]);
+      if (name === 'llamadart_webgpu_lora_api_version') return 1;
+      if (name === 'llamadart_webgpu_lora_load') return nextLoraHandle++;
+      return 0;
+    },
+  };
+  runtime._coreGeneration = 1;
+  runtime._modelBytes = 1024;
+  const { handle: runtimeLora } = await runtime.loadLoraAdapter(new Uint8Array([1, 2, 3, 4]));
+  // Core is replaced (generation advances) and another handle/load runs without deleting map entries.
+  runtime._coreGeneration = 2;
+  await assert.rejects(
+    runtime.setLoraAdapter(runtimeLora, 1),
+    /LoRA adapter 1 is not loaded/i,
+  );
+  await assert.rejects(
+    runtime.removeLoraAdapter(runtimeLora),
+    /LoRA adapter 1 is not loaded/i,
+  );
+  assert.equal(
+    nativeCalls.some(([n]) => n === 'llamadart_webgpu_lora_set' || n === 'llamadart_webgpu_lora_remove'),
+    false,
+    'stale runtime LoRA handle must fail before reaching native core',
+  );
+
+  // 2) Bridge facade LoRA generation guard when entry.owner === _loraOwner() but coreGeneration changed.
+  const bridge = new LlamaWebGpuBridge({ disableWorker: true });
+  let facadeNativeCalls = 0;
+  let coreGen = 1;
+  bridge._runtime = {
+    _modelBytes: 1024,
+    get _coreGeneration() { return coreGen; },
+    async loadLoraAdapter() { return { handle: 7 }; },
+    async setLoraAdapter() { facadeNativeCalls += 1; },
+    async removeLoraAdapter() { facadeNativeCalls += 1; },
+    async clearLoraAdapters() { facadeNativeCalls += 1; },
+    getLoraAdapterCapabilities() { return { apiVersion: 1, supported: true }; },
+    async dispose() {},
+  };
+  const facadeAdapter = await bridge.loadLoraAdapter(new Uint8Array([9, 8, 7, 6]));
+  // Simulate same runtime surviving with a new coreGeneration without _forgetLoadedModel deleting entry.
+  coreGen = 2;
+  await assert.rejects(
+    bridge.setLoraAdapter(facadeAdapter.handle, 0.5),
+    /LoRA adapter \d+ is not loaded/i,
+  );
+  // Resetting generation check on removeLoraAdapter must skip calling removeLoraAdapter on the new core.
+  const adapter2 = await bridge.loadLoraAdapter(new Uint8Array([4, 3, 2, 1]));
+  await bridge.setLoraAdapter(adapter2.handle, 0.8);
+  coreGen = 3;
+  facadeNativeCalls = 0;
+  await bridge.removeLoraAdapter(adapter2.handle);
+  assert.equal(
+    facadeNativeCalls,
+    0,
+    'removeLoraAdapter must not forward stale coreGeneration handle to current owner',
+  );
 });

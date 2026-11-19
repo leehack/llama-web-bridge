@@ -5,6 +5,9 @@ import type { EmscriptenFs } from './download.ts';
 // Logger method names the runtime routes core and bridge output through.
 export type LogMethod = 'log' | 'warn' | 'error';
 
+// Emscripten `ccall` return type names the runtime passes.
+export type CcallReturnType = 'number' | 'string' | null;
+
 // Emscripten `ccall` argument type names the runtime passes.
 export type CcallArgType = 'number' | 'string' | 'array';
 
@@ -67,6 +70,13 @@ export interface LlamaCoreModule {
     argTypes: readonly CcallArgType[],
     args: readonly CcallArg[],
   ): void;
+  ccall(
+    ident: string,
+    returnType: CcallReturnType,
+    argTypes: readonly CcallArgType[],
+    args: readonly CcallArg[],
+    opts?: { async: true },
+  ): unknown;
   FS: LlamaCoreFs;
   HEAP8?: Int8Array;
   HEAPU8?: Uint8Array;
