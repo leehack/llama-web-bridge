@@ -1274,7 +1274,7 @@ function runCommand(command, args, write) {
     requireRepository(args.repository, args.field);
   } else if (command === 'validate-upstream-pin') {
     const rawOverride = args.allowOverride ?? 'false';
-    if (rawOverride !== 'true' && rawOverride !== 'false' && rawOverride !== '') {
+    if (rawOverride !== 'true' && rawOverride !== 'false') {
       throw new ContractError('allow_upstream_tag_override must be true or false');
     }
     write(dumps(validateUpstreamPin(args.pinFile, args.upstreamTag, { allowOverride: rawOverride === 'true' })));

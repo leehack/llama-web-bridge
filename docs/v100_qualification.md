@@ -19,8 +19,9 @@ The bridge now links upstream's `mtmd` target so the source list follows the
 selected llama.cpp release. On v1.0.0, the projector's persistent thread pool
 holds workers needed by text decode within the same four-worker Emscripten
 pool. The bridge builds a generated copy of `mtmd-subcontext.cpp` that uses
-per-graph workers and preserves the configured thread count. The v0.5.0 lane
-still uses its single-threaded audio mel workaround.
+per-graph workers and preserves the configured thread count. The v0.5.0-only
+single-threaded audio mel workaround was removed when v1.0.0 became the
+default pin (#225).
 
 With the uncorrected v1.0.0 build and the pinned Qwen3.5 model and projector,
 direct wasm32 image completion stalled at four threads and exceeded a
