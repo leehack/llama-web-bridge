@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Add opt-in `jsBackedModelStaging: true` (`LlamaWebGpuBridgeConfig`) to stage fetched GGUFs in 64 MiB JS `Uint8Array` chunks under a custom `wasmfs::Backend` mount (`/jsmodels`) outside wasm linear memory, working with both threaded and no-pthreads cores across direct and worker runtimes and emitting the `model_staging_js_backed` runtime note. All staged chunks are unmounted and freed on completion, failure, or `dispose()`, JS staging OOM and >4 GiB wasm32 GGUF tensor payloads (`gguf_init_from_reader` preflight) surface as typed `ModelStagingError` (`MODEL_STAGING_ALLOCATION_FAILED`, `MODEL_TENSOR_SIZE_LIMIT_EXCEEDED`), and measured non-COI WebGPU runs cut Qwen3-0.6B peak wasm heap from 2.00 GiB to 349 MiB while unblocking Qwen3-4B-Q4_K_M (2.33 GiB, direct and worker) up to the ~4.46 GB JS heap / 4 GiB wasm32 tensor limits.
+
 - A load on a page that is not cross-origin isolated rejects at once with `CrossOriginIsolationError`, which names `Cross-Origin-Embedder-Policy: require-corp` and that `credentialless` does not isolate Safari, instead of hanging until the core init timeout. The `threads_capped_no_coi` note now appears only for a core loaded with `allowSingleThreadCore`.
 - A load with `nGpuLayers: 0` keeps WebGPU out of the model and context backends, so CPU decoding on Firefox no longer waits on its 100 ms WebGPU queue ticks at every sync (about 50x faster on a small model). `splitMode: 3` at 0 layers still loads.
 - A load with `nGpuLayers > 0` that ends up on the CPU adds the runtime note `gpu_unavailable:<reason>` and one warning, such as `adapter_missing_shader_f16` for Chrome on NVIDIA drivers older than 615.71.

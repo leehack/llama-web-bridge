@@ -4,6 +4,7 @@ addToLibrary({
   $llamadartJsModelFsState: {
     files: null,
     nextPreallocBytes: 0,
+    lastOomBytes: 0,
     chunkSize: 67108864, // 64 MiB
   },
 
@@ -45,6 +46,7 @@ addToLibrary({
       } catch (_) {
         chunks.length = 0;
         oomError = true;
+        llamadartJsModelFsState.lastOomBytes = preallocBytes;
       }
     }
 
@@ -70,7 +72,10 @@ addToLibrary({
 
   _llamadart_js_model_fs_write__sig: 'ippij',
   _llamadart_js_model_fs_write__i53abi: true,
-  _llamadart_js_model_fs_write__deps: ['$llamadartJsModelFsFiles'],
+  _llamadart_js_model_fs_write__deps: [
+    '$llamadartJsModelFsState',
+    '$llamadartJsModelFsFiles',
+  ],
   _llamadart_js_model_fs_write: (fileId, buffer, length, offset) => {
     const file = llamadartJsModelFsFiles().get(fileId);
     if (!file) {
@@ -91,7 +96,7 @@ addToLibrary({
     const end = offset + length;
     const firstChunk = Math.floor(offset / chunkSize);
     const lastChunk = Math.floor((end - 1) / chunkSize);
-    const srcBase = buffer >>> 0;
+    const srcBase = Number(buffer);
 
     try {
       for (let idx = firstChunk; idx <= lastChunk; idx += 1) {
@@ -121,6 +126,10 @@ addToLibrary({
       }
       return length;
     } catch (_) {
+      file.oomError = true;
+      file.chunks.length = 0;
+      file.size = 0;
+      llamadartJsModelFsState.lastOomBytes = end;
       return -{{{ cDefs.ENOMEM }}};
     }
   },
@@ -147,7 +156,7 @@ addToLibrary({
     const chunkSize = file.chunkSize;
     const firstChunk = Math.floor(offset / chunkSize);
     const lastChunk = Math.floor((end - 1) / chunkSize);
-    const dstBase = buffer >>> 0;
+    const dstBase = Number(buffer);
 
     for (let idx = firstChunk; idx <= lastChunk; idx += 1) {
       const chunkBase = idx * chunkSize;
@@ -212,5 +221,43 @@ addToLibrary({
     }
     file.size = size;
     return 0;
+  },
+
+  _llamadart_js_model_fs_release_all__sig: 'v',
+  _llamadart_js_model_fs_release_all__deps: [
+    '$llamadartJsModelFsState',
+    '$llamadartJsModelFsFiles',
+  ],
+  _llamadart_js_model_fs_release_all: () => {
+    const files = llamadartJsModelFsFiles();
+    for (const file of files.values()) {
+      file.chunks.length = 0;
+      file.size = 0;
+    }
+    files.clear();
+    llamadartJsModelFsState.nextPreallocBytes = 0;
+  },
+
+  _llamadart_js_model_fs_consume_oom_bytes__sig: 'd',
+  _llamadart_js_model_fs_consume_oom_bytes__deps: ['$llamadartJsModelFsState'],
+  _llamadart_js_model_fs_consume_oom_bytes: () => {
+    const bytes = llamadartJsModelFsState.lastOomBytes;
+    llamadartJsModelFsState.lastOomBytes = 0;
+    return bytes;
+  },
+
+  _llamadart_js_model_fs_allocated_bytes__sig: 'd',
+  _llamadart_js_model_fs_allocated_bytes__deps: ['$llamadartJsModelFsFiles'],
+  _llamadart_js_model_fs_allocated_bytes: () => {
+    let total = 0;
+    for (const file of llamadartJsModelFsFiles().values()) {
+      for (let i = 0; i < file.chunks.length; i += 1) {
+        const chunk = file.chunks[i];
+        if (chunk) {
+          total += chunk.byteLength;
+        }
+      }
+    }
+    return total;
   },
 });

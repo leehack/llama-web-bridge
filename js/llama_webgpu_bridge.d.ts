@@ -310,6 +310,15 @@ export class CrossOriginIsolationError extends Error {
   constructor(message?: string);
 }
 
+export type ModelStagingErrorCode =
+  | 'MODEL_STAGING_ALLOCATION_FAILED'
+  | 'MODEL_TENSOR_SIZE_LIMIT_EXCEEDED';
+/** Thrown when JS-backed model staging exhausts JS memory or a GGUF exceeds the wasm32 4 GiB tensor limit. */
+export class ModelStagingError extends Error {
+  code: ModelStagingErrorCode;
+  constructor(code: ModelStagingErrorCode, message: string);
+}
+
 export interface NextTokenScoreOptions {
   /** Token ids to score, in the order the result lists them. */
   candidates?: ArrayLike<number>;

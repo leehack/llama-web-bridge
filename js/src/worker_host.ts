@@ -4,6 +4,7 @@ import { LlamaWebGpuBridge } from './bridge.ts';
 import { decisionErrorCodeOf } from './internal/decision.ts';
 import { EMBED_BATCH_PROGRESS_OPTION, EmbeddingError } from './internal/embedding.ts';
 import { CROSS_ORIGIN_ISOLATION_REQUIRED, CrossOriginIsolationError } from './internal/isolation.ts';
+import { ModelStagingError } from './internal/model_staging.ts';
 import type { EmbedBatchProgressHook } from './internal/embedding.ts';
 import { toUint8Array } from './internal/typed_values.ts';
 import {
@@ -57,6 +58,7 @@ export function installBridgeWorkerHost() {
       message: serializeWorkerError(error),
       ...(error instanceof EmbeddingError ? { embeddingErrorCode: error.code } : {}),
       ...(error instanceof CrossOriginIsolationError ? { errorCode: CROSS_ORIGIN_ISOLATION_REQUIRED } : {}),
+      ...(error instanceof ModelStagingError ? { modelStagingErrorCode: error.code } : {}),
       ...(decisionErrorCode ? { decisionErrorCode } : {}),
       state,
     });

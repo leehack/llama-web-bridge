@@ -31,7 +31,12 @@ try {
   writeFileSync(
     path.join(temporaryDir, 'consumer.ts'),
     [
-      "import type { CompletionOptions, DecisionHeadOptions, DecisionSequence, EmbedOptions, LoraAdapterLoadOptions } from './bridge.js';",
+      "import type { CompletionOptions, DecisionHeadOptions, DecisionSequence, EmbedOptions, LlamaWebGpuBridgeConfig, LoraAdapterLoadOptions, ModelStagingError, ModelStagingErrorCode } from './bridge.js';",
+      '',
+      'export const acceptedConfig: LlamaWebGpuBridgeConfig = { jsBackedModelStaging: true };',
+      'export const acceptedStagingCode: ModelStagingErrorCode = "MODEL_STAGING_ALLOCATION_FAILED";',
+      'export const acceptedTensorCode: ModelStagingErrorCode = "MODEL_TENSOR_SIZE_LIMIT_EXCEEDED";',
+      'export declare const stagingErrorCheck: ModelStagingError;',
       '',
       'export const accepted: CompletionOptions = {',
       '  nPredict: 64,',

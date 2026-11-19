@@ -31,6 +31,9 @@ int32_t _llamadart_js_model_fs_read(
     int64_t offset);
 void _llamadart_js_model_fs_get_size(uintptr_t file_id, int64_t * out_size);
 int32_t _llamadart_js_model_fs_set_size(uintptr_t file_id, int64_t size);
+void _llamadart_js_model_fs_release_all();
+double _llamadart_js_model_fs_consume_oom_bytes();
+double _llamadart_js_model_fs_allocated_bytes();
 }
 
 namespace {
@@ -107,6 +110,13 @@ std::unordered_set<std::string> & mounted_js_model_paths() {
   return *paths;
 }
 
+wasmfs::backend_t shared_js_model_backend() {
+  // Reuse one backend across unmount/remount retries so wasmFS.backends stays bounded.
+  static wasmfs::backend_t backend =
+      wasmfs::wasmFS.addBackend(std::make_unique<ChunkedJsModelBackend>());
+  return backend;
+}
+
 }  // namespace
 
 extern "C" {
@@ -128,8 +138,7 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_mount_js_model_fs(const char * mou
     return 0;
   }
 
-  wasmfs::backend_t backend =
-      wasmfs::wasmFS.addBackend(std::make_unique<ChunkedJsModelBackend>());
+  wasmfs::backend_t backend = shared_js_model_backend();
   if (backend == nullptr) {
     return -ENOMEM;
   }
@@ -146,12 +155,41 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_mount_js_model_fs(const char * mou
   return 0;
 }
 
+EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_unmount_js_model_fs(const char * mount_path) {
+  _llamadart_js_model_fs_release_all();
+  auto & mounted = mounted_js_model_paths();
+
+  if (mount_path == nullptr || std::strlen(mount_path) == 0) {
+    int first_error = 0;
+    for (const std::string & path_str : mounted) {
+      const int rc = wasmfs_unmount(path_str.c_str());
+      if (rc != 0 && rc != -ENOENT && first_error == 0) {
+        first_error = rc;
+      }
+    }
+    mounted.clear();
+    return first_error;
+  }
+
+  mounted.erase(std::string(mount_path));
+  const int rc = wasmfs_unmount(mount_path);
+  return rc == -ENOENT ? 0 : rc;
+}
+
 EMSCRIPTEN_KEEPALIVE void llamadart_webgpu_js_model_fs_prealloc_next(double bytes) {
   if (!(bytes > 0.0)) {
     _llamadart_js_model_fs_set_next_prealloc_bytes(0);
     return;
   }
   _llamadart_js_model_fs_set_next_prealloc_bytes(static_cast<int64_t>(bytes));
+}
+
+EMSCRIPTEN_KEEPALIVE double llamadart_webgpu_js_model_fs_consume_oom_bytes() {
+  return _llamadart_js_model_fs_consume_oom_bytes();
+}
+
+EMSCRIPTEN_KEEPALIVE double llamadart_webgpu_js_model_fs_allocated_bytes() {
+  return _llamadart_js_model_fs_allocated_bytes();
 }
 
 }  // extern "C"

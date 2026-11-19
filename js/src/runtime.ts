@@ -56,6 +56,11 @@ import {
   hasModelSource,
   normalizeAbsoluteUrl,
 } from './internal/model_source.ts';
+import {
+  ModelStagingError,
+  isJsAllocationError,
+  isWasm32TensorLimitText,
+} from './internal/model_staging.ts';
 import { nextTokenCandidateIds, scoredTokensFrom } from './internal/next_token_scores.ts';
 import {
   parseBooleanFlag,
@@ -242,6 +247,7 @@ export class LlamaWebGpuBridgeRuntime {
   declare _activeTransferAbortController: AbortController | null;
   declare _lastCoreErrorText: string;
   declare _lastCoreErrorHint: string;
+  declare _jsBackedStagingMounted: boolean;
   declare _logLevel: number;
 
   constructor(config: LlamaWebGpuBridgeConfig = {}) {
@@ -331,6 +337,7 @@ export class LlamaWebGpuBridgeRuntime {
     this._activeTransferAbortController = null;
     this._lastCoreErrorText = '';
     this._lastCoreErrorHint = '';
+    this._jsBackedStagingMounted = false;
     this._logLevel = Number.isFinite(config.logLevel)
       ? Math.max(0, Math.min(4, Math.trunc(config.logLevel as number)))
       : 2;
@@ -1358,6 +1365,20 @@ export class LlamaWebGpuBridgeRuntime {
     return unlinkFsFile(this._core.FS, path);
   }
 
+  _releaseJsModelStaging(core: LlamaCoreModule | null = this._core) {
+    if (!core || !this._jsBackedStagingMounted) {
+      this._jsBackedStagingMounted = false;
+      return;
+    }
+
+    this._jsBackedStagingMounted = false;
+    try {
+      core.ccall('llamadart_webgpu_unmount_js_model_fs', 'number', ['string'], ['/jsmodels']);
+    } catch (_) {
+      // Ignore cleanup failures against a dead or custom core missing unmount.
+    }
+  }
+
   _releaseModelFiles() {
     const paths = Array.isArray(this._modelPaths) && this._modelPaths.length > 0
       ? [...this._modelPaths]
@@ -1371,6 +1392,7 @@ export class LlamaWebGpuBridgeRuntime {
     }
 
     this._modelPaths = [];
+    this._releaseJsModelStaging();
     return removed;
   }
 
@@ -2131,6 +2153,7 @@ export class LlamaWebGpuBridgeRuntime {
         if (mountRc !== 0) {
           throw new Error(`Failed to mount JS-backed model filesystem (rc=${mountRc})`);
         }
+        this._jsBackedStagingMounted = true;
         modelDir = '/jsmodels';
         this._pushRuntimeNote('model_staging_js_backed');
       } else {
@@ -2286,8 +2309,23 @@ export class LlamaWebGpuBridgeRuntime {
                 }
               }
 
+              let jsOomBytes = 0;
+              if (useJsBackedStaging) {
+                try {
+                  jsOomBytes = Number(
+                    core.ccall('llamadart_webgpu_js_model_fs_consume_oom_bytes', 'number', [], []),
+                  ) || 0;
+                } catch (_) {
+                  jsOomBytes = 0;
+                }
+              }
+
+              const isStagingAllocFailure = useJsBackedStaging
+                && (jsOomBytes > 0 || isJsAllocationError(error));
+
               const shouldRetryResume =
-                isRetryableStreamNetworkError(error)
+                !isStagingAllocFailure
+                && isRetryableStreamNetworkError(error)
                 && resumeOffset > 0
                 && resumeAttempt < maxStreamResumeRetries;
               if (shouldRetryResume) {
@@ -2295,6 +2333,20 @@ export class LlamaWebGpuBridgeRuntime {
                 this._runtimeNotes.push(`model_stream_resume_retry:${resumeAttempt}`);
                 this._runtimeNotes.push(`model_stream_resume_offset:${resumeOffset}`);
                 continue;
+              }
+
+              if (isStagingAllocFailure) {
+                this._runtimeNotes.push('model_fs_write_arraybuffer_oom');
+                const detailBytes = jsOomBytes > 0
+                  ? jsOomBytes
+                  : (knownTotalBytes > 0 ? knownTotalBytes : resumeOffset);
+                const detailText = detailBytes > 0
+                  ? ` (${detailBytes} bytes)`
+                  : '';
+                throw new ModelStagingError(
+                  'MODEL_STAGING_ALLOCATION_FAILED',
+                  `Failed to allocate JavaScript memory while staging the model${detailText}. Close other tabs or use a smaller quantization.`,
+                );
               }
 
               if (text.includes('bigint')) {
@@ -2328,6 +2380,8 @@ export class LlamaWebGpuBridgeRuntime {
         let rc = 0;
         let nativeLoadStarted = false;
         let nativeAbortCleanupDone = false;
+        this._lastCoreErrorHint = '';
+        this._lastCoreErrorText = '';
         try {
           throwIfAborted(operationSignal, abortMessage);
           nativeLoadStarted = true;
@@ -2377,6 +2431,11 @@ export class LlamaWebGpuBridgeRuntime {
             }
             error = createAbortError(abortMessage);
           }
+          const combinedText = [
+            String(error || ''),
+            String(this._lastCoreErrorHint || ''),
+            String(this._lastCoreErrorText || ''),
+          ].join(' ');
           const text = String(error || '').toLowerCase();
           if (text.includes('bigint')) {
             this._runtimeNotes.push('model_load_ccall_bigint_error');
@@ -2385,11 +2444,27 @@ export class LlamaWebGpuBridgeRuntime {
           } else {
             this._runtimeNotes.push('model_load_ccall_failed');
           }
+          if (isWasm32TensorLimitText(combinedText)) {
+            if (text.includes('abort')) {
+              this._core = null;
+              this._coreVariant = 'uninitialized';
+            }
+            throw new ModelStagingError(
+              'MODEL_TENSOR_SIZE_LIMIT_EXCEEDED',
+              this._lastCoreErrorHint
+                || 'GGUF tensor payload exceeds the wasm32 4 GiB address space limit; use the memory64 core or a smaller quantization.',
+            );
+          }
           throw error;
         }
 
         if (rc !== 0) {
-          throw new Error(this._coreErrorMessage('Failed to load GGUF model', rc));
+          const errorMessage = this._coreErrorMessage('Failed to load GGUF model', rc);
+          const combined = `${errorMessage} ${this._lastCoreErrorHint} ${this._lastCoreErrorText}`;
+          if (rc === -4 || isWasm32TensorLimitText(combined)) {
+            throw new ModelStagingError('MODEL_TENSOR_SIZE_LIMIT_EXCEEDED', errorMessage);
+          }
+          throw new Error(errorMessage);
         }
 
         if (modelUrls.length > 1) {
@@ -2403,8 +2478,9 @@ export class LlamaWebGpuBridgeRuntime {
           this._loadedModelUrl = null;
         }
         for (const modelPath of modelPaths) {
-          this._deleteFsFile(modelPath);
+          unlinkFsFile(core.FS, modelPath);
         }
+        this._releaseJsModelStaging(core);
         throw error;
       }
     }
@@ -2573,6 +2649,9 @@ export class LlamaWebGpuBridgeRuntime {
         }
 
         if (!stabilized) {
+          this._releaseModelFiles();
+          this._modelPath = null;
+          this._modelBytes = 0;
           throw new Error('Safari GPU probe failed and fallback attempts were unsuccessful.');
         }
       } else {
@@ -4659,6 +4738,7 @@ export class LlamaWebGpuBridgeRuntime {
       }
       await this._core.ccall('llamadart_webgpu_shutdown', null, [], [], { async: true });
       this._deleteFsFile(mmprojPath);
+      this._releaseModelFiles();
     }
     this._modelPath = null;
     this._modelPaths = [];

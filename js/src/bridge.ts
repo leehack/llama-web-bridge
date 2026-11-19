@@ -25,6 +25,7 @@ import {
   staleLoraAdapterError,
 } from './internal/lora.ts';
 import { cloneModelSource, hasModelSource, normalizeAbsoluteUrl, resolveModelSource, resolvePartUrls } from './internal/model_source.ts';
+import { ModelStagingError } from './internal/model_staging.ts';
 import { withoutNul } from './internal/text.ts';
 import { bufferSourceBytes, toUint8Array } from './internal/typed_values.ts';
 import { LlamaWebGpuBridgeRuntime } from './runtime.ts';
@@ -1520,6 +1521,10 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
   }
 
   _shouldFallbackToMainThread(error: unknown) {
+    if (error instanceof ModelStagingError) {
+      return false;
+    }
+
     const text = serializeWorkerError(error).toLowerCase();
 
     if (text.includes('aborted(native code called abort())')) {

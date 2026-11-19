@@ -158,6 +158,7 @@ it.
 | `workerUrl` | `string` | URL for `llama_webgpu_bridge_worker.js`. Defaults to a sibling of the bridge module when possible. |
 | `disableWorker` | `boolean` | Force direct runtime mode. |
 | `allowSingleThreadCore` | `boolean` | Set for a `coreModuleUrl` core built without pthreads (`WEBGPU_BRIDGE_PTHREADS=0`). It then loads on a page that is not cross-origin isolated, capped to one thread (`threads_capped_no_coi`), instead of rejecting with `CrossOriginIsolationError`. |
+| `jsBackedModelStaging` | `boolean` | Opt-in (`false` by default). Stages fetched model files into 64 MiB JS `Uint8Array` chunks under `/jsmodels` outside wasm linear memory instead of WASMFS `MemoryBackend`, recording `model_staging_js_backed`. Works on both threaded and no-pthreads cores in direct and worker mode, and unmounts/releases all chunks after load completion or failure. |
 | `preferMemory64` | `boolean` | Prefer the wasm64 core when available. Defaults to `true`; the runtime can still fall back to wasm32. |
 | `workerRequestTimeoutMs` | `number` | Default timeout for worker RPC calls, 2 minutes unless a method has its own default. It also sets the `embed`/`embedBatch` budget, which defaults to 10 minutes when an input has image or audio parts. |
 | `workerInitTimeoutMs` | `number` | Timeout for worker initialization. |
@@ -1154,7 +1155,7 @@ include:
 | `llamadart.webgpu.core_variant` | `wasm32`, `wasm64`, or initialization state. |
 | `llamadart.webgpu.model_source` | Model load source, such as network/cache/remote fetch. |
 | `llamadart.webgpu.model_cache_state` | Cache Storage state for the loaded model. |
-| `llamadart.webgpu.runtime_notes` | Semicolon-separated bridge notes such as thread caps or fallback reasons. `gpu_unavailable:<reason>` (`no_webgpu`, `no_adapter`, `adapter_missing_shader_f16`, `unknown`) says why a load with `nGpuLayers > 0` runs on the CPU; the bridge also logs one warning. Chrome hides `shader-f16` on NVIDIA drivers older than 615.71, and ggml-webgpu then registers no device. |
+| `llamadart.webgpu.runtime_notes` | Semicolon-separated bridge notes such as thread caps, staging mode (`model_staging_js_backed`), or fallback reasons. `gpu_unavailable:<reason>` (`no_webgpu`, `no_adapter`, `adapter_missing_shader_f16`, `unknown`) says why a load with `nGpuLayers > 0` runs on the CPU; the bridge also logs one warning. Chrome hides `shader-f16` on NVIDIA drivers older than 615.71, and ggml-webgpu then registers no device. |
 | `llamadart.webgpu.mmproj_loaded` | `1` when a projector is loaded. |
 | `llamadart.webgpu.supports_vision` | `1` when the active projector supports vision. |
 | `llamadart.webgpu.supports_audio` | `1` when the active projector supports audio. |
@@ -1253,3 +1254,20 @@ this function themselves.
   and wasm files from the same published bridge asset set.
 - Use `dispose()` before dropping references when switching models or tearing
   down a page component.
+- When serving without cross-origin isolation using `WEBGPU_BRIDGE_PTHREADS=0` +
+  `allowSingleThreadCore: true`, opt into `jsBackedModelStaging: true` to keep
+  the fetched GGUF out of the 4 GiB wasm32 heap until `load_tensors` copies it
+  to CPU/WebGPU buffers and unmounts `/jsmodels`. A JS allocation failure during
+  staging throws `ModelStagingError` with code
+  `'MODEL_STAGING_ALLOCATION_FAILED'`, and a GGUF whose tensor payload exceeds
+  the wasm32 `4 GiB` (`SIZE_MAX`) limit throws `ModelStagingError` with code
+  `'MODEL_TENSOR_SIZE_LIMIT_EXCEEDED'`. Measured on Chrome WebGPU (Apple Metal-3,
+  `nCtx: 2048`, `nGpuLayers: 999`) against `llama.cpp` v1.0.0: Qwen3-0.6B-Q8_0
+  (767 MiB) dropped peak wasm heap from `2.00 GiB` to `349 MiB` (`125.99` /
+  `117.82` tok/s prefill/decode), Qwen3-4B-Q4_K_M (2.33 GiB; baseline failed at
+  `1 GiB` during `FS.write`) loaded in both direct (`643 MiB` peak wasm heap,
+  `93.66` / `41.94` tok/s) and worker (`106.80` / `43.70` tok/s) modes with peak
+  JS `usedJSHeapSize` reaching `~4.46 GB` (above Chrome's `4.40 GB`
+  `jsHeapSizeLimit`) before dropping to `~8.8 MB` after release, and
+  Qwen3-8B-Q4_K_M (4.68 GiB) hit the `4 GiB` `gguf_init_from_reader` tensor
+  size-overflow ceiling (`4,288,489,984 + 9,437,184` > `4,294,967,295`).
