@@ -172,7 +172,9 @@ addToLibrary({
     if (file.oomError) {
       return -{{{ cDefs.ENOMEM }}};
     }
-    if (!(source instanceof Uint8Array) || !Number.isSafeInteger(offset) || offset < 0) {
+    const isUint8Array = source instanceof Uint8Array
+      || (ArrayBuffer.isView(source) && Object.prototype.toString.call(source) === '[object Uint8Array]');
+    if (!isUint8Array || !Number.isSafeInteger(offset) || offset < 0) {
       return -{{{ cDefs.EINVAL }}};
     }
     const length = source.byteLength;

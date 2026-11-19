@@ -82,7 +82,7 @@ Optional outputs (when `WEBGPU_BRIDGE_BUILD_MEM64=1`):
 Use `jsBackedModelStaging: true` for models over about 1 GB on `wasm32`, or for
 any large model on `memory64` to cut the peak wasm heap. When running without
 cross-origin isolation (`WEBGPU_BRIDGE_PTHREADS=0` + `allowSingleThreadCore: true`),
-it streams the GGUF directly into 64 MiB JS `Uint8Array` chunks (`/jsmodels`)
+it streams the model (and any `loadMultimodalProjector` GGUF) directly into 64 MiB JS `Uint8Array` chunks (`/jsmodels`)
 without copying through WASMFS, unmounts/releases all chunks after load or
 failure, and turns staging allocation, mount collision, version-skew, or 4 GiB
 tensor-limit failures into typed `ModelStagingError` errors.

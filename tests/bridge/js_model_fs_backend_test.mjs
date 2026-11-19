@@ -596,3 +596,37 @@ test('direct JS chunk writer writes across chunk boundaries and >2 GiB without t
   callNative('_llamadart_js_model_fs_free_file', [fileId]);
   assert.equal(callNative('_llamadart_js_model_fs_allocated_bytes'), 0);
 });
+
+test('direct JS chunk writer accepts cross-realm Uint8Array chunks and rejects non-Uint8Array views', () => {
+  const { callNative, writeDirect, HEAPU8, cDefs } = instantiateJsModelFsLibrary();
+  const fileId = 8192;
+  callNative('_llamadart_js_model_fs_alloc_file', [fileId]);
+  const handle = callNative('_llamadart_js_model_fs_bind_direct', [fileId]);
+  assert.ok(handle > 0);
+
+  const foreignRealmChunk = vm.runInNewContext('new Uint8Array([31, 41, 59, 26, 53])', {});
+  assert.equal(writeDirect(handle, foreignRealmChunk, 0), foreignRealmChunk.byteLength);
+
+  const dstPtr = 4096;
+  HEAPU8.fill(0, dstPtr, dstPtr + 16);
+  assert.equal(
+    callNative('_llamadart_js_model_fs_read', [fileId, dstPtr, foreignRealmChunk.byteLength, 0]),
+    foreignRealmChunk.byteLength,
+  );
+  assert.deepEqual(
+    HEAPU8.subarray(dstPtr, dstPtr + foreignRealmChunk.byteLength),
+    new Uint8Array([31, 41, 59, 26, 53]),
+  );
+
+  // Other cross-realm ArrayBufferViews and spoofed toStringTag objects must still be rejected.
+  const foreignInt8 = vm.runInNewContext('new Int8Array([1, 2, 3])', {});
+  const foreignView = vm.runInNewContext('new DataView(new ArrayBuffer(4))', {});
+  const spoofedTag = { length: 4, byteLength: 4, [Symbol.toStringTag]: 'Uint8Array' };
+  assert.equal(writeDirect(handle, foreignInt8, 0), -cDefs.EINVAL);
+  assert.equal(writeDirect(handle, foreignView, 0), -cDefs.EINVAL);
+  assert.equal(writeDirect(handle, spoofedTag, 0), -cDefs.EINVAL);
+
+  callNative('_llamadart_js_model_fs_unbind_direct', [handle]);
+  callNative('_llamadart_js_model_fs_free_file', [fileId]);
+  assert.equal(callNative('_llamadart_js_model_fs_allocated_bytes'), 0);
+});
