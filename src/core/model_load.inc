@@ -26,19 +26,66 @@ static_assert(resolve_load_mode(false, true) == LLAMA_LOAD_MODE_MLOCK);
 static_assert(resolve_load_mode(true, true) == LLAMA_LOAD_MODE_MLOCK);
 
 #if SIZE_MAX <= 0xffffffffULL
-bool read_exact_bytes(std::FILE * fp, void * dst, size_t len) {
-  return std::fread(dst, 1, len, fp) == len;
-}
+class BufferedFileReader {
+  std::FILE * fp_ = nullptr;
+  std::vector<uint8_t> buf_;
+  size_t pos_ = 0;
+  size_t end_ = 0;
 
-bool skip_file_bytes(std::FILE * fp, uint64_t count) {
-  if (count == 0) {
+ public:
+  explicit BufferedFileReader(std::FILE * fp, size_t capacity = 65536)
+      : fp_(fp), buf_(capacity) {}
+
+  bool read_bytes(void * dst, size_t len) {
+    auto * out = static_cast<uint8_t *>(dst);
+    while (len > 0) {
+      if (pos_ < end_) {
+        const size_t avail = end_ - pos_;
+        const size_t take = std::min(len, avail);
+        std::memcpy(out, buf_.data() + pos_, take);
+        pos_ += take;
+        out += take;
+        len -= take;
+        continue;
+      }
+      if (len >= buf_.size()) {
+        return std::fread(out, 1, len, fp_) == len;
+      }
+      pos_ = 0;
+      end_ = std::fread(buf_.data(), 1, buf_.size(), fp_);
+      if (end_ == 0) {
+        return false;
+      }
+    }
     return true;
   }
-  if (count <= static_cast<uint64_t>(std::numeric_limits<off_t>::max())) {
-    return fseeko(fp, static_cast<off_t>(count), SEEK_CUR) == 0;
+
+  bool skip_bytes(uint64_t count) {
+    while (count > 0) {
+      const size_t avail = end_ - pos_;
+      if (count <= avail) {
+        pos_ += static_cast<size_t>(count);
+        return true;
+      }
+      count -= avail;
+      pos_ = 0;
+      end_ = 0;
+      if (count < buf_.size()) {
+        // Refill the buffer once rather than issuing an fseeko across block boundaries.
+        end_ = std::fread(buf_.data(), 1, buf_.size(), fp_);
+        if (end_ == 0) {
+          return false;
+        }
+        continue;
+      }
+      if (count <= static_cast<uint64_t>(std::numeric_limits<off_t>::max())) {
+        return fseeko(fp_, static_cast<off_t>(count), SEEK_CUR) == 0;
+      }
+      return false;
+    }
+    return true;
   }
-  return false;
-}
+};
 
 size_t gguf_scalar_byte_size(uint32_t gguf_type) {
   switch (gguf_type) {
@@ -62,22 +109,42 @@ size_t gguf_scalar_byte_size(uint32_t gguf_type) {
   }
 }
 
-bool skip_gguf_value(std::FILE * fp, uint32_t gguf_type, uint32_t * out_u32) {
-  if (out_u32 != nullptr && gguf_type == GGUF_TYPE_UINT32) {
-    return read_exact_bytes(fp, out_u32, sizeof(*out_u32));
+bool read_or_skip_gguf_value(
+    BufferedFileReader & reader,
+    uint32_t gguf_type,
+    uint64_t * out_uint) {
+  if (out_uint != nullptr) {
+    if (gguf_type == GGUF_TYPE_UINT16) {
+      uint16_t v = 0;
+      const bool ok = reader.read_bytes(&v, sizeof(v));
+      *out_uint = v;
+      return ok;
+    }
+    if (gguf_type == GGUF_TYPE_UINT32) {
+      uint32_t v = 0;
+      const bool ok = reader.read_bytes(&v, sizeof(v));
+      *out_uint = v;
+      return ok;
+    }
+    if (gguf_type == GGUF_TYPE_UINT64) {
+      uint64_t v = 0;
+      const bool ok = reader.read_bytes(&v, sizeof(v));
+      *out_uint = v;
+      return ok;
+    }
   }
   if (gguf_type == GGUF_TYPE_STRING) {
     uint64_t len = 0;
-    if (!read_exact_bytes(fp, &len, sizeof(len))) {
+    if (!reader.read_bytes(&len, sizeof(len))) {
       return false;
     }
-    return skip_file_bytes(fp, len);
+    return reader.skip_bytes(len);
   }
   if (gguf_type == GGUF_TYPE_ARRAY) {
     uint32_t elem_type = 0;
     uint64_t count = 0;
-    if (!read_exact_bytes(fp, &elem_type, sizeof(elem_type)) ||
-        !read_exact_bytes(fp, &count, sizeof(count))) {
+    if (!reader.read_bytes(&elem_type, sizeof(elem_type)) ||
+        !reader.read_bytes(&count, sizeof(count))) {
       return false;
     }
     if (elem_type == GGUF_TYPE_STRING) {
@@ -85,7 +152,7 @@ bool skip_gguf_value(std::FILE * fp, uint32_t gguf_type, uint32_t * out_u32) {
         return false;
       }
       for (uint64_t i = 0; i < count; ++i) {
-        if (!skip_gguf_value(fp, GGUF_TYPE_STRING, nullptr)) {
+        if (!read_or_skip_gguf_value(reader, GGUF_TYPE_STRING, nullptr)) {
           return false;
         }
       }
@@ -95,37 +162,40 @@ bool skip_gguf_value(std::FILE * fp, uint32_t gguf_type, uint32_t * out_u32) {
     if (elem_size == 0 || count > std::numeric_limits<uint64_t>::max() / elem_size) {
       return false;
     }
-    return skip_file_bytes(fp, count * elem_size);
+    return reader.skip_bytes(count * elem_size);
   }
   const size_t scalar_size = gguf_scalar_byte_size(gguf_type);
   if (scalar_size == 0) {
     return false;
   }
-  return skip_file_bytes(fp, scalar_size);
+  return reader.skip_bytes(scalar_size);
 }
 
-// Fail fast with a clean status before gguf_init_from_reader logs overflow and
-// unwinds across un-catchable llama.cpp C++ frames into a raw wasm abort().
-bool check_wasm32_gguf_tensor_size_limit(const char * model_path) {
-  if (model_path == nullptr || std::strlen(model_path) == 0) {
+bool check_wasm32_gguf_shard(
+    const char * shard_path,
+    uint64_t * total_accumulated,
+    uint16_t * out_split_count,
+    uint16_t * out_split_no) {
+  if (shard_path == nullptr || std::strlen(shard_path) == 0) {
     return true;
   }
   std::unique_ptr<std::FILE, decltype(&std::fclose)> fp(
-      std::fopen(model_path, "rb"), &std::fclose);
+      std::fopen(shard_path, "rb"), &std::fclose);
   if (!fp) {
     return true;
   }
+  BufferedFileReader reader(fp.get());
 
   char magic[4] = {};
   uint32_t version = 0;
   uint64_t n_tensors = 0;
   uint64_t n_kv = 0;
-  if (!read_exact_bytes(fp.get(), magic, sizeof(magic)) ||
+  if (!reader.read_bytes(magic, sizeof(magic)) ||
       std::memcmp(magic, "GGUF", 4) != 0 ||
-      !read_exact_bytes(fp.get(), &version, sizeof(version)) ||
+      !reader.read_bytes(&version, sizeof(version)) ||
       (version != 2 && version != 3) ||
-      !read_exact_bytes(fp.get(), &n_tensors, sizeof(n_tensors)) ||
-      !read_exact_bytes(fp.get(), &n_kv, sizeof(n_kv))) {
+      !reader.read_bytes(&n_tensors, sizeof(n_tensors)) ||
+      !reader.read_bytes(&n_kv, sizeof(n_kv))) {
     return true;
   }
   if (n_tensors > (uint64_t(1) << 24) || n_kv > (uint64_t(1) << 24)) {
@@ -134,64 +204,85 @@ bool check_wasm32_gguf_tensor_size_limit(const char * model_path) {
 
   uint64_t alignment = GGUF_DEFAULT_ALIGNMENT;
   constexpr const char kAlignmentKey[] = "general.alignment";
-  constexpr uint64_t kAlignmentKeyLen = sizeof(kAlignmentKey) - 1;
+  constexpr const char kSplitCountKey[] = "split.count";
+  constexpr const char kSplitNoKey[] = "split.no";
+  constexpr uint64_t kMaxMatchedKeyLen = 17;
 
   for (uint64_t i = 0; i < n_kv; ++i) {
     uint64_t key_len = 0;
-    if (!read_exact_bytes(fp.get(), &key_len, sizeof(key_len))) {
+    if (!reader.read_bytes(&key_len, sizeof(key_len))) {
       return true;
     }
-    bool is_alignment_key = false;
-    if (key_len == kAlignmentKeyLen) {
-      char key_buf[kAlignmentKeyLen] = {};
-      if (!read_exact_bytes(fp.get(), key_buf, kAlignmentKeyLen)) {
+    enum KvMatch { kNone, kAlignment, kSplitCount, kSplitNo };
+    KvMatch match = kNone;
+    if (key_len <= kMaxMatchedKeyLen) {
+      char key_buf[kMaxMatchedKeyLen] = {};
+      if (!reader.read_bytes(key_buf, static_cast<size_t>(key_len))) {
         return true;
       }
-      is_alignment_key = std::memcmp(key_buf, kAlignmentKey, kAlignmentKeyLen) == 0;
-    } else if (!skip_file_bytes(fp.get(), key_len)) {
+      if (key_len == sizeof(kAlignmentKey) - 1 &&
+          std::memcmp(key_buf, kAlignmentKey, key_len) == 0) {
+        match = kAlignment;
+      } else if (out_split_count != nullptr &&
+                 key_len == sizeof(kSplitCountKey) - 1 &&
+                 std::memcmp(key_buf, kSplitCountKey, key_len) == 0) {
+        match = kSplitCount;
+      } else if (out_split_no != nullptr &&
+                 key_len == sizeof(kSplitNoKey) - 1 &&
+                 std::memcmp(key_buf, kSplitNoKey, key_len) == 0) {
+        match = kSplitNo;
+      }
+    } else if (!reader.skip_bytes(key_len)) {
       return true;
     }
 
     uint32_t kv_type = 0;
-    if (!read_exact_bytes(fp.get(), &kv_type, sizeof(kv_type))) {
+    if (!reader.read_bytes(&kv_type, sizeof(kv_type))) {
       return true;
     }
-    uint32_t alignment_val = 0;
-    if (!skip_gguf_value(fp.get(), kv_type, is_alignment_key ? &alignment_val : nullptr)) {
+    uint64_t matched_val = 0;
+    if (!read_or_skip_gguf_value(
+            reader, kv_type, match != kNone ? &matched_val : nullptr)) {
       return true;
     }
-    if (is_alignment_key && kv_type == GGUF_TYPE_UINT32 &&
-        alignment_val > 0 && (alignment_val & (alignment_val - 1)) == 0) {
-      alignment = alignment_val;
+    if (match == kAlignment && kv_type == GGUF_TYPE_UINT32 &&
+        matched_val > 0 && (matched_val & (matched_val - 1)) == 0) {
+      alignment = matched_val;
+    } else if (match == kSplitCount && matched_val > 1 &&
+               matched_val <= std::numeric_limits<uint16_t>::max()) {
+      *out_split_count = static_cast<uint16_t>(matched_val);
+    } else if (match == kSplitNo &&
+               matched_val <= std::numeric_limits<uint16_t>::max()) {
+      *out_split_no = static_cast<uint16_t>(matched_val);
     }
   }
 
-  constexpr uint64_t kWasm32SizeMax = static_cast<uint64_t>(std::numeric_limits<size_t>::max());
-  uint64_t accumulated = 0;
+  constexpr uint64_t kWasm32SizeMax = static_cast<uint64_t>(SIZE_MAX);
+  uint64_t shard_accumulated = 0;
 
   for (uint64_t i = 0; i < n_tensors; ++i) {
     uint64_t name_len = 0;
-    if (!read_exact_bytes(fp.get(), &name_len, sizeof(name_len))) {
+    if (!reader.read_bytes(&name_len, sizeof(name_len))) {
       return true;
     }
     char name_buf[65] = {};
     const size_t capture = static_cast<size_t>(std::min<uint64_t>(name_len, 64));
-    if (capture > 0 && !read_exact_bytes(fp.get(), name_buf, capture)) {
+    if (capture > 0 && !reader.read_bytes(name_buf, capture)) {
       return true;
     }
     name_buf[capture] = '\0';
-    if (name_len > capture && !skip_file_bytes(fp.get(), name_len - capture)) {
+    if (name_len > capture && !reader.skip_bytes(name_len - capture)) {
       return true;
     }
 
     uint32_t n_dims = 0;
-    if (!read_exact_bytes(fp.get(), &n_dims, sizeof(n_dims)) || n_dims > GGML_MAX_DIMS) {
+    if (!reader.read_bytes(&n_dims, sizeof(n_dims)) || n_dims > GGML_MAX_DIMS) {
       return true;
     }
     uint64_t ne[GGML_MAX_DIMS] = {1, 1, 1, 1};
     for (uint32_t d = 0; d < n_dims; ++d) {
       int64_t dim = 0;
-      if (!read_exact_bytes(fp.get(), &dim, sizeof(dim)) || dim < 0) {
+      if (!reader.read_bytes(&dim, sizeof(dim)) || dim < 0) {
         return true;
       }
       ne[d] = static_cast<uint64_t>(dim);
@@ -199,8 +290,8 @@ bool check_wasm32_gguf_tensor_size_limit(const char * model_path) {
 
     int32_t tensor_type = -1;
     uint64_t tensor_offset = 0;
-    if (!read_exact_bytes(fp.get(), &tensor_type, sizeof(tensor_type)) ||
-        !read_exact_bytes(fp.get(), &tensor_offset, sizeof(tensor_offset)) ||
+    if (!reader.read_bytes(&tensor_type, sizeof(tensor_type)) ||
+        !reader.read_bytes(&tensor_offset, sizeof(tensor_offset)) ||
         tensor_type < 0 || tensor_type >= GGML_TYPE_COUNT) {
       return true;
     }
@@ -234,17 +325,67 @@ bool check_wasm32_gguf_tensor_size_limit(const char * model_path) {
     const uint64_t padded_size = nbytes_overflows
         ? kWasm32SizeMax
         : ((nbytes + alignment - 1) / alignment) * alignment;
+    const uint64_t prior_total = *total_accumulated;
     if (nbytes_overflows || tensor_offset > kWasm32SizeMax ||
-        kWasm32SizeMax - accumulated < padded_size) {
+        kWasm32SizeMax - shard_accumulated < padded_size ||
+        kWasm32SizeMax - prior_total < padded_size) {
       set_error(
           "GGUF tensor payload exceeds the wasm32 4 GiB address space limit (tensor '" +
-          std::string(name_buf) + "', accumulated " + std::to_string(accumulated) +
+          std::string(name_buf) + "', accumulated " + std::to_string(prior_total) +
           " + " + std::to_string(padded_size) + " > " +
           std::to_string(kWasm32SizeMax) +
           " bytes); use the memory64 core or a smaller quantization");
       return false;
     }
-    accumulated += padded_size;
+    shard_accumulated += padded_size;
+    *total_accumulated += padded_size;
+  }
+
+  return true;
+}
+
+// Fail fast with a clean status before gguf_init_from_reader logs overflow and
+// unwinds across un-catchable llama.cpp C++ frames into a raw wasm abort().
+bool check_wasm32_gguf_tensor_size_limit(const char * model_path) {
+  if (model_path == nullptr || std::strlen(model_path) == 0) {
+    return true;
+  }
+  uint64_t total_accumulated = 0;
+  uint16_t split_count = 1;
+  uint16_t split_no = 0;
+  if (!check_wasm32_gguf_shard(
+          model_path, &total_accumulated, &split_count, &split_no)) {
+    return false;
+  }
+
+  if (split_count > 1) {
+    const size_t path_buf_len = std::strlen(model_path) + 64;
+    std::vector<char> prefix_buf(path_buf_len, 0);
+    const int32_t prefix_len = llama_split_prefix(
+        prefix_buf.data(),
+        prefix_buf.size(),
+        model_path,
+        static_cast<int32_t>(split_no),
+        static_cast<int32_t>(split_count));
+    if (prefix_len > 0) {
+      std::vector<char> shard_buf(static_cast<size_t>(prefix_len) + 64, 0);
+      for (uint16_t s = 0; s < split_count; ++s) {
+        if (s == split_no) {
+          continue;
+        }
+        const int32_t written = llama_split_path(
+            shard_buf.data(),
+            shard_buf.size(),
+            prefix_buf.data(),
+            static_cast<int32_t>(s),
+            static_cast<int32_t>(split_count));
+        if (written > 0 &&
+            !check_wasm32_gguf_shard(
+                shard_buf.data(), &total_accumulated, nullptr, nullptr)) {
+          return false;
+        }
+      }
+    }
   }
 
   return true;
@@ -298,7 +439,8 @@ int32_t load_model_internal(
   }
 
 #if SIZE_MAX <= 0xffffffffULL
-  if (!check_wasm32_gguf_tensor_size_limit(model_path)) {
+  if (llamadart_webgpu_is_js_model_path(model_path) &&
+      !check_wasm32_gguf_tensor_size_limit(model_path)) {
     return -4;
   }
 #endif

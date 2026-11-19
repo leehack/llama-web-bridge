@@ -58,8 +58,10 @@ import {
 } from './internal/model_source.ts';
 import {
   ModelStagingError,
+  isGenericCoreAbortText,
   isJsAllocationError,
   isWasm32TensorLimitText,
+  missingJsModelStagingExports,
 } from './internal/model_staging.ts';
 import { nextTokenCandidateIds, scoredTokensFrom } from './internal/next_token_scores.ts';
 import {
@@ -247,6 +249,7 @@ export class LlamaWebGpuBridgeRuntime {
   declare _activeTransferAbortController: AbortController | null;
   declare _lastCoreErrorText: string;
   declare _lastCoreErrorHint: string;
+  declare _lastWasm32TensorLimitError: string;
   declare _jsBackedStagingMounted: boolean;
   declare _logLevel: number;
 
@@ -337,6 +340,7 @@ export class LlamaWebGpuBridgeRuntime {
     this._activeTransferAbortController = null;
     this._lastCoreErrorText = '';
     this._lastCoreErrorHint = '';
+    this._lastWasm32TensorLimitError = '';
     this._jsBackedStagingMounted = false;
     this._logLevel = Number.isFinite(config.logLevel)
       ? Math.max(0, Math.min(4, Math.trunc(config.logLevel as number)))
@@ -1853,17 +1857,15 @@ export class LlamaWebGpuBridgeRuntime {
           },
           printErr: (msg: unknown) => {
             const text = String(msg ?? '');
-            this._lastCoreErrorText = text;
             const trimmed = text.trim();
-            if (trimmed.length > 0) {
-              const loweredTrimmed = trimmed.toLowerCase();
-              const isGenericAbort =
-                loweredTrimmed === 'aborted(native code called abort())'
-                || loweredTrimmed === 'native code called abort()'
-                || loweredTrimmed === 'aborted';
-              if (!isGenericAbort) {
+            if (!isGenericCoreAbortText(trimmed)) {
+              this._lastCoreErrorText = text;
+              if (trimmed.length > 0) {
                 this._lastCoreErrorHint = trimmed;
               }
+            }
+            if (isWasm32TensorLimitText(trimmed)) {
+              this._lastWasm32TensorLimitError = trimmed;
             }
             const classification = this._classifyCoreErrorLine(text);
             if (classification === 'ignore') {
@@ -2147,11 +2149,26 @@ export class LlamaWebGpuBridgeRuntime {
       const useJsBackedStaging = this._config.jsBackedModelStaging === true;
       let modelDir = '/models';
       if (useJsBackedStaging) {
+        const missingExports = missingJsModelStagingExports(core);
+        if (missingExports.length > 0) {
+          this._pushRuntimeNote('model_staging_js_backed_unsupported');
+          throw new ModelStagingError(
+            'MODEL_STAGING_UNSUPPORTED',
+            `JS-backed model staging ('jsBackedModelStaging' / 'model_staging_js_backed') is not supported by this core binary (missing exports: ${missingExports.join(', ')}). Update the core build or disable jsBackedModelStaging.`,
+          );
+        }
         const mountRc = Number(
           core.ccall('llamadart_webgpu_mount_js_model_fs', 'number', ['string'], ['/jsmodels']),
         );
         if (mountRc !== 0) {
-          throw new Error(`Failed to mount JS-backed model filesystem (rc=${mountRc})`);
+          this._pushRuntimeNote('model_staging_mount_failed');
+          const detail = mountRc === -20 || mountRc === -17
+            ? 'the /jsmodels path already exists under another filesystem backend'
+            : `rc=${mountRc}`;
+          throw new ModelStagingError(
+            'MODEL_STAGING_MOUNT_FAILED',
+            `Failed to mount JS-backed model filesystem at /jsmodels (${detail}).`,
+          );
         }
         this._jsBackedStagingMounted = true;
         modelDir = '/jsmodels';
@@ -2255,13 +2272,66 @@ export class LlamaWebGpuBridgeRuntime {
             }
 
             try {
-              if (useJsBackedStaging && resumeOffset === 0 && knownTotalBytes > 0) {
-                core.ccall(
-                  'llamadart_webgpu_js_model_fs_prealloc_next',
-                  null,
-                  ['number'],
-                  [knownTotalBytes],
+              let directWriter = null;
+              if (useJsBackedStaging) {
+                const preallocBytes = resumeOffset === 0 && knownTotalBytes > 0
+                  ? knownTotalBytes
+                  : 0;
+                const directHandle = Number(
+                  core.ccall(
+                    'llamadart_webgpu_js_model_fs_open_direct',
+                    'number',
+                    ['string', 'number', 'number'],
+                    [modelPath, preallocBytes, resumeOffset > 0 ? 1 : 0],
+                  ),
                 );
+                if (!Number.isInteger(directHandle) || directHandle <= 0) {
+                  const openErr = new Error(
+                    `Failed to open direct JS-backed model file (rc=${directHandle}).`,
+                  ) as Error & { errno?: number; code?: string };
+                  if (directHandle < 0) {
+                    openErr.errno = -directHandle;
+                    if (directHandle === -12 || directHandle === -48) {
+                      openErr.code = 'ENOMEM';
+                    }
+                  }
+                  throw openErr;
+                }
+                let closed = false;
+                const closeDirect = () => {
+                  if (closed) {
+                    return;
+                  }
+                  closed = true;
+                  try {
+                    core.ccall(
+                      'llamadart_webgpu_js_model_fs_close_direct',
+                      null,
+                      ['number'],
+                      [directHandle],
+                    );
+                  } catch (_) {
+                    // ignore best-effort direct handle cleanup
+                  }
+                };
+                const writeDirect = core.llamadartJsModelFsWriteDirect!;
+                directWriter = {
+                  writeChunk(chunk: Uint8Array, position: number) {
+                    const rc = Number(writeDirect(directHandle, chunk, position));
+                    if (!Number.isFinite(rc) || rc < 0) {
+                      const writeErr = new Error(
+                        `Failed to write direct JS-backed model chunk (rc=${rc}).`,
+                      ) as Error & { errno?: number; code?: string };
+                      writeErr.errno = -rc;
+                      if (rc === -12 || rc === -48) {
+                        writeErr.code = 'ENOMEM';
+                      }
+                      throw writeErr;
+                    }
+                    return rc;
+                  },
+                  close: closeDirect,
+                };
               }
               shardBytes = await writeResponseToFsFileWithProgress(
                 response,
@@ -2281,6 +2351,7 @@ export class LlamaWebGpuBridgeRuntime {
                 {
                   useBigIntPosition: this._coreVariant === 'wasm64',
                   skipMemoryReservation: useJsBackedStaging,
+                  directWriter,
                   startOffset: resumeOffset,
                   preservePartialOnError: true,
                   totalBytes: knownTotalBytes,
@@ -2382,6 +2453,7 @@ export class LlamaWebGpuBridgeRuntime {
         let nativeAbortCleanupDone = false;
         this._lastCoreErrorHint = '';
         this._lastCoreErrorText = '';
+        this._lastWasm32TensorLimitError = '';
         try {
           throwIfAborted(operationSignal, abortMessage);
           nativeLoadStarted = true;
@@ -2433,25 +2505,29 @@ export class LlamaWebGpuBridgeRuntime {
           }
           const combinedText = [
             String(error || ''),
+            String(this._lastWasm32TensorLimitError || ''),
             String(this._lastCoreErrorHint || ''),
             String(this._lastCoreErrorText || ''),
           ].join(' ');
           const text = String(error || '').toLowerCase();
+          const aborted = (error instanceof Error && error.name === 'RuntimeError')
+            || /\babort(?:ed)?\b/i.test(text);
           if (text.includes('bigint')) {
             this._runtimeNotes.push('model_load_ccall_bigint_error');
-          } else if (text.includes('abort')) {
+          } else if (aborted) {
             this._runtimeNotes.push('model_load_ccall_abort');
           } else {
             this._runtimeNotes.push('model_load_ccall_failed');
           }
           if (isWasm32TensorLimitText(combinedText)) {
-            if (text.includes('abort')) {
+            if (aborted) {
               this._core = null;
               this._coreVariant = 'uninitialized';
             }
             throw new ModelStagingError(
               'MODEL_TENSOR_SIZE_LIMIT_EXCEEDED',
-              this._lastCoreErrorHint
+              this._lastWasm32TensorLimitError
+                || this._lastCoreErrorHint
                 || 'GGUF tensor payload exceeds the wasm32 4 GiB address space limit; use the memory64 core or a smaller quantization.',
             );
           }

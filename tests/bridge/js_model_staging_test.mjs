@@ -1,5 +1,10 @@
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 import test from 'node:test';
+import { fileURLToPath } from 'node:url';
 
 import { LlamaWebGpuBridge, ModelStagingError } from '../../js/src/llama_webgpu_bridge.js';
 import { writeResponseToFsFileWithProgress } from '../../js/src/internal/download.ts';
@@ -10,6 +15,8 @@ import {
   workerDriver,
 } from './bridge_operation_queue_fixtures.mjs';
 import { readNativeCoreSource } from './native_core_source.mjs';
+
+const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 
 function createStubFs({ failWriteWith = null } = {}) {
   const dirs = new Set(['/']);
@@ -73,11 +80,17 @@ function createStagingHarness({
   pthreads = false,
   coreVariant = 'wasm32',
   jsBackedModelStaging = true,
+  includeJsModelFsExports = true,
+  mountResult = 0,
   failWriteWith = null,
   onLoadModel = null,
 } = {}) {
   const fs = createStubFs({ failWriteWith });
   const ccalls = [];
+  const directWrites = [];
+  const openDirectHandles = new Set();
+  const closedDirectHandles = [];
+  let nextDirectHandle = 1;
   let preallocNextBytes = 0;
   let oomBytes = 0;
   let lastErrorText = '';
@@ -86,9 +99,39 @@ function createStagingHarness({
   const core = {
     FS: fs,
     UTF8ToString: () => lastErrorText,
+    ...(includeJsModelFsExports ? {
+      _llamadart_webgpu_mount_js_model_fs: () => 0,
+      _llamadart_webgpu_unmount_js_model_fs: () => 0,
+      _llamadart_webgpu_js_model_fs_prealloc_next: () => 0,
+      _llamadart_webgpu_js_model_fs_open_direct: () => 0,
+      _llamadart_webgpu_js_model_fs_close_direct: () => 0,
+      _llamadart_webgpu_js_model_fs_consume_oom_bytes: () => 0,
+      _llamadart_webgpu_js_model_fs_allocated_bytes: () => 0,
+      llamadartJsModelFsWriteDirect(handle, chunk, position) {
+        if (!openDirectHandles.has(handle)) {
+          return -8;
+        }
+        if (typeof failWriteWith === 'function') {
+          const err = failWriteWith({ filePath: null, length: chunk.byteLength, position });
+          if (err) {
+            return -(Number(err.errno) || 12);
+          }
+        }
+        directWrites.push({
+          handle,
+          chunkRef: chunk,
+          length: chunk.byteLength,
+          position,
+        });
+        return chunk.byteLength;
+      },
+    } : {}),
     ccall(name, _returnType, _argTypes, args = []) {
       ccalls.push([name, ...args]);
       if (name === 'llamadart_webgpu_mount_js_model_fs') {
+        if (mountResult !== 0) {
+          return mountResult;
+        }
         fs.dirs.add(args[0]);
         return 0;
       }
@@ -100,11 +143,30 @@ function createStagingHarness({
           }
         }
         fs.dirs.delete(args[0]);
+        openDirectHandles.clear();
         preallocNextBytes = 0;
         return 0;
       }
       if (name === 'llamadart_webgpu_js_model_fs_prealloc_next') {
         preallocNextBytes = Number(args[0]) || 0;
+        return 0;
+      }
+      if (name === 'llamadart_webgpu_js_model_fs_open_direct') {
+        const [filePath, preallocBytes = 0, append = 0] = args;
+        if (!append) {
+          fs.files.set(filePath, 0);
+          preallocNextBytes = Number(preallocBytes) || 0;
+        } else if (!fs.files.has(filePath)) {
+          return -2;
+        }
+        const handle = nextDirectHandle++;
+        openDirectHandles.add(handle);
+        return handle;
+      }
+      if (name === 'llamadart_webgpu_js_model_fs_close_direct') {
+        const [handle] = args;
+        openDirectHandles.delete(handle);
+        closedDirectHandles.push(handle);
         return 0;
       }
       if (name === 'llamadart_webgpu_js_model_fs_consume_oom_bytes') {
@@ -162,6 +224,9 @@ function createStagingHarness({
     core,
     fs,
     ccalls,
+    directWrites,
+    openDirectHandles,
+    closedDirectHandles,
     get preallocNextBytes() { return preallocNextBytes; },
     setOomBytes: (bytes) => { oomBytes = bytes; },
     setLastError: (msg) => { lastErrorText = msg; },
@@ -195,21 +260,25 @@ test('jsBackedModelStaging defaults off and works opt-in for threaded and non-th
     });
 
     assert.deepEqual(harness.ccalls[0], ['llamadart_webgpu_mount_js_model_fs', '/jsmodels']);
-    assert.deepEqual(harness.ccalls[1], ['llamadart_webgpu_js_model_fs_prealloc_next', 4]);
-    assert.deepEqual(harness.ccalls[2].slice(0, 3), ['llamadart_webgpu_load_model', '/jsmodels/demo.gguf', 2048]);
+    assert.deepEqual(harness.ccalls[1], ['llamadart_webgpu_js_model_fs_open_direct', '/jsmodels/demo.gguf', 4, 0]);
+    assert.ok(harness.ccalls.some((c) => c[0] === 'llamadart_webgpu_js_model_fs_close_direct'));
+    assert.ok(harness.ccalls.some((c) => c[0] === 'llamadart_webgpu_load_model' && c[1] === '/jsmodels/demo.gguf'));
     assert.ok(harness.ccalls.some((c) => c[0] === 'llamadart_webgpu_unmount_js_model_fs' && c[1] === '/jsmodels'));
     assert.ok(harness.runtime._runtimeNotes.includes('model_staging_js_backed'));
+    assert.equal(harness.fs.writes.length, 0);
+    assert.equal(harness.directWrites.length, 1);
+    assert.equal(harness.openDirectHandles.size, 0);
     assert.equal(harness.fs.files.size, 0);
     assert.deepEqual(harness.fs.unmountedPaths, ['/jsmodels']);
   }
 });
 
-test('skipMemoryReservation skips the 1-byte seek write even for 1 GiB+ Content-Length', async () => {
+test('skipMemoryReservation skips the 1-byte seek write while keeping exact transfer-length validation', async () => {
   const fs = createStubFs();
   const gib = 1073741824;
   const response = new Response(new Uint8Array([7, 8, 9]), {
     status: 200,
-    headers: { 'content-length': String(gib), 'content-encoding': 'identity' },
+    headers: { 'content-length': String(gib) },
   });
   const written = await writeResponseToFsFileWithProgress(
     response,
@@ -225,9 +294,32 @@ test('skipMemoryReservation skips the 1-byte seek write even for 1 GiB+ Content-
     position: 0,
     positionType: 'number',
   }]);
+
+  // With Content-Encoding: identity and a short body, skipMemoryReservation must still reject short transfers.
+  for (const useBigIntPosition of [false, true]) {
+    const shortFs = createStubFs();
+    const shortBody = new ReadableStream({
+      start(controller) {
+        controller.enqueue(new Uint8Array(16));
+        controller.close();
+      },
+    });
+    const shortResp = new Response(shortBody, {
+      status: 200,
+      headers: { 'content-length': String(gib), 'content-encoding': 'identity' },
+    });
+    await assert.rejects(
+      writeResponseToFsFileWithProgress(shortResp, shortFs, '/jsmodels/short.gguf', null, {
+        skipMemoryReservation: true,
+        useBigIntPosition,
+      }),
+      { name: 'ModelTransferLengthError' },
+    );
+    assert.equal(shortFs.files.has('/jsmodels/short.gguf'), false);
+  }
 });
 
-test('jsBackedModelStaging on wasm64 uses BigInt FS.write positions and skips reservation', async () => {
+test('jsBackedModelStaging on wasm64 writes directly via handle without FS.write round-trip', async () => {
   const harness = createStagingHarness({
     coreVariant: 'wasm64',
     jsBackedModelStaging: true,
@@ -241,16 +333,21 @@ test('jsBackedModelStaging on wasm64 uses BigInt FS.write positions and skips re
     forceRemoteFetchBackend: false,
   });
 
-  assert.deepEqual(harness.fs.writes, [{
-    filePath: '/jsmodels/mem64.gguf',
+  assert.equal(harness.fs.writes.length, 0);
+  assert.deepEqual(harness.directWrites.map(({ handle, length, position }) => ({
+    handle,
+    length,
+    position,
+  })), [{
+    handle: 1,
     length: 4,
     position: 0,
-    positionType: 'bigint',
   }]);
   assert.deepEqual(harness.ccalls[0], ['llamadart_webgpu_mount_js_model_fs', '/jsmodels']);
-  assert.deepEqual(harness.ccalls[1], ['llamadart_webgpu_js_model_fs_prealloc_next', 4]);
+  assert.deepEqual(harness.ccalls[1], ['llamadart_webgpu_js_model_fs_open_direct', '/jsmodels/mem64.gguf', 4, 0]);
   assert.ok(harness.ccalls.some((c) => c[0] === 'llamadart_webgpu_unmount_js_model_fs' && c[1] === '/jsmodels'));
   assert.ok(harness.runtime._runtimeNotes.includes('model_staging_js_backed'));
+  assert.equal(harness.openDirectHandles.size, 0);
   assert.equal(harness.fs.files.size, 0);
 
   const workerBridge = new LlamaWebGpuBridge({
@@ -386,7 +483,12 @@ test('ModelStagingError preserves class and code across worker host and proxy wi
     const driver = workerDriver(proxy, workers[0]);
     driver.ready();
 
-    for (const code of ['MODEL_STAGING_ALLOCATION_FAILED', 'MODEL_TENSOR_SIZE_LIMIT_EXCEEDED']) {
+    for (const code of [
+      'MODEL_STAGING_ALLOCATION_FAILED',
+      'MODEL_TENSOR_SIZE_LIMIT_EXCEEDED',
+      'MODEL_STAGING_MOUNT_FAILED',
+      'MODEL_STAGING_UNSUPPORTED',
+    ]) {
       const call = proxy.call('loadModelFromUrl', ['https://models.test/model.gguf', {}]);
       await driver.settle();
       const pending = driver.calls('loadModelFromUrl').at(-1);
@@ -421,10 +523,345 @@ test('ModelStagingError preserves class and code across worker host and proxy wi
   }
 });
 
-test('native model_load.inc checks wasm32 GGUF tensor size limit before llama_model_load_from_file', () => {
+test('native model_load.inc checks wasm32 GGUF tensor size limit across split shards only for JS-backed staging, using buffered I/O', () => {
   const source = readNativeCoreSource();
   const loader = source.slice(source.indexOf('int32_t load_model_internal('));
   const preLoad = loader.slice(0, loader.indexOf('llama_model_load_from_file('));
-  assert.match(preLoad, /if \(!check_wasm32_gguf_tensor_size_limit\(model_path\)\)\s*\{\s*return -4;\s*\}/);
+  assert.match(preLoad, /if \(llamadart_webgpu_is_js_model_path\(model_path\) &&\s*!check_wasm32_gguf_tensor_size_limit\(model_path\)\)\s*\{\s*return -4;\s*\}/);
   assert.match(source, /SIZE_MAX <= 0xffffffffULL/);
+
+  // Compile and execute the real model_load.inc preflight against split GGUF fixtures
+  // and default-off /models/ paths on the host C++ compiler.
+  const modelLoadText = readFileSync(path.join(rootDir, 'src/core/model_load.inc'), 'utf8');
+  const start = modelLoadText.indexOf('class BufferedFileReader {');
+  const end = modelLoadText.indexOf('#endif', modelLoadText.indexOf('bool check_wasm32_gguf_tensor_size_limit('));
+  assert.ok(start >= 0 && end > start, 'preflight block must exist in model_load.inc');
+  const preflightImpl = modelLoadText
+    .slice(start, end)
+    .replaceAll('std::fread', 'counted_fread')
+    .replaceAll('fseeko(', 'counted_fseeko(');
+
+  const fixtureCpp = `#include <algorithm>
+#include <cassert>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <limits>
+#include <memory>
+#include <string>
+#include <vector>
+
+static unsigned long long g_freads = 0;
+static unsigned long long g_fseeks = 0;
+static size_t counted_fread(void * ptr, size_t sz, size_t n, std::FILE * fp) {
+  ++g_freads;
+  return std::fread(ptr, sz, n, fp);
+}
+static int counted_fseeko(std::FILE * fp, off_t off, int wh) {
+  ++g_fseeks;
+  return fseeko(fp, off, wh);
+}
+
+#undef SIZE_MAX
+#define SIZE_MAX 0xffffffffULL
+
+enum ggml_type { GGML_TYPE_F32 = 0, GGML_TYPE_COUNT = 2 };
+enum { GGML_MAX_DIMS = 4, GGUF_DEFAULT_ALIGNMENT = 32 };
+enum gguf_type {
+  GGUF_TYPE_UINT8 = 0, GGUF_TYPE_INT8 = 1, GGUF_TYPE_UINT16 = 2, GGUF_TYPE_INT16 = 3,
+  GGUF_TYPE_UINT32 = 4, GGUF_TYPE_INT32 = 5, GGUF_TYPE_FLOAT32 = 6, GGUF_TYPE_BOOL = 7,
+  GGUF_TYPE_STRING = 8, GGUF_TYPE_ARRAY = 9, GGUF_TYPE_UINT64 = 10, GGUF_TYPE_INT64 = 11,
+  GGUF_TYPE_FLOAT64 = 12,
+};
+
+size_t ggml_type_size(ggml_type) { return 4; }
+int64_t ggml_blck_size(ggml_type) { return 1; }
+int32_t llama_split_path(char * dst, size_t max, const char * prefix, int32_t no, int32_t count) {
+  int w = std::snprintf(dst, max, "%s-%05d-of-%05d.gguf", prefix, no + 1, count);
+  return (w > 0 && static_cast<size_t>(w) < max) ? w : 0;
+}
+int32_t llama_split_prefix(char * dst, size_t max, const char * path, int32_t no, int32_t count) {
+  char suf[32];
+  std::snprintf(suf, sizeof(suf), "-%05d-of-%05d.gguf", no + 1, count);
+  std::string s(path), ss(suf);
+  if (s.size() <= ss.size() || s.compare(s.size() - ss.size(), ss.size(), ss) != 0) return 0;
+  size_t len = s.size() - ss.size();
+  if (len + 1 > max) return 0;
+  std::memcpy(dst, path, len);
+  dst[len] = '\\0';
+  return static_cast<int32_t>(len);
+}
+static std::string g_error;
+void set_error(const std::string & s) { g_error = s; }
+bool llamadart_webgpu_is_js_model_path(const char * p) {
+  return p != nullptr && std::strncmp(p, "/jsmodels/", 10) == 0;
+}
+
+${preflightImpl}
+
+static void write_u32(std::vector<uint8_t> & b, uint32_t v) {
+  size_t o = b.size(); b.resize(o + 4); std::memcpy(b.data() + o, &v, 4);
+}
+static void write_i32(std::vector<uint8_t> & b, int32_t v) {
+  size_t o = b.size(); b.resize(o + 4); std::memcpy(b.data() + o, &v, 4);
+}
+static void write_u16(std::vector<uint8_t> & b, uint16_t v) {
+  size_t o = b.size(); b.resize(o + 2); std::memcpy(b.data() + o, &v, 2);
+}
+static void write_u64(std::vector<uint8_t> & b, uint64_t v) {
+  size_t o = b.size(); b.resize(o + 8); std::memcpy(b.data() + o, &v, 8);
+}
+static void write_str(std::vector<uint8_t> & b, const std::string & s) {
+  write_u64(b, s.size()); b.insert(b.end(), s.begin(), s.end());
+}
+
+static void write_gguf(
+    const std::string & path,
+    uint16_t split_count,
+    uint16_t split_no,
+    uint32_t extra_vocab_strings,
+    const std::vector<std::pair<std::string, uint64_t>> & tensors_f32_elems) {
+  std::vector<uint8_t> out;
+  out.insert(out.end(), {'G', 'G', 'U', 'F'});
+  write_u32(out, 3);
+  write_u64(out, tensors_f32_elems.size());
+  uint64_t n_kv = (split_count > 1 ? 2 : 0) + (extra_vocab_strings > 0 ? 1 : 0);
+  write_u64(out, n_kv);
+  if (split_count > 1) {
+    write_str(out, "split.count"); write_u32(out, GGUF_TYPE_UINT16); write_u16(out, split_count);
+    write_str(out, "split.no"); write_u32(out, GGUF_TYPE_UINT16); write_u16(out, split_no);
+  }
+  if (extra_vocab_strings > 0) {
+    write_str(out, "tokenizer.ggml.tokens");
+    write_u32(out, GGUF_TYPE_ARRAY);
+    write_u32(out, GGUF_TYPE_STRING);
+    write_u64(out, extra_vocab_strings);
+    for (uint32_t i = 0; i < extra_vocab_strings; ++i) write_str(out, "tok_abcdef");
+  }
+  for (const auto & kv : tensors_f32_elems) {
+    write_str(out, kv.first);
+    write_u32(out, 1);
+    write_u64(out, kv.second);
+    write_i32(out, GGML_TYPE_F32);
+    write_u64(out, 0);
+  }
+  FILE * fp = std::fopen(path.c_str(), "wb");
+  assert(fp != nullptr);
+  assert(std::fwrite(out.data(), 1, out.size(), fp) == out.size());
+  std::fclose(fp);
+}
+
+int main(int argc, char ** argv) {
+  std::string dir = argv[1];
+  // 1) Split GGUF with metadata-only shard 1 + >4 GiB tensor shard 2 must fail preflight.
+  std::string s1 = dir + "/m-00001-of-00002.gguf";
+  std::string s2 = dir + "/m-00002-of-00002.gguf";
+  write_gguf(s1, 2, 0, 10000, {});
+  write_gguf(s2, 2, 1, 0, {{"t0", 600000000ULL}, {"t1", 600000000ULL}}); // 4.8 GB > 4 GiB
+  g_error.clear(); g_freads = 0; g_fseeks = 0;
+  assert(!check_wasm32_gguf_tensor_size_limit(s1.c_str()));
+  assert(g_error.find("wasm32 4 GiB") != std::string::npos);
+  // Buffered reader must scan 10,000 KV strings with <= 1 seek and minimal fread calls.
+  assert(g_fseeks <= 1);
+  assert(g_freads < 20);
+
+  // 2) Combined >4 GiB across two individually <4 GiB shards must also fail preflight.
+  std::string c1 = dir + "/c-00001-of-00002.gguf";
+  std::string c2 = dir + "/c-00002-of-00002.gguf";
+  write_gguf(c1, 2, 0, 0, {{"a", 650000000ULL}}); // 2.6 GB
+  write_gguf(c2, 2, 1, 0, {{"b", 650000000ULL}}); // 2.6 GB => 5.2 GB combined
+  g_error.clear();
+  assert(!check_wasm32_gguf_tensor_size_limit(c1.c_str()));
+
+  // 3) Default /models/ path does NOT invoke preflight (0 reads, 0 seeks).
+  std::string def = "/models/default.gguf";
+  g_freads = 0; g_fseeks = 0;
+  bool would_run = llamadart_webgpu_is_js_model_path(def.c_str()) &&
+      !check_wasm32_gguf_tensor_size_limit(def.c_str());
+  assert(!would_run);
+  assert(g_freads == 0 && g_fseeks == 0);
+  return 0;
+}
+`;
+
+  const dir = mkdtempSync(path.join(tmpdir(), 'bridge-preflight-native-'));
+  try {
+    const cpp = path.join(dir, 'preflight.cpp');
+    const exe = path.join(dir, 'preflight');
+    writeFileSync(cpp, fixtureCpp);
+    const comp = spawnSync(process.env.CXX || 'c++', ['-std=c++17', cpp, '-o', exe], { encoding: 'utf8' });
+    assert.equal(comp.status, 0, comp.stderr);
+    const run = spawnSync(exe, [dir], { encoding: 'utf8' });
+    assert.equal(run.status, 0, `${run.signal}: ${run.stderr}`);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('generic Emscripten abort printErr does not overwrite wasm32 tensor-limit hint and resets dead core for retry', async () => {
+  let stage = 0;
+  const harness = createStagingHarness({
+    jsBackedModelStaging: true,
+    onLoadModel: ({ emitLog }) => {
+      stage += 1;
+      if (stage === 1) {
+        emitLog("gguf_init_from_reader: tensor 'blk.30.attn_output.weight' size overflow, cannot accumulate size 4288489984 + 9437184");
+        // Simulate Emscripten printErr/onAbort emitting generic abort messages afterward.
+        harness.runtime._lastCoreErrorText = harness.runtime._lastCoreErrorText;
+        harness.runtime._core._printErr?.('core abort');
+        throw new WebAssembly.RuntimeError('Aborted(undefined). Build with -sASSERTIONS for more info.');
+      }
+      return 0;
+    },
+  });
+
+  // Exercise the exact printErr handler logic on a mock core:
+  harness.runtime._lastCoreErrorText = "gguf_init_from_reader: tensor 'blk.30.attn_output.weight' size overflow, cannot accumulate size 4288489984 + 9437184";
+  harness.runtime._lastCoreErrorHint = harness.runtime._lastCoreErrorText;
+  harness.runtime._lastWasm32TensorLimitError = harness.runtime._lastCoreErrorText;
+
+  // Verify the generic abort guard refuses to clobber diagnostic with 'Aborted(undefined)'.
+  const runtimeSrc = readFileSync(path.join(rootDir, 'js/src/runtime.ts'), 'utf8');
+  assert.match(runtimeSrc, /!isGenericCoreAbortText\(trimmed\)/);
+
+  const err = await harness.runtime.loadModelFromUrl('https://models.test/split-8b.gguf', {
+    nCtx: 2048,
+    nGpuLayers: 999,
+    useCache: false,
+    forceRemoteFetchBackend: false,
+  }).then(() => assert.fail('must reject'), (e) => e);
+
+  assert.ok(err instanceof ModelStagingError, String(err));
+  assert.equal(err.code, 'MODEL_TENSOR_SIZE_LIMIT_EXCEEDED');
+  // Core was reset so next retry re-initializes instead of hitting the aborted module.
+  assert.equal(harness.runtime._core, null);
+
+  await harness.runtime.loadModelFromUrl('https://models.test/0.6b.gguf', {
+    nCtx: 2048,
+    nGpuLayers: 999,
+    useCache: false,
+    forceRemoteFetchBackend: false,
+  });
+  assert.equal(harness.fs.files.size, 0);
+});
+
+test('jsBackedModelStaging fails cleanly with MODEL_STAGING_UNSUPPORTED on older core missing exports', async () => {
+  const harness = createStagingHarness({
+    jsBackedModelStaging: true,
+    includeJsModelFsExports: false,
+  });
+
+  const err = await harness.runtime.loadModelFromUrl('https://models.test/small.gguf', {
+    nCtx: 2048,
+    nGpuLayers: 0,
+    useCache: false,
+    forceRemoteFetchBackend: false,
+  }).then(() => assert.fail('must reject'), (e) => e);
+
+  assert.ok(err instanceof ModelStagingError, String(err));
+  assert.equal(err.code, 'MODEL_STAGING_UNSUPPORTED');
+  assert.match(err.message, /jsBackedModelStaging/);
+  assert.match(err.message, /_llamadart_webgpu_mount_js_model_fs/);
+  assert.equal(harness.ccalls.length, 0, 'must probe exports before calling ccall');
+});
+
+test('jsBackedModelStaging fails cleanly with MODEL_STAGING_MOUNT_FAILED on /jsmodels collision', async () => {
+  const harness = createStagingHarness({
+    jsBackedModelStaging: true,
+    mountResult: -20,
+  });
+
+  const err = await harness.runtime.loadModelFromUrl('https://models.test/small.gguf', {
+    nCtx: 2048,
+    nGpuLayers: 0,
+    useCache: false,
+    forceRemoteFetchBackend: false,
+  }).then(() => assert.fail('must reject'), (e) => e);
+
+  assert.ok(err instanceof ModelStagingError, String(err));
+  assert.equal(err.code, 'MODEL_STAGING_MOUNT_FAILED');
+  assert.match(err.message, /\/jsmodels/);
+  assert.ok(!harness.runtime._runtimeNotes.includes('model_staging_js_backed'));
+  assert.equal(harness.fs.unmountedPaths.length, 0, 'must not unmount pre-existing non-JS-backed directory');
+});
+
+test('direct JS-backed staging avoids slice clones and FS.write round-trips while keeping progress and length checks', async () => {
+  const chunkA = new Uint8Array([10, 20, 30, 40]);
+  const chunkB = new Uint8Array([50, 60, 70, 80, 90, 100]);
+  let sliceCount = 0;
+  for (const chunk of [chunkA, chunkB]) {
+    const origSlice = chunk.slice.bind(chunk);
+    chunk.slice = (...args) => {
+      sliceCount += 1;
+      return origSlice(...args);
+    };
+  }
+
+  let openedWriteStreams = 0;
+  let closedWriteStreams = 0;
+  const harness = createStagingHarness({
+    jsBackedModelStaging: true,
+    pthreads: false,
+  });
+  const origOpen = harness.fs.open.bind(harness.fs);
+  harness.fs.open = (...args) => {
+    openedWriteStreams += 1;
+    return origOpen(...args);
+  };
+  harness.fs.close = () => {
+    closedWriteStreams += 1;
+  };
+  harness.runtime._getCachedModelResponse = async () => new Response(new ReadableStream({
+    start(controller) {
+      controller.enqueue(chunkA);
+      controller.enqueue(chunkB);
+      controller.close();
+    },
+  }), {
+    status: 200,
+    headers: { 'content-length': '10', 'content-encoding': 'identity' },
+  });
+
+  const progressEvents = [];
+  await harness.runtime.loadModelFromUrl('https://models.test/direct.gguf', {
+    nCtx: 2048,
+    nGpuLayers: 0,
+    useCache: false,
+    forceRemoteFetchBackend: false,
+    progressCallback: (ev) => progressEvents.push(ev),
+  });
+
+  assert.equal(sliceCount, 0, 'direct path must not clone chunks with .slice()');
+  assert.equal(openedWriteStreams, 0, 'direct path must not open FS write streams');
+  assert.equal(closedWriteStreams, 0, 'direct path must not close FS write streams');
+  assert.equal(harness.fs.writes.length, 0, 'direct path must not call FS.write');
+  assert.equal(harness.directWrites.length, 2);
+  assert.equal(harness.directWrites[0].chunkRef, chunkA);
+  assert.equal(harness.directWrites[0].position, 0);
+  assert.equal(harness.directWrites[1].chunkRef, chunkB);
+  assert.equal(harness.directWrites[1].position, 4);
+  assert.equal(progressEvents[progressEvents.length - 1].loaded, 10);
+  assert.equal(progressEvents[progressEvents.length - 1].total, 10);
+
+  // Transfer-length check still rejects short >= 1 GiB streams on the direct path.
+  const gib = 1073741824;
+  harness.runtime._getCachedModelResponse = async () => new Response(new ReadableStream({
+    start(controller) {
+      controller.enqueue(new Uint8Array(16));
+      controller.close();
+    },
+  }), {
+    status: 200,
+    headers: { 'content-length': String(gib), 'content-encoding': 'identity' },
+  });
+
+  const shortErr = await harness.runtime.loadModelFromUrl('https://models.test/short-direct.gguf', {
+    nCtx: 2048,
+    nGpuLayers: 0,
+    useCache: false,
+    forceRemoteFetchBackend: false,
+  }).then(() => assert.fail('must reject short transfer'), (e) => e);
+  assert.equal(shortErr.name, 'ModelTransferLengthError');
+  assert.equal(harness.fs.writes.length, 0);
+  assert.equal(harness.openDirectHandles.size, 0);
 });

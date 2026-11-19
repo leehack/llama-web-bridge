@@ -1,7 +1,19 @@
 import type { ModelStagingErrorCode } from '../llama_webgpu_bridge.d.ts';
+import type { LlamaCoreModule } from './types.ts';
+
+export const REQUIRED_JS_MODEL_STAGING_EXPORTS = [
+  '_llamadart_webgpu_mount_js_model_fs',
+  '_llamadart_webgpu_unmount_js_model_fs',
+  '_llamadart_webgpu_js_model_fs_prealloc_next',
+  '_llamadart_webgpu_js_model_fs_open_direct',
+  '_llamadart_webgpu_js_model_fs_close_direct',
+  '_llamadart_webgpu_js_model_fs_consume_oom_bytes',
+  '_llamadart_webgpu_js_model_fs_allocated_bytes',
+  'llamadartJsModelFsWriteDirect',
+] as const;
 
 // Typed, worker-transportable failures raised when JS-backed model staging
-// runs out of JS heap memory or when a GGUF exceeds the wasm32 4 GiB limit.
+// fails, is unsupported by the core, collides on mount, or hits the wasm32 4 GiB limit.
 export class ModelStagingError extends Error {
   declare code: ModelStagingErrorCode;
 
@@ -14,7 +26,28 @@ export class ModelStagingError extends Error {
 
 export function isModelStagingErrorCode(value: unknown): value is ModelStagingErrorCode {
   return value === 'MODEL_STAGING_ALLOCATION_FAILED'
-    || value === 'MODEL_TENSOR_SIZE_LIMIT_EXCEEDED';
+    || value === 'MODEL_TENSOR_SIZE_LIMIT_EXCEEDED'
+    || value === 'MODEL_STAGING_MOUNT_FAILED'
+    || value === 'MODEL_STAGING_UNSUPPORTED';
+}
+
+export function missingJsModelStagingExports(core: LlamaCoreModule | null | undefined): string[] {
+  const missing: string[] = [];
+  for (const name of REQUIRED_JS_MODEL_STAGING_EXPORTS) {
+    if (typeof core?.[name] !== 'function') {
+      missing.push(name);
+    }
+  }
+  return missing;
+}
+
+export function isGenericCoreAbortText(value: unknown): boolean {
+  const lowered = String(value ?? '').trim().toLowerCase();
+  return lowered === 'aborted'
+    || lowered === 'native code called abort()'
+    || lowered === 'core abort'
+    || lowered.startsWith('core abort:')
+    || /^aborted\([^)]*\)(?:\.\s*build with -sassertions.*)?$/i.test(lowered);
 }
 
 export function isJsAllocationError(error: unknown): boolean {

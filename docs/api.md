@@ -158,7 +158,7 @@ it.
 | `workerUrl` | `string` | URL for `llama_webgpu_bridge_worker.js`. Defaults to a sibling of the bridge module when possible. |
 | `disableWorker` | `boolean` | Force direct runtime mode. |
 | `allowSingleThreadCore` | `boolean` | Set for a `coreModuleUrl` core built without pthreads (`WEBGPU_BRIDGE_PTHREADS=0`). It then loads on a page that is not cross-origin isolated, capped to one thread (`threads_capped_no_coi`), instead of rejecting with `CrossOriginIsolationError`. |
-| `jsBackedModelStaging` | `boolean` | Opt-in (`false` by default). Stages fetched model files into 64 MiB JS `Uint8Array` chunks under `/jsmodels` outside wasm linear memory instead of WASMFS `MemoryBackend`, recording `model_staging_js_backed`. Works on both threaded and no-pthreads cores in direct and worker mode, and unmounts/releases all chunks after load completion or failure. |
+| `jsBackedModelStaging` | `boolean` | Opt-in (`false` by default). Use for models over ~1 GB on `wasm32`, or large models on `memory64` to cut peak wasm heap; streams directly into 64 MiB JS `Uint8Array` chunks under `/jsmodels` (`model_staging_js_backed`) and releases all chunks on completion or failure, at the cost of slightly slower small loads and temporary JS heap storage. |
 | `preferMemory64` | `boolean` | Prefer the wasm64 core when available. Defaults to `true`; the runtime can still fall back to wasm32. |
 | `workerRequestTimeoutMs` | `number` | Default timeout for worker RPC calls, 2 minutes unless a method has its own default. It also sets the `embed`/`embedBatch` budget, which defaults to 10 minutes when an input has image or audio parts. |
 | `workerInitTimeoutMs` | `number` | Timeout for worker initialization. |
@@ -1254,27 +1254,36 @@ this function themselves.
   and wasm files from the same published bridge asset set.
 - Use `dispose()` before dropping references when switching models or tearing
   down a page component.
-- When serving without cross-origin isolation using `WEBGPU_BRIDGE_PTHREADS=0` +
-  `allowSingleThreadCore: true`, opt into `jsBackedModelStaging: true` to keep
-  the fetched GGUF out of the 4 GiB wasm32 heap until `load_tensors` copies it
-  to CPU/WebGPU buffers and unmounts `/jsmodels`. A JS allocation failure during
-  staging throws `ModelStagingError` with code
-  `'MODEL_STAGING_ALLOCATION_FAILED'`, and a GGUF whose tensor payload exceeds
-  the wasm32 `4 GiB` (`SIZE_MAX`) limit throws `ModelStagingError` with code
-  `'MODEL_TENSOR_SIZE_LIMIT_EXCEEDED'`. Measured on Chrome WebGPU (Apple Metal-3,
-  `nCtx: 2048`, `nGpuLayers: 999`, `crossOriginIsolated === false`,
-  `typeof SharedArrayBuffer === 'undefined'`, `threads_capped_no_coi`) against
-  `llama.cpp` v1.0.0: Qwen3-0.6B-Q8_0 (767 MiB) dropped `wasm32` peak wasm heap
-  from `2.00 GiB` to `349 MiB` (`108.81` / `111.13` tok/s direct, `276.54` /
-  `115.64` tok/s worker); Qwen3-4B-Q4_K_M (2.33 GiB; `wasm32` baseline failed at
-  `1.37 GiB` during `FS.write`) loaded in both direct (`643 MiB` peak wasm heap,
-  `57.95` / `48.41` tok/s) and worker (`102.48` / `46.33` tok/s) modes with peak
-  JS `usedJSHeapSize` reaching `~3.72 GB` before dropping to `~3.8 MB` after
-  completion release; on `memory64` (`wasm64` no-pthreads), Qwen3-4B-Q4_K_M
-  dropped peak wasm heap from `8.01 GiB` (`8.60 GB`, `8,044 ms` load, `115.07` /
-  `39.16` tok/s direct; `3,934 ms` load, `127.18` / `39.08` tok/s worker) to
-  `656 MiB` (`0.69 GB`, `3,727 ms` load, `4.44 GB` peak JS heap dropping to
-  `10.2 MB`, `122.34` / `37.44` tok/s direct; `4,249 ms` load, `119.18` /
-  `36.82` tok/s worker); and `wasm32` Qwen3-8B-Q4_K_M (4.68 GiB) hit the `4 GiB`
+- Use `jsBackedModelStaging: true` for models over about 1 GB on `wasm32`, or
+  for any large model on `memory64` to cut the peak wasm heap (for example, when
+  serving without cross-origin isolation using `WEBGPU_BRIDGE_PTHREADS=0` +
+  `allowSingleThreadCore: true`). It streams the fetched GGUF directly into
+  64 MiB JS `Uint8Array` chunks under `/jsmodels` without copying through WASMFS,
+  and unmounts/releases all chunks after `load_tensors` completes or fails. Its
+  cost is slightly slower native chunk reads on small loads (`Qwen3-0.6B-Q8_0`
+  3-run median `nativeLoadMs` `480.9 ms` vs `444.6 ms` off; total load
+  `1,317.7 ms` vs `1,660.5 ms` as direct staging skips wasm memory growth) and
+  temporarily holding the full file in the JS heap until loaded and released. A
+  JS allocation failure during staging throws `ModelStagingError` with code
+  `'MODEL_STAGING_ALLOCATION_FAILED'`, an unsupported older core missing
+  JS-backed exports throws `'MODEL_STAGING_UNSUPPORTED'`, an existing
+  non-backend path collision at `/jsmodels` throws
+  `'MODEL_STAGING_MOUNT_FAILED'`, and a single or split GGUF whose tensor
+  payload exceeds the wasm32 `4 GiB` (`SIZE_MAX`) limit throws
+  `ModelStagingError` with code `'MODEL_TENSOR_SIZE_LIMIT_EXCEEDED'`. Measured
+  on Chrome WebGPU (Apple Metal-3, `nCtx: 2048`, `nGpuLayers: 999`,
+  `crossOriginIsolated === false`, `typeof SharedArrayBuffer === 'undefined'`,
+  `threads_capped_no_coi`) against `llama.cpp` v1.0.0: Qwen3-0.6B-Q8_0
+  (767 MiB) cut `wasm32` peak wasm heap from `2.00 GiB` to `349 MiB` (`373.5` /
+  `123.1` tok/s direct, `377.8` / `115.5` tok/s worker); Qwen3-4B-Q4_K_M
+  (2.33 GiB; `wasm32` baseline failed at `1.37 GiB` during `FS.write`) loaded
+  with `643 MiB` peak wasm heap in direct (`3,274 ms` load, `4.26 GB` peak JS
+  heap before GC, `124.2` / `45.9` tok/s) and worker (`1,475 ms` load, `135.4` /
+  `53.2` tok/s) modes; on `memory64` (`wasm64` no-pthreads), Qwen3-4B-Q4_K_M cut
+  peak wasm heap from `8.01 GiB` (`8.60 GB`, `4,131 ms` load, `127.2` / `43.5`
+  tok/s direct; `4,388 ms` load, `124.9` / `42.0` tok/s worker) to `656 MiB`
+  (`0.69 GB`, `2,049 ms` load, `3.79 GB` peak JS heap dropping to `23.5 MB`,
+  `124.8` / `50.7` tok/s direct; `1,585 ms` load, `128.6` / `50.0` tok/s worker);
+  and `wasm32` Qwen3-8B-Q4_K_M (4.68 GiB) hit the `4 GiB`
   `gguf_init_from_reader` tensor size-overflow ceiling (`4,288,489,984 +
   9,437,184` > `4,294,967,295`).

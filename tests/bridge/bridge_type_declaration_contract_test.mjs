@@ -36,6 +36,8 @@ try {
       'export const acceptedConfig: LlamaWebGpuBridgeConfig = { jsBackedModelStaging: true };',
       'export const acceptedStagingCode: ModelStagingErrorCode = "MODEL_STAGING_ALLOCATION_FAILED";',
       'export const acceptedTensorCode: ModelStagingErrorCode = "MODEL_TENSOR_SIZE_LIMIT_EXCEEDED";',
+      'export const acceptedMountCode: ModelStagingErrorCode = "MODEL_STAGING_MOUNT_FAILED";',
+      'export const acceptedUnsupportedCode: ModelStagingErrorCode = "MODEL_STAGING_UNSUPPORTED";',
       'export declare const stagingErrorCheck: ModelStagingError;',
       '',
       'export const accepted: CompletionOptions = {',

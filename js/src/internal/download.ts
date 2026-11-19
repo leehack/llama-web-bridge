@@ -28,10 +28,16 @@ export interface DrainOptions {
   chunkTimeoutMs?: unknown;
 }
 
+export interface DirectFileChunkWriter {
+  writeChunk(chunk: Uint8Array, position: number): number | void;
+  close?: () => void;
+}
+
 export interface WriteResponseOptions {
   totalBytes?: unknown;
   useBigIntPosition?: boolean;
   skipMemoryReservation?: boolean;
+  directWriter?: DirectFileChunkWriter | null;
   startOffset?: unknown;
   preservePartialOnError?: boolean;
   chunkTimeoutMs?: unknown;
@@ -372,16 +378,33 @@ export function unlinkFsFile(fs: EmscriptenFs, filePath: string): boolean {
 // near-2 GiB allocation. Reserve a bounded size hint, then truncate the
 // logical file while retaining its capacity. Small, visibly encoded,
 // resumed and unknown-length responses retain the incremental writer.
-function reservableResponseLength(response: Response, startOffset: number, bigInt: boolean): number {
-  if (startOffset !== 0 || bigInt || response.status !== 200
-    || response.headers.has('content-range')) return 0;
+function parseIdentityLength(response: Response, startOffset: number): { length: number; exact: boolean } {
+  if (startOffset !== 0 || response.status !== 200 || response.headers.has('content-range')) {
+    return { length: 0, exact: false };
+  }
   const encoding = response.headers.get('content-encoding')?.trim().toLowerCase();
-  if (encoding && encoding !== 'identity') return 0;
+  if (encoding && encoding !== 'identity') return { length: 0, exact: false };
   const header = response.headers.get('content-length')?.trim() || '';
-  if (!/^[0-9]+$/.test(header)) return 0;
+  if (!/^[0-9]+$/.test(header)) return { length: 0, exact: false };
   const length = Number(header);
-  return Number.isSafeInteger(length) && length >= 1073741824 && length <= 2147483647
-    ? length : 0;
+  if (!Number.isSafeInteger(length) || length < 1073741824) {
+    return { length: 0, exact: false };
+  }
+  // CORS can hide Content-Encoding while exposing compressed Content-Length.
+  // Constructed/cache responses can also lose the original response type.
+  const exact = response.type === 'basic' || encoding === 'identity';
+  return { length, exact };
+}
+
+function reservableResponseLength(response: Response, startOffset: number, bigInt: boolean): number {
+  if (bigInt) return 0;
+  const { length } = parseIdentityLength(response, startOffset);
+  return length <= 2147483647 ? length : 0;
+}
+
+function exactExpectedTransferLength(response: Response, startOffset: number): number {
+  const { length, exact } = parseIdentityLength(response, startOffset);
+  return exact ? length : 0;
 }
 
 export async function writeResponseToFsFileWithProgress(
@@ -394,6 +417,7 @@ export async function writeResponseToFsFileWithProgress(
   const total = parsePositiveInteger(writeOptions.totalBytes)
     || inferResponseTotalBytes(response, 0);
   const useBigIntPosition = writeOptions.useBigIntPosition === true;
+  const directWriter = writeOptions.directWriter || null;
   const startOffset = parsePositiveInteger(writeOptions.startOffset);
   const preservePartialOnError = writeOptions.preservePartialOnError === true;
   const appendMode = startOffset > 0;
@@ -403,7 +427,7 @@ export async function writeResponseToFsFileWithProgress(
 
   throwIfAborted(signal, abortMessage);
 
-  if (!appendMode) {
+  if (!appendMode && !directWriter) {
     // best-effort replacement of stale temp files
     unlinkFsFile(fs, filePath);
   }
@@ -412,7 +436,13 @@ export async function writeResponseToFsFileWithProgress(
     throwIfAborted(signal, abortMessage);
     const bytes = new Uint8Array(await response.arrayBuffer());
     throwIfAborted(signal, abortMessage);
-    if (appendMode) {
+    if (directWriter) {
+      try {
+        directWriter.writeChunk(bytes, startOffset);
+      } finally {
+        directWriter.close?.();
+      }
+    } else if (appendMode) {
       const stream = fs.open(filePath, 'r+');
       try {
         throwIfAborted(signal, abortMessage);
@@ -432,24 +462,20 @@ export async function writeResponseToFsFileWithProgress(
     return finalLoaded;
   }
 
-  const reservedLength = writeOptions.skipMemoryReservation === true
+  const reservedLength = (directWriter || writeOptions.skipMemoryReservation === true)
     ? 0
     : reservableResponseLength(response, startOffset, useBigIntPosition);
-  // CORS can hide Content-Encoding while exposing compressed Content-Length.
-  // Constructed/cache responses can also lose the original response type.
-  const encoding = response.headers.get('content-encoding')?.trim().toLowerCase();
-  const exactLength = reservedLength > 0
-    && (response.type === 'basic' || encoding === 'identity') ? reservedLength : 0;
+  const exactLength = exactExpectedTransferLength(response, startOffset);
   const reader = response.body.getReader();
   const openMode = appendMode ? 'r+' : 'w';
-  const stream = fs.open(filePath, openMode);
+  const stream = directWriter ? null : fs.open(filePath, openMode);
   let loaded = 0;
   let lastBucket = -1;
   let writePosition = startOffset;
   let writePositionBigInt: bigint | null = null;
 
   try {
-    if (reservedLength > 0) {
+    if (reservedLength > 0 && stream != null) {
       try {
         const written = fs.write(stream, new Uint8Array(1), 0, 1, reservedLength - 1);
         if (written !== 1) throw new Error('Filesystem reservation returned a short write.');
@@ -488,21 +514,29 @@ export async function writeResponseToFsFileWithProgress(
         throw error;
       }
 
-      // Some browsers may reuse the same Uint8Array backing store across reads.
-      // Clone each chunk before writing to avoid transient buffer aliasing.
-      const chunk = value.slice ? value.slice() : new Uint8Array(value);
-      throwIfAborted(signal, abortMessage);
-      if (useBigIntPosition) {
-        if (writePositionBigInt == null) {
-          writePositionBigInt = BigInt(startOffset);
-        }
-        fs.write(stream, chunk, 0, chunk.length, writePositionBigInt);
-        writePositionBigInt += BigInt(chunk.length);
+      if (directWriter) {
+        throwIfAborted(signal, abortMessage);
+        // Copy synchronously from the network chunk directly into the JS-backed
+        // storage chunks, avoiding value.slice() and any wasm linear memory copy.
+        directWriter.writeChunk(value, writePosition);
+        writePosition += value.length;
       } else {
-        fs.write(stream, chunk, 0, chunk.length, writePosition);
-        writePosition += chunk.length;
+        // Some browsers may reuse the same Uint8Array backing store across reads.
+        // Clone each chunk before writing to avoid transient buffer aliasing.
+        const chunk = value.slice ? value.slice() : new Uint8Array(value);
+        throwIfAborted(signal, abortMessage);
+        if (useBigIntPosition) {
+          if (writePositionBigInt == null) {
+            writePositionBigInt = BigInt(startOffset);
+          }
+          fs.write(stream, chunk, 0, chunk.length, writePositionBigInt);
+          writePositionBigInt += BigInt(chunk.length);
+        } else {
+          fs.write(stream, chunk, 0, chunk.length, writePosition);
+          writePosition += chunk.length;
+        }
       }
-      loaded += chunk.length;
+      loaded += value.length;
 
       if (typeof progressCallback === 'function') {
         const effectiveLoaded = startOffset + loaded;
@@ -530,10 +564,18 @@ export async function writeResponseToFsFileWithProgress(
       // ignore metadata attachment failures
     }
 
-    try {
-      fs.close(stream);
-    } catch (_) {
-      // ignore close failures during abort/error
+    if (directWriter) {
+      try {
+        directWriter.close?.();
+      } catch (_) {
+        // ignore close failures during abort/error
+      }
+    } else if (stream != null) {
+      try {
+        fs.close(stream);
+      } catch (_) {
+        // ignore close failures during abort/error
+      }
     }
 
     try {
@@ -555,7 +597,11 @@ export async function writeResponseToFsFileWithProgress(
     throw error;
   }
 
-  fs.close(stream);
+  if (directWriter) {
+    directWriter.close?.();
+  } else if (stream != null) {
+    fs.close(stream);
+  }
 
   const finalLoaded = startOffset + loaded;
   if (typeof progressCallback === 'function') {

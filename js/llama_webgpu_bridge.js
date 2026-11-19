@@ -945,6 +945,16 @@ function expandModelShardUrls(modelUrlOrUrls) {
 }
 
 // js/src/internal/model_staging.ts
+var REQUIRED_JS_MODEL_STAGING_EXPORTS = [
+  "_llamadart_webgpu_mount_js_model_fs",
+  "_llamadart_webgpu_unmount_js_model_fs",
+  "_llamadart_webgpu_js_model_fs_prealloc_next",
+  "_llamadart_webgpu_js_model_fs_open_direct",
+  "_llamadart_webgpu_js_model_fs_close_direct",
+  "_llamadart_webgpu_js_model_fs_consume_oom_bytes",
+  "_llamadart_webgpu_js_model_fs_allocated_bytes",
+  "llamadartJsModelFsWriteDirect"
+];
 var ModelStagingError = class extends Error {
   constructor(code, message) {
     super(message);
@@ -953,7 +963,20 @@ var ModelStagingError = class extends Error {
   }
 };
 function isModelStagingErrorCode(value) {
-  return value === "MODEL_STAGING_ALLOCATION_FAILED" || value === "MODEL_TENSOR_SIZE_LIMIT_EXCEEDED";
+  return value === "MODEL_STAGING_ALLOCATION_FAILED" || value === "MODEL_TENSOR_SIZE_LIMIT_EXCEEDED" || value === "MODEL_STAGING_MOUNT_FAILED" || value === "MODEL_STAGING_UNSUPPORTED";
+}
+function missingJsModelStagingExports(core) {
+  const missing = [];
+  for (const name of REQUIRED_JS_MODEL_STAGING_EXPORTS) {
+    if (typeof core?.[name] !== "function") {
+      missing.push(name);
+    }
+  }
+  return missing;
+}
+function isGenericCoreAbortText(value) {
+  const lowered = String(value ?? "").trim().toLowerCase();
+  return lowered === "aborted" || lowered === "native code called abort()" || lowered === "core abort" || lowered.startsWith("core abort:") || /^aborted\([^)]*\)(?:\.\s*build with -sassertions.*)?$/i.test(lowered);
 }
 function isJsAllocationError(error) {
   if (!error || typeof error !== "object") {
@@ -1274,18 +1297,34 @@ function unlinkFsFile(fs, filePath) {
     return false;
   }
 }
-function reservableResponseLength(response, startOffset, bigInt) {
-  if (startOffset !== 0 || bigInt || response.status !== 200 || response.headers.has("content-range")) return 0;
+function parseIdentityLength(response, startOffset) {
+  if (startOffset !== 0 || response.status !== 200 || response.headers.has("content-range")) {
+    return { length: 0, exact: false };
+  }
   const encoding = response.headers.get("content-encoding")?.trim().toLowerCase();
-  if (encoding && encoding !== "identity") return 0;
+  if (encoding && encoding !== "identity") return { length: 0, exact: false };
   const header = response.headers.get("content-length")?.trim() || "";
-  if (!/^[0-9]+$/.test(header)) return 0;
+  if (!/^[0-9]+$/.test(header)) return { length: 0, exact: false };
   const length = Number(header);
-  return Number.isSafeInteger(length) && length >= 1073741824 && length <= 2147483647 ? length : 0;
+  if (!Number.isSafeInteger(length) || length < 1073741824) {
+    return { length: 0, exact: false };
+  }
+  const exact = response.type === "basic" || encoding === "identity";
+  return { length, exact };
+}
+function reservableResponseLength(response, startOffset, bigInt) {
+  if (bigInt) return 0;
+  const { length } = parseIdentityLength(response, startOffset);
+  return length <= 2147483647 ? length : 0;
+}
+function exactExpectedTransferLength(response, startOffset) {
+  const { length, exact } = parseIdentityLength(response, startOffset);
+  return exact ? length : 0;
 }
 async function writeResponseToFsFileWithProgress(response, fs, filePath, progressCallback, writeOptions = {}) {
   const total = parsePositiveInteger(writeOptions.totalBytes) || inferResponseTotalBytes(response, 0);
   const useBigIntPosition = writeOptions.useBigIntPosition === true;
+  const directWriter = writeOptions.directWriter || null;
   const startOffset = parsePositiveInteger(writeOptions.startOffset);
   const preservePartialOnError = writeOptions.preservePartialOnError === true;
   const appendMode = startOffset > 0;
@@ -1293,14 +1332,20 @@ async function writeResponseToFsFileWithProgress(response, fs, filePath, progres
   const signal = writeOptions.signal || null;
   const abortMessage = writeOptions.abortMessage || "Model transfer was cancelled.";
   throwIfAborted(signal, abortMessage);
-  if (!appendMode) {
+  if (!appendMode && !directWriter) {
     unlinkFsFile(fs, filePath);
   }
   if (!response.body || typeof response.body.getReader !== "function") {
     throwIfAborted(signal, abortMessage);
     const bytes = new Uint8Array(await response.arrayBuffer());
     throwIfAborted(signal, abortMessage);
-    if (appendMode) {
+    if (directWriter) {
+      try {
+        directWriter.writeChunk(bytes, startOffset);
+      } finally {
+        directWriter.close?.();
+      }
+    } else if (appendMode) {
       const stream2 = fs.open(filePath, "r+");
       try {
         throwIfAborted(signal, abortMessage);
@@ -1318,18 +1363,17 @@ async function writeResponseToFsFileWithProgress(response, fs, filePath, progres
     }
     return finalLoaded2;
   }
-  const reservedLength = writeOptions.skipMemoryReservation === true ? 0 : reservableResponseLength(response, startOffset, useBigIntPosition);
-  const encoding = response.headers.get("content-encoding")?.trim().toLowerCase();
-  const exactLength = reservedLength > 0 && (response.type === "basic" || encoding === "identity") ? reservedLength : 0;
+  const reservedLength = directWriter || writeOptions.skipMemoryReservation === true ? 0 : reservableResponseLength(response, startOffset, useBigIntPosition);
+  const exactLength = exactExpectedTransferLength(response, startOffset);
   const reader = response.body.getReader();
   const openMode = appendMode ? "r+" : "w";
-  const stream = fs.open(filePath, openMode);
+  const stream = directWriter ? null : fs.open(filePath, openMode);
   let loaded = 0;
   let lastBucket = -1;
   let writePosition = startOffset;
   let writePositionBigInt = null;
   try {
-    if (reservedLength > 0) {
+    if (reservedLength > 0 && stream != null) {
       try {
         const written = fs.write(stream, new Uint8Array(1), 0, 1, reservedLength - 1);
         if (written !== 1) throw new Error("Filesystem reservation returned a short write.");
@@ -1363,19 +1407,25 @@ async function writeResponseToFsFileWithProgress(response, fs, filePath, progres
         error.name = "ModelTransferLengthError";
         throw error;
       }
-      const chunk = value.slice ? value.slice() : new Uint8Array(value);
-      throwIfAborted(signal, abortMessage);
-      if (useBigIntPosition) {
-        if (writePositionBigInt == null) {
-          writePositionBigInt = BigInt(startOffset);
-        }
-        fs.write(stream, chunk, 0, chunk.length, writePositionBigInt);
-        writePositionBigInt += BigInt(chunk.length);
+      if (directWriter) {
+        throwIfAborted(signal, abortMessage);
+        directWriter.writeChunk(value, writePosition);
+        writePosition += value.length;
       } else {
-        fs.write(stream, chunk, 0, chunk.length, writePosition);
-        writePosition += chunk.length;
+        const chunk = value.slice ? value.slice() : new Uint8Array(value);
+        throwIfAborted(signal, abortMessage);
+        if (useBigIntPosition) {
+          if (writePositionBigInt == null) {
+            writePositionBigInt = BigInt(startOffset);
+          }
+          fs.write(stream, chunk, 0, chunk.length, writePositionBigInt);
+          writePositionBigInt += BigInt(chunk.length);
+        } else {
+          fs.write(stream, chunk, 0, chunk.length, writePosition);
+          writePosition += chunk.length;
+        }
       }
-      loaded += chunk.length;
+      loaded += value.length;
       if (typeof progressCallback === "function") {
         const effectiveLoaded = startOffset + loaded;
         const effectiveTotal = total || effectiveLoaded;
@@ -1397,9 +1447,16 @@ async function writeResponseToFsFileWithProgress(response, fs, filePath, progres
       }
     } catch (_) {
     }
-    try {
-      fs.close(stream);
-    } catch (_) {
+    if (directWriter) {
+      try {
+        directWriter.close?.();
+      } catch (_) {
+      }
+    } else if (stream != null) {
+      try {
+        fs.close(stream);
+      } catch (_) {
+      }
     }
     try {
       await reader.cancel?.();
@@ -1413,7 +1470,11 @@ async function writeResponseToFsFileWithProgress(response, fs, filePath, progres
     }
     throw error;
   }
-  fs.close(stream);
+  if (directWriter) {
+    directWriter.close?.();
+  } else if (stream != null) {
+    fs.close(stream);
+  }
   const finalLoaded = startOffset + loaded;
   if (typeof progressCallback === "function") {
     progressCallback({ loaded: finalLoaded, total: total || finalLoaded });
@@ -1673,6 +1734,7 @@ var LlamaWebGpuBridgeRuntime = class {
     this._activeTransferAbortController = null;
     this._lastCoreErrorText = "";
     this._lastCoreErrorHint = "";
+    this._lastWasm32TensorLimitError = "";
     this._jsBackedStagingMounted = false;
     this._logLevel = Number.isFinite(config.logLevel) ? Math.max(0, Math.min(4, Math.trunc(config.logLevel))) : 2;
   }
@@ -2874,14 +2936,15 @@ var LlamaWebGpuBridgeRuntime = class {
             },
             printErr: (msg) => {
               const text = String(msg ?? "");
-              this._lastCoreErrorText = text;
               const trimmed = text.trim();
-              if (trimmed.length > 0) {
-                const loweredTrimmed = trimmed.toLowerCase();
-                const isGenericAbort = loweredTrimmed === "aborted(native code called abort())" || loweredTrimmed === "native code called abort()" || loweredTrimmed === "aborted";
-                if (!isGenericAbort) {
+              if (!isGenericCoreAbortText(trimmed)) {
+                this._lastCoreErrorText = text;
+                if (trimmed.length > 0) {
                   this._lastCoreErrorHint = trimmed;
                 }
+              }
+              if (isWasm32TensorLimitText(trimmed)) {
+                this._lastWasm32TensorLimitError = trimmed;
               }
               const classification = this._classifyCoreErrorLine(text);
               if (classification === "ignore") {
@@ -3106,11 +3169,24 @@ var LlamaWebGpuBridgeRuntime = class {
       const useJsBackedStaging = this._config.jsBackedModelStaging === true;
       let modelDir = "/models";
       if (useJsBackedStaging) {
+        const missingExports = missingJsModelStagingExports(core);
+        if (missingExports.length > 0) {
+          this._pushRuntimeNote("model_staging_js_backed_unsupported");
+          throw new ModelStagingError(
+            "MODEL_STAGING_UNSUPPORTED",
+            `JS-backed model staging ('jsBackedModelStaging' / 'model_staging_js_backed') is not supported by this core binary (missing exports: ${missingExports.join(", ")}). Update the core build or disable jsBackedModelStaging.`
+          );
+        }
         const mountRc = Number(
           core.ccall("llamadart_webgpu_mount_js_model_fs", "number", ["string"], ["/jsmodels"])
         );
         if (mountRc !== 0) {
-          throw new Error(`Failed to mount JS-backed model filesystem (rc=${mountRc})`);
+          this._pushRuntimeNote("model_staging_mount_failed");
+          const detail = mountRc === -20 || mountRc === -17 ? "the /jsmodels path already exists under another filesystem backend" : `rc=${mountRc}`;
+          throw new ModelStagingError(
+            "MODEL_STAGING_MOUNT_FAILED",
+            `Failed to mount JS-backed model filesystem at /jsmodels (${detail}).`
+          );
         }
         this._jsBackedStagingMounted = true;
         modelDir = "/jsmodels";
@@ -3193,13 +3269,63 @@ var LlamaWebGpuBridgeRuntime = class {
               shardTotals[shardIndex] = responseTotal;
             }
             try {
-              if (useJsBackedStaging && resumeOffset === 0 && knownTotalBytes > 0) {
-                core.ccall(
-                  "llamadart_webgpu_js_model_fs_prealloc_next",
-                  null,
-                  ["number"],
-                  [knownTotalBytes]
+              let directWriter = null;
+              if (useJsBackedStaging) {
+                const preallocBytes = resumeOffset === 0 && knownTotalBytes > 0 ? knownTotalBytes : 0;
+                const directHandle = Number(
+                  core.ccall(
+                    "llamadart_webgpu_js_model_fs_open_direct",
+                    "number",
+                    ["string", "number", "number"],
+                    [modelPath, preallocBytes, resumeOffset > 0 ? 1 : 0]
+                  )
                 );
+                if (!Number.isInteger(directHandle) || directHandle <= 0) {
+                  const openErr = new Error(
+                    `Failed to open direct JS-backed model file (rc=${directHandle}).`
+                  );
+                  if (directHandle < 0) {
+                    openErr.errno = -directHandle;
+                    if (directHandle === -12 || directHandle === -48) {
+                      openErr.code = "ENOMEM";
+                    }
+                  }
+                  throw openErr;
+                }
+                let closed = false;
+                const closeDirect = () => {
+                  if (closed) {
+                    return;
+                  }
+                  closed = true;
+                  try {
+                    core.ccall(
+                      "llamadart_webgpu_js_model_fs_close_direct",
+                      null,
+                      ["number"],
+                      [directHandle]
+                    );
+                  } catch (_) {
+                  }
+                };
+                const writeDirect = core.llamadartJsModelFsWriteDirect;
+                directWriter = {
+                  writeChunk(chunk, position) {
+                    const rc2 = Number(writeDirect(directHandle, chunk, position));
+                    if (!Number.isFinite(rc2) || rc2 < 0) {
+                      const writeErr = new Error(
+                        `Failed to write direct JS-backed model chunk (rc=${rc2}).`
+                      );
+                      writeErr.errno = -rc2;
+                      if (rc2 === -12 || rc2 === -48) {
+                        writeErr.code = "ENOMEM";
+                      }
+                      throw writeErr;
+                    }
+                    return rc2;
+                  },
+                  close: closeDirect
+                };
               }
               shardBytes = await writeResponseToFsFileWithProgress(
                 response,
@@ -3217,6 +3343,7 @@ var LlamaWebGpuBridgeRuntime = class {
                 {
                   useBigIntPosition: this._coreVariant === "wasm64",
                   skipMemoryReservation: useJsBackedStaging,
+                  directWriter,
                   startOffset: resumeOffset,
                   preservePartialOnError: true,
                   totalBytes: knownTotalBytes,
@@ -3301,6 +3428,7 @@ var LlamaWebGpuBridgeRuntime = class {
         let nativeAbortCleanupDone = false;
         this._lastCoreErrorHint = "";
         this._lastCoreErrorText = "";
+        this._lastWasm32TensorLimitError = "";
         try {
           throwIfAborted(operationSignal, abortMessage);
           nativeLoadStarted = true;
@@ -3350,25 +3478,27 @@ var LlamaWebGpuBridgeRuntime = class {
           }
           const combinedText = [
             String(error || ""),
+            String(this._lastWasm32TensorLimitError || ""),
             String(this._lastCoreErrorHint || ""),
             String(this._lastCoreErrorText || "")
           ].join(" ");
           const text = String(error || "").toLowerCase();
+          const aborted = error instanceof Error && error.name === "RuntimeError" || /\babort(?:ed)?\b/i.test(text);
           if (text.includes("bigint")) {
             this._runtimeNotes.push("model_load_ccall_bigint_error");
-          } else if (text.includes("abort")) {
+          } else if (aborted) {
             this._runtimeNotes.push("model_load_ccall_abort");
           } else {
             this._runtimeNotes.push("model_load_ccall_failed");
           }
           if (isWasm32TensorLimitText(combinedText)) {
-            if (text.includes("abort")) {
+            if (aborted) {
               this._core = null;
               this._coreVariant = "uninitialized";
             }
             throw new ModelStagingError(
               "MODEL_TENSOR_SIZE_LIMIT_EXCEEDED",
-              this._lastCoreErrorHint || "GGUF tensor payload exceeds the wasm32 4 GiB address space limit; use the memory64 core or a smaller quantization."
+              this._lastWasm32TensorLimitError || this._lastCoreErrorHint || "GGUF tensor payload exceeds the wasm32 4 GiB address space limit; use the memory64 core or a smaller quantization."
             );
           }
           throw error;

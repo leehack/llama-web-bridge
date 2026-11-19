@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
@@ -125,7 +127,15 @@ function instantiateJsModelFsLibrary({
     return fn(...marshalled);
   };
 
-  return { registered, callNative, HEAPU8, heapBacking, view, cDefs };
+  return {
+    registered,
+    callNative,
+    writeDirect: sandbox.llamadartJsModelFsWriteDirect,
+    HEAPU8,
+    heapBacking,
+    view,
+    cDefs,
+  };
 }
 
 test('js model fs backend C++ and JS signatures enforce 64-bit i53 ABI', () => {
@@ -306,6 +316,282 @@ test('wasm64 BigInt pointers (> 4 GiB) and i53 offsets/sizes round-trip cleanly'
     4,
   );
   assert.deepEqual(heapBacking.subarray(4128, 4132), payload.subarray(0, 4));
+
+  callNative('_llamadart_js_model_fs_free_file', [fileId]);
+  assert.equal(callNative('_llamadart_js_model_fs_allocated_bytes'), 0);
+});
+
+test('C++ mount rejects ordinary /jsmodels collision and unmount releases unlinked open files to 0 bytes', () => {
+  const { callNative } = instantiateJsModelFsLibrary();
+  const dir = mkdtempSync(path.join(tmpdir(), 'bridge-js-model-fs-cpp-'));
+  try {
+    // Minimal Emscripten/WASMFS headers so src/llama_webgpu_js_model_fs.cpp compiles directly with host c++.
+    writeFileSync(path.join(dir, 'backend.h'), `
+#pragma once
+#include <memory>
+#include <string>
+#include <sys/stat.h>
+namespace wasmfs {
+class DataFile;
+class Directory;
+class Symlink;
+class Backend {
+ public:
+  virtual ~Backend() = default;
+  virtual std::shared_ptr<DataFile> createFile(mode_t) = 0;
+  virtual std::shared_ptr<Directory> createDirectory(mode_t) = 0;
+  virtual std::shared_ptr<Symlink> createSymlink(std::string) = 0;
+};
+using backend_t = Backend*;
+}
+`);
+    writeFileSync(path.join(dir, 'file.h'), `
+#pragma once
+#include <cstdint>
+#include <sys/stat.h>
+namespace wasmfs {
+using oflags_t = int;
+class DataFile {
+  backend_t backend_;
+ public:
+  DataFile(mode_t, backend_t b) : backend_(b) {}
+  virtual ~DataFile() = default;
+  virtual int open(oflags_t) = 0;
+  virtual int close() = 0;
+  virtual int flush() = 0;
+  virtual ssize_t write(const uint8_t*, size_t, off_t) = 0;
+  virtual ssize_t read(uint8_t*, size_t, off_t) = 0;
+  virtual off_t getSize() = 0;
+  virtual int setSize(off_t) = 0;
+};
+class Directory {};
+class Symlink {};
+}
+`);
+    writeFileSync(path.join(dir, 'memory_backend.h'), `
+#pragma once
+#include "file.h"
+namespace wasmfs {
+struct MemoryDirectory : Directory { MemoryDirectory(mode_t, backend_t) {} };
+struct MemorySymlink : Symlink { MemorySymlink(std::string, backend_t) {} };
+}
+`);
+    writeFileSync(path.join(dir, 'wasmfs.h'), `
+#pragma once
+#include <memory>
+#include <vector>
+#include "backend.h"
+namespace wasmfs {
+struct WasmFS {
+  std::vector<std::unique_ptr<Backend>> backends;
+  backend_t addBackend(std::unique_ptr<Backend> b) {
+    backends.push_back(std::move(b));
+    return backends.back().get();
+  }
+};
+inline WasmFS wasmFS;
+}
+`);
+
+    const cppHarness = `
+#include <cassert>
+#include <cerrno>
+#include <cstdint>
+#include <map>
+#include <memory>
+#include <string>
+#include <sys/stat.h>
+
+#include "backend.h"
+#include "file.h"
+#include "wasmfs.h"
+#include "emscripten/wasmfs.h"
+
+namespace {
+struct StubEntry {
+  ::backend_t backend = nullptr;
+};
+std::map<std::string, StubEntry> g_dirs;
+struct DummyMemBackend {};
+DummyMemBackend g_mem_backend_obj;
+::backend_t g_mem_backend = reinterpret_cast<::backend_t>(&g_mem_backend_obj);
+int64_t g_prealloc = 0;
+std::map<uintptr_t, size_t> g_js_chunks;
+size_t g_oom = 0;
+}
+
+extern "C" {
+void _llamadart_js_model_fs_set_next_prealloc_bytes(int64_t b) { g_prealloc = b; }
+void _llamadart_js_model_fs_alloc_file(uintptr_t id) {
+  g_js_chunks[id] = g_prealloc > 0 ? static_cast<size_t>(g_prealloc) : 0;
+  g_prealloc = 0;
+}
+void _llamadart_js_model_fs_free_file(uintptr_t id) { g_js_chunks.erase(id); }
+int32_t _llamadart_js_model_fs_bind_direct(uintptr_t id) { return g_js_chunks.count(id) ? 1 : -EBADF; }
+void _llamadart_js_model_fs_unbind_direct(int32_t) {}
+int32_t _llamadart_js_model_fs_write(uintptr_t id, const uint8_t*, uint32_t len, int64_t) {
+  if (g_js_chunks[id] < 64u * 1024u * 1024u) g_js_chunks[id] = 64u * 1024u * 1024u;
+  return static_cast<int32_t>(len);
+}
+int32_t _llamadart_js_model_fs_read(uintptr_t, uint8_t*, uint32_t, int64_t) { return 0; }
+void _llamadart_js_model_fs_get_size(uintptr_t, int64_t* out) { *out = 0; }
+int32_t _llamadart_js_model_fs_set_size(uintptr_t, int64_t) { return 0; }
+void _llamadart_js_model_fs_release_all() { g_js_chunks.clear(); }
+double _llamadart_js_model_fs_consume_oom_bytes() { double r = g_oom; g_oom = 0; return r; }
+double _llamadart_js_model_fs_allocated_bytes() {
+  size_t total = 0;
+  for (const auto& kv : g_js_chunks) total += kv.second;
+  return static_cast<double>(total);
+}
+
+::backend_t wasmfs_get_backend_by_path(const char* path) {
+  auto it = g_dirs.find(path ? path : "");
+  return it == g_dirs.end() ? nullptr : it->second.backend;
+}
+int wasmfs_create_directory(const char* path, mode_t, ::backend_t backend) {
+  std::string p = path ? path : "";
+  if (g_dirs.count(p)) return -EEXIST;
+  g_dirs[p] = {backend};
+  return 0;
+}
+int wasmfs_unmount(const char* path) {
+  std::string p = path ? path : "";
+  auto it = g_dirs.find(p);
+  if (it == g_dirs.end()) return -ENOENT;
+  if (it->second.backend == g_mem_backend) return -EINVAL;
+  g_dirs.erase(it);
+  return 0;
+}
+int32_t llamadart_webgpu_mount_js_model_fs(const char* mount_path);
+int32_t llamadart_webgpu_unmount_js_model_fs(const char* mount_path);
+double llamadart_webgpu_js_model_fs_allocated_bytes();
+bool llamadart_webgpu_is_js_model_path(const char* path);
+}
+
+int main() {
+  // 1) An existing ordinary /jsmodels directory must fail mount with -EEXIST and not emit path match.
+  g_dirs["/jsmodels"] = {g_mem_backend};
+  assert(llamadart_webgpu_mount_js_model_fs("/jsmodels") == -EEXIST);
+  assert(!llamadart_webgpu_is_js_model_path("/jsmodels/a.gguf"));
+  g_dirs.erase("/jsmodels");
+
+  // 2) Normal mount creates our backend directory; default /models/ paths do not match it.
+  assert(llamadart_webgpu_mount_js_model_fs("/jsmodels") == 0);
+  assert(llamadart_webgpu_is_js_model_path("/jsmodels/a.gguf"));
+  assert(!llamadart_webgpu_is_js_model_path("/models/a.gguf"));
+
+  // 3) An unlinked file still open (shared_ptr held across unmount) must release all chunks to 0 bytes.
+  auto* backend = reinterpret_cast<wasmfs::Backend*>(g_dirs["/jsmodels"].backend);
+  {
+    std::shared_ptr<wasmfs::DataFile> open_fd = backend->createFile(0666);
+    uint8_t byte = 42;
+    assert(open_fd->write(&byte, 1, 0) == 1);
+    assert(llamadart_webgpu_js_model_fs_allocated_bytes() == 64.0 * 1024.0 * 1024.0);
+    // Unmount while open_fd still holds a strong reference (simulating open unlinked fd).
+    assert(llamadart_webgpu_unmount_js_model_fs("/jsmodels") == 0);
+    assert(llamadart_webgpu_js_model_fs_allocated_bytes() == 0.0);
+  }
+  return 0;
+}
+`;
+    const emInc = path.join(dir, 'emscripten');
+    mkdirSync(emInc, { recursive: true });
+    writeFileSync(path.join(emInc, 'emscripten.h'), '#pragma once\n#define EMSCRIPTEN_KEEPALIVE\n');
+    writeFileSync(path.join(emInc, 'wasmfs.h'), `
+#pragma once
+#include <sys/stat.h>
+typedef struct Backend* backend_t;
+extern "C" {
+backend_t wasmfs_get_backend_by_path(const char* path);
+int wasmfs_create_directory(const char* path, mode_t mode, backend_t backend);
+int wasmfs_unmount(const char* path);
+}
+`);
+    const harnessPath = path.join(dir, 'harness.cpp');
+    const cppSourcePath = path.join(rootDir, 'src/llama_webgpu_js_model_fs.cpp');
+    writeFileSync(harnessPath, cppHarness);
+    const exe = path.join(dir, 'test_js_model_fs');
+    const comp = spawnSync(
+      process.env.CXX || 'c++',
+      ['-std=c++17', '-I', dir, cppSourcePath, harnessPath, '-o', exe],
+      { encoding: 'utf8' },
+    );
+    assert.equal(comp.status, 0, comp.stderr);
+    const run = spawnSync(exe, [], { encoding: 'utf8' });
+    assert.equal(run.status, 0, `${run.signal}: ${run.stderr}`);
+
+    // Mutation check: removing _llamadart_js_model_fs_release_all() from unmount must fail.
+    const mutatedCppPath = path.join(dir, 'mutated.cpp');
+    const mutatedExe = path.join(dir, 'test_js_model_fs_mutated');
+    writeFileSync(
+      mutatedCppPath,
+      cppFsSource.replace('  _llamadart_js_model_fs_release_all();\n', '  /* mutated_release_removed */\n'),
+    );
+    const mutComp = spawnSync(
+      process.env.CXX || 'c++',
+      ['-std=c++17', '-I', dir, mutatedCppPath, harnessPath, '-o', mutatedExe],
+      { encoding: 'utf8' },
+    );
+    assert.equal(mutComp.status, 0, mutComp.stderr);
+    const mutRun = spawnSync(mutatedExe, [], { encoding: 'utf8' });
+    assert.notEqual(mutRun.status, 0, 'removing release_all from unmount must fail open-fd check');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+  assert.equal(callNative('_llamadart_js_model_fs_allocated_bytes'), 0);
+});
+
+test('direct JS chunk writer writes across chunk boundaries and >2 GiB without touching HEAPU8', () => {
+  const { callNative, writeDirect, heapBacking, HEAPU8, view } = instantiateJsModelFsLibrary();
+  const fileId = 4096;
+  const outSizePtr = 64;
+  callNative('_llamadart_js_model_fs_alloc_file', [fileId]);
+  const handle = callNative('_llamadart_js_model_fs_bind_direct', [fileId]);
+  assert.ok(handle > 0);
+
+  // Poison HEAPU8 access during writeDirect to prove zero wasm linear-memory copy.
+  const originalSubarray = heapBacking.subarray.bind(heapBacking);
+  const originalSet = heapBacking.set.bind(heapBacking);
+  let heapReadsDuringWrite = 0;
+  let heapWritesDuringWrite = 0;
+  heapBacking.subarray = (...args) => {
+    heapReadsDuringWrite += 1;
+    return originalSubarray(...args);
+  };
+  heapBacking.set = (...args) => {
+    heapWritesDuringWrite += 1;
+    return originalSet(...args);
+  };
+
+  const payload = new Uint8Array(96);
+  for (let i = 0; i < payload.length; i += 1) {
+    payload[i] = (i * 11 + 5) & 0xff;
+  }
+  const crossBoundaryOffset = 2_214_592_480; // 32 bytes before 33 * 64 MiB boundary
+  const written = writeDirect(handle, payload, crossBoundaryOffset);
+  assert.equal(written, payload.length);
+  assert.equal(heapReadsDuringWrite, 0, 'direct chunk write must not read HEAPU8');
+  assert.equal(heapWritesDuringWrite, 0, 'direct chunk write must not write HEAPU8');
+
+  heapBacking.subarray = originalSubarray;
+  heapBacking.set = originalSet;
+
+  callNative('_llamadart_js_model_fs_get_size', [fileId, outSizePtr]);
+  assert.equal(Number(view.getBigInt64(outSizePtr, true)), crossBoundaryOffset + payload.length);
+
+  // llama.cpp seeks and rereads the same bytes multiple times from chunks.
+  const dstPtr = 4096;
+  for (let pass = 0; pass < 2; pass += 1) {
+    HEAPU8.fill(0, dstPtr, dstPtr + 128);
+    assert.equal(
+      callNative('_llamadart_js_model_fs_read', [fileId, dstPtr, payload.length, crossBoundaryOffset]),
+      payload.length,
+    );
+    assert.deepEqual(HEAPU8.subarray(dstPtr, dstPtr + payload.length), payload);
+  }
+
+  callNative('_llamadart_js_model_fs_unbind_direct', [handle]);
+  assert.ok(writeDirect(handle, payload, 0) < 0, 'unbound direct handle must reject subsequent writes');
 
   callNative('_llamadart_js_model_fs_free_file', [fileId]);
   assert.equal(callNative('_llamadart_js_model_fs_allocated_bytes'), 0);
