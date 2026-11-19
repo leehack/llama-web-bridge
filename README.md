@@ -77,6 +77,13 @@ Optional outputs (when `WEBGPU_BRIDGE_BUILD_MEM64=1`):
 - `dist/llama_webgpu_core_mem64.js`
 - `dist/llama_webgpu_core_mem64.wasm`
 
+Optional single-thread outputs (when `WEBGPU_BRIDGE_BUILD_SINGLE_THREAD=1`, plus `WEBGPU_BRIDGE_BUILD_MEM64=1` for memory64):
+
+- `dist/llama_webgpu_core_st.js`
+- `dist/llama_webgpu_core_st.wasm`
+- `dist/llama_webgpu_core_mem64_st.js`
+- `dist/llama_webgpu_core_mem64_st.wasm`
+
 ### JS-backed model staging
 
 Use `jsBackedModelStaging: true` for models over about 1 GB on `wasm32`, or for
@@ -254,12 +261,14 @@ This repo includes a wasm build gate in:
 
 - `.github/workflows/ci.yml`
 
-After the JS/compatibility contracts pass, it builds wasm32 and memory64 against
-the `llama.cpp` tag in `llama_cpp.version` (`v1.0.0`, verified against
-`b1b770d90d94cad9e9ea5b993bdbc383a522fb28`). It runs state-persistence,
-multimodal, grammar, next-token scoring, and speculative decoding browser
-smokes, uploading the seven built files as `webgpu-bridge-dist` on success and
-any available smoke diagnostics on failure. The
+After the JS/compatibility contracts pass, it builds all four cores (threaded and
+single-thread `_st` variants for wasm32 and memory64) against the `llama.cpp`
+tag in `llama_cpp.version` (`v1.0.0`, verified against
+`b1b770d90d94cad9e9ea5b993bdbc383a522fb28`). It runs state-persistence
+(including non-isolated `--threading single` wasm32 and wasm64), multimodal,
+grammar, next-token scoring, and speculative decoding browser smokes, uploading
+the eleven built files as `webgpu-bridge-dist` on success and any available
+smoke diagnostics on failure. The
 [v1.0.0 qualification notes](docs/v100_qualification.md) cover the qualification
 evidence and release gates.
 
@@ -558,6 +567,13 @@ memory64 core artifacts:
 
 - `https://cdn.jsdelivr.net/gh/leehack/llama-web-bridge-assets@<tag>/llama_webgpu_core_mem64.js`
 - `https://cdn.jsdelivr.net/gh/leehack/llama-web-bridge-assets@<tag>/llama_webgpu_core_mem64.wasm`
+
+When `WEBGPU_BRIDGE_BUILD_SINGLE_THREAD=1` (and `WEBGPU_BRIDGE_BUILD_MEM64=1`), the assets repo also publishes single-thread (`_st`) core artifacts:
+
+- `https://cdn.jsdelivr.net/gh/leehack/llama-web-bridge-assets@<tag>/llama_webgpu_core_st.js`
+- `https://cdn.jsdelivr.net/gh/leehack/llama-web-bridge-assets@<tag>/llama_webgpu_core_st.wasm`
+- `https://cdn.jsdelivr.net/gh/leehack/llama-web-bridge-assets@<tag>/llama_webgpu_core_mem64_st.js`
+- `https://cdn.jsdelivr.net/gh/leehack/llama-web-bridge-assets@<tag>/llama_webgpu_core_mem64_st.wasm`
 
 Note: CDN pinning fundamentally relies on git tags in the assets repo.
 

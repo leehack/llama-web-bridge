@@ -13,6 +13,7 @@ import {
   PATCHES,
   PatchError,
   patchWasm64Runtime,
+  wasmMemories,
   wasmMemoryAddressTypes,
 } from '../../scripts/build/patch_wasm64_runtime.mjs';
 
@@ -53,7 +54,7 @@ const importedMemory = (flags) => wasmModule(
     [...str('env'), ...str('memory'), 0x02, flags, 0x01, 0x80, 0x01],
   ),
 );
-const definedMemory = (flags) => wasmModule(section(5, [flags, 0x01]));
+const definedMemory = (flags) => wasmModule(section(5, flags & 0x01 ? [flags, 0x01, 0x01] : [flags, 0x01]));
 const WASM32_IMPORTED = importedMemory(0x03);
 const WASM64_IMPORTED = importedMemory(0x07);
 
@@ -64,6 +65,14 @@ const WASM64_IMPORTED = importedMemory(0x07);
   assert.deepEqual(wasmMemoryAddressTypes(WASM64_IMPORTED), ['i64']);
   assert.deepEqual(wasmMemoryAddressTypes(definedMemory(0x00)), ['i32']);
   assert.deepEqual(wasmMemoryAddressTypes(definedMemory(0x04)), ['i64']);
+  assert.deepEqual(wasmMemories(WASM32_IMPORTED), [{ addressType: 'i32', shared: true }]);
+  assert.deepEqual(wasmMemories(WASM64_IMPORTED), [{ addressType: 'i64', shared: true }]);
+  assert.deepEqual(wasmMemories(importedMemory(0x01)), [{ addressType: 'i32', shared: false }]);
+  assert.deepEqual(wasmMemories(importedMemory(0x05)), [{ addressType: 'i64', shared: false }]);
+  assert.deepEqual(wasmMemories(definedMemory(0x00)), [{ addressType: 'i32', shared: false }]);
+  assert.deepEqual(wasmMemories(definedMemory(0x04)), [{ addressType: 'i64', shared: false }]);
+  assert.deepEqual(wasmMemories(definedMemory(0x03)), [{ addressType: 'i32', shared: true }]);
+  assert.deepEqual(wasmMemories(definedMemory(0x07)), [{ addressType: 'i64', shared: true }]);
   const otherImportsAndPageSize = wasmModule(
     section(1, [0x60, 0x00, 0x00]),
     section(
@@ -75,6 +84,10 @@ const WASM64_IMPORTED = importedMemory(0x07);
     section(5, [0x0c, 0x01, 0x10]),
   );
   assert.deepEqual(wasmMemoryAddressTypes(otherImportsAndPageSize), ['i64', 'i64']);
+  assert.deepEqual(wasmMemories(otherImportsAndPageSize), [
+    { addressType: 'i64', shared: true },
+    { addressType: 'i64', shared: false },
+  ]);
   assertWasmMemory64(WASM64_IMPORTED);
   assertWasmMemory64(definedMemory(0x04));
   for (const [label, bytes, message] of [
