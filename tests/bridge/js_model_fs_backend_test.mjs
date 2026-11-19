@@ -12,10 +12,34 @@ const cppFsSource = readFileSync(path.join(rootDir, 'src/llama_webgpu_js_model_f
 function instantiateJsModelFsLibrary({
   mutatedSource = jsFsSource,
   forceI32SizeAbi = false,
+  wasm64 = false,
+  heapWindowBase = 0,
   failingChunkAlloc = null,
 } = {}) {
-  const HEAPU8 = new Uint8Array(4 * 1024 * 1024);
-  const view = new DataView(HEAPU8.buffer);
+  const heapBacking = new Uint8Array(4 * 1024 * 1024);
+  const view = new DataView(heapBacking.buffer);
+  const toWindowIndex = (idx) => {
+    const num = Number(idx);
+    const local = num - heapWindowBase;
+    assert.ok(
+      Number.isSafeInteger(local) && local >= 0 && local <= heapBacking.length,
+      `heap index ${num} outside test window [${heapWindowBase}, ${heapWindowBase + heapBacking.length}]`,
+    );
+    return local;
+  };
+  const HEAPU8 = heapWindowBase === 0
+    ? heapBacking
+    : {
+        subarray(start, end) {
+          return heapBacking.subarray(toWindowIndex(start), toWindowIndex(end));
+        },
+        set(src, offset) {
+          heapBacking.set(src, toWindowIndex(offset));
+        },
+        fill(val, start, end) {
+          heapBacking.fill(val, toWindowIndex(start), toWindowIndex(end));
+        },
+      };
   const cDefs = { EBADF: 8, ENOMEM: 12, EINVAL: 28 };
   const heapRef = HEAPU8;
 
@@ -25,13 +49,13 @@ function instantiateJsModelFsLibrary({
       /\{\{\{\s*makeSetValue\(\s*'([^']+)'\s*,\s*([^,]+)\s*,\s*'([^']+)'\s*,\s*'i64'\s*\)\s*\}\}\}/g,
       (_, ptrName, offsetExpr, valName) => (
         forceI32SizeAbi
-          ? `view.setInt32((${ptrName}) + (${offsetExpr}), Number(${valName}) | 0, true)`
-          : `view.setBigInt64((${ptrName}) + (${offsetExpr}), BigInt(Math.trunc(${valName})), true)`
+          ? `view.setInt32((Number(${ptrName}) - ${heapWindowBase}) + (${offsetExpr}), Number(${valName}) | 0, true)`
+          : `view.setBigInt64((Number(${ptrName}) - ${heapWindowBase}) + (${offsetExpr}), BigInt(Math.trunc(${valName})), true)`
       ),
     )
     .replace(
       /\{\{\{\s*makeSetValue\(\s*'([^']+)'\s*,\s*([^,]+)\s*,\s*'([^']+)'\s*,\s*'i32'\s*\)\s*\}\}\}/g,
-      (_, ptrName, offsetExpr, valName) => `view.setInt32((${ptrName}) + (${offsetExpr}), Number(${valName}) | 0, true)`,
+      (_, ptrName, offsetExpr, valName) => `view.setInt32((Number(${ptrName}) - ${heapWindowBase}) + (${offsetExpr}), Number(${valName}) | 0, true)`,
     );
 
   let registered = null;
@@ -66,6 +90,14 @@ function instantiateJsModelFsLibrary({
   vm.runInNewContext(transformed, sandbox);
   assert.ok(registered, 'addToLibrary must register the backend symbols');
 
+  const bigintToI53Checked = (num) => {
+    const n = typeof num === 'bigint' ? num : BigInt(num);
+    if (n < -9007199254740992n || n > 9007199254740991n) {
+      return Number.NaN;
+    }
+    return Number(n);
+  };
+
   const callNative = (symbol, args = []) => {
     const fn = registered[symbol];
     assert.equal(typeof fn, 'function', `missing library function ${symbol}`);
@@ -74,12 +106,16 @@ function instantiateJsModelFsLibrary({
     const paramSig = typeof sig === 'string' ? sig.slice(1) : '';
     const marshalled = args.map((arg, index) => {
       const code = paramSig[index];
+      if (code === 'p') {
+        // Under -m64 (wasm64), Emscripten passes pointers as BigInt and wraps 'p' with bigintToI53Checked.
+        return wasm64 ? bigintToI53Checked(typeof arg === 'bigint' ? arg : BigInt(arg)) : Number(arg);
+      }
       if (code === 'j') {
         if (forceI32SizeAbi || !usesI53) {
           // Simulate C 32-bit signed truncation when __i53abi or int64 'j' is missing.
           return Number(arg) | 0;
         }
-        return Number(arg);
+        return wasm64 ? bigintToI53Checked(typeof arg === 'bigint' ? arg : BigInt(arg)) : Number(arg);
       }
       if (code === 'i') {
         return Number(arg) | 0;
@@ -89,7 +125,7 @@ function instantiateJsModelFsLibrary({
     return fn(...marshalled);
   };
 
-  return { registered, callNative, HEAPU8, view, cDefs };
+  return { registered, callNative, HEAPU8, heapBacking, view, cDefs };
 }
 
 test('js model fs backend C++ and JS signatures enforce 64-bit i53 ABI', () => {
@@ -216,5 +252,61 @@ test('js allocation failure records OOM bytes, leaks zero chunks, and releases c
   assert.equal(callNative('_llamadart_js_model_fs_allocated_bytes'), 4096);
   assert.equal(callNative('_llamadart_js_model_fs_write', [3, 0, 16, 0]), 16);
   callNative('_llamadart_js_model_fs_release_all');
+  assert.equal(callNative('_llamadart_js_model_fs_allocated_bytes'), 0);
+});
+
+test('wasm64 BigInt pointers (> 4 GiB) and i53 offsets/sizes round-trip cleanly', () => {
+  const heapWindowBase = 6 * 1024 * 1024 * 1024; // 6 GiB virtual base above 32-bit range
+  const { callNative, heapBacking, view, registered } = instantiateJsModelFsLibrary({
+    wasm64: true,
+    heapWindowBase,
+  });
+
+  // Pointer parameters must not be truncated with 32-bit shifts/masks in the JS library.
+  assert.doesNotMatch(jsFsSource, /\b(fileId|buffer|outSizePtr)\s*(\|\s*0|>>>\s*0|&\s*0xffffffff)/);
+
+  const fileId = BigInt(heapWindowBase) + 0x1238n;
+  const outSizePtr = BigInt(heapWindowBase) + 64n;
+  const srcPtr = BigInt(heapWindowBase) + 1024n;
+  const dstPtr = BigInt(heapWindowBase) + 4096n;
+  const payload = new Uint8Array([11, 22, 33, 44, 55, 66, 77, 88]);
+  heapBacking.set(payload, 1024);
+
+  callNative('_llamadart_js_model_fs_set_next_prealloc_bytes', [4096n]);
+  callNative('_llamadart_js_model_fs_alloc_file', [fileId]);
+  assert.equal(callNative('_llamadart_js_model_fs_allocated_bytes'), 4096);
+
+  const over4GiBOffset = 4_362_076_156n; // straddles 65 * 64 MiB boundary
+  assert.equal(callNative('_llamadart_js_model_fs_write', [fileId, srcPtr, payload.length, over4GiBOffset]), payload.length);
+
+  callNative('_llamadart_js_model_fs_get_size', [fileId, outSizePtr]);
+  assert.equal(view.getBigInt64(64, true), over4GiBOffset + BigInt(payload.length));
+
+  heapBacking.fill(0, 4096, 4096 + payload.length);
+  assert.equal(callNative('_llamadart_js_model_fs_read', [fileId, dstPtr, payload.length, over4GiBOffset]), payload.length);
+  assert.deepEqual(heapBacking.subarray(4096, 4096 + payload.length), payload);
+
+  // Direct un-narrowed BigInt buffer pointer still converts safely via Number(buffer).
+  assert.equal(
+    registered._llamadart_js_model_fs_write(
+      Number(fileId),
+      srcPtr,
+      4,
+      0,
+    ),
+    4,
+  );
+  assert.equal(
+    registered._llamadart_js_model_fs_read(
+      Number(fileId),
+      dstPtr + 32n,
+      4,
+      0,
+    ),
+    4,
+  );
+  assert.deepEqual(heapBacking.subarray(4128, 4132), payload.subarray(0, 4));
+
+  callNative('_llamadart_js_model_fs_free_file', [fileId]);
   assert.equal(callNative('_llamadart_js_model_fs_allocated_bytes'), 0);
 });

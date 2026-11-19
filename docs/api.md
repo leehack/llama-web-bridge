@@ -1262,12 +1262,19 @@ this function themselves.
   `'MODEL_STAGING_ALLOCATION_FAILED'`, and a GGUF whose tensor payload exceeds
   the wasm32 `4 GiB` (`SIZE_MAX`) limit throws `ModelStagingError` with code
   `'MODEL_TENSOR_SIZE_LIMIT_EXCEEDED'`. Measured on Chrome WebGPU (Apple Metal-3,
-  `nCtx: 2048`, `nGpuLayers: 999`) against `llama.cpp` v1.0.0: Qwen3-0.6B-Q8_0
-  (767 MiB) dropped peak wasm heap from `2.00 GiB` to `349 MiB` (`125.99` /
-  `117.82` tok/s prefill/decode), Qwen3-4B-Q4_K_M (2.33 GiB; baseline failed at
-  `1 GiB` during `FS.write`) loaded in both direct (`643 MiB` peak wasm heap,
-  `93.66` / `41.94` tok/s) and worker (`106.80` / `43.70` tok/s) modes with peak
-  JS `usedJSHeapSize` reaching `~4.46 GB` (above Chrome's `4.40 GB`
-  `jsHeapSizeLimit`) before dropping to `~8.8 MB` after release, and
-  Qwen3-8B-Q4_K_M (4.68 GiB) hit the `4 GiB` `gguf_init_from_reader` tensor
-  size-overflow ceiling (`4,288,489,984 + 9,437,184` > `4,294,967,295`).
+  `nCtx: 2048`, `nGpuLayers: 999`, `crossOriginIsolated === false`,
+  `typeof SharedArrayBuffer === 'undefined'`, `threads_capped_no_coi`) against
+  `llama.cpp` v1.0.0: Qwen3-0.6B-Q8_0 (767 MiB) dropped `wasm32` peak wasm heap
+  from `2.00 GiB` to `349 MiB` (`108.81` / `111.13` tok/s direct, `276.54` /
+  `115.64` tok/s worker); Qwen3-4B-Q4_K_M (2.33 GiB; `wasm32` baseline failed at
+  `1.37 GiB` during `FS.write`) loaded in both direct (`643 MiB` peak wasm heap,
+  `57.95` / `48.41` tok/s) and worker (`102.48` / `46.33` tok/s) modes with peak
+  JS `usedJSHeapSize` reaching `~3.72 GB` before dropping to `~3.8 MB` after
+  completion release; on `memory64` (`wasm64` no-pthreads), Qwen3-4B-Q4_K_M
+  dropped peak wasm heap from `8.01 GiB` (`8.60 GB`, `8,044 ms` load, `115.07` /
+  `39.16` tok/s direct; `3,934 ms` load, `127.18` / `39.08` tok/s worker) to
+  `656 MiB` (`0.69 GB`, `3,727 ms` load, `4.44 GB` peak JS heap dropping to
+  `10.2 MB`, `122.34` / `37.44` tok/s direct; `4,249 ms` load, `119.18` /
+  `36.82` tok/s worker); and `wasm32` Qwen3-8B-Q4_K_M (4.68 GiB) hit the `4 GiB`
+  `gguf_init_from_reader` tensor size-overflow ceiling (`4,288,489,984 +
+  9,437,184` > `4,294,967,295`).

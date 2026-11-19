@@ -91,12 +91,17 @@ Measured in Chromium WebGPU (Apple Metal-3, `nCtx: 2048`, `nGpuLayers: 999`,
 
 | Model (size) | Staging / Mode | Peak wasm heap | Peak JS heap | Prefill / Decode | Outcome |
 | --- | --- | --- | --- | --- | --- |
-| Qwen3-0.6B-Q8_0 (767 MiB) | Baseline (`/models`), direct | 2.00 GiB | 336 MB | 102.6 / 111.7 tok/s | Pass |
-| Qwen3-0.6B-Q8_0 (767 MiB) | JS-backed (`/jsmodels`), direct | 349 MiB | 1.41 GB | 126.0 / 117.8 tok/s | Pass |
-| Qwen3-4B-Q4_K_M (2.33 GiB) | Baseline (`/models`), direct | 2.00 GiB | — | — | Fail in `FS.write` at 1 GiB |
-| Qwen3-4B-Q4_K_M (2.33 GiB) | JS-backed (`/jsmodels`), direct | 643 MiB | 4.46 GB (drops to 8.8 MB) | 93.7 / 41.9 tok/s | Pass (`37/37` GPU layers) |
-| Qwen3-4B-Q4_K_M (2.33 GiB) | JS-backed (`/jsmodels`), worker | — | — | 106.8 / 43.7 tok/s | Pass (`37/37` GPU layers) |
-| Qwen3-8B-Q4_K_M (4.68 GiB) | JS-backed (`/jsmodels`), direct | 16 MiB | 7.18 GB | — | Fail: wasm32 4 GiB `gguf_init_from_reader` tensor overflow |
+| Qwen3-0.6B-Q8_0 (767 MiB) | `wasm32` Baseline (`/models`), direct | 2.00 GiB | 292 MB | 186.0 / 116.4 tok/s | Pass |
+| Qwen3-0.6B-Q8_0 (767 MiB) | `wasm32` JS-backed (`/jsmodels`), direct | 349 MiB | 1.18 GB | 108.8 / 111.1 tok/s | Pass |
+| Qwen3-0.6B-Q8_0 (767 MiB) | `wasm32` JS-backed (`/jsmodels`), worker | — | — | 276.5 / 115.6 tok/s | Pass |
+| Qwen3-4B-Q4_K_M (2.33 GiB) | `wasm32` Baseline (`/models`), direct | 2.75 GiB | 863 MB | — | Fail in `FS.write` at 1.37 GiB |
+| Qwen3-4B-Q4_K_M (2.33 GiB) | `wasm32` JS-backed (`/jsmodels`), direct | 643 MiB | 3.72 GB (drops to 3.8 MB) | 58.0 / 48.4 tok/s | Pass (`37/37` GPU layers) |
+| Qwen3-4B-Q4_K_M (2.33 GiB) | `wasm32` JS-backed (`/jsmodels`), worker | — | — | 102.5 / 46.3 tok/s | Pass (`37/37` GPU layers) |
+| Qwen3-4B-Q4_K_M (2.33 GiB) | `memory64` Baseline (`/models`), direct | 8.01 GiB (8.60 GB) | 1.10 GB (drops to 3.6 MB) | 115.1 / 39.2 tok/s | Pass (8,044 ms load) |
+| Qwen3-4B-Q4_K_M (2.33 GiB) | `memory64` Baseline (`/models`), worker | 8.01 GiB (8.60 GB) | — | 127.2 / 39.1 tok/s | Pass (3,934 ms load) |
+| Qwen3-4B-Q4_K_M (2.33 GiB) | `memory64` JS-backed (`/jsmodels`), direct | 656 MiB (0.69 GB) | 4.44 GB (drops to 10.2 MB) | 122.3 / 37.4 tok/s | Pass (3,727 ms load) |
+| Qwen3-4B-Q4_K_M (2.33 GiB) | `memory64` JS-backed (`/jsmodels`), worker | 656 MiB (0.69 GB) | — | 119.2 / 36.8 tok/s | Pass (4,249 ms load) |
+| Qwen3-8B-Q4_K_M (4.68 GiB) | `wasm32` JS-backed (`/jsmodels`), direct | — | — | — | Fail: wasm32 4 GiB `gguf_init_from_reader` tensor overflow |
 
 Note that V8 `usedJSHeapSize` approaches Chrome's `~4.4 GB` `jsHeapSizeLimit`
 during 4B staging before chunks are released, and models whose padded GGUF

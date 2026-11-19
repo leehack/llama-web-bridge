@@ -45,12 +45,17 @@ function createStubFs({ failWriteWith = null } = {}) {
     },
     write(stream, _bytes, _offset, length, position) {
       if (typeof failWriteWith === 'function') {
-        const err = failWriteWith({ filePath: stream.filePath, length, position: Number(position) });
+        const err = failWriteWith({ filePath: stream.filePath, length, position });
         if (err) {
           throw err;
         }
       }
-      this.writes.push({ filePath: stream.filePath, length, position: Number(position) });
+      this.writes.push({
+        filePath: stream.filePath,
+        length,
+        position: Number(position),
+        positionType: typeof position,
+      });
       files.set(stream.filePath, Math.max(files.get(stream.filePath) || 0, Number(position) + length));
       return length;
     },
@@ -66,6 +71,7 @@ function createStubFs({ failWriteWith = null } = {}) {
 
 function createStagingHarness({
   pthreads = false,
+  coreVariant = 'wasm32',
   jsBackedModelStaging = true,
   failWriteWith = null,
   onLoadModel = null,
@@ -129,15 +135,16 @@ function createStagingHarness({
   const bridge = new LlamaWebGpuBridge({
     disableWorker: true,
     allowSingleThreadCore: true,
+    preferMemory64: coreVariant === 'wasm64',
     jsBackedModelStaging,
   });
   runtime = bridge._runtime;
   runtime._core = core;
-  runtime._coreVariant = 'wasm32';
+  runtime._coreVariant = coreVariant;
   runtime._probeBackends = async () => false;
   runtime._ensureCore = async () => {
     runtime._core = core;
-    runtime._coreVariant = 'wasm32';
+    runtime._coreVariant = coreVariant;
     return core;
   };
   runtime._coreSupportsPthreads = () => pthreads;
@@ -212,7 +219,48 @@ test('skipMemoryReservation skips the 1-byte seek write even for 1 GiB+ Content-
     { skipMemoryReservation: true },
   );
   assert.equal(written, 3);
-  assert.deepEqual(fs.writes, [{ filePath: '/jsmodels/big.gguf', length: 3, position: 0 }]);
+  assert.deepEqual(fs.writes, [{
+    filePath: '/jsmodels/big.gguf',
+    length: 3,
+    position: 0,
+    positionType: 'number',
+  }]);
+});
+
+test('jsBackedModelStaging on wasm64 uses BigInt FS.write positions and skips reservation', async () => {
+  const harness = createStagingHarness({
+    coreVariant: 'wasm64',
+    jsBackedModelStaging: true,
+    pthreads: false,
+  });
+
+  await harness.runtime.loadModelFromUrl('https://models.test/mem64.gguf', {
+    nCtx: 2048,
+    nGpuLayers: 999,
+    useCache: false,
+    forceRemoteFetchBackend: false,
+  });
+
+  assert.deepEqual(harness.fs.writes, [{
+    filePath: '/jsmodels/mem64.gguf',
+    length: 4,
+    position: 0,
+    positionType: 'bigint',
+  }]);
+  assert.deepEqual(harness.ccalls[0], ['llamadart_webgpu_mount_js_model_fs', '/jsmodels']);
+  assert.deepEqual(harness.ccalls[1], ['llamadart_webgpu_js_model_fs_prealloc_next', 4]);
+  assert.ok(harness.ccalls.some((c) => c[0] === 'llamadart_webgpu_unmount_js_model_fs' && c[1] === '/jsmodels'));
+  assert.ok(harness.runtime._runtimeNotes.includes('model_staging_js_backed'));
+  assert.equal(harness.fs.files.size, 0);
+
+  const workerBridge = new LlamaWebGpuBridge({
+    disableWorker: false,
+    allowSingleThreadCore: true,
+    preferMemory64: true,
+    jsBackedModelStaging: true,
+  });
+  assert.equal(workerBridge._workerConfig().preferMemory64, true);
+  assert.equal(workerBridge._workerConfig().jsBackedModelStaging, true);
 });
 
 test('JS allocation failure during staging raises ModelStagingError, unmounts chunks, and retries cleanly', async () => {
