@@ -100,8 +100,11 @@ export CCACHE_DIR=/private/tmp/llama_web_bridge_ccache
 export EM_CACHE=/private/tmp/llama_web_bridge_emcache
 BUILD_DIR=/private/tmp/llama_web_bridge_build \
 MEM64_BUILD_DIR=/private/tmp/llama_web_bridge_build_mem64 \
+SINGLE_THREAD_BUILD_DIR=/private/tmp/llama_web_bridge_build_st \
+SINGLE_THREAD_MEM64_BUILD_DIR=/private/tmp/llama_web_bridge_build_mem64_st \
 OUT_DIR=/private/tmp/llama_web_bridge_dist \
 WEBGPU_BRIDGE_BUILD_MEM64=1 \
+WEBGPU_BRIDGE_BUILD_SINGLE_THREAD=1 \
 ./scripts/build/build_bridge.sh
 ```
 
@@ -117,6 +120,12 @@ Expected files in `OUT_DIR`:
 - `llama_webgpu_core_mem64.js` (only with `WEBGPU_BRIDGE_BUILD_MEM64=1`, as
   above and in CI)
 - `llama_webgpu_core_mem64.wasm` (same condition)
+- `llama_webgpu_core_st.js` (only with `WEBGPU_BRIDGE_BUILD_SINGLE_THREAD=1`,
+  as above and in CI)
+- `llama_webgpu_core_st.wasm` (same condition)
+- `llama_webgpu_core_mem64_st.js` (only with both
+  `WEBGPU_BRIDGE_BUILD_SINGLE_THREAD=1` and `WEBGPU_BRIDGE_BUILD_MEM64=1`)
+- `llama_webgpu_core_mem64_st.wasm` (same condition)
 
 This file owns the runnable smoke invocations and the model/projector pins
 they carry; `README.md` and `AGENTS.md` link here instead of repeating them.
@@ -152,6 +161,22 @@ Run the same state smoke with `--memory-mode wasm64` as well. Both runs
 exercise extraction toggles, generation and state restore through direct and
 worker paths; metadata assertions reject memory-mode or worker fallback. CI
 and candidate qualification require both runs.
+
+To validate the single-thread `_st` cores on a non-isolated page
+(`crossOriginIsolated === false` and no `SharedArrayBuffer`):
+
+```bash
+node scripts/smoke/state_persistence.mjs \
+  --dist-dir /private/tmp/llama_web_bridge_dist \
+  --threading single \
+  --model-url "$LLAMA_WEBGPU_SMOKE_MODEL_URL" \
+  --model-sha256 "$LLAMA_WEBGPU_SMOKE_MODEL_SHA256" \
+  --model-cache-dir ~/.cache/llama-web-bridge/state-smoke-models \
+  --artifacts-dir /tmp/llama-web-bridge-state-smoke-st
+```
+
+Run the same single-thread smoke with `--memory-mode wasm64` as well. Both
+non-isolated runs are required in CI and candidate qualification.
 
 For the v0.7.0 embedding scheduler repair and its exact source fingerprint, see
 [the qualification notes](docs/v070_qualification.md). The build compiles a

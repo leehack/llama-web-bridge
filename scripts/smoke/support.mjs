@@ -25,6 +25,14 @@ export const MEMORY64_ARTIFACTS = Object.freeze([
   'llama_webgpu_core_mem64.js',
   'llama_webgpu_core_mem64.wasm',
 ]);
+export const SINGLE_THREAD_ARTIFACTS = Object.freeze([
+  'llama_webgpu_core_st.js',
+  'llama_webgpu_core_st.wasm',
+]);
+export const SINGLE_THREAD_MEMORY64_ARTIFACTS = Object.freeze([
+  'llama_webgpu_core_mem64_st.js',
+  'llama_webgpu_core_mem64_st.wasm',
+]);
 export const DEFAULT_MODEL_CACHE = '~/.cache/llama-web-bridge/state-smoke-models';
 
 // The download read timeout, per socket read like urllib's timeout=120.
@@ -302,6 +310,21 @@ export async function copyMemory64Artifacts(distDir, webRoot) {
   }
 }
 
+export async function copySingleThreadArtifacts(distDir, webRoot, { memory64 = false } = {}) {
+  for (const artifact of SINGLE_THREAD_ARTIFACTS) {
+    const source = path.join(distDir, artifact);
+    ensure(isFile(source), `missing single-thread bridge artifact: ${source}`);
+    await fsp.copyFile(source, path.join(webRoot, artifact));
+  }
+  if (memory64) {
+    for (const artifact of SINGLE_THREAD_MEMORY64_ARTIFACTS) {
+      const source = path.join(distDir, artifact);
+      ensure(isFile(source), `missing single-thread wasm64 bridge artifact: ${source}`);
+      await fsp.copyFile(source, path.join(webRoot, artifact));
+    }
+  }
+}
+
 // Stage a large input without copying when the filesystem allows a hard link.
 export async function stageFile(source, target) {
   try {
@@ -328,6 +351,10 @@ export const ISOLATION_HEADERS = Object.freeze([
   ['Cross-Origin-Opener-Policy', 'same-origin'],
   ['Cross-Origin-Embedder-Policy', 'require-corp'],
   ['Cross-Origin-Resource-Policy', 'same-origin'],
+  ['Access-Control-Allow-Origin', '*'],
+  ['Cache-Control', 'no-store'],
+]);
+export const NON_ISOLATED_HEADERS = Object.freeze([
   ['Access-Control-Allow-Origin', '*'],
   ['Cache-Control', 'no-store'],
 ]);
@@ -362,7 +389,7 @@ function escapeHtml(text) {
 }
 
 // BaseHTTPRequestHandler.send_error.
-function sendError(req, res, code, message) {
+function sendError(req, res, code, message, headers = ISOLATION_HEADERS) {
   const body = Buffer.from(
     '<!DOCTYPE HTML>\n<html lang="en">\n    <head>\n        <meta charset="utf-8">\n'
       + '        <style type="text/css">\n            :root {\n                color-scheme: light dark;\n'
@@ -378,7 +405,7 @@ function sendError(req, res, code, message) {
     ['Connection', 'close'],
     ['Content-Type', 'text/html;charset=utf-8'],
     ['Content-Length', String(body.length)],
-    ...ISOLATION_HEADERS,
+    ...headers,
   ]);
   res.end(req.method === 'HEAD' ? undefined : body);
 }
@@ -402,10 +429,10 @@ export function translatePath(root, requestPath) {
 // bridge's `bytes=0-0` probe expects from this server), and one response per
 // connection (`Connection: close` on an HTTP/1.1 status line). A directory
 // without index.html is a 404 rather than a listing; smoke web roots are flat.
-async function handleRequest(root, req, res) {
+async function handleRequest(root, req, res, headers = ISOLATION_HEADERS) {
   res.shouldKeepAlive = false;
   if (req.method !== 'GET' && req.method !== 'HEAD') {
-    sendError(req, res, 501, `Unsupported method ('${req.method}')`);
+    sendError(req, res, 501, `Unsupported method ('${req.method}')`, headers);
     return;
   }
   let file = translatePath(root, req.url);
@@ -414,26 +441,26 @@ async function handleRequest(root, req, res) {
     const urlPath = cut < 0 ? req.url : req.url.slice(0, cut);
     if (!/(\/|%2f|%2F)$/.test(urlPath)) {
       const location = cut < 0 ? `${req.url}/` : `${urlPath}/${req.url.slice(cut)}`;
-      res.writeHead(301, 'Moved Permanently', [['Location', location], ['Content-Length', '0'], ...ISOLATION_HEADERS]);
+      res.writeHead(301, 'Moved Permanently', [['Location', location], ['Content-Length', '0'], ...headers]);
       res.end();
       return;
     }
     const index = ['index.html', 'index.htm'].map((name) => path.join(file, name)).find(isFile);
     if (!index) {
-      sendError(req, res, 404, 'File not found');
+      sendError(req, res, 404, 'File not found', headers);
       return;
     }
     file = index;
   }
   if (file.endsWith('/')) {
-    sendError(req, res, 404, 'File not found');
+    sendError(req, res, 404, 'File not found', headers);
     return;
   }
   let handle;
   try {
     handle = await fsp.open(file, 'r');
   } catch {
-    sendError(req, res, 404, 'File not found');
+    sendError(req, res, 404, 'File not found', headers);
     return;
   }
   try {
@@ -442,7 +469,7 @@ async function handleRequest(root, req, res) {
     const since = req.headers['if-modified-since'];
     if (since !== undefined && req.headers['if-none-match'] === undefined
       && /(?:GMT|UTC|[+-]0000)\s*$/.test(since) && modified.getTime() <= Date.parse(since)) {
-      res.writeHead(304, 'Not Modified', [...ISOLATION_HEADERS]);
+      res.writeHead(304, 'Not Modified', [...headers]);
       res.end();
       await handle.close();
       return;
@@ -451,7 +478,7 @@ async function handleRequest(root, req, res) {
       ['Content-type', contentType(file)],
       ['Content-Length', String(stat.size)],
       ['Last-Modified', modified.toUTCString()],
-      ...ISOLATION_HEADERS,
+      ...headers,
     ]);
   } catch (error) {
     await handle.close();
@@ -473,10 +500,11 @@ async function handleRequest(root, req, res) {
 }
 
 // Serve `webRoot` on 127.0.0.1 at a free port until `close()`.
-export async function serveIsolated(webRoot) {
+export async function serveIsolated(webRoot, { isolated = true } = {}) {
+  const headers = isolated ? ISOLATION_HEADERS : NON_ISOLATED_HEADERS;
   const root = path.resolve(webRoot);
   const server = http.createServer((req, res) => {
-    handleRequest(root, req, res).catch(() => res.destroy());
+    handleRequest(root, req, res, headers).catch(() => res.destroy());
   });
   await new Promise((resolve, reject) => {
     server.once('error', reject);
@@ -492,8 +520,8 @@ export async function serveIsolated(webRoot) {
   };
 }
 
-export async function withServer(webRoot, fn) {
-  const server = await serveIsolated(webRoot);
+export async function withServer(webRoot, fn, options) {
+  const server = await serveIsolated(webRoot, options);
   try {
     return await fn(server.url);
   } finally {

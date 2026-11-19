@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Build and inventory single-thread (`WEBGPU_BRIDGE_PTHREADS=0`) cores (`llama_webgpu_core_st.{js,wasm}` and `llama_webgpu_core_mem64_st.{js,wasm}`) in `CMakeLists.txt`, `scripts/build/build_bridge.sh`, `scripts/release/manifest.mjs` (with per-core `{ addressType, shared }` memory validation), CI, candidate, and publish workflows; add non-isolated `--threading single` validation in `scripts/smoke/state_persistence.mjs` and bump `HARNESS_VERSION` to `5.5.0`. (Runtime fetch-backend gating remains pending before dispatching a candidate.)
+
 - Bump the default `llama.cpp` pin in `llama_cpp.version` from `v0.5.0` to `v1.0.0` (verified in CI at `b1b770d90d94cad9e9ea5b993bdbc383a522fb28`), retire the separate `v1.0.0` CI matrix lane, remove the `v0.5.0`-only `mtmd-audio.cpp` mel-worker CMake workaround while retaining `mtmd-subcontext.cpp` per-graph worker handling, and make `publish_assets.yml` fail early if `upstream_tag` differs from `llama_cpp.version` unless `allow_upstream_tag_override=true` is set.
 
 - A load on a page that is not cross-origin isolated rejects at once with `CrossOriginIsolationError`, which names `Cross-Origin-Embedder-Policy: require-corp` and that `credentialless` does not isolate Safari, instead of hanging until the core init timeout. The `threads_capped_no_coi` note now appears only for a core loaded with `allowSingleThreadCore`.

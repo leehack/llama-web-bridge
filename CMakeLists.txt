@@ -267,9 +267,13 @@ endif()
 
 target_link_options(llama_webgpu_core PRIVATE ${LLAMADART_WEBGPU_LINK_OPTIONS})
 
+set(LLAMADART_WEBGPU_CORE_OUTPUT_SUFFIX "" CACHE STRING "Optional suffix for core output name")
 set(LLAMADART_WEBGPU_CORE_OUTPUT_NAME "llama_webgpu_core")
 if (LLAMADART_WEBGPU_MEM64)
     set(LLAMADART_WEBGPU_CORE_OUTPUT_NAME "llama_webgpu_core_mem64")
+endif()
+if (LLAMADART_WEBGPU_CORE_OUTPUT_SUFFIX)
+    set(LLAMADART_WEBGPU_CORE_OUTPUT_NAME "${LLAMADART_WEBGPU_CORE_OUTPUT_NAME}${LLAMADART_WEBGPU_CORE_OUTPUT_SUFFIX}")
 endif()
 
 set_target_properties(llama_webgpu_core PROPERTIES

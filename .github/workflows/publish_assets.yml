@@ -457,6 +457,10 @@ jobs:
             ${{ runner.temp }}/candidate/llama_webgpu_core.wasm
             ${{ runner.temp }}/candidate/llama_webgpu_core_mem64.js
             ${{ runner.temp }}/candidate/llama_webgpu_core_mem64.wasm
+            ${{ runner.temp }}/candidate/llama_webgpu_core_st.js
+            ${{ runner.temp }}/candidate/llama_webgpu_core_st.wasm
+            ${{ runner.temp }}/candidate/llama_webgpu_core_mem64_st.js
+            ${{ runner.temp }}/candidate/llama_webgpu_core_mem64_st.wasm
             ${{ runner.temp }}/candidate/manifest.json
             ${{ runner.temp }}/candidate/sha256sums.txt
 
@@ -815,6 +819,8 @@ jobs:
               llama_webgpu_bridge_worker.js llama_webgpu_bridge.d.ts \
               llama_webgpu_core.js llama_webgpu_core.wasm \
               llama_webgpu_core_mem64.js llama_webgpu_core_mem64.wasm \
+              llama_webgpu_core_st.js llama_webgpu_core_st.wasm \
+              llama_webgpu_core_mem64_st.js llama_webgpu_core_mem64_st.wasm \
               manifest.json sha256sums.txt
             git -C assets-repo commit -m "chore: publish webgpu bridge ${RELEASE_TAG}"
             git -C assets-repo tag "${RELEASE_TAG}"

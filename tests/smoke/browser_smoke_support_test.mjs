@@ -15,9 +15,13 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import {
   ISOLATION_HEADERS,
+  NON_ISOLATED_HEADERS,
+  SINGLE_THREAD_ARTIFACTS,
+  SINGLE_THREAD_MEMORY64_ARTIFACTS,
   UsageError,
   cachedModelName,
   contentType,
+  copySingleThreadArtifacts,
   downloadToCache,
   env,
   expandHome,
@@ -230,7 +234,16 @@ assert.deepEqual(webGpuLaunchArgs('linux'), [
       distDir: '/d', modelUrl: 'https://h/m.gguf', modelPath: null, modelSha256: 'ab',
       modelCacheDir: '~/.cache/llama-web-bridge/state-smoke-models',
     };
-    assert.deepEqual(stateSmoke.parseArgs([]), { ...shared, memoryMode: 'wasm32', timeoutMs: 120000, artifactsDir: '/a/state' });
+    assert.deepEqual(stateSmoke.parseArgs([]), {
+      ...shared, memoryMode: 'wasm32', threading: 'pthreads', timeoutMs: 120000, artifactsDir: '/a/state',
+    });
+    assert.deepEqual(stateSmoke.parseArgs(['--threading', 'single', '--memory-mode', 'wasm64']), {
+      ...shared, memoryMode: 'wasm64', threading: 'single', timeoutMs: 120000, artifactsDir: '/a/state',
+    });
+    assert.throws(
+      () => stateSmoke.parseArgs(['--threading', 'bogus']),
+      (error) => error instanceof UsageError && /argument --threading: invalid choice: 'bogus'/.test(error.message),
+    );
     assert.deepEqual(grammarSmoke.parseArgs([]), {
       ...shared, timeoutMs: 7, memoryMode: 'all', nCtx: 1024, artifactsDir: '/a/grammar',
     });
@@ -636,15 +649,19 @@ assert.deepEqual(webGpuLaunchArgs('linux'), [
 // Runs a harness page's module script in Node against a fake bridge class, so the
 // in-page usage assertions are exercised without a browser. The page imports the
 // bridge from '/llama_webgpu_bridge.js'; that one call is redirected to the fake.
-async function runHarnessPage(page, Bridge, extraDocument = {}) {
+async function runHarnessPage(page, Bridge, extraDocument = {}, { crossOriginIsolated = true, hideSharedArrayBuffer = false } = {}) {
   const body = page.slice(page.indexOf('<script type="module">\n') + '<script type="module">\n'.length, page.lastIndexOf('</script>'));
   const importCall = "await import('/llama_webgpu_bridge.js')";
   assert.equal(body.split(importCall).length, 2, 'the harness must import the bridge exactly once');
   const script = body.replace(importCall, '({ LlamaWebGpuBridge: window.__FakeBridge })').trim();
   const result = { textContent: 'pending' };
-  const window = { crossOriginIsolated: true, __FakeBridge: Bridge };
+  const window = { crossOriginIsolated, __FakeBridge: Bridge };
   const document = { getElementById: (id) => (id === 'result' ? result : null), ...extraDocument };
-  await new Function('window', 'document', `'use strict'; return ${script}`)(window, document);
+  if (hideSharedArrayBuffer) {
+    await new Function('window', 'document', 'SharedArrayBuffer', `'use strict'; return ${script}`)(window, document, undefined);
+  } else {
+    await new Function('window', 'document', `'use strict'; return ${script}`)(window, document);
+  }
   assert.equal(result.textContent, JSON.stringify(window.__smokeResult));
   return window.__smokeResult;
 }
@@ -695,9 +712,12 @@ const decodeSnapshot = (bytes, capacity) => {
 // `tweak.corruptSnapshot` changes how a corrupt snapshot is handled, and
 // `tweak.cString` names a method that drops its text after U+0000.
 const stateBridge = (tweak = {}) => class FakeStateBridge {
-  constructor({ disableWorker, preferMemory64 }) {
+  constructor({ disableWorker, preferMemory64, allowSingleThreadCore, coreModuleUrl, coreModuleUrlMem64 }) {
     this.mode = disableWorker ? 'direct runtime' : 'worker runtime';
     this.coreVariant = preferMemory64 ? 'wasm64' : 'wasm32';
+    this.allowSingleThreadCore = allowSingleThreadCore === true;
+    this.coreModuleUrl = coreModuleUrl;
+    this.coreModuleUrlMem64 = coreModuleUrlMem64;
     this.loaded = false;
     this.cache = [];
     this.calls = 0;
@@ -720,10 +740,19 @@ const stateBridge = (tweak = {}) => class FakeStateBridge {
     return {
       'llamadart.webgpu.core_variant': tweak.coreVariant || this.coreVariant,
       'llamadart.webgpu.execution': tweak.execution || (this.mode === 'worker runtime' ? 'worker' : 'main-thread'),
+      'llamadart.webgpu.n_threads': tweak.nThreads ?? '1',
+      'llamadart.webgpu.runtime_notes': tweak.runtimeNotes ?? 'core_pthreads:0;threads_capped_no_coi',
     };
   }
 
   async loadModelFromUrl(url, options) {
+    if (!this.allowSingleThreadCore && tweak.requireIsolation) {
+      const error = new Error('Cross-origin isolation required');
+      error.code = tweak.isolationErrorCode ?? 'CROSS_ORIGIN_ISOLATION_REQUIRED';
+      throw error;
+    }
+    if (tweak.expectedCoreModuleUrl !== undefined) assert.equal(this.coreModuleUrl, tweak.expectedCoreModuleUrl);
+    if (tweak.expectedCoreModuleUrlMem64 !== undefined) assert.equal(this.coreModuleUrlMem64, tweak.expectedCoreModuleUrlMem64);
     assert.equal(url, '/state-smoke-model.gguf');
     for (let loaded = 1; loaded <= 3; loaded += 1) options.progressCallback?.({ loaded, total: 3 });
     this.loaded = true;
@@ -911,6 +940,33 @@ const stateBridge = (tweak = {}) => class FakeStateBridge {
   for (const [tweak, message] of cases) {
     assert.equal(firstErrorLine(await runHarnessPage(page, stateBridge(tweak))), `Error: ${message}`, message);
   }
+
+  // Single-thread mode requires non-isolated execution, verifies negative control,
+  // passes allowSingleThreadCore + _st module URLs, and checks n_threads/notes.
+  const singlePage = stateSmoke.renderHarness('state-smoke-model.gguf', 'wasm32', 'single');
+  const singleMem64Page = stateSmoke.renderHarness('state-smoke-model.gguf', 'wasm64', 'single');
+  const nonIsoOpts = { crossOriginIsolated: false, hideSharedArrayBuffer: true };
+  assert.equal((await runHarnessPage(singlePage, stateBridge({
+    requireIsolation: true,
+    expectedCoreModuleUrl: '/llama_webgpu_core_st.js',
+  }), {}, nonIsoOpts)).ok, true);
+  assert.equal((await runHarnessPage(singleMem64Page, stateBridge({
+    requireIsolation: true,
+    expectedCoreModuleUrl: '/llama_webgpu_core_st.js',
+    expectedCoreModuleUrlMem64: '/llama_webgpu_core_mem64_st.js',
+  }), {}, nonIsoOpts)).ok, true);
+  assert.match(firstErrorLine(await runHarnessPage(singlePage, stateBridge({ requireIsolation: true }), {}, { crossOriginIsolated: true, hideSharedArrayBuffer: true })),
+    /single-thread test page must not be cross-origin isolated/);
+  assert.match(firstErrorLine(await runHarnessPage(singlePage, stateBridge({ requireIsolation: true }), {}, { crossOriginIsolated: false, hideSharedArrayBuffer: false })),
+    /single-thread test page must not expose SharedArrayBuffer/);
+  assert.match(firstErrorLine(await runHarnessPage(singlePage, stateBridge({ requireIsolation: false }), {}, nonIsoOpts)),
+    /default threaded core did not reject with CROSS_ORIGIN_ISOLATION_REQUIRED/);
+  assert.match(firstErrorLine(await runHarnessPage(singlePage, stateBridge({ requireIsolation: true, nThreads: '4' }), {}, nonIsoOpts)),
+    /reported n_threads=4/);
+  assert.match(firstErrorLine(await runHarnessPage(singlePage, stateBridge({ requireIsolation: true, runtimeNotes: 'threads_capped_no_coi' }), {}, nonIsoOpts)),
+    /missing core_pthreads:0 note/);
+  assert.match(firstErrorLine(await runHarnessPage(singlePage, stateBridge({ requireIsolation: true, runtimeNotes: 'core_pthreads:0' }), {}, nonIsoOpts)),
+    /missing threads_capped_no_coi note/);
 }
 
 // A fake bridge for the multimodal harness: the image adds 64 prompt positions
@@ -1099,6 +1155,45 @@ function parseResponse(buffer) {
   assert.equal(contentType('x.wasm'), 'application/wasm');
   assert.equal(contentType('x.JS'), 'text/javascript');
   assert.equal(contentType('x.gguf'), 'application/octet-stream');
+
+  // Non-isolated server omits COOP/COEP/CORP while keeping CORS and Cache-Control.
+  const nonIsoServer = await serveIsolated(webRoot, { isolated: false });
+  try {
+    const nonIso200 = parseResponse(await rawRequest(nonIsoServer.url, 'GET /index.html HTTP/1.0\r\n\r\n'));
+    assert.equal(nonIso200.status, 'HTTP/1.1 200 OK');
+    const nonIsoHeaders = nonIso200.headers.map(([name, value]) => `${name}: ${value}`);
+    assert.deepEqual(nonIsoHeaders.slice(3, 5), NON_ISOLATED_HEADERS.map(([name, value]) => `${name}: ${value}`));
+    for (const forbidden of ['cross-origin-opener-policy', 'cross-origin-embedder-policy', 'cross-origin-resource-policy']) {
+      assert.ok(!nonIso200.headers.some(([name]) => name.toLowerCase() === forbidden), `unexpected header ${forbidden}`);
+    }
+    const nonIso404 = parseResponse(await rawRequest(nonIsoServer.url, 'GET /missing HTTP/1.0\r\n\r\n'));
+    assert.equal(nonIso404.status, 'HTTP/1.1 404 File not found');
+    for (const forbidden of ['cross-origin-opener-policy', 'cross-origin-embedder-policy', 'cross-origin-resource-policy']) {
+      assert.ok(!nonIso404.headers.some(([name]) => name.toLowerCase() === forbidden), `unexpected 404 header ${forbidden}`);
+    }
+  } finally {
+    await nonIsoServer.close();
+  }
+
+  // copySingleThreadArtifacts copies _st artifacts and reports missing files.
+  const stDist = path.join(tmp, 'st-dist');
+  const stWeb = path.join(tmp, 'st-web');
+  fs.mkdirSync(stDist, { recursive: true });
+  fs.mkdirSync(stWeb, { recursive: true });
+  await assert.rejects(
+    copySingleThreadArtifacts(stDist, stWeb),
+    { message: `missing single-thread bridge artifact: ${path.join(stDist, SINGLE_THREAD_ARTIFACTS[0])}` },
+  );
+  for (const name of SINGLE_THREAD_ARTIFACTS) fs.writeFileSync(path.join(stDist, name), name);
+  await copySingleThreadArtifacts(stDist, stWeb);
+  for (const name of SINGLE_THREAD_ARTIFACTS) assert.equal(fs.readFileSync(path.join(stWeb, name), 'utf8'), name);
+  await assert.rejects(
+    copySingleThreadArtifacts(stDist, stWeb, { memory64: true }),
+    { message: `missing single-thread wasm64 bridge artifact: ${path.join(stDist, SINGLE_THREAD_MEMORY64_ARTIFACTS[0])}` },
+  );
+  for (const name of SINGLE_THREAD_MEMORY64_ARTIFACTS) fs.writeFileSync(path.join(stDist, name), name);
+  await copySingleThreadArtifacts(stDist, stWeb, { memory64: true });
+  for (const name of SINGLE_THREAD_MEMORY64_ARTIFACTS) assert.equal(fs.readFileSync(path.join(stWeb, name), 'utf8'), name);
 }
 
 // --- Model download and cache ------------------------------------------------

@@ -103,7 +103,8 @@ export const ATTESTATION_TYPE = 'llama-web-bridge-automated-qualification';
 // 5.2.0: the heavy gates reject core fallback and the manifest reads the core binaries.
 // 5.3.0: the heavy gates reject a worker mode that ran on the main thread.
 // 5.4.0: they also reject a worker mode whose model load fell back to it.
-export const HARNESS_VERSION = '5.4.0';
+// 5.5.0: candidate builds and gates include single-thread cores and non-isolated state smoke.
+export const HARNESS_VERSION = '5.5.0';
 
 // --- small Python helpers ---------------------------------------------------
 

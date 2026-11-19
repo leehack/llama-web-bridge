@@ -79,6 +79,7 @@ export function patchWasm64Runtime(text) {
 export class Memory64Error extends Error {}
 
 const LIMITS_HAS_MAX = 0x01;
+const LIMITS_SHARED = 0x02;
 const LIMITS_MEMORY64 = 0x04;
 const LIMITS_PAGE_SIZE = 0x08;
 const LIMITS_KNOWN_FLAGS = 0x0f;
@@ -117,13 +118,16 @@ function wasmReader(bytes) {
   return reader;
 }
 
-function readLimitsIsMemory64(reader) {
+function readLimits(reader) {
   const flags = reader.byte();
   if ((flags & ~LIMITS_KNOWN_FLAGS) !== 0) reader.fail(`unknown limits flags 0x${flags.toString(16)}`);
   reader.leb();
   if (flags & LIMITS_HAS_MAX) reader.leb();
   if (flags & LIMITS_PAGE_SIZE) reader.u32();
-  return (flags & LIMITS_MEMORY64) !== 0;
+  return {
+    addressType: (flags & LIMITS_MEMORY64) !== 0 ? 'i64' : 'i32',
+    shared: (flags & LIMITS_SHARED) !== 0,
+  };
 }
 
 function skipValueType(reader) {
@@ -132,8 +136,9 @@ function skipValueType(reader) {
   if (type === 0x63 || type === 0x64) reader.leb();
 }
 
-// Address type of every memory the module imports or defines, in index order.
-export function wasmMemoryAddressTypes(bytes) {
+// Address type and shared bit of every memory the module imports or defines, in
+// index order.
+export function wasmMemories(bytes) {
   const reader = wasmReader(bytes);
   const header = [0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
   for (const expected of header) {
@@ -153,9 +158,9 @@ export function wasmMemoryAddressTypes(bytes) {
           reader.u32();
         } else if (kind === 0x01) {
           skipValueType(reader);
-          readLimitsIsMemory64(reader);
+          readLimits(reader);
         } else if (kind === 0x02) {
-          memories.push(readLimitsIsMemory64(reader) ? 'i64' : 'i32');
+          memories.push(readLimits(reader));
         } else if (kind === 0x03) {
           skipValueType(reader);
           reader.byte();
@@ -168,7 +173,7 @@ export function wasmMemoryAddressTypes(bytes) {
       }
     } else if (id === 5) {
       for (let count = reader.u32(); count > 0; count -= 1) {
-        memories.push(readLimitsIsMemory64(reader) ? 'i64' : 'i32');
+        memories.push(readLimits(reader));
       }
     } else {
       reader.skip(size);
@@ -176,6 +181,11 @@ export function wasmMemoryAddressTypes(bytes) {
     if (reader.offset !== end) reader.fail(`section ${id} size does not match its contents`);
   }
   return memories;
+}
+
+// Address type of every memory the module imports or defines, in index order.
+export function wasmMemoryAddressTypes(bytes) {
+  return wasmMemories(bytes).map((memory) => memory.addressType);
 }
 
 export function assertWasmMemory64(bytes) {

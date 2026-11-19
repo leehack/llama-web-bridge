@@ -321,7 +321,7 @@ test('extract-artifact extracts each artifact type fail-closed', async () => {
         'artifact archive size 1048736 exceeds bound 1048576: '],
       ['hidden metadata', 'prequalification', [{ name, data: record, extra: [0xca, 0xfe, 0, 0] }], undefined, 'carries hidden metadata'],
       ['an attestation as a candidate', 'candidate', [['qualification-attestation.json', attestationText]], undefined,
-        'member count must be exactly 9, got 1'],
+        `member count must be exactly ${CANDIDATE_ALLOWED_MEMBERS.size}, got 1`],
       ['an unknown type', 'bogus', [[name, record]], undefined, "unknown artifact type: 'bogus'"],
     ]) {
       const { result, destination } = await extract(type, entries, options);

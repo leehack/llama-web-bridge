@@ -150,8 +150,14 @@ test('the Node generator reproduces the published v0.1.53 manifest.json and sha2
   const sha256 = (text) => createHash('sha256').update(text, 'utf8').digest('hex');
   assert.equal(sha256(V0_1_53.MANIFEST_JSON), V0_1_53.MANIFEST_JSON_SHA256);
   assert.equal(sha256(V0_1_53.SHA256SUMS), V0_1_53.SHA256SUMS_SHA256);
+  assert.deepEqual(ARTIFACTS.slice(-4), [
+    'llama_webgpu_core_st.js',
+    'llama_webgpu_core_st.wasm',
+    'llama_webgpu_core_mem64_st.js',
+    'llama_webgpu_core_mem64_st.wasm',
+  ]);
   const args = parseArguments(['--out-dir', 'unused', ...V0_1_53.ARGV], { prog: 'generate_release_manifest.py', options: OPTIONS });
-  assert.deepEqual(V0_1_53.ARTIFACTS.map(({ name }) => name), ARTIFACTS);
+  assert.deepEqual(V0_1_53.ARTIFACTS.map(({ name }) => name), ARTIFACTS.slice(0, 7));
   const rendered = renderManifestFiles(args, V0_1_53.ARTIFACTS);
   assert.equal(rendered['manifest.json'], V0_1_53.MANIFEST_JSON);
   assert.equal(rendered['sha256sums.txt'], V0_1_53.SHA256SUMS);
@@ -172,6 +178,12 @@ test('generation refuses a core binary that contradicts its claimed address type
     ['llama_webgpu_core_mem64.wasm', emptyModule, 'llama_webgpu_core_mem64.wasm memories are [], expected only i64'],
     ['llama_webgpu_core_mem64.wasm', Buffer.from('not wasm'), 'llama_webgpu_core_mem64.wasm: malformed wasm at byte 1'],
     ['llama_webgpu_core.wasm', coreWasm('i64'), 'llama_webgpu_core.wasm memories are [i64], expected only i32'],
+    ['llama_webgpu_core.wasm', coreWasm({ addressType: 'i32', shared: false }), 'llama_webgpu_core.wasm memories are [unshared], expected only shared'],
+    ['llama_webgpu_core_mem64.wasm', coreWasm({ addressType: 'i64', shared: false }), 'llama_webgpu_core_mem64.wasm memories are [unshared], expected only shared'],
+    ['llama_webgpu_core_st.wasm', coreWasm({ addressType: 'i32', shared: true }), 'llama_webgpu_core_st.wasm memories are [shared], expected only unshared'],
+    ['llama_webgpu_core_mem64_st.wasm', coreWasm({ addressType: 'i64', shared: true }), 'llama_webgpu_core_mem64_st.wasm memories are [shared], expected only unshared'],
+    ['llama_webgpu_core_mem64_st.wasm', coreWasm({ addressType: 'i32', shared: false }), 'llama_webgpu_core_mem64_st.wasm memories are [i32], expected only i64'],
+    ['llama_webgpu_core_st.wasm', coreWasm({ addressType: 'i64', shared: false }), 'llama_webgpu_core_st.wasm memories are [i64], expected only i32'],
   ];
   for (const [name, bytes, message] of cases) {
     withTemporaryDirectory((outDir) => {
