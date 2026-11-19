@@ -114,33 +114,24 @@ set(MTMD_DIR "${LLAMA_CPP_DIR}/tools/mtmd")
 set(MTMD_AUDIO_SRC "${MTMD_DIR}/mtmd-audio.cpp")
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${MTMD_AUDIO_SRC}")
 file(READ "${MTMD_AUDIO_SRC}" MTMD_AUDIO_CONTENT)
-string(FIND "${MTMD_AUDIO_CONTENT}" "4,  // n_threads" MTMD_AUDIO_THREAD_MARKER_INDEX)
-if (NOT MTMD_AUDIO_THREAD_MARKER_INDEX EQUAL -1)
-    # Older mtmd starts its own mel workers outside the configured thread budget.
-    set(MTMD_REPLACED_SOURCE "${MTMD_AUDIO_SRC}")
-    set(MTMD_PATCHED_NAME "mtmd-audio-single-thread.cpp")
-    string(REPLACE "4,  // n_threads" "1,  // n_threads (patched for wasm)"
-        MTMD_PATCHED_CONTENT "${MTMD_AUDIO_CONTENT}")
-else()
-    string(FIND "${MTMD_AUDIO_CONTENT}" "mtmd_audio_log_mel(params," MTMD_AUDIO_SCHEDULER_INDEX)
-    if (MTMD_AUDIO_SCHEDULER_INDEX EQUAL -1)
-        message(FATAL_ERROR "mtmd-audio.cpp thread markers not found; recheck the wasm thread budget")
-    endif()
-
-    # A persistent projector pool holds workers needed by text decode on the same core.
-    # Leave ggml to allocate workers per graph with the configured thread count.
-    set(MTMD_REPLACED_SOURCE "${MTMD_DIR}/mtmd-subcontext.cpp")
-    set(MTMD_PATCHED_NAME "mtmd-subcontext-disposable-threads.cpp")
-    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${MTMD_REPLACED_SOURCE}")
-    file(READ "${MTMD_REPLACED_SOURCE}" MTMD_SUBCONTEXT_CONTENT)
-    string(REGEX MATCHALL "threadpool = mtmd_threadpool_init\\(n_threads\\);"
-        MTMD_THREADPOOL_INIT_MATCHES "${MTMD_SUBCONTEXT_CONTENT}")
-    if (NOT MTMD_THREADPOOL_INIT_MATCHES STREQUAL "threadpool = mtmd_threadpool_init(n_threads);")
-        message(FATAL_ERROR "mtmd-subcontext.cpp pool initialization changed; recheck the wasm thread budget")
-    endif()
-    string(REPLACE "threadpool = mtmd_threadpool_init(n_threads);" "(void) n_threads;"
-        MTMD_PATCHED_CONTENT "${MTMD_SUBCONTEXT_CONTENT}")
+string(FIND "${MTMD_AUDIO_CONTENT}" "mtmd_audio_log_mel(params," MTMD_AUDIO_SCHEDULER_INDEX)
+if (MTMD_AUDIO_SCHEDULER_INDEX EQUAL -1)
+    message(FATAL_ERROR "mtmd-audio.cpp thread markers not found; recheck the wasm thread budget")
 endif()
+
+# A persistent projector pool holds workers needed by text decode on the same core.
+# Leave ggml to allocate workers per graph with the configured thread count.
+set(MTMD_REPLACED_SOURCE "${MTMD_DIR}/mtmd-subcontext.cpp")
+set(MTMD_PATCHED_NAME "mtmd-subcontext-disposable-threads.cpp")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${MTMD_REPLACED_SOURCE}")
+file(READ "${MTMD_REPLACED_SOURCE}" MTMD_SUBCONTEXT_CONTENT)
+string(REGEX MATCHALL "threadpool = mtmd_threadpool_init\\(n_threads\\);"
+    MTMD_THREADPOOL_INIT_MATCHES "${MTMD_SUBCONTEXT_CONTENT}")
+if (NOT MTMD_THREADPOOL_INIT_MATCHES STREQUAL "threadpool = mtmd_threadpool_init(n_threads);")
+    message(FATAL_ERROR "mtmd-subcontext.cpp pool initialization changed; recheck the wasm thread budget")
+endif()
+string(REPLACE "threadpool = mtmd_threadpool_init(n_threads);" "(void) n_threads;"
+    MTMD_PATCHED_CONTENT "${MTMD_SUBCONTEXT_CONTENT}")
 
 set(MTMD_PATCHED_SOURCE "${CMAKE_BINARY_DIR}/generated/${MTMD_PATCHED_NAME}")
 file(CONFIGURE OUTPUT "${MTMD_PATCHED_SOURCE}" CONTENT "${MTMD_PATCHED_CONTENT}" @ONLY)

@@ -1,11 +1,13 @@
-# llama.cpp v1.0.0 compatibility preparation
+# llama.cpp v1.0.0 qualification
 
-The CI candidate lane verifies that the llama.cpp `v1.0.0` tag resolves to
-`b1b770d90d94cad9e9ea5b993bdbc383a522fb28` before building. The default lane
-continues to build `v0.5.0` from `llama_cpp.version`. See the
-[v0.9.0 preparation record](v090_qualification.md) for the previous candidate.
+`llama_cpp.version` now pins `v1.0.0`, and CI's default lane verifies that the
+cloned tag resolves to `b1b770d90d94cad9e9ea5b993bdbc383a522fb28` before
+building. The former separate `v1.0.0` candidate CI matrix lane and the
+`v0.5.0`-only `mtmd-audio.cpp` single-thread mel workaround in `CMakeLists.txt`
+have been retired. See the [v0.9.0 preparation record](v090_qualification.md)
+for the previous candidate.
 
-Both lanes build wasm32 and memory64 and run browser smokes for state
+The default lane builds wasm32 and memory64 and runs browser smokes for state
 persistence, multimodal completion, grammar, next-token scoring, and
 speculative decoding. State persistence also runs explicitly on memory64 to
 check model extraction, generation, and state restore. Local commands and
@@ -17,8 +19,9 @@ The bridge now links upstream's `mtmd` target so the source list follows the
 selected llama.cpp release. On v1.0.0, the projector's persistent thread pool
 holds workers needed by text decode within the same four-worker Emscripten
 pool. The bridge builds a generated copy of `mtmd-subcontext.cpp` that uses
-per-graph workers and preserves the configured thread count. The v0.5.0 lane
-still uses its single-threaded audio mel workaround.
+per-graph workers and preserves the configured thread count. The v0.5.0-only
+single-threaded audio mel workaround was removed when v1.0.0 became the
+default pin (#225).
 
 With the uncorrected v1.0.0 build and the pinned Qwen3.5 model and projector,
 direct wasm32 image completion stalled at four threads and exceeded a

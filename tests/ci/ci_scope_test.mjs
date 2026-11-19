@@ -149,16 +149,15 @@ const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../.
   }
 }
 
-// CI builds pinned and candidate native lanes behind the selector and reports a truthful
+// CI builds the pinned native lane behind the selector and reports a truthful
 // aggregate.
 {
   const workflow = parseYaml(readFileSync(path.join(rootDir, '.github/workflows/ci.yml'), 'utf8'));
   const { jobs } = workflow;
   const build = jobs['build-webgpu-bridge'];
   const { checks } = jobs;
-  assert.equal(build.name, "${{ matrix.upstream == 'pinned' && 'Build WebGPU Bridge (WASM)' || 'Build WebGPU Bridge (WASM v1.0.0)' }}");
-  assert.deepEqual(build.strategy.matrix.upstream, ['pinned', 'v1.0.0']);
-  assert.equal(build.strategy['fail-fast'], false);
+  assert.equal(build.name, 'Build WebGPU Bridge (WASM)');
+  assert.equal('strategy' in build, false);
   assert.deepEqual(build.needs, ['changes', 'checks']);
   assert.equal(build.if, "needs.changes.outputs.native == 'true'");
   assert.equal(jobs['ci-result'].if, 'always()');
@@ -170,15 +169,14 @@ const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../.
     1,
   );
   const clone = build.steps.find((step) => step.name === 'Clone llama.cpp source').run;
-  assert.match(clone, /if \[ "\$\{\{ matrix\.upstream \}\}" = "v1\.0\.0" \]; then/);
+  assert.doesNotMatch(clone, /matrix\.upstream/);
   assert.match(
     clone,
     /test "\$\(git -C third_party\/llama_cpp rev-parse HEAD\)" = b1b770d90d94cad9e9ea5b993bdbc383a522fb28\b/,
   );
   const resolver = build.steps.find((step) => step.name === 'Resolve llama.cpp pin').run;
   assert.match(resolver, /llama_cpp.version/);
-  assert.match(resolver, /matrix.upstream/);
-  assert.match(resolver, /LLAMA_CPP_TAG=v1\.0\.0\b/);
+  assert.doesNotMatch(resolver, /matrix\.upstream/);
   const pinnedArtifacts = [
     'state-persistence-smoke-artifacts',
     'multimodal-smoke-artifacts',
@@ -190,10 +188,7 @@ const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../.
   const uploadNames = build.steps
     .filter((step) => step.uses?.startsWith('actions/upload-artifact@'))
     .map((step) => step.with.name);
-  const expectedUploadNames = pinnedArtifacts.map(
-    (name) => `\${{ matrix.upstream == 'pinned' && '${name}' || '${name}-v1.0.0' }}`,
-  );
-  assert.deepEqual(uploadNames.sort(), expectedUploadNames.sort());
+  assert.deepEqual(uploadNames.sort(), [...pinnedArtifacts].sort());
   const buildSteps = Object.fromEntries(build.steps.map((step) => [step.name, step]));
   for (const name of ['Run state persistence browser smoke', 'Run multimodal browser smoke', 'Build bridge artifacts', 'Verify outputs']) {
     assert.equal('if' in buildSteps[name], false, name);

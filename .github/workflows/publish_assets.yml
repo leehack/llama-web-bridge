@@ -22,6 +22,11 @@ on:
         description: Exact llama.cpp vMAJOR.MINOR.PATCH or bNNNN tag
         required: true
         type: string
+      allow_upstream_tag_override:
+        description: Allow upstream_tag to differ from llama_cpp.version for an intentional out-of-pin release
+        required: false
+        default: false
+        type: boolean
       upstream_commit:
         description: Exact full commit resolved by upstream_tag
         required: true
@@ -67,6 +72,7 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
   BRIDGE_SOURCE_SHA: ${{ inputs.bridge_source_sha }}
   UPSTREAM_TAG: ${{ inputs.upstream_tag }}
+  ALLOW_UPSTREAM_TAG_OVERRIDE: ${{ inputs.allow_upstream_tag_override }}
   UPSTREAM_COMMIT: ${{ inputs.upstream_commit }}
   NATIVE_REPO: leehack/llamadart-native
   BRIDGE_REPO: leehack/llama-web-bridge
@@ -210,6 +216,10 @@ jobs:
             echo "error: checked-out bridge source does not match the requested full SHA"
             exit 1
           fi
+          node scripts/release/contract.mjs validate-upstream-pin \
+            --pin-file bridge-source/llama_cpp.version \
+            --upstream-tag "${UPSTREAM_TAG}" \
+            --allow-override "${ALLOW_UPSTREAM_TAG_OVERRIDE}"
           node scripts/release/contract.mjs validate-release \
             --release-tag "${RELEASE_TAG}" --release-rebuild "${RELEASE_REBUILD}" \
             --upstream-tag "${UPSTREAM_TAG}"

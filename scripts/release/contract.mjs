@@ -251,6 +251,37 @@ export function parseUpstreamTag(tag) {
   throw new ContractError(`unsupported upstream tag ${pyRepr(tag)}; expected exact vMAJOR.MINOR.PATCH or bNNNN`);
 }
 
+// Require upstream_tag to match the bridge source's llama_cpp.version unless
+// allow_upstream_tag_override=true is explicitly set.
+export function validateUpstreamPin(pinFile, upstreamTag, { allowOverride = false } = {}) {
+  parseUpstreamTag(upstreamTag);
+  let raw;
+  try {
+    raw = pyDecodeUtf8(pyReadBytes(pinFile));
+  } catch (error) {
+    if (isPyException(error, 'OSError', 'UnicodeDecodeError')) {
+      throw new ContractError(`could not read upstream pin file ${pyRepr(String(pinFile))}: ${error.message}`, { cause: error });
+    }
+    throw error;
+  }
+  const pinnedTag = raw.endsWith('\n') ? raw.slice(0, -1) : raw;
+  parseUpstreamTag(pinnedTag);
+  if (typeof allowOverride !== 'boolean') {
+    throw new ContractError('allow_upstream_tag_override must be true or false');
+  }
+  if (!pyEquals(pinnedTag, upstreamTag) && !allowOverride) {
+    throw new ContractError(
+      `upstream_tag ${pyRepr(upstreamTag)} differs from ${pyRepr(String(pinFile))} (${pyRepr(pinnedTag)}); `
+      + 'set allow_upstream_tag_override=true to override',
+    );
+  }
+  return {
+    upstream_tag: upstreamTag,
+    pinned_upstream_tag: pinnedTag,
+    override_applied: !pyEquals(pinnedTag, upstreamTag),
+  };
+}
+
 export function parseReleaseTag(tag, { allowLegacy = false } = {}) {
   const stable = fullmatch(STABLE_RELEASE_RE, tag);
   if (stable) return new ReleaseVersion(tag, Channel.STABLE, stable.slice(1, 4).map((text) => pyIntFromString(text)), pyIntFromString(stable[4] ?? '0'));
@@ -1161,6 +1192,13 @@ export const COMMANDS = Object.freeze({
   // exit status 1 otherwise.
   'require-correlation-id': { options: [required('--orchestrator-correlation-id')] },
   'require-repository': { options: [required('--repository'), required('--field')] },
+  'validate-upstream-pin': {
+    options: [
+      required('--pin-file', 'path'),
+      required('--upstream-tag'),
+      { flag: '--allow-override', required: false, type: 'str', default: 'false' },
+    ],
+  },
 });
 
 function dumps(value) {
@@ -1234,6 +1272,12 @@ function runCommand(command, args, write) {
     requireCorrelationId(args.orchestratorCorrelationId);
   } else if (command === 'require-repository') {
     requireRepository(args.repository, args.field);
+  } else if (command === 'validate-upstream-pin') {
+    const rawOverride = args.allowOverride ?? 'false';
+    if (rawOverride !== 'true' && rawOverride !== 'false') {
+      throw new ContractError('allow_upstream_tag_override must be true or false');
+    }
+    write(dumps(validateUpstreamPin(args.pinFile, args.upstreamTag, { allowOverride: rawOverride === 'true' })));
   } else {
     const environmentPayload = pyJsonLoads(pyReadText(args.environmentJson));
     const branchPoliciesPayload = pyJsonLoads(pyReadText(args.branchPoliciesJson));

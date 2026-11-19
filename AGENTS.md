@@ -81,12 +81,11 @@ GGUFs or smoke artifacts.
 ## CI / Release
 
 - CI build gate: `.github/workflows/ci.yml`
-  - Builds wasm32/memory64 against the `llama_cpp.version` pin and exact
-    v1.0.0 candidate in separate lanes. The candidate commit lives in the
-    workflow, and its check and artifacts use the `v1.0.0` suffix. Preserve
-    the default identities (`Build WebGPU Bridge (WASM)`, `webgpu-bridge-dist`).
-    See [the preparation notes](docs/v100_qualification.md) for the release
-    gates.
+  - Builds wasm32/memory64 against the `llama_cpp.version` pin (`v1.0.0`,
+    asserting resolved commit `b1b770d90d94cad9e9ea5b993bdbc383a522fb28`)
+    with default identities (`Build WebGPU Bridge (WASM)`, `webgpu-bridge-dist`).
+    The former separate `v1.0.0` candidate lane is now the default; see
+    [the qualification notes](docs/v100_qualification.md) for the release gates.
     Builds against llama.cpp v0.4.0 are no longer tested in CI; the
     `src/llama_webgpu_mtmd_compat.h` shim and its static contract remain.
   - Verifies the active `emcc` identity against `emsdk.version` and
