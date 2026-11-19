@@ -986,10 +986,19 @@ function checkCiRunsContracts({ ci, candidate, publish }, testFiles, errors) {
   check.includes(ci.path, ci.runText, [
     'node scripts/smoke/next_token_scores.mjs',
     'node scripts/smoke/state_persistence.mjs',
-    'node scripts/smoke/state_persistence.mjs --threading single',
-    'node scripts/smoke/state_persistence.mjs --threading single --memory-mode wasm64',
     'node scripts/smoke/multimodal.mjs',
   ], 'run the next-token scores, state persistence and multimodal browser smokes');
+  const ciBuildSteps = ci.jobSteps('build-webgpu-bridge');
+  for (const command of [
+    'node scripts/smoke/state_persistence.mjs --threading single',
+    'node scripts/smoke/state_persistence.mjs --threading single --memory-mode wasm64',
+  ]) {
+    check.require(
+      ciBuildSteps.some((step) => step.run.trim() === command
+        && step.raw.if === undefined && step.raw['continue-on-error'] === undefined),
+      `${ci.path} job build-webgpu-bridge must run "${command}" unconditionally without continue-on-error`,
+    );
+  }
   // Row 57: CI builds the llama.cpp pin.
   check.includes(ci.path, ci.runText, ["tr -d '[:space:]' < llama_cpp.version"], 'resolve the llama.cpp tag from llama_cpp.version');
   // Row 61: ordinary CI never dispatches publication or holds actions: write.
