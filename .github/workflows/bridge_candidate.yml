@@ -284,6 +284,7 @@ jobs:
         env:
           OUT_DIR: ${{ runner.temp }}/webgpu_bridge_dist
           WEBGPU_BRIDGE_BUILD_MEM64: 1
+          WEBGPU_BRIDGE_BUILD_SINGLE_THREAD: 1
         run: |
           node scripts/build/verify_emscripten_version.mjs --emit-github-env "$GITHUB_ENV"
           ./scripts/build/build_bridge.sh
@@ -311,6 +312,18 @@ jobs:
         env:
           BRIDGE_DIST_DIR: ${{ runner.temp }}/webgpu_bridge_dist
         run: node scripts/smoke/state_persistence.mjs --memory-mode wasm64
+
+      - name: Run single-thread state persistence gate
+        id: state_st_gate
+        env:
+          BRIDGE_DIST_DIR: ${{ runner.temp }}/webgpu_bridge_dist
+        run: node scripts/smoke/state_persistence.mjs --threading single
+
+      - name: Run single-thread memory64 state persistence gate
+        id: state_mem64_st_gate
+        env:
+          BRIDGE_DIST_DIR: ${{ runner.temp }}/webgpu_bridge_dist
+        run: node scripts/smoke/state_persistence.mjs --threading single --memory-mode wasm64
 
       - name: Run durable multimodal gate
         id: multimodal_gate
@@ -389,6 +402,10 @@ jobs:
             ${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_core.wasm
             ${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_core_mem64.js
             ${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_core_mem64.wasm
+            ${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_core_st.js
+            ${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_core_st.wasm
+            ${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_core_mem64_st.js
+            ${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_core_mem64_st.wasm
             ${{ runner.temp }}/webgpu_bridge_dist/manifest.json
             ${{ runner.temp }}/webgpu_bridge_dist/sha256sums.txt
 

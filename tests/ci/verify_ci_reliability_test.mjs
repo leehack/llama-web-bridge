@@ -601,6 +601,22 @@ assertRejected(validatePublicationPatContract('jobs: [unterminated', EXPECTED_ST
     // R3: candidate and publish run the release suites through check:js.
     [CANDIDATE_PATH, '          npm run check:js\n', '', 'run the release contract suites (through npm run check:js)'],
     [PUBLISH_PATH, '          node scripts/ci/verify_ci_reliability.mjs\n', '', 'run the release contract suites (through npm run check:js)'],
+    // Single-thread build/smoke gates in CI, candidate and publish excludes.
+    [CI_PATH, 'node scripts/smoke/state_persistence.mjs --threading single --memory-mode wasm64', 'node scripts/smoke/state_persistence.mjs --memory-mode wasm64',
+      'run the next-token scores, state persistence and multimodal browser smokes'],
+    [CANDIDATE_PATH, '          WEBGPU_BRIDGE_BUILD_SINGLE_THREAD: 1\n', '',
+      'must build the memory64 and single-thread cores'],
+    [CANDIDATE_PATH, '        id: state_st_gate\n', '        id: state_st_gate_renamed\n',
+      'must build the memory64 and single-thread cores'],
+    [CANDIDATE_PATH, '        run: node scripts/smoke/state_persistence.mjs --threading single\n',
+      '        if: false\n        run: node scripts/smoke/state_persistence.mjs --threading single\n',
+      'must build the memory64 and single-thread cores'],
+    [CANDIDATE_PATH, '        run: node scripts/smoke/state_persistence.mjs --threading single --memory-mode wasm64\n',
+      '        continue-on-error: true\n        run: node scripts/smoke/state_persistence.mjs --threading single --memory-mode wasm64\n',
+      'must build the memory64 and single-thread cores'],
+    [PUBLISH_PATH, '          set -euo pipefail\n          node publication-policy/scripts/release/qualification.mjs verify-attestation',
+      '          set -euo pipefail\n          # WEBGPU_BRIDGE_BUILD_SINGLE_THREAD\n          node publication-policy/scripts/release/qualification.mjs verify-attestation',
+      'never rebuild the candidate or run a validator from the historical build source'],
     // Rows 44-46: the Emscripten pin, its verifier and the manifest record.
     [CI_PATH, 'node scripts/build/verify_emscripten_version.mjs --print-pin', 'python3 scripts/verify_emscripten_version.py --print-pin',
       'resolve emsdk.version and verify the resolved emcc version before building'],

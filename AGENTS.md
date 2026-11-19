@@ -59,7 +59,8 @@ Validate Outputs. Run them from there; do not copy them here. Which smoke
 applies:
 
 - state-persistence or workflow changes:
-  `scripts/smoke/state_persistence.mjs` against a built `OUT_DIR`;
+  `scripts/smoke/state_persistence.mjs` (both default pthreads and
+  `--threading single` for wasm32 and wasm64) against a built `OUT_DIR`;
 - llama.cpp pin or multimodal changes: `scripts/smoke/multimodal.mjs`
   through both direct and worker runtimes;
 - sampler or grammar changes: `scripts/smoke/grammar.mjs` with the
@@ -81,7 +82,8 @@ GGUFs or smoke artifacts.
 ## CI / Release
 
 - CI build gate: `.github/workflows/ci.yml`
-  - Builds wasm32/memory64 against the `llama_cpp.version` pin (`v1.0.0`,
+  - Builds all four cores (threaded and single-thread `_st` wasm32/memory64)
+    against the `llama_cpp.version` pin (`v1.0.0`,
     asserting resolved commit `b1b770d90d94cad9e9ea5b993bdbc383a522fb28`)
     with default identities (`Build WebGPU Bridge (WASM)`, `webgpu-bridge-dist`).
     The former separate `v1.0.0` candidate lane is now the default; see
@@ -176,7 +178,7 @@ immutable baseline is:
   smoke, and release tooling lives in `scripts/build/`, `scripts/ci/`,
   `scripts/smoke/`, and `scripts/release/`. The qualification harness digest
   covers `HARNESS_SOURCES` in `scripts/release/qualification.mjs` (harness
-  `5.4.0`, the Node harness), and the candidate/publication checkouts address
+  `5.5.0`, the Node harness), and the candidate/publication checkouts address
   harness files by their `scripts/` path at the candidate's commit, so moving
   or adding a harness module changes the digest and needs a new candidate.
   `tests/release/qualification_harness_test.mjs` requires that list to equal

@@ -180,12 +180,15 @@ jobs:
         env:
           BUILD_DIR: ${{ runner.temp }}/webgpu-build
           MEM64_BUILD_DIR: ${{ runner.temp }}/webgpu-build-mem64
+          SINGLE_THREAD_BUILD_DIR: ${{ runner.temp }}/webgpu-build-st
+          SINGLE_THREAD_MEM64_BUILD_DIR: ${{ runner.temp }}/webgpu-build-mem64-st
           CCACHE_DIR: ${{ runner.temp }}/webgpu-ccache
           CCACHE_MAXSIZE: 2G
           CCACHE_COMPILERCHECK: content
           EM_COMPILER_WRAPPER: ccache
           OUT_DIR: ${{ runner.temp }}/webgpu_bridge_dist
           WEBGPU_BRIDGE_BUILD_MEM64: 1
+          WEBGPU_BRIDGE_BUILD_SINGLE_THREAD: 1
         run: |
           ccache --zero-stats
           trap 'ccache --show-stats' EXIT
@@ -207,6 +210,10 @@ jobs:
           test -f "${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_core.wasm"
           test -f "${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_core_mem64.js"
           test -f "${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_core_mem64.wasm"
+          test -f "${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_core_st.js"
+          test -f "${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_core_st.wasm"
+          test -f "${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_core_mem64_st.js"
+          test -f "${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_core_mem64_st.wasm"
 
       # The smokes use the locked playwright package.
       - name: Install Playwright Chromium
@@ -222,6 +229,16 @@ jobs:
         env:
           BRIDGE_DIST_DIR: ${{ runner.temp }}/webgpu_bridge_dist
         run: node scripts/smoke/state_persistence.mjs --memory-mode wasm64
+
+      - name: Run single-thread state persistence browser smoke
+        env:
+          BRIDGE_DIST_DIR: ${{ runner.temp }}/webgpu_bridge_dist
+        run: node scripts/smoke/state_persistence.mjs --threading single
+
+      - name: Run single-thread memory64 state persistence browser smoke
+        env:
+          BRIDGE_DIST_DIR: ${{ runner.temp }}/webgpu_bridge_dist
+        run: node scripts/smoke/state_persistence.mjs --threading single --memory-mode wasm64
 
       - name: Run multimodal browser smoke
         env:
@@ -303,6 +320,10 @@ jobs:
             ${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_core.wasm
             ${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_core_mem64.js
             ${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_core_mem64.wasm
+            ${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_core_st.js
+            ${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_core_st.wasm
+            ${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_core_mem64_st.js
+            ${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_core_mem64_st.wasm
 
   ci-result:
     name: CI validation

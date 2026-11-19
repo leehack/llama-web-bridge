@@ -12,6 +12,7 @@ import {
   DEFAULT_MODEL_CACHE,
   copyBridgeArtifacts,
   copyMemory64Artifacts,
+  copySingleThreadArtifacts,
   downloadToCache,
   ensure,
   env,
@@ -54,9 +55,40 @@ export const REQUIRED_METHODS = Object.freeze([
 const MODES = Object.freeze(['direct runtime', 'worker runtime']);
 const MODEL_FILENAME = 'state-smoke-model.gguf';
 
-export function renderHarness(modelFilename, memoryMode = 'wasm32') {
+export function renderHarness(modelFilename, memoryMode = 'wasm32', threading = 'pthreads') {
   const methodsJson = pyJson(REQUIRED_METHODS);
   const modelUrlJson = pyJson(modelFilename ? `/${modelFilename}` : null);
+  const singleThread = threading === 'single';
+  const isolationCheck = singleThread
+    ? `    if (window.crossOriginIsolated !== false) {
+      throw new Error('single-thread test page must not be cross-origin isolated');
+    }
+    if (typeof SharedArrayBuffer !== 'undefined') {
+      throw new Error('single-thread test page must not expose SharedArrayBuffer');
+    }`
+    : `    if (!window.crossOriginIsolated) {
+      throw new Error('test page is not cross-origin isolated');
+    }`;
+  const defaultMemoryOptions = memoryMode === 'wasm64' ? {
+    preferMemory64: true,
+    coreModuleUrlMem64: '/llama_webgpu_core_mem64.js',
+    wasmUrlMem64: '/llama_webgpu_core_mem64.wasm',
+  } : { preferMemory64: false };
+  const memoryOptions = singleThread
+    ? (memoryMode === 'wasm64' ? {
+      preferMemory64: true,
+      allowSingleThreadCore: true,
+      coreModuleUrl: '/llama_webgpu_core_st.js',
+      wasmUrl: '/llama_webgpu_core_st.wasm',
+      coreModuleUrlMem64: '/llama_webgpu_core_mem64_st.js',
+      wasmUrlMem64: '/llama_webgpu_core_mem64_st.wasm',
+    } : {
+      preferMemory64: false,
+      allowSingleThreadCore: true,
+      coreModuleUrl: '/llama_webgpu_core_st.js',
+      wasmUrl: '/llama_webgpu_core_st.wasm',
+    })
+    : defaultMemoryOptions;
   return `
 <!doctype html>
 <meta charset="utf-8">
@@ -100,9 +132,7 @@ export function renderHarness(modelFilename, memoryMode = 'wasm32') {
     );
   };
   try {
-    if (!window.crossOriginIsolated) {
-      throw new Error('test page is not cross-origin isolated');
-    }
+${isolationCheck}
     const module = await import('/llama_webgpu_bridge.js');
     const LlamaWebGpuBridge = module.LlamaWebGpuBridge || window.LlamaWebGpuBridge;
     if (typeof LlamaWebGpuBridge !== 'function') {
@@ -151,6 +181,15 @@ export function renderHarness(modelFilename, memoryMode = 'wasm32') {
         \`\${mode} did not use the requested ${memoryMode} core\`);
       assert(metadata['llamadart.webgpu.execution'] === (mode === 'worker runtime' ? 'worker' : 'main-thread'),
         \`\${mode} silently changed execution path\`);
+      if (${pyJson(singleThread)}) {
+        assert(metadata['llamadart.webgpu.n_threads'] === '1',
+          \`\${mode} single-thread load reported n_threads=\${metadata['llamadart.webgpu.n_threads']}\`);
+        const notes = String(metadata['llamadart.webgpu.runtime_notes'] || '').split(';');
+        assert(notes.includes('core_pthreads:0'),
+          \`\${mode} single-thread load missing core_pthreads:0 note: \${metadata['llamadart.webgpu.runtime_notes']}\`);
+        assert(notes.includes('threads_capped_no_coi'),
+          \`\${mode} single-thread load missing threads_capped_no_coi note: \${metadata['llamadart.webgpu.runtime_notes']}\`);
+      }
 
       const prompt = 'Hello';
       const mutationPrompt = 'Completely different prompt';
@@ -485,11 +524,30 @@ export function renderHarness(modelFilename, memoryMode = 'wasm32') {
       }
     };
 
-    const memoryOptions = ${pyJson(memoryMode === 'wasm64' ? {
-    preferMemory64: true,
-    coreModuleUrlMem64: '/llama_webgpu_core_mem64.js',
-    wasmUrlMem64: '/llama_webgpu_core_mem64.wasm',
-  } : { preferMemory64: false })};
+    if (${pyJson(singleThread)}) {
+      const defaultMemoryOptions = ${pyJson(defaultMemoryOptions)};
+      for (const [disableWorker, label] of [[true, 'direct runtime'], [false, 'worker runtime']]) {
+        const defaultBridge = new LlamaWebGpuBridge({ ...defaultMemoryOptions, disableWorker });
+        let rejectedCode = null;
+        try {
+          await defaultBridge.loadModelFromUrl(modelUrl || '/missing.gguf', {
+            nCtx: 64,
+            nThreads: 1,
+            nGpuLayers: 0,
+          });
+        } catch (error) {
+          rejectedCode = error && error.code ? error.code : String(error && error.message ? error.message : error);
+        } finally {
+          await defaultBridge.dispose();
+        }
+        assert(
+          rejectedCode === 'CROSS_ORIGIN_ISOLATION_REQUIRED',
+          \`\${label} default threaded core did not reject with CROSS_ORIGIN_ISOLATION_REQUIRED: \${rejectedCode}\`,
+        );
+      }
+    }
+
+    const memoryOptions = ${pyJson(memoryOptions)};
     await verifyBridgeStateApi(new LlamaWebGpuBridge({ ...memoryOptions, disableWorker: true }), 'direct runtime');
     await verifyBridgeStateApi(new LlamaWebGpuBridge({ ...memoryOptions, disableWorker: false }), 'worker runtime');
 
@@ -529,6 +587,13 @@ export function parseArgs(argv) {
         default: () => 'wasm32',
         choices: ['wasm32', 'wasm64'],
         help: 'Core memory mode to test; wasm64 requires the memory64 artifacts.',
+      },
+      {
+        flag: '--threading',
+        type: 'string',
+        default: () => 'pthreads',
+        choices: ['pthreads', 'single'],
+        help: 'Core threading mode to test; single serves without COOP/COEP and tests the _st cores.',
       },
       {
         flag: '--timeout-ms',
@@ -614,21 +679,23 @@ export async function main(argv = process.argv.slice(2)) {
   ensure(isDirectory(distDir), `dist directory does not exist: ${distDir}`);
   const artifactsDir = args.artifactsDir !== null ? resolvePath(args.artifactsDir) : null;
 
+  const singleThread = args.threading === 'single';
   const modelPath = await resolveModel(args);
   const payload = await withTempDir('llama-web-bridge-smoke-', async (webRoot) => {
     await copyBridgeArtifacts(distDir, webRoot);
     if (args.memoryMode === 'wasm64') await copyMemory64Artifacts(distDir, webRoot);
+    if (singleThread) await copySingleThreadArtifacts(distDir, webRoot, { memory64: args.memoryMode === 'wasm64' });
     let modelFilename = null;
     if (modelPath !== null) {
       await fsp.copyFile(modelPath, path.join(webRoot, MODEL_FILENAME));
       modelFilename = MODEL_FILENAME;
     }
-    await fsp.writeFile(path.join(webRoot, 'index.html'), renderHarness(modelFilename, args.memoryMode), 'utf8');
+    await fsp.writeFile(path.join(webRoot, 'index.html'), renderHarness(modelFilename, args.memoryMode, args.threading), 'utf8');
     if (artifactsDir !== null) {
       await fsp.mkdir(artifactsDir, { recursive: true });
       await fsp.copyFile(path.join(webRoot, 'index.html'), path.join(artifactsDir, 'index.html'));
     }
-    return withServer(webRoot, (url) => runPlaywright(url, args.timeoutMs, artifactsDir));
+    return withServer(webRoot, (url) => runPlaywright(url, args.timeoutMs, artifactsDir), { isolated: !singleThread });
   });
 
   writeStdout(`${pyJson(payload, { indent: 2, sortKeys: true })}\n`);

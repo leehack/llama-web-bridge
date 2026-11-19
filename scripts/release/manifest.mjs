@@ -10,7 +10,7 @@
 
 import { createHash } from 'node:crypto';
 
-import { Memory64Error, wasmMemoryAddressTypes } from '../build/patch_wasm64_runtime.mjs';
+import { Memory64Error, wasmMemories } from '../build/patch_wasm64_runtime.mjs';
 import {
   SystemExitError, parseArguments, progName, runCli,
 } from './cli.mjs';
@@ -42,6 +42,10 @@ export const ARTIFACTS = Object.freeze([
   'llama_webgpu_core.wasm',
   'llama_webgpu_core_mem64.js',
   'llama_webgpu_core_mem64.wasm',
+  'llama_webgpu_core_st.js',
+  'llama_webgpu_core_st.wasm',
+  'llama_webgpu_core_mem64_st.js',
+  'llama_webgpu_core_mem64_st.wasm',
 ]);
 
 export const CAPABILITIES = Object.freeze({
@@ -77,26 +81,38 @@ export const QUALIFICATION_GATES = Object.freeze({
 });
 
 // CAPABILITIES claims a wasm32 and a memory64 core; each claim holds only
-// while every memory of that core's binary has this address type.
-const CORE_ADDRESS_TYPES = Object.freeze({
-  'llama_webgpu_core.wasm': 'i32',
-  'llama_webgpu_core_mem64.wasm': 'i64',
+// while every memory of that core's binary has its expected address type and
+// sharing bit (threaded cores require shared memory; _st cores must not).
+const CORE_MEMORY_SPECS = Object.freeze({
+  'llama_webgpu_core.wasm': Object.freeze({ addressType: 'i32', shared: true }),
+  'llama_webgpu_core_mem64.wasm': Object.freeze({ addressType: 'i64', shared: true }),
+  'llama_webgpu_core_st.wasm': Object.freeze({ addressType: 'i32', shared: false }),
+  'llama_webgpu_core_mem64_st.wasm': Object.freeze({ addressType: 'i64', shared: false }),
 });
 
-function requireCoreAddressType(name, data) {
-  const expected = CORE_ADDRESS_TYPES[name];
+function requireCoreMemorySpec(name, data) {
+  const expected = CORE_MEMORY_SPECS[name];
   if (expected === undefined) return;
   let memories;
   try {
-    memories = wasmMemoryAddressTypes(data);
+    memories = wasmMemories(data);
   } catch (error) {
     if (error instanceof Memory64Error) throw new ContractError(`${name}: ${error.message}`);
     throw error;
   }
-  if (memories.length === 0 || memories.some((type) => type !== expected)) {
+  const addressTypes = memories.map((memory) => memory.addressType);
+  if (addressTypes.length === 0 || addressTypes.some((type) => type !== expected.addressType)) {
     throw new ContractError(
-      `${name} memories are [${memories.join(', ')}], expected only ${expected}: `
+      `${name} memories are [${addressTypes.join(', ')}], expected only ${expected.addressType}: `
       + 'the manifest capabilities would misstate the built core',
+    );
+  }
+  if (memories.some((memory) => memory.shared !== expected.shared)) {
+    const sharing = memories.map((memory) => (memory.shared ? 'shared' : 'unshared'));
+    const expectedSharing = expected.shared ? 'shared' : 'unshared';
+    throw new ContractError(
+      `${name} memories are [${sharing.join(', ')}], expected only ${expectedSharing}: `
+      + 'the manifest would misstate the built core',
     );
   }
 }
@@ -222,7 +238,7 @@ export function generate(args) {
     const path = pyJoinPath(outDir, name);
     if (!pyIsFile(path)) throw new ContractError(`required artifact is missing: ${name}`);
     const data = pyReadBytes(path);
-    requireCoreAddressType(name, data);
+    requireCoreMemorySpec(name, data);
     artifacts.push({ name, sha256: sha256Hex(data), sizeBytes: data.length });
   }
   const rendered = render(args, identity, artifacts);

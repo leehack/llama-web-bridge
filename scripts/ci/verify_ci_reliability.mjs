@@ -986,6 +986,8 @@ function checkCiRunsContracts({ ci, candidate, publish }, testFiles, errors) {
   check.includes(ci.path, ci.runText, [
     'node scripts/smoke/next_token_scores.mjs',
     'node scripts/smoke/state_persistence.mjs',
+    'node scripts/smoke/state_persistence.mjs --threading single',
+    'node scripts/smoke/state_persistence.mjs --threading single --memory-mode wasm64',
     'node scripts/smoke/multimodal.mjs',
   ], 'run the next-token scores, state persistence and multimodal browser smokes');
   // Row 57: CI builds the llama.cpp pin.
@@ -1411,15 +1413,23 @@ function checkCandidateAndQualification({ candidate, qualification, publish }, e
   const stateGate = candidate.steps.find((step) => step.id === 'state_gate');
   const multimodalGate = candidate.steps.find((step) => step.id === 'multimodal_gate');
   check.require(
-    build !== undefined && String(build.env.WEBGPU_BRIDGE_BUILD_MEM64) === '1'
+    build !== undefined
+      && String(build.env.WEBGPU_BRIDGE_BUILD_MEM64) === '1'
+      && String(build.env.WEBGPU_BRIDGE_BUILD_SINGLE_THREAD) === '1'
       && stateGate?.run.trim() === 'node scripts/smoke/state_persistence.mjs'
       && candidate.steps.some((step) => step.id === 'state_mem64_gate'
         && step.run.trim() === 'node scripts/smoke/state_persistence.mjs --memory-mode wasm64'
-        && step.if === undefined && step['continue-on-error'] === undefined)
+        && step.raw.if === undefined && step.raw['continue-on-error'] === undefined)
+      && candidate.steps.some((step) => step.id === 'state_st_gate'
+        && step.run.trim() === 'node scripts/smoke/state_persistence.mjs --threading single'
+        && step.raw.if === undefined && step.raw['continue-on-error'] === undefined)
+      && candidate.steps.some((step) => step.id === 'state_mem64_st_gate'
+        && step.run.trim() === 'node scripts/smoke/state_persistence.mjs --threading single --memory-mode wasm64'
+        && step.raw.if === undefined && step.raw['continue-on-error'] === undefined)
       && multimodalGate?.run.trim() === 'node scripts/smoke/multimodal.mjs'
       && candidate.steps.some((step) => step.env.STATE_CONCLUSION === '${{ steps.state_gate.outcome }}'
         && step.env.MULTIMODAL_CONCLUSION === '${{ steps.multimodal_gate.outcome }}'),
-    `${candidate.path} must build the memory64 core and record the outcomes of its state persistence and multimodal gates`,
+    `${candidate.path} must build the memory64 and single-thread cores and record the outcomes of its state persistence and multimodal gates`,
   );
   const uploads = candidate.steps.filter((step) => /^actions\/upload-artifact@/.test(step.uses)).map((step) => step.with.name);
   check.require(
@@ -1507,7 +1517,8 @@ function checkCandidateAndQualification({ candidate, qualification, publish }, e
     `${publish.path} must pin the candidate and qualification workflow paths and the exact artifact names`,
   );
   check.excludes(publish.path, publish.text, [
-    'scripts/build/build_bridge.sh', 'WEBGPU_BRIDGE_BUILD_MEM64', 'setup-emsdk', 'emsdk install', 'emsdk_env.sh', RELEASE_MANIFEST_MODULE,
+    'scripts/build/build_bridge.sh', 'WEBGPU_BRIDGE_BUILD_MEM64', 'WEBGPU_BRIDGE_BUILD_SINGLE_THREAD',
+    'setup-emsdk', 'emsdk install', 'emsdk_env.sh', RELEASE_MANIFEST_MODULE,
     'bridge-source/scripts/release/',
   ], 'never rebuild the candidate or run a validator from the historical build source');
   // The one command publish runs from the historical build source reads its
