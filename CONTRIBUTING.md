@@ -417,8 +417,9 @@ query strings, and fragments before printing the location.
   It holds exactly one upstream tag in either channel, stable
   `vMAJOR.MINOR.PATCH` or development `bNNNN`; `scripts/ci/verify_ci_reliability.mjs`
   rejects every other form. Publication fails early when `upstream_tag` differs
-  from `llama_cpp.version` unless `allow_upstream_tag_override=true` is
-  explicitly passed for an intentional out-of-pin release.
+  from `bridge_source_sha`'s `llama_cpp.version` unless
+  `allow_upstream_tag_override=true` is explicitly passed for an intentional
+  out-of-pin release.
 - Preserve `emsdk.version` as the single compiler source for CI and publish.
   Both workflows must verify the active `emcc` version, and published manifests
   must record that verified identity.
@@ -480,7 +481,7 @@ gh api repos/leehack/llama-web-bridge-assets/immutable-releases  # must be enabl
 3. Publish Exact Qualified Bridge Assets, with the step 1 inputs except
    `assets_immutable_releases_enabled`, plus both run IDs (add
    `-f allow_upstream_tag_override=true` only when `upstream_tag` intentionally
-   differs from `llama_cpp.version`):
+   differs from `bridge_source_sha`'s `llama_cpp.version`):
 
    ```bash
    gh workflow run publish_assets.yml -R leehack/llama-web-bridge --ref main \

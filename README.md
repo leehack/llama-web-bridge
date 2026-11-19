@@ -421,8 +421,9 @@ Every request supplies a required correlation ID, the exact bridge
 source SHA, upstream llama.cpp tag/commit, native release tag plus `assets.json`
 SHA-256, output release tag/rebuild, a distinct required `candidate_run_id` and
 `qualification_run_id`, and an exact assertion of the fixed assets repository.
-Publication checks `upstream_tag` against `llama_cpp.version` and fails early
-when they differ unless `allow_upstream_tag_override=true` is explicitly passed.
+Publication checks `upstream_tag` against `bridge_source_sha`'s
+`llama_cpp.version` and fails early when they differ unless
+`allow_upstream_tag_override=true` is explicitly passed.
 Dispatch values enter shell scripts only through environment variables and
 quoted expansions. The owner sets `publish_approved=true` explicitly, and the
 workflow still validates the live publication-environment policy itself.

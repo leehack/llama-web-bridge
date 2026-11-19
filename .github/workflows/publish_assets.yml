@@ -216,15 +216,10 @@ jobs:
             echo "error: checked-out bridge source does not match the requested full SHA"
             exit 1
           fi
-          PINNED_UPSTREAM_TAG="$(tr -d '[:space:]' < llama_cpp.version)"
-          if [ -z "${PINNED_UPSTREAM_TAG}" ]; then
-            echo "error: llama_cpp.version is empty"
-            exit 1
-          fi
-          if [ "${UPSTREAM_TAG}" != "${PINNED_UPSTREAM_TAG}" ] && [ "${ALLOW_UPSTREAM_TAG_OVERRIDE}" != "true" ]; then
-            echo "error: upstream_tag (${UPSTREAM_TAG}) differs from llama_cpp.version (${PINNED_UPSTREAM_TAG}); set allow_upstream_tag_override=true to override"
-            exit 1
-          fi
+          node scripts/release/contract.mjs validate-upstream-pin \
+            --pin-file bridge-source/llama_cpp.version \
+            --upstream-tag "${UPSTREAM_TAG}" \
+            --allow-override "${ALLOW_UPSTREAM_TAG_OVERRIDE}"
           node scripts/release/contract.mjs validate-release \
             --release-tag "${RELEASE_TAG}" --release-rebuild "${RELEASE_REBUILD}" \
             --upstream-tag "${UPSTREAM_TAG}"

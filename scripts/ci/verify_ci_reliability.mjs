@@ -1162,17 +1162,16 @@ function checkPublication({ publish, candidate }, errors) {
   );
   const validateInputs = publish.step('verify-candidate-and-qualification', 'Validate exact bridge and release inputs');
   const upstreamLookupStep = publish.step('verify-candidate-and-qualification', 'Resolve immutable upstream and native release tag commits');
+  const expectedPinGuard = `${RELEASE_CONTRACT_COMMAND} validate-upstream-pin --pin-file bridge-source/llama_cpp.version --upstream-tag "\${UPSTREAM_TAG}" --allow-override "\${ALLOW_UPSTREAM_TAG_OVERRIDE}"`;
   check.require(
     validateInputs !== undefined
       && upstreamLookupStep !== undefined
       && validateInputs.index < upstreamLookupStep.index
       && validateInputs.env.UPSTREAM_TAG === '${{ inputs.upstream_tag }}'
       && validateInputs.env.ALLOW_UPSTREAM_TAG_OVERRIDE === '${{ inputs.allow_upstream_tag_override }}'
-      && validateInputs.run.includes("tr -d '[:space:]' < llama_cpp.version")
-      && validateInputs.run.includes('"${UPSTREAM_TAG}" != "${PINNED_UPSTREAM_TAG}"')
-      && validateInputs.run.includes('"${ALLOW_UPSTREAM_TAG_OVERRIDE}" != "true"')
-      && !/\bUPSTREAM_TAG=/.test(runText),
-    `${publish.path} must fail early when upstream_tag differs from llama_cpp.version unless allow_upstream_tag_override=true, without deriving UPSTREAM_TAG from llama_cpp.version`,
+      && shellCommands(validateInputs.run).includes(expectedPinGuard)
+      && !/\b(?:UPSTREAM_TAG|ALLOW_UPSTREAM_TAG_OVERRIDE)=/.test(runText),
+    `${publish.path} must fail early via ${expectedPinGuard}, without deriving UPSTREAM_TAG or ALLOW_UPSTREAM_TAG_OVERRIDE in shell`,
   );
   check.includes(publish.path, runText, [
     'if [ "${GITHUB_REPOSITORY}" != "${BRIDGE_REPO}" ]',

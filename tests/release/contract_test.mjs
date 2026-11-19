@@ -4,7 +4,7 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
@@ -36,6 +36,7 @@ import {
   validateReleaseAttestation,
   validateReleaseIdentity,
   validateReleaseImmutability,
+  validateUpstreamPin,
 } from '../../scripts/release/contract.mjs';
 import { PyException, pyItems, pyJsonDumps, pyJsonLoads } from '../../scripts/release/json.mjs';
 import { ASSETS_REPO, RUN_ID, RUN_URL, TAG_COMMIT, releaseAttestation } from './contract_fixtures.mjs';
@@ -1166,5 +1167,94 @@ test('test_reads_current_and_legacy_previous_manifest', () => {
       );
       assert.throws(() => readPreviousManifest(conflicting), ContractError, field);
     }
+  });
+});
+
+test('test_validate_upstream_pin_checks_bridge_source_and_override', () => {
+  withTemporaryDirectory((directory) => {
+    const rootPin = path.join(directory, 'llama_cpp.version');
+    const bridgeDir = path.join(directory, 'bridge-source');
+    const bridgePin = path.join(bridgeDir, 'llama_cpp.version');
+    mkdirSync(bridgeDir, { recursive: true });
+    // Simulate a workflow checkout at v1.0.0 publishing an older bridge-source commit pinned at v0.5.0.
+    writeFileSync(rootPin, 'v1.0.0\n', 'utf8');
+    writeFileSync(bridgePin, 'v0.5.0\n', 'utf8');
+
+    const runInDir = (args) => {
+      const result = spawnSync(process.execPath, [CLI, ...args], { cwd: directory, encoding: 'utf8' });
+      return { returncode: result.status, stdout: result.stdout, stderr: result.stderr };
+    };
+
+    // Mismatch against bridge-source/llama_cpp.version fails unless allow_upstream_tag_override=true.
+    for (const overrideArgs of [[], ['--allow-override', 'false'], ['--allow-override=']]) {
+      const rejected = runInDir([
+        'validate-upstream-pin',
+        '--pin-file', 'bridge-source/llama_cpp.version',
+        '--upstream-tag', 'v1.0.0',
+        ...overrideArgs,
+      ]);
+      assert.notEqual(rejected.returncode, 0);
+      assert.match(rejected.stderr, /differs from/);
+    }
+
+    const overridden = runInDir([
+      'validate-upstream-pin',
+      '--pin-file', 'bridge-source/llama_cpp.version',
+      '--upstream-tag', 'v1.0.0',
+      '--allow-override', 'true',
+    ]);
+    assert.equal(overridden.returncode, 0, overridden.stderr);
+    assert.deepEqual(JSON.parse(overridden.stdout), {
+      override_applied: true,
+      pinned_upstream_tag: 'v0.5.0',
+      upstream_tag: 'v1.0.0',
+    });
+
+    // Exact match passes without override.
+    writeFileSync(bridgePin, 'v1.0.0\n', 'utf8');
+    const matched = runInDir([
+      'validate-upstream-pin',
+      '--pin-file', 'bridge-source/llama_cpp.version',
+      '--upstream-tag', 'v1.0.0',
+      '--allow-override', 'false',
+    ]);
+    assert.equal(matched.returncode, 0, matched.stderr);
+    assert.deepEqual(JSON.parse(matched.stdout), {
+      override_applied: false,
+      pinned_upstream_tag: 'v1.0.0',
+      upstream_tag: 'v1.0.0',
+    });
+
+    // Empty, quoted, whitespace-padded, multiline, or invalid tags/pin files and invalid overrides fail.
+    for (const badTag of ['', '""', '"v1.0.0"', ' v1.0.0', 'v1.0.0-1', 'main']) {
+      const result = runInDir([
+        'validate-upstream-pin',
+        '--pin-file', 'bridge-source/llama_cpp.version',
+        `--upstream-tag=${badTag}`,
+        '--allow-override', 'true',
+      ]);
+      assert.notEqual(result.returncode, 0, JSON.stringify(badTag));
+    }
+    for (const badPin of ['', '\n', '"v1.0.0"\n', ' v1.0.0\n', 'v1.0.0\r\n', 'v1.0.0\nv1.0.0\n', 'main\n']) {
+      writeFileSync(bridgePin, badPin, 'utf8');
+      const result = runInDir([
+        'validate-upstream-pin',
+        '--pin-file', 'bridge-source/llama_cpp.version',
+        '--upstream-tag', 'v1.0.0',
+        '--allow-override', 'true',
+      ]);
+      assert.notEqual(result.returncode, 0, JSON.stringify(badPin));
+    }
+    writeFileSync(bridgePin, 'v1.0.0\n', 'utf8');
+    for (const badOverride of ['yes', '1', 'TRUE']) {
+      const result = runInDir([
+        'validate-upstream-pin',
+        '--pin-file', 'bridge-source/llama_cpp.version',
+        '--upstream-tag', 'v1.0.0',
+        '--allow-override', badOverride,
+      ]);
+      assert.notEqual(result.returncode, 0, badOverride);
+    }
+    assert.throws(() => validateUpstreamPin(path.join(directory, 'missing/llama_cpp.version'), 'v1.0.0'), ContractError);
   });
 });
