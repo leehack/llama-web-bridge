@@ -84,7 +84,10 @@ parts. Each parts array produces one pooled vector; strings retain their existin
 route and defaults. Use `getEmbeddingCapabilities()` after model/projector loading
 to check the active runtime. Media needs a compatible pooled embedding model,
 projector and mixed-batch upstream API; generation support does not imply embedding
-support. The current production source pin reports media embeddings unsupported.
+support. The `v1.0.0` source pin exposes the mixed-batch upstream API
+(`getEmbeddingCapabilities()` reports `image`/`audio` for compatible pooled
+embedding models and non-M-RoPE projectors); local BF16 CPU qualification in
+[the qualification record](docs/multimodal_embeddings.md) ran against `v0.7.0`.
 
 The parts path validates the whole expanded input against one physical microbatch
 and never chunks or averages separate parts. Direct and worker runtimes preserve
@@ -215,13 +218,13 @@ This repo includes a wasm build gate in:
 - `.github/workflows/ci.yml`
 
 After the JS/compatibility contracts pass, it builds wasm32 and memory64 against
-the `llama.cpp` tag in `llama_cpp.version` and the exact v1.0.0 candidate in
-separate lanes. Both run state-persistence, multimodal, grammar, next-token
-scoring, and speculative decoding browser smokes. The default lane uploads
-the seven built files as `webgpu-bridge-dist` on success and any available
-smoke diagnostics on failure. The candidate lane uses the `v1.0.0` suffix
-for its check and artifacts. The [v1.0.0 preparation notes](docs/v100_qualification.md)
-cover the release gates.
+the `llama.cpp` tag in `llama_cpp.version` (`v1.0.0`, verified against
+`b1b770d90d94cad9e9ea5b993bdbc383a522fb28`). It runs state-persistence,
+multimodal, grammar, next-token scoring, and speculative decoding browser
+smokes, uploading the seven built files as `webgpu-bridge-dist` on success and
+any available smoke diagnostics on failure. The
+[v1.0.0 qualification notes](docs/v100_qualification.md) cover the qualification
+evidence and release gates.
 
 To run the media-helper and static CI contracts locally:
 
@@ -418,6 +421,9 @@ Every request supplies a required correlation ID, the exact bridge
 source SHA, upstream llama.cpp tag/commit, native release tag plus `assets.json`
 SHA-256, output release tag/rebuild, a distinct required `candidate_run_id` and
 `qualification_run_id`, and an exact assertion of the fixed assets repository.
+Publication checks `upstream_tag` against `bridge_source_sha`'s
+`llama_cpp.version` and fails early when they differ unless
+`allow_upstream_tag_override=true` is explicitly passed.
 Dispatch values enter shell scripts only through environment variables and
 quoted expansions. The owner sets `publish_approved=true` explicitly, and the
 workflow still validates the live publication-environment policy itself.

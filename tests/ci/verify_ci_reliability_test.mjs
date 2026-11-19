@@ -715,6 +715,22 @@ assertRejected(validatePublicationPatContract('jobs: [unterminated', EXPECTED_ST
     [PUBLISH_PATH, '          set -euo pipefail\n          gh api "repos/${BRIDGE_REPO}/environments/bridge-assets-publication" \\\n            > "${RUNNER_TEMP}/publication-environment.json"',
       '          set -euo pipefail\n          npx --yes some-package\n          gh api "repos/${BRIDGE_REPO}/environments/bridge-assets-publication" \\\n            > "${RUNNER_TEMP}/publication-environment.json"',
       `${PUBLISH_PATH} job verify-publication-environment must never install or run packages`],
+    // Upstream pin match gate and override input on publish_assets.yml.
+    [PUBLISH_PATH, '      allow_upstream_tag_override:\n        description: Allow upstream_tag to differ from llama_cpp.version for an intentional out-of-pin release\n        required: false\n        default: false',
+      '      allow_upstream_tag_override:\n        description: Allow upstream_tag to differ from llama_cpp.version for an intentional out-of-pin release\n        required: false\n        default: true',
+      `${PUBLISH_PATH} must define allow_upstream_tag_override as an optional boolean input defaulting to false`],
+    [PUBLISH_PATH, '            --pin-file bridge-source/llama_cpp.version \\',
+      '            --pin-file llama_cpp.version \\',
+      `${PUBLISH_PATH} must fail early via`],
+    [PUBLISH_PATH, '            --allow-override "${ALLOW_UPSTREAM_TAG_OVERRIDE}"',
+      '            --allow-override true',
+      `${PUBLISH_PATH} must fail early via`],
+    [PUBLISH_PATH, '          node scripts/release/contract.mjs validate-upstream-pin \\\n            --pin-file bridge-source/llama_cpp.version \\\n            --upstream-tag "${UPSTREAM_TAG}" \\\n            --allow-override "${ALLOW_UPSTREAM_TAG_OVERRIDE}"\n',
+      '',
+      `${PUBLISH_PATH} must fail early via`],
+    [PUBLISH_PATH, '          node scripts/release/contract.mjs validate-upstream-pin \\\n',
+      '          UPSTREAM_TAG="$(tr -d \'[:space:]\' < bridge-source/llama_cpp.version)"\n          node scripts/release/contract.mjs validate-upstream-pin \\\n',
+      'without deriving UPSTREAM_TAG or ALLOW_UPSTREAM_TAG_OVERRIDE in shell'],
   ];
   for (const [relativePath, old, replacement, fragment, options] of cases) {
     const errors = mutated(relativePath, old, replacement, options);
