@@ -31,6 +31,7 @@ export interface DrainOptions {
 export interface WriteResponseOptions {
   totalBytes?: unknown;
   useBigIntPosition?: boolean;
+  skipMemoryReservation?: boolean;
   startOffset?: unknown;
   preservePartialOnError?: boolean;
   chunkTimeoutMs?: unknown;
@@ -431,7 +432,9 @@ export async function writeResponseToFsFileWithProgress(
     return finalLoaded;
   }
 
-  const reservedLength = reservableResponseLength(response, startOffset, useBigIntPosition);
+  const reservedLength = writeOptions.skipMemoryReservation === true
+    ? 0
+    : reservableResponseLength(response, startOffset, useBigIntPosition);
   // CORS can hide Content-Encoding while exposing compressed Content-Length.
   // Constructed/cache responses can also lose the original response type.
   const encoding = response.headers.get('content-encoding')?.trim().toLowerCase();

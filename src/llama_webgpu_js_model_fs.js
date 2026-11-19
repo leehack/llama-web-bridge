@@ -1,0 +1,216 @@
+// Chunked JS-backed WASMFS file storage for staging large models outside wasm linear memory.
+
+addToLibrary({
+  $llamadartJsModelFsState: {
+    files: null,
+    nextPreallocBytes: 0,
+    chunkSize: 67108864, // 64 MiB
+  },
+
+  $llamadartJsModelFsFiles__deps: ['$llamadartJsModelFsState'],
+  $llamadartJsModelFsFiles: () => {
+    if (!llamadartJsModelFsState.files) {
+      llamadartJsModelFsState.files = new Map();
+    }
+    return llamadartJsModelFsState.files;
+  },
+
+  _llamadart_js_model_fs_set_next_prealloc_bytes__sig: 'vj',
+  _llamadart_js_model_fs_set_next_prealloc_bytes__i53abi: true,
+  _llamadart_js_model_fs_set_next_prealloc_bytes__deps: ['$llamadartJsModelFsState'],
+  _llamadart_js_model_fs_set_next_prealloc_bytes: (bytes) => {
+    llamadartJsModelFsState.nextPreallocBytes = bytes > 0 ? bytes : 0;
+  },
+
+  _llamadart_js_model_fs_alloc_file__sig: 'vp',
+  _llamadart_js_model_fs_alloc_file__deps: [
+    '$llamadartJsModelFsState',
+    '$llamadartJsModelFsFiles',
+  ],
+  _llamadart_js_model_fs_alloc_file: (fileId) => {
+    const chunkSize = llamadartJsModelFsState.chunkSize;
+    const preallocBytes = llamadartJsModelFsState.nextPreallocBytes;
+    llamadartJsModelFsState.nextPreallocBytes = 0;
+
+    const chunks = [];
+    let oomError = false;
+    if (preallocBytes > 0) {
+      const numChunks = Math.ceil(preallocBytes / chunkSize);
+      try {
+        for (let i = 0; i < numChunks; i += 1) {
+          const isLast = i === numChunks - 1;
+          const len = isLast ? (preallocBytes - i * chunkSize) : chunkSize;
+          chunks.push(new Uint8Array(len));
+        }
+      } catch (_) {
+        chunks.length = 0;
+        oomError = true;
+      }
+    }
+
+    llamadartJsModelFsFiles().set(fileId, {
+      size: 0,
+      chunkSize,
+      chunks,
+      oomError,
+    });
+  },
+
+  _llamadart_js_model_fs_free_file__sig: 'vp',
+  _llamadart_js_model_fs_free_file__deps: ['$llamadartJsModelFsFiles'],
+  _llamadart_js_model_fs_free_file: (fileId) => {
+    const files = llamadartJsModelFsFiles();
+    const file = files.get(fileId);
+    if (file) {
+      file.chunks.length = 0;
+      file.size = 0;
+      files.delete(fileId);
+    }
+  },
+
+  _llamadart_js_model_fs_write__sig: 'ippij',
+  _llamadart_js_model_fs_write__i53abi: true,
+  _llamadart_js_model_fs_write__deps: ['$llamadartJsModelFsFiles'],
+  _llamadart_js_model_fs_write: (fileId, buffer, length, offset) => {
+    const file = llamadartJsModelFsFiles().get(fileId);
+    if (!file) {
+      return -{{{ cDefs.EBADF }}};
+    }
+    if (file.oomError) {
+      return -{{{ cDefs.ENOMEM }}};
+    }
+    if (offset < 0) {
+      return -{{{ cDefs.EINVAL }}};
+    }
+    length >>>= 0;
+    if (length === 0) {
+      return 0;
+    }
+
+    const chunkSize = file.chunkSize;
+    const end = offset + length;
+    const firstChunk = Math.floor(offset / chunkSize);
+    const lastChunk = Math.floor((end - 1) / chunkSize);
+    const srcBase = buffer >>> 0;
+
+    try {
+      for (let idx = firstChunk; idx <= lastChunk; idx += 1) {
+        const chunkBase = idx * chunkSize;
+        const writeStart = Math.max(offset, chunkBase);
+        const writeEnd = Math.min(end, chunkBase + chunkSize);
+        const copyLen = writeEnd - writeStart;
+        const dstOff = writeStart - chunkBase;
+        const srcOff = srcBase + (writeStart - offset);
+
+        let chunk = file.chunks[idx];
+        if (!chunk) {
+          chunk = new Uint8Array(chunkSize);
+          file.chunks[idx] = chunk;
+        } else if (dstOff + copyLen > chunk.length) {
+          // Only resize this single chunk if the file grew past its preallocated tail.
+          const expanded = new Uint8Array(chunkSize);
+          expanded.set(chunk);
+          chunk = expanded;
+          file.chunks[idx] = chunk;
+        }
+
+        chunk.set(HEAPU8.subarray(srcOff, srcOff + copyLen), dstOff);
+      }
+      if (end > file.size) {
+        file.size = end;
+      }
+      return length;
+    } catch (_) {
+      return -{{{ cDefs.ENOMEM }}};
+    }
+  },
+
+  _llamadart_js_model_fs_read__sig: 'ippij',
+  _llamadart_js_model_fs_read__i53abi: true,
+  _llamadart_js_model_fs_read__deps: ['$llamadartJsModelFsFiles'],
+  _llamadart_js_model_fs_read: (fileId, buffer, length, offset) => {
+    const file = llamadartJsModelFsFiles().get(fileId);
+    if (!file) {
+      return -{{{ cDefs.EBADF }}};
+    }
+    if (offset < 0) {
+      return -{{{ cDefs.EINVAL }}};
+    }
+    length >>>= 0;
+    if (length === 0 || offset >= file.size) {
+      return 0;
+    }
+
+    const available = file.size - offset;
+    const toRead = Math.min(length, available);
+    const end = offset + toRead;
+    const chunkSize = file.chunkSize;
+    const firstChunk = Math.floor(offset / chunkSize);
+    const lastChunk = Math.floor((end - 1) / chunkSize);
+    const dstBase = buffer >>> 0;
+
+    for (let idx = firstChunk; idx <= lastChunk; idx += 1) {
+      const chunkBase = idx * chunkSize;
+      const readStart = Math.max(offset, chunkBase);
+      const readEnd = Math.min(end, chunkBase + chunkSize);
+      const copyLen = readEnd - readStart;
+      const srcOff = readStart - chunkBase;
+      const dstOff = dstBase + (readStart - offset);
+
+      const chunk = file.chunks[idx];
+      if (!chunk || srcOff >= chunk.length) {
+        HEAPU8.fill(0, dstOff, dstOff + copyLen);
+      } else if (srcOff + copyLen <= chunk.length) {
+        HEAPU8.set(chunk.subarray(srcOff, srcOff + copyLen), dstOff);
+      } else {
+        const validLen = chunk.length - srcOff;
+        HEAPU8.set(chunk.subarray(srcOff, chunk.length), dstOff);
+        HEAPU8.fill(0, dstOff + validLen, dstOff + copyLen);
+      }
+    }
+
+    return toRead;
+  },
+
+  _llamadart_js_model_fs_get_size__sig: 'vpp',
+  _llamadart_js_model_fs_get_size__deps: ['$llamadartJsModelFsFiles'],
+  _llamadart_js_model_fs_get_size: (fileId, outSizePtr) => {
+    const file = llamadartJsModelFsFiles().get(fileId);
+    const size = file ? file.size : 0;
+    {{{ makeSetValue('outSizePtr', 0, 'size', 'i64') }}};
+  },
+
+  _llamadart_js_model_fs_set_size__sig: 'ipj',
+  _llamadart_js_model_fs_set_size__i53abi: true,
+  _llamadart_js_model_fs_set_size__deps: ['$llamadartJsModelFsFiles'],
+  _llamadart_js_model_fs_set_size: (fileId, size) => {
+    const file = llamadartJsModelFsFiles().get(fileId);
+    if (!file) {
+      return -{{{ cDefs.EBADF }}};
+    }
+    if (size < 0) {
+      return -{{{ cDefs.EINVAL }}};
+    }
+    if (size === 0) {
+      if (file.size > 0) {
+        file.chunks.length = 0;
+        file.size = 0;
+      }
+      return 0;
+    }
+
+    const chunkSize = file.chunkSize;
+    if (size < file.size) {
+      const keepChunks = Math.ceil(size / chunkSize);
+      file.chunks.length = keepChunks;
+      const lastIdx = keepChunks - 1;
+      const tailLen = size - lastIdx * chunkSize;
+      const lastChunk = file.chunks[lastIdx];
+      if (lastChunk && tailLen < lastChunk.length) {
+        lastChunk.fill(0, tailLen);
+      }
+    }
+    file.size = size;
+    return 0;
+  },
+});

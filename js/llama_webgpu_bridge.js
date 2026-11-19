@@ -1290,7 +1290,7 @@ async function writeResponseToFsFileWithProgress(response, fs, filePath, progres
     }
     return finalLoaded2;
   }
-  const reservedLength = reservableResponseLength(response, startOffset, useBigIntPosition);
+  const reservedLength = writeOptions.skipMemoryReservation === true ? 0 : reservableResponseLength(response, startOffset, useBigIntPosition);
   const encoding = response.headers.get("content-encoding")?.trim().toLowerCase();
   const exactLength = reservedLength > 0 && (response.type === "basic" || encoding === "identity") ? reservedLength : 0;
   const reader = response.body.getReader();
@@ -3062,7 +3062,20 @@ var LlamaWebGpuBridgeRuntime = class {
       this._runtimeNotes.push("model_fetch_backend_skipped_split");
     }
     if (!loadedViaRemoteFetch) {
-      ensureFsDirectory(core.FS, "/models");
+      const useJsBackedStaging = this._config.jsBackedModelStaging === true;
+      let modelDir = "/models";
+      if (useJsBackedStaging) {
+        const mountRc = Number(
+          core.ccall("llamadart_webgpu_mount_js_model_fs", "number", ["string"], ["/jsmodels"])
+        );
+        if (mountRc !== 0) {
+          throw new Error(`Failed to mount JS-backed model filesystem (rc=${mountRc})`);
+        }
+        modelDir = "/jsmodels";
+        this._pushRuntimeNote("model_staging_js_backed");
+      } else {
+        ensureFsDirectory(core.FS, "/models");
+      }
       const progressCallback = typeof options.progressCallback === "function" ? options.progressCallback : null;
       const shardLoaded = new Array(modelUrls.length).fill(0);
       const shardTotals = new Array(modelUrls.length).fill(0);
@@ -3088,7 +3101,7 @@ var LlamaWebGpuBridgeRuntime = class {
         for (let shardIndex = 0; shardIndex < modelUrls.length; shardIndex += 1) {
           const shardUrl = modelUrls[shardIndex];
           const fileName = basenameFromUrl(shardUrl);
-          const modelPath = `/models/${fileName}`;
+          const modelPath = `${modelDir}/${fileName}`;
           modelPaths.push(modelPath);
           let shardBytes = 0;
           let resumeOffset = 0;
@@ -3138,6 +3151,14 @@ var LlamaWebGpuBridgeRuntime = class {
               shardTotals[shardIndex] = responseTotal;
             }
             try {
+              if (useJsBackedStaging && resumeOffset === 0 && knownTotalBytes > 0) {
+                core.ccall(
+                  "llamadart_webgpu_js_model_fs_prealloc_next",
+                  null,
+                  ["number"],
+                  [knownTotalBytes]
+                );
+              }
               shardBytes = await writeResponseToFsFileWithProgress(
                 response,
                 core.FS,
@@ -3153,6 +3174,7 @@ var LlamaWebGpuBridgeRuntime = class {
                 } : null,
                 {
                   useBigIntPosition: this._coreVariant === "wasm64",
+                  skipMemoryReservation: useJsBackedStaging,
                   startOffset: resumeOffset,
                   preservePartialOnError: true,
                   totalBytes: knownTotalBytes,
@@ -6521,6 +6543,7 @@ var LlamaWebGpuBridge = class {
       coreModuleUrlMem64: typeof config.coreModuleUrlMem64 === "string" ? config.coreModuleUrlMem64 : void 0,
       preferMemory64: typeof config.preferMemory64 === "boolean" ? config.preferMemory64 : void 0,
       allowSingleThreadCore: config.allowSingleThreadCore === true ? true : void 0,
+      jsBackedModelStaging: config.jsBackedModelStaging === true ? true : void 0,
       threads: Number(config.threads) > 0 ? Number(config.threads) : void 0,
       threadsBatch: Number(config.threadsBatch) > 0 ? Number(config.threadsBatch) : void 0,
       threadPoolSize: Number(config.threadPoolSize) > 0 ? Number(config.threadPoolSize) : void 0,

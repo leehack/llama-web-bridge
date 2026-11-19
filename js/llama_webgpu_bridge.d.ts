@@ -11,6 +11,8 @@ export interface LlamaWebGpuBridgeConfig {
   coreModuleFactory?: LlamaCoreModuleFactory | Promise<LlamaCoreModuleFactory>;
   /** Set for a `coreModuleUrl` core built without pthreads (`WEBGPU_BRIDGE_PTHREADS=0`): it loads on a page that is not cross-origin isolated, capped to one thread, instead of rejecting with `CrossOriginIsolationError`. */
   allowSingleThreadCore?: boolean;
+  /** Stage fetched model files into a chunked JS-backed WASMFS mount outside wasm linear memory. */
+  jsBackedModelStaging?: boolean;
   workerUrl?: string;
   disableWorker?: boolean;
   preferMemory64?: boolean;

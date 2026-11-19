@@ -1461,6 +1461,7 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
         ? config.preferMemory64
         : undefined,
       allowSingleThreadCore: config.allowSingleThreadCore === true ? true : undefined,
+      jsBackedModelStaging: config.jsBackedModelStaging === true ? true : undefined,
       threads: Number(config.threads) > 0 ? Number(config.threads) : undefined,
       threadsBatch: Number(config.threadsBatch) > 0
         ? Number(config.threadsBatch)

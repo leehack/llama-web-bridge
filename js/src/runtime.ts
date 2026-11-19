@@ -2122,7 +2122,20 @@ export class LlamaWebGpuBridgeRuntime {
     }
 
     if (!loadedViaRemoteFetch) {
-      ensureFsDirectory(core.FS, '/models');
+      const useJsBackedStaging = this._config.jsBackedModelStaging === true;
+      let modelDir = '/models';
+      if (useJsBackedStaging) {
+        const mountRc = Number(
+          core.ccall('llamadart_webgpu_mount_js_model_fs', 'number', ['string'], ['/jsmodels']),
+        );
+        if (mountRc !== 0) {
+          throw new Error(`Failed to mount JS-backed model filesystem (rc=${mountRc})`);
+        }
+        modelDir = '/jsmodels';
+        this._pushRuntimeNote('model_staging_js_backed');
+      } else {
+        ensureFsDirectory(core.FS, '/models');
+      }
 
       const progressCallback = typeof options.progressCallback === 'function'
         ? options.progressCallback
@@ -2156,7 +2169,7 @@ export class LlamaWebGpuBridgeRuntime {
         for (let shardIndex = 0; shardIndex < modelUrls.length; shardIndex += 1) {
           const shardUrl = modelUrls[shardIndex];
           const fileName = basenameFromUrl(shardUrl);
-          const modelPath = `/models/${fileName}`;
+          const modelPath = `${modelDir}/${fileName}`;
           modelPaths.push(modelPath);
 
           let shardBytes = 0;
@@ -2219,6 +2232,14 @@ export class LlamaWebGpuBridgeRuntime {
             }
 
             try {
+              if (useJsBackedStaging && resumeOffset === 0 && knownTotalBytes > 0) {
+                core.ccall(
+                  'llamadart_webgpu_js_model_fs_prealloc_next',
+                  null,
+                  ['number'],
+                  [knownTotalBytes],
+                );
+              }
               shardBytes = await writeResponseToFsFileWithProgress(
                 response,
                 core.FS,
@@ -2236,6 +2257,7 @@ export class LlamaWebGpuBridgeRuntime {
                   : null,
                 {
                   useBigIntPosition: this._coreVariant === 'wasm64',
+                  skipMemoryReservation: useJsBackedStaging,
                   startOffset: resumeOffset,
                   preservePartialOnError: true,
                   totalBytes: knownTotalBytes,
