@@ -715,6 +715,19 @@ assertRejected(validatePublicationPatContract('jobs: [unterminated', EXPECTED_ST
     [PUBLISH_PATH, '          set -euo pipefail\n          gh api "repos/${BRIDGE_REPO}/environments/bridge-assets-publication" \\\n            > "${RUNNER_TEMP}/publication-environment.json"',
       '          set -euo pipefail\n          npx --yes some-package\n          gh api "repos/${BRIDGE_REPO}/environments/bridge-assets-publication" \\\n            > "${RUNNER_TEMP}/publication-environment.json"',
       `${PUBLISH_PATH} job verify-publication-environment must never install or run packages`],
+    // Upstream pin match gate and override input on publish_assets.yml.
+    [PUBLISH_PATH, '      allow_upstream_tag_override:\n        description: Allow upstream_tag to differ from llama_cpp.version for an intentional out-of-pin release\n        required: false\n        default: false',
+      '      allow_upstream_tag_override:\n        description: Allow upstream_tag to differ from llama_cpp.version for an intentional out-of-pin release\n        required: false\n        default: true',
+      `${PUBLISH_PATH} must define allow_upstream_tag_override as an optional boolean input defaulting to false`],
+    [PUBLISH_PATH, 'if [ "${UPSTREAM_TAG}" != "${PINNED_UPSTREAM_TAG}" ] && [ "${ALLOW_UPSTREAM_TAG_OVERRIDE}" != "true" ]; then',
+      'if false && [ "${ALLOW_UPSTREAM_TAG_OVERRIDE}" != "true" ]; then',
+      `${PUBLISH_PATH} must fail early when upstream_tag differs from llama_cpp.version unless allow_upstream_tag_override=true`],
+    [PUBLISH_PATH, 'if [ "${UPSTREAM_TAG}" != "${PINNED_UPSTREAM_TAG}" ] && [ "${ALLOW_UPSTREAM_TAG_OVERRIDE}" != "true" ]; then',
+      'if [ "${UPSTREAM_TAG}" != "${PINNED_UPSTREAM_TAG}" ] && false; then',
+      `${PUBLISH_PATH} must fail early when upstream_tag differs from llama_cpp.version unless allow_upstream_tag_override=true`],
+    [PUBLISH_PATH, '          PINNED_UPSTREAM_TAG="$(tr -d \'[:space:]\' < llama_cpp.version)"',
+      '          UPSTREAM_TAG="$(tr -d \'[:space:]\' < llama_cpp.version)"\n          PINNED_UPSTREAM_TAG="${UPSTREAM_TAG}"',
+      `without deriving UPSTREAM_TAG from llama_cpp.version`],
   ];
   for (const [relativePath, old, replacement, fragment, options] of cases) {
     const errors = mutated(relativePath, old, replacement, options);

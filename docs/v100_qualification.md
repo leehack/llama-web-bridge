@@ -1,11 +1,13 @@
-# llama.cpp v1.0.0 compatibility preparation
+# llama.cpp v1.0.0 qualification
 
-The CI candidate lane verifies that the llama.cpp `v1.0.0` tag resolves to
-`b1b770d90d94cad9e9ea5b993bdbc383a522fb28` before building. The default lane
-continues to build `v0.5.0` from `llama_cpp.version`. See the
-[v0.9.0 preparation record](v090_qualification.md) for the previous candidate.
+`llama_cpp.version` now pins `v1.0.0`, and CI's default lane verifies that the
+cloned tag resolves to `b1b770d90d94cad9e9ea5b993bdbc383a522fb28` before
+building. The former separate `v1.0.0` candidate CI matrix lane and the
+`v0.5.0`-only `mtmd-audio.cpp` single-thread mel workaround in `CMakeLists.txt`
+have been retired. See the [v0.9.0 preparation record](v090_qualification.md)
+for the previous candidate.
 
-Both lanes build wasm32 and memory64 and run browser smokes for state
+The default lane builds wasm32 and memory64 and runs browser smokes for state
 persistence, multimodal completion, grammar, next-token scoring, and
 speculative decoding. State persistence also runs explicitly on memory64 to
 check model extraction, generation, and state restore. Local commands and

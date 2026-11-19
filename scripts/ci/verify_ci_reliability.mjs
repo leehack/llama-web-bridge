@@ -1130,10 +1130,19 @@ function checkPublication({ publish, candidate }, errors) {
   // Rows 62 and 64: dispatch-only, with an explicit approval input, and no
   // automatic trigger or reusable entry point.
   const on = mapping(publish.data.on);
+  const dispatchInputs = mapping(mapping(on.workflow_dispatch).inputs);
   check.require(
     sameList(Object.keys(on), ['workflow_dispatch'])
-      && has(mapping(mapping(on.workflow_dispatch).inputs), 'publish_approved'),
+      && has(dispatchInputs, 'publish_approved'),
     `${publish.path} must be triggered only by workflow_dispatch (no push, schedule or workflow_call) and take a publish_approved input`,
+  );
+  const overrideInput = mapping(dispatchInputs.allow_upstream_tag_override);
+  check.require(
+    has(dispatchInputs, 'allow_upstream_tag_override')
+      && overrideInput.type === 'boolean'
+      && overrideInput.required === false
+      && overrideInput.default === false,
+    `${publish.path} must define allow_upstream_tag_override as an optional boolean input defaulting to false`,
   );
   const approval = publish.steps.find((step) => step.run.includes('if [ "${PUBLISH_APPROVED}" != "true" ]'));
   check.require(
@@ -1151,7 +1160,20 @@ function checkPublication({ publish, candidate }, errors) {
       && assetsRepo.env.APPROVED_ASSETS_REPO === 'leehack/llama-web-bridge-assets',
     `${publish.path} must refuse any assets_repo other than leehack/llama-web-bridge-assets`,
   );
-  check.excludes(publish.path, text, ['llama_cpp.version'], 'never read the bridge llama.cpp pin');
+  const validateInputs = publish.step('verify-candidate-and-qualification', 'Validate exact bridge and release inputs');
+  const upstreamLookupStep = publish.step('verify-candidate-and-qualification', 'Resolve immutable upstream and native release tag commits');
+  check.require(
+    validateInputs !== undefined
+      && upstreamLookupStep !== undefined
+      && validateInputs.index < upstreamLookupStep.index
+      && validateInputs.env.UPSTREAM_TAG === '${{ inputs.upstream_tag }}'
+      && validateInputs.env.ALLOW_UPSTREAM_TAG_OVERRIDE === '${{ inputs.allow_upstream_tag_override }}'
+      && validateInputs.run.includes("tr -d '[:space:]' < llama_cpp.version")
+      && validateInputs.run.includes('"${UPSTREAM_TAG}" != "${PINNED_UPSTREAM_TAG}"')
+      && validateInputs.run.includes('"${ALLOW_UPSTREAM_TAG_OVERRIDE}" != "true"')
+      && !/\bUPSTREAM_TAG=/.test(runText),
+    `${publish.path} must fail early when upstream_tag differs from llama_cpp.version unless allow_upstream_tag_override=true, without deriving UPSTREAM_TAG from llama_cpp.version`,
+  );
   check.includes(publish.path, runText, [
     'if [ "${GITHUB_REPOSITORY}" != "${BRIDGE_REPO}" ]',
     'if [ "${GITHUB_REF}" != "refs/heads/${bridge_default}" ]',

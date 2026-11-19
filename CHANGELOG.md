@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Bump the default `llama.cpp` pin in `llama_cpp.version` from `v0.5.0` to `v1.0.0` (verified in CI at `b1b770d90d94cad9e9ea5b993bdbc383a522fb28`), retire the separate `v1.0.0` CI matrix lane, remove the `v0.5.0`-only `mtmd-audio.cpp` mel-worker CMake workaround while retaining `mtmd-subcontext.cpp` per-graph worker handling, and make `publish_assets.yml` fail early if `upstream_tag` differs from `llama_cpp.version` unless `allow_upstream_tag_override=true` is set.
+
 - A load on a page that is not cross-origin isolated rejects at once with `CrossOriginIsolationError`, which names `Cross-Origin-Embedder-Policy: require-corp` and that `credentialless` does not isolate Safari, instead of hanging until the core init timeout. The `threads_capped_no_coi` note now appears only for a core loaded with `allowSingleThreadCore`.
 - A load with `nGpuLayers: 0` keeps WebGPU out of the model and context backends, so CPU decoding on Firefox no longer waits on its 100 ms WebGPU queue ticks at every sync (about 50x faster on a small model). `splitMode: 3` at 0 layers still loads.
 - A load with `nGpuLayers > 0` that ends up on the CPU adds the runtime note `gpu_unavailable:<reason>` and one warning, such as `adapter_missing_shader_f16` for Chrome on NVIDIA drivers older than 615.71.

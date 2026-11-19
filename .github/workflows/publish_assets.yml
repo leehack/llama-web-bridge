@@ -22,6 +22,11 @@ on:
         description: Exact llama.cpp vMAJOR.MINOR.PATCH or bNNNN tag
         required: true
         type: string
+      allow_upstream_tag_override:
+        description: Allow upstream_tag to differ from llama_cpp.version for an intentional out-of-pin release
+        required: false
+        default: false
+        type: boolean
       upstream_commit:
         description: Exact full commit resolved by upstream_tag
         required: true
@@ -67,6 +72,7 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
   BRIDGE_SOURCE_SHA: ${{ inputs.bridge_source_sha }}
   UPSTREAM_TAG: ${{ inputs.upstream_tag }}
+  ALLOW_UPSTREAM_TAG_OVERRIDE: ${{ inputs.allow_upstream_tag_override }}
   UPSTREAM_COMMIT: ${{ inputs.upstream_commit }}
   NATIVE_REPO: leehack/llamadart-native
   BRIDGE_REPO: leehack/llama-web-bridge
@@ -208,6 +214,15 @@ jobs:
           set -euo pipefail
           if [[ ! "${BRIDGE_SOURCE_SHA}" =~ ^[0-9a-f]{40}$ ]] || [ "$(git -C bridge-source rev-parse HEAD)" != "${BRIDGE_SOURCE_SHA}" ]; then
             echo "error: checked-out bridge source does not match the requested full SHA"
+            exit 1
+          fi
+          PINNED_UPSTREAM_TAG="$(tr -d '[:space:]' < llama_cpp.version)"
+          if [ -z "${PINNED_UPSTREAM_TAG}" ]; then
+            echo "error: llama_cpp.version is empty"
+            exit 1
+          fi
+          if [ "${UPSTREAM_TAG}" != "${PINNED_UPSTREAM_TAG}" ] && [ "${ALLOW_UPSTREAM_TAG_OVERRIDE}" != "true" ]; then
+            echo "error: upstream_tag (${UPSTREAM_TAG}) differs from llama_cpp.version (${PINNED_UPSTREAM_TAG}); set allow_upstream_tag_override=true to override"
             exit 1
           fi
           node scripts/release/contract.mjs validate-release \
