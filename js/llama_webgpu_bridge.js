@@ -810,6 +810,15 @@ var SingleThreadCoreError = class extends Error {
   }
 };
 var CROSS_ORIGIN_ISOLATION_MESSAGE = 'The llama.cpp web core needs shared memory, which this page cannot use because it is not cross-origin isolated. Serve the page with "Cross-Origin-Opener-Policy: same-origin" and "Cross-Origin-Embedder-Policy: require-corp". "credentialless" does not isolate Safari.';
+var PTHREAD_CORE_TIMEOUT_HINT = ' This core is built with pthreads, and the page cannot share memory with workers. Starting a pthread pool can stall initialization. Use the single-thread "_st" cores with "allowSingleThreadCore", or serve the page with "Cross-Origin-Opener-Policy: same-origin" and "Cross-Origin-Embedder-Policy: require-corp".';
+function coreReportsPthreads(core) {
+  try {
+    const supportsPthreads = core?._llamadart_webgpu_supports_pthreads;
+    return typeof supportsPthreads === "function" && supportsPthreads.call(core) === 1;
+  } catch (_) {
+    return false;
+  }
+}
 
 // js/src/internal/logging.ts
 function logLevelForName(level) {
@@ -3384,14 +3393,15 @@ var LlamaWebGpuBridgeRuntime = class {
         this._runtimeNotes.push("core_mem64_attempt");
       }
       let factoryLoaded = false;
-      let initTimeoutError = null;
+      const initState = {};
       try {
         const moduleFactory = await candidate.factoryPromise;
         factoryLoaded = true;
         const initTimeoutMs = this._resolveCoreInitTimeoutMs();
         this._core = await Promise.race([
           moduleFactory({
-            locateFile: (path, prefix) => {
+            locateFile(path, prefix) {
+              initState.pendingCore = this;
               if (path.endsWith(".wasm") && candidate.wasmUrl) {
                 return candidate.wasmUrl;
               }
@@ -3459,8 +3469,8 @@ var LlamaWebGpuBridgeRuntime = class {
           }),
           new Promise((_, reject) => {
             globalThis.setTimeout(() => {
-              initTimeoutError = new Error(`Bridge core init timeout (${initTimeoutMs}ms)`);
-              reject(initTimeoutError);
+              initState.timeoutError = new Error(`Bridge core init timeout (${initTimeoutMs}ms)`);
+              reject(initState.timeoutError);
             }, initTimeoutMs);
           })
         ]);
@@ -3474,8 +3484,12 @@ var LlamaWebGpuBridgeRuntime = class {
         break;
       } catch (error) {
         lastError = error;
+        const timeoutError = error === initState.timeoutError ? initState.timeoutError : void 0;
+        if (timeoutError && !canPostSharedMemory() && coreReportsPthreads(initState.pendingCore)) {
+          timeoutError.message += `.${PTHREAD_CORE_TIMEOUT_HINT}`;
+        }
         if (candidate.variant === "wasm64") {
-          const reason = initTimeoutError && error === initTimeoutError ? "timeout" : factoryLoaded && isMemory64Unsupported() ? "unsupported" : "init_error";
+          const reason = timeoutError ? "timeout" : factoryLoaded && isMemory64Unsupported() ? "unsupported" : "init_error";
           memory64FallbackReason = reason;
           this._runtimeNotes.push("core_mem64_unavailable");
           this._runtimeNotes.push(`core_mem64_unavailable:${reason}`);
@@ -3483,6 +3497,8 @@ var LlamaWebGpuBridgeRuntime = class {
           continue;
         }
         throw error;
+      } finally {
+        initState.pendingCore = void 0;
       }
     }
     if (!this._core) {

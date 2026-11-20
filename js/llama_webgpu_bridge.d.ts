@@ -7,9 +7,9 @@ export interface LlamaWebGpuBridgeConfig {
   coreModuleUrlMem64?: string;
   wasmUrl?: string;
   wasmUrlMem64?: string;
-  /** A custom factory skips the cross-origin isolation check, so a custom pthread core on a page that is not isolated still waits for `coreInitTimeoutMs`. */
+  /** A custom factory skips the default isolation check. A core that starts a pthread pool can time out during init if the page cannot share memory with workers. */
   coreModuleFactory?: LlamaCoreModuleFactory | Promise<LlamaCoreModuleFactory>;
-  /** Set for a `coreModuleUrl` core built without pthreads (`WEBGPU_BRIDGE_PTHREADS=0`): it loads on a page that is not cross-origin isolated, capped to one thread, instead of rejecting with `CrossOriginIsolationError`. */
+  /** Set with the explicit `_st` core URLs to load on a page that is not cross-origin isolated, capped to one thread. A core that starts a pthread pool can still hit the core init timeout. */
   allowSingleThreadCore?: boolean;
   /** Stage fetched model files into a chunked JS-backed WASMFS mount outside wasm linear memory. */
   jsBackedModelStaging?: boolean;

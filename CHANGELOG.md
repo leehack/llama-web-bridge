@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- When a core reports pthread support and times out on a page that cannot share memory with workers, the init error suggests using the `_st` cores or enabling cross-origin isolation.
+
 - Escape control characters in tensor names in wasm32 GGUF size errors and report an overflowed declared size as at least 2^64 bytes.
 
 - Keep both memory64 fallback notes in metadata for later loads that reuse the fallback wasm32 core.

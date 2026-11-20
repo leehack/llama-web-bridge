@@ -5,6 +5,14 @@ cores run with one CPU thread. WebGPU can still offload model layers, and the
 cores support vision, speech recognition and speech synthesis. Use the wasm32
 core in Safari, where memory64 is unavailable.
 
+`allowSingleThreadCore` lets the selected core initialize without checking
+whether it starts a pthread pool. When a page cannot share memory with workers,
+the default `llama_webgpu_core.js` and other cores with a pthread pool can stall
+during initialization. Each runtime can wait for `coreInitTimeoutMs` twice, or
+four times if it also tries a stalled threaded memory64 core, before reporting
+`Bridge core init timeout`. A shorter worker load timeout can trigger a retry on
+the main thread. Use the `_st` files for both core URLs you configure.
+
 A worker with automatic fetch-backed loading falls back to streamed staging
 and reports `model_fetch_backend_requires_pthreads`. Forcing the fetch backend
 on a single-thread worker raises `SingleThreadCoreError`. Every single-thread
