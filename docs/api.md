@@ -950,6 +950,8 @@ Returns the versioned capability record for the loaded model/projector. Check
 `supported` before showing synthesis controls. `supportsLanguage` and
 `supportsSpeakerReference` describe optional request inputs; `sampleRate` and
 `channels` describe generated PCM. `reason` explains an unsupported state.
+Check `supportsIncrementalAudio === true` before enabling streamed audio.
+Older bridge assets may omit this capability.
 
 ### `synthesizeSpeech(options)`
 
@@ -998,16 +1000,33 @@ from the returned PCM.
 | `maxFrames` | Maximum generated audio frames. Defaults to `512`; a completed result reports `truncated` when this cap is reached. |
 | `topK`, `topP`, `minP`, `temperature`, `seed` | Model sampling controls. Defaults are `40`, `0.95`, `0`, `0.8`, and a random seed. |
 | `signal` | `AbortSignal` for cancellation. Cancellation rejects with `AbortError`. |
-| `onProgress` | Receives task state, remaining prompt tokens, generated frames, and truncation state. |
+| `streamAudio` | Opt in to incremental PCM. Requires an `onProgress` callback. Defaults to `false`. |
+| `onProgress` | Receives task state, remaining prompt tokens, generated frames, and truncation state. When streamed PCM is available, the event also carries `pcm`, `sampleOffset`, `sampleRate`, and `channels`. |
 
 Direct and worker modes use the same API, and worker mode transfers the output
 PCM buffer to the caller. Apart from the single eligible main-thread retry
 described above, a failed request is surfaced to the caller, who may retry
-explicitly.
+explicitly. Streamed synthesis follows the rules below.
 
 A second synthesis is not rejected. It — and any other shared-runtime operation
 issued while synthesis is running — waits in the FIFO queue and runs in call
 order; see [Operation serialization](#operation-serialization).
+
+#### Streamed audio
+
+With `streamAudio: true`, Qwen3-TTS delivers about 5.76 seconds of PCM per full
+chunk. Any remaining tail arrives on the completing progress event. Concatenate
+the chunks in `sampleOffset` order to obtain the same PCM as a non-streamed
+request with the same sampling seed and settings. The result's `pcm` is empty
+and its `sampleCount` reports the total number of samples.
+
+Worker mode transfers each chunk to the caller. Cancellation stops chunk
+delivery and rejects with `AbortError` if observed before the request settles,
+including from the completing progress callback. After the first chunk reaches
+the caller, a worker failure rejects the request without replaying synthesis.
+A worker script without `supportsIncrementalAudio` rejects a streaming request
+with `TextToSpeechStreamingUnsupportedError` (`TTS_STREAMING_UNSUPPORTED`).
+Use bridge and worker scripts from the same release.
 
 ## Decision heads
 

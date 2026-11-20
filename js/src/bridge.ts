@@ -28,6 +28,7 @@ import {
 } from './internal/lora.ts';
 import { cloneModelSource, hasModelSource, normalizeAbsoluteUrl, resolveModelSource, resolvePartUrls } from './internal/model_source.ts';
 import { ModelStagingError } from './internal/model_staging.ts';
+import { TEXT_TO_SPEECH_CANCELLED } from './internal/text_to_speech.ts';
 import { withoutNul } from './internal/text.ts';
 import { bufferSourceBytes, toUint8Array } from './internal/typed_values.ts';
 import { LlamaWebGpuBridgeRuntime } from './runtime.ts';
@@ -122,6 +123,7 @@ interface ExclusiveRunOptions {
   abortMessage?: string;
   allowDisposed?: boolean;
   kind?: string;
+  cancelSignalWhileActiveOnly?: boolean;
 }
 
 // The last worker model load's proxy and reply, read after a failed load.
@@ -223,6 +225,8 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
   declare _bridgeWarnRecent: Map<string, number>;
   declare _operationQueueTail: Promise<unknown> | null;
   declare _activeOperation: BridgeOperation | null;
+  // Streamed speech stays cancellable until its public promise settles.
+  declare private _settlingStreamedSpeechOperation?: BridgeOperation;
   declare _nextOperationId: number;
   declare _lifecycleState: 'open' | 'disposing' | 'disposed';
   declare _shadowStateTransactionDepth: number;
@@ -734,7 +738,9 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
             reject(abortError());
             return;
           }
-          this._cancelOperation(operation, 'signal');
+          if (!options.cancelSignalWhileActiveOnly || this._activeOperation === operation) {
+            this._cancelOperation(operation, 'signal');
+          }
         };
         signal.addEventListener('abort', onAbort, { once: true });
         removeAbortListener = () => signal.removeEventListener('abort', onAbort);
@@ -1802,6 +1808,7 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
     args: unknown[],
     onEvent?: WorkerEventHandler | null,
     transferList: Transferable[] = [],
+    beforePost?: () => void,
   ): Promise<T> {
     if (this._workerProxy?.coreRetired === true) {
       // The core aborted while no call was waiting on this worker.
@@ -1840,6 +1847,7 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
         operation
           ? { operationId: operation.id, workerGeneration: operation.workerGeneration }
           : undefined,
+        beforePost,
       );
       if (operation?.cancelRequested) {
         // The worker drops a cancel that reached it before this call, so the
@@ -2666,35 +2674,102 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
   }
 
   async synthesizeSpeech(options: Partial<TextToSpeechOptions> = {}) {
+    const streamAudio = options?.streamAudio === true;
+    let operation: BridgeOperation | null = null;
+    let consumerFailure: { error: unknown } | undefined;
+    let synthesisOptions = options;
+    if (streamAudio) {
+      const onProgress = options.onProgress;
+      if (typeof onProgress !== 'function') {
+        throw new TypeError('streamAudio requires an onProgress callback.');
+      }
+      synthesisOptions = {
+        text: options.text,
+        language: options.language,
+        speakerAudio: options.speakerAudio,
+        promptBatchSize: options.promptBatchSize,
+        maxFrames: options.maxFrames,
+        topK: options.topK,
+        topP: options.topP,
+        minP: options.minP,
+        temperature: options.temperature,
+        seed: options.seed,
+        signal: options.signal,
+        streamAudio: true,
+        onProgress: (progress) => {
+          try {
+            onProgress.call(options, progress);
+          } catch (error) {
+            if (!this._isOperationCancellation(undefined, operation)) {
+              consumerFailure = { error };
+            }
+            throw error;
+          }
+        },
+      };
+    }
     for (const field of ['text', 'language'] as const) {
-      const value = options?.[field];
+      const value = synthesisOptions?.[field];
       if (typeof value === 'string') {
         withoutNul(value, `TextToSpeechOptions.${field}`);
       }
     }
-    return this._runExclusive(
-      () => this._synthesizeSpeechUnlocked(options),
+    const synthesis = this._runExclusive(
+      (active) => {
+        operation = active;
+        if (streamAudio) {
+          this._settlingStreamedSpeechOperation = active;
+        }
+        return this._synthesizeSpeechUnlocked(synthesisOptions, streamAudio);
+      },
       {
-        signal: options?.signal,
-        abortMessage: 'Text-to-speech synthesis was cancelled.',
+        signal: synthesisOptions?.signal,
+        abortMessage: TEXT_TO_SPEECH_CANCELLED,
         kind: 'text-to-speech',
+        cancelSignalWhileActiveOnly: streamAudio,
       },
     );
+    if (!streamAudio) {
+      return synthesis;
+    }
+    try {
+      return await synthesis;
+    } finally {
+      if (this._settlingStreamedSpeechOperation === operation) {
+        this._settlingStreamedSpeechOperation = undefined;
+      }
+      if (consumerFailure) {
+        throw consumerFailure.error;
+      }
+      this._throwIfOperationCancelled(undefined, TEXT_TO_SPEECH_CANCELLED, operation);
+    }
   }
 
   async _synthesizeSpeechUnlocked(
-    options: Partial<TextToSpeechOptions> = {},
+    options: Partial<TextToSpeechOptions>,
+    streamAudio: boolean,
   ): Promise<TextToSpeechResult> {
+    if (streamAudio) {
+      this._throwIfOperationCancelled(undefined, TEXT_TO_SPEECH_CANCELLED);
+    }
     if (options.signal?.aborted) {
       throw new DOMException('Text-to-speech synthesis was cancelled.', 'AbortError');
     }
     if (!this._workerProxy) {
-      return this._runtime!.synthesizeSpeech(options);
+      return this._runtime!.synthesizeSpeech(options, streamAudio);
     }
 
+    let deliveredSampleCount = 0;
+    let cancelledAfterChunk = false;
+    let progressFailure: { error: unknown } | undefined;
+    let result: TextToSpeechResult;
+    const operation = this._activeOperation;
     try {
       await this._restoreWorkerModelIfMissing();
-      const workerOptions = { ...options };
+      if (streamAudio) {
+        this._throwIfOperationCancelled(undefined, TEXT_TO_SPEECH_CANCELLED);
+      }
+      const workerOptions = { ...options, streamAudio };
       delete workerOptions.onProgress;
       delete workerOptions.signal;
       const transferList: Transferable[] = [];
@@ -2704,24 +2779,50 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
         workerOptions.speakerAudio = copy;
         transferList.push(copy.buffer);
       }
-      const result = await this._callWorker<TextToSpeechResult>(
+      result = await this._callWorker<TextToSpeechResult>(
         'synthesizeSpeech',
         [workerOptions],
         (event) => {
-          if (event.event === 'progress') {
-            options.onProgress?.((event.payload || {}) as TextToSpeechProgress);
+          if (event.event === 'progress' && !cancelledAfterChunk && !progressFailure) {
+            const progress = (event.payload || {}) as TextToSpeechProgress;
+            const chunkSamples = streamAudio ? progress.pcm?.length ?? 0 : 0;
+            deliveredSampleCount += chunkSamples;
+            try {
+              options.onProgress?.(progress);
+            } catch (error) {
+              if (!streamAudio) {
+                throw error;
+              }
+              progressFailure = { error };
+              this._sendWorkerCancel(this._workerProxy, this._activeOperation);
+              return;
+            }
+            if (chunkSamples > 0) {
+              cancelledAfterChunk = this._isOperationCancellation(undefined);
+            }
           }
         },
         transferList,
+        streamAudio
+          ? () => this._throwIfOperationCancelled(undefined, TEXT_TO_SPEECH_CANCELLED, operation)
+          : undefined,
       );
-      this._throwIfCallerCancelled('Text-to-speech synthesis was cancelled.');
-      return result;
     } catch (error) {
+      if (progressFailure) {
+        if (!isCoreRetiredError(error) && this._isWorkerRequestTimeoutError(error)) {
+          this._disableWorkerFallback(error);
+          await this._waitForWorkerDisposal();
+        }
+        throw progressFailure.error;
+      }
       this._throwIfOperationCancelled(error, 'Text-to-speech synthesis was cancelled.');
       if (isCoreRetiredError(error)) {
+        if (deliveredSampleCount > 0) {
+          throw error;
+        }
         return this._rerunOnCpuAfterCoreAbort(
           error,
-          () => this._synthesizeSpeechUnlocked(options),
+          () => this._synthesizeSpeechUnlocked(options, streamAudio),
         );
       }
       if (
@@ -2733,7 +2834,8 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
       }
 
       const canRetryOnCpu =
-        !this._isCpuModelMode()
+        deliveredSampleCount === 0
+        && !this._isCpuModelMode()
         && (
           this._isDispatchWorkgroupLimitError(error)
           || this._isWorkerRequestTimeoutError(error)
@@ -2748,10 +2850,13 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
           },
           error,
         );
+        if (streamAudio) {
+          this._throwIfOperationCancelled(undefined, TEXT_TO_SPEECH_CANCELLED);
+        }
         if (options.signal?.aborted) {
           throw new DOMException('Text-to-speech synthesis was cancelled.', 'AbortError');
         }
-        return this._runtime!.synthesizeSpeech(options);
+        return this._runtime!.synthesizeSpeech(options, streamAudio);
       }
 
       if (this._isWorkerRequestTimeoutError(error)) {
@@ -2760,6 +2865,21 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
       }
       throw error;
     }
+    if (progressFailure) {
+      throw progressFailure.error;
+    }
+    if (streamAudio) {
+      if (cancelledAfterChunk) {
+        throw createAbortError(TEXT_TO_SPEECH_CANCELLED);
+      }
+      this._throwIfOperationCancelled(undefined, TEXT_TO_SPEECH_CANCELLED);
+      if (result.pcm.length !== 0 || result.sampleCount !== deliveredSampleCount) {
+        throw new Error('Worker streamed PCM sample count does not match the delivered audio.');
+      }
+    } else {
+      this._throwIfCallerCancelled(TEXT_TO_SPEECH_CANCELLED);
+    }
+    return result;
   }
 
   _decisionHeadMap() {
@@ -3661,8 +3781,9 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
       return;
     }
 
-    if (this._activeOperation) {
-      this._cancelOperation(this._activeOperation);
+    const operation = this._activeOperation ?? this._settlingStreamedSpeechOperation;
+    if (operation) {
+      this._cancelOperation(operation);
       return;
     }
 
