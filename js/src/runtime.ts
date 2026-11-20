@@ -124,6 +124,11 @@ type ModelCacheStoreOutcome = 'stored' | 'store_failed';
 const pendingModelCacheStores = new WeakMap<Response, Promise<ModelCacheStoreOutcome>>();
 
 const SAFARI_EMBEDDING_PROBE_MAX_COSINE = 0.999;
+const SAFARI_EMBEDDING_PROBE_MIN_COMPONENT = 0.001;
+
+type SafariGpuProbeResult = 'passed' | 'failed' | 'skipped';
+
+class EmbeddingInputTooLongError extends Error {}
 
 // Fetch and cache knobs read from a load, prefetch or request options bag.
 // Callers may pass anything, so each value is coerced where it is read.
@@ -2966,7 +2971,7 @@ export class LlamaWebGpuBridgeRuntime {
         this._runtimeNotes.push('safari_gpu_probe_embedding');
       }
 
-      const runProbe = async (seedOffset: number) => {
+      const runProbe = async (seedOffset: number): Promise<SafariGpuProbeResult> => {
         try {
           if (probesEmbedding) {
             return await this._probeSafariEmbeddings();
@@ -2980,15 +2985,16 @@ export class LlamaWebGpuBridgeRuntime {
               penalty: 1,
               seed: index + seedOffset,
             });
-            if (looksLikeCorruptedGeneration(probeOutput)) return false;
+            if (looksLikeCorruptedGeneration(probeOutput)) return 'failed';
           }
-          return true;
+          return 'passed';
         } catch (_) {
-          return false;
+          return 'failed';
         }
       };
 
-      if (!(await runProbe(1))) {
+      const probeResult = await runProbe(1);
+      if (probeResult === 'failed') {
         this._runtimeNotes.push('safari_gpu_probe_failed');
 
         const retryCandidates = [];
@@ -3084,7 +3090,7 @@ export class LlamaWebGpuBridgeRuntime {
             break;
           }
 
-          if (await runProbe(11)) {
+          if (await runProbe(11) !== 'failed') {
             this._runtimeNotes.push(`safari_gpu_layers_capped:${candidateLayers}`);
             stabilized = true;
             break;
@@ -3094,7 +3100,7 @@ export class LlamaWebGpuBridgeRuntime {
         if (!stabilized) {
           throw new Error('Safari GPU probe failed and fallback attempts were unsuccessful.');
         }
-      } else {
+      } else if (probeResult === 'passed') {
         this._runtimeNotes.push('safari_gpu_probe_passed');
       }
     }
@@ -5045,23 +5051,46 @@ export class LlamaWebGpuBridgeRuntime {
     }
   }
 
-  async _probeSafariEmbeddings(): Promise<boolean> {
-    // A constant GPU output can have unit norm after native normalization.
-    const options = { normalize: true };
-    const first = await this._readTextEmbedding('The Eiffel Tower is in Paris.', options);
-    const second = await this._readTextEmbedding('WebGPU runs matrix math on the GPU.', options);
-    const finite = (vector: unknown[]): vector is number[] => vector.every(Number.isFinite);
-    if (first.length !== second.length || !finite(first) || !finite(second)) return false;
+  async _probeSafariEmbeddings(): Promise<SafariGpuProbeResult> {
+    const readProbeVector = async (prompt: string) => {
+      const { dimension, values } = await this._readTextEmbedding(prompt, { normalize: true }, true);
+      if (values.length !== dimension || !values.every((value): value is number => Number.isFinite(value))) {
+        return null;
+      }
 
-    const firstNorm = Math.hypot(...first);
-    const secondNorm = Math.hypot(...second);
-    if (Math.abs(firstNorm - 1) >= 0.01 || Math.abs(secondNorm - 1) >= 0.01) return false;
+      // Native normalization can give a collapsed vector unit norm.
+      const significantComponents = values.filter((value) => Math.abs(value) >= SAFARI_EMBEDDING_PROBE_MIN_COMPONENT);
+      const norm = Math.hypot(...values);
+      return significantComponents.length >= 2 && Math.abs(norm - 1) < 0.01 ? { values, norm } : null;
+    };
 
-    const dot = first.reduce((sum, value, index) => sum + value * second[index], 0);
-    return dot / (firstNorm * secondNorm) < SAFARI_EMBEDDING_PROBE_MAX_COSINE;
+    // The native overflow check uses the effective microbatch after context setup.
+    const promptPairs = [
+      ['The Eiffel Tower is in Paris.', 'WebGPU runs matrix math on the GPU.'],
+      ['cat', 'dog'],
+    ];
+    for (const [firstPrompt, secondPrompt] of promptPairs) {
+      try {
+        const first = await readProbeVector(firstPrompt);
+        if (!first) return 'failed';
+        const second = await readProbeVector(secondPrompt);
+        if (!second || first.values.length !== second.values.length) return 'failed';
+
+        const dot = first.values.reduce((sum, value, index) => sum + value * second.values[index], 0);
+        return dot / (first.norm * second.norm) < SAFARI_EMBEDDING_PROBE_MAX_COSINE ? 'passed' : 'failed';
+      } catch (error) {
+        if (!(error instanceof EmbeddingInputTooLongError)) throw error;
+      }
+    }
+    this._runtimeNotes.push('safari_gpu_probe_skipped_input_too_long');
+    return 'skipped';
   }
 
-  async _readTextEmbedding(text: string, options: EmbedOptions): Promise<unknown[]> {
+  async _readTextEmbedding(
+    text: string,
+    options: EmbedOptions,
+    classifyOverflow = false,
+  ): Promise<{ dimension: number; values: unknown[] }> {
     if (this._modelBytes <= 0) {
       throw new Error('No model loaded. Call loadModelFromUrl first.');
     }
@@ -5079,12 +5108,14 @@ export class LlamaWebGpuBridgeRuntime {
     );
 
     if (rc < 0) {
-      throw new Error(this._coreErrorMessage('Embedding generation failed', rc));
+      const message = this._coreErrorMessage('Embedding generation failed', rc);
+      if (classifyOverflow && rc === -12) throw new EmbeddingInputTooLongError(message);
+      throw new Error(message);
     }
 
     const raw = this._core!.ccall('llamadart_webgpu_last_embedding_json', 'string', [], []) || '[]';
     const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? parsed : [];
+    return { dimension: rc, values: Array.isArray(parsed) ? parsed : [] };
   }
 
   async embed(text: EmbedInput, options: EmbedOptions = {}) {
@@ -5095,7 +5126,7 @@ export class LlamaWebGpuBridgeRuntime {
       if (this._abortRequested) throw createAbortError('Embedding was cancelled.');
       return this._embedParts(parts, options);
     }
-    const values = await this._readTextEmbedding(text, options);
+    const { values } = await this._readTextEmbedding(text, options);
     return values.map((value) => {
       const numeric = Number(value);
       return Number.isFinite(numeric) ? numeric : 0;

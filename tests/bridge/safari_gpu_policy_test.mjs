@@ -1,8 +1,14 @@
 import assert from 'node:assert/strict';
-import test from 'node:test';
+import { execFileSync } from 'node:child_process';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+import test, { after } from 'node:test';
+import { fileURLToPath } from 'node:url';
 
 import * as environment from '../../js/src/internal/environment.ts';
 import { createDirectBridge } from './bridge_operation_queue_fixtures.mjs';
+import { readNativeCoreSource } from './native_core_source.mjs';
 
 const MAC = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko)';
 const safari = (version) => `${MAC} Version/${version} Safari/605.1.15`;
@@ -48,14 +54,36 @@ test('the default layer cap is lifted starting at Safari 27', () => {
   assert.equal(environment.safariDefaultMaxGpuLayers(`${MAC} Safari/605.1.15`), 1);
 });
 
-// Mirror the float inputs, double-precision accumulation and float output in
-// normalize_embedding_inplace before the bridge reads the core's JSON.
+let normalizationDir;
+after(() => {
+  if (normalizationDir) rmSync(normalizationDir, { recursive: true, force: true });
+});
+
 function normalizeEmbedding(values) {
-  const floats = values.map(Math.fround);
-  const normSquared = floats.reduce((sum, value) => sum + value * value, 0);
-  if (normSquared <= 0) return floats;
-  const scale = 1 / Math.sqrt(normSquared);
-  return floats.map((value) => Math.fround(value * scale));
+  if (!normalizationDir) {
+    const source = readNativeCoreSource();
+    const start = source.indexOf('void normalize_embedding_inplace(');
+    assert.ok(start >= 0);
+    const normalization = source.slice(start, source.indexOf('\n}\n', start) + 2);
+    const coreIncludes = fileURLToPath(new URL('../../src/', import.meta.url));
+    normalizationDir = mkdtempSync(path.join(tmpdir(), 'lane245-normalization-'));
+    const cpp = path.join(normalizationDir, 'normalize.cpp');
+    writeFileSync(cpp, `
+#include <cmath>
+#include <cstdlib>
+#include <iostream>
+#include "llama_webgpu_embedding_json.h"
+${normalization}
+int main(int argc, char **argv) {
+  std::vector<float> values;
+  for (int i = 1; i < argc; ++i) values.push_back(std::strtof(argv[i], nullptr));
+  normalize_embedding_inplace(values);
+  std::cout << llamadart_webgpu_detail::serialize_embedding_json(values);
+}
+`);
+    execFileSync(process.env.CXX || 'c++', ['-std=c++17', '-I', coreIncludes, cpp, '-o', path.join(normalizationDir, 'normalize')]);
+  }
+  return JSON.parse(execFileSync(path.join(normalizationDir, 'normalize'), values.map(String), { encoding: 'utf8' }));
 }
 
 async function load({
@@ -66,6 +94,8 @@ async function load({
   completion = async () => 'Hello there.',
   nativeEmbedding,
   embeddingJson,
+  embeddingDimension,
+  promptTokens,
 }) {
   const oldNavigator = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
   Object.defineProperty(globalThis, 'navigator', { configurable: true, value: { userAgent } });
@@ -75,6 +105,8 @@ async function load({
     const ccall = core.ccall.bind(core);
     const loadedLayers = [];
     const nativeEmbedCalls = [];
+    let effectiveContext;
+    let effectiveMicrobatch;
     let lastEmbeddingJson = '[]';
     core._llamadart_webgpu_embed_bytes_to_json = () => {};
     if (!legacyCore) {
@@ -86,10 +118,12 @@ async function load({
       if (name === 'llamadart_webgpu_backends_json') return '["WebGPU","CPU"]';
       if (name === 'llamadart_webgpu_load_model') {
         loadedLayers.push(args[6]);
+        effectiveContext = args[1];
+        effectiveMicrobatch = Math.min(effectiveContext, args[4] || 2048, args[5] || 512);
         return 0;
       }
       if (name === 'llamadart_webgpu_free_model' || name === 'llamadart_webgpu_shutdown') return 0;
-      if (name === 'llamadart_webgpu_get_context_size') return 128;
+      if (name === 'llamadart_webgpu_get_context_size') return effectiveContext;
       if (name === 'llamadart_webgpu_embedding_capabilities_json') {
         return JSON.stringify({ apiVersion: 1, text: embeddingModel, image: false, audio: false });
       }
@@ -97,13 +131,13 @@ async function load({
         const [bytes, , normalize] = args;
         const prompt = new TextDecoder().decode(bytes);
         nativeEmbedCalls.push({ prompt, normalize });
+        if (promptTokens?.(prompt) > effectiveMicrobatch) return -12;
         const firstPrompt = nativeEmbedCalls[0].prompt;
         const values = nativeEmbedding?.(prompt, loadedLayers.at(-1), firstPrompt)
           ?? (prompt === firstPrompt ? [3, 4] : [4, -3]);
         const embedding = normalize ? normalizeEmbedding(values) : values;
-        lastEmbeddingJson = embeddingJson?.(embedding)
-          ?? JSON.stringify(embedding.map((value) => Number.isFinite(value) ? Number(value.toPrecision(9)) : 0));
-        return embedding.length;
+        lastEmbeddingJson = embeddingJson?.(embedding) ?? JSON.stringify(embedding);
+        return embeddingDimension ?? embedding.length;
       }
       if (name === 'llamadart_webgpu_last_embedding_json') return lastEmbeddingJson;
       return ccall(name, type, types, args);
@@ -227,6 +261,70 @@ test('an embedding model is probed with an embedding and stays on the GPU', asyn
   }
 });
 
+test('small contexts use shorter embedding probes and keep GPU layers', async () => {
+  for (const nCtx of [8, 10, 12]) {
+    const tokenCount = (prompt) => {
+      if (prompt === 'The Eiffel Tower is in Paris.') return 11;
+      if (prompt === 'WebGPU runs matrix math on the GPU.') return 13;
+      return 3;
+    };
+    const result = await load({
+      userAgent: safari('27.0'),
+      embeddingModel: true,
+      options: { nCtx, nBatch: 32, nUbatch: 32 },
+      promptTokens: tokenCount,
+      nativeEmbedding: (prompt) => prompt === 'cat' ? [3, 4] : [4, -3],
+    });
+    assert.deepEqual(result.loadedLayers, [99], `nCtx=${nCtx}`);
+    assert.deepEqual(result.notes, ['safari_gpu_probe_embedding', 'safari_gpu_probe_passed']);
+    assert.deepEqual(result.nativeEmbedCalls.slice(-2).map(({ prompt }) => prompt), ['cat', 'dog']);
+  }
+});
+
+test('an embedding probe that cannot fit is skipped without dropping GPU layers', async () => {
+  const result = await load({
+    userAgent: safari('27.0'),
+    embeddingModel: true,
+    options: { nCtx: 2, nBatch: 32, nUbatch: 32 },
+    promptTokens: () => 3,
+  });
+  assert.deepEqual(result.loadedLayers, [99]);
+  assert.deepEqual(result.notes, ['safari_gpu_probe_embedding', 'safari_gpu_probe_skipped_input_too_long']);
+});
+
+test('an oversized second prompt does not hide corruption in the first embedding', async () => {
+  const result = await load({
+    userAgent: safari('27.0'),
+    embeddingModel: true,
+    options: { nCtx: 12, nBatch: 32, nUbatch: 32 },
+    promptTokens: (prompt) => prompt === 'WebGPU runs matrix math on the GPU.' ? 13 : 3,
+    nativeEmbedding: (prompt, _layers, firstPrompt) => {
+      if (prompt === firstPrompt) return [4, 0];
+      return prompt === 'cat' ? [3, 4] : [4, -3];
+    },
+  });
+  assert.deepEqual(result.loadedLayers, [99, 1, 0]);
+});
+
+test('the embedding probe rejects opposite single-axis vectors after native normalization', async () => {
+  const result = await load({
+    userAgent: safari('27.0'),
+    embeddingModel: true,
+    nativeEmbedding: (prompt, _layers, firstPrompt) => [prompt === firstPrompt ? 4 : -4, 1e-8],
+  });
+  assert.ok(Math.abs(Math.hypot(...JSON.parse(result.lastEmbeddingJson)) - 1) < 0.01);
+  assert.deepEqual(result.loadedLayers, [99, 1, 0]);
+});
+
+test('the embedding probe rejects vectors shorter than the native reported dimension', async () => {
+  const result = await load({
+    userAgent: safari('27.0'),
+    embeddingModel: true,
+    embeddingDimension: 768,
+  });
+  assert.deepEqual(result.loadedLayers, [99, 1, 0]);
+});
+
 test('a degenerate or failing embedding probe walks the fallback ladder', async () => {
   const failures = [
     { nativeEmbedding: () => [0, 0] },
@@ -262,7 +360,7 @@ test('the embedding probe rejects non-finite values before public embedding sani
   const result = await load({
     userAgent: safari('27.0'),
     embeddingModel: true,
-    embeddingJson: (values) => `[${values.join(',')},1e999]`,
+    embeddingJson: (values) => `[${values[0]},1e999]`,
   });
   assert.deepEqual(result.loadedLayers, [99, 1, 0]);
 });
@@ -273,7 +371,9 @@ test('the embedding probe applies the cosine cutoff within the unit norm toleran
       userAgent: safari('27.0'),
       embeddingModel: true,
       nativeEmbedding: (prompt, _layers, firstPrompt) => (
-        prompt === firstPrompt ? [1, 0] : [cosine, Math.sqrt(1 - cosine * cosine)]
+        prompt === firstPrompt
+          ? [1, 1]
+          : [cosine + Math.sqrt(1 - cosine * cosine), cosine - Math.sqrt(1 - cosine * cosine)]
       ),
       embeddingJson: (values) => JSON.stringify(values.map((value) => value * 0.995)),
     });
