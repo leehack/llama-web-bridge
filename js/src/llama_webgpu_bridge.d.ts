@@ -54,6 +54,10 @@ export interface LoadModelOptions {
   signal?: AbortSignal;
   remoteFetchThresholdBytes?: number;
   remoteFetchChunkBytes?: number;
+  /** Overrides the Safari GPU layer cap. Recognized Safari 27+ is uncapped by default. */
+  safariMaxGpuLayers?: number;
+  /** Set to false to skip the Safari load-time GPU probe. */
+  safariGpuProbe?: boolean;
   /** Load the model's MTP layers, which `draft-mtp` speculative decoding needs. Defaults to false. */
   loadMtp?: boolean;
   /** Rollback snapshots per sequence, llama.cpp's `n_rs_seq`: a model with recurrent state needs at least the draft length for `draft-*` speculative decoding. Defaults to 0. */

@@ -37,7 +37,14 @@ import {
   unlinkFsFile,
   writeResponseToFsFileWithProgress,
 } from './internal/download.ts';
-import { canPostSharedMemory, describeWebGpuUnavailable, isMemory64Unsupported, isSafariUserAgent } from './internal/environment.ts';
+import {
+  canPostSharedMemory,
+  describeWebGpuUnavailable,
+  isAppleSafariUserAgent,
+  isMemory64Unsupported,
+  isSafariUserAgent,
+  safariDefaultMaxGpuLayers,
+} from './internal/environment.ts';
 import { CrossOriginIsolationError, SingleThreadCoreError } from './internal/isolation.ts';
 import { decodeImageBytesToRgb } from './internal/image.ts';
 import {
@@ -115,6 +122,8 @@ type ModelCacheStoreOutcome = 'stored' | 'store_failed';
 
 // Cache stores still being written from a response the caller is reading.
 const pendingModelCacheStores = new WeakMap<Response, Promise<ModelCacheStoreOutcome>>();
+
+const SAFARI_EMBEDDING_PROBE_MAX_COSINE = 0.999;
 
 // Fetch and cache knobs read from a load, prefetch or request options bag.
 // Callers may pass anything, so each value is coerced where it is read.
@@ -242,6 +251,8 @@ export class LlamaWebGpuBridgeRuntime {
   declare _loadMtp: boolean;
   declare _speculativeRollbackTokenMax: number;
   declare _isSafari: boolean;
+  declare _isAppleSafari: boolean;
+  declare _safariDefaultMaxGpuLayers: number;
   declare _coreVariant: string;
   declare _preferMemory64: boolean;
   declare _modelSource: string;
@@ -332,7 +343,10 @@ export class LlamaWebGpuBridgeRuntime {
     this._mainGpu = -1;
     this._loadMtp = false;
     this._speculativeRollbackTokenMax = 0;
-    this._isSafari = isSafariUserAgent(this._config.userAgent ?? globalThis.navigator?.userAgent ?? '');
+    const userAgent = this._config.userAgent ?? globalThis.navigator?.userAgent ?? '';
+    this._isSafari = isSafariUserAgent(userAgent);
+    this._isAppleSafari = isAppleSafariUserAgent(userAgent);
+    this._safariDefaultMaxGpuLayers = safariDefaultMaxGpuLayers(userAgent);
     this._coreVariant = 'uninitialized';
     this._preferMemory64 = this._config.preferMemory64 !== false;
     this._modelSource = 'network';
@@ -2439,7 +2453,7 @@ export class LlamaWebGpuBridgeRuntime {
       const requestedSafariMaxLayers = Number(options.safariMaxGpuLayers);
       const safariMaxGpuLayers = Number.isFinite(requestedSafariMaxLayers)
         ? Math.max(1, Math.trunc(requestedSafariMaxLayers))
-        : 1;
+        : this._safariDefaultMaxGpuLayers;
 
       if (this._nGpuLayers > safariMaxGpuLayers) {
         this._nGpuLayers = safariMaxGpuLayers;
@@ -2874,32 +2888,43 @@ export class LlamaWebGpuBridgeRuntime {
         ? Math.min(Math.trunc(probeTokensRaw), 96)
         : 48;
 
-      const runProbe = async (probePrompt: string, probeSeed: number) => {
+      // Pooled embedding models can return empty text or repeated `<pad>` tokens
+      // in a completion, so the completion probe cannot validate them.
+      let probesEmbedding = false;
+      if (this._isAppleSafari) {
         try {
-          const probeOutput = await this.createCompletion(probePrompt, {
-            nPredict: probeTokens,
-            temp: 0,
-            topK: 1,
-            topP: 1,
-            penalty: 1,
-            seed: probeSeed,
-          });
-          return !looksLikeCorruptedGeneration(probeOutput);
+          probesEmbedding = (await this.getEmbeddingCapabilities()).text === true;
+        } catch (_) {
+          // A core without the embedding exports keeps the completion probe.
+        }
+      }
+      if (probesEmbedding) {
+        this._runtimeNotes.push('safari_gpu_probe_embedding');
+      }
+
+      const runProbe = async (seedOffset: number) => {
+        try {
+          if (probesEmbedding) {
+            return await this._probeSafariEmbeddings();
+          }
+          for (const [index, prompt] of probePrompts.entries()) {
+            const probeOutput = await this.createCompletion(prompt, {
+              nPredict: probeTokens,
+              temp: 0,
+              topK: 1,
+              topP: 1,
+              penalty: 1,
+              seed: index + seedOffset,
+            });
+            if (looksLikeCorruptedGeneration(probeOutput)) return false;
+          }
+          return true;
         } catch (_) {
           return false;
         }
       };
 
-      let initialProbePassed = true;
-      for (let i = 0; i < probePrompts.length; i += 1) {
-        const ok = await runProbe(probePrompts[i], i + 1);
-        if (!ok) {
-          initialProbePassed = false;
-          break;
-        }
-      }
-
-      if (!initialProbePassed) {
+      if (!(await runProbe(1))) {
         this._runtimeNotes.push('safari_gpu_probe_failed');
 
         const retryCandidates = [];
@@ -2995,16 +3020,7 @@ export class LlamaWebGpuBridgeRuntime {
             break;
           }
 
-          let retryProbePassed = true;
-          for (let i = 0; i < probePrompts.length; i += 1) {
-            const ok = await runProbe(probePrompts[i], i + 11);
-            if (!ok) {
-              retryProbePassed = false;
-              break;
-            }
-          }
-
-          if (retryProbePassed) {
+          if (await runProbe(11)) {
             this._runtimeNotes.push(`safari_gpu_layers_capped:${candidateLayers}`);
             stabilized = true;
             break;
@@ -4965,14 +4981,23 @@ export class LlamaWebGpuBridgeRuntime {
     }
   }
 
-  async embed(text: EmbedInput, options: EmbedOptions = {}) {
-    if (Array.isArray(text)) {
-      const parts = snapshotEmbedInput(text) as Exclude<EmbedInput, string>;
-      this._abortRequested = false;
-      await this._preflightEmbeddingInputs([parts]);
-      if (this._abortRequested) throw createAbortError('Embedding was cancelled.');
-      return this._embedParts(parts, options);
-    }
+  async _probeSafariEmbeddings(): Promise<boolean> {
+    // A constant GPU output can have unit norm after native normalization.
+    const options = { normalize: true };
+    const first = await this._readTextEmbedding('The Eiffel Tower is in Paris.', options);
+    const second = await this._readTextEmbedding('WebGPU runs matrix math on the GPU.', options);
+    const finite = (vector: unknown[]): vector is number[] => vector.every(Number.isFinite);
+    if (first.length !== second.length || !finite(first) || !finite(second)) return false;
+
+    const firstNorm = Math.hypot(...first);
+    const secondNorm = Math.hypot(...second);
+    if (Math.abs(firstNorm - 1) >= 0.01 || Math.abs(secondNorm - 1) >= 0.01) return false;
+
+    const dot = first.reduce((sum, value, index) => sum + value * second[index], 0);
+    return dot / (firstNorm * secondNorm) < SAFARI_EMBEDDING_PROBE_MAX_COSINE;
+  }
+
+  async _readTextEmbedding(text: string, options: EmbedOptions): Promise<unknown[]> {
     if (this._modelBytes <= 0) {
       throw new Error('No model loaded. Call loadModelFromUrl first.');
     }
@@ -4995,12 +5020,22 @@ export class LlamaWebGpuBridgeRuntime {
 
     const raw = this._core!.ccall('llamadart_webgpu_last_embedding_json', 'string', [], []) || '[]';
     const parsed = JSON.parse(raw);
-    return Array.isArray(parsed)
-      ? parsed.map((v) => {
-        const numeric = Number(v);
-        return Number.isFinite(numeric) ? numeric : 0;
-      })
-      : [];
+    return Array.isArray(parsed) ? parsed : [];
+  }
+
+  async embed(text: EmbedInput, options: EmbedOptions = {}) {
+    if (Array.isArray(text)) {
+      const parts = snapshotEmbedInput(text) as Exclude<EmbedInput, string>;
+      this._abortRequested = false;
+      await this._preflightEmbeddingInputs([parts]);
+      if (this._abortRequested) throw createAbortError('Embedding was cancelled.');
+      return this._embedParts(parts, options);
+    }
+    const values = await this._readTextEmbedding(text, options);
+    return values.map((value) => {
+      const numeric = Number(value);
+      return Number.isFinite(numeric) ? numeric : 0;
+    });
   }
 
   async embedBatch(texts: EmbedInput[], options: EmbedOptions = {}) {
