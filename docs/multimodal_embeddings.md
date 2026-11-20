@@ -174,11 +174,11 @@ Each mutation bypasses a guard or breaks an ownership/lifecycle invariant in an 
 | `parts-abort-reset` | fresh parts embed clears a prior runtime abort |
 | `mrope-projector` | native capabilities and inference reject multi-position projectors |
 | `utf8-buffer` | exact UTF-8 bytes for lone surrogates, CJK and NUL |
-| `core-abort-signal` | parts core abort retains the worker recovery signal |
+| `core-abort-signal` | parts embedding rethrows the original `RuntimeError` |
 | `legacy-string-coercion` | non-array embedding inputs retain legacy String coercion |
 | `disposed-empty-batch` | empty batch still rejects on a disposed bridge |
 | `asset-version` | capability error reports loaded version without URL secrets |
-| `probe-crash-masking` | embed/batch/capabilities recover worker crash, timeout and core abort |
+| `probe-crash-masking` | embed/batch/capabilities recover worker crash and timeout |
 | `fallback-projector` | probe-time and inference-time crashes restore projector |
 | `active-core-version` | capability error reports actual wasm32/wasm64 asset |
 | `qualification-cosine` | independently observable cosine threshold |

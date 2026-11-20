@@ -101,7 +101,8 @@ serialized state bytes outside it.
 Runtime notes include `core_retired`, `core_retired_threads:<n>` when a
 pthread pool was stopped, and `core_retired_staged_bytes:<n>` for released
 staging data. Older cores without a retirement hook report
-`core_retired_threads_unavailable`.
+`core_retired_threads_unavailable`. These notes appear only in direct mode.
+Worker mode never shows them: the replacement worker starts with no notes.
 
 ## Operation serialization
 
