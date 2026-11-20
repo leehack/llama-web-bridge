@@ -67,7 +67,7 @@ for (const blocked of [false, true]) {
     const start = await workerStartModules(`descriptor-${blocked}`);
     let used = 0;
     const options = Object.defineProperties({}, start.pthreadScriptProperties(10_000, () => { used++; }));
-    options[Symbol.for('llamadart.pthreadScriptUrl')](coreUrl);
+    options[Symbol.for('llamadart.pthreadScriptUrl')](() => coreUrl);
     assert.deepEqual(Object.assign({}, options), {});
     assert.deepEqual({ ...options }, {});
     assert.equal(state.workers.length, 0);
@@ -241,7 +241,7 @@ test('a shared pending probe respects this pthread initialization budget', async
   assert.equal(await start.probeBlobWorker(), null);
   const longerProbe = start.probeBlobWorker(coreUrl, 20_000);
   const options = Object.defineProperties({}, start.pthreadScriptProperties(10_000, assert.fail));
-  options[Symbol.for('llamadart.pthreadScriptUrl')](coreUrl);
+  options[Symbol.for('llamadart.pthreadScriptUrl')](() => coreUrl);
   let factoryCalls = 0;
   const failure = assert.rejects(start.withPthreadStartProbe(() => {
     factoryCalls++;
@@ -255,4 +255,18 @@ test('a shared pending probe respects this pthread initialization budget', async
   state.workers[1].onerror({});
   t.mock.timers.tick(0);
   assert.equal(await longerProbe, 'script');
+});
+
+test('a wrapper can set its own worker script without running a probe', async (t) => {
+  const state = stubWorkerStart(t);
+  const start = await workerStartModules('assigned-pthread-url');
+  const props = start.pthreadScriptProperties(10_000, assert.fail);
+  for (const value of ['https://app.test/custom.js', new Blob(['']), undefined]) {
+    const options = Object.defineProperties({}, props);
+    options.mainScriptUrlOrBlob = value;
+    options[Symbol.for('llamadart.pthreadScriptUrl')](() => coreUrl);
+    assert.equal(options.mainScriptUrlOrBlob, value);
+    assert.equal(Object.prototype.propertyIsEnumerable.call(options, 'mainScriptUrlOrBlob'), true);
+  }
+  assert.equal(state.workers.length, 0);
 });

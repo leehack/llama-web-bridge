@@ -163,17 +163,23 @@ export class PthreadStartProbeRequired extends Error {
 }
 
 export function pthreadScriptProperties(timeoutMs: number, onUse: () => void): PropertyDescriptorMap {
-  let scriptUrl = '';
+  let resolveScriptUrl: (() => string) | undefined;
   return {
     // A redirect or re-export can load the factory from a different origin
     // than the caller's specifier. Only the core knows its worker script URL.
     [Symbol.for('llamadart.pthreadScriptUrl')]: {
-      value(url: string) { scriptUrl = url; },
+      value(resolve: () => string) { resolveScriptUrl = resolve; },
     },
     mainScriptUrlOrBlob: {
       configurable: true,
       enumerable: false,
+      set(this: object, value: unknown) {
+        Object.defineProperty(this, 'mainScriptUrlOrBlob', {
+          configurable: true, enumerable: true, writable: true, value,
+        });
+      },
       get() {
+        const scriptUrl = resolveScriptUrl?.();
         if (!scriptUrl || !isCrossOriginScriptUrl(scriptUrl)) return undefined;
         const blocked = blobWorkerProbeResult(scriptUrl);
         if (blocked === undefined) {

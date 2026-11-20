@@ -4,10 +4,11 @@ import { LlamaWebGpuBridgeRuntime } from '../../js/src/runtime.ts';
 
 export async function withCrossOriginCore({
   readsWorkerScript, blocked = false, coreUrl = 'https://cdn.test/core.js', actualUrl = coreUrl,
+  suspendImportProbe = false,
 }, run) {
   const source = `export default async (options) => {
     globalThis.__pthreadStartGateCalls.push(options);
-    if (${readsWorkerScript}) options[Symbol.for('llamadart.pthreadScriptUrl')]?.(${JSON.stringify(actualUrl)});
+    if (${readsWorkerScript}) options[Symbol.for('llamadart.pthreadScriptUrl')]?.(() => ${JSON.stringify(actualUrl)});
     return { script: ${readsWorkerScript} ? options.mainScriptUrlOrBlob : undefined };
   };`;
   const hook = registerHooks({
@@ -25,7 +26,10 @@ export async function withCrossOriginCore({
     __pthreadStartGateCalls: coreCalls,
     Worker: class {
       constructor(url, options) {
-        state.workers.push({ url, options });
+        this.url = url;
+        this.options = options;
+        state.workers.push(this);
+        if (suspendImportProbe && state.workers.length === 2) return;
         queueMicrotask(() => {
           if (blocked) this.onerror?.({});
           else this.onmessage?.({ data: 0 });

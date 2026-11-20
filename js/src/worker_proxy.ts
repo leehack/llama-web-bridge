@@ -5,6 +5,7 @@ import {
   isDecisionErrorCode,
   withDecisionErrorCode,
 } from './internal/decision.ts';
+import { resolveCoreModuleUrl } from './internal/core_loader.ts';
 import { createModelTransferLengthError } from './internal/download.ts';
 import { EMBEDDING_MEDIA_WORKER_TIMEOUT_MS, EmbeddingError, hasEmbeddingMediaParts } from './internal/embedding.ts';
 import {
@@ -14,6 +15,7 @@ import {
   SingleThreadCoreError,
 } from './internal/isolation.ts';
 import { MODEL_UNLOADED_AFTER_CORE_ABORT, ModelUnloadedError } from './internal/core_guard.ts';
+import { normalizeAbsoluteUrl } from './internal/model_source.ts';
 import { ModelStagingError, isModelStagingErrorCode } from './internal/model_staging.ts';
 import type { LlamaWebGpuBridgeConfig } from './llama_webgpu_bridge.d.ts';
 import {
@@ -80,6 +82,22 @@ function deriveBridgeModuleUrlFromWorkerEntry(moduleUrl: unknown): string | null
   } catch (_) {
     return null;
   }
+}
+
+function resolveBlobWorkerAssets(config: LlamaWebGpuBridgeConfig): LlamaWebGpuBridgeConfig {
+  const assetUrl = (value: string | undefined) => value ? normalizeAbsoluteUrl(value) : value;
+  const coreSpecifier = (value: string | undefined) => {
+    if (!value) return value;
+    if (/^(?:\.{1,2}\/|\/)/.test(value)) return normalizeAbsoluteUrl(value);
+    return resolveCoreModuleUrl(value) || value;
+  };
+  return {
+    ...config,
+    wasmUrl: assetUrl(config.wasmUrl),
+    wasmUrlMem64: assetUrl(config.wasmUrlMem64),
+    coreModuleUrl: coreSpecifier(config.coreModuleUrl),
+    coreModuleUrlMem64: coreSpecifier(config.coreModuleUrlMem64),
+  };
 }
 
 export class BridgeWorkerProxy {
@@ -257,7 +275,8 @@ export class BridgeWorkerProxy {
       this._pending.clear();
     };
 
-    this._worker.postMessage({ type: 'init', config: { ...config, workerStart: this.startMode } });
+    const workerConfig = this.startMode === 'blob' ? resolveBlobWorkerAssets(this._config) : this._config;
+    this._worker.postMessage({ type: 'init', config: { ...workerConfig, workerStart: this.startMode } });
   }
 
   async call(

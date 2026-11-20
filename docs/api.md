@@ -176,10 +176,10 @@ it.
 
 | Option | Type | Description |
 | --- | --- | --- |
-| `coreModuleUrl` | `string` | Same-origin or CDN URL for the wasm32 Emscripten JS loader, usually `llama_webgpu_core.js`. Cross-origin pthreads use module `blob:` wrappers. Worker mode resolves relative paths against the page base URL. |
-| `coreModuleUrlMem64` | `string` | Same-origin or CDN URL for the optional wasm64 Emscripten JS loader. Cross-origin pthreads use module `blob:` wrappers. Worker mode resolves relative paths against the page base URL. |
-| `wasmUrl` | `string` | URL for the wasm32 `llama_webgpu_core.wasm` binary. Worker mode resolves relative paths against the page base URL. |
-| `wasmUrlMem64` | `string` | URL for the optional wasm64 wasm binary. Worker mode resolves relative paths against the page base URL. |
+| `coreModuleUrl` | `string` | Same-origin or CDN URL for the wasm32 Emscripten JS loader, usually `llama_webgpu_core.js`. Cross-origin pthreads use module `blob:` wrappers. A blob worker resolves relative paths against the page base URL. |
+| `coreModuleUrlMem64` | `string` | Same-origin or CDN URL for the optional wasm64 Emscripten JS loader. Cross-origin pthreads use module `blob:` wrappers. A blob worker resolves relative paths against the page base URL. |
+| `wasmUrl` | `string` | URL for the wasm32 `llama_webgpu_core.wasm` binary. A blob worker resolves relative paths against the page base URL. |
+| `wasmUrlMem64` | `string` | URL for the optional wasm64 wasm binary. A blob worker resolves relative paths against the page base URL. |
 | `coreModuleFactory` | `LlamaCoreModuleFactory \| Promise<LlamaCoreModuleFactory>` | Preloaded Emscripten factory. Supplying this disables worker mode because factories cannot be transferred to the worker. It also skips the default isolation check. A core that starts a pthread pool can hit `coreInitTimeoutMs` if the page cannot share memory with workers. See [the custom core contract](#custom-core-factory). A core instance holds one loaded model. Bridges that share the same core instance must not hold models at the same time. A load on either bridge releases the model in that core. Return a separate core instance for each bridge that needs an independent model. |
 | `workerUrl` | `string` | Same-origin or CDN URL for the bridge worker entry. Cross-origin entries start from a module `blob:` wrapper. Defaults to `llama_webgpu_bridge_worker.js` next to the bridge module. |
 | `disableWorker` | `boolean` | Force direct runtime mode. |
@@ -1351,8 +1351,9 @@ this function themselves.
 - The bridge, worker script, and core JS and Wasm may use URLs on the page's
   origin or a CDN. The CDN must allow CORS and serve the assets under COEP
   `require-corp`. Cross-origin workers use module `blob:` wrappers. Cross-origin
-  pthread workers require rebuilt core assets that report their own script URL
-  to the bridge. Redirects and re-exports use the loaded core's origin.
+  pthread workers require rebuilt core assets that report where Emscripten
+  would load their worker script. Redirects, re-exports, and bundled loaders
+  use that worker script's origin.
 - With CSP, allow `worker-src blob: <asset-origin>`,
   `script-src <asset-origin> 'wasm-unsafe-eval'`, and `connect-src` for the asset
   and model hosts, in addition to the application's own sources. If the page

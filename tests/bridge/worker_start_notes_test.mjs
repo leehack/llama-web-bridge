@@ -103,7 +103,7 @@ test('the pthread error survives the worker protocol without a direct retry', as
 });
 
 for (const [mode, assetOrigin] of [['blob', 'https://cdn.test'], ['direct', 'https://app.test']]) {
-  test(`worker init resolves asset URLs against the page base in ${mode} mode`, async (t) => {
+  test(`worker init preserves the historical asset base for ${mode} mode`, async (t) => {
     const state = stubWorkerStart(t);
     const originalDocument = Object.getOwnPropertyDescriptor(globalThis, 'document');
     Object.defineProperty(globalThis, 'document', {
@@ -126,10 +126,10 @@ for (const [mode, assetOrigin] of [['blob', 'https://cdn.test'], ['direct', 'htt
     try {
       const { config } = worker.posted[0];
       assert.equal(config.workerStart, mode);
-      assert.equal(config.wasmUrl, 'https://app.test/models/core.wasm');
-      assert.equal(config.wasmUrlMem64, 'https://app.test/asset-base/core64.wasm');
-      assert.equal(config.coreModuleUrl, 'https://app.test/asset-base/models/core.js');
-      assert.equal(config.coreModuleUrlMem64, 'https://app.test/models/core64.js');
+      assert.equal(config.wasmUrl, mode === 'blob' ? 'https://app.test/models/core.wasm' : '/models/core.wasm');
+      assert.equal(config.wasmUrlMem64, mode === 'blob' ? 'https://app.test/asset-base/core64.wasm' : './core64.wasm');
+      assert.equal(config.coreModuleUrl, mode === 'blob' ? 'https://app.test/asset-base/models/core.js' : './models/core.js');
+      assert.equal(config.coreModuleUrlMem64, mode === 'blob' ? 'https://app.test/models/core64.js' : '/models/core64.js');
     } finally {
       await bridge.dispose();
     }

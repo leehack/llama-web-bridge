@@ -807,32 +807,6 @@ function decodeDecisionOutputs(bytes, count) {
   return outputs;
 }
 
-// js/src/internal/core_loader.ts
-function normalizeFactory(moduleExport) {
-  if (typeof moduleExport === "function") {
-    return moduleExport;
-  }
-  if (moduleExport && typeof moduleExport.default === "function") {
-    return moduleExport.default;
-  }
-  if (moduleExport && typeof moduleExport.createLlamaWebGpuCoreModule === "function") {
-    return moduleExport.createLlamaWebGpuCoreModule;
-  }
-  throw new Error("Unable to resolve llama_webgpu_core factory function");
-}
-async function importCoreFactory(moduleUrl) {
-  const exportedModule = await import(moduleUrl);
-  return normalizeFactory(exportedModule);
-}
-function resolveCoreModuleUrl(moduleUrl) {
-  try {
-    const resolve = import.meta.resolve;
-    return typeof resolve === "function" ? resolve.call(import.meta, moduleUrl) : new URL(moduleUrl, import.meta.url).href;
-  } catch (_) {
-    return "";
-  }
-}
-
 // js/src/internal/core_guard.ts
 var MODEL_UNLOADED_AFTER_CORE_ABORT = "MODEL_UNLOADED_AFTER_CORE_ABORT";
 var MODEL_UNLOADED_AFTER_CORE_ABORT_MESSAGE = "The native core aborted and was replaced, which unloaded the model. Call loadModelFromUrl again.";
@@ -1100,19 +1074,28 @@ var PthreadStartProbeRequired = class extends Error {
   }
 };
 function pthreadScriptProperties(timeoutMs, onUse) {
-  let scriptUrl = "";
+  let resolveScriptUrl;
   return {
     // A redirect or re-export can load the factory from a different origin
     // than the caller's specifier. Only the core knows its worker script URL.
     [/* @__PURE__ */ Symbol.for("llamadart.pthreadScriptUrl")]: {
-      value(url) {
-        scriptUrl = url;
+      value(resolve) {
+        resolveScriptUrl = resolve;
       }
     },
     mainScriptUrlOrBlob: {
       configurable: true,
       enumerable: false,
+      set(value) {
+        Object.defineProperty(this, "mainScriptUrlOrBlob", {
+          configurable: true,
+          enumerable: true,
+          writable: true,
+          value
+        });
+      },
       get() {
+        const scriptUrl = resolveScriptUrl?.();
         if (!scriptUrl || !isCrossOriginScriptUrl(scriptUrl)) return void 0;
         const blocked = blobWorkerProbeResult(scriptUrl);
         if (blocked === void 0) {
@@ -1343,6 +1326,32 @@ function isJsAllocationError(error) {
 function isWasm32TensorLimitText(text) {
   const normalized = text.toLowerCase();
   return normalized.includes("wasm32 4 gib") || normalized.includes("gguf_init_from_reader") && normalized.includes("size overflow");
+}
+
+// js/src/internal/core_loader.ts
+function normalizeFactory(moduleExport) {
+  if (typeof moduleExport === "function") {
+    return moduleExport;
+  }
+  if (moduleExport && typeof moduleExport.default === "function") {
+    return moduleExport.default;
+  }
+  if (moduleExport && typeof moduleExport.createLlamaWebGpuCoreModule === "function") {
+    return moduleExport.createLlamaWebGpuCoreModule;
+  }
+  throw new Error("Unable to resolve llama_webgpu_core factory function");
+}
+async function importCoreFactory(moduleUrl) {
+  const exportedModule = await import(moduleUrl);
+  return normalizeFactory(exportedModule);
+}
+function resolveCoreModuleUrl(moduleUrl) {
+  try {
+    const resolve = import.meta.resolve;
+    return typeof resolve === "function" ? resolve.call(import.meta, moduleUrl) : new URL(moduleUrl, import.meta.url).href;
+  } catch (_) {
+    return "";
+  }
 }
 
 // js/src/internal/parse.ts
@@ -3850,9 +3859,10 @@ var LlamaWebGpuBridgeRuntime = class {
       }
       this._backendLabels = Array.isArray(parsed) ? parsed.map((v) => String(v)) : [];
       this._gpuActive = probeResult === 1;
-    } catch (_err) {
+    } catch (error) {
       this._backendLabels = [];
       this._gpuActive = false;
+      if (error instanceof BlobWorkerBlockedError) throw error;
     }
     return this._gpuActive;
   }
@@ -6543,6 +6553,21 @@ function deriveBridgeModuleUrlFromWorkerEntry(moduleUrl) {
     return null;
   }
 }
+function resolveBlobWorkerAssets(config) {
+  const assetUrl = (value) => value ? normalizeAbsoluteUrl(value) : value;
+  const coreSpecifier = (value) => {
+    if (!value) return value;
+    if (/^(?:\.{1,2}\/|\/)/.test(value)) return normalizeAbsoluteUrl(value);
+    return resolveCoreModuleUrl(value) || value;
+  };
+  return {
+    ...config,
+    wasmUrl: assetUrl(config.wasmUrl),
+    wasmUrlMem64: assetUrl(config.wasmUrlMem64),
+    coreModuleUrl: coreSpecifier(config.coreModuleUrl),
+    coreModuleUrlMem64: coreSpecifier(config.coreModuleUrlMem64)
+  };
+}
 var BridgeWorkerProxy = class {
   constructor({ moduleUrl, config }) {
     this._config = config && typeof config === "object" ? config : {};
@@ -6663,7 +6688,8 @@ var BridgeWorkerProxy = class {
       }
       this._pending.clear();
     };
-    this._worker.postMessage({ type: "init", config: { ...config, workerStart: this.startMode } });
+    const workerConfig = this.startMode === "blob" ? resolveBlobWorkerAssets(this._config) : this._config;
+    this._worker.postMessage({ type: "init", config: { ...workerConfig, workerStart: this.startMode } });
   }
   async call(method, args, onEvent, transferList = [], operationMeta = null) {
     await this._ready;
@@ -7867,12 +7893,6 @@ var LlamaWebGpuBridge = class {
   }
   _workerConfig() {
     const config = this._config || {};
-    const assetUrl = (value) => typeof value === "string" && value.length > 0 ? normalizeAbsoluteUrl(value) : void 0;
-    const coreSpecifier = (value) => {
-      if (typeof value !== "string" || value.length === 0) return void 0;
-      if (/^(?:\.{1,2}\/|\/)/.test(value)) return normalizeAbsoluteUrl(value);
-      return resolveCoreModuleUrl(value) || value;
-    };
     return {
       workerRequestTimeoutMs: config.workerRequestTimeoutMs,
       workerInitTimeoutMs: config.workerInitTimeoutMs,
@@ -7881,10 +7901,10 @@ var LlamaWebGpuBridge = class {
       workerCompletionTimeoutMs: config.workerCompletionTimeoutMs,
       workerTextToSpeechTimeoutMs: config.workerTextToSpeechTimeoutMs,
       coreInitTimeoutMs: config.coreInitTimeoutMs,
-      wasmUrl: assetUrl(config.wasmUrl),
-      wasmUrlMem64: assetUrl(config.wasmUrlMem64),
-      coreModuleUrl: coreSpecifier(config.coreModuleUrl),
-      coreModuleUrlMem64: coreSpecifier(config.coreModuleUrlMem64),
+      wasmUrl: typeof config.wasmUrl === "string" ? config.wasmUrl : void 0,
+      wasmUrlMem64: typeof config.wasmUrlMem64 === "string" ? config.wasmUrlMem64 : void 0,
+      coreModuleUrl: typeof config.coreModuleUrl === "string" ? config.coreModuleUrl : void 0,
+      coreModuleUrlMem64: typeof config.coreModuleUrlMem64 === "string" ? config.coreModuleUrlMem64 : void 0,
       preferMemory64: typeof config.preferMemory64 === "boolean" ? config.preferMemory64 : void 0,
       allowSingleThreadCore: config.allowSingleThreadCore === true ? true : void 0,
       ...config.jsBackedModelStaging === true ? { jsBackedModelStaging: true } : {},

@@ -1,0 +1,4 @@
+// Match the URL expression in Emscripten's generated pthread Worker call.
+Module[Symbol.for('llamadart.pthreadScriptUrl')]?.(
+  () => new URL("@LLAMADART_WEBGPU_CORE_OUTPUT_NAME@.js", import.meta.url).href,
+);

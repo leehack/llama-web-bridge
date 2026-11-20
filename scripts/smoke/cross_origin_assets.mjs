@@ -23,6 +23,7 @@ const scenarios = {
   'csp-st': { single: true, csp: 'self', workers: 0, violations: 1, fallback: 'csp' },
   'isolated-threaded': {},
   'isolated-threaded-direct': { direct: true },
+  'bundled-loader': { direct: true, bundledLoader: true },
   'csp-threaded': { csp: 'self', direct: true, blocked: 'csp', workers: 0, violations: 1 },
   'csp-threaded-worker': { csp: 'self', blocked: 'csp', workers: 0, violations: 1 },
   'csp-threaded-worker-response': { workerResponseCsp: true, blocked: 'csp' },
@@ -67,7 +68,9 @@ export function renderHarness(name, assetOrigin, memoryMode) {
   const core = coreFileStem(memoryMode, scenario.single);
   const bridgeOrigin = scenario.workerResponseCsp ? '' : assetOrigin;
   const bridgeUrl = `${bridgeOrigin}/llama_webgpu_bridge.js`;
-  const coreUrl = `${assetOrigin}/${scenario.oldCore ? 'old/' : ''}${core}.js`;
+  const coreUrl = scenario.bundledLoader
+    ? `${assetOrigin}/bundled-loader.js`
+    : `${assetOrigin}/${scenario.oldCore ? 'old/' : ''}${core}.js`;
   const wasmUrl = `${assetOrigin}/${core}.wasm`;
   return `
 const { LlamaWebGpuBridge, BlobWorkerBlockedError } = await import(${JSON.stringify(bridgeUrl)});
@@ -262,6 +265,10 @@ async function main() {
     assert.ok(threaded.includes(WORKER_HOOK), 'threaded core lacks the worker hook');
     assert.ok(!single.includes(WORKER_HOOK), 'single-thread core includes the worker hook');
     await fsp.writeFile(path.join(assetDir, 'old', threadedFile), coreWithoutWorkerHook(threaded));
+    await fsp.writeFile(path.join(assetDir, 'bundled-loader.js'), `
+if (typeof document === 'undefined') throw new Error('Application code requires the page');
+${threaded}
+`);
 
     const requests = new Map();
     const recordRequest = (req) => {

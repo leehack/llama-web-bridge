@@ -47,7 +47,7 @@ import {
 } from './internal/environment.ts';
 import { guardCore, isCoreRetired, retireCore, unguardedCore } from './internal/core_guard.ts';
 import { CrossOriginIsolationError, SingleThreadCoreError } from './internal/isolation.ts';
-import { pthreadScriptProperties, withPthreadStartProbe } from './internal/worker_start.ts';
+import { BlobWorkerBlockedError, pthreadScriptProperties, withPthreadStartProbe } from './internal/worker_start.ts';
 import type { WorkerStartMode } from './internal/worker_start.ts';
 import { decodeImageBytesToRgb } from './internal/image.ts';
 import {
@@ -2389,9 +2389,10 @@ export class LlamaWebGpuBridgeRuntime {
         ? parsed.map((v) => String(v))
         : [];
       this._gpuActive = probeResult === 1;
-    } catch (_err) {
+    } catch (error) {
       this._backendLabels = [];
       this._gpuActive = false;
+      if (error instanceof BlobWorkerBlockedError) throw error;
     }
 
     return this._gpuActive;

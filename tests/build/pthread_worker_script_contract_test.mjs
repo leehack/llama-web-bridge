@@ -19,11 +19,15 @@ test('the core link options extend the Emscripten 6.0.8 incoming module API', ()
   assert.ok(shared?.includes(flags[0][0]));
 });
 
-test('the compiled pthread core reports the actual module URL before starting the pool', () => {
+test('the compiled pthread core resolves the generated worker filename before starting the pool', () => {
   const cmake = readFileSync(new URL('../../CMakeLists.txt', import.meta.url), 'utf8');
   const threaded = cmake.match(/^if \(LLAMADART_WEBGPU_PTHREADS\)\n([^]*?"--pre-js=[^"]+"[^]*?)^endif\(\)/m)?.[1];
   assert.match(threaded ?? '', /llama_webgpu_core_pthread_pre\.js/);
   assert.match(threaded ?? '', /APPEND PROPERTY LINK_DEPENDS/);
-  const preJs = readFileSync(new URL('../../src/llama_webgpu_core_pthread_pre.js', import.meta.url), 'utf8');
-  assert.match(preJs, /Module\[Symbol\.for\('llamadart\.pthreadScriptUrl'\)\]\?\.\(import\.meta\.url\)/);
+  const naming = cmake.indexOf('set(LLAMADART_WEBGPU_CORE_OUTPUT_SUFFIX');
+  const configured = cmake.indexOf('configure_file(src/llama_webgpu_core_pthread_pre.js.in');
+  assert.ok(naming >= 0 && configured > naming);
+  const preJs = readFileSync(new URL('../../src/llama_webgpu_core_pthread_pre.js.in', import.meta.url), 'utf8');
+  assert.match(preJs, /Module\[Symbol\.for\('llamadart\.pthreadScriptUrl'\)\]\?\./);
+  assert.match(preJs, /new URL\("@LLAMADART_WEBGPU_CORE_OUTPUT_NAME@\.js", import\.meta\.url\)\.href/);
 });
