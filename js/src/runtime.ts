@@ -2577,7 +2577,7 @@ export class LlamaWebGpuBridgeRuntime {
               );
             }
 
-            let expectedResumeBytes = 0;
+            let expectedShardBytes: number | null = null;
             if (resumeOffset > 0 && resumeIdentity) {
               const resume = classifyResumeResponse(resumeIdentity, response, responseUrl, resumeOffset);
               if (resume.verdict === 'changed') {
@@ -2597,8 +2597,8 @@ export class LlamaWebGpuBridgeRuntime {
                 continue;
               }
               this._runtimeNotes.push('model_stream_resume_' + resume.verdict);
-              expectedResumeBytes = resume.total;
-              resumeIdentity.total = expectedResumeBytes;
+              expectedShardBytes = resume.expectedBytes;
+              resumeIdentity.total = resume.total;
             }
 
             if (!hasReadableResponseStream(response)) {
@@ -2613,7 +2613,8 @@ export class LlamaWebGpuBridgeRuntime {
 
             const responseTotal = inferResponseTotalBytes(response, knownTotalBytes);
             if (resumeOffset === 0) {
-              resumeIdentity = captureResumeIdentity(response, responseUrl, responseTotal);
+              resumeIdentity = captureResumeIdentity(response, responseUrl);
+              expectedShardBytes = resumeIdentity.total;
             }
             if (responseTotal > 0) {
               knownTotalBytes = responseTotal;
@@ -2660,9 +2661,9 @@ export class LlamaWebGpuBridgeRuntime {
                   abortMessage,
                 },
               );
-              if (expectedResumeBytes > 0 && shardBytes !== expectedResumeBytes) {
+              if (expectedShardBytes !== null && shardBytes !== expectedShardBytes) {
                 throw createModelTransferLengthError(
-                  'Resumed model response staged ' + shardBytes + ' bytes, expected ' + expectedResumeBytes + '.',
+                  'Model response staged ' + shardBytes + ' bytes, expected ' + expectedShardBytes + '.',
                 );
               }
               await this._settleModelCacheStore(response);

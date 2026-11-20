@@ -24,26 +24,33 @@ test('strong ETags use quoted opaque-tag syntax', () => {
 for (const [name, verdict, initial, resumed, finalUrl = MODEL, total = 4] of [
   ['different URL', 'changed', { ETag: '"a"' }, { ETag: '"a"' }, OTHER],
   ['changed strong ETag', 'changed', { ETag: '"a"' }, { ETag: '"b"' }],
-  ['missing strong ETag', 'changed', { ETag: '"a"' }, {}],
-  ['non-HTTP whitespace makes resumed ETag malformed', 'changed', { ETag: '"a"' },
+  ['missing strong ETag', 'unvalidated', { ETag: '"a"' }, {}],
+  ['non-HTTP whitespace makes resumed ETag malformed', 'unvalidated', { ETag: '"a"' },
     { ETag: '\u00a0"a"', 'Content-Range': RANGE }],
   ['equal malformed ETags are unvalidated', 'unvalidated', { ETag: '\u00a0"a"' },
     { ETag: '\u00a0"a"', 'Content-Range': RANGE }],
-  ['changed weak ETag', 'changed', { ETag: 'W/"a"' }, { ETag: 'W/"b"' }],
-  ['changed Last-Modified', 'changed', { 'Last-Modified': LAST_MODIFIED },
+  ['changed weak ETag', 'unvalidated', { ETag: 'W/"a"' }, { ETag: 'W/"b"' }],
+  ['changed Last-Modified', 'unvalidated', { 'Last-Modified': LAST_MODIFIED },
     { 'Last-Modified': 'Thu, 22 Oct 2015 07:28:00 GMT' }],
-  ['new ETag', 'changed', {}, { ETag: '"a"' }],
+  ['new ETag', 'unvalidated', {}, { ETag: '"a"', 'Content-Range': RANGE }],
   ['wrong start', 'changed', {}, { 'Content-Range': 'bytes 0-3/4' }],
   ['wrong end', 'changed', {}, { 'Content-Range': 'bytes 2-2/4' }],
   ['wrong total', 'changed', {}, { 'Content-Range': 'bytes 2-4/5' }],
-  ['unknown total', 'changed', {}, { 'Content-Range': 'bytes 2-3/*' }],
-  ['malformed range', 'changed', {}, { 'Content-Range': 'bytes 2/4' }],
-  ['empty range', 'changed', {}, { 'Content-Range': '' }],
+  ['wildcard total with known full size', 'unvalidated', {}, { 'Content-Range': 'bytes 2-3/*' }],
+  ['wildcard total with a wrong end', 'changed', {}, { 'Content-Range': 'bytes 2-2/*' }],
+  ['malformed range', 'unvalidated', {}, { 'Content-Range': 'bytes 2/4' }],
+  ['empty range', 'unvalidated', {}, { 'Content-Range': '' }],
   ['hidden range and wrong length', 'changed', {}, { 'Content-Length': '4' }],
   ['hidden range and conflicting linked size', 'changed', {}, { 'Content-Length': '2', 'x-linked-size': '5' }],
   ['visible range and conflicting linked size', 'changed', {}, { 'Content-Range': RANGE, 'x-linked-size': '5' }],
   ['matched strong ETag and range', 'validated', { ETag: '"a"' },
     { ETag: '"a"', 'Content-Range': RANGE }],
+  ['matched strong ETag and capitalized range unit', 'validated', { ETag: '"a"' },
+    { ETag: '"a"', 'Content-Range': 'Bytes 2-3/4' }],
+  ['matched strong ETag and wildcard range with known full size', 'validated', { ETag: '"a"' },
+    { ETag: '"a"', 'Content-Range': 'bytes 2-3/*' }],
+  ['matched strong ETag and wildcard range without a known full size', 'unvalidated', { ETag: '"a"' },
+    { ETag: '"a"', 'Content-Range': 'bytes 2-3/*' }, MODEL, 0],
   ['matched strong ETag and tail length', 'validated', { ETag: '"a"' },
     { ETag: '"a"', 'Content-Length': '2' }],
   ['equal weak ETag', 'unvalidated', { ETag: 'W/"same"' },
@@ -59,8 +66,9 @@ for (const [name, verdict, initial, resumed, finalUrl = MODEL, total = 4] of [
     { ETag: '"a"', 'Content-Length': '2' }, MODEL, 0],
 ]) {
   test(`resume classification: ${name}`, () => {
-    const identity = download.captureResumeIdentity(new Response(null, { headers: initial }), MODEL, total);
-    const response = new Response(null, { status: 206, headers: resumed });
+    const initialHeaders = total > 0 ? { 'Content-Length': String(total), ...initial } : initial;
+    const identity = download.captureResumeIdentity(transfer([], { headers: initialHeaders }).response, MODEL);
+    const { response } = transfer([], { status: 206, headers: resumed });
     assert.equal(download.classifyResumeResponse(identity, response, finalUrl, 2).verdict, verdict);
   });
 }
@@ -74,7 +82,7 @@ test('model download: reject a short tail when the resume discloses the full siz
   assert.deepEqual(requests, [fullGet, rangeGet]);
 });
 
-function transfer(bytes, { status = 200, headers = {}, url = MODEL, cut = false } = {}) {
+function transfer(bytes, { status = 200, headers = {}, url = MODEL, cut = false, type = 'basic' } = {}) {
   let started = false;
   let cancelled = false;
   const body = new ReadableStream({
@@ -95,7 +103,7 @@ function transfer(bytes, { status = 200, headers = {}, url = MODEL, cut = false 
     },
   }, { highWaterMark: 0 });
   const response = new Response(body, { status, headers });
-  Object.defineProperty(response, 'url', { value: url });
+  Object.defineProperties(response, { url: { value: url }, type: { value: type } });
   return { response, wasCancelled: () => cancelled };
 }
 
@@ -162,13 +170,80 @@ const fullB = () => transfer(B, { headers: { 'Content-Length': '4' } });
 const validated = 'model_stream_resume_validated';
 const unvalidated = 'model_stream_resume_unvalidated';
 
+test('model download: rejects a truncated-size claim on the replacement response before native load', async (t) => {
+  const replacement = transfer(B, { headers: { 'x-linked-size': '3', 'Content-Length': '4' } });
+  const { load, loads, requests } = runTransfer(t, [
+    first({ ETag: '"a"' }),
+    tail(B.slice(2), { ETag: '"b"' }),
+    replacement,
+  ]);
+  await assert.rejects(load, { name: 'ModelTransferLengthError' });
+  assert.deepEqual(loads, []);
+  assert.deepEqual(requests, [fullGet, rangeGet, fullGet]);
+});
+
+for (const type of ['basic', 'cors']) {
+  test(`model download: resumes a decoded ${type} full GET with an identity tail`, async (t) => {
+    const headers = { 'Content-Length': '3', ...(type === 'basic' ? { 'Content-Encoding': 'gzip' } : {}) };
+    const { load, loads, requests, notes } = runTransfer(t, [
+      transfer(A.slice(0, 2), { headers, type, cut: true }),
+      tail(A.slice(2), {}, { type }),
+    ]);
+    await load;
+    assert.deepEqual(loads, [A]);
+    assert.deepEqual(requests, [fullGet, rangeGet]);
+    assert.ok(notes().includes(unvalidated));
+  });
+}
+
+test('model download: retains the original validator visibility across later ranges', async (t) => {
+  const firstRange = transfer([3], {
+    status: 206, headers: { ETag: '"a"', 'Content-Range': 'bytes 2-3/4' }, cut: true,
+  });
+  const finalRange = tail([4], { ETag: '"b"', 'Content-Range': 'bytes 3-3/4' });
+  const { load, loads, requests, notes } = runTransfer(t, [first(), firstRange, finalRange]);
+  await load;
+  assert.deepEqual(loads, [A]);
+  assert.deepEqual(requests, [fullGet, rangeGet, ['GET', MODEL, [['range', 'bytes=3-']]]]);
+  assert.deepEqual(notes().filter((note) => note === unvalidated), [unvalidated, unvalidated]);
+});
+
+for (const exposure of ['*', 'ETag, Content-Range, Content-Encoding, Access-Control-Expose-Headers']) {
+  test(`model download: restarts on different strong ETags with visible CORS encoding metadata (${exposure})`, async (t) => {
+    const exposed = { 'Access-Control-Expose-Headers': exposure };
+    const initial = transfer(A.slice(0, 2), {
+      headers: { 'Content-Length': '4', ETag: '"a"', ...exposed }, type: 'cors', cut: true,
+    });
+    const resumed = tail(B.slice(2), { ETag: '"b"', ...exposed }, { type: 'cors' });
+    const { load, loads, requests, notes } = runTransfer(t, [initial, resumed, fullB()]);
+    await load;
+    assert.deepEqual(loads, [B]);
+    assert.deepEqual(requests, [fullGet, rangeGet, fullGet]);
+    assert.ok(notes().includes('model_stream_restart:etag'));
+  });
+}
+
+test('model download: accepts different strong ETags when CORS hides the range encoding', async (t) => {
+  const initial = transfer(A.slice(0, 2), {
+    headers: { 'Content-Length': '3', 'Content-Encoding': 'gzip', ETag: '"gzip"' },
+    type: 'cors',
+    cut: true,
+  });
+  const resumed = tail(A.slice(2), { ETag: '"identity"' }, { type: 'cors' });
+  const { load, loads, requests, notes } = runTransfer(t, [initial, resumed]);
+  await load;
+  assert.deepEqual(loads, [A]);
+  assert.deepEqual(requests, [fullGet, rangeGet]);
+  assert.ok(notes().includes(unvalidated));
+});
+
 for (const {
   name, initial, resumed, restart, expected, note, error, retryLimit, restartReason,
 } of [
   { name: 'strong ETag changes', initial: { ETag: '"a"' },
     resumed: () => tail(B.slice(2), { ETag: '"b"' }), restart: true, expected: B, restartReason: 'etag' },
   { name: 'weak ETag changes', initial: { ETag: 'W/"a"' },
-    resumed: () => tail(B.slice(2), { ETag: 'W/"b"' }), restart: true, expected: B, restartReason: 'etag' },
+    resumed: () => tail(B.slice(2), { ETag: 'W/"b"' }), expected: HYBRID, note: unvalidated },
   { name: 'weak ETag unchanged', initial: { ETag: 'W/"same"' },
     resumed: () => tail(B.slice(2), { ETag: 'W/"same"' }), expected: HYBRID, note: unvalidated },
   { name: 'Last-Modified unchanged', initial: { 'Last-Modified': LAST_MODIFIED },
@@ -184,6 +259,11 @@ for (const {
   { name: 'Content-Range wrong total', initial: { ETag: '"a"' },
     resumed: () => tail([3, 4, 5], { ETag: '"a"', 'Content-Range': 'bytes 2-4/5' }),
     restart: true, expected: B, restartReason: 'range' },
+  { name: 'Content-Range and Content-Length disagree', initial: { ETag: '"a"' },
+    resumed: () => tail([3], { ETag: '"a"', 'Content-Length': '1' }),
+    restart: true, expected: B, restartReason: 'range' },
+  { name: 'first ETag becomes visible on the resume',
+    resumed: () => tail(A.slice(2), { ETag: '"a"' }), expected: A, note: unvalidated },
   { name: 'clean short tail', initial: { ETag: '"a"' },
     resumed: () => tail([3], { ETag: '"a"' }), note: validated,
     error: { name: 'ModelTransferLengthError' } },

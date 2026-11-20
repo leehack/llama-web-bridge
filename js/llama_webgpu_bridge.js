@@ -1142,52 +1142,72 @@ function inferResponseTotalBytes(response, loadedFallback = 0) {
 function strongEtagOf(value) {
   return value !== null && /^"[\x21\x23-\x7E\x80-\xFF]*"$/.test(value) ? value : null;
 }
-function captureResumeIdentity(response, finalUrl, total) {
-  const etag = response.headers.get("etag");
+function contentEncodingOf(response) {
+  const encoding = response.headers.get("content-encoding");
+  if (encoding !== null) return encoding.toLowerCase();
+  if (response.type === "basic") return "identity";
+  if (response.type === "cors") {
+    const exposed = response.headers.get("access-control-expose-headers")?.toLowerCase().split(",");
+    if (exposed?.some((name) => ["*", "content-encoding"].includes(name.trim()))) return "identity";
+  }
+  return null;
+}
+function parseByteLength(value) {
+  if (value === null || !/^\d+$/.test(value)) return null;
+  const length = Number(value);
+  return Number.isSafeInteger(length) ? length : null;
+}
+function parseByteRange(value) {
+  const match = value === null ? null : /^bytes (\d+)-(\d+)\/(\d+|\*)$/i.exec(value);
+  if (!match) return null;
+  const start = parseByteLength(match[1]);
+  const end = parseByteLength(match[2]);
+  const total = parseByteLength(match[3]);
+  if (start === null || end === null || total === null && match[3] !== "*") return null;
+  return { start, end, total };
+}
+function captureResumeIdentity(response, finalUrl) {
+  const encoding = contentEncodingOf(response);
+  let total = parseByteLength(response.headers.get("x-linked-size"));
+  if (total === null && encoding === "identity") {
+    total = response.status === 206 ? parseByteRange(response.headers.get("content-range"))?.total ?? null : parseByteLength(response.headers.get("content-length"));
+  }
   return {
     url: finalUrl,
-    strongEtag: strongEtagOf(etag),
-    etag,
-    lastModified: response.headers.get("last-modified"),
+    strongEtag: strongEtagOf(response.headers.get("etag")),
+    encoding,
     total
   };
 }
 function classifyResumeResponse(identity, response, finalUrl, offset) {
   if (finalUrl !== identity.url) return { verdict: "changed", reason: "url" };
-  let total = identity.total;
-  let rangeVerified = false;
+  const encoding = contentEncodingOf(response);
   const contentRange = response.headers.get("content-range");
-  if (contentRange !== null) {
-    const match = /^bytes (\d+)-(\d+)\/(\d+)$/.exec(contentRange);
-    if (!match) return { verdict: "changed", reason: "range" };
-    const [, start, end, declaredTotal] = match.map(Number);
-    if (!Number.isSafeInteger(declaredTotal) || start !== offset || end < start || end !== declaredTotal - 1 || total > 0 && declaredTotal !== total) {
-      return { verdict: "changed", reason: "range" };
-    }
-    total = declaredTotal;
-    rangeVerified = true;
-  } else {
-    const contentLength = response.headers.get("content-length");
-    if (total > 0 && contentLength !== null && /^\d+$/.test(contentLength)) {
-      if (Number(contentLength) !== total - offset) return { verdict: "changed", reason: "range" };
-      rangeVerified = true;
-    }
-  }
-  const linkedSize = parsePositiveInteger(response.headers.get("x-linked-size"));
-  if (linkedSize > 0 && total > 0 && linkedSize !== total) {
+  const range = encoding === "identity" ? parseByteRange(contentRange) : null;
+  const length = encoding === "identity" ? parseByteLength(response.headers.get("content-length")) : null;
+  const linkedSize = parseByteLength(response.headers.get("x-linked-size"));
+  const total = range?.total ?? linkedSize ?? identity.total;
+  if (total !== null && (identity.total !== null && total !== identity.total || linkedSize !== null && total !== linkedSize)) {
     return { verdict: "changed", reason: "range" };
   }
-  const etag = response.headers.get("etag");
-  if (identity.strongEtag !== null) {
-    if (strongEtagOf(etag) !== identity.strongEtag) return { verdict: "changed", reason: "etag" };
-  } else {
-    if (etag !== identity.etag) return { verdict: "changed", reason: "etag" };
-    const lastModified = response.headers.get("last-modified");
-    if (lastModified !== identity.lastModified) return { verdict: "changed", reason: "last_modified" };
+  let rangeVerified = false;
+  if (range) {
+    if (range.start !== offset || range.end < range.start || total !== null && range.end !== total - 1 || length !== null && length !== range.end - range.start + 1) {
+      return { verdict: "changed", reason: "range" };
+    }
+    rangeVerified = total !== null;
+  } else if (length !== null && total !== null) {
+    if (length !== total - offset) return { verdict: "changed", reason: "range" };
+    rangeVerified = contentRange === null;
   }
+  const etag = strongEtagOf(response.headers.get("etag"));
+  const comparableTags = identity.strongEtag !== null && etag !== null && encoding !== null && identity.encoding === encoding;
+  if (comparableTags && etag !== identity.strongEtag) return { verdict: "changed", reason: "etag" };
+  const tailBytes = range ? range.end + 1 : length === null ? null : offset + length;
   return {
-    verdict: identity.strongEtag !== null && rangeVerified ? "validated" : "unvalidated",
-    total: total || linkedSize
+    verdict: comparableTags && rangeVerified ? "validated" : "unvalidated",
+    total,
+    expectedBytes: total ?? tailBytes
   };
 }
 function isRetryableStreamNetworkError(error) {
@@ -1347,7 +1367,10 @@ function teeResponseForCache(source, maxCacheLagBytes = DEFAULT_CACHE_TEE_LAG_BY
   );
   const init = { status: source.status, statusText: source.statusText, headers: source.headers };
   const response = new Response(bodyStream, init);
-  Object.defineProperty(response, "url", { value: source.url });
+  Object.defineProperties(response, {
+    url: { value: source.url },
+    type: { value: source.type }
+  });
   return {
     response,
     cacheResponse: new Response(cacheStream, init),
@@ -3625,7 +3648,7 @@ var LlamaWebGpuBridgeRuntime = class {
                   `Range resume not honored for model shard: ${response.status} ${response.statusText}`
                 );
               }
-              let expectedResumeBytes = 0;
+              let expectedShardBytes = null;
               if (resumeOffset > 0 && resumeIdentity) {
                 const resume = classifyResumeResponse(resumeIdentity, response, responseUrl, resumeOffset);
                 if (resume.verdict === "changed") {
@@ -3646,8 +3669,8 @@ var LlamaWebGpuBridgeRuntime = class {
                   continue;
                 }
                 this._runtimeNotes.push("model_stream_resume_" + resume.verdict);
-                expectedResumeBytes = resume.total;
-                resumeIdentity.total = expectedResumeBytes;
+                expectedShardBytes = resume.expectedBytes;
+                resumeIdentity.total = resume.total;
               }
               if (!hasReadableResponseStream(response)) {
                 this._runtimeNotes.push("model_response_nostream");
@@ -3660,7 +3683,8 @@ var LlamaWebGpuBridgeRuntime = class {
               this._runtimeNotes.push("model_response_stream");
               const responseTotal = inferResponseTotalBytes(response, knownTotalBytes);
               if (resumeOffset === 0) {
-                resumeIdentity = captureResumeIdentity(response, responseUrl, responseTotal);
+                resumeIdentity = captureResumeIdentity(response, responseUrl);
+                expectedShardBytes = resumeIdentity.total;
               }
               if (responseTotal > 0) {
                 knownTotalBytes = responseTotal;
@@ -3702,9 +3726,9 @@ var LlamaWebGpuBridgeRuntime = class {
                     abortMessage
                   }
                 );
-                if (expectedResumeBytes > 0 && shardBytes !== expectedResumeBytes) {
+                if (expectedShardBytes !== null && shardBytes !== expectedShardBytes) {
                   throw createModelTransferLengthError(
-                    "Resumed model response staged " + shardBytes + " bytes, expected " + expectedResumeBytes + "."
+                    "Model response staged " + shardBytes + " bytes, expected " + expectedShardBytes + "."
                   );
                 }
                 await this._settleModelCacheStore(response);

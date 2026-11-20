@@ -241,22 +241,26 @@ For full wasm32 responses with a valid `Content-Length` hint between 1 GiB
 and 2 GiB minus one byte, the writer attempts to reserve filesystem capacity before streaming. It resets
 the logical file length before writing and falls back to incremental writes if
 the reservation fails. A CORS response can hide compression headers, so its
-length is only an allocation hint. For full downloads, short or excess bodies
-are rejected only when the decoded length is established by same-origin or
-visible identity encoding metadata. Invalid partial files are removed.
-Visibly encoded, resumed and unknown-size responses keep incremental writes.
+length is only an allocation hint when the encoding is unknown. Visibly
+encoded, resumed and unknown-size responses keep incremental writes.
 
 For an interrupted streamed download, the bridge validates an open-ended
 range response using a matching strong ETag, the same final URL, and a
-consistent `Content-Range`. When `Content-Range` is hidden, a matching
-`Content-Length` for a known remainder also verifies the range. If the
-visible response contradicts the original download, the bridge restarts that
-shard at byte zero. If the response is consistent but lacks a strong visible
-validator or a verifiable range, the bridge resumes without validation. A
-same-size revision change can go undetected on this path.
-A resumed shard whose byte count differs from its known full size is rejected
-before model initialization. For cross-origin downloads, expose `ETag` and
-`Content-Range` with `Access-Control-Expose-Headers`.
+consistent identity-encoded `Content-Range`. When `Content-Range` is hidden,
+a matching identity-encoded `Content-Length` for a known remainder also
+verifies the range. A changed URL, differing comparable strong ETags, or
+contradictory byte lengths or offsets restart the shard at byte zero.
+Missing or weak ETags and lengths measured with different or unknown
+encodings can leave a resume unvalidated. A same-size revision change can
+go undetected on this path.
+
+The bridge checks the staged byte count against any known decoded size
+before initializing the model, including after a restart. For cross-origin
+downloads, expose `ETag`, `Content-Range`, and any `Content-Encoding` with
+`Access-Control-Expose-Headers`. When `Content-Encoding` is absent, the bridge
+can establish identity encoding if it can read an exposure list that includes
+`Content-Encoding` or `*`. If the encoding is unknown, HTTP length headers
+are hints and the bridge resumes without range validation.
 
 Relative URLs resolve against the page's base URL (`document.baseURI`, so a
 `<base href>` applies) in both runtimes; worker mode resolves them before

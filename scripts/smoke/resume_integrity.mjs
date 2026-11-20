@@ -7,6 +7,7 @@ import fsp from 'node:fs/promises';
 import http from 'node:http';
 import path from 'node:path';
 import process from 'node:process';
+import { gzipSync } from 'node:zlib';
 import { chromium } from 'playwright';
 
 import {
@@ -162,7 +163,10 @@ if (${deterministicProgress}) {
       cancel(reason) { return reader.cancel(reason); },
     }, { highWaterMark: 0 });
     const wrapped = new Response(body, { status: response.status, headers: response.headers });
-    Object.defineProperty(wrapped, 'url', { value: response.url });
+    Object.defineProperties(wrapped, {
+      url: { value: response.url },
+      type: { value: response.type },
+    });
     return wrapped;
   };
 }
@@ -202,16 +206,35 @@ const CASES = {
   'strong-etag-changed': { cut: true, initialTag: '"a"', laterTag: '"b"', newRevision: true,
     expected: 'B', requests: RESTART, note: 'model_stream_restart:etag' },
   'weak-etag-changed': { cut: true, initialTag: 'W/"a"', laterTag: 'W/"b"', newRevision: true,
-    expected: 'B', requests: RESTART, note: 'model_stream_restart:etag' },
+    expected: 'hybrid', requests: RESUME, note: UNVALIDATED },
   'strong-etag-unchanged': { cut: true, initialTag: '"same"', laterTag: '"same"',
     expected: 'A', requests: RESUME, note: VALIDATED },
   redirect: { cut: true, redirect: true, initialTag: '"same"', laterTag: '"same"', newRevision: true,
     expected: 'B', requests: REDIRECT, note: 'model_stream_restart:url' },
   'wrong-start': { cut: true, malformed: 'start', expected: 'A', requests: RESTART, note: 'model_stream_restart:range' },
   'wrong-total': { cut: true, malformed: 'total', expected: 'A', requests: RESTART, note: 'model_stream_restart:range' },
-  'short-tail': { cut: true, short: true, requests: [...RESUME, [RECOVERY, null]], note: UNVALIDATED },
-  'cross-origin-exposed': { crossOrigin: true, expose: true, cut: true, initialTag: '"a"', laterTag: '"a"',
+  'contradictory-tail-length': { cut: true, shortTail: true, declareTailLength: true, initialTag: '"a"', laterTag: '"a"',
+    expected: 'A', requests: RESTART, note: 'model_stream_restart:range' },
+  'short-tail': { cut: true, shortTail: true, recover: true,
+    requests: [...RESUME, [RECOVERY, null]], note: UNVALIDATED },
+  'wrong-replacement-size': { cut: true, wrongReplacementSize: true, recover: true, initialTag: '"a"', laterTag: '"b"',
+    requests: [...RESTART, [RECOVERY, null]], note: 'model_stream_restart:etag' },
+  'mixed-case-range-unit': { cut: true, alwaysCut: true, rangeUnit: 'Bytes',
+    expected: 'A', requests: RESUME, note: UNVALIDATED },
+  'wildcard-range-total': { cut: true, alwaysCut: true, wildcardTotal: true,
+    expected: 'A', requests: RESUME, note: UNVALIDATED },
+  'cross-origin-etag-exposed-on-resume': { crossOrigin: true, exposeOnResume: true, cut: true, alwaysCut: true,
+    initialTag: '"a"', laterTag: '"a"', expected: 'A', requests: RESUME, note: UNVALIDATED },
+  'negotiated-gzip': { cut: true, alwaysCut: true, gzip: true,
+    expected: 'A', requests: RESUME, note: UNVALIDATED },
+  'cross-origin-negotiated-gzip': { crossOrigin: true, expose: true, cut: true, alwaysCut: true, gzip: true,
+    initialTag: '"gzip"', laterTag: '"identity"', expected: 'A', requests: RESUME, note: UNVALIDATED },
+  'cross-origin-exposed': { crossOrigin: true, exposeAll: true,
+    cut: true, initialTag: '"a"', laterTag: '"a"',
     expected: 'A', requests: RESUME, note: VALIDATED },
+  'cross-origin-strong-etag-changed': { crossOrigin: true, exposeAll: true, cut: true,
+    initialTag: '"a"', laterTag: '"b"', newRevision: true,
+    expected: 'B', requests: RESTART, note: 'model_stream_restart:etag' },
   'cross-origin-hidden': { crossOrigin: true, cut: true, initialTag: '"a"', laterTag: '"a"',
     expected: 'A', requests: RESUME, note: UNVALIDATED },
   'weak-etag-unchanged': { cut: true, initialTag: 'W/"same"', laterTag: 'W/"same"', newRevision: true,
@@ -227,7 +250,11 @@ function serveModel(req, res, requestPath, index, scenario, { revA, revB }) {
   const headers = { 'Content-Type': 'application/octet-stream', 'Cache-Control': 'no-store' };
   if (scenario.crossOrigin) {
     headers['Access-Control-Allow-Origin'] = '*';
-    if (scenario.expose) headers['Access-Control-Expose-Headers'] = 'ETag, Content-Range';
+    if (scenario.exposeAll) {
+      headers['Access-Control-Expose-Headers'] = '*';
+    } else if (scenario.expose || (scenario.exposeOnResume && req.headers.range)) {
+      headers['Access-Control-Expose-Headers'] = 'ETag, Content-Range, Content-Encoding';
+    }
   }
   if (req.method !== 'GET') {
     res.writeHead(403, headers).end();
@@ -252,13 +279,31 @@ function serveModel(req, res, requestPath, index, scenario, { revA, revB }) {
   if (range && scenario.malformed === 'total') revision = Buffer.concat([revision, Buffer.alloc(4096)]);
 
   const start = range && scenario.malformed !== 'start' ? Number(range[1]) : 0;
-  if (range) headers['Content-Range'] = `bytes ${start}-${revision.length - 1}/${revision.length}`;
-  if (!(range && scenario.short)) headers['Content-Length'] = revision.length - start;
+  const shortTail = range && scenario.shortTail;
+  const body = revision.subarray(start, shortTail ? start + 400000 : undefined);
+  if (range) {
+    const unit = scenario.rangeUnit ?? 'bytes';
+    const total = scenario.wildcardTotal ? '*' : revision.length;
+    headers['Content-Range'] = `${unit} ${start}-${revision.length - 1}/${total}`;
+  }
+  if (!shortTail || scenario.declareTailLength) headers['Content-Length'] = body.length;
+  if (scenario.wrongReplacementSize && !range && index > 0) headers['X-Linked-Size'] = revision.length - 1;
+  if (scenario.gzip) {
+    headers.Vary = 'Accept-Encoding';
+    if (!range && /\bgzip\b/.test(req.headers['accept-encoding'] ?? '')) {
+      const prefix = gzipSync(revision.subarray(0, CUT));
+      headers['Content-Length'] = prefix.length + gzipSync(revision.subarray(CUT)).length;
+      headers['Content-Encoding'] = 'gzip';
+      res.writeHead(200, headers);
+      res.write(prefix, () => setTimeout(() => res.destroy(), 150));
+      return;
+    }
+  }
   res.writeHead(range ? 206 : 200, headers);
   if (!range && scenario.cut && (index === 0 || scenario.alwaysCut)) {
     res.write(revision.subarray(0, CUT), () => setTimeout(() => res.destroy(), 150));
   } else {
-    res.end(revision.subarray(start, range && scenario.short ? start + 400000 : undefined));
+    res.end(body);
   }
 }
 
@@ -307,7 +352,7 @@ async function runCase(browser, args, revisions, name, { worker = false, parity 
     }
     if (req.url === '/index.html') {
       res.writeHead(200, { ...isolationHeaders, 'Content-Type': 'text/html' });
-      res.end(renderHarness(args, { modelUrl: modelOrigin + MODEL, worker, recover: scenario.short ?? false }));
+      res.end(renderHarness(args, { modelUrl: modelOrigin + MODEL, worker, recover: scenario.recover ?? false }));
       return;
     }
     if (req.url === '/instrumented-core.js') {
@@ -353,7 +398,7 @@ function verifyCase(args, revisions, name, result, worker = false) {
   assert.deepEqual(notes, scenario.note ? [scenario.note] : []);
   const rewinds = result.progress.filter(({ loaded }, index) => index > 0 && loaded < result.progress[index - 1].loaded);
   assert.deepEqual(rewinds.map(({ loaded }) => loaded), scenario.note?.startsWith('model_stream_restart:') ? [0] : []);
-  if (scenario.short) {
+  if (scenario.recover) {
     assert.equal(result.ok, false);
     assert.equal(result.error?.name, 'ModelTransferLengthError');
     assert.equal(result.recoveredSameCore, true);
