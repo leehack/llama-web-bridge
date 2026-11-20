@@ -331,9 +331,9 @@ bool check_wasm32_gguf_shard(
         kWasm32SizeMax - prior_total < padded_size) {
       set_error(
           "GGUF tensor payload exceeds the wasm32 4 GiB address space limit (tensor '" +
-          std::string(name_buf) + "', accumulated " + std::to_string(prior_total) +
-          " + " + std::to_string(padded_size) + " > " +
-          std::to_string(kWasm32SizeMax) +
+          std::string(name_buf) + "' declares " + std::to_string(nbytes) +
+          " bytes, accumulated " + std::to_string(prior_total) +
+          " bytes, limit " + std::to_string(kWasm32SizeMax) +
           " bytes); use the memory64 core or a smaller quantization");
       return false;
     }
