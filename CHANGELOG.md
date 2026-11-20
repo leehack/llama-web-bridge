@@ -2,7 +2,6 @@
 
 ## Unreleased
 
-- On a page without cross-origin isolation, the core init timeout includes guidance for pthread cores.
 - Thinking budgets accept an ordered list of natural ends. A tool opener can close reasoning and activate the paused tool grammar, and an exhausted budget emits the full forced close. The loaded core reports support through `thinkingBudgetMultiEnd`.
 
 - Escape control characters in tensor names in wasm32 GGUF size errors and report an overflowed declared size as at least 2^64 bytes.

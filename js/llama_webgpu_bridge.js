@@ -826,13 +826,6 @@ var SingleThreadCoreError = class extends Error {
   }
 };
 var CROSS_ORIGIN_ISOLATION_MESSAGE = 'The llama.cpp web core needs shared memory, which this page cannot use because it is not cross-origin isolated. Serve the page with "Cross-Origin-Opener-Policy: same-origin" and "Cross-Origin-Embedder-Policy: require-corp". "credentialless" does not isolate Safari.';
-function appendCoreInitTimeoutHint(error) {
-  try {
-    if (globalThis.crossOriginIsolated !== false) return;
-    error.message += '. If this core was built with pthreads, its worker pool may need cross-origin isolation. Serve the page with "Cross-Origin-Opener-Policy: same-origin" and "Cross-Origin-Embedder-Policy: require-corp", or use the single-thread "_st" cores with "allowSingleThreadCore".';
-  } catch (_) {
-  }
-}
 
 // js/src/internal/logging.ts
 function logLevelForName(level) {
@@ -3371,7 +3364,7 @@ var LlamaWebGpuBridgeRuntime = class {
       return false;
     }
   }
-  async _ensureCore({ reportTimeoutHint = true } = {}) {
+  async _ensureCore() {
     if (this._core) {
       this._applyCoreLogLevel();
       return this._core;
@@ -3505,9 +3498,6 @@ var LlamaWebGpuBridgeRuntime = class {
           this._emitLogger("warn", `Memory64 core unavailable (${reason}). Trying the wasm32 core.`);
           continue;
         }
-        if (reportTimeoutHint && initTimeoutError && error === initTimeoutError) {
-          appendCoreInitTimeoutHint(initTimeoutError);
-        }
         throw error;
       }
     }
@@ -3519,7 +3509,7 @@ var LlamaWebGpuBridgeRuntime = class {
   }
   async _probeBackends() {
     try {
-      const core = await this._ensureCore({ reportTimeoutHint: false });
+      const core = await this._ensureCore();
       const probeResult = Number(
         await core.ccall("llamadart_webgpu_probe", "number", [], [], { async: true })
       );

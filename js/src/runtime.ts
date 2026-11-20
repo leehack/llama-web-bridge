@@ -45,9 +45,7 @@ import {
   isSafariUserAgent,
   safariDefaultMaxGpuLayers,
 } from './internal/environment.ts';
-import {
-  CrossOriginIsolationError, SingleThreadCoreError, appendCoreInitTimeoutHint,
-} from './internal/isolation.ts';
+import { CrossOriginIsolationError, SingleThreadCoreError } from './internal/isolation.ts';
 import { decodeImageBytesToRgb } from './internal/image.ts';
 import {
   EmbeddingError, EMPTY_EMBEDDING_CAPABILITIES, EMBEDDING_MEDIA_MARKER,
@@ -2160,7 +2158,7 @@ export class LlamaWebGpuBridgeRuntime {
     }
   }
 
-  async _ensureCore({ reportTimeoutHint = true } = {}) {
+  async _ensureCore() {
     if (this._core) {
       this._applyCoreLogLevel();
       return this._core;
@@ -2318,9 +2316,6 @@ export class LlamaWebGpuBridgeRuntime {
           this._emitLogger('warn', `Memory64 core unavailable (${reason}). Trying the wasm32 core.`);
           continue;
         }
-        if (reportTimeoutHint && initTimeoutError && error === initTimeoutError) {
-          appendCoreInitTimeoutHint(initTimeoutError);
-        }
         throw error;
       }
     }
@@ -2336,7 +2331,7 @@ export class LlamaWebGpuBridgeRuntime {
 
   async _probeBackends() {
     try {
-      const core = await this._ensureCore({ reportTimeoutHint: false });
+      const core = await this._ensureCore();
       const probeResult = Number(
         await core.ccall('llamadart_webgpu_probe', 'number', [], [], { async: true }),
       );
