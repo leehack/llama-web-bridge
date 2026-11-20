@@ -319,6 +319,12 @@ export class SingleThreadCoreError extends Error {
   constructor(message?: string);
 }
 
+/** Thrown by calls that need a model after a native abort unloaded it, until `loadModelFromUrl` succeeds again. */
+export class ModelUnloadedError extends Error {
+  readonly code: 'MODEL_UNLOADED_AFTER_CORE_ABORT';
+  constructor(message?: string);
+}
+
 export type ModelStagingErrorCode =
   | 'MODEL_STAGING_ALLOCATION_FAILED'
   | 'MODEL_TENSOR_SIZE_LIMIT_EXCEEDED'

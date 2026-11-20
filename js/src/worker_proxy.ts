@@ -12,6 +12,7 @@ import {
   SINGLE_THREAD_CORE_UNSUPPORTED,
   SingleThreadCoreError,
 } from './internal/isolation.ts';
+import { MODEL_UNLOADED_AFTER_CORE_ABORT, ModelUnloadedError } from './internal/core_guard.ts';
 import { ModelStagingError, isModelStagingErrorCode } from './internal/model_staging.ts';
 import type { LlamaWebGpuBridgeConfig } from './llama_webgpu_bridge.d.ts';
 import { bridgeWorkerModeParam } from './worker_protocol.ts';
@@ -82,12 +83,16 @@ export class BridgeWorkerProxy {
   declare _readyResolve: () => void;
   declare _readyReject: (reason?: unknown) => void;
   declare _readyTimeoutHandle: ReturnType<typeof setTimeout> | null;
+  // Set once the worker reports that its core aborted. It never clears: the
+  // facade replaces this worker.
+  declare coreRetired: boolean;
 
   constructor({ moduleUrl, config }: { moduleUrl: string; config: LlamaWebGpuBridgeConfig }) {
     this._config = config && typeof config === 'object' ? config : {};
     this._nextId = 1;
     this._pending = new Map();
     this._workerBlobUrl = null;
+    this.coreRetired = false;
 
     let workerInitError: unknown = null;
     const moduleCandidates = [moduleUrl];
@@ -151,6 +156,10 @@ export class BridgeWorkerProxy {
         this._readyResolve?.();
         return;
       }
+      if (type === 'core-retired') {
+        this.coreRetired = true;
+        return;
+      }
 
       const id = Number(message.id || 0);
       const pending = this._pending.get(id);
@@ -175,7 +184,9 @@ export class BridgeWorkerProxy {
               ? new CrossOriginIsolationError(errorMessage)
               : message.errorCode === SINGLE_THREAD_CORE_UNSUPPORTED
                 ? new SingleThreadCoreError(errorMessage)
-                : new Error(errorMessage);
+                : message.errorCode === MODEL_UNLOADED_AFTER_CORE_ABORT
+                  ? new ModelUnloadedError(errorMessage)
+                  : new Error(errorMessage);
         if (isDecisionErrorCode(message.decisionErrorCode)) {
           withDecisionErrorCode(workerError, message.decisionErrorCode);
         }

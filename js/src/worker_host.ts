@@ -3,6 +3,7 @@
 import { LlamaWebGpuBridge } from './bridge.ts';
 import { decisionErrorCodeOf } from './internal/decision.ts';
 import { EMBED_BATCH_PROGRESS_OPTION, EmbeddingError } from './internal/embedding.ts';
+import { ModelUnloadedError } from './internal/core_guard.ts';
 import { CrossOriginIsolationError, SingleThreadCoreError } from './internal/isolation.ts';
 import { ModelStagingError } from './internal/model_staging.ts';
 import type { EmbedBatchProgressHook } from './internal/embedding.ts';
@@ -58,6 +59,7 @@ export function installBridgeWorkerHost() {
       message: serializeWorkerError(error),
       ...(error instanceof EmbeddingError ? { embeddingErrorCode: error.code } : {}),
       ...(error instanceof CrossOriginIsolationError || error instanceof SingleThreadCoreError
+        || error instanceof ModelUnloadedError
         ? { errorCode: error.code } : {}),
       ...(error instanceof ModelStagingError ? { modelStagingErrorCode: error.code } : {}),
       ...(decisionErrorCode ? { decisionErrorCode } : {}),
@@ -81,6 +83,9 @@ export function installBridgeWorkerHost() {
           ...(message.config || {}),
           disableWorker: true,
         });
+        // Posted when the core retires, so it reaches the facade before the
+        // reply of the call that hit the abort, whatever that reply carries.
+        bridge._onCoreRetired = () => self.postMessage({ type: 'core-retired' });
         self.postMessage({ type: 'ready' });
         return;
       }

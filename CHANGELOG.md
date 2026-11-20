@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Retire the native core after its abort callback or a genuine WebAssembly runtime error. Direct callers receive `ModelUnloadedError` on later model operations until a load succeeds. Worker mode replaces the worker and restores the remembered model and its active LoRA adapters. Media completion and speech synthesis on a GPU-loaded model retry once on the replacement worker with a CPU-only restore. Abort-like error text alone no longer restarts a worker or selects CPU offload. All four cores expose their realm's `WebAssembly.RuntimeError` and a hook that releases pthreads and JS-backed staging data. Older cross-realm cores without the constructor export retire through `onAbort`. Use bridge JS and the worker script from the same release.
+
 - Carry strong ETag and expected size evidence across repeated streamed GGUF interruptions. Restart overlong interrupted ranges, and enforce the declared span and consistent totals when a full GET returns an identity-encoded byte range starting at zero.
 
 - Report the tensor name, declared byte size, and accumulated bytes when wasm32 GGUF tensor preflight rejects a model.

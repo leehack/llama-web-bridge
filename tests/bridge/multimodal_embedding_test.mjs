@@ -302,7 +302,7 @@ test('capabilities are re-probed across projector unload/reload', async () => {
 
 
 for (const method of ['embed', 'embedBatch', 'getEmbeddingCapabilities']) {
-  for (const failure of ['crash', 'timeout', 'core abort']) {
+  for (const failure of ['crash', 'timeout']) {
     test(`${method} recovers a worker ${failure} during capability probing and reloads its projector`, async () => {
       const {bridge,runtime}=fixture();
       runtime._mmProjPath=null;
@@ -316,7 +316,7 @@ for (const method of ['embed', 'embedBatch', 'getEmbeddingCapabilities']) {
       bridge._restoreLoraAdapters=async()=>{};
       bridge._disableWorkerFallback=()=>{bridge._workerProxy=null;};
       bridge._waitForWorkerDisposal=async()=>{};
-      const error=failure==='core abort'?new WebAssembly.RuntimeError('Aborted()'):new Error('worker '+failure);
+      const error = new Error('worker ' + failure);
       if(failure==='crash') error.llamadartWorkerCrash=true;
       if(failure==='timeout') error.llamadartWorkerTimeout=true;
       bridge._loadedModelOptions={nGpuLayers:0};
@@ -354,12 +354,12 @@ for (const method of ['embed','embedBatch']) {
   });
 }
 
-test('parts core abort retains the worker recovery signal while staging diagnostics remain private', async()=>{
+test('parts embedding rethrows the original RuntimeError', async()=>{
   const {bridge,runtime}=fixture();
   const original=runtime._core.ccall;
   const abort=new WebAssembly.RuntimeError('Aborted()');
   runtime._core.ccall=(name,...args)=>{if(name==='llamadart_webgpu_embed_parts_to_json') throw abort; return original(name,...args);};
-  await assert.rejects(bridge.embed([{type:'text',text:'x'}]),error=>error===abort && bridge._isWorkerUnusableError(error));
+  await assert.rejects(bridge.embed([{type:'text',text:'x'}]),(error) => error === abort);
 });
 
 test('parts marshal exact UTF-8 bytes for lone surrogates, surrogate before CJK and NUL', async()=>{
@@ -656,7 +656,7 @@ for (const type of ['image', 'IMAGE', 'audio', 'AuDiO']) {
     const options = { parts: [{ type, bytes: new Uint8Array([1]) }] };
     assert.equal(bridge._hasMediaParts(options), true);
     assert.equal(bridge._workerCompletionStallTimeoutMs(options), 180000);
-    await bridge._ensureRuntimeReadyAfterWorkerFallback(options, new Error('RuntimeError: Aborted()'));
+    await bridge._ensureRuntimeReadyAfterWorkerFallback(options, new Error('ggml_webgpu: device error'));
     assert.deepEqual(loads[0].options, { nGpuLayers: 0, nCtx: 4096, nBatch: 128, nUbatch: 64, nThreads: 4, nThreadsBatch: 4 });
     assert.equal(projectors.length, 1);
   });

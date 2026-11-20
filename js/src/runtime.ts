@@ -45,6 +45,7 @@ import {
   isSafariUserAgent,
   safariDefaultMaxGpuLayers,
 } from './internal/environment.ts';
+import { guardCore, isCoreRetired, retireCore } from './internal/core_guard.ts';
 import { CrossOriginIsolationError, SingleThreadCoreError } from './internal/isolation.ts';
 import { decodeImageBytesToRgb } from './internal/image.ts';
 import {
@@ -254,6 +255,8 @@ export class LlamaWebGpuBridgeRuntime {
   declare _isAppleSafari: boolean;
   declare _safariDefaultMaxGpuLayers: number;
   declare _coreVariant: string;
+  declare _coreRetired: boolean;
+  declare _onCoreRetired: ((runtime: LlamaWebGpuBridgeRuntime, cause: unknown) => void) | null;
   declare _preferMemory64: boolean;
   declare _modelSource: string;
   declare _modelCacheState: string;
@@ -348,6 +351,8 @@ export class LlamaWebGpuBridgeRuntime {
     this._isAppleSafari = isAppleSafariUserAgent(userAgent);
     this._safariDefaultMaxGpuLayers = safariDefaultMaxGpuLayers(userAgent);
     this._coreVariant = 'uninitialized';
+    this._coreRetired = false;
+    this._onCoreRetired = null;
     this._preferMemory64 = this._config.preferMemory64 !== false;
     this._modelSource = 'network';
     this._modelCacheState = 'disabled';
@@ -1524,7 +1529,7 @@ export class LlamaWebGpuBridgeRuntime {
         return;
       }
       closed = true;
-      if ((core as { ABORT?: unknown }).ABORT === true) {
+      if (isCoreRetired(core)) {
         return;
       }
       assertMountOwned();
@@ -1627,7 +1632,7 @@ export class LlamaWebGpuBridgeRuntime {
       return;
     }
 
-    if (!core || (core as { ABORT?: unknown }).ABORT === true) {
+    if (!core || isCoreRetired(core)) {
       for (const targetMount of targets.keys()) {
         this._activeJsStagingMounts.delete(targetMount);
         this._failedUnmountJsStagingMounts.delete(targetMount);
@@ -2122,6 +2127,23 @@ export class LlamaWebGpuBridgeRuntime {
     }
   }
 
+  _handleCoreRetired(cause: unknown, stats?: { threads: number; stagedBytes: number }) {
+    if (this._coreRetired) {
+      return;
+    }
+    this._coreRetired = true;
+    this._runtimeNotes.push('core_retired');
+    if (!stats) {
+      this._runtimeNotes.push('core_retired_threads_unavailable');
+    } else {
+      if (stats.threads >= 0) {
+        this._runtimeNotes.push(`core_retired_threads:${stats.threads}`);
+      }
+      this._runtimeNotes.push(`core_retired_staged_bytes:${stats.stagedBytes}`);
+    }
+    this._onCoreRetired?.(this, cause);
+  }
+
   async _ensureCore() {
     if (this._core) {
       this._applyCoreLogLevel();
@@ -2167,11 +2189,14 @@ export class LlamaWebGpuBridgeRuntime {
 
       let factoryLoaded = false;
       let initTimeoutError: Error | null = null;
+      // Set once this candidate's core is adopted. A candidate that was
+      // discarded keeps its callbacks, which must not reach the adopted core.
+      let candidateCore: LlamaCoreModule | null = null;
       try {
         const moduleFactory = await candidate.factoryPromise;
         factoryLoaded = true;
         const initTimeoutMs = this._resolveCoreInitTimeoutMs();
-        this._core = await Promise.race([
+        candidateCore = guardCore(await Promise.race([
           moduleFactory({
           locateFile: (path: string, prefix: string) => {
             if (path.endsWith('.wasm') && candidate.wasmUrl) {
@@ -2248,6 +2273,7 @@ export class LlamaWebGpuBridgeRuntime {
               this._runtimeNotes.push('core_abort');
               this._emitLogger('error', 'core abort');
             }
+            retireCore(candidateCore, reason);
           },
           }),
           new Promise((_, reject) => {
@@ -2256,7 +2282,8 @@ export class LlamaWebGpuBridgeRuntime {
               reject(initTimeoutError);
             }, initTimeoutMs);
           }),
-        ]) as LlamaCoreModule;
+        ]) as LlamaCoreModule, (cause, stats) => this._handleCoreRetired(cause, stats));
+        this._core = candidateCore;
 
         this._coreVariant = candidate.variant === 'wasm64' ? 'wasm64' : 'wasm32';
         if (candidate.variant === 'wasm64') {
@@ -2711,7 +2738,7 @@ export class LlamaWebGpuBridgeRuntime {
               await this._settleModelCacheStore(response);
               break;
             } catch (error) {
-              if (assertMountOwned && (core as { ABORT?: unknown }).ABORT !== true) {
+              if (assertMountOwned && !isCoreRetired(core)) {
                 assertMountOwned();
               }
               const text = String(error || '').toLowerCase();
@@ -2877,7 +2904,7 @@ export class LlamaWebGpuBridgeRuntime {
         }
         if (useJsBackedStaging) {
           try {
-            if ((core as { ABORT?: unknown }).ABORT !== true) {
+            if (!isCoreRetired(core)) {
               assertMountOwned?.();
             }
           } finally {
@@ -3241,7 +3268,7 @@ export class LlamaWebGpuBridgeRuntime {
           this._deleteFsFile(createdMmprojPath);
         }
         try {
-          if (assertMountOwned && (core as { ABORT?: unknown }).ABORT !== true) {
+          if (assertMountOwned && !isCoreRetired(core)) {
             assertMountOwned();
           }
         } catch (ownershipError) {

@@ -4,7 +4,7 @@ import { LlamaWebGpuBridge } from '../../js/src/llama_webgpu_bridge.js';
 
 function createBridge({
   gpuLayers = 99,
-  workerError = new Error('Aborted()'),
+  workerError = new Error('ggml_webgpu: device error'),
   runtimeError = null,
   beforeWorkerError = null,
 } = {}) {
@@ -80,7 +80,7 @@ function createBridge({
 
 {
   const { bridge, calls } = createBridge({ gpuLayers: 0 });
-  await assert.rejects(bridge.synthesizeSpeech({ text: 'Hello.' }), /Aborted/);
+  await assert.rejects(bridge.synthesizeSpeech({ text: 'Hello.' }), /ggml_webgpu: device error/);
   assert.equal(calls.length, 0);
   assert.notEqual(bridge._workerProxy, null);
 }
