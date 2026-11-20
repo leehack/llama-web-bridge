@@ -198,4 +198,32 @@ for (const workerError of [
   assert.deepEqual(calls, workerError.message.startsWith('Worker request timeout') ? [['disposeWorker']] : []);
 }
 
+{
+  const { bridge, calls, runtime } = createBridge();
+  const projectorLoading = Promise.withResolvers();
+  const projectorLoaded = Promise.withResolvers();
+  const loadProjector = runtime.loadMultimodalProjector;
+  runtime.loadMultimodalProjector = async (url) => {
+    await loadProjector(url);
+    projectorLoading.resolve();
+    await projectorLoaded.promise;
+  };
+  const chunks = [];
+  const synthesize = runtime.synthesizeSpeech;
+  runtime.synthesizeSpeech = async (options) => {
+    options.onProgress({ pcm: new Float32Array([0.25]) });
+    return synthesize(options);
+  };
+  const rejected = assert.rejects(
+    bridge.synthesizeSpeech({ text: 'Hello.', streamAudio: true, onProgress: (event) => chunks.push(event.pcm) }),
+    { name: 'AbortError' },
+  );
+  await projectorLoading.promise;
+  bridge.cancel();
+  projectorLoaded.resolve();
+  await rejected;
+  assert.equal(calls.some(([method]) => method === 'synthesizeSpeech'), false, 'no fallback synthesis starts after cancel');
+  assert.deepEqual(chunks, []);
+}
+
 console.log('Text-to-speech CPU recovery tests passed');

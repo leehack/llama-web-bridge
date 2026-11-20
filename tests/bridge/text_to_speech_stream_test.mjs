@@ -174,6 +174,7 @@ async function runWorkerSpeech(options, {
     const proxy = bridge._workerProxy;
     const worker = workers[0];
     const driver = workerDriver(proxy, worker);
+    const eventErrors = [];
     worker.onmessage({ data: { type: 'ready', ...(legacy ? {} : { supportsIncrementalAudio: true }) } });
     onBridge?.(bridge);
     const pending = bridge.synthesizeSpeech(options).then(
@@ -186,9 +187,13 @@ async function runWorkerSpeech(options, {
       if (!legacy) {
         for (const [state, sampleOffset, pcm] of [[2, 0, first], [3, first.length, tail]]) {
           if (state === 3 && !emitSecond) break;
-          worker.onmessage({ data: {
-            type: 'event', id, event: 'progress', payload: { state, sampleOffset, pcm: new Float32Array(pcm) },
-          } });
+          try {
+            worker.onmessage({ data: {
+              type: 'event', id, event: 'progress', payload: { state, sampleOffset, pcm: new Float32Array(pcm) },
+            } });
+          } catch (error) {
+            eventErrors.push(error);
+          }
           afterProgress?.(state);
         }
       }
@@ -200,17 +205,124 @@ async function runWorkerSpeech(options, {
       afterResult?.();
     }
     await driver.settle();
-    for (const { id } of driver.calls('cancel')) driver.reply(id, true);
+    const cancelCalls = driver.calls('cancel');
+    for (const { id } of cancelCalls) driver.reply(id, true);
     const outcome = await pending;
     const dispose = bridge.dispose();
     await driver.settle();
     for (const { id } of driver.calls('dispose')) driver.reply(id, true);
     await dispose;
-    return { ...outcome, calls };
+    return { ...outcome, calls, cancelCalls, eventErrors };
   });
 }
 
 const cancellationScript = [{ state: 2, pcm: first }, { state: 3, pcm: tail }];
+
+test('a queued one-shot request keeps its admitted mode in direct synthesis', async () => {
+  const { bridge, calls } = createSpeechBridge({ script: cancellationScript });
+  const active = bridge.synthesizeSpeech({ text: 'First.' });
+  const options = { text: 'Queued.' };
+  const queued = bridge.synthesizeSpeech(options);
+  options.streamAudio = true;
+  await active;
+  const result = await queued;
+  assert.deepEqual(calls.filter(([method]) => method === 'start').map(([, , args]) => args.at(-1)), [0, 0]);
+  assert.deepEqual(result.pcm, new Float32Array(full));
+  assert.equal(result.sampleCount, full.length);
+});
+
+test('a queued one-shot request keeps its admitted mode on the worker', async () => {
+  await withStubWorkerEnvironment(async ({ workers }) => {
+    const bridge = createRealWorkerBridge();
+    const worker = workers[0];
+    const driver = workerDriver(bridge._workerProxy, worker);
+    worker.onmessage({ data: { type: 'ready', supportsIncrementalAudio: true } });
+    const active = bridge.synthesizeSpeech({ text: 'First.' });
+    const options = { text: 'Queued.' };
+    const queued = bridge.synthesizeSpeech(options).then((value) => ({ value }), (error) => ({ error }));
+    options.streamAudio = true;
+    await driver.settle();
+    const [firstCall] = driver.calls('synthesizeSpeech');
+    const oneShot = { pcm: new Float32Array(full), sampleCount: full.length };
+    driver.reply(firstCall.id, oneShot);
+    await active;
+    await driver.settle();
+    const [, secondCall] = driver.calls('synthesizeSpeech');
+    const streamed = secondCall.args[0].streamAudio === true;
+    driver.reply(secondCall.id, streamed ? { ...oneShot, pcm: new Float32Array(0) } : oneShot);
+    const result = await queued;
+    const dispose = bridge.dispose();
+    await driver.settle();
+    for (const { id } of driver.calls('dispose')) driver.reply(id, true);
+    await dispose;
+    assert.equal(streamed, false);
+    assert.deepEqual(result, { value: oneShot });
+  });
+});
+
+test('mutating streamed progress cannot truncate direct synthesis or change the result metadata', async () => {
+  const { bridge } = createSpeechBridge({ script: cancellationScript });
+  const chunks = [];
+  const result = await bridge.synthesizeSpeech({
+    text: 'Hello.', streamAudio: true,
+    onProgress(event) {
+      chunks.push([...event.pcm]);
+      event.state = 3;
+      event.framesGenerated = 500;
+      event.truncated = true;
+    },
+  });
+  assert.deepEqual(chunks, [first, tail]);
+  assert.equal(result.sampleCount, first.length + tail.length);
+  assert.equal(result.framesGenerated, 1);
+  assert.equal(result.truncated, false);
+});
+
+test('a thrown streamed callback cancels the worker and rejects with the original error', async () => {
+  const failure = new Error('ggml_webgpu: device error from the consumer');
+  for (const run of [
+    (options) => createSpeechBridge({ script: cancellationScript }).bridge.synthesizeSpeech(options)
+      .then((value) => ({ value }), (error) => ({ error })),
+    runWorkerSpeech,
+  ]) {
+    let callbacks = 0;
+    const result = await run({
+      text: 'Hello.', streamAudio: true,
+      onProgress() { callbacks += 1; throw failure; },
+    });
+    assert.equal(result.error, failure);
+    assert.equal(callbacks, 1);
+    if (result.cancelCalls) {
+      assert.equal(result.cancelCalls.length, 1);
+      assert.equal(result.cancelCalls[0].operationId, result.calls[0].operationId);
+      assert.equal(result.calls.length, 1);
+      assert.deepEqual(result.eventErrors, []);
+    }
+  }
+});
+
+test('later cancellation cannot replace a streamed callback failure while the worker settles', async () => {
+  for (const useSignal of [false, true]) {
+    let bridge;
+    const controller = new AbortController();
+    const failure = new Error('consumer failed');
+    const result = await runWorkerSpeech({
+      text: 'Hello.', streamAudio: true, signal: controller.signal,
+      onProgress() { throw failure; },
+    }, {
+      onBridge(value) { bridge = value; },
+      afterProgress(state) {
+        if (state !== 2) return;
+        if (useSignal) controller.abort();
+        else bridge.cancel();
+      },
+    });
+    assert.equal(result.error, failure);
+    assert.deepEqual(result.eventErrors, []);
+    assert.equal(result.calls.length, 1);
+  }
+});
+
 for (const [label, trigger, expected] of [
   ['abort from the first chunk', (event, controller) => { if (event.state === 2) controller.abort(); }, [first]],
   ['abort from the final chunk', (event, controller) => { if (event.state === 3) controller.abort(); }, [first, tail]],

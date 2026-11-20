@@ -205,6 +205,10 @@ int main() {
   llama_webgpu_tts * tts = llama_webgpu_tts_init(&llama, &mtmd, nullptr);
   assert(tts);
   assert(llama_webgpu_tts_get_info(&mtmd).capabilities == 11);
+  generate(tts, true, window_frames, 1);
+  assert(tts->stream_chunk.capacity() >= window_frames * samples_per_frame);
+  assert(llama_webgpu_tts_reset(tts) == ok);
+  assert(tts->stream_chunk.capacity() == 0);
   for (const int frames : {187, 72, 73, 144}) {
     const int max_frames = frames == eos_frame ? 200 : frames;
     const auto nonstream = generate(tts, false, max_frames, 1);

@@ -561,7 +561,7 @@ llama_webgpu_tts_status llama_webgpu_tts_reset(llama_webgpu_tts * tts) {
   tts->sample_count = 0;
   tts->pcm.clear();
   tts->stream = false;
-  tts->stream_chunk.clear();
+  std::vector<float>().swap(tts->stream_chunk);
   tts->language.clear();
   tts->error.clear();
   return LLAMADART_WEBGPU_TTS_STATUS_OK;

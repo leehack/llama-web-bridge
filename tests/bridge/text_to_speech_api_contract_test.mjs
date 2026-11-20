@@ -187,7 +187,9 @@ require(
   'runtime dispose must inspect projector unload status and release the staged WasmFS file after shutdown',
 );
 require(
-  /async synthesizeSpeech\(options(?::[^=]*)? = \{\}\).*?if \(this\._textToSpeechActive\).*?this\._ensureTextToSpeechDir\(\)/s.test(JS),
+  /if \(this\._textToSpeechActive\).*?this\._ensureTextToSpeechDir\(\)/s.test(
+    methodBody(RUNTIME_JS, 'async synthesizeSpeech('),
+  ),
   'direct TTS must reserve the operation before writing temporary speaker input',
 );
 

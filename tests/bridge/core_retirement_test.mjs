@@ -765,6 +765,33 @@ test('streamed speech retries a retired core only before delivering PCM', async 
   }
 });
 
+test('a streamed callback failure keeps the replacement for a retired worker that timed out', async () => {
+  const failure = new Error('consumer failed');
+  const timeout = new Error('Worker request timeout (synthesizeSpeech, 5000ms)');
+  const dead = createProxy('dead', () => { throw timeout; });
+  dead.hasModel = true;
+  dead.call = async (method, _args, onEvent) => {
+    if (method === 'cancel') return { value: true };
+    assert.equal(method, 'synthesizeSpeech');
+    onEvent({ event: 'progress', payload: { state: 1 } });
+    dead.coreRetired = true;
+    throw timeout;
+  };
+  const { bridge, created } = createBridge({ proxy: dead, overrides: { ...loaded } });
+  const result = await outcome(bridge.synthesizeSpeech({
+    text: 'Hello.', streamAudio: true,
+    onProgress() { throw failure; },
+  }));
+  assert.equal(result.error, failure);
+  assert.equal(timeout.llamadartCoreRetired, true);
+  assert.equal(dead.disposeCalls, 1);
+  assert.equal(created.length, 1);
+  assert.equal(created[0].disposeCalls, 0);
+  assert.equal(bridge._workerProxy, created[0]);
+  assert.ok(!created[0].calls.includes('synthesizeSpeech'));
+  await bridge.dispose();
+});
+
 test('no replacement worker can be created', async () => {
   const dead = abortingProxy('dead', 'tokenize');
   dead.hasModel = true;

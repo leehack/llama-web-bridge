@@ -3723,7 +3723,7 @@ export class LlamaWebGpuBridgeRuntime {
     return chunk;
   }
 
-  async synthesizeSpeech(options: Partial<TextToSpeechOptions> = {}) {
+  async synthesizeSpeech(options: Partial<TextToSpeechOptions>, streamAudio: boolean) {
     if (this._modelBytes <= 0) {
       throw new Error('No model loaded. Call loadModelFromUrl first.');
     }
@@ -3731,7 +3731,6 @@ export class LlamaWebGpuBridgeRuntime {
       throw new DOMException('Text-to-speech synthesis was cancelled.', 'AbortError');
     }
     const capabilities = this.getTextToSpeechCapabilities();
-    const streamAudio = options.streamAudio === true;
     if (streamAudio && capabilities.supportsIncrementalAudio !== true) {
       throw new Error('Loaded text-to-speech runtime cannot stream audio.');
     }
@@ -3848,7 +3847,7 @@ export class LlamaWebGpuBridgeRuntime {
             streamedSampleCount += chunk.length;
           }
         }
-        options.onProgress?.(progress);
+        options.onProgress?.(streamAudio ? { ...progress } : progress);
         if (chunk && (this._abortRequested || options.signal?.aborted)) {
           throw createAbortError(TEXT_TO_SPEECH_CANCELLED);
         }
