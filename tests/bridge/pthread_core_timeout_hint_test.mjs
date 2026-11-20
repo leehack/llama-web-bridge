@@ -1,111 +1,181 @@
 import assert from 'node:assert/strict';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+import test from 'node:test';
+import { pathToFileURL } from 'node:url';
 
-import { CrossOriginIsolationError, LlamaWebGpuBridge } from '../../js/src/llama_webgpu_bridge.js';
-
-// Emscripten calls locateFile as a Module method, then runs preRun hooks before waiting for dependencies.
-function fakeCoreUrl({ kind, pthreads, hangs = true, detachedLocator = false, wrapperPreRun = false }) {
-  return `data:text/javascript,${encodeURIComponent(`export default async (options) => {
-  let repaired = false;
-  const module = ${wrapperPreRun ? '{ preRun: [() => { repaired = true; }], ...options }' : 'options'};
-  const record = ((globalThis.__fakeCores ??= {})[${JSON.stringify(kind)}] ??= { exportCalls: 0 });
-  ${pthreads === undefined ? '' : `module._llamadart_webgpu_supports_pthreads = () => { record.exportCalls += 1; ${pthreads} };`}
-  ${detachedLocator ? 'const { locateFile } = module; locateFile("core.wasm", "/");' : 'module.locateFile("core.wasm", "/");'}
-  for (const hook of [].concat(module.preRun ?? [])) hook(module);
-  await new Promise((resolve) => { if (!${hangs} || repaired) setTimeout(resolve, 20); });
-  module.kind = ${JSON.stringify(kind)};
-  return module;
-};`)}`;
-}
-
-async function onPage({ sharedMemory }, run) {
-  const original = { MessageChannel: globalThis.MessageChannel, setTimeout: globalThis.setTimeout };
-  if (!sharedMemory) {
-    globalThis.MessageChannel = class {
-      constructor() {
-        this.port1 = {
-          postMessage() {
-            throw new DOMException('The object can not be cloned.', 'DataCloneError');
-          },
-          close() {},
-        };
-        this.port2 = { close() {} };
-      }
-    };
-  }
-  // Fire the 10 s core init timeout after 40 ms.
-  globalThis.setTimeout = (fn, ms, ...args) => original.setTimeout(fn, ms >= 10000 ? 40 : ms, ...args);
-  try {
-    await run();
-  } finally {
-    globalThis.MessageChannel = original.MessageChannel;
-    globalThis.setTimeout = original.setTimeout;
-  }
-}
+import { LlamaWebGpuBridge } from '../../js/src/llama_webgpu_bridge.js';
 
 const TIMEOUT = 'Bridge core init timeout (10000ms)';
-const directBridge = (config) => new LlamaWebGpuBridge({
-  disableWorker: true, allowSingleThreadCore: true, coreInitTimeoutMs: 10000, ...config,
-});
-const initError = (spec, config = {}) => directBridge({ coreModuleUrl: fakeCoreUrl(spec), ...config })
-  ._runtime._ensureCore().then(() => assert.fail('must time out'), (error) => error);
-const exportCalls = (kind) => globalThis.__fakeCores[kind].exportCalls;
 
-await onPage({ sharedMemory: false }, async () => {
-  // A pthread core that never finishes init keeps the timeout and gains the hint.
-  {
-    const bridge = directBridge({ coreModuleUrl: fakeCoreUrl({ kind: 'pthread-hang', pthreads: 'return 1;' }) });
-    const error = await bridge._runtime._ensureCore().then(() => assert.fail('must time out'), (rejected) => rejected);
-    assert.ok(error.message.startsWith(`${TIMEOUT}. This core is built with pthreads`), error.message);
+function onPage(t, { isolated = false, closeThrows = false, isolationThrows = false } = {}) {
+  const originalIsolation = Object.getOwnPropertyDescriptor(globalThis, 'crossOriginIsolated');
+  Object.defineProperty(globalThis, 'crossOriginIsolated', {
+    configurable: true,
+    get() {
+      if (isolationThrows) throw new Error('isolation unavailable');
+      return isolated;
+    },
+  });
+  t.after(() => {
+    if (originalIsolation) Object.defineProperty(globalThis, 'crossOriginIsolated', originalIsolation);
+    else delete globalThis.crossOriginIsolated;
+  });
+
+  const originalSetTimeout = globalThis.setTimeout;
+  t.mock.method(globalThis, 'setTimeout', (fn, ms, ...args) => originalSetTimeout(fn, ms === 10000 ? 40 : ms, ...args));
+  if (!isolated) {
+    t.mock.method(globalThis, 'MessageChannel', class {
+      port1 = {
+        postMessage() { throw new DOMException('refused', 'DataCloneError'); },
+        close() {
+          if (closeThrows) throw new TypeError('MessagePort close wrapper failed');
+        },
+      };
+      port2 = { close() {} };
+    });
+  }
+}
+
+function directBridge(config) {
+  return new LlamaWebGpuBridge({
+    disableWorker: true, allowSingleThreadCore: true, coreInitTimeoutMs: 10000, ...config,
+  });
+}
+
+async function writeCore(t, filename, setup = 'await new Promise(() => {});') {
+  const dir = await mkdtemp(path.join(tmpdir(), 'pthread-timeout-'));
+  t.after(() => rm(dir, { recursive: true }));
+  const file = path.join(dir, filename);
+  await writeFile(file, `
+    export default async (options) => {
+      const core = { ...options, kind: ${JSON.stringify(filename)} };
+      core.locateFile('core.wasm', '/');
+      ${setup}
+      return core;
+    };
+  `);
+  return pathToFileURL(file).href;
+}
+
+function captureInitError(bridge) {
+  return bridge._runtime._ensureCore().then(() => assert.fail('must time out'), (error) => error);
+}
+
+test('an unfinished custom factory times out without calling its pthread export', async (t) => {
+  onPage(t);
+  let exportCalls = 0;
+  const bridge = directBridge({
+    coreModuleFactory(options) {
+      const module = {
+        ...options,
+        _llamadart_webgpu_supports_pthreads() {
+          exportCalls += 1;
+          return 1;
+        },
+      };
+      module.locateFile('core.wasm', '/');
+      return new Promise(() => {});
+    },
+  });
+  const error = await captureInitError(bridge);
+  assert.equal(exportCalls, 0);
+  assert.equal(error.constructor, Error);
+  assert.equal(error.message, TIMEOUT);
+});
+
+test('an auxiliary pthread core cannot label a custom single-thread core timeout', async (t) => {
+  onPage(t);
+  const bridge = directBridge({
+    coreModuleFactory(options) {
+      const primary = { ...options, _llamadart_webgpu_supports_pthreads: () => 0 };
+      primary.locateFile('core_st.wasm', '/');
+      const auxiliary = { ...options, _llamadart_webgpu_supports_pthreads: () => 1 };
+      auxiliary.locateFile('core.wasm', '/');
+      return new Promise(() => {});
+    },
+  });
+  assert.equal((await captureInitError(bridge)).message, TIMEOUT);
+});
+
+test('a throwing MessagePort close cannot interrupt wasm64 timeout fallback', async (t) => {
+  onPage(t, { closeThrows: true });
+  const bridge = directBridge({
+    preferMemory64: true,
+    coreModuleUrlMem64: await writeCore(t, 'llama_webgpu_core_mem64.js'),
+    coreModuleUrl: await writeCore(t, 'llama_webgpu_core_st.js', ''),
+  });
+  assert.equal((await bridge._runtime._ensureCore()).kind, 'llama_webgpu_core_st.js');
+  assert.ok(bridge._runtime._runtimeNotes.includes('core_mem64_unavailable:timeout'));
+});
+
+test('a diagnostic exception preserves the plain timeout', async (t) => {
+  onPage(t, { isolationThrows: true });
+  const bridge = directBridge({ coreModuleUrl: await writeCore(t, 'llama_webgpu_core.js') });
+  const error = await captureInitError(bridge);
+  assert.equal(error.constructor, Error);
+  assert.equal(error.message, TIMEOUT);
+});
+
+test('only recognized threaded loader URLs on non-isolated pages get a timeout hint', async (t) => {
+  onPage(t);
+  for (const name of ['llama_webgpu_core.js', 'llama_webgpu_core_mem64.js']) {
+    const url = await writeCore(t, name);
+    const bridge = directBridge({ coreModuleUrl: url + '?version=1#core' });
+    const error = await captureInitError(bridge);
+    assert.equal(error.constructor, Error);
+    assert.equal(error.code, undefined);
+    assert.ok(error.message.startsWith(TIMEOUT + '.'), error.message);
+    assert.match(error.message, /if (the|this) URL serves a pthread core/i);
     assert.match(error.message, /"_st"/);
     assert.match(error.message, /allowSingleThreadCore/);
     assert.match(error.message, /Cross-Origin-Embedder-Policy: require-corp/);
-    assert.equal(error.constructor, Error);
-    assert.ok(!(error instanceof CrossOriginIsolationError));
-    assert.equal(error.code, undefined);
     const plain = new Error(TIMEOUT);
     assert.equal(bridge._shouldFallbackToMainThread(error), bridge._shouldFallbackToMainThread(plain));
     assert.equal(bridge._isRecoverableWorkerFsError(error), bridge._isRecoverableWorkerFsError(plain));
   }
-
-  // Every other core keeps the timeout message unchanged.
-  for (const spec of [
-    { kind: 'st-hang', pthreads: 'return 0;' },
-    { kind: 'no-export-hang' },
-    { kind: 'throwing-export-hang', pthreads: 'throw new Error("not ready");' },
-    { kind: 'pthread-detached-locator-hang', pthreads: 'return 1;', detachedLocator: true },
-  ]) {
-    assert.equal((await initError(spec)).message, TIMEOUT, spec.kind);
+  for (const name of ['llama_webgpu_core_st.js', 'llama_webgpu_core_mem64_st.js', 'wrapper.js']) {
+    const bridge = directBridge({ coreModuleUrl: await writeCore(t, name) });
+    assert.equal((await captureInitError(bridge)).message, TIMEOUT, name);
   }
-
-  // The wasm64 fallback still records a timeout.
-  {
-    const bridge = directBridge({
-      preferMemory64: true,
-      coreModuleUrlMem64: fakeCoreUrl({ kind: 'pthread64-hang', pthreads: 'return 1;' }),
-      coreModuleUrl: fakeCoreUrl({ kind: 'st32', pthreads: 'return 0;', hangs: false }),
-    });
-    assert.equal((await bridge._runtime._ensureCore()).kind, 'st32');
-    assert.ok(bridge._runtime._runtimeNotes.includes('core_mem64_unavailable:timeout'));
-  }
-
-  // A core that finishes init is never asked for its flag.
-  const finishingCores = [
-    { kind: 'st', pthreads: 'return 0;', hangs: false },
-    { kind: 'pthread-pool0', pthreads: 'return 1;', hangs: false },
-    { kind: 'pthread-repaired', pthreads: 'return 1;', wrapperPreRun: true },
-  ];
-  for (const spec of finishingCores) {
-    const core = await directBridge({ coreModuleUrl: fakeCoreUrl(spec) })._runtime._ensureCore();
-    assert.equal(core.kind, spec.kind);
-  }
-  await new Promise((resolve) => setTimeout(resolve, 60));
-  for (const spec of finishingCores) {
-    assert.equal(exportCalls(spec.kind), 0);
-  }
+  const inline = 'data:text/javascript,export default () => new Promise(() => {}); // /llama_webgpu_core.js';
+  assert.equal((await captureInitError(directBridge({ coreModuleUrl: inline }))).message, TIMEOUT);
 });
 
-// A page that can post shared memory gets no capability probe and no hint.
-await onPage({ sharedMemory: true }, async () => {
-  assert.equal((await initError({ kind: 'pthread-isolated-hang', pthreads: 'return 1;' })).message, TIMEOUT);
-  assert.equal(exportCalls('pthread-isolated-hang'), 0);
+test('an isolated page keeps the plain timeout for a threaded loader URL', async (t) => {
+  onPage(t, { isolated: true });
+  const bridge = directBridge({ coreModuleUrl: await writeCore(t, 'llama_webgpu_core.js') });
+  assert.equal((await captureInitError(bridge)).message, TIMEOUT);
+});
+
+test('only the bridge deadline gets a hint, and a fallback uses its own URL', async (t) => {
+  onPage(t);
+  const factoryError = directBridge({
+    coreModuleUrl: await writeCore(t, 'llama_webgpu_core.js', `throw new Error(${JSON.stringify(TIMEOUT)});`),
+  });
+  assert.equal((await captureInitError(factoryError)).message, TIMEOUT);
+
+  const fallback = directBridge({
+    preferMemory64: true,
+    coreModuleUrlMem64: await writeCore(t, 'llama_webgpu_core_mem64.js'),
+    coreModuleUrl: await writeCore(t, 'llama_webgpu_core_st.js'),
+  });
+  assert.equal((await captureInitError(fallback)).message, TIMEOUT);
+  assert.ok(fallback._runtime._runtimeNotes.includes('core_mem64_unavailable:timeout'));
+});
+
+test('an opaque factory rejection still falls back to wasm32', async (t) => {
+  onPage(t);
+  const bridge = directBridge({
+    preferMemory64: true,
+    coreModuleUrlMem64: await writeCore(t, 'llama_webgpu_core_mem64.js', `
+      const { proxy, revoke } = Proxy.revocable({}, {});
+      revoke();
+      throw proxy;
+    `),
+    coreModuleUrl: await writeCore(t, 'llama_webgpu_core_st.js', ''),
+  });
+  assert.equal((await bridge._runtime._ensureCore()).kind, 'llama_webgpu_core_st.js');
+  assert.ok(bridge._runtime._runtimeNotes.includes('core_mem64_unavailable:init_error'));
 });

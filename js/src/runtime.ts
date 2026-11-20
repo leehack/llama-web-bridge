@@ -46,7 +46,7 @@ import {
   safariDefaultMaxGpuLayers,
 } from './internal/environment.ts';
 import {
-  CrossOriginIsolationError, PTHREAD_CORE_TIMEOUT_HINT, SingleThreadCoreError, coreReportsPthreads,
+  CrossOriginIsolationError, SingleThreadCoreError, appendCoreInitTimeoutHint,
 } from './internal/isolation.ts';
 import { decodeImageBytesToRgb } from './internal/image.ts';
 import {
@@ -2183,16 +2183,20 @@ export class LlamaWebGpuBridgeRuntime {
         && typeof this._config.coreModuleUrlMem64 === 'string'
         && this._config.coreModuleUrlMem64.length > 0
       ) {
+        const moduleUrl = this._config.coreModuleUrlMem64;
         candidates.push({
           variant: 'wasm64',
-          factoryPromise: importCoreFactory(this._config.coreModuleUrlMem64),
+          moduleUrl,
+          factoryPromise: importCoreFactory(moduleUrl),
           wasmUrl: this._config.wasmUrlMem64 || this._config.wasmUrl,
         });
       }
 
+      const moduleUrl = this._config.coreModuleUrl ?? './llama_webgpu_core.js';
       candidates.push({
         variant: 'wasm32',
-        factoryPromise: importCoreFactory(this._config.coreModuleUrl ?? './llama_webgpu_core.js'),
+        moduleUrl,
+        factoryPromise: importCoreFactory(moduleUrl),
         wasmUrl: this._config.wasmUrl,
       });
     }
@@ -2205,16 +2209,14 @@ export class LlamaWebGpuBridgeRuntime {
       }
 
       let factoryLoaded = false;
-      const initState: { timeoutError?: Error; pendingCore?: unknown } = {};
+      let initTimeoutError: Error | null = null;
       try {
         const moduleFactory = await candidate.factoryPromise;
         factoryLoaded = true;
         const initTimeoutMs = this._resolveCoreInitTimeoutMs();
         this._core = await Promise.race([
           moduleFactory({
-          locateFile(this: unknown, path: string, prefix: string) {
-            // Emscripten calls this as a Module method. Adding a preRun option can replace a wrapper's hooks.
-            initState.pendingCore = this;
+          locateFile: (path: string, prefix: string) => {
             if (path.endsWith('.wasm') && candidate.wasmUrl) {
               return candidate.wasmUrl;
             }
@@ -2293,8 +2295,8 @@ export class LlamaWebGpuBridgeRuntime {
           }),
           new Promise((_, reject) => {
             globalThis.setTimeout(() => {
-              initState.timeoutError = new Error(`Bridge core init timeout (${initTimeoutMs}ms)`);
-              reject(initState.timeoutError);
+              initTimeoutError = new Error(`Bridge core init timeout (${initTimeoutMs}ms)`);
+              reject(initTimeoutError);
             }, initTimeoutMs);
           }),
         ]) as LlamaCoreModule;
@@ -2310,12 +2312,11 @@ export class LlamaWebGpuBridgeRuntime {
         break;
       } catch (error) {
         lastError = error;
-        const timeoutError = error === initState.timeoutError ? initState.timeoutError : undefined;
-        if (timeoutError && !canPostSharedMemory() && coreReportsPthreads(initState.pendingCore)) {
-          timeoutError.message += `.${PTHREAD_CORE_TIMEOUT_HINT}`;
+        if (initTimeoutError && error === initTimeoutError) {
+          appendCoreInitTimeoutHint(initTimeoutError, candidate.moduleUrl);
         }
         if (candidate.variant === 'wasm64') {
-          const reason = timeoutError
+          const reason = initTimeoutError && error === initTimeoutError
             ? 'timeout'
             : factoryLoaded && isMemory64Unsupported() ? 'unsupported' : 'init_error';
           memory64FallbackReason = reason;
@@ -2325,8 +2326,6 @@ export class LlamaWebGpuBridgeRuntime {
           continue;
         }
         throw error;
-      } finally {
-        initState.pendingCore = undefined;
       }
     }
 

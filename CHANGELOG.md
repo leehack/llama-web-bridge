@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- When a core reports pthread support and times out on a page that cannot share memory with workers, the init error suggests using the `_st` cores or enabling cross-origin isolation.
+- On a page without cross-origin isolation, a timeout from a standard pthread core URL suggests using the `_st` cores or enabling cross-origin isolation.
 
 - Escape control characters in tensor names in wasm32 GGUF size errors and report an overflowed declared size as at least 2^64 bytes.
 

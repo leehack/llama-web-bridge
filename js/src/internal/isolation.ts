@@ -27,22 +27,16 @@ export const CROSS_ORIGIN_ISOLATION_MESSAGE =
   + 'cross-origin isolated. Serve the page with "Cross-Origin-Opener-Policy: same-origin" and '
   + '"Cross-Origin-Embedder-Policy: require-corp". "credentialless" does not isolate Safari.';
 
-// Appended to the core init timeout for a pthread core on a page that cannot
-// post shared memory. It stays a hint on the timeout: a wrapper can still
-// clear the pool's run dependency, so the refused pool alone does not mean
-// init will fail.
-export const PTHREAD_CORE_TIMEOUT_HINT =
-  ' This core is built with pthreads, and the page cannot share memory with workers. Starting a pthread '
-  + 'pool can stall initialization. Use the single-thread "_st" cores with "allowSingleThreadCore", '
-  + 'or serve the page with "Cross-Origin-Opener-Policy: same-origin" and '
-  + '"Cross-Origin-Embedder-Policy: require-corp".';
-
-export function coreReportsPthreads(core: unknown): boolean {
+export function appendCoreInitTimeoutHint(error: Error, moduleUrl: string | undefined): void {
   try {
-    const supportsPthreads = (core as { _llamadart_webgpu_supports_pthreads?: () => unknown } | null)
-      ?._llamadart_webgpu_supports_pthreads;
-    return typeof supportsPthreads === 'function' && supportsPthreads.call(core) === 1;
+    if (!moduleUrl || globalThis.crossOriginIsolated !== false) return;
+    const { protocol, pathname } = new URL(moduleUrl, import.meta.url);
+    if (protocol !== 'http:' && protocol !== 'https:' && protocol !== 'file:') return;
+    if (!/\/llama_webgpu_core(?:_mem64)?\.js$/.test(pathname)) return;
+    error.message += '. If this URL serves a pthread core, its worker pool can stall on a page without '
+      + 'cross-origin isolation. Use the single-thread "_st" cores with "allowSingleThreadCore", or serve '
+      + 'the page with "Cross-Origin-Opener-Policy: same-origin" and "Cross-Origin-Embedder-Policy: require-corp".';
   } catch (_) {
-    return false;
+    // The diagnostic must preserve the timeout and fallback even if the environment is unavailable.
   }
 }
