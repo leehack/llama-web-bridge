@@ -992,6 +992,8 @@ function checkCiRunsContracts({ ci, candidate, publish }, testFiles, errors) {
   for (const command of [
     'node scripts/smoke/state_persistence.mjs --threading single',
     'node scripts/smoke/state_persistence.mjs --threading single --memory-mode wasm64',
+    'node scripts/smoke/resume_integrity.mjs',
+    'node scripts/smoke/resume_integrity.mjs --threading single',
   ]) {
     check.require(
       ciBuildSteps.some((step) => step.run.trim() === command

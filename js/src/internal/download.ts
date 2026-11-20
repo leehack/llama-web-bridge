@@ -68,7 +68,7 @@ export function sumProgressValues(values: Iterable<unknown> | null | undefined):
   return total;
 }
 
-function createModelTransferLengthError(message: string): Error {
+export function createModelTransferLengthError(message: string): Error {
   const error = new Error(message);
   error.name = 'ModelTransferLengthError';
   return error;
@@ -135,6 +135,116 @@ export function inferResponseTotalBytes(
   }
 
   return parsePositiveInteger(loadedFallback);
+}
+
+export interface ResumeIdentity {
+  url: string;
+  strongEtag: string | null;
+  encoding: string | null;
+  total: number | null;
+}
+
+type ResumeVerdict =
+  | { verdict: 'changed'; reason: 'url' | 'range' | 'etag' }
+  | { verdict: 'validated' | 'unvalidated'; total: number | null; expectedBytes: number | null };
+
+export function strongEtagOf(value: string | null): string | null {
+  return value !== null && /^"[\x21\x23-\x7E\x80-\xFF]*"$/.test(value) ? value : null;
+}
+
+function contentEncodingOf(response: Response): string | null {
+  const encoding = response.headers.get('content-encoding');
+  if (encoding !== null) return encoding.toLowerCase();
+  if (response.type === 'basic') return 'identity';
+
+  // A CORS response can expose Content-Length while hiding Content-Encoding.
+  if (response.type === 'cors') {
+    const exposed = response.headers.get('access-control-expose-headers')?.toLowerCase().split(',');
+    if (exposed?.some((name) => ['*', 'content-encoding'].includes(name.trim()))) return 'identity';
+  }
+  return null;
+}
+
+function parseByteLength(value: string | null): number | null {
+  if (value === null || !/^\d+$/.test(value)) return null;
+  const length = Number(value);
+  return Number.isSafeInteger(length) ? length : null;
+}
+
+function parseByteRange(value: string | null): { start: number; end: number; total: number | null } | null {
+  const match = value === null ? null : /^bytes (\d+)-(\d+)\/(\d+|\*)$/i.exec(value);
+  if (!match) return null;
+  const start = parseByteLength(match[1]);
+  const end = parseByteLength(match[2]);
+  const total = parseByteLength(match[3]);
+  if (start === null || end === null || (total === null && match[3] !== '*')) return null;
+  return { start, end, total };
+}
+
+export function captureResumeIdentity(
+  response: Response,
+  finalUrl: string,
+): ResumeIdentity {
+  const encoding = contentEncodingOf(response);
+  let total = parseByteLength(response.headers.get('x-linked-size'));
+  if (total === null && encoding === 'identity') {
+    total = response.status === 206
+      ? parseByteRange(response.headers.get('content-range'))?.total ?? null
+      : parseByteLength(response.headers.get('content-length'));
+  }
+  return {
+    url: finalUrl,
+    strongEtag: strongEtagOf(response.headers.get('etag')),
+    encoding,
+    total,
+  };
+}
+
+export function classifyResumeResponse(
+  identity: ResumeIdentity,
+  response: Response,
+  finalUrl: string,
+  offset: number,
+): ResumeVerdict {
+  if (finalUrl !== identity.url) return { verdict: 'changed', reason: 'url' };
+
+  const encoding = contentEncodingOf(response);
+  const contentRange = response.headers.get('content-range');
+  const range = encoding === 'identity' ? parseByteRange(contentRange) : null;
+  const length = encoding === 'identity' ? parseByteLength(response.headers.get('content-length')) : null;
+  // X-Linked-Size describes the model artifact, independent of HTTP encoding.
+  const linkedSize = parseByteLength(response.headers.get('x-linked-size'));
+  const total = range?.total ?? linkedSize ?? identity.total;
+  if (total !== null && ((identity.total !== null && total !== identity.total)
+    || (linkedSize !== null && total !== linkedSize))) {
+    return { verdict: 'changed', reason: 'range' };
+  }
+
+  let rangeVerified = false;
+  if (range) {
+    if (range.start !== offset || range.end < range.start
+      || (total !== null && range.end !== total - 1)
+      || (length !== null && length !== range.end - range.start + 1)) {
+      return { verdict: 'changed', reason: 'range' };
+    }
+    rangeVerified = total !== null;
+  } else if (length !== null && total !== null) {
+    if (length !== total - offset) return { verdict: 'changed', reason: 'range' };
+    rangeVerified = contentRange === null;
+  }
+
+  const etag = strongEtagOf(response.headers.get('etag'));
+  // Strong validators identify the encoded representation.
+  const comparableTags = identity.strongEtag !== null && etag !== null
+    && encoding !== null && identity.encoding === encoding;
+  if (comparableTags && etag !== identity.strongEtag) return { verdict: 'changed', reason: 'etag' };
+
+  const tailBytes = range ? range.end + 1 : (length === null ? null : offset + length);
+  return {
+    verdict: comparableTags && rangeVerified ? 'validated' : 'unvalidated',
+    total,
+    expectedBytes: total ?? tailBytes,
+  };
 }
 
 export function isRetryableStreamNetworkError(error: unknown): boolean {
@@ -353,8 +463,11 @@ export function teeResponseForCache(
 
   const init = { status: source.status, statusText: source.statusText, headers: source.headers };
   const response = new Response(bodyStream, init);
-  // A constructed Response has an empty url; callers resolve redirects from it.
-  Object.defineProperty(response, 'url', { value: source.url });
+  // Redirect and encoding checks need the network response's URL and filter type.
+  Object.defineProperties(response, {
+    url: { value: source.url },
+    type: { value: source.type },
+  });
   return {
     response,
     cacheResponse: new Response(cacheStream, init),
