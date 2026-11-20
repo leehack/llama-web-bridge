@@ -34,7 +34,13 @@ import {
   unlinkFsFile,
   writeResponseToFsFileWithProgress,
 } from './internal/download.ts';
-import { canPostSharedMemory, describeWebGpuUnavailable, isMemory64Unsupported, isSafariUserAgent } from './internal/environment.ts';
+import {
+  canPostSharedMemory,
+  describeWebGpuUnavailable,
+  isMemory64Unsupported,
+  isSafariUserAgent,
+  safariDefaultMaxGpuLayers,
+} from './internal/environment.ts';
 import { CrossOriginIsolationError, SingleThreadCoreError } from './internal/isolation.ts';
 import { decodeImageBytesToRgb } from './internal/image.ts';
 import {
@@ -239,6 +245,7 @@ export class LlamaWebGpuBridgeRuntime {
   declare _loadMtp: boolean;
   declare _speculativeRollbackTokenMax: number;
   declare _isSafari: boolean;
+  declare _safariDefaultMaxGpuLayers: number;
   declare _coreVariant: string;
   declare _preferMemory64: boolean;
   declare _modelSource: string;
@@ -329,7 +336,9 @@ export class LlamaWebGpuBridgeRuntime {
     this._mainGpu = -1;
     this._loadMtp = false;
     this._speculativeRollbackTokenMax = 0;
-    this._isSafari = isSafariUserAgent(this._config.userAgent ?? globalThis.navigator?.userAgent ?? '');
+    const userAgent = this._config.userAgent ?? globalThis.navigator?.userAgent ?? '';
+    this._isSafari = isSafariUserAgent(userAgent);
+    this._safariDefaultMaxGpuLayers = safariDefaultMaxGpuLayers(userAgent);
     this._coreVariant = 'uninitialized';
     this._preferMemory64 = this._config.preferMemory64 !== false;
     this._modelSource = 'network';
@@ -2436,7 +2445,7 @@ export class LlamaWebGpuBridgeRuntime {
       const requestedSafariMaxLayers = Number(options.safariMaxGpuLayers);
       const safariMaxGpuLayers = Number.isFinite(requestedSafariMaxLayers)
         ? Math.max(1, Math.trunc(requestedSafariMaxLayers))
-        : 1;
+        : this._safariDefaultMaxGpuLayers;
 
       if (this._nGpuLayers > safariMaxGpuLayers) {
         this._nGpuLayers = safariMaxGpuLayers;
@@ -2837,8 +2846,24 @@ export class LlamaWebGpuBridgeRuntime {
         ? Math.min(Math.trunc(probeTokensRaw), 96)
         : 48;
 
+      // Pooled embedding models can return empty text or repeated `<pad>` tokens
+      // in a completion, so the completion probe cannot validate them.
+      let probesEmbedding = false;
+      try {
+        probesEmbedding = (await this.getEmbeddingCapabilities()).text === true;
+      } catch (_) {
+        // A core without the embedding exports keeps the completion probe.
+      }
+      if (probesEmbedding) {
+        this._runtimeNotes.push('safari_gpu_probe_embedding');
+      }
+
       const runProbe = async (probePrompt: string, probeSeed: number) => {
         try {
+          if (probesEmbedding) {
+            const vector = await this.embed(probePrompt, { normalize: true });
+            return Math.abs(Math.hypot(...vector) - 1) < 0.01;
+          }
           const probeOutput = await this.createCompletion(probePrompt, {
             nPredict: probeTokens,
             temp: 0,

@@ -10,6 +10,25 @@ export function isSafariUserAgent(userAgent: unknown): boolean {
   return hasSafariToken && !hasOtherBrowserToken;
 }
 
+// Full GPU offload is verified from this Safari major on.
+const SAFARI_UNCAPPED_GPU_MIN_MAJOR = 27;
+
+// Safari freezes the platform and WebKit tokens of its user agent but keeps
+// `Version/<major>` current.
+export function safariMajorVersion(userAgent: unknown): number | null {
+  if (!isSafariUserAgent(userAgent)) {
+    return null;
+  }
+  const match = /\bVersion\/(\d+)/.exec(userAgent as string);
+  return match ? Number(match[1]) : null;
+}
+
+// An unknown version keeps the cap of the Safari releases it was added for.
+export function safariDefaultMaxGpuLayers(userAgent: unknown): number {
+  const major = safariMajorVersion(userAgent);
+  return major !== null && major >= SAFARI_UNCAPPED_GPU_MIN_MAJOR ? Infinity : 1;
+}
+
 // A pthread core preallocates workers and posts its shared memory to them.
 // Browsers refuse that post (DataCloneError) unless the page is cross-origin
 // isolated, and core init then never settles. Probing the post itself, rather

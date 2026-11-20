@@ -1554,6 +1554,18 @@ function isSafariUserAgent(userAgent) {
   const hasOtherBrowserToken = /(Chrome|Chromium|CriOS|Edg|OPR|Firefox|FxiOS)\//.test(userAgent);
   return hasSafariToken && !hasOtherBrowserToken;
 }
+var SAFARI_UNCAPPED_GPU_MIN_MAJOR = 27;
+function safariMajorVersion(userAgent) {
+  if (!isSafariUserAgent(userAgent)) {
+    return null;
+  }
+  const match = /\bVersion\/(\d+)/.exec(userAgent);
+  return match ? Number(match[1]) : null;
+}
+function safariDefaultMaxGpuLayers(userAgent) {
+  const major = safariMajorVersion(userAgent);
+  return major !== null && major >= SAFARI_UNCAPPED_GPU_MIN_MAJOR ? Infinity : 1;
+}
 function canPostSharedMemory() {
   if (typeof MessageChannel !== "function" || typeof WebAssembly === "undefined") {
     return true;
@@ -1783,7 +1795,9 @@ var LlamaWebGpuBridgeRuntime = class {
     this._mainGpu = -1;
     this._loadMtp = false;
     this._speculativeRollbackTokenMax = 0;
-    this._isSafari = isSafariUserAgent(this._config.userAgent ?? globalThis.navigator?.userAgent ?? "");
+    const userAgent = this._config.userAgent ?? globalThis.navigator?.userAgent ?? "";
+    this._isSafari = isSafariUserAgent(userAgent);
+    this._safariDefaultMaxGpuLayers = safariDefaultMaxGpuLayers(userAgent);
     this._coreVariant = "uninitialized";
     this._preferMemory64 = this._config.preferMemory64 !== false;
     this._modelSource = "network";
@@ -3461,7 +3475,7 @@ var LlamaWebGpuBridgeRuntime = class {
     }
     if (this._isSafari && this._nGpuLayers > 0) {
       const requestedSafariMaxLayers = Number(options.safariMaxGpuLayers);
-      const safariMaxGpuLayers = Number.isFinite(requestedSafariMaxLayers) ? Math.max(1, Math.trunc(requestedSafariMaxLayers)) : 1;
+      const safariMaxGpuLayers = Number.isFinite(requestedSafariMaxLayers) ? Math.max(1, Math.trunc(requestedSafariMaxLayers)) : this._safariDefaultMaxGpuLayers;
       if (this._nGpuLayers > safariMaxGpuLayers) {
         this._nGpuLayers = safariMaxGpuLayers;
         this._runtimeNotes.push(`safari_gpu_layers_capped:${safariMaxGpuLayers}`);
@@ -3798,8 +3812,20 @@ var LlamaWebGpuBridgeRuntime = class {
         const probePrompts = Array.isArray(options.safariProbePrompts) ? options.safariProbePrompts.map((v) => String(v || "").trim()).filter((v) => v.length > 0) : typeof options.safariProbePrompt === "string" && options.safariProbePrompt.trim().length > 0 ? [options.safariProbePrompt.trim()] : defaultProbePrompts;
         const probeTokensRaw = Number(options.safariProbeTokens);
         const probeTokens = Number.isFinite(probeTokensRaw) && probeTokensRaw > 0 ? Math.min(Math.trunc(probeTokensRaw), 96) : 48;
+        let probesEmbedding = false;
+        try {
+          probesEmbedding = (await this.getEmbeddingCapabilities()).text === true;
+        } catch (_) {
+        }
+        if (probesEmbedding) {
+          this._runtimeNotes.push("safari_gpu_probe_embedding");
+        }
         const runProbe = async (probePrompt, probeSeed) => {
           try {
+            if (probesEmbedding) {
+              const vector = await this.embed(probePrompt, { normalize: true });
+              return Math.abs(Math.hypot(...vector) - 1) < 0.01;
+            }
             const probeOutput = await this.createCompletion(probePrompt, {
               nPredict: probeTokens,
               temp: 0,
