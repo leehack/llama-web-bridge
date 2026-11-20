@@ -154,7 +154,7 @@ it.
 | `coreModuleUrlMem64` | `string` | URL for the optional wasm64 Emscripten JS loader. |
 | `wasmUrl` | `string` | URL for the wasm32 `llama_webgpu_core.wasm` binary. |
 | `wasmUrlMem64` | `string` | URL for the optional wasm64 wasm binary. |
-| `coreModuleFactory` | `LlamaCoreModuleFactory \| Promise<LlamaCoreModuleFactory>` | Preloaded Emscripten factory. Supplying this disables worker mode because factories cannot be transferred to the worker. It also skips the cross-origin isolation check, so a custom pthread core on a page that is not isolated still waits for `coreInitTimeoutMs`. |
+| `coreModuleFactory` | `LlamaCoreModuleFactory \| Promise<LlamaCoreModuleFactory>` | Preloaded Emscripten factory. Supplying this disables worker mode because factories cannot be transferred to the worker. It also skips the cross-origin isolation check, so a custom pthread core on a page that is not isolated still waits for `coreInitTimeoutMs`. A core instance holds one loaded model. Bridges that share the same core instance must not hold models at the same time. A load on either bridge releases the model in that core. Return a separate core instance for each bridge that needs an independent model. |
 | `workerUrl` | `string` | URL for `llama_webgpu_bridge_worker.js`. Defaults to a sibling of the bridge module when possible. |
 | `disableWorker` | `boolean` | Force direct runtime mode. |
 | `allowSingleThreadCore` | `boolean` | Set to `true` with explicit `_st` core URLs to load on pages without cross-origin isolation. Single-thread cores use one CPU thread and report `core_single_thread`. |
