@@ -88,6 +88,7 @@ import {
   trimUnstableUtf8Tail,
 } from './internal/text.ts';
 import { bufferSourceBytes, isInt32, toFloat32Array, toUint8Array } from './internal/typed_values.ts';
+import { TEXT_TO_SPEECH_CANCELLED, withTextToSpeechStreaming } from './internal/text_to_speech.ts';
 import type { ResolvedGrammarOptions, ResolvedSpeculativeOptions } from './internal/completion_options.ts';
 import type { DirectFileChunkWriter, ProgressCallback, ResumeIdentity } from './internal/download.ts';
 import type { EmbedBatchProgressHook } from './internal/embedding.ts';
@@ -111,7 +112,6 @@ import type {
   LoraAdapterInfo,
   LoraAdapterLoadOptions,
   NextTokenScoreOptions,
-  TextToSpeechCapabilities,
   TextToSpeechOptions,
   TextToSpeechProgress,
 } from './llama_webgpu_bridge.d.ts';
@@ -3666,6 +3666,7 @@ export class LlamaWebGpuBridgeRuntime {
         capabilities: 0,
         supportsLanguage: false,
         supportsSpeakerReference: false,
+        supportsIncrementalAudio: false,
         sampleRate: 0,
         channels: 0,
         reason: 'WebGPU core is not initialized',
@@ -3678,7 +3679,7 @@ export class LlamaWebGpuBridgeRuntime {
       [],
     ) || '{}';
     try {
-      return JSON.parse(raw) as TextToSpeechCapabilities;
+      return withTextToSpeechStreaming(JSON.parse(raw));
     } catch (_) {
       return {
         apiVersion: 0,
@@ -3687,6 +3688,7 @@ export class LlamaWebGpuBridgeRuntime {
         capabilities: 0,
         supportsLanguage: false,
         supportsSpeakerReference: false,
+        supportsIncrementalAudio: false,
         sampleRate: 0,
         channels: 0,
         reason: 'WebGPU TTS capability response is invalid',
@@ -3702,7 +3704,26 @@ export class LlamaWebGpuBridgeRuntime {
     }
   }
 
-  async synthesizeSpeech(options: Partial<TextToSpeechOptions> = {}) {
+  private _takeTextToSpeechChunk(path: string): Float32Array | null {
+    const samples = Number(this._core!.ccall(
+      'llamadart_webgpu_tts_write_pcm_chunk', 'number', ['string'], [path],
+    ));
+    if (samples < 0) {
+      throw new Error(this._coreErrorMessage('Failed to read synthesized speech', samples));
+    }
+    if (samples === 0) {
+      return null;
+    }
+    const bytes = this._core!.FS.readFile(path);
+    if (!(bytes instanceof Uint8Array) || bytes.byteLength !== samples * Float32Array.BYTES_PER_ELEMENT) {
+      throw new Error('Synthesized PCM chunk is malformed.');
+    }
+    const chunk = new Float32Array(new Uint8Array(bytes).buffer);
+    this._deleteFsFile(path);
+    return chunk;
+  }
+
+  async synthesizeSpeech(options: Partial<TextToSpeechOptions>, streamAudio: boolean) {
     if (this._modelBytes <= 0) {
       throw new Error('No model loaded. Call loadModelFromUrl first.');
     }
@@ -3710,6 +3731,9 @@ export class LlamaWebGpuBridgeRuntime {
       throw new DOMException('Text-to-speech synthesis was cancelled.', 'AbortError');
     }
     const capabilities = this.getTextToSpeechCapabilities();
+    if (streamAudio && capabilities.supportsIncrementalAudio !== true) {
+      throw new Error('Loaded text-to-speech runtime cannot stream audio.');
+    }
     if (capabilities.supported !== true) {
       throw new Error(
         capabilities.reason || 'Loaded model/projector does not support text-to-speech.',
@@ -3727,6 +3751,7 @@ export class LlamaWebGpuBridgeRuntime {
     const taskId = `${Date.now()}_${++this._mediaFileCounter}`;
     const speakerPath = `/tts/speaker_${taskId}.bin`;
     const outputPath = `/tts/output_${taskId}.pcm`;
+    const chunkPath = `/tts/chunk_${taskId}.pcm`;
     const speakerBytes = toUint8Array(options.speakerAudio);
     if (speakerBytes && speakerBytes.length > 0) {
       this._core!.FS.writeFile(speakerPath, speakerBytes);
@@ -3763,7 +3788,7 @@ export class LlamaWebGpuBridgeRuntime {
         await this._core!.ccall(
           'llamadart_webgpu_tts_start',
           'number',
-          ['string', 'string', 'string', 'number', 'number', 'number', 'number', 'number', 'number', 'number'],
+          ['string', 'string', 'string', 'number', 'number', 'number', 'number', 'number', 'number', 'number', 'number'],
           [
             text,
             language,
@@ -3775,6 +3800,7 @@ export class LlamaWebGpuBridgeRuntime {
             minP,
             temperature,
             seed,
+            streamAudio ? 1 : 0,
           ],
           { async: true },
         ),
@@ -3786,6 +3812,7 @@ export class LlamaWebGpuBridgeRuntime {
 
       // Each step replaces this with the core's progress before it is read.
       let progress = {} as TextToSpeechProgress;
+      let streamedSampleCount = 0;
       for (;;) {
         if (this._abortRequested || options.signal?.aborted) {
           this.cancel();
@@ -3799,6 +3826,9 @@ export class LlamaWebGpuBridgeRuntime {
             { async: true },
           ),
         );
+        if (streamAudio && (this._abortRequested || options.signal?.aborted)) {
+          throw createAbortError(TEXT_TO_SPEECH_CANCELLED);
+        }
         const rawProgress = this._core!.ccall(
           'llamadart_webgpu_tts_progress_json',
           'string',
@@ -3806,7 +3836,21 @@ export class LlamaWebGpuBridgeRuntime {
           [],
         ) || '{}';
         progress = JSON.parse(rawProgress);
-        options.onProgress?.(progress);
+        let chunk: Float32Array | null = null;
+        if (streamAudio && stepRc === 0 && (progress.state === 2 || progress.state === 3)) {
+          chunk = this._takeTextToSpeechChunk(chunkPath);
+          if (chunk) {
+            progress.pcm = chunk;
+            progress.sampleOffset = streamedSampleCount;
+            progress.sampleRate = Number(capabilities.sampleRate) || 0;
+            progress.channels = Number(capabilities.channels) || 1;
+            streamedSampleCount += chunk.length;
+          }
+        }
+        options.onProgress?.(streamAudio ? { ...progress } : progress);
+        if (chunk && (this._abortRequested || options.signal?.aborted)) {
+          throw createAbortError(TEXT_TO_SPEECH_CANCELLED);
+        }
         if (stepRc === -6 || progress.state === 4) {
           throw new DOMException('Text-to-speech synthesis was cancelled.', 'AbortError');
         }
@@ -3819,28 +3863,36 @@ export class LlamaWebGpuBridgeRuntime {
         await new Promise((resolve) => setTimeout(resolve, 0));
       }
 
-      const outputRc = Number(
-        this._core!.ccall(
-          'llamadart_webgpu_tts_write_pcm',
-          'number',
-          ['string'],
-          [outputPath],
-        ),
-      );
-      if (outputRc !== 0) {
-        throw new Error(this._coreErrorMessage('Failed to read synthesized speech', outputRc));
+      let pcm: Float32Array;
+      if (streamAudio) {
+        if (streamedSampleCount === 0) {
+          throw new Error('Synthesized PCM output is empty or malformed.');
+        }
+        pcm = new Float32Array(0);
+      } else {
+        const outputRc = Number(
+          this._core!.ccall(
+            'llamadart_webgpu_tts_write_pcm',
+            'number',
+            ['string'],
+            [outputPath],
+          ),
+        );
+        if (outputRc !== 0) {
+          throw new Error(this._coreErrorMessage('Failed to read synthesized speech', outputRc));
+        }
+        const bytes = this._core!.FS.readFile(outputPath);
+        if (!(bytes instanceof Uint8Array) || bytes.byteLength === 0 || (bytes.byteLength % 4) !== 0) {
+          throw new Error('Synthesized PCM output is empty or malformed.');
+        }
+        const copy = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+        pcm = new Float32Array(copy);
       }
-      const bytes = this._core!.FS.readFile(outputPath);
-      if (!(bytes instanceof Uint8Array) || bytes.byteLength === 0 || (bytes.byteLength % 4) !== 0) {
-        throw new Error('Synthesized PCM output is empty or malformed.');
-      }
-      const copy = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
-      const pcm = new Float32Array(copy);
       return {
         pcm,
         sampleRate: Number(capabilities.sampleRate) || 0,
         channels: Number(capabilities.channels) || 1,
-        sampleCount: pcm.length,
+        sampleCount: streamAudio ? streamedSampleCount : pcm.length,
         framesGenerated: Number(progress.framesGenerated) || 0,
         truncated: progress.truncated === true,
       };
@@ -3854,6 +3906,9 @@ export class LlamaWebGpuBridgeRuntime {
       }
       this._deleteFsFile(speakerPath);
       this._deleteFsFile(outputPath);
+      if (streamAudio) {
+        this._deleteFsFile(chunkPath);
+      }
       this._textToSpeechActive = false;
       this._resolveTextToSpeechDone?.();
       this._resolveTextToSpeechDone = null;

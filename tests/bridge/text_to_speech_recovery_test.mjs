@@ -46,12 +46,12 @@ function createBridge({
     _loadedMmProjUrl: 'mmproj.gguf',
     _multimodalWorkerCpuMode: false,
     _bridgeWarnRecent: new Map(),
-    _callWorker: async (method) => {
+    _callWorker: async (method, _args, onEvent) => {
       if (method === 'cancel') {
         calls.push(['cancelWorker']);
         return true;
       }
-      await beforeWorkerError?.();
+      await beforeWorkerError?.(onEvent);
       throw workerError;
     },
     _emitBridgeWarn: (message) => warnings.push(message),
@@ -178,6 +178,52 @@ function createBridge({
     'CPU recovery must run at most once',
   );
   assert.equal(calls.filter(([method]) => method === 'loadModelFromUrl').length, 1);
+}
+
+for (const workerError of [
+  new Error('ggml_webgpu: device error'),
+  new Error('Worker request timeout (synthesizeSpeech, 1200000ms)'),
+]) {
+  const pcm = new Float32Array([0.25]);
+  const chunks = [];
+  const { bridge, calls } = createBridge({
+    workerError,
+    beforeWorkerError: (deliver) => deliver({ event: 'progress', payload: { pcm } }),
+  });
+  await assert.rejects(
+    bridge.synthesizeSpeech({ text: 'Hello.', streamAudio: true, onProgress: (event) => chunks.push(event.pcm) }),
+    (error) => error === workerError,
+  );
+  assert.deepEqual(chunks, [pcm]);
+  assert.deepEqual(calls, workerError.message.startsWith('Worker request timeout') ? [['disposeWorker']] : []);
+}
+
+{
+  const { bridge, calls, runtime } = createBridge();
+  const projectorLoading = Promise.withResolvers();
+  const projectorLoaded = Promise.withResolvers();
+  const loadProjector = runtime.loadMultimodalProjector;
+  runtime.loadMultimodalProjector = async (url) => {
+    await loadProjector(url);
+    projectorLoading.resolve();
+    await projectorLoaded.promise;
+  };
+  const chunks = [];
+  const synthesize = runtime.synthesizeSpeech;
+  runtime.synthesizeSpeech = async (options) => {
+    options.onProgress({ pcm: new Float32Array([0.25]) });
+    return synthesize(options);
+  };
+  const rejected = assert.rejects(
+    bridge.synthesizeSpeech({ text: 'Hello.', streamAudio: true, onProgress: (event) => chunks.push(event.pcm) }),
+    { name: 'AbortError' },
+  );
+  await projectorLoading.promise;
+  bridge.cancel();
+  projectorLoaded.resolve();
+  await rejected;
+  assert.equal(calls.some(([method]) => method === 'synthesizeSpeech'), false, 'no fallback synthesis starts after cancel');
+  assert.deepEqual(chunks, []);
 }
 
 console.log('Text-to-speech CPU recovery tests passed');
