@@ -563,7 +563,7 @@ test('ModelStagingError preserves class and code across worker host and proxy wi
   }
 });
 
-test('native model_load.inc checks wasm32 GGUF tensor size limit across split shards only for JS-backed staging, using buffered I/O', () => {
+test('native model_load.inc checks wasm32 GGUF tensor size limit across split shards only for JS-backed staging, using buffered I/O', async (t) => {
   const source = readNativeCoreSource();
   const loader = source.slice(source.indexOf('int32_t load_model_internal('));
   const preLoad = loader.slice(0, loader.indexOf('llama_model_load_from_file('));
@@ -660,7 +660,8 @@ static void write_gguf(
     uint16_t split_count,
     uint16_t split_no,
     uint32_t extra_vocab_strings,
-    const std::vector<std::pair<std::string, uint64_t>> & tensors_f32_elems) {
+    const std::vector<std::pair<std::string, uint64_t>> & tensors_f32_elems,
+    uint64_t second_dim = 1) {
   std::vector<uint8_t> out;
   out.insert(out.end(), {'G', 'G', 'U', 'F'});
   write_u32(out, 3);
@@ -680,8 +681,9 @@ static void write_gguf(
   }
   for (const auto & kv : tensors_f32_elems) {
     write_str(out, kv.first);
-    write_u32(out, 1);
+    write_u32(out, second_dim == 1 ? 1 : 2);
     write_u64(out, kv.second);
+    if (second_dim != 1) write_u64(out, second_dim);
     write_i32(out, GGML_TYPE_F32);
     write_u64(out, 0);
   }
@@ -712,6 +714,7 @@ int main(int argc, char ** argv) {
   write_gguf(c2, 2, 1, 0, {{"b", 650000000ULL}}); // 2.6 GB => 5.2 GB combined
   g_error.clear();
   assert(!check_wasm32_gguf_tensor_size_limit(c1.c_str()));
+  assert(g_error.find("tensor 'b' declares 2600000000 bytes, accumulated 2600000000 bytes") != std::string::npos);
 
   // 3) Default /models/ path does NOT invoke preflight (0 reads, 0 seeks).
   std::string def = "/models/default.gguf";
@@ -724,6 +727,30 @@ int main(int argc, char ** argv) {
   const std::string oversized = dir + "/oversized.gguf";
   write_gguf(oversized, 1, 0, 0, {{"oversized.weight", 1200000000ULL}});
   g_error.clear();
+  assert(!check_wasm32_gguf_tensor_size_limit(oversized.c_str()));
+  std::puts(g_error.c_str());
+
+  const std::string control_name = std::string("part\\n\\r\\t\\x1b\\x7f") + '\\0' +
+      std::string(54, 'a') + "uncaptured";
+  write_gguf(oversized, 1, 0, 0, {{control_name, 1200000000ULL}});
+  assert(!check_wasm32_gguf_tensor_size_limit(oversized.c_str()));
+  std::puts(g_error.c_str());
+
+  write_gguf(oversized, 1, 0, 0, {{"caf\\xc3\\xa9\\xc2\\x85next", 1200000000ULL}});
+  assert(!check_wasm32_gguf_tensor_size_limit(oversized.c_str()));
+  std::puts(g_error.c_str());
+
+  write_gguf(oversized, 1, 0, 0, {{"type-width-overflow", std::numeric_limits<int64_t>::max()}});
+  assert(!check_wasm32_gguf_tensor_size_limit(oversized.c_str()));
+  std::puts(g_error.c_str());
+
+  write_gguf(oversized, 1, 0, 0, {{"dimension-overflow", 1ULL << 60}}, 4);
+  assert(!check_wasm32_gguf_tensor_size_limit(oversized.c_str()));
+  std::puts(g_error.c_str());
+
+  write_gguf(oversized, 1, 0, 0, {{"max-aligned-f32", 1073741816ULL}});
+  assert(check_wasm32_gguf_tensor_size_limit(oversized.c_str()));
+  write_gguf(oversized, 1, 0, 0, {{"first-rejected-f32", 1073741817ULL}});
   assert(!check_wasm32_gguf_tensor_size_limit(oversized.c_str()));
   std::puts(g_error.c_str());
   return 0;
@@ -740,6 +767,25 @@ int main(int argc, char ** argv) {
     const run = spawnSync(exe, [dir], { encoding: 'utf8' });
     assert.equal(run.status, 0, `${run.signal}: ${run.stderr}`);
     assert.match(run.stdout, /tensor 'oversized\.weight' declares 4800000000 bytes, accumulated 0 bytes, limit 4294967295 bytes/);
+    assert.match(run.stdout, /tensor 'first-rejected-f32' declares 4294967268 bytes/);
+    const messages = run.stdout.split('\n');
+    const hasDiagnostic = (detail) => messages.includes(
+      `GGUF tensor payload exceeds the wasm32 4 GiB address space limit (${detail}, accumulated 0 bytes, `
+        + 'limit 4294967295 bytes); use the memory64 core or a smaller quantization',
+    );
+    await t.test('escapes control bytes in the first 64 name bytes', () => {
+      const escapedName = `part\\x0a\\x0d\\x09\\x1b\\x7f\\x00${'a'.repeat(54)}`;
+      assert.ok(hasDiagnostic(`tensor '${escapedName}' declares 4800000000 bytes`), run.stdout);
+    });
+    await t.test('escapes UTF-8 control characters and preserves printable UTF-8', () => {
+      assert.ok(hasDiagnostic("tensor 'café\\u0085next' declares 4800000000 bytes"), run.stdout);
+    });
+    await t.test('reports overflow when multiplying by the type width', () => {
+      assert.ok(hasDiagnostic("tensor 'type-width-overflow' declares at least 2^64 bytes"), run.stdout);
+    });
+    await t.test('reports overflow when multiplying by another dimension', () => {
+      assert.ok(hasDiagnostic("tensor 'dimension-overflow' declares at least 2^64 bytes"), run.stdout);
+    });
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
