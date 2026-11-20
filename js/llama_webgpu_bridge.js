@@ -791,6 +791,26 @@ function decodeDecisionOutputs(bytes, count) {
   return outputs;
 }
 
+// js/src/internal/isolation.ts
+var CROSS_ORIGIN_ISOLATION_REQUIRED = "CROSS_ORIGIN_ISOLATION_REQUIRED";
+var CrossOriginIsolationError = class extends Error {
+  constructor(message = CROSS_ORIGIN_ISOLATION_MESSAGE) {
+    super(message);
+    this.name = "CrossOriginIsolationError";
+    this.code = CROSS_ORIGIN_ISOLATION_REQUIRED;
+  }
+};
+var SINGLE_THREAD_CORE_UNSUPPORTED = "SINGLE_THREAD_CORE_UNSUPPORTED";
+var SingleThreadCoreError = class extends Error {
+  code = SINGLE_THREAD_CORE_UNSUPPORTED;
+  feature = "remote_fetch_backend";
+  constructor(message = "Fetch-backed model loading requires a core built with pthreads") {
+    super(message);
+    this.name = "SingleThreadCoreError";
+  }
+};
+var CROSS_ORIGIN_ISOLATION_MESSAGE = 'The llama.cpp web core needs shared memory, which this page cannot use because it is not cross-origin isolated. Serve the page with "Cross-Origin-Opener-Policy: same-origin" and "Cross-Origin-Embedder-Policy: require-corp". "credentialless" does not isolate Safari.';
+
 // js/src/internal/logging.ts
 function logLevelForName(level) {
   switch (level) {
@@ -1570,17 +1590,6 @@ async function describeWebGpuUnavailable() {
   };
 }
 
-// js/src/internal/isolation.ts
-var CROSS_ORIGIN_ISOLATION_REQUIRED = "CROSS_ORIGIN_ISOLATION_REQUIRED";
-var CrossOriginIsolationError = class extends Error {
-  constructor(message = CROSS_ORIGIN_ISOLATION_MESSAGE) {
-    super(message);
-    this.name = "CrossOriginIsolationError";
-    this.code = CROSS_ORIGIN_ISOLATION_REQUIRED;
-  }
-};
-var CROSS_ORIGIN_ISOLATION_MESSAGE = 'The llama.cpp web core needs shared memory, which this page cannot use because it is not cross-origin isolated. Serve the page with "Cross-Origin-Opener-Policy: same-origin" and "Cross-Origin-Embedder-Policy: require-corp". "credentialless" does not isolate Safari.';
-
 // js/src/internal/image.ts
 async function decodeImageBytesToRgb(bytes, options = {}) {
   const sourceBytes = toUint8Array(bytes);
@@ -2325,9 +2334,14 @@ var LlamaWebGpuBridgeRuntime = class {
     if (!this._canUseRemoteFetchBackend(options)) {
       return { loaded: false, sizeBytes: null };
     }
+    const forceRemote = options.forceRemoteFetchBackend === true;
+    if (!this._coreSupportsPthreads()) {
+      if (forceRemote) throw new SingleThreadCoreError();
+      this._pushRuntimeNote("model_fetch_backend_requires_pthreads");
+      return { loaded: false, sizeBytes: null };
+    }
     const thresholdBytes = this._resolveRemoteFetchThresholdBytes(options);
     const chunkBytes = this._resolveRemoteFetchChunkBytes(options);
-    const forceRemote = options.forceRemoteFetchBackend === true;
     let sizeBytes = Number(options.modelBytesHint);
     if (!Number.isFinite(sizeBytes) || sizeBytes <= 0) {
       sizeBytes = await this._tryHeadContentLength(url);
@@ -2389,6 +2403,9 @@ var LlamaWebGpuBridgeRuntime = class {
           { async: true }
         )
       );
+      if (rc === -7) {
+        throw new SingleThreadCoreError(this._coreErrorMessage("Fetch-backed model load failed", rc));
+      }
       if (rc !== 0) {
         throw new Error(this._coreErrorMessage("Fetch-backed model load failed", rc));
       }
@@ -2405,6 +2422,11 @@ var LlamaWebGpuBridgeRuntime = class {
         sizeBytes: Number.isFinite(sizeBytes) ? sizeBytes : null
       };
     } catch (error) {
+      if (error instanceof SingleThreadCoreError) {
+        if (forceRemote) throw error;
+        this._pushRuntimeNote("model_fetch_backend_requires_pthreads");
+        return { loaded: false, sizeBytes };
+      }
       const text = String(error || "").toLowerCase();
       if (text.includes("aborted(native code called abort())")) {
         try {
@@ -3346,6 +3368,9 @@ var LlamaWebGpuBridgeRuntime = class {
     this._syncThreadPoolSizeHintFromCore();
     const coreSupportsPthreads = this._coreSupportsPthreads();
     this._pushRuntimeNote(`core_pthreads:${coreSupportsPthreads ? 1 : 0}`);
+    if (!coreSupportsPthreads) {
+      this._pushRuntimeNote("core_single_thread");
+    }
     if (!coreSupportsPthreads && Number.isFinite(configuredPoolHint) && configuredPoolHint > 1) {
       this._runtimeNotes.push("threads_capped_no_pthread");
     }
@@ -5952,7 +5977,7 @@ var BridgeWorkerProxy = class {
       this._pending.delete(id);
       if (type === "error") {
         const errorMessage = String(message.message || "Worker request failed");
-        const workerError = message.embeddingErrorCode ? new EmbeddingError(message.embeddingErrorCode, errorMessage) : this._config.jsBackedModelStaging === true && isModelStagingErrorCode(message.modelStagingErrorCode) ? new ModelStagingError(message.modelStagingErrorCode, errorMessage) : message.errorCode === CROSS_ORIGIN_ISOLATION_REQUIRED ? new CrossOriginIsolationError(errorMessage) : new Error(errorMessage);
+        const workerError = message.embeddingErrorCode ? new EmbeddingError(message.embeddingErrorCode, errorMessage) : this._config.jsBackedModelStaging === true && isModelStagingErrorCode(message.modelStagingErrorCode) ? new ModelStagingError(message.modelStagingErrorCode, errorMessage) : message.errorCode === CROSS_ORIGIN_ISOLATION_REQUIRED ? new CrossOriginIsolationError(errorMessage) : message.errorCode === SINGLE_THREAD_CORE_UNSUPPORTED ? new SingleThreadCoreError(errorMessage) : new Error(errorMessage);
         if (isDecisionErrorCode(message.decisionErrorCode)) {
           withDecisionErrorCode(workerError, message.decisionErrorCode);
         }
@@ -6738,7 +6763,7 @@ var LlamaWebGpuBridge = class {
     return error instanceof ModelStagingError || error.name === "ModelStagingError";
   }
   _isRecoverableWorkerFsError(error) {
-    if (this._isNonRecoverableStagingError(error)) {
+    if (error instanceof SingleThreadCoreError || this._isNonRecoverableStagingError(error)) {
       return false;
     }
     const text = serializeWorkerError(error).toLowerCase();
@@ -7133,7 +7158,7 @@ var LlamaWebGpuBridge = class {
     }
   }
   _shouldFallbackToMainThread(error) {
-    if (this._isNonRecoverableStagingError(error)) {
+    if (error instanceof SingleThreadCoreError || this._isNonRecoverableStagingError(error)) {
       return false;
     }
     const text = serializeWorkerError(error).toLowerCase();
@@ -8893,7 +8918,7 @@ function installBridgeWorkerHost() {
       id,
       message: serializeWorkerError(error),
       ...error instanceof EmbeddingError ? { embeddingErrorCode: error.code } : {},
-      ...error instanceof CrossOriginIsolationError ? { errorCode: CROSS_ORIGIN_ISOLATION_REQUIRED } : {},
+      ...error instanceof CrossOriginIsolationError || error instanceof SingleThreadCoreError ? { errorCode: error.code } : {},
       ...error instanceof ModelStagingError ? { modelStagingErrorCode: error.code } : {},
       ...decisionErrorCode ? { decisionErrorCode } : {},
       state
@@ -9266,5 +9291,6 @@ export {
   EmbeddingError,
   LlamaWebGpuBridge,
   ModelStagingError,
+  SingleThreadCoreError,
   enableBridgeWorkerHost
 };

@@ -35,7 +35,7 @@ import {
   writeResponseToFsFileWithProgress,
 } from './internal/download.ts';
 import { canPostSharedMemory, describeWebGpuUnavailable, isSafariUserAgent } from './internal/environment.ts';
-import { CrossOriginIsolationError } from './internal/isolation.ts';
+import { CrossOriginIsolationError, SingleThreadCoreError } from './internal/isolation.ts';
 import { decodeImageBytesToRgb } from './internal/image.ts';
 import {
   EmbeddingError, EMPTY_EMBEDDING_CAPABILITIES, EMBEDDING_MEDIA_MARKER,
@@ -1054,9 +1054,15 @@ export class LlamaWebGpuBridgeRuntime {
       return { loaded: false, sizeBytes: null };
     }
 
+    const forceRemote = options.forceRemoteFetchBackend === true;
+    if (!this._coreSupportsPthreads()) {
+      if (forceRemote) throw new SingleThreadCoreError();
+      this._pushRuntimeNote('model_fetch_backend_requires_pthreads');
+      return { loaded: false, sizeBytes: null };
+    }
+
     const thresholdBytes = this._resolveRemoteFetchThresholdBytes(options);
     const chunkBytes = this._resolveRemoteFetchChunkBytes(options);
-    const forceRemote = options.forceRemoteFetchBackend === true;
 
     let sizeBytes: number | null = Number(options.modelBytesHint);
     if (!Number.isFinite(sizeBytes) || sizeBytes <= 0) {
@@ -1128,6 +1134,9 @@ export class LlamaWebGpuBridgeRuntime {
         ),
       );
 
+      if (rc === -7) {
+        throw new SingleThreadCoreError(this._coreErrorMessage('Fetch-backed model load failed', rc));
+      }
       if (rc !== 0) {
         throw new Error(this._coreErrorMessage('Fetch-backed model load failed', rc));
       }
@@ -1147,6 +1156,12 @@ export class LlamaWebGpuBridgeRuntime {
         sizeBytes: Number.isFinite(sizeBytes) ? sizeBytes : null,
       };
     } catch (error) {
+      if (error instanceof SingleThreadCoreError) {
+        if (forceRemote) throw error;
+        this._pushRuntimeNote('model_fetch_backend_requires_pthreads');
+        return { loaded: false, sizeBytes };
+      }
+
       const text = String(error || '').toLowerCase();
 
       if (text.includes('aborted(native code called abort())')) {
@@ -2307,6 +2322,9 @@ export class LlamaWebGpuBridgeRuntime {
     this._syncThreadPoolSizeHintFromCore();
     const coreSupportsPthreads = this._coreSupportsPthreads();
     this._pushRuntimeNote(`core_pthreads:${coreSupportsPthreads ? 1 : 0}`);
+    if (!coreSupportsPthreads) {
+      this._pushRuntimeNote('core_single_thread');
+    }
     if (
       !coreSupportsPthreads
       && Number.isFinite(configuredPoolHint)

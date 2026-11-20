@@ -231,6 +231,10 @@ After publishing assets tag:
 - For state persistence, exercise both direct and worker runtimes with a real
   tiny model. The smoke should evaluate a prompt, save bytes, mutate state,
   reload bytes, and verify generation still works after restore.
+- For single-thread runtime changes, run the non-isolated state smoke and the
+  [local WebGPU acceptance smoke](CONTRIBUTING.md#validate-outputs). The state
+  smoke checks the public worker error and automatic staging fallback. The
+  local worker run also checks the native URL loader directly.
 - Worker and direct runtime filesystems are separate. Do not silently fall back
   from worker-owned state APIs to direct runtime state; byte APIs are the durable
   app-storage path for IndexedDB/OPFS/Cache API integrations.

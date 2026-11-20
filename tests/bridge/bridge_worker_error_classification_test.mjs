@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 
-import { LlamaWebGpuBridge } from '../../js/src/llama_webgpu_bridge.js';
+import { LlamaWebGpuBridge, SingleThreadCoreError } from '../../js/src/llama_webgpu_bridge.js';
 import {
   createRealWorkerBridge,
   settleQuietly,
@@ -414,6 +414,13 @@ const CASES = [
       false,
       'a request timeout never selects the FS restart-and-retry path',
     );
+  }],
+
+  ['a single-thread capability error never restarts or falls back from the worker', () => {
+    const { bridge } = createBridge();
+    const error = new SingleThreadCoreError('Bridge worker FS error');
+    assert.equal(bridge._isRecoverableWorkerFsError(error), false);
+    assert.equal(bridge._shouldFallbackToMainThread(error), false);
   }],
 
   ['worker model-load FS error restarts the worker once and retries there', async () => {

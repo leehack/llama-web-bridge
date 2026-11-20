@@ -10,6 +10,18 @@ export class CrossOriginIsolationError extends Error {
   }
 }
 
+export const SINGLE_THREAD_CORE_UNSUPPORTED = 'SINGLE_THREAD_CORE_UNSUPPORTED';
+
+export class SingleThreadCoreError extends Error {
+  readonly code = SINGLE_THREAD_CORE_UNSUPPORTED;
+  readonly feature = 'remote_fetch_backend';
+
+  constructor(message = 'Fetch-backed model loading requires a core built with pthreads') {
+    super(message);
+    this.name = 'SingleThreadCoreError';
+  }
+}
+
 export const CROSS_ORIGIN_ISOLATION_MESSAGE =
   'The llama.cpp web core needs shared memory, which this page cannot use because it is not '
   + 'cross-origin isolated. Serve the page with "Cross-Origin-Opener-Policy: same-origin" and '

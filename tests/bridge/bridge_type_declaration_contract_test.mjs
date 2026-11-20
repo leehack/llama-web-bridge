@@ -32,6 +32,7 @@ try {
     path.join(temporaryDir, 'consumer.ts'),
     [
       "import type { CompletionOptions, DecisionHeadOptions, DecisionSequence, EmbedOptions, LlamaWebGpuBridgeConfig, LoraAdapterLoadOptions, ModelStagingError, ModelStagingErrorCode } from './bridge.js';",
+      "import { SingleThreadCoreError } from './bridge.js';",
       '',
       'export const acceptedConfig: LlamaWebGpuBridgeConfig = { jsBackedModelStaging: true };',
       'export const acceptedStagingCode: ModelStagingErrorCode = "MODEL_STAGING_ALLOCATION_FAILED";',
@@ -39,6 +40,9 @@ try {
       'export const acceptedMountCode: ModelStagingErrorCode = "MODEL_STAGING_MOUNT_FAILED";',
       'export const acceptedUnsupportedCode: ModelStagingErrorCode = "MODEL_STAGING_UNSUPPORTED";',
       'export declare const stagingErrorCheck: ModelStagingError;',
+      'const fetchError = new SingleThreadCoreError();',
+      'export const singleThreadCode: "SINGLE_THREAD_CORE_UNSUPPORTED" = fetchError.code;',
+      'export const unsupportedFeature: "remote_fetch_backend" = fetchError.feature;',
       '',
       'export const accepted: CompletionOptions = {',
       '  nPredict: 64,',

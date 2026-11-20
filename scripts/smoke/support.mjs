@@ -938,16 +938,16 @@ export async function runPlaywright(url, timeoutMs, artifactsDir, artifactPrefix
 
 // The Chromium flags of the text-to-speech and decision smokes, which enable
 // WebGPU (Metal through ANGLE on macOS, Vulkan elsewhere).
-export function webGpuLaunchArgs(platform = process.platform) {
+export function webGpuLaunchArgs(platform = process.platform, { sharedArrayBuffer = true } = {}) {
   const args = ['--no-sandbox', '--disable-dev-shm-usage', '--enable-unsafe-webgpu'];
-  const features = ['SharedArrayBuffer'];
+  const features = sharedArrayBuffer ? ['SharedArrayBuffer'] : [];
   if (platform === 'darwin') {
     args.push('--use-angle=metal');
   } else {
     args.push('--disable-vulkan-surface');
     features.push('Vulkan');
   }
-  args.push(`--enable-features=${features.join(',')}`);
+  if (features.length > 0) args.push(`--enable-features=${features.join(',')}`);
   return args;
 }
 
@@ -960,11 +960,12 @@ export function webGpuLaunchArgs(platform = process.platform) {
 // added and the console log and result are written to `artifactsDir`.
 export async function runPollingPlaywright(url, timeoutMs, artifactsDir, {
   artifactPrefix, stageMarker, stagePrefix = null, transform = async () => {},
+  launchArgs = webGpuLaunchArgs(),
 }) {
   const chromium = await loadChromium();
   const consoleLines = [];
   let payload = null;
-  const browser = await chromium.launch({ args: webGpuLaunchArgs() });
+  const browser = await chromium.launch({ args: launchArgs });
   try {
     const page = await browser.newPage();
     page.on('console', (message) => {

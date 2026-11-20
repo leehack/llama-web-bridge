@@ -109,6 +109,11 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_load_model_from_url(
     return -2;
   }
 
+#if !defined(__EMSCRIPTEN_PTHREADS__)
+  set_error("Fetch-backed model loading requires a core built with pthreads");
+  return -7;
+#endif
+
   free_runtime();
 
   if (emscripten_is_main_browser_thread()) {

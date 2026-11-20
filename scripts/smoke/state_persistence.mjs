@@ -165,14 +165,34 @@ ${isolationCheck}
 
     const verifyModelRoundTrip = async (bridge, mode) => {
       const progress = [];
-      await bridge.loadModelFromUrl(modelUrl, {
+      const singleWorker = ${pyJson(singleThread)} && mode === 'worker runtime';
+      const modelOptions = {
         nCtx: 64,
         nThreads: 1,
         nGpuLayers: 0,
         nBatch: 32,
         nUbatch: 32,
         useCache: false,
-        forceRemoteFetchBackend: false,
+      };
+      if (singleWorker) {
+        const workerBeforeRejection = bridge._workerProxy;
+        let rejected;
+        try {
+          await bridge.loadModelFromUrl(modelUrl, { ...modelOptions, forceRemoteFetchBackend: true });
+        } catch (error) {
+          rejected = error;
+        }
+        assert(
+          rejected instanceof module.SingleThreadCoreError
+            && rejected.code === 'SINGLE_THREAD_CORE_UNSUPPORTED'
+            && rejected.feature === 'remote_fetch_backend',
+          'forced fetch did not reject with SingleThreadCoreError: ' + rejected,
+        );
+        assert(bridge._workerProxy === workerBeforeRejection, 'forced fetch rejection replaced the worker');
+      }
+      await bridge.loadModelFromUrl(modelUrl, {
+        ...modelOptions,
+        ...(singleWorker ? {} : { forceRemoteFetchBackend: false }),
         progressCallback: (event) => progress.push(event || {}),
       });
 
@@ -189,6 +209,10 @@ ${isolationCheck}
           \`\${mode} single-thread load missing core_pthreads:0 note: \${metadata['llamadart.webgpu.runtime_notes']}\`);
         assert(notes.includes('threads_capped_no_coi'),
           \`\${mode} single-thread load missing threads_capped_no_coi note: \${metadata['llamadart.webgpu.runtime_notes']}\`);
+        assert(notes.includes('core_single_thread'), 'single-thread load missing core_single_thread');
+        assert(notes.includes('model_fetch_backend_requires_pthreads') === singleWorker,
+          'single-thread load reported an unexpected fetch fallback note');
+        assert(metadata['llamadart.webgpu.model_source'] === 'network', 'single-thread load did not stream into staging');
       }
 
       const prompt = 'Hello';
@@ -549,7 +573,11 @@ ${isolationCheck}
 
     const memoryOptions = ${pyJson(memoryOptions)};
     await verifyBridgeStateApi(new LlamaWebGpuBridge({ ...memoryOptions, disableWorker: true }), 'direct runtime');
-    await verifyBridgeStateApi(new LlamaWebGpuBridge({ ...memoryOptions, disableWorker: false }), 'worker runtime');
+    await verifyBridgeStateApi(new LlamaWebGpuBridge({
+      ...memoryOptions,
+      disableWorker: false,
+      ...(${pyJson(singleThread)} ? { allowAutoRemoteFetchBackend: true } : {}),
+    }), 'worker runtime');
 
     if (modelUrl) {
       const direct = modeResults.find((entry) => entry.mode === 'direct runtime');
