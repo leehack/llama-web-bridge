@@ -1837,6 +1837,10 @@ function scoredTokensFrom(entries) {
 var pendingModelCacheStores = /* @__PURE__ */ new WeakMap();
 var SAFARI_EMBEDDING_PROBE_MAX_COSINE = 0.999;
 var textEncoder = new TextEncoder();
+var jsStagingMountCounters = /* @__PURE__ */ new WeakMap();
+var MAX_JS_STAGING_PATH_PROBES = 64;
+var WASMFS_EEXIST = 20;
+var WASMFS_ENOENT = 44;
 var LlamaWebGpuBridgeRuntime = class {
   constructor(config = {}) {
     this._config = config;
@@ -1849,7 +1853,6 @@ var LlamaWebGpuBridgeRuntime = class {
     this._ownedModelMount = null;
     this._modelFilesUseJsStaging = false;
     this._jsBackedStagingMounted = false;
-    this._jsStagingMountCounter = 0;
     this._activeJsStagingMounts = /* @__PURE__ */ new Map();
     this._failedUnmountJsStagingMounts = /* @__PURE__ */ new Map();
     this._modelBytes = 0;
@@ -2755,19 +2758,7 @@ var LlamaWebGpuBridgeRuntime = class {
         `JS-backed model staging requires native ABI version >= 3 (got ${apiVersion}). Update the core build or disable jsBackedModelStaging.`
       );
     }
-    this._jsStagingMountCounter += 1;
-    const mountPath = `/jsmodels-${this._jsStagingMountCounter}`;
-    const mountRc = Number(
-      core.ccall("llamadart_webgpu_mount_js_model_fs", "number", ["string"], [mountPath])
-    );
-    if (mountRc !== 0) {
-      this._pushRuntimeNote("model_staging_mount_failed");
-      const detail = mountRc === -20 || mountRc === -17 ? `the ${mountPath} path already exists under another filesystem backend` : `rc=${mountRc}`;
-      throw new ModelStagingError(
-        "MODEL_STAGING_MOUNT_FAILED",
-        `Failed to mount JS-backed model filesystem at ${mountPath} (${detail}).`
-      );
-    }
+    const mountPath = this._mountAtFreeJsStagingPath(core);
     const mountId = Number(
       core.ccall("llamadart_webgpu_js_model_fs_mount_id", "number", ["string"], [mountPath])
     );
@@ -2786,6 +2777,42 @@ var LlamaWebGpuBridgeRuntime = class {
     this._jsBackedStagingMounted = true;
     this._pushRuntimeNote(noteTag);
     return mountPath;
+  }
+  _mountAtFreeJsStagingPath(core) {
+    const previousMountNumber = jsStagingMountCounters.get(core) ?? 0;
+    for (let offset = 1; offset <= MAX_JS_STAGING_PATH_PROBES; offset += 1) {
+      const mountNumber = previousMountNumber + offset;
+      const mountPath = `/jsmodels-${mountNumber}`;
+      try {
+        core.FS.lstat(mountPath);
+        continue;
+      } catch (error) {
+        if (!(error && typeof error === "object" && "errno" in error && error.errno === WASMFS_ENOENT)) {
+          this._pushRuntimeNote("model_staging_mount_failed");
+          throw new ModelStagingError(
+            "MODEL_STAGING_MOUNT_FAILED",
+            `Failed to inspect JS-backed model staging path ${mountPath} (${String(error)}).`
+          );
+        }
+      }
+      jsStagingMountCounters.set(core, mountNumber);
+      const mountRc = Number(
+        core.ccall("llamadart_webgpu_mount_js_model_fs", "number", ["string"], [mountPath])
+      );
+      if (mountRc === 0) return mountPath;
+      if (mountRc === -WASMFS_EEXIST) continue;
+      this._pushRuntimeNote("model_staging_mount_failed");
+      const detail = mountRc === -17 ? `the ${mountPath} path already exists under another filesystem backend` : `rc=${mountRc}`;
+      throw new ModelStagingError(
+        "MODEL_STAGING_MOUNT_FAILED",
+        `Failed to mount JS-backed model filesystem at ${mountPath} (${detail}).`
+      );
+    }
+    this._pushRuntimeNote("model_staging_mount_failed");
+    throw new ModelStagingError(
+      "MODEL_STAGING_MOUNT_FAILED",
+      `No free JS-backed model staging path among the next ${MAX_JS_STAGING_PATH_PROBES} candidates.`
+    );
   }
   _isJsStagingMountOwned(core, mountPath, expectedMountId) {
     if (!core || !mountPath || !expectedMountId || expectedMountId <= 0) {

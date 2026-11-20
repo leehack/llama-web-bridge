@@ -179,6 +179,21 @@ Run the same single-thread smoke with `--memory-mode wasm64` as well. Both
 non-isolated runs check that the worker rejects a forced fetch-backend load,
 and that auto mode stages the model. CI and candidate qualification require both runs.
 
+The shared-core staging regression uses the same pinned model and cache. Run it
+against a dist with all four cores to verify that a new bridge can load after
+an earlier bridge leaves a busy staging mount, when the application occupies
+the next path or leaves a native registration there, and when the root
+directory allows mounting but denies listing.
+
+```bash
+BRIDGE_DIST_DIR="$OUT_DIR" \
+LLAMA_WEBGPU_SMOKE_MODEL_URL="$LLAMA_WEBGPU_SMOKE_MODEL_URL" \
+LLAMA_WEBGPU_SMOKE_MODEL_SHA256="$LLAMA_WEBGPU_SMOKE_MODEL_SHA256" \
+LLAMA_WEBGPU_SMOKE_MODEL_CACHE=~/.cache/llama-web-bridge/state-smoke-models \
+LLAMADART_BROWSER_STAGING_MOUNT_SMOKE=1 \
+node --test tests/bridge/js_model_staging_shared_core_browser_test.mjs
+```
+
 For local WebGPU acceptance on a non-isolated page, use the model and checksum
 for each memory mode in the [single-thread measurements](docs/single_thread.md):
 

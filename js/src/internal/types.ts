@@ -20,6 +20,7 @@ export type TextBytesExport =
 
 // The Emscripten FS subset the runtime uses, on top of the download helpers'.
 export interface LlamaCoreFs extends EmscriptenFs {
+  lstat(path: string): unknown;
   readFile(path: string): Uint8Array;
 }
 

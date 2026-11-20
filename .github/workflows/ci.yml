@@ -235,6 +235,12 @@ jobs:
           BRIDGE_DIST_DIR: ${{ runner.temp }}/webgpu_bridge_dist
         run: node scripts/smoke/state_persistence.mjs --threading single
 
+      - name: Run shared-core model staging browser smoke
+        env:
+          BRIDGE_DIST_DIR: ${{ runner.temp }}/webgpu_bridge_dist
+          LLAMADART_BROWSER_STAGING_MOUNT_SMOKE: '1'
+        run: node --test tests/bridge/js_model_staging_shared_core_browser_test.mjs
+
       - name: Run single-thread memory64 state persistence browser smoke
         env:
           BRIDGE_DIST_DIR: ${{ runner.temp }}/webgpu_bridge_dist
