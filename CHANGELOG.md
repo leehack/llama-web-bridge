@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Carry strong ETag and expected size evidence across repeated streamed GGUF interruptions, and enforce the declared span when a full GET returns an identity-encoded byte range starting at zero.
+
 - Validate streamed GGUF resumes against the final URL, visible validators, and range metadata. Restart a shard when the response contradicts the original download and reject incorrect resumed byte counts before native load. Progress can decrease on a restart.
 
 - When memory64 initialization fails, report `core_mem64_unavailable:<reason>` in model metadata and log the same reason at warn level before trying wasm32. The existing `core_mem64_unavailable` note remains available.

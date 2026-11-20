@@ -142,11 +142,18 @@ export interface ResumeIdentity {
   strongEtag: string | null;
   encoding: string | null;
   total: number | null;
+  initialSpanBytes: number | null;
+  resumedStrongEtags: Map<string, string>;
 }
 
 type ResumeVerdict =
   | { verdict: 'changed'; reason: 'url' | 'range' | 'etag' }
-  | { verdict: 'validated' | 'unvalidated'; total: number | null; expectedBytes: number | null };
+  | {
+    verdict: 'validated' | 'unvalidated';
+    total: number | null;
+    expectedBytes: number | null;
+    validator: { encoding: string; etag: string } | null;
+  };
 
 export function strongEtagOf(value: string | null): string | null {
   return value !== null && /^"[\x21\x23-\x7E\x80-\xFF]*"$/.test(value) ? value : null;
@@ -186,10 +193,13 @@ export function captureResumeIdentity(
   finalUrl: string,
 ): ResumeIdentity {
   const encoding = contentEncodingOf(response);
+  const range = response.status === 206 && encoding === 'identity'
+    ? parseByteRange(response.headers.get('content-range'))
+    : null;
   let total = parseByteLength(response.headers.get('x-linked-size'));
   if (total === null && encoding === 'identity') {
     total = response.status === 206
-      ? parseByteRange(response.headers.get('content-range'))?.total ?? null
+      ? range?.total ?? null
       : parseByteLength(response.headers.get('content-length'));
   }
   return {
@@ -197,6 +207,8 @@ export function captureResumeIdentity(
     strongEtag: strongEtagOf(response.headers.get('etag')),
     encoding,
     total,
+    initialSpanBytes: range?.start === 0 ? range.end + 1 : null,
+    resumedStrongEtags: new Map(),
   };
 }
 
@@ -205,6 +217,7 @@ export function classifyResumeResponse(
   response: Response,
   finalUrl: string,
   offset: number,
+  minimumBytes = 0,
 ): ResumeVerdict {
   if (finalUrl !== identity.url) return { verdict: 'changed', reason: 'url' };
 
@@ -215,7 +228,8 @@ export function classifyResumeResponse(
   // X-Linked-Size describes the model artifact, independent of HTTP encoding.
   const linkedSize = parseByteLength(response.headers.get('x-linked-size'));
   const total = range?.total ?? linkedSize ?? identity.total;
-  if (total !== null && ((identity.total !== null && total !== identity.total)
+  if (total !== null && (total < minimumBytes
+    || (identity.total !== null && total !== identity.total)
     || (linkedSize !== null && total !== linkedSize))) {
     return { verdict: 'changed', reason: 'range' };
   }
@@ -235,15 +249,22 @@ export function classifyResumeResponse(
 
   const etag = strongEtagOf(response.headers.get('etag'));
   // Strong validators identify the encoded representation.
-  const comparableTags = identity.strongEtag !== null && etag !== null
-    && encoding !== null && identity.encoding === encoding;
-  if (comparableTags && etag !== identity.strongEtag) return { verdict: 'changed', reason: 'etag' };
+  const originalTag = encoding !== null && identity.encoding === encoding ? identity.strongEtag : null;
+  const validator = etag !== null && encoding !== null ? { etag, encoding } : null;
+  if (validator) {
+    const earlierTag = originalTag ?? identity.resumedStrongEtags.get(validator.encoding);
+    if (earlierTag !== undefined && earlierTag !== validator.etag) {
+      return { verdict: 'changed', reason: 'etag' };
+    }
+  }
 
   const tailBytes = range ? range.end + 1 : (length === null ? null : offset + length);
   return {
-    verdict: comparableTags && rangeVerified ? 'validated' : 'unvalidated',
+    // A tag first seen on a range can check later ranges but cannot verify the original prefix.
+    verdict: validator && originalTag !== null && rangeVerified ? 'validated' : 'unvalidated',
     total,
     expectedBytes: total ?? tailBytes,
+    validator,
   };
 }
 

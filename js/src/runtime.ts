@@ -2539,6 +2539,7 @@ export class LlamaWebGpuBridgeRuntime {
           let activeShardUrl = shardUrl;
           let knownTotalBytes = 0;
           let resumeIdentity: ResumeIdentity | null = null;
+          let minimumShardBytes = 0;
 
           while (true) {
             throwIfAborted(operationSignal, abortMessage);
@@ -2579,7 +2580,9 @@ export class LlamaWebGpuBridgeRuntime {
 
             let expectedShardBytes: number | null = null;
             if (resumeOffset > 0 && resumeIdentity) {
-              const resume = classifyResumeResponse(resumeIdentity, response, responseUrl, resumeOffset);
+              const resume = classifyResumeResponse(
+                resumeIdentity, response, responseUrl, resumeOffset, minimumShardBytes,
+              );
               if (resume.verdict === 'changed') {
                 await response.body?.cancel().catch(() => {});
                 this._runtimeNotes.push('model_stream_restart:' + resume.reason);
@@ -2591,6 +2594,7 @@ export class LlamaWebGpuBridgeRuntime {
                 resumeOffset = 0;
                 knownTotalBytes = 0;
                 resumeIdentity = null;
+                minimumShardBytes = 0;
                 shardLoaded[shardIndex] = 0;
                 shardTotals[shardIndex] = 0;
                 emitAggregateProgress();
@@ -2599,6 +2603,9 @@ export class LlamaWebGpuBridgeRuntime {
               this._runtimeNotes.push('model_stream_resume_' + resume.verdict);
               expectedShardBytes = resume.expectedBytes;
               resumeIdentity.total = resume.total;
+              if (resume.validator) {
+                resumeIdentity.resumedStrongEtags.set(resume.validator.encoding, resume.validator.etag);
+              }
             }
 
             if (!hasReadableResponseStream(response)) {
@@ -2612,10 +2619,14 @@ export class LlamaWebGpuBridgeRuntime {
             this._runtimeNotes.push('model_response_stream');
 
             const responseTotal = inferResponseTotalBytes(response, knownTotalBytes);
+            let fullGetSpanBytes: number | null = null;
             if (resumeOffset === 0) {
               resumeIdentity = captureResumeIdentity(response, responseUrl);
               expectedShardBytes = resumeIdentity.total;
+              fullGetSpanBytes = resumeIdentity.initialSpanBytes;
             }
+            // A declared end from an earlier partial response is a lower bound on the shard size.
+            minimumShardBytes = Math.max(minimumShardBytes, expectedShardBytes ?? 0, fullGetSpanBytes ?? 0);
             if (responseTotal > 0) {
               knownTotalBytes = responseTotal;
               shardTotals[shardIndex] = responseTotal;
@@ -2661,9 +2672,17 @@ export class LlamaWebGpuBridgeRuntime {
                   abortMessage,
                 },
               );
-              if (expectedShardBytes !== null && shardBytes !== expectedShardBytes) {
+              const expectedBytes = fullGetSpanBytes !== null && shardBytes !== fullGetSpanBytes
+                ? fullGetSpanBytes
+                : expectedShardBytes;
+              if (expectedBytes !== null && shardBytes !== expectedBytes) {
                 throw createModelTransferLengthError(
-                  'Model response staged ' + shardBytes + ' bytes, expected ' + expectedShardBytes + '.',
+                  'Model response staged ' + shardBytes + ' bytes, expected ' + expectedBytes + '.',
+                );
+              }
+              if (shardBytes < minimumShardBytes) {
+                throw createModelTransferLengthError(
+                  'Model response staged ' + shardBytes + ' bytes, expected at least ' + minimumShardBytes + '.',
                 );
               }
               await this._settleModelCacheStore(response);
