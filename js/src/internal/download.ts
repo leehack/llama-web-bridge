@@ -161,7 +161,12 @@ export function strongEtagOf(value: string | null): string | null {
 
 function contentEncodingOf(response: Response): string | null {
   const encoding = response.headers.get('content-encoding');
-  if (encoding !== null) return encoding.toLowerCase();
+  if (encoding !== null) {
+    const codings = encoding.split(',')
+      .map((coding) => coding.replace(/^[ \t]+|[ \t]+$/g, '').toLowerCase())
+      .filter(Boolean);
+    return codings.join(',') || 'identity';
+  }
   if (response.type === 'basic') return 'identity';
 
   // A CORS response can expose Content-Length while hiding Content-Encoding.

@@ -444,15 +444,17 @@ export async function main(argv = process.argv.slice(2)) {
       }
     }
     if (baseline) {
+      const comparable = (result) => ({
+        ...result, notes: result.notes.filter((note) => note !== UNVALIDATED),
+      });
       results.parity = Object.fromEntries(await Promise.all([false, true].map(async (worker) => {
         const parityCases = {};
         for (const name of CONTROLS) {
           const current = await runCase(browser, args, revisions, name, { worker, parity: true });
           verifyCase(args, revisions, name, current, worker);
           const prior = await runCase(browser, { ...args, distDir: baseline }, revisions, name, { worker, parity: true });
-          assert.deepEqual({
-            ...current, notes: current.notes.filter((note) => note !== UNVALIDATED),
-          }, prior, `${name} request, bytes, notes or progress differs from baseline`);
+          assert.deepEqual(comparable(current), comparable(prior),
+            `${name} request, bytes, notes or progress differs from baseline`);
           parityCases[name] = current;
         }
         return [worker ? 'worker' : 'direct', parityCases];

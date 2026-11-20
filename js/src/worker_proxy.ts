@@ -5,6 +5,7 @@ import {
   isDecisionErrorCode,
   withDecisionErrorCode,
 } from './internal/decision.ts';
+import { createModelTransferLengthError } from './internal/download.ts';
 import { EMBEDDING_MEDIA_WORKER_TIMEOUT_MS, EmbeddingError, hasEmbeddingMediaParts } from './internal/embedding.ts';
 import {
   CROSS_ORIGIN_ISOLATION_REQUIRED,
@@ -175,7 +176,9 @@ export class BridgeWorkerProxy {
               ? new CrossOriginIsolationError(errorMessage)
               : message.errorCode === SINGLE_THREAD_CORE_UNSUPPORTED
                 ? new SingleThreadCoreError(errorMessage)
-                : new Error(errorMessage);
+                : message.errorCode === 'MODEL_TRANSFER_LENGTH_ERROR'
+                  ? createModelTransferLengthError(errorMessage)
+                  : new Error(errorMessage);
         if (isDecisionErrorCode(message.decisionErrorCode)) {
           withDecisionErrorCode(workerError, message.decisionErrorCode);
         }

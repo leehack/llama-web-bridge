@@ -1144,7 +1144,10 @@ function strongEtagOf(value) {
 }
 function contentEncodingOf(response) {
   const encoding = response.headers.get("content-encoding");
-  if (encoding !== null) return encoding.toLowerCase();
+  if (encoding !== null) {
+    const codings = encoding.split(",").map((coding) => coding.replace(/^[ \t]+|[ \t]+$/g, "").toLowerCase()).filter(Boolean);
+    return codings.join(",") || "identity";
+  }
   if (response.type === "basic") return "identity";
   if (response.type === "cors") {
     const exposed = response.headers.get("access-control-expose-headers")?.toLowerCase().split(",");
@@ -1836,6 +1839,9 @@ function scoredTokensFrom(entries) {
 // js/src/runtime.ts
 var pendingModelCacheStores = /* @__PURE__ */ new WeakMap();
 var SAFARI_EMBEDDING_PROBE_MAX_COSINE = 0.999;
+var SAFARI_EMBEDDING_PROBE_MIN_COMPONENT = 1e-3;
+var EmbeddingInputTooLongError = class extends Error {
+};
 var textEncoder = new TextEncoder();
 var jsStagingMountCounters = /* @__PURE__ */ new WeakMap();
 var MAX_JS_STAGING_PATH_PROBES = 64;
@@ -1903,6 +1909,7 @@ var LlamaWebGpuBridgeRuntime = class {
     this._isAppleSafari = isAppleSafariUserAgent(userAgent);
     this._safariDefaultMaxGpuLayers = safariDefaultMaxGpuLayers(userAgent);
     this._coreVariant = "uninitialized";
+    this._memory64FallbackReason = null;
     this._preferMemory64 = this._config.preferMemory64 !== false;
     this._modelSource = "network";
     this._modelCacheState = "disabled";
@@ -3371,6 +3378,7 @@ var LlamaWebGpuBridgeRuntime = class {
       });
     }
     let lastError = null;
+    let memory64FallbackReason = null;
     for (const candidate of candidates) {
       if (candidate.variant === "wasm64") {
         this._runtimeNotes.push("core_mem64_attempt");
@@ -3457,6 +3465,7 @@ var LlamaWebGpuBridgeRuntime = class {
           })
         ]);
         this._coreVariant = candidate.variant === "wasm64" ? "wasm64" : "wasm32";
+        this._memory64FallbackReason = memory64FallbackReason;
         if (candidate.variant === "wasm64") {
           this._runtimeNotes.push("core_mem64_active");
         } else if (candidate.variant === "wasm32") {
@@ -3467,6 +3476,7 @@ var LlamaWebGpuBridgeRuntime = class {
         lastError = error;
         if (candidate.variant === "wasm64") {
           const reason = initTimeoutError && error === initTimeoutError ? "timeout" : factoryLoaded && isMemory64Unsupported() ? "unsupported" : "init_error";
+          memory64FallbackReason = reason;
           this._runtimeNotes.push("core_mem64_unavailable");
           this._runtimeNotes.push(`core_mem64_unavailable:${reason}`);
           this._emitLogger("warn", `Memory64 core unavailable (${reason}). Trying the wasm32 core.`);
@@ -3507,7 +3517,7 @@ var LlamaWebGpuBridgeRuntime = class {
     const abortMessage = "Model load was cancelled.";
     throwIfAborted(operationSignal, abortMessage);
     this._abortRequested = false;
-    this._runtimeNotes = [];
+    this._runtimeNotes = this._core && this._memory64FallbackReason ? ["core_mem64_unavailable", `core_mem64_unavailable:${this._memory64FallbackReason}`] : [];
     this._suppressedWarmupWarningCount = 0;
     this._didReportWarmupWarningSuppression = false;
     await this._probeBackends();
@@ -4033,14 +4043,15 @@ var LlamaWebGpuBridgeRuntime = class {
                 penalty: 1,
                 seed: index + seedOffset
               });
-              if (looksLikeCorruptedGeneration(probeOutput)) return false;
+              if (looksLikeCorruptedGeneration(probeOutput)) return "failed";
             }
-            return true;
+            return "passed";
           } catch (_) {
-            return false;
+            return "failed";
           }
         };
-        if (!await runProbe(1)) {
+        const probeResult = await runProbe(1);
+        if (probeResult === "failed") {
           this._runtimeNotes.push("safari_gpu_probe_failed");
           const retryCandidates = [];
           if (this._nGpuLayers > 1) {
@@ -4128,7 +4139,7 @@ var LlamaWebGpuBridgeRuntime = class {
               stabilized = true;
               break;
             }
-            if (await runProbe(11)) {
+            if (await runProbe(11) !== "failed") {
               this._runtimeNotes.push(`safari_gpu_layers_capped:${candidateLayers}`);
               stabilized = true;
               break;
@@ -4137,7 +4148,7 @@ var LlamaWebGpuBridgeRuntime = class {
           if (!stabilized) {
             throw new Error("Safari GPU probe failed and fallback attempts were unsuccessful.");
           }
-        } else {
+        } else if (probeResult === "passed") {
           this._runtimeNotes.push("safari_gpu_probe_passed");
         }
       }
@@ -5822,18 +5833,35 @@ var LlamaWebGpuBridgeRuntime = class {
     }
   }
   async _probeSafariEmbeddings() {
-    const options = { normalize: true };
-    const first = await this._readTextEmbedding("The Eiffel Tower is in Paris.", options);
-    const second = await this._readTextEmbedding("WebGPU runs matrix math on the GPU.", options);
-    const finite = (vector) => vector.every(Number.isFinite);
-    if (first.length !== second.length || !finite(first) || !finite(second)) return false;
-    const firstNorm = Math.hypot(...first);
-    const secondNorm = Math.hypot(...second);
-    if (Math.abs(firstNorm - 1) >= 0.01 || Math.abs(secondNorm - 1) >= 0.01) return false;
-    const dot = first.reduce((sum, value, index) => sum + value * second[index], 0);
-    return dot / (firstNorm * secondNorm) < SAFARI_EMBEDDING_PROBE_MAX_COSINE;
+    const readProbeVector = async (prompt) => {
+      const { dimension, values } = await this._readTextEmbedding(prompt, { normalize: true }, true);
+      if (values.length !== dimension || !values.every((value) => Number.isFinite(value))) {
+        return null;
+      }
+      const significantComponents = values.filter((value) => Math.abs(value) >= SAFARI_EMBEDDING_PROBE_MIN_COMPONENT);
+      const norm = Math.hypot(...values);
+      return significantComponents.length >= 2 && Math.abs(norm - 1) < 0.01 ? { values, norm } : null;
+    };
+    const promptPairs = [
+      ["The Eiffel Tower is in Paris.", "WebGPU runs matrix math on the GPU."],
+      ["cat", "dog"]
+    ];
+    for (const [firstPrompt, secondPrompt] of promptPairs) {
+      try {
+        const first = await readProbeVector(firstPrompt);
+        if (!first) return "failed";
+        const second = await readProbeVector(secondPrompt);
+        if (!second || first.values.length !== second.values.length) return "failed";
+        const dot = first.values.reduce((sum, value, index) => sum + value * second.values[index], 0);
+        return dot / (first.norm * second.norm) < SAFARI_EMBEDDING_PROBE_MAX_COSINE ? "passed" : "failed";
+      } catch (error) {
+        if (!(error instanceof EmbeddingInputTooLongError)) throw error;
+      }
+    }
+    this._runtimeNotes.push("safari_gpu_probe_skipped_input_too_long");
+    return "skipped";
   }
-  async _readTextEmbedding(text, options) {
+  async _readTextEmbedding(text, options, classifyOverflow = false) {
     if (this._modelBytes <= 0) {
       throw new Error("No model loaded. Call loadModelFromUrl first.");
     }
@@ -5849,11 +5877,13 @@ var LlamaWebGpuBridgeRuntime = class {
       )
     );
     if (rc < 0) {
-      throw new Error(this._coreErrorMessage("Embedding generation failed", rc));
+      const message = this._coreErrorMessage("Embedding generation failed", rc);
+      if (classifyOverflow && rc === -12) throw new EmbeddingInputTooLongError(message);
+      throw new Error(message);
     }
     const raw = this._core.ccall("llamadart_webgpu_last_embedding_json", "string", [], []) || "[]";
     const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? parsed : [];
+    return { dimension: rc, values: Array.isArray(parsed) ? parsed : [] };
   }
   async embed(text, options = {}) {
     if (Array.isArray(text)) {
@@ -5863,7 +5893,7 @@ var LlamaWebGpuBridgeRuntime = class {
       if (this._abortRequested) throw createAbortError("Embedding was cancelled.");
       return this._embedParts(parts, options);
     }
-    const values = await this._readTextEmbedding(text, options);
+    const { values } = await this._readTextEmbedding(text, options);
     return values.map((value) => {
       const numeric = Number(value);
       return Number.isFinite(numeric) ? numeric : 0;
@@ -6218,7 +6248,7 @@ var BridgeWorkerProxy = class {
       this._pending.delete(id);
       if (type === "error") {
         const errorMessage = String(message.message || "Worker request failed");
-        const workerError = message.embeddingErrorCode ? new EmbeddingError(message.embeddingErrorCode, errorMessage) : this._config.jsBackedModelStaging === true && isModelStagingErrorCode(message.modelStagingErrorCode) ? new ModelStagingError(message.modelStagingErrorCode, errorMessage) : message.errorCode === CROSS_ORIGIN_ISOLATION_REQUIRED ? new CrossOriginIsolationError(errorMessage) : message.errorCode === SINGLE_THREAD_CORE_UNSUPPORTED ? new SingleThreadCoreError(errorMessage) : new Error(errorMessage);
+        const workerError = message.embeddingErrorCode ? new EmbeddingError(message.embeddingErrorCode, errorMessage) : this._config.jsBackedModelStaging === true && isModelStagingErrorCode(message.modelStagingErrorCode) ? new ModelStagingError(message.modelStagingErrorCode, errorMessage) : message.errorCode === CROSS_ORIGIN_ISOLATION_REQUIRED ? new CrossOriginIsolationError(errorMessage) : message.errorCode === SINGLE_THREAD_CORE_UNSUPPORTED ? new SingleThreadCoreError(errorMessage) : message.errorCode === "MODEL_TRANSFER_LENGTH_ERROR" ? createModelTransferLengthError(errorMessage) : new Error(errorMessage);
         if (isDecisionErrorCode(message.decisionErrorCode)) {
           withDecisionErrorCode(workerError, message.decisionErrorCode);
         }
@@ -9160,6 +9190,7 @@ function installBridgeWorkerHost() {
       message: serializeWorkerError(error),
       ...error instanceof EmbeddingError ? { embeddingErrorCode: error.code } : {},
       ...error instanceof CrossOriginIsolationError || error instanceof SingleThreadCoreError ? { errorCode: error.code } : {},
+      ...error instanceof Error && error.name === "ModelTransferLengthError" ? { errorCode: "MODEL_TRANSFER_LENGTH_ERROR" } : {},
       ...error instanceof ModelStagingError ? { modelStagingErrorCode: error.code } : {},
       ...decisionErrorCode ? { decisionErrorCode } : {},
       state

@@ -49,12 +49,15 @@ function setup(t, wasm64Factory) {
   };
 }
 
-function assertFallback(bridge, warnings, reason) {
+function assertFallback(bridge, warnings, reason, { reused = false } = {}) {
   const metadata = bridge.getModelMetadata();
   const notes = metadata['llamadart.webgpu.runtime_notes'];
   assert.equal(metadata['llamadart.webgpu.core_variant'], 'wasm32');
   assert.deepEqual(notes.split(';').filter((note) => /^core_(mem64|wasm32)/.test(note)), [
-    'core_mem64_attempt', 'core_mem64_unavailable', `core_mem64_unavailable:${reason}`, 'core_wasm32_active',
+    ...(reused ? [] : ['core_mem64_attempt']),
+    'core_mem64_unavailable',
+    `core_mem64_unavailable:${reason}`,
+    ...(reused ? [] : ['core_wasm32_active']),
   ]);
   assert.doesNotMatch(notes, /assets\.test|fixture-token/);
   assert.equal(warnings.length, 1);
@@ -80,6 +83,8 @@ for (const { reason, supported, factory } of [
     t.after(() => bridge.dispose());
     await bridge.loadModelFromUrl(MODEL_URL, LOAD_OPTIONS);
     assertFallback(bridge, warnings, reason);
+    await bridge.loadModelFromUrl(MODEL_URL, LOAD_OPTIONS);
+    assertFallback(bridge, warnings, reason, { reused: true });
   });
 }
 
@@ -112,6 +117,9 @@ test('the memory64 reason survives the worker host and proxy round trip', async 
       await bridge.loadModelFromUrl(MODEL_URL, LOAD_OPTIONS);
       assert.equal(bridge.getModelMetadata()['llamadart.webgpu.execution'], 'worker');
       assertFallback(bridge, warnings, 'init_error');
+      await bridge.loadModelFromUrl(MODEL_URL, LOAD_OPTIONS);
+      assert.equal(bridge.getModelMetadata()['llamadart.webgpu.execution'], 'worker');
+      assertFallback(bridge, warnings, 'init_error', { reused: true });
     } finally {
       await bridge.dispose();
       if (oldSelf === undefined) delete globalThis.self;
