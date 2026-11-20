@@ -2553,6 +2553,23 @@ export class LlamaWebGpuBridgeRuntime {
           let activeShardUrl = shardUrl;
           let knownTotalBytes = 0;
           let resumeIdentity: ResumeIdentity | null = null;
+          let minimumShardBytes = 0;
+
+          const restartShard = (reason: 'url' | 'range' | 'etag') => {
+            this._runtimeNotes.push('model_stream_restart:' + reason);
+            if (resumeAttempt >= maxStreamResumeRetries) {
+              throw new Error('Model shard changed during download and the retry limit was reached.');
+            }
+            resumeAttempt += 1;
+            activeShardUrl = shardUrl;
+            resumeOffset = 0;
+            knownTotalBytes = 0;
+            resumeIdentity = null;
+            minimumShardBytes = 0;
+            shardLoaded[shardIndex] = 0;
+            shardTotals[shardIndex] = 0;
+            emitAggregateProgress();
+          };
 
           while (true) {
             throwIfAborted(operationSignal, abortMessage);
@@ -2593,26 +2610,20 @@ export class LlamaWebGpuBridgeRuntime {
 
             let expectedShardBytes: number | null = null;
             if (resumeOffset > 0 && resumeIdentity) {
-              const resume = classifyResumeResponse(resumeIdentity, response, responseUrl, resumeOffset);
+              const resume = classifyResumeResponse(
+                resumeIdentity, response, responseUrl, resumeOffset, minimumShardBytes,
+              );
               if (resume.verdict === 'changed') {
                 await response.body?.cancel().catch(() => {});
-                this._runtimeNotes.push('model_stream_restart:' + resume.reason);
-                if (resumeAttempt >= maxStreamResumeRetries) {
-                  throw new Error('Model shard changed during download and the retry limit was reached.');
-                }
-                resumeAttempt += 1;
-                activeShardUrl = shardUrl;
-                resumeOffset = 0;
-                knownTotalBytes = 0;
-                resumeIdentity = null;
-                shardLoaded[shardIndex] = 0;
-                shardTotals[shardIndex] = 0;
-                emitAggregateProgress();
+                restartShard(resume.reason);
                 continue;
               }
               this._runtimeNotes.push('model_stream_resume_' + resume.verdict);
               expectedShardBytes = resume.expectedBytes;
               resumeIdentity.total = resume.total;
+              if (resume.validator) {
+                resumeIdentity.resumedStrongEtags.set(resume.validator.encoding, resume.validator.etag);
+              }
             }
 
             if (!hasReadableResponseStream(response)) {
@@ -2626,10 +2637,19 @@ export class LlamaWebGpuBridgeRuntime {
             this._runtimeNotes.push('model_response_stream');
 
             const responseTotal = inferResponseTotalBytes(response, knownTotalBytes);
+            let fullGetSpanBytes: number | null = null;
             if (resumeOffset === 0) {
               resumeIdentity = captureResumeIdentity(response, responseUrl);
+              if (!resumeIdentity) {
+                await response.body?.cancel().catch(() => {});
+                throw createModelTransferLengthError('Model response reported conflicting Content-Range and X-Linked-Size totals.');
+              }
               expectedShardBytes = resumeIdentity.total;
+              fullGetSpanBytes = resumeIdentity.initialSpanBytes;
             }
+            const responseEndBytes = response.status === 206 ? fullGetSpanBytes ?? expectedShardBytes : null;
+            // A declared end from an earlier partial response is a lower bound on the shard size.
+            minimumShardBytes = Math.max(minimumShardBytes, expectedShardBytes ?? 0, fullGetSpanBytes ?? 0);
             if (responseTotal > 0) {
               knownTotalBytes = responseTotal;
               shardTotals[shardIndex] = responseTotal;
@@ -2675,9 +2695,17 @@ export class LlamaWebGpuBridgeRuntime {
                   abortMessage,
                 },
               );
-              if (expectedShardBytes !== null && shardBytes !== expectedShardBytes) {
+              const expectedBytes = fullGetSpanBytes !== null && shardBytes !== fullGetSpanBytes
+                ? fullGetSpanBytes
+                : expectedShardBytes;
+              if (expectedBytes !== null && shardBytes !== expectedBytes) {
                 throw createModelTransferLengthError(
-                  'Model response staged ' + shardBytes + ' bytes, expected ' + expectedShardBytes + '.',
+                  'Model response staged ' + shardBytes + ' bytes, expected ' + expectedBytes + '.',
+                );
+              }
+              if (shardBytes < minimumShardBytes) {
+                throw createModelTransferLengthError(
+                  'Model response staged ' + shardBytes + ' bytes, expected at least ' + minimumShardBytes + '.',
                 );
               }
               await this._settleModelCacheStore(response);
@@ -2690,10 +2718,11 @@ export class LlamaWebGpuBridgeRuntime {
               const loadedBytes = Number(
                 (error as { llamadartLoadedBytes?: unknown } | null | undefined)?.llamadartLoadedBytes,
               );
+              const rangeOverrun = responseEndBytes !== null && loadedBytes > responseEndBytes;
               if (Number.isFinite(loadedBytes) && loadedBytes >= 0) {
                 const normalizedLoaded = Math.trunc(loadedBytes);
                 this._runtimeNotes.push(`model_fs_write_loaded:${normalizedLoaded}`);
-                if (normalizedLoaded > resumeOffset) {
+                if (!rangeOverrun && normalizedLoaded > resumeOffset) {
                   resumeOffset = normalizedLoaded;
                   shardLoaded[shardIndex] = normalizedLoaded;
                   if (knownTotalBytes > 0 && shardTotals[shardIndex] < knownTotalBytes) {
@@ -2711,9 +2740,15 @@ export class LlamaWebGpuBridgeRuntime {
                   )
                 : null;
 
+              const retryableNetworkError = isRetryableStreamNetworkError(error);
+              if (!stagingAllocError && retryableNetworkError && rangeOverrun) {
+                restartShard('range');
+                continue;
+              }
+
               const shouldRetryResume =
                 !stagingAllocError
-                && isRetryableStreamNetworkError(error)
+                && retryableNetworkError
                 && resumeOffset > 0
                 && resumeAttempt < maxStreamResumeRetries;
               if (shouldRetryResume) {
@@ -2733,7 +2768,7 @@ export class LlamaWebGpuBridgeRuntime {
                 this._runtimeNotes.push('model_fs_write_abort');
               } else if (text.includes('array buffer allocation failed')) {
                 this._runtimeNotes.push('model_fs_write_arraybuffer_oom');
-              } else if (isRetryableStreamNetworkError(error)) {
+              } else if (retryableNetworkError) {
                 this._runtimeNotes.push('model_fs_write_network_error');
                 this._runtimeNotes.push('model_fs_write_failed');
               } else {

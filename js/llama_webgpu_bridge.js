@@ -1168,18 +1168,24 @@ function parseByteRange(value) {
 }
 function captureResumeIdentity(response, finalUrl) {
   const encoding = contentEncodingOf(response);
-  let total = parseByteLength(response.headers.get("x-linked-size"));
+  const range = response.status === 206 && encoding === "identity" ? parseByteRange(response.headers.get("content-range")) : null;
+  const rangeTotal = range?.total ?? null;
+  const linkedSize = parseByteLength(response.headers.get("x-linked-size"));
+  if (rangeTotal !== null && linkedSize !== null && rangeTotal !== linkedSize) return null;
+  let total = linkedSize;
   if (total === null && encoding === "identity") {
-    total = response.status === 206 ? parseByteRange(response.headers.get("content-range"))?.total ?? null : parseByteLength(response.headers.get("content-length"));
+    total = response.status === 206 ? rangeTotal : parseByteLength(response.headers.get("content-length"));
   }
   return {
     url: finalUrl,
     strongEtag: strongEtagOf(response.headers.get("etag")),
     encoding,
-    total
+    total,
+    initialSpanBytes: range?.start === 0 ? range.end + 1 : null,
+    resumedStrongEtags: /* @__PURE__ */ new Map()
   };
 }
-function classifyResumeResponse(identity, response, finalUrl, offset) {
+function classifyResumeResponse(identity, response, finalUrl, offset, minimumBytes = 0) {
   if (finalUrl !== identity.url) return { verdict: "changed", reason: "url" };
   const encoding = contentEncodingOf(response);
   const contentRange = response.headers.get("content-range");
@@ -1187,7 +1193,7 @@ function classifyResumeResponse(identity, response, finalUrl, offset) {
   const length = encoding === "identity" ? parseByteLength(response.headers.get("content-length")) : null;
   const linkedSize = parseByteLength(response.headers.get("x-linked-size"));
   const total = range?.total ?? linkedSize ?? identity.total;
-  if (total !== null && (identity.total !== null && total !== identity.total || linkedSize !== null && total !== linkedSize)) {
+  if (total !== null && (total < minimumBytes || identity.total !== null && total !== identity.total || linkedSize !== null && total !== linkedSize)) {
     return { verdict: "changed", reason: "range" };
   }
   let rangeVerified = false;
@@ -1201,13 +1207,21 @@ function classifyResumeResponse(identity, response, finalUrl, offset) {
     rangeVerified = contentRange === null;
   }
   const etag = strongEtagOf(response.headers.get("etag"));
-  const comparableTags = identity.strongEtag !== null && etag !== null && encoding !== null && identity.encoding === encoding;
-  if (comparableTags && etag !== identity.strongEtag) return { verdict: "changed", reason: "etag" };
+  const originalTag = encoding !== null && identity.encoding === encoding ? identity.strongEtag : null;
+  const validator = etag !== null && encoding !== null ? { etag, encoding } : null;
+  if (validator) {
+    const earlierTag = originalTag ?? identity.resumedStrongEtags.get(validator.encoding);
+    if (earlierTag !== void 0 && earlierTag !== validator.etag) {
+      return { verdict: "changed", reason: "etag" };
+    }
+  }
   const tailBytes = range ? range.end + 1 : length === null ? null : offset + length;
   return {
-    verdict: comparableTags && rangeVerified ? "validated" : "unvalidated",
+    // A tag first seen on a range can check later ranges but cannot verify the original prefix.
+    verdict: validator && originalTag !== null && rangeVerified ? "validated" : "unvalidated",
     total,
-    expectedBytes: total ?? tailBytes
+    expectedBytes: total ?? tailBytes,
+    validator
   };
 }
 function isRetryableStreamNetworkError(error) {
@@ -3647,6 +3661,22 @@ var LlamaWebGpuBridgeRuntime = class {
             let activeShardUrl = shardUrl;
             let knownTotalBytes = 0;
             let resumeIdentity = null;
+            let minimumShardBytes = 0;
+            const restartShard = (reason) => {
+              this._runtimeNotes.push("model_stream_restart:" + reason);
+              if (resumeAttempt >= maxStreamResumeRetries) {
+                throw new Error("Model shard changed during download and the retry limit was reached.");
+              }
+              resumeAttempt += 1;
+              activeShardUrl = shardUrl;
+              resumeOffset = 0;
+              knownTotalBytes = 0;
+              resumeIdentity = null;
+              minimumShardBytes = 0;
+              shardLoaded[shardIndex] = 0;
+              shardTotals[shardIndex] = 0;
+              emitAggregateProgress();
+            };
             while (true) {
               throwIfAborted(operationSignal, abortMessage);
               const requestHeaders = resumeOffset > 0 ? { Range: `bytes=${resumeOffset}-` } : null;
@@ -3677,27 +3707,25 @@ var LlamaWebGpuBridgeRuntime = class {
               }
               let expectedShardBytes = null;
               if (resumeOffset > 0 && resumeIdentity) {
-                const resume = classifyResumeResponse(resumeIdentity, response, responseUrl, resumeOffset);
+                const resume = classifyResumeResponse(
+                  resumeIdentity,
+                  response,
+                  responseUrl,
+                  resumeOffset,
+                  minimumShardBytes
+                );
                 if (resume.verdict === "changed") {
                   await response.body?.cancel().catch(() => {
                   });
-                  this._runtimeNotes.push("model_stream_restart:" + resume.reason);
-                  if (resumeAttempt >= maxStreamResumeRetries) {
-                    throw new Error("Model shard changed during download and the retry limit was reached.");
-                  }
-                  resumeAttempt += 1;
-                  activeShardUrl = shardUrl;
-                  resumeOffset = 0;
-                  knownTotalBytes = 0;
-                  resumeIdentity = null;
-                  shardLoaded[shardIndex] = 0;
-                  shardTotals[shardIndex] = 0;
-                  emitAggregateProgress();
+                  restartShard(resume.reason);
                   continue;
                 }
                 this._runtimeNotes.push("model_stream_resume_" + resume.verdict);
                 expectedShardBytes = resume.expectedBytes;
                 resumeIdentity.total = resume.total;
+                if (resume.validator) {
+                  resumeIdentity.resumedStrongEtags.set(resume.validator.encoding, resume.validator.etag);
+                }
               }
               if (!hasReadableResponseStream(response)) {
                 this._runtimeNotes.push("model_response_nostream");
@@ -3709,10 +3737,19 @@ var LlamaWebGpuBridgeRuntime = class {
               }
               this._runtimeNotes.push("model_response_stream");
               const responseTotal = inferResponseTotalBytes(response, knownTotalBytes);
+              let fullGetSpanBytes = null;
               if (resumeOffset === 0) {
                 resumeIdentity = captureResumeIdentity(response, responseUrl);
+                if (!resumeIdentity) {
+                  await response.body?.cancel().catch(() => {
+                  });
+                  throw createModelTransferLengthError("Model response reported conflicting Content-Range and X-Linked-Size totals.");
+                }
                 expectedShardBytes = resumeIdentity.total;
+                fullGetSpanBytes = resumeIdentity.initialSpanBytes;
               }
+              const responseEndBytes = response.status === 206 ? fullGetSpanBytes ?? expectedShardBytes : null;
+              minimumShardBytes = Math.max(minimumShardBytes, expectedShardBytes ?? 0, fullGetSpanBytes ?? 0);
               if (responseTotal > 0) {
                 knownTotalBytes = responseTotal;
                 shardTotals[shardIndex] = responseTotal;
@@ -3753,9 +3790,15 @@ var LlamaWebGpuBridgeRuntime = class {
                     abortMessage
                   }
                 );
-                if (expectedShardBytes !== null && shardBytes !== expectedShardBytes) {
+                const expectedBytes = fullGetSpanBytes !== null && shardBytes !== fullGetSpanBytes ? fullGetSpanBytes : expectedShardBytes;
+                if (expectedBytes !== null && shardBytes !== expectedBytes) {
                   throw createModelTransferLengthError(
-                    "Model response staged " + shardBytes + " bytes, expected " + expectedShardBytes + "."
+                    "Model response staged " + shardBytes + " bytes, expected " + expectedBytes + "."
+                  );
+                }
+                if (shardBytes < minimumShardBytes) {
+                  throw createModelTransferLengthError(
+                    "Model response staged " + shardBytes + " bytes, expected at least " + minimumShardBytes + "."
                   );
                 }
                 await this._settleModelCacheStore(response);
@@ -3768,10 +3811,11 @@ var LlamaWebGpuBridgeRuntime = class {
                 const loadedBytes = Number(
                   error?.llamadartLoadedBytes
                 );
+                const rangeOverrun = responseEndBytes !== null && loadedBytes > responseEndBytes;
                 if (Number.isFinite(loadedBytes) && loadedBytes >= 0) {
                   const normalizedLoaded = Math.trunc(loadedBytes);
                   this._runtimeNotes.push(`model_fs_write_loaded:${normalizedLoaded}`);
-                  if (normalizedLoaded > resumeOffset) {
+                  if (!rangeOverrun && normalizedLoaded > resumeOffset) {
                     resumeOffset = normalizedLoaded;
                     shardLoaded[shardIndex] = normalizedLoaded;
                     if (knownTotalBytes > 0 && shardTotals[shardIndex] < knownTotalBytes) {
@@ -3785,7 +3829,12 @@ var LlamaWebGpuBridgeRuntime = class {
                   error,
                   knownTotalBytes > 0 ? knownTotalBytes : resumeOffset
                 ) : null;
-                const shouldRetryResume = !stagingAllocError && isRetryableStreamNetworkError(error) && resumeOffset > 0 && resumeAttempt < maxStreamResumeRetries;
+                const retryableNetworkError = isRetryableStreamNetworkError(error);
+                if (!stagingAllocError && retryableNetworkError && rangeOverrun) {
+                  restartShard("range");
+                  continue;
+                }
+                const shouldRetryResume = !stagingAllocError && retryableNetworkError && resumeOffset > 0 && resumeAttempt < maxStreamResumeRetries;
                 if (shouldRetryResume) {
                   resumeAttempt += 1;
                   this._runtimeNotes.push(`model_stream_resume_retry:${resumeAttempt}`);
@@ -3801,7 +3850,7 @@ var LlamaWebGpuBridgeRuntime = class {
                   this._runtimeNotes.push("model_fs_write_abort");
                 } else if (text.includes("array buffer allocation failed")) {
                   this._runtimeNotes.push("model_fs_write_arraybuffer_oom");
-                } else if (isRetryableStreamNetworkError(error)) {
+                } else if (retryableNetworkError) {
                   this._runtimeNotes.push("model_fs_write_network_error");
                   this._runtimeNotes.push("model_fs_write_failed");
                 } else {

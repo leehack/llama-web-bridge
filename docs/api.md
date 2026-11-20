@@ -251,12 +251,21 @@ consistent identity-encoded `Content-Range`. When `Content-Range` is hidden,
 a matching identity-encoded `Content-Length` for a known remainder also
 verifies the range. A changed URL, differing comparable strong ETags, or
 contradictory byte lengths or offsets restart the shard at byte zero.
+The bridge remembers the first comparable strong ETag for each encoding
+across interruptions. A tag first seen on a range can detect a later change
+for that encoding while the original prefix stays unvalidated.
 Missing or weak ETags and lengths measured with different or unknown
 encodings can leave a resume unvalidated. A same-size revision change can
 go undetected on this path.
 
 The bridge checks the staged byte count against any known decoded size
-before initializing the model, including after a restart. For cross-origin
+before initializing the model. Earlier responses' declared ends still bound
+the minimum size when a later range is shorter or omits size metadata. If an
+interrupted range runs past its declared end, the bridge restarts the shard
+from byte zero. An identity-encoded `206` response to a full GET that declares
+a range starting at byte zero must match its declared span, including when
+the total is `*`. If the response exposes numeric totals in both
+`Content-Range` and `X-Linked-Size`, they must agree. For cross-origin
 downloads, expose `ETag`, `Content-Range`, and any `Content-Encoding` with
 `Access-Control-Expose-Headers`. When `Content-Encoding` is absent, the bridge
 can establish identity encoding if it can read an exposure list that includes

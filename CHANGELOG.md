@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Carry strong ETag and expected size evidence across repeated streamed GGUF interruptions. Restart overlong interrupted ranges, and enforce the declared span and consistent totals when a full GET returns an identity-encoded byte range starting at zero.
+
 - Report the tensor name, declared byte size, and accumulated bytes when wasm32 GGUF tensor preflight rejects a model.
 
 - Recognized Safari 27 and newer lift the default one-layer GPU cap. In a macOS Safari 27 worker test, Qwen3.5-0.8B went from 17 to 31 tokens per second with 99 layers requested. Older and unidentified Safari versions keep the one-layer cap. `safariMaxGpuLayers` overrides either default.
