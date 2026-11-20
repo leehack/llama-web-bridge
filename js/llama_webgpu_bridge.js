@@ -1144,7 +1144,10 @@ function strongEtagOf(value) {
 }
 function contentEncodingOf(response) {
   const encoding = response.headers.get("content-encoding");
-  if (encoding !== null) return encoding.toLowerCase();
+  if (encoding !== null) {
+    const codings = encoding.split(",").map((coding) => coding.replace(/^[ \t]+|[ \t]+$/g, "").toLowerCase()).filter(Boolean);
+    return codings.join(",") || "identity";
+  }
   if (response.type === "basic") return "identity";
   if (response.type === "cors") {
     const exposed = response.headers.get("access-control-expose-headers")?.toLowerCase().split(",");
@@ -6218,7 +6221,7 @@ var BridgeWorkerProxy = class {
       this._pending.delete(id);
       if (type === "error") {
         const errorMessage = String(message.message || "Worker request failed");
-        const workerError = message.embeddingErrorCode ? new EmbeddingError(message.embeddingErrorCode, errorMessage) : this._config.jsBackedModelStaging === true && isModelStagingErrorCode(message.modelStagingErrorCode) ? new ModelStagingError(message.modelStagingErrorCode, errorMessage) : message.errorCode === CROSS_ORIGIN_ISOLATION_REQUIRED ? new CrossOriginIsolationError(errorMessage) : message.errorCode === SINGLE_THREAD_CORE_UNSUPPORTED ? new SingleThreadCoreError(errorMessage) : new Error(errorMessage);
+        const workerError = message.embeddingErrorCode ? new EmbeddingError(message.embeddingErrorCode, errorMessage) : this._config.jsBackedModelStaging === true && isModelStagingErrorCode(message.modelStagingErrorCode) ? new ModelStagingError(message.modelStagingErrorCode, errorMessage) : message.errorCode === CROSS_ORIGIN_ISOLATION_REQUIRED ? new CrossOriginIsolationError(errorMessage) : message.errorCode === SINGLE_THREAD_CORE_UNSUPPORTED ? new SingleThreadCoreError(errorMessage) : message.errorCode === "MODEL_TRANSFER_LENGTH_ERROR" ? createModelTransferLengthError(errorMessage) : new Error(errorMessage);
         if (isDecisionErrorCode(message.decisionErrorCode)) {
           withDecisionErrorCode(workerError, message.decisionErrorCode);
         }
@@ -9160,6 +9163,7 @@ function installBridgeWorkerHost() {
       message: serializeWorkerError(error),
       ...error instanceof EmbeddingError ? { embeddingErrorCode: error.code } : {},
       ...error instanceof CrossOriginIsolationError || error instanceof SingleThreadCoreError ? { errorCode: error.code } : {},
+      ...error instanceof Error && error.name === "ModelTransferLengthError" ? { errorCode: "MODEL_TRANSFER_LENGTH_ERROR" } : {},
       ...error instanceof ModelStagingError ? { modelStagingErrorCode: error.code } : {},
       ...decisionErrorCode ? { decisionErrorCode } : {},
       state

@@ -630,11 +630,12 @@ assertRejected(validatePublicationPatContract('jobs: [unterminated', EXPECTED_ST
     [CANDIDATE_PATH, '        run: node scripts/smoke/state_persistence.mjs --threading single --memory-mode wasm64\n',
       '        continue-on-error: true\n        run: node scripts/smoke/state_persistence.mjs --threading single --memory-mode wasm64\n',
       'must build the memory64 and single-thread cores'],
-    [CI_PATH, '        run: node scripts/smoke/resume_integrity.mjs\n', '        run: true\n',
-      'job build-webgpu-bridge must run "node scripts/smoke/resume_integrity.mjs" unconditionally without continue-on-error'],
-    [CI_PATH, '        run: node scripts/smoke/resume_integrity.mjs --threading single\n',
-      '        if: false\n        run: node scripts/smoke/resume_integrity.mjs --threading single\n',
-      'job build-webgpu-bridge must run "node scripts/smoke/resume_integrity.mjs --threading single" unconditionally without continue-on-error'],
+    ...['', ' --threading single', ' --js-backed-model-staging', ' --threading single --js-backed-model-staging']
+      .map((flags) => {
+        const command = `node scripts/smoke/resume_integrity.mjs --baseline-dist-dir "$BRIDGE_DIST_DIR"${flags}`;
+        return [CI_PATH, `        run: ${command}\n`, `        if: false\n        run: ${command}\n`,
+          `job build-webgpu-bridge must run "${command}" unconditionally without continue-on-error`];
+      }),
     [PUBLISH_PATH, '          set -euo pipefail\n          node publication-policy/scripts/release/qualification.mjs verify-attestation',
       '          set -euo pipefail\n          # WEBGPU_BRIDGE_BUILD_SINGLE_THREAD\n          node publication-policy/scripts/release/qualification.mjs verify-attestation',
       'never rebuild the candidate or run a validator from the historical build source'],
