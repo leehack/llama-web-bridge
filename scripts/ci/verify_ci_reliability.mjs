@@ -992,8 +992,10 @@ function checkCiRunsContracts({ ci, candidate, publish }, testFiles, errors) {
   for (const command of [
     'node scripts/smoke/state_persistence.mjs --threading single',
     'node scripts/smoke/state_persistence.mjs --threading single --memory-mode wasm64',
-    'node scripts/smoke/resume_integrity.mjs',
-    'node scripts/smoke/resume_integrity.mjs --threading single',
+    'node scripts/smoke/resume_integrity.mjs --baseline-dist-dir "$BRIDGE_DIST_DIR"',
+    'node scripts/smoke/resume_integrity.mjs --baseline-dist-dir "$BRIDGE_DIST_DIR" --threading single',
+    'node scripts/smoke/resume_integrity.mjs --baseline-dist-dir "$BRIDGE_DIST_DIR" --js-backed-model-staging',
+    'node scripts/smoke/resume_integrity.mjs --baseline-dist-dir "$BRIDGE_DIST_DIR" --threading single --js-backed-model-staging',
   ]) {
     check.require(
       ciBuildSteps.some((step) => step.run.trim() === command

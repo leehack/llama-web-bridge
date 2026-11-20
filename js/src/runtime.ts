@@ -125,6 +125,11 @@ type ModelCacheStoreOutcome = 'stored' | 'store_failed';
 const pendingModelCacheStores = new WeakMap<Response, Promise<ModelCacheStoreOutcome>>();
 
 const SAFARI_EMBEDDING_PROBE_MAX_COSINE = 0.999;
+const SAFARI_EMBEDDING_PROBE_MIN_COMPONENT = 0.001;
+
+type SafariGpuProbeResult = 'passed' | 'failed' | 'skipped';
+
+class EmbeddingInputTooLongError extends Error {}
 
 // Fetch and cache knobs read from a load, prefetch or request options bag.
 // Callers may pass anything, so each value is coerced where it is read.
@@ -198,6 +203,11 @@ interface RemoteFetchProbe {
 }
 
 const textEncoder = new TextEncoder();
+// A core can outlive a bridge and retain its staging mounts.
+const jsStagingMountCounters = new WeakMap<LlamaCoreModule, number>();
+const MAX_JS_STAGING_PATH_PROBES = 64;
+const WASMFS_EEXIST = 20;
+const WASMFS_ENOENT = 44;
 
 export class LlamaWebGpuBridgeRuntime {
   declare _config: LlamaWebGpuBridgeConfig;
@@ -210,7 +220,6 @@ export class LlamaWebGpuBridgeRuntime {
   declare _ownedModelMount: { mountPath: string; mountId: number } | null;
   declare _modelFilesUseJsStaging: boolean;
   declare _jsBackedStagingMounted: boolean;
-  declare _jsStagingMountCounter: number;
   declare _activeJsStagingMounts: Map<string, number>;
   declare _failedUnmountJsStagingMounts: Map<string, number>;
   declare _modelBytes: number;
@@ -257,6 +266,7 @@ export class LlamaWebGpuBridgeRuntime {
   declare _coreVariant: string;
   declare _coreRetired: boolean;
   declare _onCoreRetired: ((runtime: LlamaWebGpuBridgeRuntime, cause: unknown) => void) | null;
+  declare _memory64FallbackReason: string | null;
   declare _preferMemory64: boolean;
   declare _modelSource: string;
   declare _modelCacheState: string;
@@ -288,7 +298,6 @@ export class LlamaWebGpuBridgeRuntime {
     this._ownedModelMount = null;
     this._modelFilesUseJsStaging = false;
     this._jsBackedStagingMounted = false;
-    this._jsStagingMountCounter = 0;
     this._activeJsStagingMounts = new Map();
     this._failedUnmountJsStagingMounts = new Map();
     this._modelBytes = 0;
@@ -353,6 +362,7 @@ export class LlamaWebGpuBridgeRuntime {
     this._coreVariant = 'uninitialized';
     this._coreRetired = false;
     this._onCoreRetired = null;
+    this._memory64FallbackReason = null;
     this._preferMemory64 = this._config.preferMemory64 !== false;
     this._modelSource = 'network';
     this._modelCacheState = 'disabled';
@@ -1440,21 +1450,7 @@ export class LlamaWebGpuBridgeRuntime {
         `JS-backed model staging requires native ABI version >= 3 (got ${apiVersion}). Update the core build or disable jsBackedModelStaging.`,
       );
     }
-    this._jsStagingMountCounter += 1;
-    const mountPath = `/jsmodels-${this._jsStagingMountCounter}`;
-    const mountRc = Number(
-      core.ccall('llamadart_webgpu_mount_js_model_fs', 'number', ['string'], [mountPath]),
-    );
-    if (mountRc !== 0) {
-      this._pushRuntimeNote('model_staging_mount_failed');
-      const detail = mountRc === -20 || mountRc === -17
-        ? `the ${mountPath} path already exists under another filesystem backend`
-        : `rc=${mountRc}`;
-      throw new ModelStagingError(
-        'MODEL_STAGING_MOUNT_FAILED',
-        `Failed to mount JS-backed model filesystem at ${mountPath} (${detail}).`,
-      );
-    }
+    const mountPath = this._mountAtFreeJsStagingPath(core);
     const mountId = Number(
       core.ccall('llamadart_webgpu_js_model_fs_mount_id', 'number', ['string'], [mountPath]),
     );
@@ -1474,6 +1470,46 @@ export class LlamaWebGpuBridgeRuntime {
     this._jsBackedStagingMounted = true;
     this._pushRuntimeNote(noteTag);
     return mountPath;
+  }
+
+  _mountAtFreeJsStagingPath(core: LlamaCoreModule): string {
+    const previousMountNumber = jsStagingMountCounters.get(core) ?? 0;
+    for (let offset = 1; offset <= MAX_JS_STAGING_PATH_PROBES; offset += 1) {
+      const mountNumber = previousMountNumber + offset;
+      const mountPath = `/jsmodels-${mountNumber}`;
+      try {
+        core.FS.lstat(mountPath);
+        continue;
+      } catch (error) {
+        if (!(error && typeof error === 'object' && 'errno' in error && error.errno === WASMFS_ENOENT)) {
+          this._pushRuntimeNote('model_staging_mount_failed');
+          throw new ModelStagingError(
+            'MODEL_STAGING_MOUNT_FAILED',
+            `Failed to inspect JS-backed model staging path ${mountPath} (${String(error)}).`,
+          );
+        }
+      }
+      jsStagingMountCounters.set(core, mountNumber);
+      const mountRc = Number(
+        core.ccall('llamadart_webgpu_mount_js_model_fs', 'number', ['string'], [mountPath]),
+      );
+      if (mountRc === 0) return mountPath;
+      // The native registry can retain a mount after its path disappears.
+      if (mountRc === -WASMFS_EEXIST) continue;
+      this._pushRuntimeNote('model_staging_mount_failed');
+      const detail = mountRc === -17
+        ? `the ${mountPath} path already exists under another filesystem backend`
+        : `rc=${mountRc}`;
+      throw new ModelStagingError(
+        'MODEL_STAGING_MOUNT_FAILED',
+        `Failed to mount JS-backed model filesystem at ${mountPath} (${detail}).`,
+      );
+    }
+    this._pushRuntimeNote('model_staging_mount_failed');
+    throw new ModelStagingError(
+      'MODEL_STAGING_MOUNT_FAILED',
+      `No free JS-backed model staging path among the next ${MAX_JS_STAGING_PATH_PROBES} candidates.`,
+    );
   }
 
   _isJsStagingMountOwned(
@@ -2182,6 +2218,7 @@ export class LlamaWebGpuBridgeRuntime {
     }
 
     let lastError = null;
+    let memory64FallbackReason: string | null = null;
     for (const candidate of candidates) {
       if (candidate.variant === 'wasm64') {
         this._runtimeNotes.push('core_mem64_attempt');
@@ -2286,6 +2323,7 @@ export class LlamaWebGpuBridgeRuntime {
         this._core = candidateCore;
 
         this._coreVariant = candidate.variant === 'wasm64' ? 'wasm64' : 'wasm32';
+        this._memory64FallbackReason = memory64FallbackReason;
         if (candidate.variant === 'wasm64') {
           this._runtimeNotes.push('core_mem64_active');
         } else if (candidate.variant === 'wasm32') {
@@ -2299,6 +2337,7 @@ export class LlamaWebGpuBridgeRuntime {
           const reason = initTimeoutError && error === initTimeoutError
             ? 'timeout'
             : factoryLoaded && isMemory64Unsupported() ? 'unsupported' : 'init_error';
+          memory64FallbackReason = reason;
           this._runtimeNotes.push('core_mem64_unavailable');
           this._runtimeNotes.push(`core_mem64_unavailable:${reason}`);
           this._emitLogger('warn', `Memory64 core unavailable (${reason}). Trying the wasm32 core.`);
@@ -2353,7 +2392,9 @@ export class LlamaWebGpuBridgeRuntime {
     const abortMessage = 'Model load was cancelled.';
     throwIfAborted(operationSignal, abortMessage);
     this._abortRequested = false;
-    this._runtimeNotes = [];
+    this._runtimeNotes = this._core && this._memory64FallbackReason
+      ? ['core_mem64_unavailable', `core_mem64_unavailable:${this._memory64FallbackReason}`]
+      : [];
     this._suppressedWarmupWarningCount = 0;
     this._didReportWarmupWarningSuppression = false;
     await this._probeBackends();
@@ -2964,7 +3005,7 @@ export class LlamaWebGpuBridgeRuntime {
         this._runtimeNotes.push('safari_gpu_probe_embedding');
       }
 
-      const runProbe = async (seedOffset: number) => {
+      const runProbe = async (seedOffset: number): Promise<SafariGpuProbeResult> => {
         try {
           if (probesEmbedding) {
             return await this._probeSafariEmbeddings();
@@ -2978,15 +3019,16 @@ export class LlamaWebGpuBridgeRuntime {
               penalty: 1,
               seed: index + seedOffset,
             });
-            if (looksLikeCorruptedGeneration(probeOutput)) return false;
+            if (looksLikeCorruptedGeneration(probeOutput)) return 'failed';
           }
-          return true;
+          return 'passed';
         } catch (_) {
-          return false;
+          return 'failed';
         }
       };
 
-      if (!(await runProbe(1))) {
+      const probeResult = await runProbe(1);
+      if (probeResult === 'failed') {
         this._runtimeNotes.push('safari_gpu_probe_failed');
 
         const retryCandidates = [];
@@ -3082,7 +3124,7 @@ export class LlamaWebGpuBridgeRuntime {
             break;
           }
 
-          if (await runProbe(11)) {
+          if (await runProbe(11) !== 'failed') {
             this._runtimeNotes.push(`safari_gpu_layers_capped:${candidateLayers}`);
             stabilized = true;
             break;
@@ -3092,7 +3134,7 @@ export class LlamaWebGpuBridgeRuntime {
         if (!stabilized) {
           throw new Error('Safari GPU probe failed and fallback attempts were unsuccessful.');
         }
-      } else {
+      } else if (probeResult === 'passed') {
         this._runtimeNotes.push('safari_gpu_probe_passed');
       }
     }
@@ -5043,23 +5085,46 @@ export class LlamaWebGpuBridgeRuntime {
     }
   }
 
-  async _probeSafariEmbeddings(): Promise<boolean> {
-    // A constant GPU output can have unit norm after native normalization.
-    const options = { normalize: true };
-    const first = await this._readTextEmbedding('The Eiffel Tower is in Paris.', options);
-    const second = await this._readTextEmbedding('WebGPU runs matrix math on the GPU.', options);
-    const finite = (vector: unknown[]): vector is number[] => vector.every(Number.isFinite);
-    if (first.length !== second.length || !finite(first) || !finite(second)) return false;
+  async _probeSafariEmbeddings(): Promise<SafariGpuProbeResult> {
+    const readProbeVector = async (prompt: string) => {
+      const { dimension, values } = await this._readTextEmbedding(prompt, { normalize: true }, true);
+      if (values.length !== dimension || !values.every((value): value is number => Number.isFinite(value))) {
+        return null;
+      }
 
-    const firstNorm = Math.hypot(...first);
-    const secondNorm = Math.hypot(...second);
-    if (Math.abs(firstNorm - 1) >= 0.01 || Math.abs(secondNorm - 1) >= 0.01) return false;
+      // Native normalization can give a collapsed vector unit norm.
+      const significantComponents = values.filter((value) => Math.abs(value) >= SAFARI_EMBEDDING_PROBE_MIN_COMPONENT);
+      const norm = Math.hypot(...values);
+      return significantComponents.length >= 2 && Math.abs(norm - 1) < 0.01 ? { values, norm } : null;
+    };
 
-    const dot = first.reduce((sum, value, index) => sum + value * second[index], 0);
-    return dot / (firstNorm * secondNorm) < SAFARI_EMBEDDING_PROBE_MAX_COSINE;
+    // The native overflow check uses the effective microbatch after context setup.
+    const promptPairs = [
+      ['The Eiffel Tower is in Paris.', 'WebGPU runs matrix math on the GPU.'],
+      ['cat', 'dog'],
+    ];
+    for (const [firstPrompt, secondPrompt] of promptPairs) {
+      try {
+        const first = await readProbeVector(firstPrompt);
+        if (!first) return 'failed';
+        const second = await readProbeVector(secondPrompt);
+        if (!second || first.values.length !== second.values.length) return 'failed';
+
+        const dot = first.values.reduce((sum, value, index) => sum + value * second.values[index], 0);
+        return dot / (first.norm * second.norm) < SAFARI_EMBEDDING_PROBE_MAX_COSINE ? 'passed' : 'failed';
+      } catch (error) {
+        if (!(error instanceof EmbeddingInputTooLongError)) throw error;
+      }
+    }
+    this._runtimeNotes.push('safari_gpu_probe_skipped_input_too_long');
+    return 'skipped';
   }
 
-  async _readTextEmbedding(text: string, options: EmbedOptions): Promise<unknown[]> {
+  async _readTextEmbedding(
+    text: string,
+    options: EmbedOptions,
+    classifyOverflow = false,
+  ): Promise<{ dimension: number; values: unknown[] }> {
     if (this._modelBytes <= 0) {
       throw new Error('No model loaded. Call loadModelFromUrl first.');
     }
@@ -5077,12 +5142,14 @@ export class LlamaWebGpuBridgeRuntime {
     );
 
     if (rc < 0) {
-      throw new Error(this._coreErrorMessage('Embedding generation failed', rc));
+      const message = this._coreErrorMessage('Embedding generation failed', rc);
+      if (classifyOverflow && rc === -12) throw new EmbeddingInputTooLongError(message);
+      throw new Error(message);
     }
 
     const raw = this._core!.ccall('llamadart_webgpu_last_embedding_json', 'string', [], []) || '[]';
     const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? parsed : [];
+    return { dimension: rc, values: Array.isArray(parsed) ? parsed : [] };
   }
 
   async embed(text: EmbedInput, options: EmbedOptions = {}) {
@@ -5093,7 +5160,7 @@ export class LlamaWebGpuBridgeRuntime {
       if (this._abortRequested) throw createAbortError('Embedding was cancelled.');
       return this._embedParts(parts, options);
     }
-    const values = await this._readTextEmbedding(text, options);
+    const { values } = await this._readTextEmbedding(text, options);
     return values.map((value) => {
       const numeric = Number(value);
       return Number.isFinite(numeric) ? numeric : 0;

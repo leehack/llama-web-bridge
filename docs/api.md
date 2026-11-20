@@ -179,7 +179,7 @@ it.
 | `coreModuleUrlMem64` | `string` | URL for the optional wasm64 Emscripten JS loader. |
 | `wasmUrl` | `string` | URL for the wasm32 `llama_webgpu_core.wasm` binary. |
 | `wasmUrlMem64` | `string` | URL for the optional wasm64 wasm binary. |
-| `coreModuleFactory` | `LlamaCoreModuleFactory \| Promise<LlamaCoreModuleFactory>` | Preloaded Emscripten factory. Supplying this disables worker mode because factories cannot be transferred to the worker. It also skips the cross-origin isolation check, so a custom pthread core on a page that is not isolated still waits for `coreInitTimeoutMs`. See [the custom core contract](#custom-core-factory). |
+| `coreModuleFactory` | `LlamaCoreModuleFactory \| Promise<LlamaCoreModuleFactory>` | Preloaded Emscripten factory. Supplying this disables worker mode because factories cannot be transferred to the worker. It also skips the cross-origin isolation check, so a custom pthread core on a page that is not isolated still waits for `coreInitTimeoutMs`. See [the custom core contract](#custom-core-factory). A core instance holds one loaded model. Bridges that share the same core instance must not hold models at the same time. A load on either bridge releases the model in that core. Return a separate core instance for each bridge that needs an independent model. |
 | `workerUrl` | `string` | URL for `llama_webgpu_bridge_worker.js`. Defaults to a sibling of the bridge module when possible. |
 | `disableWorker` | `boolean` | Force direct runtime mode. |
 | `allowSingleThreadCore` | `boolean` | Set to `true` with explicit `_st` core URLs to load on pages without cross-origin isolation. Single-thread cores use one CPU thread and report `core_single_thread`. |
@@ -337,11 +337,15 @@ The default Safari cap uses the major version from a standalone numeric
 `Version/` product in the Apple Safari user agent. Safari-like user agents
 that match the legacy detector continue to use its one-layer default cap and
 completion probe. For a pooled-embedding model on recognized Apple Safari,
-the probe runs two distinct prompts and requires finite normalized embeddings
-whose L2 norms differ from 1 by less than 0.01 and whose cosine similarity is
-below 0.999. Text models and older cores without embedding capabilities use
-the completion probe. If the probe fails, the bridge retries at one GPU layer
-when possible, then on the CPU.
+the probe runs two distinct prompts. If a prompt exceeds the effective
+microbatch, the bridge tries a shorter pair. If that pair still exceeds the
+microbatch, the bridge keeps the current GPU layers and records
+`safari_gpu_probe_skipped_input_too_long`. Each embedding must match the native
+output dimension, contain only finite values and have at least two components
+with magnitude 0.001 or higher. Each L2 norm must differ from 1 by less than
+0.01, and the cosine similarity must be below 0.999. Text models and older
+cores without embedding capabilities use the completion probe. If the probe
+fails, the bridge retries at one GPU layer when possible, then on the CPU.
 
 Returns the underlying load result from the active runtime. After a successful
 load, metadata and capability helpers reflect the loaded model.
@@ -1234,7 +1238,7 @@ include:
 | `llamadart.webgpu.core_variant` | `wasm32`, `wasm64`, or initialization state. |
 | `llamadart.webgpu.model_source` | Model load source, such as network/cache/remote fetch. |
 | `llamadart.webgpu.model_cache_state` | Cache Storage state for the loaded model. |
-| `llamadart.webgpu.runtime_notes` | Semicolon-separated bridge notes. When a memory64 core attempt fails, `core_mem64_unavailable:<reason>` accompanies `core_mem64_unavailable` and the bridge logs a warning with the same code before trying wasm32. The codes are `unsupported` (the engine rejects a memory64 feature probe after the core factory fails), `timeout` (the bridge's core initialization timer expires), and `init_error` (other failures, including module import). Single-thread cores report `core_single_thread` and `core_pthreads:0`. Automatic fetch-backed loading on a single-thread worker reports `model_fetch_backend_requires_pthreads` and streams into staging. `model_staging_js_backed` identifies JS-backed staging. Model downloads report `model_stream_resume_validated` for verified resumes, `model_stream_resume_unvalidated` for resumes without sufficient validation, and `model_stream_restart:<reason>` when a response requires restarting at zero. `gpu_unavailable:<reason>` (`no_webgpu`, `no_adapter`, `adapter_missing_shader_f16`, `unknown`) says why a load with `nGpuLayers > 0` runs on the CPU. The bridge also logs one warning. Chrome hides `shader-f16` on NVIDIA drivers older than 615.71, and ggml-webgpu then registers no device. Safari reports `safari_gpu_layers_capped:<n>` when the cap lowers the requested count, `safari_gpu_probe_embedding` when probing with embeddings, `safari_gpu_probe_passed` or `safari_gpu_probe_failed` for the initial probe, and `safari_fallback_cpu` when a retry loads on the CPU. |
+| `llamadart.webgpu.runtime_notes` | Semicolon-separated bridge notes. When a memory64 core attempt fails, `core_mem64_unavailable:<reason>` accompanies `core_mem64_unavailable` and the bridge logs a warning with the same code before trying wasm32. The codes are `unsupported` (the engine rejects a memory64 feature probe after the core factory fails), `timeout` (the bridge's core initialization timer expires), and `init_error` (other failures, including module import). Single-thread cores report `core_single_thread` and `core_pthreads:0`. Automatic fetch-backed loading on a single-thread worker reports `model_fetch_backend_requires_pthreads` and streams into staging. `model_staging_js_backed` identifies JS-backed staging. Model downloads report `model_stream_resume_validated` for verified resumes, `model_stream_resume_unvalidated` for resumes without sufficient validation, and `model_stream_restart:<reason>` when a response requires restarting at zero. `gpu_unavailable:<reason>` (`no_webgpu`, `no_adapter`, `adapter_missing_shader_f16`, `unknown`) says why a load with `nGpuLayers > 0` runs on the CPU. The bridge also logs one warning. Chrome hides `shader-f16` on NVIDIA drivers older than 615.71, and ggml-webgpu then registers no device. Safari reports `safari_gpu_layers_capped:<n>` when the cap lowers the requested count, `safari_gpu_probe_embedding` when probing with embeddings, `safari_gpu_probe_passed` or `safari_gpu_probe_failed` for the initial probe, `safari_gpu_probe_skipped_input_too_long` when both embedding prompt pairs exceed the effective microbatch, and `safari_fallback_cpu` when a retry loads on the CPU. |
 | `llamadart.webgpu.mmproj_loaded` | `1` when a projector is loaded. |
 | `llamadart.webgpu.supports_vision` | `1` when the active projector supports vision. |
 | `llamadart.webgpu.supports_audio` | `1` when the active projector supports audio. |
@@ -1343,8 +1347,15 @@ this function themselves.
   serving without cross-origin isolation using `WEBGPU_BRIDGE_PTHREADS=0` +
   `allowSingleThreadCore: true`). It streams fetched model and multimodal
   projector GGUFs directly into 64 MiB JS `Uint8Array` chunks under a private
-  per-operation `/jsmodels-<n>` mount without copying through WASMFS, and
-  unmounts/releases only that mount's chunks after load completes or fails. Known limitation: native memory grows by a few bytes per staging mount for the core's lifetime because Emscripten's WasmFS backend table retains created backends. Its
+  per-operation `/jsmodels-<n>` mount without copying through WASMFS. The path is
+  unique per core instance, including across bridges that share one through
+  `coreModuleFactory` from the same bridge bundle. Later loads use a fresh path
+  even when a mount or its native registration remains after cleanup. The
+  allocator checks individual paths and skips existing entries and native mount
+  collisions. It reports `MODEL_STAGING_MOUNT_FAILED` if all 64 candidates are
+  blocked. Each bridge cleans up its own mounts.
+  Native memory grows by a few bytes per staging mount for the core's lifetime
+  because Emscripten's WasmFS backend table retains created backends. Its
   cost is slightly slower native chunk reads on small loads (`Qwen3-0.6B-Q8_0`
   3-run median `nativeLoadMs` `480.9 ms` vs `444.6 ms` off; total load
   `1,317.7 ms` vs `1,660.5 ms` as direct staging skips wasm memory growth) and

@@ -29,7 +29,7 @@ export interface WorkerResponse {
   embeddingErrorCode?: EmbeddingErrorCode;
   decisionErrorCode?: DecisionErrorCode;
   modelStagingErrorCode?: ModelStagingErrorCode;
-  errorCode?: 'CROSS_ORIGIN_ISOLATION_REQUIRED' | 'SINGLE_THREAD_CORE_UNSUPPORTED'
+  errorCode?: 'CROSS_ORIGIN_ISOLATION_REQUIRED' | 'SINGLE_THREAD_CORE_UNSUPPORTED' | 'MODEL_TRANSFER_LENGTH_ERROR'
     | 'MODEL_UNLOADED_AFTER_CORE_ABORT';
   event?: string;
   payload?: unknown;
