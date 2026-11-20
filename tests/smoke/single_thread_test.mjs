@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import vm from 'node:vm';
 
-import { parseArgs, renderHarness } from '../../scripts/smoke/single_thread.mjs';
+import { parseArgs, parseGpuOffload, renderHarness, verifyGpuOffload } from '../../scripts/smoke/single_thread.mjs';
 import { webGpuLaunchArgs } from '../../scripts/smoke/support.mjs';
 
 function renderPage(options) {
@@ -11,7 +11,7 @@ function renderPage(options) {
   return script.replace(/^import \* as bridgeModule from .*;$/m, '');
 }
 
-async function runPage(options, { fallBackDuringGeneration = false, ...overrides } = {}) {
+async function runPage(options, { fallBackDuringGeneration = false, gpuOffload = { offloadedLayers: 29, modelLayers: 29 }, ...overrides } = {}) {
   const calls = [];
   class SingleThreadCoreError extends Error {
     code = 'SINGLE_THREAD_CORE_UNSUPPORTED';
@@ -49,7 +49,9 @@ async function runPage(options, { fallBackDuringGeneration = false, ...overrides
     async dispose() {}
   }
   class BroadcastChannel {
-    postMessage() { this.onmessage({ data: 100 }); }
+    postMessage(request) {
+      this.onmessage({ data: request === 'gpu offload' ? gpuOffload : 100 });
+    }
     close() {}
   }
   class Worker {
@@ -81,6 +83,7 @@ test('single-thread acceptance exercises worker fallback and reports wasm64 peak
   const { result, calls } = await runPage(options);
   assert.equal(result.ok, true, result.error);
   assert.equal(result.gpuActive, true);
+  assert.deepEqual(result.gpuOffload, { offloadedLayers: 29, modelLayers: 29 });
   assert.equal(result.stagedBytes, 42);
   assert.equal(result.peakWasmHeapBytes, 100);
   assert.equal(result.nativeFetchGuard.rc, -7);
@@ -101,6 +104,29 @@ test('single-thread acceptance rejects isolation and a visible SharedArrayBuffer
   const shared = await runPage(options, { SharedArrayBuffer });
   assert.equal(shared.result.ok, false);
   assert.match(shared.result.error, /must not expose SharedArrayBuffer/);
+});
+
+test('single-thread acceptance rejects zero offloaded layers while WebGPU stays active', async () => {
+  const options = { memoryMode: 'wasm32', runtimeMode: 'direct', gpuLayers: 999, jsBackedModelStaging: false };
+  const { result } = await runPage(options, { gpuOffload: parseGpuOffload('load_tensors: offloaded 0/29 layers to GPU') });
+  assert.equal(result.ok, false);
+  assert.equal(result.stage, 'checking GPU offload');
+  assert.match(result.error, /offloaded 0\/29 layers to GPU, expected at least 29/);
+});
+
+test('GPU offload requires a native count that meets the request capped at model layers', () => {
+  const nativeLog = (count) => parseGpuOffload(`load_tensors: offloaded ${count} layers to GPU\n`);
+  assert.deepEqual(nativeLog('0/29'), { offloadedLayers: 0, modelLayers: 29 });
+  assert.throws(() => verifyGpuOffload(999, nativeLog('0/29')), /expected at least 29/);
+  assert.throws(() => verifyGpuOffload(999, nativeLog('28/29')), /expected at least 29/);
+  assert.throws(() => verifyGpuOffload(4, nativeLog('3/29')), /expected at least 4/);
+  verifyGpuOffload(999, nativeLog('29/29'));
+  verifyGpuOffload(4, nativeLog('4/29'));
+  assert.equal(nativeLog('30/29'), null);
+  const missing = parseGpuOffload('load_tensors: offloading 28 repeating layers to GPU');
+  assert.equal(missing, null);
+  assert.throws(() => verifyGpuOffload(999, missing), /missing native GPU layer offload count/);
+  verifyGpuOffload(0, missing);
 });
 
 test('single-thread acceptance fails if generation switches from WebGPU to CPU', async () => {

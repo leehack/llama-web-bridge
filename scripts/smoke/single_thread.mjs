@@ -23,7 +23,7 @@ import {
 } from './support.mjs';
 
 const ARTIFACT_PREFIX = 'single-thread-smoke';
-const HEAP_CHANNEL = 'single-thread-smoke-heap';
+const CORE_PROBE_CHANNEL = 'single-thread-smoke-core';
 const MODEL_FILENAME = 'single-thread-model.gguf';
 
 export function parseArgs(argv) {
@@ -46,12 +46,32 @@ export function parseArgs(argv) {
   });
 }
 
-// WebAssembly linear memory cannot shrink, so its size after inference is its peak.
-function renderHeapProbe(coreName) {
+export function parseGpuOffload(line) {
+  const match = /^(?:load_tensors: )?offloaded (\d+)\/(\d+) layers to GPU$/.exec(String(line).trim());
+  if (!match) return null;
+  const offloadedLayers = Number(match[1]);
+  const modelLayers = Number(match[2]);
+  if (!Number.isSafeInteger(modelLayers) || modelLayers === 0 || offloadedLayers > modelLayers) return null;
+  return { offloadedLayers, modelLayers };
+}
+
+export function verifyGpuOffload(requestedLayers, gpuOffload) {
+  if (requestedLayers <= 0) return;
+  if (!gpuOffload) throw new Error('missing native GPU layer offload count');
+  const { offloadedLayers, modelLayers } = gpuOffload;
+  const expectedLayers = Math.min(requestedLayers, modelLayers);
+  if (offloadedLayers < expectedLayers) {
+    throw new Error(`offloaded ${offloadedLayers}/${modelLayers} layers to GPU, expected at least ${expectedLayers}`);
+  }
+}
+
+function renderCoreProbe(coreName) {
   return `
 import createCore from '/${coreName}.js';
+const parseGpuOffload = ${parseGpuOffload.toString()};
 export default async (options) => {
   let memory;
+  let gpuOffload = null;
   const { instantiate, instantiateStreaming } = WebAssembly;
   const captureMemory = (load) => async (...args) => {
     const result = await load(...args);
@@ -64,15 +84,23 @@ export default async (options) => {
   try {
     WebAssembly.instantiate = captureMemory(instantiate);
     WebAssembly.instantiateStreaming = captureMemory(instantiateStreaming);
-    core = await createCore(options);
+    core = await createCore({
+      ...options,
+      printErr: (line) => {
+        gpuOffload = parseGpuOffload(line) ?? gpuOffload;
+        options.printErr(line);
+      },
+    });
   } finally {
     WebAssembly.instantiate = instantiate;
     WebAssembly.instantiateStreaming = instantiateStreaming;
   }
   if (!memory) throw new Error('single-thread core did not export its wasm memory');
 
-  const channel = new BroadcastChannel(${JSON.stringify(HEAP_CHANNEL)});
-  channel.onmessage = () => channel.postMessage(memory.buffer.byteLength);
+  const channel = new BroadcastChannel(${JSON.stringify(CORE_PROBE_CHANNEL)});
+  channel.onmessage = ({ data }) => {
+    channel.postMessage(data === 'gpu offload' ? gpuOffload : memory.buffer.byteLength);
+  };
   return core;
 };
 `;
@@ -124,6 +152,18 @@ import * as bridgeModule from '/llama_webgpu_bridge.js';
 
 const assert = (condition, message) => {
   if (!condition) throw new Error(message);
+};
+const verifyGpuOffload = ${verifyGpuOffload.toString()};
+const readCoreProbe = async (request) => {
+  const channel = new BroadcastChannel(${JSON.stringify(CORE_PROBE_CHANNEL)});
+  try {
+    return await new Promise((resolve) => {
+      channel.onmessage = ({ data }) => resolve(data);
+      channel.postMessage(request);
+    });
+  } finally {
+    channel.close();
+  }
 };
 const options = { nCtx: 2048, nThreads: 4, nGpuLayers: ${gpuLayers}, useCache: false };
 const modelUrl = '/${MODEL_FILENAME}';
@@ -181,6 +221,9 @@ try {
     return { metadata, notes, gpuActive };
   };
   const { metadata, notes: loadNotes } = verifyRuntime('after loading');
+  window.__smokeStage = 'checking GPU offload';
+  const gpuOffload = options.nGpuLayers > 0 ? await readCoreProbe('gpu offload') : null;
+  verifyGpuOffload(options.nGpuLayers, gpuOffload);
   assert(metadata['llamadart.webgpu.n_threads'] === '1', 'expected one CPU thread');
   for (const note of ['core_pthreads:0', 'core_single_thread', 'threads_capped_no_coi']) {
     assert(loadNotes.includes(note), 'missing runtime note ' + note);
@@ -201,12 +244,8 @@ try {
   });
   assert(usage?.completionTokens > 0, 'model did not generate');
   const { notes, gpuActive } = verifyRuntime('after generation');
-  const channel = new BroadcastChannel(${JSON.stringify(HEAP_CHANNEL)});
-  const peakWasmHeapBytes = await new Promise((resolve) => {
-    channel.onmessage = (event) => resolve(event.data);
-    channel.postMessage('peak heap');
-  });
-  channel.close();
+  // WebAssembly linear memory cannot shrink, so its size after inference is its peak.
+  const peakWasmHeapBytes = await readCoreProbe('peak heap');
   assert(Number.isSafeInteger(peakWasmHeapBytes) && peakWasmHeapBytes > 0, 'missing wasm heap measurement');
 
   window.__smokeResult = {
@@ -217,6 +256,7 @@ try {
     jsBackedModelStaging: ${jsBackedModelStaging},
     gpuLayers: options.nGpuLayers,
     gpuActive,
+    gpuOffload,
     backend: bridge.getBackendName(),
     crossOriginIsolated,
     sharedArrayBuffer: typeof SharedArrayBuffer,
@@ -257,9 +297,9 @@ export async function main(argv = process.argv.slice(2)) {
     await copyBridgeArtifacts(distDir, webRoot);
     await copySingleThreadArtifacts(distDir, webRoot, { memory64 });
     await stageFile(model, path.join(webRoot, MODEL_FILENAME));
-    await fsp.writeFile(path.join(webRoot, 'measure-core_st.js'), renderHeapProbe('llama_webgpu_core_st'));
+    await fsp.writeFile(path.join(webRoot, 'measure-core_st.js'), renderCoreProbe('llama_webgpu_core_st'));
     if (memory64) {
-      await fsp.writeFile(path.join(webRoot, 'measure-core_mem64_st.js'), renderHeapProbe('llama_webgpu_core_mem64_st'));
+      await fsp.writeFile(path.join(webRoot, 'measure-core_mem64_st.js'), renderCoreProbe('llama_webgpu_core_mem64_st'));
     }
     if (args.runtimeMode === 'worker') {
       const coreName = memory64 ? 'llama_webgpu_core_mem64_st' : 'llama_webgpu_core_st';

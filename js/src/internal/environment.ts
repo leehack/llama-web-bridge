@@ -33,6 +33,16 @@ export function canPostSharedMemory(): boolean {
   }
 }
 
+export function isMemory64Unsupported(): boolean {
+  try {
+    // A module with one unshared memory, a 64-bit address type, and zero initial pages.
+    return typeof WebAssembly !== 'undefined'
+      && WebAssembly.validate(Uint8Array.of(0, 97, 115, 109, 1, 0, 0, 0, 5, 3, 1, 4, 0)) === false;
+  } catch (_) {
+    return false;
+  }
+}
+
 export type WebGpuUnavailable = {
   reason: 'no_webgpu' | 'no_adapter' | 'adapter_missing_shader_f16' | 'unknown';
   adapter: string;
