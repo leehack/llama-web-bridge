@@ -242,11 +242,26 @@ For full wasm32 responses with a valid `Content-Length` hint between 1 GiB
 and 2 GiB minus one byte, the writer attempts to reserve filesystem capacity before streaming. It resets
 the logical file length before writing and falls back to incremental writes if
 the reservation fails. A CORS response can hide compression headers, so its
-length is only an allocation hint. Short or excess bodies are rejected only
-when the decoded length is established by same-origin or visible identity
-encoding metadata; invalid partial files are removed. Visibly encoded, resumed and unknown-size
-responses keep incremental writes; this does not establish a universal model-size
-limit or guarantee that native model initialization fits memory.
+length is only an allocation hint when the encoding is unknown. Visibly
+encoded, resumed and unknown-size responses keep incremental writes.
+
+For an interrupted streamed download, the bridge validates an open-ended
+range response using a matching strong ETag, the same final URL, and a
+consistent identity-encoded `Content-Range`. When `Content-Range` is hidden,
+a matching identity-encoded `Content-Length` for a known remainder also
+verifies the range. A changed URL, differing comparable strong ETags, or
+contradictory byte lengths or offsets restart the shard at byte zero.
+Missing or weak ETags and lengths measured with different or unknown
+encodings can leave a resume unvalidated. A same-size revision change can
+go undetected on this path.
+
+The bridge checks the staged byte count against any known decoded size
+before initializing the model, including after a restart. For cross-origin
+downloads, expose `ETag`, `Content-Range`, and any `Content-Encoding` with
+`Access-Control-Expose-Headers`. When `Content-Encoding` is absent, the bridge
+can establish identity encoding if it can read an exposure list that includes
+`Content-Encoding` or `*`. If the encoding is unknown, HTTP length headers
+are hints and the bridge resumes without range validation.
 
 Relative URLs resolve against the page's base URL (`document.baseURI`, so a
 `<base href>` applies) in both runtimes; worker mode resolves them before
@@ -256,7 +271,7 @@ Common `options` keys:
 
 | Option | Description |
 | --- | --- |
-| `progressCallback(progress)` | Receives aggregate `{ loaded, total }` events. Split models may also include shard progress metadata. |
+| `progressCallback(progress)` | Receives aggregate `{ loaded, total }` events. Split models may also include shard progress metadata. `loaded` can decrease when a shard restarts from zero. |
 | `signal` | `AbortSignal` used to cancel model transfer. |
 | `nCtx` | Context size. Defaults to the bridge runtime default, initially 4096. |
 | `nThreads`, `nThreadsBatch` | Per-load thread overrides, capped to the active runtime. |
@@ -265,7 +280,7 @@ Common `options` keys:
 | `safariGpuProbe` | Set to `false` to skip the Safari load-time GPU probe. |
 | `nBatch`, `nUbatch` | Per-load batch and micro-batch overrides. |
 | `useCache`, `force` | Cache Storage controls for model responses. A cache miss writes the model to Cache Storage while it downloads, so progress follows the download; a failed cache write leaves the model loaded but uncached, and a cancelled load stores nothing. |
-| `streamResumeRetries` | Retry count for resumable streamed model loads. |
+| `streamResumeRetries` | Maximum retry count per shard for resuming or restarting a streamed model download. |
 | `remoteFetchThresholdBytes`, `remoteFetchChunkBytes` | Per-load remote-fetch tuning. |
 | `forceRemoteFetchBackend` | Force the native fetch backend for a single-file model in a worker. On a single-thread worker, the load rejects with `SingleThreadCoreError` (`code: 'SINGLE_THREAD_CORE_UNSUPPORTED'`, `feature: 'remote_fetch_backend'`). Page-thread loads use streamed staging. |
 | `loadMtp` | Loads the model's MTP layers, which `draft-mtp` speculative decoding needs. Defaults to `false`. |
@@ -1169,7 +1184,7 @@ include:
 | `llamadart.webgpu.core_variant` | `wasm32`, `wasm64`, or initialization state. |
 | `llamadart.webgpu.model_source` | Model load source, such as network/cache/remote fetch. |
 | `llamadart.webgpu.model_cache_state` | Cache Storage state for the loaded model. |
-| `llamadart.webgpu.runtime_notes` | Semicolon-separated bridge notes. When a memory64 core attempt fails, `core_mem64_unavailable:<reason>` accompanies `core_mem64_unavailable` and the bridge logs a warning with the same code before trying wasm32. The codes are `unsupported` (the engine rejects a memory64 feature probe after the core factory fails), `timeout` (the bridge's core initialization timer expires), and `init_error` (other failures, including module import). Single-thread cores report `core_single_thread` and `core_pthreads:0`. Automatic fetch-backed loading on a single-thread worker reports `model_fetch_backend_requires_pthreads` and streams into staging. `model_staging_js_backed` identifies JS-backed staging. `gpu_unavailable:<reason>` (`no_webgpu`, `no_adapter`, `adapter_missing_shader_f16`, `unknown`) says why a load with `nGpuLayers > 0` runs on the CPU. The bridge also logs one warning. Chrome hides `shader-f16` on NVIDIA drivers older than 615.71, and ggml-webgpu then registers no device. Safari reports `safari_gpu_layers_capped:<n>` when the cap lowers the requested count, `safari_gpu_probe_embedding` when probing with embeddings, `safari_gpu_probe_passed` or `safari_gpu_probe_failed` for the initial probe, and `safari_fallback_cpu` when a retry loads on the CPU. |
+| `llamadart.webgpu.runtime_notes` | Semicolon-separated bridge notes. When a memory64 core attempt fails, `core_mem64_unavailable:<reason>` accompanies `core_mem64_unavailable` and the bridge logs a warning with the same code before trying wasm32. The codes are `unsupported` (the engine rejects a memory64 feature probe after the core factory fails), `timeout` (the bridge's core initialization timer expires), and `init_error` (other failures, including module import). Single-thread cores report `core_single_thread` and `core_pthreads:0`. Automatic fetch-backed loading on a single-thread worker reports `model_fetch_backend_requires_pthreads` and streams into staging. `model_staging_js_backed` identifies JS-backed staging. Model downloads report `model_stream_resume_validated` for verified resumes, `model_stream_resume_unvalidated` for resumes without sufficient validation, and `model_stream_restart:<reason>` when a response requires restarting at zero. `gpu_unavailable:<reason>` (`no_webgpu`, `no_adapter`, `adapter_missing_shader_f16`, `unknown`) says why a load with `nGpuLayers > 0` runs on the CPU. The bridge also logs one warning. Chrome hides `shader-f16` on NVIDIA drivers older than 615.71, and ggml-webgpu then registers no device. Safari reports `safari_gpu_layers_capped:<n>` when the cap lowers the requested count, `safari_gpu_probe_embedding` when probing with embeddings, `safari_gpu_probe_passed` or `safari_gpu_probe_failed` for the initial probe, and `safari_fallback_cpu` when a retry loads on the CPU. |
 | `llamadart.webgpu.mmproj_loaded` | `1` when a projector is loaded. |
 | `llamadart.webgpu.supports_vision` | `1` when the active projector supports vision. |
 | `llamadart.webgpu.supports_audio` | `1` when the active projector supports audio. |
