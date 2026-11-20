@@ -1306,8 +1306,9 @@ this function themselves.
   unique per core instance, including across bridges that share one through
   `coreModuleFactory` from the same bridge bundle. Later loads use a fresh path
   even when a mount or its native registration remains after cleanup. The
-  allocator skips existing filesystem entries and reports `MODEL_STAGING_MOUNT_FAILED`
-  if all 64 candidate paths are occupied. Each bridge cleans up its own mounts.
+  allocator checks individual paths and skips existing entries and native mount
+  collisions. It reports `MODEL_STAGING_MOUNT_FAILED` if all 64 candidates are
+  blocked. Each bridge cleans up its own mounts.
   Native memory grows by a few bytes per staging mount for the core's lifetime
   because Emscripten's WasmFS backend table retains created backends. Its
   cost is slightly slower native chunk reads on small loads (`Qwen3-0.6B-Q8_0`

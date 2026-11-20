@@ -200,6 +200,8 @@ const textEncoder = new TextEncoder();
 // A core can outlive a bridge and retain its staging mounts.
 const jsStagingMountCounters = new WeakMap<LlamaCoreModule, number>();
 const MAX_JS_STAGING_PATH_PROBES = 64;
+const WASMFS_EEXIST = 20;
+const WASMFS_ENOENT = 44;
 
 export class LlamaWebGpuBridgeRuntime {
   declare _config: LlamaWebGpuBridgeConfig;
@@ -1436,20 +1438,7 @@ export class LlamaWebGpuBridgeRuntime {
         `JS-backed model staging requires native ABI version >= 3 (got ${apiVersion}). Update the core build or disable jsBackedModelStaging.`,
       );
     }
-    const mountPath = this._reserveJsStagingMountPath(core);
-    const mountRc = Number(
-      core.ccall('llamadart_webgpu_mount_js_model_fs', 'number', ['string'], [mountPath]),
-    );
-    if (mountRc !== 0) {
-      this._pushRuntimeNote('model_staging_mount_failed');
-      const detail = mountRc === -20 || mountRc === -17
-        ? `the ${mountPath} path already exists under another filesystem backend`
-        : `rc=${mountRc}`;
-      throw new ModelStagingError(
-        'MODEL_STAGING_MOUNT_FAILED',
-        `Failed to mount JS-backed model filesystem at ${mountPath} (${detail}).`,
-      );
-    }
+    const mountPath = this._mountAtFreeJsStagingPath(core);
     const mountId = Number(
       core.ccall('llamadart_webgpu_js_model_fs_mount_id', 'number', ['string'], [mountPath]),
     );
@@ -1471,26 +1460,38 @@ export class LlamaWebGpuBridgeRuntime {
     return mountPath;
   }
 
-  _reserveJsStagingMountPath(core: LlamaCoreModule): string {
-    let entries: unknown;
-    try {
-      entries = core.FS.readdir('/');
-      if (!Array.isArray(entries)) throw new Error('invalid root directory listing');
-    } catch (error) {
-      this._pushRuntimeNote('model_staging_mount_failed');
-      throw new ModelStagingError(
-        'MODEL_STAGING_MOUNT_FAILED',
-        `Failed to inspect JS-backed model staging paths (${String(error)}).`,
-      );
-    }
-    const occupied = new Set(entries);
+  _mountAtFreeJsStagingPath(core: LlamaCoreModule): string {
     const previousMountNumber = jsStagingMountCounters.get(core) ?? 0;
     for (let offset = 1; offset <= MAX_JS_STAGING_PATH_PROBES; offset += 1) {
       const mountNumber = previousMountNumber + offset;
-      const name = `jsmodels-${mountNumber}`;
-      if (occupied.has(name)) continue;
+      const mountPath = `/jsmodels-${mountNumber}`;
+      try {
+        core.FS.lstat(mountPath);
+        continue;
+      } catch (error) {
+        if (!(error && typeof error === 'object' && 'errno' in error && error.errno === WASMFS_ENOENT)) {
+          this._pushRuntimeNote('model_staging_mount_failed');
+          throw new ModelStagingError(
+            'MODEL_STAGING_MOUNT_FAILED',
+            `Failed to inspect JS-backed model staging path ${mountPath} (${String(error)}).`,
+          );
+        }
+      }
       jsStagingMountCounters.set(core, mountNumber);
-      return `/${name}`;
+      const mountRc = Number(
+        core.ccall('llamadart_webgpu_mount_js_model_fs', 'number', ['string'], [mountPath]),
+      );
+      if (mountRc === 0) return mountPath;
+      // The native registry can retain a mount after its path disappears.
+      if (mountRc === -WASMFS_EEXIST) continue;
+      this._pushRuntimeNote('model_staging_mount_failed');
+      const detail = mountRc === -17
+        ? `the ${mountPath} path already exists under another filesystem backend`
+        : `rc=${mountRc}`;
+      throw new ModelStagingError(
+        'MODEL_STAGING_MOUNT_FAILED',
+        `Failed to mount JS-backed model filesystem at ${mountPath} (${detail}).`,
+      );
     }
     this._pushRuntimeNote('model_staging_mount_failed');
     throw new ModelStagingError(
