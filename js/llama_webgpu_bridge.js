@@ -3626,6 +3626,7 @@ var LlamaWebGpuBridgeRuntime = class {
       let factoryLoaded = false;
       let initTimeoutError = null;
       let candidateCore = null;
+      let initTimer;
       try {
         const moduleFactory = await candidate.factoryPromise;
         factoryLoaded = true;
@@ -3700,7 +3701,7 @@ var LlamaWebGpuBridgeRuntime = class {
             }
           }),
           new Promise((_, reject) => {
-            globalThis.setTimeout(() => {
+            initTimer = globalThis.setTimeout(() => {
               initTimeoutError = new Error(`Bridge core init timeout (${initTimeoutMs}ms)`);
               reject(initTimeoutError);
             }, initTimeoutMs);
@@ -3726,6 +3727,8 @@ var LlamaWebGpuBridgeRuntime = class {
           continue;
         }
         throw error;
+      } finally {
+        if (initTimer !== void 0) globalThis.clearTimeout(initTimer);
       }
     }
     if (!this._core) {
