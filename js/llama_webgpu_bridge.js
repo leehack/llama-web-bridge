@@ -1909,6 +1909,7 @@ var LlamaWebGpuBridgeRuntime = class {
     this._isAppleSafari = isAppleSafariUserAgent(userAgent);
     this._safariDefaultMaxGpuLayers = safariDefaultMaxGpuLayers(userAgent);
     this._coreVariant = "uninitialized";
+    this._memory64FallbackReason = null;
     this._preferMemory64 = this._config.preferMemory64 !== false;
     this._modelSource = "network";
     this._modelCacheState = "disabled";
@@ -3377,6 +3378,7 @@ var LlamaWebGpuBridgeRuntime = class {
       });
     }
     let lastError = null;
+    let memory64FallbackReason = null;
     for (const candidate of candidates) {
       if (candidate.variant === "wasm64") {
         this._runtimeNotes.push("core_mem64_attempt");
@@ -3463,6 +3465,7 @@ var LlamaWebGpuBridgeRuntime = class {
           })
         ]);
         this._coreVariant = candidate.variant === "wasm64" ? "wasm64" : "wasm32";
+        this._memory64FallbackReason = memory64FallbackReason;
         if (candidate.variant === "wasm64") {
           this._runtimeNotes.push("core_mem64_active");
         } else if (candidate.variant === "wasm32") {
@@ -3473,6 +3476,7 @@ var LlamaWebGpuBridgeRuntime = class {
         lastError = error;
         if (candidate.variant === "wasm64") {
           const reason = initTimeoutError && error === initTimeoutError ? "timeout" : factoryLoaded && isMemory64Unsupported() ? "unsupported" : "init_error";
+          memory64FallbackReason = reason;
           this._runtimeNotes.push("core_mem64_unavailable");
           this._runtimeNotes.push(`core_mem64_unavailable:${reason}`);
           this._emitLogger("warn", `Memory64 core unavailable (${reason}). Trying the wasm32 core.`);
@@ -3513,7 +3517,7 @@ var LlamaWebGpuBridgeRuntime = class {
     const abortMessage = "Model load was cancelled.";
     throwIfAborted(operationSignal, abortMessage);
     this._abortRequested = false;
-    this._runtimeNotes = [];
+    this._runtimeNotes = this._core && this._memory64FallbackReason ? ["core_mem64_unavailable", `core_mem64_unavailable:${this._memory64FallbackReason}`] : [];
     this._suppressedWarmupWarningCount = 0;
     this._didReportWarmupWarningSuppression = false;
     await this._probeBackends();

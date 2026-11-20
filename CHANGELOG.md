@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Keep both memory64 fallback notes in metadata for later loads that reuse the fallback wasm32 core.
+- Document the single loaded model slot for bridges sharing a `coreModuleFactory` core instance.
+
 - Allocate JS-backed staging paths per core and skip occupied filesystem paths. A bridge sharing a core through `coreModuleFactory` can load a model even when an earlier bridge left a busy staging mount or stale native registration.
 
 - Carry strong ETag and expected size evidence across repeated streamed GGUF interruptions. Restart overlong interrupted ranges, and enforce the declared span and consistent totals when a full GET returns an identity-encoded byte range starting at zero.
