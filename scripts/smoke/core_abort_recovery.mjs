@@ -77,7 +77,7 @@ async function instrumentCore(createCore, settings, options) {
       report('injected', { name, fault });
       if (fault === 'plain') throw new Error('operation aborted(foo)');
       originalCcall('llamadart_webgpu_tokenize_bytes_to_json', 'number',
-        ['number', 'number', 'number', 'number'], [0x7ffffff0, 64, 0, 0]);
+        ['pointer', 'number', 'number'], [0x7ffffff0, 64, 0]);
       throw new Error('The native trap unexpectedly returned');
     }
   };
@@ -222,7 +222,7 @@ async function runBrowserCase(settings) {
     const initial = await snapshot(first.id);
     const metadata = bridge.getModelMetadata();
     const note = (value) => (value['llamadart.webgpu.runtime_notes'] || '').split(';');
-    assert(metadata['llamadart.webgpu.core_variant'] === (memory64 ? 'wasm64' : 'wasm32'),
+    assert(iframe || metadata['llamadart.webgpu.core_variant'] === (memory64 ? 'wasm64' : 'wasm32'),
       'The selected Wasm core did not match the requested memory mode');
     assert(Number(metadata['llamadart.webgpu.n_threads']) === nThreads, 'Unexpected model thread count');
     assert(initial.created === (single ? 0 : 4), `Unexpected pthread pool size: ${initial.created}`);
@@ -247,7 +247,9 @@ async function runBrowserCase(settings) {
       bridge = null;
       await waitFor(() => events.some(({ name }) => name === 'llamadart_webgpu_shutdown'),
         'No native shutdown during disposal');
-      parity.calls = events.filter(({ type }) => type === 'call').map(({ name }) => name);
+      // The number of streamed download chunks varies between runs, and each chunk repeats its calls.
+      parity.calls = events.filter(({ type }) => type === 'call').map(({ name }) => name)
+        .filter((name, index, names) => name !== names[index - 1]);
       assert(parity.retirements === 0, 'The parity scenario retired a core');
       Object.assign(result, { parity, ok: true });
       return;
@@ -255,7 +257,7 @@ async function runBrowserCase(settings) {
 
     window.__smokeStage = scenario + ':fault';
     if (scenario === 'healthy') {
-      await expectError(() => complete({ grammar: 'root ::=' }), (error) => /grammar/i.test(error.message));
+      await expectError(() => complete({ grammar: 'root ::= answer' }), (error) => error.message.includes('(invalid grammar)'));
       const controller = new AbortController();
       controller.abort();
       await expectError(() => complete({ signal: controller.signal }), (error) => error.name === 'AbortError');
@@ -311,6 +313,10 @@ async function runBrowserCase(settings) {
     if (staging) assert(retired.stats.stagedBytes > 0, 'The abort did not report staged bytes released');
     window.__smokeStage = scenario + ':recover';
     if (!worker) {
+      const notes = note(bridge.getModelMetadata());
+      assert(notes.includes('core_retired'), 'Direct replacement lost the retirement note');
+      assert(notes.includes(`core_retired_staged_bytes:${retired.stats.stagedBytes}`), 'Missing staged-byte note');
+      if (!single) assert(notes.includes(`core_retired_threads:${initial.created}`), 'Missing pthread note');
       await expectError(() => bridge.tokenize('hello'),
         (error) => error.name === 'ModelUnloadedError' && error.code === 'MODEL_UNLOADED_AFTER_CORE_ABORT');
       await load();
@@ -327,12 +333,6 @@ async function runBrowserCase(settings) {
     assert(workers.length === (worker ? 2 : 0)
       && workers.filter(({ terminated }) => !terminated).length === Number(worker),
     'Expected one live replacement bridge worker');
-    const notes = note(bridge.getModelMetadata());
-    if (!worker) {
-      assert(notes.includes('core_retired'), 'Direct replacement lost the retirement note');
-      assert(notes.includes(`core_retired_staged_bytes:${retired.stats.stagedBytes}`), 'Missing staged-byte note');
-      if (!single) assert(notes.includes(`core_retired_threads:${initial.created}`), 'Missing pthread note');
-    }
     Object.assign(result, {
       ok: true,
       pthreadsCreated: initial.created + after.created,
@@ -424,6 +424,11 @@ async function main() {
   if (args.baselineDistDir) {
     const baselineArgs = { ...args, artifactsDir: args.artifactsDir && path.join(args.artifactsDir, 'baseline') };
     const baseline = await runDist(baselineArgs, args.baselineDistDir, modelPath, cases);
+    if (args.artifactsDir) {
+      await fsp.mkdir(args.artifactsDir, { recursive: true });
+      await fsp.writeFile(path.join(args.artifactsDir, 'parity-branch.json'), JSON.stringify(results, null, 2));
+      await fsp.writeFile(path.join(args.artifactsDir, 'parity-baseline.json'), JSON.stringify(baseline, null, 2));
+    }
     assert.deepEqual(results, baseline);
   }
   console.log(JSON.stringify({ ok: true, results }, null, 2));

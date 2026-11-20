@@ -31,7 +31,7 @@ Module['llamadartWasmRuntimeError'] = WebAssembly.RuntimeError;
 Module['llamadartRetire'] = () => {
   let threads = -1;
   if (typeof PThread !== 'undefined') {
-    threads = PThread.runningWorkers.length + PThread.unusedWorkers.length;
+    threads = Object.keys(PThread.pthreads).length + PThread.unusedWorkers.length;
     PThread.terminateAllThreads();
   }
   let stagedBytes = 0;
