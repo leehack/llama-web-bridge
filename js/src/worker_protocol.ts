@@ -17,7 +17,6 @@ export interface BridgeStateSnapshot {
   backendName: string;
   supportsVision: boolean;
   supportsAudio: boolean;
-  coreGeneration?: number;
 }
 
 // A message from the worker host: a result, an error, or a progress, token or usage event.
@@ -31,7 +30,6 @@ export interface WorkerResponse {
   decisionErrorCode?: DecisionErrorCode;
   modelStagingErrorCode?: ModelStagingErrorCode;
   errorCode?: 'CROSS_ORIGIN_ISOLATION_REQUIRED';
-  errorName?: 'ModelTransferLengthError';
   event?: string;
   payload?: unknown;
 }
@@ -67,9 +65,7 @@ type BridgeStateSource = Pick<
   | 'getBackendName'
   | 'supportsVision'
   | 'supportsAudio'
-> & {
-  _currentCoreGeneration?: () => number;
-};
+>;
 
 export function serializeWorkerError(error: unknown): string {
   if (!error) {
@@ -102,7 +98,6 @@ export function emptyBridgeState(): BridgeStateSnapshot {
     backendName: 'WASM (Prototype bridge)',
     supportsVision: false,
     supportsAudio: false,
-    coreGeneration: 0,
   };
 }
 
@@ -114,8 +109,5 @@ export function snapshotBridgeState(target: BridgeStateSource): BridgeStateSnaps
     backendName: target.getBackendName(),
     supportsVision: target.supportsVision(),
     supportsAudio: target.supportsAudio(),
-    coreGeneration: typeof target._currentCoreGeneration === 'function'
-      ? (Number(target._currentCoreGeneration()) || 0)
-      : 0,
   };
 }

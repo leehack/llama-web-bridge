@@ -445,11 +445,11 @@ const cases = [
 
   ['every model free and shutdown, including Safari probe retries, is an awaited async ccall', async () => {
     const calls = [...bridgeJsSource().matchAll(
-      /(\bawait\s+)?this\._callCore(Async|Sync)\(\s*'llamadart_webgpu_(free_model|shutdown)'[^;]*;/g,
+      /(\bawait\s+)?[\w.!?]*ccall\(\s*'llamadart_webgpu_(free_model|shutdown)'[^;]*;/g,
     )];
     assert.ok(calls.length >= 5, `expected the free and shutdown call sites, found ${calls.length}`);
-    for (const [call, awaited, mode] of calls) {
-      assert.ok(awaited && mode === 'Async', `synchronous core free: ${call}`);
+    for (const [call, awaited] of calls) {
+      assert.ok(awaited && call.includes('{ async: true }'), `synchronous core free: ${call}`);
     }
   }],
 

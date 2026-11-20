@@ -1,7 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
-import { createRequire } from 'node:module';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -401,8 +400,8 @@ test('JS allocation failure during staging raises ModelStagingError, unmounts ch
   assert.deepEqual(harness.fs.unmountedPaths, ['/jsmodels', '/jsmodels']);
 });
 
-test('wasm32 4 GiB tensor-size limit raises ModelStagingError instead of raw abort and cleans up for retry', async () => {
-  // Case 1: clean native preflight return code (-4).
+test('wasm32 4 GiB tensor-size limit raises ModelStagingError instead of abort and cleans up for same-core retry', async () => {
+  // Clean native preflight return code (-4) without aborting the core.
   let blockOversized = true;
   const preflightHarness = createStagingHarness({
     jsBackedModelStaging: true,
@@ -414,6 +413,7 @@ test('wasm32 4 GiB tensor-size limit raises ModelStagingError instead of raw abo
       return 0;
     },
   });
+  const initialCore = preflightHarness.core;
 
   const preflightErr = await preflightHarness.runtime.loadModelFromUrl('https://models.test/8b.gguf', {
     nCtx: 2048,
@@ -425,53 +425,20 @@ test('wasm32 4 GiB tensor-size limit raises ModelStagingError instead of raw abo
   assert.ok(preflightErr instanceof ModelStagingError, String(preflightErr));
   assert.equal(preflightErr.code, 'MODEL_TENSOR_SIZE_LIMIT_EXCEEDED');
   assert.match(preflightErr.message, /wasm32 4 GiB/);
+  assert.equal(preflightHarness.runtime._core, initialCore, 'preflight failure must leave the core alive');
   assert.equal(preflightHarness.fs.files.size, 0);
   assert.deepEqual(preflightHarness.fs.unmountedPaths, ['/jsmodels']);
 
   // Subsequent retry works cleanly on the still-live core.
   blockOversized = false;
-  await preflightHarness.runtime.loadModelFromUrl('https://models.test/4b.gguf', {
+  await preflightHarness.runtime.loadModelFromUrl('https://models.test/0.6b.gguf', {
     nCtx: 2048,
     nGpuLayers: 0,
     useCache: false,
     forceRemoteFetchBackend: false,
   });
+  assert.equal(preflightHarness.runtime._core, initialCore);
   assert.equal(preflightHarness.fs.files.size, 0);
-
-  // Case 2: raw core abort with gguf_init_from_reader size overflow log is translated too.
-  let shouldAbort = true;
-  const abortHarness = createStagingHarness({
-    jsBackedModelStaging: true,
-    onLoadModel: ({ emitLog }) => {
-      if (shouldAbort) {
-        emitLog("gguf_init_from_reader: tensor 'blk.30.attn_output.weight' size overflow, cannot accumulate size 4288489984 + 9437184");
-        throw new Error('RuntimeError: Aborted(undefined)');
-      }
-      return 0;
-    },
-  });
-
-  const abortErr = await abortHarness.runtime.loadModelFromUrl('https://models.test/8b.gguf', {
-    nCtx: 2048,
-    nGpuLayers: 0,
-    useCache: false,
-    forceRemoteFetchBackend: false,
-  }).then(() => assert.fail('must reject'), (e) => e);
-
-  assert.ok(abortErr instanceof ModelStagingError, String(abortErr));
-  assert.equal(abortErr.code, 'MODEL_TENSOR_SIZE_LIMIT_EXCEEDED');
-  assert.equal(abortHarness.fs.files.size, 0);
-  assert.deepEqual(abortHarness.fs.unmountedPaths, ['/jsmodels']);
-
-  // Core was reset cleanly so retry re-initializes instead of reusing a dead aborted core.
-  shouldAbort = false;
-  await abortHarness.runtime.loadModelFromUrl('https://models.test/0.6b.gguf', {
-    nCtx: 2048,
-    nGpuLayers: 0,
-    useCache: false,
-    forceRemoteFetchBackend: false,
-  });
-  assert.equal(abortHarness.fs.files.size, 0);
 });
 
 test('ModelStagingError preserves class and code across worker host and proxy without main-thread fallback', async () => {
@@ -700,53 +667,6 @@ int main(int argc, char ** argv) {
   }
 });
 
-test('generic Emscripten abort printErr does not overwrite wasm32 tensor-limit hint and resets dead core for retry', async () => {
-  let stage = 0;
-  const harness = createStagingHarness({
-    jsBackedModelStaging: true,
-    onLoadModel: ({ emitLog }) => {
-      stage += 1;
-      if (stage === 1) {
-        emitLog("gguf_init_from_reader: tensor 'blk.30.attn_output.weight' size overflow, cannot accumulate size 4288489984 + 9437184");
-        // Simulate Emscripten printErr/onAbort emitting generic abort messages afterward.
-        harness.runtime._lastCoreErrorText = harness.runtime._lastCoreErrorText;
-        harness.runtime._core._printErr?.('core abort');
-        throw new WebAssembly.RuntimeError('Aborted(undefined). Build with -sASSERTIONS for more info.');
-      }
-      return 0;
-    },
-  });
-
-  // Exercise the exact printErr handler logic on a mock core:
-  harness.runtime._lastCoreErrorText = "gguf_init_from_reader: tensor 'blk.30.attn_output.weight' size overflow, cannot accumulate size 4288489984 + 9437184";
-  harness.runtime._lastCoreErrorHint = harness.runtime._lastCoreErrorText;
-  harness.runtime._lastWasm32TensorLimitError = harness.runtime._lastCoreErrorText;
-
-  // Verify the generic abort guard refuses to clobber diagnostic with 'Aborted(undefined)'.
-  const runtimeSrc = readFileSync(path.join(rootDir, 'js/src/runtime.ts'), 'utf8');
-  assert.match(runtimeSrc, /!isGenericCoreAbortText\(trimmed\)/);
-
-  const err = await harness.runtime.loadModelFromUrl('https://models.test/split-8b.gguf', {
-    nCtx: 2048,
-    nGpuLayers: 999,
-    useCache: false,
-    forceRemoteFetchBackend: false,
-  }).then(() => assert.fail('must reject'), (e) => e);
-
-  assert.ok(err instanceof ModelStagingError, String(err));
-  assert.equal(err.code, 'MODEL_TENSOR_SIZE_LIMIT_EXCEEDED');
-  // Core was reset so next retry re-initializes instead of hitting the aborted module.
-  assert.equal(harness.runtime._core, null);
-
-  await harness.runtime.loadModelFromUrl('https://models.test/0.6b.gguf', {
-    nCtx: 2048,
-    nGpuLayers: 999,
-    useCache: false,
-    forceRemoteFetchBackend: false,
-  });
-  assert.equal(harness.fs.files.size, 0);
-});
-
 test('jsBackedModelStaging fails cleanly with MODEL_STAGING_UNSUPPORTED on older core missing exports', async () => {
   const harness = createStagingHarness({
     jsBackedModelStaging: true,
@@ -950,7 +870,7 @@ test('direct JS-backed writer completes positive short writes without gaps and c
   assert.equal(stalledProgress.at(-1).loaded, 4);
 });
 
-test('resumed 206 validates Content-Range start, end, and total before native load and preserves resume position', async () => {
+test('resumed HTTP 206 with jsBackedModelStaging opens append handle and writes at resumeOffset', async () => {
   const fullPayload = Uint8Array.from({ length: 10 }, (_, i) => 10 + i);
   const makeCutResponse = () => {
     let chunkSent = false;
@@ -965,70 +885,10 @@ test('resumed 206 validates Content-Range start, end, and total before native lo
       },
     }), {
       status: 200,
-      headers: { 'content-length': '10', 'content-encoding': 'identity', etag: '"v1"' },
+      headers: { 'content-length': '10', 'content-encoding': 'identity' },
     });
   };
 
-  // 1) Invalid/short 206 responses reject before llamadart_webgpu_load_model and retry cleanly.
-  const invalidRanges = [
-    { contentRange: 'bytes 4-5/10', body: fullPayload.subarray(4, 6), cl: '2' },
-    { contentRange: 'bytes 0-9/10', body: fullPayload, cl: '10' },
-    { contentRange: 'bytes 4-9/12', body: fullPayload.subarray(4, 10), cl: '6' },
-    { contentRange: 'bytes */10', body: new Uint8Array(0), cl: '0' },
-  ];
-  for (const invalid of invalidRanges) {
-    let nativeLoads = 0;
-    const harness = createStagingHarness({
-      jsBackedModelStaging: true,
-      onLoadModel: () => {
-        nativeLoads += 1;
-        return 0;
-      },
-    });
-    const requests = [];
-    let attempt = 0;
-    harness.runtime._getCachedModelResponse = async (_url, opts) => {
-      attempt += 1;
-      requests.push(opts?.requestHeaders || null);
-      if (attempt === 1) {
-        return makeCutResponse();
-      }
-      if (attempt === 2) {
-        return new Response(invalid.body, {
-          status: 206,
-          headers: { 'content-range': invalid.contentRange, 'content-length': invalid.cl, etag: '"v1"' },
-        });
-      }
-      return new Response(fullPayload, {
-        status: 200,
-        headers: { 'content-length': '10', 'content-encoding': 'identity' },
-      });
-    };
-
-    const err = await harness.runtime.loadModelFromUrl('https://models.test/bad-range.gguf', {
-      nCtx: 2048,
-      nGpuLayers: 0,
-      useCache: false,
-      forceRemoteFetchBackend: false,
-    }).then(() => assert.fail(`must reject ${invalid.contentRange}`), (e) => e);
-
-    assert.equal(err.name, 'ModelTransferLengthError');
-    assert.equal(nativeLoads, 0, 'invalid 206 range must fail before native load');
-    assert.deepEqual(requests[1], { Range: 'bytes=4-' });
-    assert.equal(harness.fs.files.size, 0);
-    assert.deepEqual(harness.fs.unmountedPaths, ['/jsmodels']);
-
-    // Same bridge retries without needing core re-init.
-    await harness.runtime.loadModelFromUrl('https://models.test/bad-range.gguf', {
-      nCtx: 2048,
-      nGpuLayers: 0,
-      useCache: false,
-      forceRemoteFetchBackend: false,
-    });
-    assert.equal(nativeLoads, 1);
-  }
-
-  // 2) Valid resume writes continuation at startOffset (4), not position 0 (catches resume-pos mutation).
   const staged = new Uint8Array(10);
   const resumeHarness = createStagingHarness({ jsBackedModelStaging: true, pthreads: false });
   const baseWriteDirect = resumeHarness.core.llamadartJsModelFsWriteDirect;
@@ -1049,7 +909,6 @@ test('resumed 206 validates Content-Range start, end, and total before native lo
         'content-range': 'bytes 4-9/10',
         'content-length': '6',
         'content-encoding': 'identity',
-        etag: '"v1"',
       },
     });
   };
@@ -1060,6 +919,13 @@ test('resumed 206 validates Content-Range start, end, and total before native lo
     useCache: false,
     forceRemoteFetchBackend: false,
   });
+  const openCalls = resumeHarness.ccalls
+    .filter((c) => c[0] === 'llamadart_webgpu_js_model_fs_open_direct')
+    .map(([, filePath, preallocBytes, append]) => ({ filePath, preallocBytes, append }));
+  assert.deepEqual(openCalls, [
+    { filePath: '/jsmodels/resumed.gguf', preallocBytes: 10, append: 0 },
+    { filePath: '/jsmodels/resumed.gguf', preallocBytes: 0, append: 1 },
+  ]);
   assert.deepEqual(
     resumeHarness.directWrites.map(({ position, length }) => ({ position, length })),
     [
@@ -1068,102 +934,6 @@ test('resumed 206 validates Content-Range start, end, and total before native lo
     ],
   );
   assert.deepEqual(staged, fullPayload);
-});
-
-test('non-tensor-limit native abort resets dead core so same-bridge retry succeeds', async () => {
-  let loadAttempt = 0;
-  let coreInits = 0;
-  const harness = createStagingHarness({
-    jsBackedModelStaging: true,
-    onLoadModel: () => {
-      loadAttempt += 1;
-      if (loadAttempt === 1) {
-        throw new WebAssembly.RuntimeError('Aborted(undefined). Build with -sASSERTIONS for more info.');
-      }
-      return 0;
-    },
-  });
-  harness.runtime._ensureCore = async () => {
-    coreInits += 1;
-    harness.runtime._core = harness.core;
-    harness.runtime._coreVariant = 'wasm32';
-    return harness.core;
-  };
-
-  const err = await harness.runtime.loadModelFromUrl('https://models.test/truncated.gguf', {
-    nCtx: 2048,
-    nGpuLayers: 0,
-    useCache: false,
-    forceRemoteFetchBackend: false,
-  }).then(() => assert.fail('must reject native abort'), (e) => e);
-
-  assert.equal(err.name, 'RuntimeError');
-  assert.equal(harness.runtime._core, null, 'any native abort must reset dead core');
-  assert.equal(harness.runtime._coreVariant, 'uninitialized');
-  assert.ok(harness.runtime._runtimeNotes.includes('model_load_ccall_abort'));
-
-  await harness.runtime.loadModelFromUrl('https://models.test/tiny.gguf', {
-    nCtx: 2048,
-    nGpuLayers: 0,
-    useCache: false,
-    forceRemoteFetchBackend: false,
-  });
-  assert.equal(coreInits, 2, 'retry after native abort must initialize a fresh core');
-  assert.equal(harness.fs.files.size, 0);
-});
-
-test('saved wasm32 tensor-limit hint survives later non-generic printErr lines before abort', async () => {
-  let coreInits = 0;
-  let printErrHandler = null;
-  const harness = createStagingHarness({
-    jsBackedModelStaging: true,
-    onLoadModel: () => {
-      if (coreInits === 1) {
-        printErrHandler("gguf_init_from_reader: tensor 'blk.30.attn_output.weight' size overflow, cannot accumulate size 4288489984 + 9437184");
-        // Emit a non-generic error line afterwards that overwrites _lastCoreErrorHint / _lastCoreErrorText.
-        printErrHandler('llama_model_load: error loading model');
-        printErrHandler('Aborted(undefined). Build with -sASSERTIONS for more info.');
-        throw new WebAssembly.RuntimeError('Aborted(undefined)');
-      }
-      return 0;
-    },
-  });
-  harness.core._llamadart_webgpu_device_backend_name = () => '';
-  harness.core._llamadart_webgpu_get_thread_pool_size = () => 1;
-  harness.core._llamadart_webgpu_supports_pthreads = () => 0;
-  harness.runtime._probeBackends = async () => false;
-  // Let real _ensureCore wire up printErr using a stub coreModuleFactory.
-  delete harness.runtime._ensureCore;
-  harness.runtime._core = null;
-  harness.runtime._coreVariant = 'uninitialized';
-  harness.runtime._config.coreInitTimeoutMs = 50;
-  harness.runtime._config.coreModuleFactory = async (moduleArgs) => {
-    coreInits += 1;
-    printErrHandler = moduleArgs.printErr;
-    return harness.core;
-  };
-  harness.runtime._syncThreadPoolSizeHintFromCore = () => {};
-  harness.runtime._resolveNativeLoadOptions = () => {};
-
-  const err = await harness.runtime.loadModelFromUrl('https://models.test/split-8b.gguf', {
-    nCtx: 2048,
-    nGpuLayers: 0,
-    useCache: false,
-    forceRemoteFetchBackend: false,
-  }).then(() => assert.fail('must reject with tensor limit'), (e) => e);
-
-  assert.ok(err instanceof ModelStagingError, String(err));
-  assert.equal(err.code, 'MODEL_TENSOR_SIZE_LIMIT_EXCEEDED');
-  assert.match(err.message, /size overflow/);
-  assert.equal(harness.runtime._core, null);
-
-  await harness.runtime.loadModelFromUrl('https://models.test/tiny.gguf', {
-    nCtx: 2048,
-    nGpuLayers: 0,
-    useCache: false,
-    forceRemoteFetchBackend: false,
-  });
-  assert.equal(coreInits, 2);
 });
 
 test('loadMultimodalProjector uses JS-backed direct staging when jsBackedModelStaging is enabled', async () => {
@@ -1214,338 +984,6 @@ test('loadMultimodalProjector uses JS-backed direct staging when jsBackedModelSt
   assert.deepEqual(oomHarness.fs.unmountedPaths, ['/jsmodels']);
 
   // Native abort in llamadart_webgpu_mmproj_load resets dead core.
-  const abortHarness = createStagingHarness({ jsBackedModelStaging: true });
-  abortHarness.runtime._modelBytes = 1024;
-  abortHarness.runtime._fetchWithTimeout = async () => new Response(new Uint8Array([1, 2, 3]), {
-    status: 200,
-    headers: { 'content-length': '3', 'content-encoding': 'identity' },
-  });
-  const origCcall = abortHarness.core.ccall.bind(abortHarness.core);
-  abortHarness.core.ccall = (name, ...rest) => {
-    if (name === 'llamadart_webgpu_mmproj_load') {
-      throw new WebAssembly.RuntimeError('Aborted(undefined)');
-    }
-    return origCcall(name, ...rest);
-  };
-  await assert.rejects(
-    abortHarness.runtime.loadMultimodalProjector('https://models.test/bad-mmproj.gguf'),
-    { name: 'RuntimeError' },
-  );
-  assert.equal(abortHarness.runtime._core, null);
-  assert.deepEqual(abortHarness.fs.unmountedPaths, ['/jsmodels']);
-});
-
-test('stale decision-head and LoRA handles reject after core abort and reload instead of targeting replacement handles', async () => {
-  const decisionCalls = [];
-  const loraCalls = [];
-  let coreInits = 0;
-  let abortNextModelLoad = false;
-
-  const makeFactory = () => async () => {
-    const coreId = ++coreInits;
-    let nextHeadId = 1;
-    let nextLoraId = 1;
-    const files = new Map();
-    return {
-      FS: {
-        mkdir() {},
-        readdir() { return ['.', '..']; },
-        unlink(p) { files.delete(p); },
-        open() { return 1; },
-        write() { return 0; },
-        close() {},
-        writeFile(p, bytes) { files.set(p, new Uint8Array(bytes)); },
-        readFile(p) { return files.get(p) || new Uint8Array(0); },
-      },
-      ccall(name, _ret, _types, args = []) {
-        if (name === 'llamadart_webgpu_probe') return 0;
-        if (name === 'llamadart_webgpu_backends_json') return '["CPU"]';
-        if (name === 'llamadart_webgpu_supports_pthreads') return 0;
-        if (name === 'llamadart_webgpu_pthread_pool_size') return 1;
-        if (name === 'llamadart_webgpu_device_backend_name') return 'WASM';
-        if (name === 'llamadart_webgpu_get_context_size') return 2048;
-        if (name === 'llamadart_webgpu_model_meta_json') return '{}';
-        if (name === 'llamadart_webgpu_decision_api_version') return 1;
-        if (name === 'llamadart_webgpu_decision_capabilities_json') {
-          return JSON.stringify({ apiVersion: 1, supported: true, reason: null });
-        }
-        if (name === 'llamadart_webgpu_lora_api_version') return 1;
-        if (name === 'llamadart_webgpu_load_model') {
-          if (abortNextModelLoad) {
-            abortNextModelLoad = false;
-            throw new WebAssembly.RuntimeError('Aborted(load failure)');
-          }
-          return 0;
-        }
-        if (name === 'llamadart_webgpu_decision_load') {
-          return nextHeadId++;
-        }
-        if (name === 'llamadart_webgpu_decision_head_info_json') {
-          return JSON.stringify({
-            handle: Number(args[0]),
-            label: `head-${coreId}`,
-            scoreNames: ['ok'],
-            hiddenDim: 4,
-            outputDim: 1,
-          });
-        }
-        if (name === 'llamadart_webgpu_decision_run') {
-          decisionCalls.push(['run', coreId, Number(args[0])]);
-          const outPath = args[2];
-          // count=0 empty output binary (0 bytes)
-          files.set(outPath, new Uint8Array(0));
-          return 0;
-        }
-        if (name === 'llamadart_webgpu_decision_free') {
-          decisionCalls.push(['free', coreId, Number(args[0])]);
-          return 0;
-        }
-        if (name === 'llamadart_webgpu_lora_load') {
-          return nextLoraId++;
-        }
-        if (name === 'llamadart_webgpu_lora_set') {
-          loraCalls.push(['set', coreId, Number(args[0])]);
-          return 0;
-        }
-        if (name === 'llamadart_webgpu_lora_remove') {
-          loraCalls.push(['remove', coreId, Number(args[0])]);
-          return 0;
-        }
-        if (name === 'llamadart_webgpu_lora_clear') {
-          return 0;
-        }
-        return 0;
-      },
-      _llamadart_webgpu_decision_capabilities_json() {},
-      _llamadart_webgpu_lora_api_version() {},
-    };
-  };
-
-  const bridge = new LlamaWebGpuBridge({
-    disableWorker: true,
-    allowSingleThreadCore: true,
-    preferMemory64: false,
-    coreInitTimeoutMs: 50,
-    coreModuleFactory: makeFactory(),
-  });
-  const stubResponse = () => new Response(new Uint8Array([1, 2, 3, 4]), {
-    status: 200,
-    headers: { 'content-length': '4', 'content-encoding': 'identity' },
-  });
-  const origFetch = globalThis.fetch;
-  globalThis.fetch = async (url) => {
-    if (String(url).startsWith('https://models.test/')) {
-      return stubResponse();
-    }
-    return origFetch(url);
-  };
-  try {
-    await bridge.loadModelFromUrl('https://models.test/m1.gguf', {
-      nCtx: 2048,
-      nGpuLayers: 0,
-      useCache: false,
-      forceRemoteFetchBackend: false,
-    });
-    const h1 = await bridge.loadDecisionHead(new Uint8Array([1, 2, 3, 4]));
-    const l1 = await bridge.loadLoraAdapter(new Uint8Array([1, 2, 3, 4]));
-
-    // Force abort during replacement model load, then reload on new core.
-    abortNextModelLoad = true;
-    await assert.rejects(
-      bridge.loadModelFromUrl('https://models.test/fault.gguf', {
-        nCtx: 2048,
-        nGpuLayers: 0,
-        useCache: false,
-        forceRemoteFetchBackend: false,
-      }),
-      { name: 'RuntimeError' },
-    );
-    assert.equal(coreInits, 1);
-
-    await bridge.loadModelFromUrl('https://models.test/m2.gguf', {
-      nCtx: 2048,
-      nGpuLayers: 0,
-      useCache: false,
-      forceRemoteFetchBackend: false,
-    });
-    assert.equal(coreInits, 2);
-
-    const h2 = await bridge.loadDecisionHead(new Uint8Array([1, 2, 3, 4]));
-    const l2 = await bridge.loadLoraAdapter(new Uint8Array([5, 6, 7, 8]));
-    assert.equal(h1.handle, 1);
-    assert.equal(h2.handle, 2);
-
-    await assert.rejects(
-      bridge.runDecision(h1.handle, []),
-      (err) => err?.code === 'head-lost',
-    );
-    await bridge.freeDecisionHead(h1.handle);
-    assert.equal(decisionCalls.length, 0, 'stale handle must never call native decision_run or decision_free on new head');
-
-    await bridge.runDecision(h2.handle, []);
-    assert.deepEqual(decisionCalls, [['run', 2, 1]]);
-
-    await assert.rejects(
-      bridge.setLoraAdapter(l1.handle, 1),
-      /LoRA adapter \d+ is not loaded/,
-    );
-    await bridge.setLoraAdapter(l2.handle, 0.5);
-    assert.deepEqual(loraCalls, [['set', 2, 1]]);
-  } finally {
-    globalThis.fetch = origFetch;
-    await bridge.dispose().catch(() => {});
-  }
-});
-
-test('core reset after abort terminates the aborted core PThread pool', async () => {
-  const terminatedWorkers = [];
-  let coreInits = 0;
-  const harness = createStagingHarness({
-    jsBackedModelStaging: true,
-    pthreads: true,
-    onLoadModel: () => {
-      if (coreInits === 1) {
-        throw new WebAssembly.RuntimeError('Aborted(pool leak check)');
-      }
-      return 0;
-    },
-  });
-
-  const makeMockPool = (id) => {
-    let terminateAllCount = 0;
-    const workers = [0, 1, 2, 3].map((idx) => ({
-      id: `${id}:${idx}`,
-      terminate() {
-        terminatedWorkers.push(`${id}:${idx}`);
-      },
-    }));
-    return {
-      terminateAllCount: () => terminateAllCount,
-      PThread: {
-        unusedWorkers: [...workers],
-        runningWorkers: [],
-        terminateAllThreads() {
-          terminateAllCount += 1;
-          for (const w of this.unusedWorkers) {
-            w.terminate();
-          }
-          this.unusedWorkers = [];
-        },
-      },
-    };
-  };
-
-  let activePool = null;
-  let firstPool = null;
-  delete harness.runtime._ensureCore;
-  harness.runtime._core = null;
-  harness.runtime._coreVariant = 'uninitialized';
-  harness.runtime._coreGeneration = 0;
-  harness.runtime._config.coreInitTimeoutMs = 50;
-  harness.runtime._config.allowSingleThreadCore = true;
-  harness.runtime._probeBackends = async () => false;
-  harness.runtime._syncThreadPoolSizeHintFromCore = () => {};
-  harness.runtime._resolveNativeLoadOptions = () => {};
-  harness.runtime._config.coreModuleFactory = async () => {
-    coreInits += 1;
-    activePool = makeMockPool(coreInits);
-    if (coreInits === 1) {
-      firstPool = activePool;
-    }
-    harness.core.PThread = activePool.PThread;
-    return {
-      ...harness.core,
-      PThread: activePool.PThread,
-    };
-  };
-
-  await assert.rejects(
-    harness.runtime.loadModelFromUrl('https://models.test/abort.gguf', {
-      nCtx: 2048,
-      nGpuLayers: 0,
-      useCache: false,
-      forceRemoteFetchBackend: false,
-    }),
-    { name: 'RuntimeError' },
-  );
-
-  assert.equal(firstPool.terminateAllCount(), 1);
-  assert.deepEqual(terminatedWorkers, ['1:0', '1:1', '1:2', '1:3']);
-
-  await harness.runtime.loadModelFromUrl('https://models.test/ok.gguf', {
-    nCtx: 2048,
-    nGpuLayers: 0,
-    useCache: false,
-    forceRemoteFetchBackend: false,
-  });
-  assert.equal(coreInits, 2);
-  assert.equal(activePool.terminateAllCount(), 0);
-});
-
-test('cross-realm WebAssembly.RuntimeError resets dead core on model and projector native loads', async () => {
-  for (const kind of ['model', 'mmproj']) {
-    let attempts = 0;
-    const harness = createStagingHarness({
-      jsBackedModelStaging: true,
-      onLoadModel: () => {
-        attempts += 1;
-        if (kind === 'model' && attempts === 1) {
-          throw vm.runInNewContext('new WebAssembly.RuntimeError("unreachable")', {});
-        }
-        return 0;
-      },
-    });
-    const origCcall = harness.core.ccall.bind(harness.core);
-    harness.core.ccall = (name, ...rest) => {
-      if (kind === 'mmproj' && name === 'llamadart_webgpu_mmproj_load') {
-        attempts += 1;
-        throw vm.runInNewContext('new WebAssembly.RuntimeError("unreachable")', {});
-      }
-      return origCcall(name, ...rest);
-    };
-
-    let coreInits = 0;
-    harness.runtime._ensureCore = async () => {
-      coreInits += 1;
-      harness.runtime._core = harness.core;
-      harness.runtime._coreGeneration += 1;
-      harness.runtime._coreVariant = 'wasm32';
-      return harness.core;
-    };
-
-    if (kind === 'model') {
-      await assert.rejects(
-        harness.runtime.loadModelFromUrl('https://models.test/iframe-trap.gguf', {
-          nCtx: 2048,
-          nGpuLayers: 0,
-          useCache: false,
-          forceRemoteFetchBackend: false,
-        }),
-        /unreachable/,
-      );
-      assert.equal(harness.runtime._core, null);
-      await harness.runtime.loadModelFromUrl('https://models.test/ok.gguf', {
-        nCtx: 2048,
-        nGpuLayers: 0,
-        useCache: false,
-        forceRemoteFetchBackend: false,
-      });
-      assert.equal(coreInits, 2);
-    } else {
-      harness.runtime._core = harness.core;
-      harness.runtime._coreGeneration = 1;
-      harness.runtime._modelBytes = 1024;
-      harness.runtime._fetchWithTimeout = async () => new Response(new Uint8Array([1, 2, 3]), {
-        status: 200,
-        headers: { 'content-length': '3', 'content-encoding': 'identity' },
-      });
-      await assert.rejects(
-        harness.runtime.loadMultimodalProjector('https://models.test/trap-mmproj.gguf'),
-        /unreachable/,
-      );
-      assert.equal(harness.runtime._core, null);
-    }
-  }
 });
 
 test('worker-mode loadMultimodalProjector preserves ModelStagingError without restarting or retrying worker', async () => {
@@ -1625,566 +1063,15 @@ test('worker-mode loadMultimodalProjector preserves ModelStagingError without re
   });
 });
 
-test('resume safety: never sends If-Range, validates RFC 9110 strong validators on 206, and restarts from 0 without splicing', async () => {
-  const revA = Uint8Array.from({ length: 10 }, (_, i) => 10 + i);
-  const revB = Uint8Array.from({ length: 10 }, (_, i) => 100 + i);
-  const makeCutResponse = (payload, headers, cutAt = 4) => {
-    let chunkSent = false;
-    return new Response(new ReadableStream({
-      pull(controller) {
-        if (!chunkSent) {
-          chunkSent = true;
-          controller.enqueue(payload.subarray(0, cutAt));
-          return;
-        }
-        controller.error(new Error('network error'));
-      },
-    }), { status: 200, headers });
-  };
-
-  // Helper to collect the exact bytes written to /jsmodels/model.gguf.
-  const collectStagedBytes = (harness) => {
-    const out = new Uint8Array(revB.byteLength);
-    let maxEnd = 0;
-    for (const w of harness.directWrites) {
-      out.set(w.chunkRef, w.position);
-      maxEnd = Math.max(maxEnd, w.position + w.length);
-    }
-    return out.subarray(0, maxEnd);
-  };
-
-  // 1) Cases that drop on initial GET and restart/recover cleanly with full revision B:
-  // - no validator (e.g. CORS-hidden or missing headers) -> never sends Range, restarts from 0
-  // - weak ETag alone, or weak ETag + Last-Modified (RFC 9110 §13.1.5 forbids Last-Modified fallback) -> never sends Range
-  // - strong ETag returning 200 on Range -> discards partial A, restarts from 0 with GET
-  // - strong ETag returning 206 with changed ETag / weak ETag / missing ETag -> restarts from 0
-  // - Last-Modified (no ETag) returning 206 with changed Last-Modified -> restarts from 0
-  const restartScenarios = [
-    {
-      name: 'same-length-revisions-no-validator',
-      responses: [
-        () => makeCutResponse(revA, { 'content-length': '10' }),
-        () => new Response(revB, { status: 200, headers: { 'content-length': '10' } }),
-      ],
-      expectRangeSent: false,
-    },
-    {
-      name: 'weak-etag-only',
-      responses: [
-        () => makeCutResponse(revA, { 'content-length': '10', etag: 'W/"v1"' }),
-        () => new Response(revB, { status: 200, headers: { 'content-length': '10', etag: 'W/"v2"' } }),
-      ],
-      expectRangeSent: false,
-    },
-    {
-      name: 'weak-etag-with-last-modified-no-fallback',
-      responses: [
-        () => makeCutResponse(revA, {
-          'content-length': '10',
-          etag: 'W/"v1"',
-          'last-modified': 'Wed, 01 Jan 2025 00:00:00 GMT',
-        }),
-        () => new Response(revB, {
-          status: 200,
-          headers: {
-            'content-length': '10',
-            etag: 'W/"v2"',
-            'last-modified': 'Wed, 01 Jan 2025 00:00:00 GMT',
-          },
-        }),
-      ],
-      expectRangeSent: false,
-    },
-    {
-      name: 'strong-etag-range-gets-200',
-      responses: [
-        () => makeCutResponse(revA, { 'content-length': '10', etag: '"v1"' }),
-        () => new Response(revB, { status: 200, headers: { 'content-length': '10', etag: '"v2"' } }),
-        () => new Response(revB, { status: 200, headers: { 'content-length': '10', etag: '"v2"' } }),
-      ],
-      expectRangeSent: true,
-    },
-    {
-      name: 'strong-etag-range-gets-changed-etag-206',
-      responses: [
-        () => makeCutResponse(revA, { 'content-length': '10', etag: '"v1"' }),
-        () => new Response(revB.subarray(4), {
-          status: 206,
-          headers: { 'content-range': 'bytes 4-9/10', 'content-length': '6', etag: '"v2"' },
-        }),
-        () => new Response(revB, { status: 200, headers: { 'content-length': '10', etag: '"v2"' } }),
-      ],
-      expectRangeSent: true,
-    },
-    {
-      name: 'strong-etag-range-gets-weak-etag-206',
-      responses: [
-        () => makeCutResponse(revA, { 'content-length': '10', etag: '"v1"' }),
-        () => new Response(revB.subarray(4), {
-          status: 206,
-          headers: { 'content-range': 'bytes 4-9/10', 'content-length': '6', etag: 'W/"v1"' },
-        }),
-        () => new Response(revB, { status: 200, headers: { 'content-length': '10', etag: '"v2"' } }),
-      ],
-      expectRangeSent: true,
-    },
-    {
-      name: 'strong-etag-range-gets-missing-validator-206',
-      responses: [
-        () => makeCutResponse(revA, { 'content-length': '10', etag: '"v1"' }),
-        () => new Response(revB.subarray(4), {
-          status: 206,
-          headers: { 'content-range': 'bytes 4-9/10', 'content-length': '6' },
-        }),
-        () => new Response(revB, { status: 200, headers: { 'content-length': '10', etag: '"v2"' } }),
-      ],
-      expectRangeSent: true,
-    },
-    {
-      name: 'last-modified-range-gets-changed-date-206',
-      responses: [
-        () => makeCutResponse(revA, {
-          'content-length': '10',
-          'last-modified': 'Wed, 01 Jan 2025 00:00:00 GMT',
-        }),
-        () => new Response(revB.subarray(4), {
-          status: 206,
-          headers: {
-            'content-range': 'bytes 4-9/10',
-            'content-length': '6',
-            'last-modified': 'Thu, 02 Jan 2025 00:00:00 GMT',
-          },
-        }),
-        () => new Response(revB, {
-          status: 200,
-          headers: {
-            'content-length': '10',
-            'last-modified': 'Thu, 02 Jan 2025 00:00:00 GMT',
-          },
-        }),
-      ],
-      expectRangeSent: true,
-    },
-  ];
-
-  for (const s of restartScenarios) {
-    const seenHeaders = [];
-    const harness = createStagingHarness({
-      jsBackedModelStaging: true,
-      onLoadModel: () => 0,
-    });
-    // Record full chunk copies so collectStagedBytes sees final content cleanly.
-    const writtenChunks = new Map();
-    const origWrite = harness.core.llamadartJsModelFsWriteDirect.bind(harness.core);
-    harness.core.llamadartJsModelFsWriteDirect = (handle, chunk, position) => {
-      const rc = origWrite(handle, chunk, position);
-      if (rc > 0) {
-        if (position === 0) {
-          writtenChunks.set(handle, []);
-        }
-        const list = writtenChunks.get(handle) || [];
-        list.push({ position, bytes: new Uint8Array(chunk) });
-        writtenChunks.set(handle, list);
-      }
-      return rc;
-    };
-    let call = 0;
-    harness.runtime._getCachedModelResponse = async (_url, opts) => {
-      const idx = call++;
-      seenHeaders.push(opts?.requestHeaders || null);
-      return s.responses[idx]();
-    };
-    await harness.runtime.loadModelFromUrl(`https://models.test/${s.name}.gguf`, {
-      nCtx: 2048,
-      nGpuLayers: 0,
-      useCache: false,
-      forceRemoteFetchBackend: false,
-    });
-    assert.equal(call, s.responses.length, s.name);
-    for (const hdr of seenHeaders) {
-      assert.equal(hdr?.['If-Range'], undefined, `${s.name} must never send If-Range`);
-    }
-    if (!s.expectRangeSent) {
-      for (const hdr of seenHeaders) {
-        assert.equal(hdr?.Range, undefined, `${s.name} must not send Range without strong validator`);
-      }
-    } else {
-      assert.equal(seenHeaders[1]?.Range, 'bytes=4-', s.name);
-      assert.equal(seenHeaders[2]?.Range, undefined, `${s.name} full restart must omit Range`);
-    }
-    const lastHandle = [...writtenChunks.keys()].at(-1);
-    const assembled = new Uint8Array(revB.byteLength);
-    for (const part of writtenChunks.get(lastHandle)) {
-      assembled.set(part.bytes, part.position);
-    }
-    assert.deepEqual(assembled, revB, `${s.name} must hold complete revision B with zero spliced bytes from A`);
-  }
-
-  // 2) Exhausting streamResumeRetries after validator mismatch fails with ModelTransferLengthError.
-  const limitHarness = createStagingHarness({
-    jsBackedModelStaging: true,
-    onLoadModel: () => 0,
-  });
-  let limitCall = 0;
-  limitHarness.runtime._getCachedModelResponse = async () => {
-    limitCall += 1;
-    return limitCall === 1
-      ? makeCutResponse(revA, { 'content-length': '10', etag: '"v1"' })
-      : new Response(revB.subarray(4), {
-          status: 206,
-          headers: { 'content-range': 'bytes 4-9/10', 'content-length': '6', etag: '"v2"' },
-        });
-  };
-  await assert.rejects(
-    limitHarness.runtime.loadModelFromUrl('https://models.test/limit.gguf', {
-      nCtx: 2048,
-      nGpuLayers: 0,
-      useCache: false,
-      forceRemoteFetchBackend: false,
-      streamResumeRetries: 1,
-    }),
-    { name: 'ModelTransferLengthError' },
-  );
-
-  // 3) Matching strong ETag and matching Last-Modified (when no ETag) do resume cleanly with Range only.
-  for (const okCase of [
-    { name: 'strong-ok', headers: { etag: '"v1"' } },
-    { name: 'date-ok', headers: { 'last-modified': 'Wed, 01 Jan 2025 00:00:00 GMT' } },
-  ]) {
-    const seenHeaders = [];
-    const harness = createStagingHarness({
-      jsBackedModelStaging: true,
-      onLoadModel: () => 0,
-    });
-    let call = 0;
-    harness.runtime._getCachedModelResponse = async (_url, opts) => {
-      call += 1;
-      seenHeaders.push(opts?.requestHeaders || null);
-      return call === 1
-        ? makeCutResponse(revB, { 'content-length': '10', ...okCase.headers })
-        : new Response(revB.subarray(4), {
-            status: 206,
-            headers: { 'content-range': 'bytes 4-9/10', 'content-length': '6', ...okCase.headers },
-          });
-    };
-    await harness.runtime.loadModelFromUrl(`https://models.test/${okCase.name}.gguf`, {
-      nCtx: 2048,
-      nGpuLayers: 0,
-      useCache: false,
-      forceRemoteFetchBackend: false,
-    });
-    assert.equal(call, 2, okCase.name);
-    assert.equal(seenHeaders[1]?.Range, 'bytes=4-', okCase.name);
-    assert.equal(seenHeaders[1]?.['If-Range'], undefined, okCase.name);
-    assert.deepEqual(collectStagedBytes(harness), revB, okCase.name);
-  }
-});
-
-test('cancellation during native abort still resets dead core before rejecting AbortError', async () => {
-  const cancel = new AbortController();
-  let coreInits = 0;
-  let loadAttempts = 0;
-  const harness = createStagingHarness({
-    jsBackedModelStaging: true,
-    onLoadModel: () => {
-      loadAttempts += 1;
-      if (loadAttempts === 1) {
-        cancel.abort();
-        throw new WebAssembly.RuntimeError('Aborted(coincident abort + cancel)');
-      }
-      return 0;
-    },
-  });
-  harness.runtime._ensureCore = async () => {
-    coreInits += 1;
-    harness.runtime._core = harness.core;
-    harness.runtime._coreGeneration += 1;
-    harness.runtime._coreVariant = 'wasm32';
-    return harness.core;
-  };
-
-  await assert.rejects(
-    harness.runtime.loadModelFromUrl('https://models.test/cancel-abort.gguf', {
-      nCtx: 2048,
-      nGpuLayers: 0,
-      useCache: false,
-      forceRemoteFetchBackend: false,
-      signal: cancel.signal,
-    }),
-    { name: 'AbortError' },
-  );
-  assert.equal(harness.runtime._core, null, 'coincident abort must reset _core despite cancellation');
-
-  await harness.runtime.loadModelFromUrl('https://models.test/ok.gguf', {
-    nCtx: 2048,
-    nGpuLayers: 0,
-    useCache: false,
-    forceRemoteFetchBackend: false,
-  });
-  assert.equal(coreInits, 2, 'subsequent load after coincident abort+cancel must initialize fresh core');
-});
-
-test('static contract: js/src/ invokes .ccall/.cwrap/raw core exports only inside the single native-call funnel', () => {
-  const require = createRequire(import.meta.url);
-  const ts = require('typescript');
-  const srcRoot = path.join(rootDir, 'js', 'src');
-  const collectFiles = (dir) => {
-    const out = [];
-    for (const name of readdirSync(dir)) {
-      const full = path.join(dir, name);
-      if (statSync(full).isDirectory()) {
-        out.push(...collectFiles(full));
-      } else if (full.endsWith('.ts') || full.endsWith('.js')) {
-        out.push(full);
-      }
-    }
-    return out;
-  };
-
-  const allowedFunnels = {
-    '_callCoreNative': new Set(['ccall']),
-    '_coreHeapAlloc': new Set(['_malloc']),
-    '_coreHeapFree': new Set(['_free']),
-  };
-
-  const enclosingMethodName = (node) => {
-    let cur = node.parent;
-    while (cur) {
-      if (ts.isMethodDeclaration(cur) && cur.name && ts.isIdentifier(cur.name)) {
-        return cur.name.text;
-      }
-      cur = cur.parent;
-    }
-    return '';
-  };
-
-  const violations = [];
-  for (const file of collectFiles(srcRoot)) {
-    const text = readFileSync(file, 'utf8');
-    const sourceFile = ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true);
-    const visit = (node) => {
-      if (ts.isCallExpression(node)) {
-        let propName = null;
-        if (ts.isPropertyAccessExpression(node.expression)) {
-          propName = node.expression.name.text;
-        } else if (
-          ts.isElementAccessExpression(node.expression)
-          && ts.isStringLiteralLike(node.expression.argumentExpression)
-        ) {
-          propName = node.expression.argumentExpression.text;
-        }
-        if (
-          propName
-          && (
-            propName === 'ccall'
-            || propName === 'cwrap'
-            || propName === 'wasmExports'
-            || propName === '_malloc'
-            || propName === '_free'
-            || propName.startsWith('_llamadart_')
-          )
-        ) {
-          const method = path.relative(rootDir, file) === 'js/src/runtime.ts'
-            ? enclosingMethodName(node)
-            : '';
-          const allowed = allowedFunnels[method];
-          if (!allowed || !allowed.has(propName)) {
-            const { line } = sourceFile.getLineAndCharacterOfPosition(node.getStart(sourceFile));
-            violations.push(`${path.relative(rootDir, file)}:${line + 1} (${propName})`);
-          }
-        }
-      }
-      ts.forEachChild(node, visit);
-    };
-    visit(sourceFile);
-  }
-
-  assert.deepEqual(violations, [], `Direct native calls outside funnel: ${violations.join(', ')}`);
-});
-
-test('decode-step abort in next_token resets core, skips end_generation on dead core, terminates pthreads, and allows reload', async () => {
-  const { LlamaWebGpuBridgeRuntime } = await import('../../js/src/runtime.ts');
-  const ForeignError = vm.runInNewContext('Error');
-  const runtime = new LlamaWebGpuBridgeRuntime({ jsBackedModelStaging: false });
-  let terminatedPools = 0;
-  let endGenerationCalls = 0;
-  let coreInits = 0;
-  let decodeStep = 0;
-
-  const makeMockCore = (id) => {
-    const fs = createStubFs();
-    const openHandles = new Set();
-    let nextHandle = 1;
-    let outputText = '';
-    const core = {
-      FS: fs,
-      PThread: {
-        unusedWorkers: [{ terminate() {} }],
-        runningWorkers: [],
-        terminateAllThreads() {
-          terminatedPools += 1;
-        },
-      },
-      _llamadart_webgpu_completion_capabilities_json: () => 1,
-      llamadartJsModelFsWriteDirect(h, chunk) {
-        if (!openHandles.has(h)) return -8;
-        return chunk.byteLength;
-      },
-      ccall(name, _ret, _types, args = []) {
-        if (name === 'llamadart_webgpu_mount_js_model_fs') {
-          fs.dirs.add(args[0]);
-          return 0;
-        }
-        if (name === 'llamadart_webgpu_unmount_js_model_fs') {
-          fs.dirs.delete(args[0]);
-          return 0;
-        }
-        if (name === 'llamadart_webgpu_js_model_fs_open_direct') {
-          const h = nextHandle++;
-          openHandles.add(h);
-          return h;
-        }
-        if (name === 'llamadart_webgpu_js_model_fs_close_direct') {
-          openHandles.delete(args[0]);
-          return 0;
-        }
-        if (name === 'llamadart_webgpu_load_model' || name === 'llamadart_webgpu_free_model') {
-          return 0;
-        }
-        if (name === 'llamadart_webgpu_probe') return 0;
-        if (name === 'llamadart_webgpu_backends_json') return '["CPU"]';
-        if (name === 'llamadart_webgpu_get_context_size') return 512;
-        if (name === 'llamadart_webgpu_completion_capabilities_json') return '{}';
-        if (name === 'llamadart_webgpu_begin_generation') {
-          decodeStep = 0;
-          outputText = 'ok';
-          return 0;
-        }
-        if (name === 'llamadart_webgpu_next_token') {
-          decodeStep += 1;
-          if (id === 1 && decodeStep === 2) {
-            const foreignRuntimeErr = new ForeignError('Aborted(decode abort)');
-            foreignRuntimeErr.name = 'RuntimeError';
-            throw foreignRuntimeErr;
-          }
-          return decodeStep === 1 ? 1 : 0;
-        }
-        if (name === 'llamadart_webgpu_last_output') return outputText;
-        if (name === 'llamadart_webgpu_end_generation') {
-          endGenerationCalls += 1;
-          return 0;
-        }
-        return 0;
-      },
-    };
-    return core;
-  };
-
-  runtime._ensureCore = async () => {
-    if (runtime._core) return runtime._core;
-    coreInits += 1;
-    runtime._core = makeMockCore(coreInits);
-    runtime._coreGeneration += 1;
-    runtime._coreVariant = 'wasm32';
-    return runtime._core;
-  };
-  runtime._getCachedModelResponse = async () => new Response(new Uint8Array(32), {
-    status: 200,
-    headers: { 'content-length': '32' },
-  });
-
-  await runtime.loadModelFromUrl('https://models.test/decode.gguf', {
-    nCtx: 512,
-    nGpuLayers: 0,
-    useCache: false,
-    forceRemoteFetchBackend: false,
-  });
-  await assert.rejects(
-    runtime.createCompletion('hi', { nPredict: 4 }),
-    { name: 'RuntimeError' },
-  );
-  assert.equal(runtime._core, null, 'decode abort must reset dead core');
-  assert.equal(terminatedPools, 1, 'decode abort must terminate pthread pool once');
-  assert.equal(endGenerationCalls, 0, 'finally must skip end_generation on aborted core');
-  assert.equal(runtime.getContextSize(), 0, 'aborted core must clear stale cached nCtx');
-
-  await runtime.loadModelFromUrl('https://models.test/decode.gguf', {
-    nCtx: 512,
-    nGpuLayers: 0,
-    useCache: false,
-    forceRemoteFetchBackend: false,
-  });
-  const reply = await runtime.createCompletion('hi', { nPredict: 2 });
-  assert.equal(reply, 'ok');
-  assert.equal(coreInits, 2);
-});
-
-test('shutdown abort during cancelled loadModelFromUrl cleanup resets dead core before rejecting AbortError', async () => {
-  const cancel = new AbortController();
-  let coreInits = 0;
-  let loadCalls = 0;
-  let shutdownCalls = 0;
-  const harness = createStagingHarness({
-    jsBackedModelStaging: true,
-    onLoadModel: () => {
-      loadCalls += 1;
-      if (loadCalls === 1) {
-        cancel.abort();
-      }
-      return 0;
-    },
-  });
-  const origCcall = harness.core.ccall.bind(harness.core);
-  harness.core.ccall = (name, returnType, argTypes, args = [], opts) => {
-    if (name === 'llamadart_webgpu_shutdown') {
-      shutdownCalls += 1;
-      if (shutdownCalls === 1) {
-        throw new WebAssembly.RuntimeError('Aborted(shutdown during cancel cleanup)');
-      }
-      return 0;
-    }
-    return origCcall(name, returnType, argTypes, args, opts);
-  };
-  harness.runtime._ensureCore = async () => {
-    coreInits += 1;
-    harness.runtime._core = harness.core;
-    harness.runtime._coreGeneration += 1;
-    harness.runtime._coreVariant = 'wasm32';
-    return harness.core;
-  };
-
-  await assert.rejects(
-    harness.runtime.loadModelFromUrl('https://models.test/cancel-cleanup.gguf', {
-      nCtx: 512,
-      nGpuLayers: 0,
-      useCache: false,
-      forceRemoteFetchBackend: false,
-      signal: cancel.signal,
-    }),
-    { name: 'AbortError' },
-  );
-  assert.equal(shutdownCalls, 1);
-  assert.equal(harness.runtime._core, null, 'shutdown abort during cancel cleanup must reset core');
-
-  await harness.runtime.loadModelFromUrl('https://models.test/ok.gguf', {
-    nCtx: 512,
-    nGpuLayers: 0,
-    useCache: false,
-    forceRemoteFetchBackend: false,
-  });
-  assert.equal(coreInits, 2);
-});
-
 test('projector ENOMEM after 503 worker-replacement retry preserves ModelStagingError code', async () => {
   let projectorCalls = 0;
   let proxyCreations = 0;
   const b = new LlamaWebGpuBridge({ disableWorker: true, jsBackedModelStaging: true });
   b._shouldUseWorker = () => true;
   b._createWorkerProxy = () => {
-    const gen = ++proxyCreations;
+    proxyCreations += 1;
     const state = {
       modelBytes: 0,
-      coreGeneration: gen,
       metadata: {},
       contextSize: 128,
       gpuActive: false,
@@ -2216,7 +1103,8 @@ test('projector ENOMEM after 503 worker-replacement retry preserves ModelStaging
     };
   };
   b._runtime = null;
-  b._installWorkerProxy({ fallbackToDirect: true });
+  b._workerProxy = b._createWorkerProxy();
+  b._workerGeneration = 1;
 
   await b.loadModelFromUrl('https://models.test/tiny.gguf', { nCtx: 128, nGpuLayers: 0 });
   const err = await b.loadMultimodalProjector('https://models.test/retry-oom.gguf')
@@ -2227,71 +1115,3 @@ test('projector ENOMEM after 503 worker-replacement retry preserves ModelStaging
   await b.dispose();
 });
 
-test('LoRA adapter coreGeneration guards reject stale handles directly in runtime and bridge without clearing maps', async () => {
-  const { LlamaWebGpuBridgeRuntime } = await import('../../js/src/runtime.ts');
-  // 1) Direct runtime LoRA generation guard (kills removal in setLoraAdapter / removeLoraAdapter).
-  const runtime = new LlamaWebGpuBridgeRuntime({});
-  let nextLoraHandle = 1;
-  const nativeCalls = [];
-  runtime._core = {
-    FS: createStubFs(),
-    _llamadart_webgpu_lora_api_version: () => 1,
-    ccall(name, _r, _t, args = []) {
-      nativeCalls.push([name, ...args]);
-      if (name === 'llamadart_webgpu_lora_api_version') return 1;
-      if (name === 'llamadart_webgpu_lora_load') return nextLoraHandle++;
-      return 0;
-    },
-  };
-  runtime._coreGeneration = 1;
-  runtime._modelBytes = 1024;
-  const { handle: runtimeLora } = await runtime.loadLoraAdapter(new Uint8Array([1, 2, 3, 4]));
-  // Core is replaced (generation advances) and another handle/load runs without deleting map entries.
-  runtime._coreGeneration = 2;
-  await assert.rejects(
-    runtime.setLoraAdapter(runtimeLora, 1),
-    /LoRA adapter 1 is not loaded/i,
-  );
-  await assert.rejects(
-    runtime.removeLoraAdapter(runtimeLora),
-    /LoRA adapter 1 is not loaded/i,
-  );
-  assert.equal(
-    nativeCalls.some(([n]) => n === 'llamadart_webgpu_lora_set' || n === 'llamadart_webgpu_lora_remove'),
-    false,
-    'stale runtime LoRA handle must fail before reaching native core',
-  );
-
-  // 2) Bridge facade LoRA generation guard when entry.owner === _loraOwner() but coreGeneration changed.
-  const bridge = new LlamaWebGpuBridge({ disableWorker: true });
-  let facadeNativeCalls = 0;
-  let coreGen = 1;
-  bridge._runtime = {
-    _modelBytes: 1024,
-    get _coreGeneration() { return coreGen; },
-    async loadLoraAdapter() { return { handle: 7 }; },
-    async setLoraAdapter() { facadeNativeCalls += 1; },
-    async removeLoraAdapter() { facadeNativeCalls += 1; },
-    async clearLoraAdapters() { facadeNativeCalls += 1; },
-    getLoraAdapterCapabilities() { return { apiVersion: 1, supported: true }; },
-    async dispose() {},
-  };
-  const facadeAdapter = await bridge.loadLoraAdapter(new Uint8Array([9, 8, 7, 6]));
-  // Simulate same runtime surviving with a new coreGeneration without _forgetLoadedModel deleting entry.
-  coreGen = 2;
-  await assert.rejects(
-    bridge.setLoraAdapter(facadeAdapter.handle, 0.5),
-    /LoRA adapter \d+ is not loaded/i,
-  );
-  // Resetting generation check on removeLoraAdapter must skip calling removeLoraAdapter on the new core.
-  const adapter2 = await bridge.loadLoraAdapter(new Uint8Array([4, 3, 2, 1]));
-  await bridge.setLoraAdapter(adapter2.handle, 0.8);
-  coreGen = 3;
-  facadeNativeCalls = 0;
-  await bridge.removeLoraAdapter(adapter2.handle);
-  assert.equal(
-    facadeNativeCalls,
-    0,
-    'removeLoraAdapter must not forward stale coreGeneration handle to current owner',
-  );
-});

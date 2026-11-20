@@ -35,7 +35,6 @@ export interface DirectFileChunkWriter {
 
 export interface WriteResponseOptions {
   totalBytes?: unknown;
-  exactTransferLength?: unknown;
   useBigIntPosition?: boolean;
   skipMemoryReservation?: boolean;
   directWriter?: DirectFileChunkWriter | null;
@@ -45,20 +44,6 @@ export interface WriteResponseOptions {
   signal?: AbortSignal | null;
   abortMessage?: string;
 }
-
-export interface ParsedContentRange {
-  start: number;
-  end: number;
-  total: number;
-}
-
-export interface ValidatedPartialRange extends ParsedContentRange {
-  expectedTailLength: number;
-}
-
-export type ResumeValidators =
-  | { kind: 'etag'; value: string }
-  | { kind: 'last-modified'; value: string };
 
 // A transfer failure annotated with how far the file got, for resumable loads.
 type TransferError = Error & { llamadartLoadedBytes?: number; llamadartFilePath?: string };
@@ -82,124 +67,10 @@ export function sumProgressValues(values: Iterable<unknown> | null | undefined):
   return total;
 }
 
-export function createModelTransferLengthError(message: string): Error {
+function createModelTransferLengthError(message: string): Error {
   const error = new Error(message);
   error.name = 'ModelTransferLengthError';
   return error;
-}
-
-function readNormalizedHeader(response: Response, headerName: string): string {
-  const raw = response.headers?.get(headerName);
-  return typeof raw === 'string' ? raw.trim() : '';
-}
-
-export function captureResumeValidators(response: Response): ResumeValidators | null {
-  const etag = readNormalizedHeader(response, 'etag');
-  if (etag.length > 0) {
-    // Weak ETags cannot validate byte-range splicing, and RFC 9110 §13.1.5
-    // forbids falling back to Last-Modified when ETag is present.
-    return /^w\//i.test(etag) ? null : { kind: 'etag', value: etag };
-  }
-  const lastModified = readNormalizedHeader(response, 'last-modified');
-  return lastModified.length > 0 ? { kind: 'last-modified', value: lastModified } : null;
-}
-
-export function validateResumedValidators(
-  initial: ResumeValidators | null | undefined,
-  response: Response,
-): boolean {
-  if (!initial) {
-    return false;
-  }
-  if (initial.kind === 'etag') {
-    const resumedEtag = readNormalizedHeader(response, 'etag');
-    return resumedEtag.length > 0
-      && !/^w\//i.test(resumedEtag)
-      && resumedEtag === initial.value;
-  }
-  if (readNormalizedHeader(response, 'etag').length > 0) {
-    return false;
-  }
-  const resumedLastModified = readNormalizedHeader(response, 'last-modified');
-  return resumedLastModified.length > 0 && resumedLastModified === initial.value;
-}
-
-export function parseContentRangeHeader(
-  contentRangeHeader: string | null | undefined,
-): ParsedContentRange | null {
-  if (typeof contentRangeHeader !== 'string') {
-    return null;
-  }
-
-  const match = /^\s*bytes\s+(\d+)-(\d+)\/(\d+|\*)\s*$/i.exec(contentRangeHeader);
-  if (!match) {
-    return null;
-  }
-
-  const start = Number(match[1]);
-  const end = Number(match[2]);
-  const total = match[3] === '*' ? 0 : Number(match[3]);
-  if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start < 0 || end < start) {
-    return null;
-  }
-  if (match[3] !== '*' && (!Number.isSafeInteger(total) || total <= end)) {
-    return null;
-  }
-
-  return { start, end, total };
-}
-
-export function validateResumedPartialResponse(
-  response: Response,
-  expectedOffset: number,
-  expectedTotalBytes = 0,
-): ValidatedPartialRange {
-  const range = parseContentRangeHeader(response.headers?.get('content-range'));
-  if (!range) {
-    throw createModelTransferLengthError(
-      'Resumed 206 response is missing a valid Content-Range header.',
-    );
-  }
-  if (range.start !== expectedOffset) {
-    throw createModelTransferLengthError(
-      `Resumed Content-Range start ${range.start} does not match resume offset ${expectedOffset}.`,
-    );
-  }
-  const knownTotal = parsePositiveInteger(expectedTotalBytes);
-  if (knownTotal > 0 && range.total !== knownTotal) {
-    throw createModelTransferLengthError(
-      `Resumed Content-Range total ${range.total || '*'} does not match expected size ${knownTotal}.`,
-    );
-  }
-  const resolvedTotal = range.total > 0 ? range.total : knownTotal;
-  if (resolvedTotal <= 0) {
-    throw createModelTransferLengthError(
-      'Resumed 206 Content-Range must specify a finite total byte length.',
-    );
-  }
-  if (range.end !== resolvedTotal - 1) {
-    throw createModelTransferLengthError(
-      `Resumed Content-Range end ${range.end} does not reach expected end ${resolvedTotal - 1}.`,
-    );
-  }
-
-  const expectedTailLength = range.end - range.start + 1;
-  const rawContentLength = response.headers?.get('content-length');
-  if (typeof rawContentLength === 'string' && rawContentLength.trim().length > 0) {
-    const trimmed = rawContentLength.trim();
-    const declaredLength = /^[0-9]+$/.test(trimmed) ? Number(trimmed) : Number.NaN;
-    if (!Number.isSafeInteger(declaredLength) || declaredLength !== expectedTailLength) {
-      throw createModelTransferLengthError(
-        `Resumed Content-Length ${trimmed} does not match Content-Range length ${expectedTailLength}.`,
-      );
-    }
-  }
-
-  return {
-    ...range,
-    total: resolvedTotal,
-    expectedTailLength,
-  };
 }
 
 function writeDirectChunk(
@@ -589,15 +460,10 @@ export async function writeResponseToFsFileWithProgress(
     unlinkFsFile(fs, filePath);
   }
 
-  const explicitExactLength = parsePositiveInteger(writeOptions.exactTransferLength);
-
   if (!response.body || typeof response.body.getReader !== 'function') {
     throwIfAborted(signal, abortMessage);
     const bytes = new Uint8Array(await response.arrayBuffer());
     throwIfAborted(signal, abortMessage);
-    if (explicitExactLength > 0 && bytes.byteLength !== explicitExactLength) {
-      throw createModelTransferLengthError('Model response did not match its declared byte length.');
-    }
     let directLoaded = 0;
     if (directWriter) {
       try {
@@ -626,22 +492,23 @@ export async function writeResponseToFsFileWithProgress(
       fs.writeFile(filePath, bytes);
     }
 
-    const finalLoaded = startOffset + bytes.byteLength;
+    const finalLoaded = startOffset + (directWriter ? directLoaded : bytes.byteLength);
     if (typeof progressCallback === 'function') {
       progressCallback({ loaded: finalLoaded, total: total || finalLoaded });
     }
     return finalLoaded;
   }
 
-  const encoding = response.headers.get('content-encoding')?.trim().toLowerCase();
-  const isIdentity = !encoding || encoding === 'identity';
-  const reservedLength = (directWriter || writeOptions.skipMemoryReservation === true)
+  const skipReservation = directWriter != null || writeOptions.skipMemoryReservation === true;
+  const reservedLength = skipReservation
     ? 0
     : reservableResponseLength(response, startOffset, useBigIntPosition);
-  const headerExactLength = exactExpectedTransferLength(response, startOffset);
-  const exactLength = headerExactLength > 0
-    ? headerExactLength
-    : (isIdentity ? explicitExactLength : 0);
+  // CORS can hide Content-Encoding while exposing compressed Content-Length.
+  // Constructed/cache responses can also lose the original response type.
+  const encoding = response.headers.get('content-encoding')?.trim().toLowerCase();
+  const exactLength = skipReservation
+    ? exactExpectedTransferLength(response, startOffset)
+    : (reservedLength > 0 && (response.type === 'basic' || encoding === 'identity') ? reservedLength : 0);
   const reader = response.body.getReader();
   const openMode = appendMode ? 'r+' : 'w';
   const stream = directWriter ? null : fs.open(filePath, openMode);

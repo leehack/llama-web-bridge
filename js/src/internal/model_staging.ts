@@ -41,15 +41,6 @@ export function missingJsModelStagingExports(core: LlamaCoreModule | null | unde
   return missing;
 }
 
-export function isGenericCoreAbortText(value: unknown): boolean {
-  const lowered = String(value ?? '').trim().toLowerCase();
-  return lowered === 'aborted'
-    || lowered === 'native code called abort()'
-    || lowered === 'core abort'
-    || lowered.startsWith('core abort:')
-    || /^aborted\([^)]*\)(?:\.\s*build with -sassertions.*)?$/i.test(lowered);
-}
-
 export function isJsAllocationError(error: unknown): boolean {
   if (!error || typeof error !== 'object') {
     const text = String(error || '').toLowerCase();
