@@ -25,6 +25,8 @@ export interface ResolvedThinkingBudget {
   endTag: string;
   forcedMessage: string;
   pauseGrammar: boolean;
+  naturalEndTags?: string[];
+  grammarReplayEndIndex?: number;
 }
 
 /**
@@ -89,6 +91,7 @@ export const NO_COMPLETION_CAPABILITIES: Readonly<CompletionCapabilities> = Obje
   minP: false,
   thinkingBudget: false,
   thinkingBudgetPauseGrammar: false,
+  thinkingBudgetMultiEnd: false,
   penaltyPromptTokens: false,
   penaltyPromptTokensWithGrammar: false,
   lazyGrammar: false,
@@ -110,8 +113,7 @@ function optionalNumber(value: unknown, name: string, isValid: (value: number) =
   return value;
 }
 
-function tag(budget: Record<string, unknown>, name: 'startTag' | 'endTag'): string {
-  const value = budget[name];
+function tag(value: unknown, name: string): string {
   if (typeof value !== 'string' || value.trim().length === 0) {
     throw new TypeError(`CompletionOptions.thinkingBudget.${name} must be a non-empty string.`);
   }
@@ -133,8 +135,8 @@ function thinkingBudget(value: unknown, hasMediaParts: boolean): ResolvedThinkin
       + `got ${String(maxTokens)}.`,
     );
   }
-  const startTag = tag(budget, 'startTag');
-  const endTag = tag(budget, 'endTag');
+  const startTag = tag(budget.startTag, 'startTag');
+  const endTag = tag(budget.endTag, 'endTag');
   const forcedMessage = budget.forcedMessage ?? '';
   if (typeof forcedMessage !== 'string') {
     throw new TypeError('CompletionOptions.thinkingBudget.forcedMessage must be a string.');
@@ -149,7 +151,22 @@ function thinkingBudget(value: unknown, hasMediaParts: boolean): ResolvedThinkin
   if (hasMediaParts) {
     throw new Error('CompletionOptions.thinkingBudget supports text-only prompts; remove the media parts.');
   }
-  return { maxTokens: maxTokens as number, startTag, endTag, forcedMessage, pauseGrammar };
+  const resolved = { maxTokens: maxTokens as number, startTag, endTag, forcedMessage, pauseGrammar };
+  const ends = budget.naturalEndTags;
+  const replayIndex = budget.grammarReplayEndIndex;
+  if (ends === undefined && replayIndex === undefined) {
+    return resolved;
+  }
+  if (!Array.isArray(ends) || ends.length === 0) {
+    throw new TypeError('CompletionOptions.thinkingBudget.naturalEndTags must be a non-empty array of strings.');
+  }
+  const naturalEndTags = Array.from(ends, (value, index) => tag(value, `naturalEndTags[${index}]`));
+  const grammarReplayEndIndex = replayIndex === undefined ? -1 : replayIndex;
+  if (typeof grammarReplayEndIndex !== 'number' || !Number.isInteger(grammarReplayEndIndex)
+      || grammarReplayEndIndex < -1 || grammarReplayEndIndex >= naturalEndTags.length) {
+    throw new RangeError('CompletionOptions.thinkingBudget.grammarReplayEndIndex must be -1 or an index into naturalEndTags.');
+  }
+  return { ...resolved, naturalEndTags, grammarReplayEndIndex };
 }
 
 function speculativeInteger(
@@ -464,6 +481,7 @@ export function completionCapabilitiesFrom(raw: string | null): CompletionCapabi
     minP: parsed?.minP === true,
     thinkingBudget: parsed?.thinkingBudget === true,
     thinkingBudgetPauseGrammar: parsed?.thinkingBudgetPauseGrammar === true,
+    thinkingBudgetMultiEnd: parsed?.thinkingBudgetMultiEnd === true,
     penaltyPromptTokens: parsed?.penaltyPromptTokens === true,
     penaltyPromptTokensWithGrammar: parsed?.penaltyPromptTokensWithGrammar === true,
     lazyGrammar: parsed?.lazyGrammar === true,
@@ -482,6 +500,8 @@ export function requireCompletionCapabilities(
     sampling.minP !== 0 && !capabilities.minP ? 'minP' : null,
     sampling.presencePenalty !== 0 && !capabilities.presencePenalty ? 'presencePenalty' : null,
     sampling.thinkingBudget != null && !capabilities.thinkingBudget ? 'thinkingBudget' : null,
+    sampling.thinkingBudget?.naturalEndTags != null && capabilities.thinkingBudgetMultiEnd !== true
+      ? 'thinkingBudget.naturalEndTags' : null,
     sampling.thinkingBudget?.pauseGrammar === false && !capabilities.thinkingBudgetPauseGrammar
       ? 'thinkingBudget.pauseGrammar'
       : null,

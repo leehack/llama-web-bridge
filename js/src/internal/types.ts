@@ -16,7 +16,8 @@ export type TextBytesExport =
   | 'llamadart_webgpu_tokenize_bytes_to_json'
   | 'llamadart_webgpu_embed_bytes_to_json'
   | 'llamadart_webgpu_score_next_token_bytes_to_json'
-  | 'llamadart_webgpu_begin_generation_bytes';
+  | 'llamadart_webgpu_begin_generation_bytes'
+  | 'llamadart_webgpu_begin_generation_multi_end_bytes';
 
 // The Emscripten FS subset the runtime uses, on top of the download helpers'.
 export interface LlamaCoreFs extends EmscriptenFs {
@@ -89,6 +90,7 @@ export interface LlamaCoreModule {
   _llamadart_webgpu_embed_bytes_to_json?: unknown;
   _llamadart_webgpu_score_next_token_bytes_to_json?: unknown;
   _llamadart_webgpu_begin_generation_bytes?: unknown;
+  _llamadart_webgpu_begin_generation_multi_end_bytes?: unknown;
   // Present only in builds that include LoRA adapters.
   _llamadart_webgpu_lora_api_version?: unknown;
   // Present only in builds that include chunked JS-backed model staging with per-mount identity & release.

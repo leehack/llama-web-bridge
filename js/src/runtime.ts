@@ -4541,9 +4541,13 @@ export class LlamaWebGpuBridgeRuntime {
     if (!core || typeof core._llamadart_webgpu_completion_capabilities_json !== 'function') {
       return { ...NO_COMPLETION_CAPABILITIES };
     }
-    return completionCapabilitiesFrom(
+    const capabilities = completionCapabilitiesFrom(
       core.ccall('llamadart_webgpu_completion_capabilities_json', 'string', [], []),
     );
+    if (typeof core._llamadart_webgpu_begin_generation_multi_end_bytes !== 'function') {
+      capabilities.thinkingBudgetMultiEnd = false;
+    }
+    return capabilities;
   }
 
   async createCompletion(prompt: string, options: RuntimeCompletionOptions = {}): Promise<string> {
@@ -4552,9 +4556,13 @@ export class LlamaWebGpuBridgeRuntime {
     }
     const sampling = resolveCompletionSamplingOptions(options);
     requireCompletionCapabilities(sampling, this.getCompletionCapabilities());
+    const budget = sampling.thinkingBudget;
+    const naturalEndTags = budget?.naturalEndTags;
     const input = this._coreText(
       String(prompt),
-      'llamadart_webgpu_begin_generation_bytes',
+      naturalEndTags == null
+        ? 'llamadart_webgpu_begin_generation_bytes'
+        : 'llamadart_webgpu_begin_generation_multi_end_bytes',
       'llamadart_webgpu_begin_generation',
     );
 
@@ -4608,6 +4616,7 @@ export class LlamaWebGpuBridgeRuntime {
           [
             ...input.argTypes, 'number', 'number', 'number', 'number', 'string', 'number', 'number', 'number',
             'number', 'string', 'string', 'string', 'number',
+            ...(naturalEndTags == null ? [] : ['string', 'number'] as const),
           ],
           [
             ...input.args,
@@ -4619,11 +4628,13 @@ export class LlamaWebGpuBridgeRuntime {
             seed >>> 0,
             sampling.minP,
             sampling.presencePenalty,
-            sampling.thinkingBudget?.maxTokens ?? 0,
-            sampling.thinkingBudget?.startTag ?? null,
-            sampling.thinkingBudget?.endTag ?? null,
-            sampling.thinkingBudget?.forcedMessage ?? null,
+            budget?.maxTokens ?? 0,
+            budget?.startTag ?? null,
+            budget?.endTag ?? null,
+            budget?.forcedMessage ?? null,
             sampling.penaltyPromptTokensWithGrammar ? 2 : sampling.penaltyPromptTokens ? 0 : 1,
+            ...(naturalEndTags == null
+              ? [] : [JSON.stringify(naturalEndTags), budget?.grammarReplayEndIndex ?? -1]),
           ],
           { async: true },
         ),
