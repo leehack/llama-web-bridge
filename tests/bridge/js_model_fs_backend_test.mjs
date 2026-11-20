@@ -440,6 +440,7 @@ struct ChunkEntry {
 };
 std::map<uintptr_t, ChunkEntry> g_js_chunks;
 size_t g_oom = 0;
+bool g_force_unmount_busy = false;
 }
 
 extern "C" {
@@ -487,6 +488,7 @@ int wasmfs_create_directory(const char* path, mode_t, ::backend_t backend) {
   return 0;
 }
 int wasmfs_unmount(const char* path) {
+  if (g_force_unmount_busy) return -EBUSY;
   std::string p = path ? path : "";
   auto it = g_dirs.find(p);
   if (it == g_dirs.end()) return -ENOENT;
@@ -494,6 +496,7 @@ int wasmfs_unmount(const char* path) {
   g_dirs.erase(it);
   return 0;
 }
+int32_t llamadart_webgpu_js_model_fs_api_version();
 int32_t llamadart_webgpu_mount_js_model_fs(const char* mount_path);
 int32_t llamadart_webgpu_unmount_js_model_fs(const char* mount_path);
 double llamadart_webgpu_js_model_fs_allocated_bytes();
@@ -501,6 +504,7 @@ bool llamadart_webgpu_is_js_model_path(const char* path);
 }
 
 int main() {
+  assert(llamadart_webgpu_js_model_fs_api_version() == 2);
   // 0) Path predicate must make zero heap allocations when nothing is mounted.
   g_alloc_calls = 0;
   g_track_allocs = true;
@@ -545,6 +549,24 @@ int main() {
     assert(llamadart_webgpu_js_model_fs_allocated_bytes() == 0.0);
   }
 
+  // 4) Failed unmount (-EBUSY) keeps the mount tracked so a retry succeeds cleanly.
+  assert(llamadart_webgpu_mount_js_model_fs("/busy") == 0);
+  g_force_unmount_busy = true;
+  assert(llamadart_webgpu_unmount_js_model_fs("/busy") == -EBUSY);
+  assert(llamadart_webgpu_is_js_model_path("/busy/model.gguf"));
+  g_force_unmount_busy = false;
+  assert(llamadart_webgpu_unmount_js_model_fs("/busy") == 0);
+  assert(!llamadart_webgpu_is_js_model_path("/busy/model.gguf"));
+
+  // 5) Backend instances are reused across thousands of mount/unmount cycles without growing wasmFS.backends.
+  const size_t backends_before = wasmfs::wasmFS.backends.size();
+  for (int i = 0; i < 4100; ++i) {
+    std::string p = "/jsmodels-" + std::to_string(i);
+    assert(llamadart_webgpu_mount_js_model_fs(p.c_str()) == 0);
+    assert(llamadart_webgpu_unmount_js_model_fs(p.c_str()) == 0);
+  }
+  assert(wasmfs::wasmFS.backends.size() == backends_before);
+
   // After unmount, path predicate returns to zero allocations again.
   g_alloc_calls = 0;
   g_track_allocs = true;
@@ -580,12 +602,12 @@ int wasmfs_unmount(const char* path);
     const run = spawnSync(exe, [], { encoding: 'utf8' });
     assert.equal(run.status, 0, `${run.signal}: ${run.stderr}`);
 
-    // Mutation check: removing _llamadart_js_model_fs_release_mount(mount_id) from unmount must fail.
+    // Mutation check: removing _llamadart_js_model_fs_release_mount(it->second.mount_id) from unmount must fail.
     const mutatedCppPath = path.join(dir, 'mutated.cpp');
     const mutatedExe = path.join(dir, 'test_js_model_fs_mutated');
     writeFileSync(
       mutatedCppPath,
-      cppFsSource.replace('  _llamadart_js_model_fs_release_mount(mount_id);\n', '  /* mutated_release_removed */\n'),
+      cppFsSource.replaceAll('  _llamadart_js_model_fs_release_mount(it->second.mount_id);\n', '  /* mutated_release_removed */\n'),
     );
     const mutComp = spawnSync(
       process.env.CXX || 'c++',

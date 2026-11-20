@@ -946,6 +946,7 @@ function expandModelShardUrls(modelUrlOrUrls) {
 
 // js/src/internal/model_staging.ts
 var REQUIRED_JS_MODEL_STAGING_EXPORTS = [
+  "_llamadart_webgpu_js_model_fs_api_version",
   "_llamadart_webgpu_mount_js_model_fs",
   "_llamadart_webgpu_unmount_js_model_fs",
   "_llamadart_webgpu_js_model_fs_prealloc_next",
@@ -1715,12 +1716,15 @@ var LlamaWebGpuBridgeRuntime = class {
     this._modelPath = null;
     this._modelPaths = [];
     this._ownedModelPaths = [];
+    this._modelFilesUseJsStaging = false;
     this._jsBackedStagingMounted = false;
     this._jsStagingMountCounter = 0;
     this._activeJsStagingMounts = /* @__PURE__ */ new Set();
+    this._failedUnmountJsStagingMounts = /* @__PURE__ */ new Set();
     this._modelBytes = 0;
     this._mmProjPath = null;
     this._ownedMmProjPath = null;
+    this._mmProjUsesJsStaging = false;
     this._mmSupportsVision = false;
     this._mmSupportsAudio = false;
     this._mediaFileCounter = 0;
@@ -2688,27 +2692,65 @@ var LlamaWebGpuBridgeRuntime = class {
     );
   }
   _releaseJsModelStaging(core = this._core, mountPath = null) {
-    const targets = mountPath ? this._activeJsStagingMounts.delete(mountPath) ? [mountPath] : [] : [...this._activeJsStagingMounts];
-    if (!mountPath) {
-      this._activeJsStagingMounts.clear();
+    const targets = new Set(this._failedUnmountJsStagingMounts);
+    if (mountPath) {
+      if (this._activeJsStagingMounts.has(mountPath)) {
+        targets.add(mountPath);
+      }
+    } else {
+      for (const activeMount of this._activeJsStagingMounts) {
+        targets.add(activeMount);
+      }
     }
-    this._jsBackedStagingMounted = this._activeJsStagingMounts.size > 0;
-    if (!core || targets.length === 0) {
+    if (!core || core.ABORT === true) {
+      for (const targetMount of targets) {
+        this._activeJsStagingMounts.delete(targetMount);
+        this._failedUnmountJsStagingMounts.delete(targetMount);
+      }
+      this._jsBackedStagingMounted = this._activeJsStagingMounts.size > 0;
       return;
     }
-    if (core.ABORT === true) {
+    if (targets.size === 0) {
       return;
     }
     for (const targetMount of targets) {
+      let unmounted = false;
       try {
-        core.ccall("llamadart_webgpu_unmount_js_model_fs", "number", ["string"], [targetMount]);
+        const rc = Number(
+          core.ccall("llamadart_webgpu_unmount_js_model_fs", "number", ["string"], [targetMount])
+        );
+        unmounted = rc === 0;
       } catch (_) {
+        unmounted = false;
+      }
+      if (unmounted) {
+        this._activeJsStagingMounts.delete(targetMount);
+        this._failedUnmountJsStagingMounts.delete(targetMount);
+      } else {
+        this._failedUnmountJsStagingMounts.add(targetMount);
       }
     }
+    this._jsBackedStagingMounted = this._activeJsStagingMounts.size > 0;
   }
   _releaseModelFiles(mountPath = null) {
-    const paths = [...this._ownedModelPaths];
-    this._ownedModelPaths = [];
+    if (this._modelFilesUseJsStaging) {
+      const paths2 = [...this._ownedModelPaths];
+      this._ownedModelPaths = [];
+      this._modelFilesUseJsStaging = false;
+      let removed2 = 0;
+      for (const path of paths2) {
+        if (this._deleteFsFile(path)) {
+          removed2 += 1;
+        }
+      }
+      this._modelPaths = [];
+      this._modelPath = null;
+      if (mountPath) {
+        this._releaseJsModelStaging(this._core, mountPath);
+      }
+      return removed2;
+    }
+    const paths = Array.isArray(this._modelPaths) && this._modelPaths.length > 0 ? [...this._modelPaths] : this._modelPath ? [this._modelPath] : [];
     let removed = 0;
     for (const path of paths) {
       if (this._deleteFsFile(path)) {
@@ -2716,10 +2758,6 @@ var LlamaWebGpuBridgeRuntime = class {
       }
     }
     this._modelPaths = [];
-    this._modelPath = null;
-    if (mountPath) {
-      this._releaseJsModelStaging(this._core, mountPath);
-    }
     return removed;
   }
   // A load replaces the current model. Free it, its projector and their FS files
@@ -2727,8 +2765,9 @@ var LlamaWebGpuBridgeRuntime = class {
   // The core refuses while a generation or speech synthesis is still active,
   // which leaves the current model untouched.
   async _releaseLoadedModel(core) {
+    const projectorPath = this._mmProjPath;
     const hasModelFiles = this._ownedModelPaths.length > 0 || Array.isArray(this._modelPaths) && this._modelPaths.length > 0;
-    if (this._modelBytes <= 0 && !this._mmProjPath && !this._ownedMmProjPath && !hasModelFiles) {
+    if (this._modelBytes <= 0 && !projectorPath && !this._ownedMmProjPath && !hasModelFiles) {
       return false;
     }
     const rc = Number(await core.ccall("llamadart_webgpu_free_model", "number", [], [], { async: true }));
@@ -2737,10 +2776,11 @@ var LlamaWebGpuBridgeRuntime = class {
     }
     this._loraAdaptersLoaded = false;
     this._clearStagedMediaFiles();
-    if (this._ownedMmProjPath) {
-      this._deleteFsFile(this._ownedMmProjPath);
-      this._ownedMmProjPath = null;
+    if (!this._mmProjUsesJsStaging || projectorPath && this._ownedMmProjPath === projectorPath) {
+      this._deleteFsFile(projectorPath);
     }
+    this._ownedMmProjPath = null;
+    this._mmProjUsesJsStaging = false;
     this._releaseModelFiles();
     this._releaseJsModelStaging(core);
     this._modelPath = null;
@@ -3326,9 +3366,10 @@ var LlamaWebGpuBridgeRuntime = class {
       this._runtimeNotes.push("model_fetch_backend_skipped_split");
     }
     let stagingMountPath = null;
+    let useJsBackedStaging = false;
     try {
       if (!loadedViaRemoteFetch) {
-        const useJsBackedStaging = this._config.jsBackedModelStaging === true;
+        useJsBackedStaging = this._config.jsBackedModelStaging === true;
         let modelDir = "/models";
         if (useJsBackedStaging) {
           stagingMountPath = this._mountJsBackedStaging(core, "model_staging_js_backed");
@@ -3353,6 +3394,7 @@ var LlamaWebGpuBridgeRuntime = class {
         const modelPaths = [];
         const ownedPaths = [];
         this._ownedModelPaths = ownedPaths;
+        this._modelFilesUseJsStaging = useJsBackedStaging;
         let totalModelBytes = 0;
         const maxStreamResumeRetries = Number.isFinite(options.streamResumeRetries) ? Math.max(0, Math.trunc(options.streamResumeRetries)) : 8;
         const streamChunkTimeoutMs = this._resolveStreamChunkTimeoutMs(
@@ -3586,7 +3628,15 @@ var LlamaWebGpuBridgeRuntime = class {
           if (operationSignal?.aborted) {
             this._loadedModelUrl = null;
           }
-          this._releaseModelFiles(stagingMountPath);
+          if (useJsBackedStaging) {
+            this._releaseModelFiles(stagingMountPath);
+          } else {
+            this._ownedModelPaths = [];
+            this._modelFilesUseJsStaging = false;
+            for (const modelPath of modelPaths) {
+              this._deleteFsFile(modelPath);
+            }
+          }
           throw error;
         }
       }
@@ -3741,6 +3791,8 @@ var LlamaWebGpuBridgeRuntime = class {
       } catch (_) {
       }
       this._mmProjPath = null;
+      this._ownedMmProjPath = null;
+      this._mmProjUsesJsStaging = false;
       this._mmSupportsVision = false;
       this._mmSupportsAudio = false;
       this._mediaFileCounter = 0;
@@ -3751,8 +3803,10 @@ var LlamaWebGpuBridgeRuntime = class {
         this._runtimeNotes.push("model_file_released");
       }
     } finally {
-      this._releaseModelFiles(stagingMountPath);
-      this._releaseJsModelStaging(core, stagingMountPath);
+      if (useJsBackedStaging) {
+        this._releaseModelFiles(stagingMountPath);
+        this._releaseJsModelStaging(core, stagingMountPath);
+      }
     }
     this._emitSuppressedWarmupWarningSummaryIfNeeded();
     return 1;
@@ -3793,7 +3847,8 @@ var LlamaWebGpuBridgeRuntime = class {
           );
         }
         this._mmProjPath = mmprojPath;
-        this._ownedMmProjPath = mmprojPath;
+        this._mmProjUsesJsStaging = useJsBackedStaging;
+        this._ownedMmProjPath = useJsBackedStaging ? mmprojPath : null;
         createdMmprojPath = mmprojPath;
         let knownTotalBytes = 0;
         let directWriter = null;
@@ -3842,9 +3897,12 @@ var LlamaWebGpuBridgeRuntime = class {
         lastError = error;
         this._mmProjPath = null;
         this._ownedMmProjPath = null;
+        this._mmProjUsesJsStaging = false;
         this._mmSupportsVision = false;
         this._mmSupportsAudio = false;
-        if (createdMmprojPath) {
+        if (!useJsBackedStaging) {
+          this._deleteFsFile(mmprojPath);
+        } else if (createdMmprojPath) {
           this._deleteFsFile(createdMmprojPath);
         }
         const stagingAllocError = useJsBackedStaging ? this._consumeStagingAllocFailure(core, error, 0) : null;
@@ -3872,6 +3930,7 @@ var LlamaWebGpuBridgeRuntime = class {
     if (!this._core) {
       this._mmProjPath = null;
       this._ownedMmProjPath = null;
+      this._mmProjUsesJsStaging = false;
       this._mmSupportsVision = false;
       this._mmSupportsAudio = false;
       this._mmProjSourceUrl = null;
@@ -3884,10 +3943,11 @@ var LlamaWebGpuBridgeRuntime = class {
     if (rc !== 0) {
       throw new Error(this._coreErrorMessage("Failed to unload multimodal projector", rc));
     }
-    if (mmprojPath && this._ownedMmProjPath === mmprojPath) {
+    if (!this._mmProjUsesJsStaging || mmprojPath && this._ownedMmProjPath === mmprojPath) {
       this._deleteFsFile(mmprojPath);
     }
     this._ownedMmProjPath = null;
+    this._mmProjUsesJsStaging = false;
     this._mmProjPath = null;
     this._mmSupportsVision = false;
     this._mmSupportsAudio = false;
@@ -5557,23 +5617,27 @@ var LlamaWebGpuBridgeRuntime = class {
         );
       }
       await this._core.ccall("llamadart_webgpu_shutdown", null, [], [], { async: true });
-      if (mmprojPath && this._ownedMmProjPath === mmprojPath) {
+      if (!this._mmProjUsesJsStaging || mmprojPath && this._ownedMmProjPath === mmprojPath) {
         this._deleteFsFile(mmprojPath);
       }
-      this._releaseModelFiles();
+      if (this._modelFilesUseJsStaging) {
+        this._releaseModelFiles();
+      }
       this._releaseJsModelStaging(this._core);
+    } else {
+      this._releaseJsModelStaging(null);
     }
     this._modelPath = null;
     this._modelPaths = [];
     this._ownedModelPaths = [];
-    this._jsBackedStagingMounted = false;
-    this._activeJsStagingMounts.clear();
+    this._modelFilesUseJsStaging = false;
     this._modelBytes = 0;
     this._modelSource = "network";
     this._modelCacheState = "disabled";
     this._loadedModelUrl = null;
     this._mmProjPath = null;
     this._ownedMmProjPath = null;
+    this._mmProjUsesJsStaging = false;
     this._mmProjSourceUrl = null;
     this._mmSupportsVision = false;
     this._mmSupportsAudio = false;

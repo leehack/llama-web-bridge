@@ -2,6 +2,7 @@ import type { ModelStagingErrorCode } from '../llama_webgpu_bridge.d.ts';
 import type { LlamaCoreModule } from './types.ts';
 
 export const REQUIRED_JS_MODEL_STAGING_EXPORTS = [
+  '_llamadart_webgpu_js_model_fs_api_version',
   '_llamadart_webgpu_mount_js_model_fs',
   '_llamadart_webgpu_unmount_js_model_fs',
   '_llamadart_webgpu_js_model_fs_prealloc_next',

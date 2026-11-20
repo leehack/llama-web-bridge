@@ -101,6 +101,7 @@ function createStagingHarness({
     FS: fs,
     UTF8ToString: () => lastErrorText,
     ...(includeJsModelFsExports ? {
+      _llamadart_webgpu_js_model_fs_api_version: () => 2,
       _llamadart_webgpu_mount_js_model_fs: () => 0,
       _llamadart_webgpu_unmount_js_model_fs: () => 0,
       _llamadart_webgpu_js_model_fs_prealloc_next: () => 0,
@@ -1186,6 +1187,7 @@ test('failed Safari GPU probe fallback unmounts and releases JS-backed staged mo
     harness.runtime._nCtx = opts.nCtx;
     harness.runtime._nGpuLayers = opts.nGpuLayers;
   };
+  harness.runtime._fetchWithTimeout = async () => new Response(new Uint8Array([1, 2, 3, 4]));
   harness.runtime.createCompletion = async () => {
     throw new Error('corrupted safari gpu output');
   };
@@ -1470,4 +1472,159 @@ test('staging off preserves existing projector capabilities on /mmproj mkdir fai
     assert.equal(err.message, 'custom worker refused load');
     await offBridge.dispose();
   });
+});
+
+test('jsBackedModelStaging rejects pre-v2 core missing _llamadart_webgpu_js_model_fs_api_version with MODEL_STAGING_UNSUPPORTED', async () => {
+  const harness = createStagingHarness({ jsBackedModelStaging: true });
+  delete harness.core._llamadart_webgpu_js_model_fs_api_version;
+
+  const err = await harness.runtime.loadModelFromUrl('https://models.test/small.gguf', {
+    nCtx: 2048,
+    nGpuLayers: 0,
+    useCache: false,
+    forceRemoteFetchBackend: false,
+  }).then(() => assert.fail('must reject'), (e) => e);
+
+  assert.ok(err instanceof ModelStagingError, String(err));
+  assert.equal(err.code, 'MODEL_STAGING_UNSUPPORTED');
+  assert.match(err.message, /_llamadart_webgpu_js_model_fs_api_version/);
+  assert.equal(harness.ccalls.length, 0, 'must reject v1 core before calling ccall');
+});
+
+test('failed unmount stays tracked and retries on next cleanup and on dispose', async () => {
+  const harness = createStagingHarness({ jsBackedModelStaging: true });
+  harness.runtime._resolveNativeLoadOptions = (opts) => {
+    harness.runtime._nCtx = opts.nCtx;
+    harness.runtime._nGpuLayers = opts.nGpuLayers;
+  };
+  harness.runtime._fetchWithTimeout = async () => new Response(new Uint8Array([1, 2, 3, 4]));
+  let busyMounts = new Set(['/jsmodels-1', '/jsmodels-2']);
+  const origCcall = harness.core.ccall.bind(harness.core);
+  const unmountAttempts = [];
+  harness.core.ccall = (name, returnType, argTypes, args = [], opts) => {
+    if (name === 'llamadart_webgpu_unmount_js_model_fs') {
+      unmountAttempts.push(args[0]);
+      if (busyMounts.has(args[0])) {
+        return -16;
+      }
+    }
+    return origCcall(name, returnType, argTypes, args, opts);
+  };
+
+  await harness.runtime.loadModelFromUrl('https://models.test/one.gguf', {
+    nCtx: 128,
+    nGpuLayers: 0,
+    useCache: false,
+    forceRemoteFetchBackend: false,
+  });
+  assert.equal(harness.runtime._jsBackedStagingMounted, true);
+  assert.equal(harness.runtime._activeJsStagingMounts.has('/jsmodels-1'), true);
+
+  // Clear -EBUSY for /jsmodels-1 and load projector (/jsmodels-2, kept busy):
+  // per-mount cleanup of /jsmodels-2 still retries /jsmodels-1 via _failedUnmountJsStagingMounts.
+  busyMounts.delete('/jsmodels-1');
+  await harness.runtime.loadMultimodalProjector('https://models.test/mmproj.gguf');
+  assert.equal(harness.runtime._activeJsStagingMounts.has('/jsmodels-1'), false);
+  assert.equal(harness.runtime._activeJsStagingMounts.has('/jsmodels-2'), true);
+  assert.equal(harness.runtime._jsBackedStagingMounted, true);
+
+  // dispose() retries /jsmodels-2 and clears it once unmount succeeds.
+  busyMounts.clear();
+  await harness.bridge.dispose();
+  assert.equal(harness.runtime._activeJsStagingMounts.size, 0);
+  assert.equal(harness.runtime._jsBackedStagingMounted, false);
+  assert.ok(unmountAttempts.filter((p) => p === '/jsmodels-1').length >= 2);
+  assert.ok(unmountAttempts.filter((p) => p === '/jsmodels-2').length >= 2);
+});
+
+test('staging off cleanup matches main unchanged (retry-unlink, 404/503 unlink, replace/unload)', async () => {
+  const harness = createStagingHarness({ jsBackedModelStaging: false });
+  harness.runtime._resolveNativeLoadOptions = (opts) => {
+    harness.runtime._nCtx = opts.nCtx;
+    harness.runtime._nGpuLayers = opts.nGpuLayers;
+  };
+  let responseStatus = 200;
+  delete harness.runtime._getCachedModelResponse;
+  harness.runtime._fetchWithTimeout = async () => new Response(
+    responseStatus === 200 ? new Uint8Array([1, 2, 3, 4]) : null,
+    { status: responseStatus, statusText: responseStatus === 200 ? 'OK' : 'Error' },
+  );
+
+  // One-shot unlink failure on post-load cleanup leaves file until unload/replace retries and removes it.
+  let failOnce = '/models/one.gguf';
+  const attempted = [];
+  const origUnlink = harness.fs.unlink.bind(harness.fs);
+  harness.fs.unlink = (p) => {
+    const exists = harness.fs.files.has(p);
+    if (exists) {
+      attempted.push(p);
+    }
+    if (exists && failOnce === p) {
+      failOnce = '';
+      throw new Error('EBUSY');
+    }
+    return origUnlink(p);
+  };
+  await harness.runtime.loadModelFromUrl('https://models.test/one.gguf', {
+    nCtx: 128,
+    nGpuLayers: 0,
+    useCache: false,
+    forceRemoteFetchBackend: false,
+  });
+  assert.equal(harness.fs.files.has('/models/one.gguf'), true);
+
+  failOnce = '/mmproj/mmproj.gguf';
+  await harness.runtime.loadMultimodalProjector('https://models.test/mmproj.gguf');
+  assert.equal(harness.fs.files.has('/mmproj/mmproj.gguf'), true);
+
+  await harness.runtime.unloadMultimodalProjector();
+  assert.equal(harness.fs.files.has('/mmproj/mmproj.gguf'), false);
+
+  await harness.runtime.loadModelFromUrl('https://models.test/two.gguf', {
+    nCtx: 128,
+    nGpuLayers: 0,
+    useCache: false,
+    forceRemoteFetchBackend: false,
+  });
+  assert.equal(harness.fs.files.has('/models/one.gguf'), false);
+  assert.equal(attempted.filter((p) => p === '/models/one.gguf').length, 2);
+  assert.equal(attempted.filter((p) => p === '/mmproj/mmproj.gguf').length, 2);
+
+  // Pre-existing /models/* on 404 and /mmproj/* on 404/503 are unlinked when staging is off, matching main.
+  harness.fs.writeFile('/models/missing_model404.gguf', new Uint8Array([7, 3, 9]));
+  responseStatus = 404;
+  await assert.rejects(
+    harness.runtime.loadModelFromUrl('https://models.test/missing_model404.gguf', {
+      nCtx: 128,
+      nGpuLayers: 0,
+      useCache: false,
+      forceRemoteFetchBackend: false,
+    }),
+    /404/,
+  );
+  assert.equal(harness.fs.files.has('/models/missing_model404.gguf'), false);
+
+  responseStatus = 200;
+  await harness.runtime.loadModelFromUrl('https://models.test/two.gguf', {
+    nCtx: 128,
+    nGpuLayers: 0,
+    useCache: false,
+    forceRemoteFetchBackend: false,
+  });
+
+  harness.fs.writeFile('/mmproj/missing404.gguf', new Uint8Array([7, 3, 9]));
+  responseStatus = 404;
+  await assert.rejects(
+    harness.runtime.loadMultimodalProjector('https://models.test/missing404.gguf'),
+    /404/,
+  );
+  assert.equal(harness.fs.files.has('/mmproj/missing404.gguf'), false);
+
+  harness.fs.writeFile('/mmproj/err503.gguf', new Uint8Array([7, 3, 9]));
+  responseStatus = 503;
+  await assert.rejects(
+    harness.runtime.loadMultimodalProjector('https://models.test/err503.gguf'),
+    /503/,
+  );
+  assert.equal(harness.fs.files.has('/mmproj/err503.gguf'), false);
 });

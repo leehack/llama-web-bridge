@@ -8,6 +8,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <unordered_map>
+#include <vector>
 
 #include <emscripten/emscripten.h>
 #include <emscripten/wasmfs.h>
@@ -100,10 +101,14 @@ public:
 };
 
 class ChunkedJsModelBackend : public wasmfs::Backend {
-  int32_t mount_id_;
+  int32_t mount_id_ = 0;
 
 public:
-  explicit ChunkedJsModelBackend(int32_t mount_id) : mount_id_(mount_id) {}
+  explicit ChunkedJsModelBackend(int32_t mount_id = 0) : mount_id_(mount_id) {}
+
+  void setMountId(int32_t mount_id) {
+    mount_id_ = mount_id;
+  }
 
   std::shared_ptr<wasmfs::DataFile> createFile(mode_t mode) override {
     return std::make_shared<ChunkedJsModelFile>(mode, this, mount_id_);
@@ -118,16 +123,32 @@ public:
   }
 };
 
+struct MountedJsModelEntry {
+  int32_t mount_id = 0;
+  wasmfs::backend_t backend = nullptr;
+};
+
 bool g_has_js_model_mounts = false;
 
-std::unordered_map<std::string, int32_t> & mounted_js_model_paths() {
-  static auto * paths = new std::unordered_map<std::string, int32_t>();
+std::unordered_map<std::string, MountedJsModelEntry> & mounted_js_model_paths() {
+  static auto * paths = new std::unordered_map<std::string, MountedJsModelEntry>();
   return *paths;
+}
+
+// Reuse unmounted ChunkedJsModelBackend instances so repeated mounts do not grow
+// WasmFS's global backend table across the lifetime of the core.
+std::vector<wasmfs::backend_t> & free_js_model_backends() {
+  static auto * backends = new std::vector<wasmfs::backend_t>();
+  return *backends;
 }
 
 }  // namespace
 
 extern "C" {
+
+EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_js_model_fs_api_version() {
+  return 2;
+}
 
 EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_mount_js_model_fs(const char * mount_path) {
   if (mount_path == nullptr || std::strlen(mount_path) == 0) {
@@ -147,21 +168,31 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_mount_js_model_fs(const char * mou
     next_mount_id = 1;
   }
 
-  wasmfs::backend_t backend =
-      wasmfs::wasmFS.addBackend(std::make_unique<ChunkedJsModelBackend>(mount_id));
+  auto & free_backends = free_js_model_backends();
+  wasmfs::backend_t backend = nullptr;
+  if (!free_backends.empty()) {
+    backend = free_backends.back();
+    free_backends.pop_back();
+  } else {
+    backend = wasmfs::wasmFS.addBackend(std::make_unique<ChunkedJsModelBackend>(0));
+  }
   if (backend == nullptr) {
     return -ENOMEM;
   }
+
+  static_cast<ChunkedJsModelBackend *>(backend)->setMountId(mount_id);
 
   const int rc = wasmfs_create_directory(
       mount_path,
       0777,
       reinterpret_cast<::backend_t>(backend));
   if (rc != 0) {
+    static_cast<ChunkedJsModelBackend *>(backend)->setMountId(0);
+    free_backends.push_back(backend);
     return rc;
   }
 
-  mounted.emplace(std::move(path_str), mount_id);
+  mounted.emplace(std::move(path_str), MountedJsModelEntry{mount_id, backend});
   g_has_js_model_mounts = true;
   return 0;
 }
@@ -192,18 +223,27 @@ bool llamadart_webgpu_is_js_model_path(const char * path) {
 
 EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_unmount_js_model_fs(const char * mount_path) {
   auto & mounted = mounted_js_model_paths();
+  auto & free_backends = free_js_model_backends();
 
   if (mount_path == nullptr || std::strlen(mount_path) == 0) {
     int first_error = 0;
-    for (const auto & entry : mounted) {
-      _llamadart_js_model_fs_release_mount(entry.second);
-      const int rc = wasmfs_unmount(entry.first.c_str());
-      if (rc != 0 && rc != -ENOENT && first_error == 0) {
-        first_error = rc;
+    for (auto it = mounted.begin(); it != mounted.end(); ) {
+      const int rc = wasmfs_unmount(it->first.c_str());
+      if (rc != 0 && rc != -ENOENT) {
+        if (first_error == 0) {
+          first_error = rc;
+        }
+        ++it;
+        continue;
       }
+      _llamadart_js_model_fs_release_mount(it->second.mount_id);
+      if (it->second.backend != nullptr) {
+        static_cast<ChunkedJsModelBackend *>(it->second.backend)->setMountId(0);
+        free_backends.push_back(it->second.backend);
+      }
+      it = mounted.erase(it);
     }
-    mounted.clear();
-    g_has_js_model_mounts = false;
+    g_has_js_model_mounts = !mounted.empty();
     return first_error;
   }
 
@@ -212,12 +252,19 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_unmount_js_model_fs(const char * m
     return wasmfs_get_backend_by_path(mount_path) != nullptr ? -EINVAL : 0;
   }
 
-  const int32_t mount_id = it->second;
-  _llamadart_js_model_fs_release_mount(mount_id);
+  const int rc = wasmfs_unmount(mount_path);
+  if (rc != 0 && rc != -ENOENT) {
+    return rc;
+  }
+
+  _llamadart_js_model_fs_release_mount(it->second.mount_id);
+  if (it->second.backend != nullptr) {
+    static_cast<ChunkedJsModelBackend *>(it->second.backend)->setMountId(0);
+    free_backends.push_back(it->second.backend);
+  }
   mounted.erase(it);
   g_has_js_model_mounts = !mounted.empty();
-  const int rc = wasmfs_unmount(mount_path);
-  return rc == -ENOENT ? 0 : rc;
+  return 0;
 }
 
 EMSCRIPTEN_KEEPALIVE void llamadart_webgpu_js_model_fs_prealloc_next(double bytes) {

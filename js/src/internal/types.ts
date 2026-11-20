@@ -90,7 +90,8 @@ export interface LlamaCoreModule {
   _llamadart_webgpu_begin_generation_bytes?: unknown;
   // Present only in builds that include LoRA adapters.
   _llamadart_webgpu_lora_api_version?: unknown;
-  // Present only in builds that include chunked JS-backed model staging.
+  // Present only in builds that include chunked JS-backed model staging with per-mount release.
+  _llamadart_webgpu_js_model_fs_api_version?: unknown;
   _llamadart_webgpu_mount_js_model_fs?: unknown;
   _llamadart_webgpu_unmount_js_model_fs?: unknown;
   _llamadart_webgpu_js_model_fs_prealloc_next?: unknown;
