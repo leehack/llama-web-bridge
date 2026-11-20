@@ -32,6 +32,7 @@
 #include "mtmd-helper.h"
 #include "mtmd.h"
 #include "ngram-cache.h"
+#include "nlohmann/json.hpp"
 #include "reasoning-budget.h"
 #include "speculative.h"
 

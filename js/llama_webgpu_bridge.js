@@ -240,6 +240,7 @@ var NO_COMPLETION_CAPABILITIES = Object.freeze({
   minP: false,
   thinkingBudget: false,
   thinkingBudgetPauseGrammar: false,
+  thinkingBudgetMultiEnd: false,
   penaltyPromptTokens: false,
   penaltyPromptTokensWithGrammar: false,
   lazyGrammar: false,
@@ -257,8 +258,7 @@ function optionalNumber(value, name, isValid, range) {
   }
   return value;
 }
-function tag(budget, name) {
-  const value = budget[name];
+function tag(value, name) {
   if (typeof value !== "string" || value.trim().length === 0) {
     throw new TypeError(`CompletionOptions.thinkingBudget.${name} must be a non-empty string.`);
   }
@@ -278,8 +278,8 @@ function thinkingBudget(value, hasMediaParts) {
       `CompletionOptions.thinkingBudget.maxTokens must be an integer from 0 to ${MAX_THINKING_BUDGET_TOKENS}; got ${String(maxTokens)}.`
     );
   }
-  const startTag = tag(budget, "startTag");
-  const endTag = tag(budget, "endTag");
+  const startTag = tag(budget.startTag, "startTag");
+  const endTag = tag(budget.endTag, "endTag");
   const forcedMessage = budget.forcedMessage ?? "";
   if (typeof forcedMessage !== "string") {
     throw new TypeError("CompletionOptions.thinkingBudget.forcedMessage must be a string.");
@@ -294,7 +294,21 @@ function thinkingBudget(value, hasMediaParts) {
   if (hasMediaParts) {
     throw new Error("CompletionOptions.thinkingBudget supports text-only prompts; remove the media parts.");
   }
-  return { maxTokens, startTag, endTag, forcedMessage, pauseGrammar };
+  const resolved = { maxTokens, startTag, endTag, forcedMessage, pauseGrammar };
+  const ends = budget.naturalEndTags;
+  const replayIndex = budget.grammarReplayEndIndex;
+  if (ends === void 0 && replayIndex === void 0) {
+    return resolved;
+  }
+  if (!Array.isArray(ends) || ends.length === 0) {
+    throw new TypeError("CompletionOptions.thinkingBudget.naturalEndTags must be a non-empty array of strings.");
+  }
+  const naturalEndTags = Array.from(ends, (value2, index) => tag(value2, `naturalEndTags[${index}]`));
+  const grammarReplayEndIndex = replayIndex === void 0 ? -1 : replayIndex;
+  if (typeof grammarReplayEndIndex !== "number" || !Number.isInteger(grammarReplayEndIndex) || grammarReplayEndIndex < -1 || grammarReplayEndIndex >= naturalEndTags.length) {
+    throw new RangeError("CompletionOptions.thinkingBudget.grammarReplayEndIndex must be -1 or an index into naturalEndTags.");
+  }
+  return { ...resolved, naturalEndTags, grammarReplayEndIndex };
 }
 function speculativeInteger(config, name, min, max) {
   const value = config[name];
@@ -553,6 +567,7 @@ function completionCapabilitiesFrom(raw) {
     minP: parsed?.minP === true,
     thinkingBudget: parsed?.thinkingBudget === true,
     thinkingBudgetPauseGrammar: parsed?.thinkingBudgetPauseGrammar === true,
+    thinkingBudgetMultiEnd: parsed?.thinkingBudgetMultiEnd === true,
     penaltyPromptTokens: parsed?.penaltyPromptTokens === true,
     penaltyPromptTokensWithGrammar: parsed?.penaltyPromptTokensWithGrammar === true,
     lazyGrammar: parsed?.lazyGrammar === true,
@@ -565,6 +580,7 @@ function requireCompletionCapabilities(sampling, capabilities) {
     sampling.minP !== 0 && !capabilities.minP ? "minP" : null,
     sampling.presencePenalty !== 0 && !capabilities.presencePenalty ? "presencePenalty" : null,
     sampling.thinkingBudget != null && !capabilities.thinkingBudget ? "thinkingBudget" : null,
+    sampling.thinkingBudget?.naturalEndTags != null && capabilities.thinkingBudgetMultiEnd !== true ? "thinkingBudget.naturalEndTags" : null,
     sampling.thinkingBudget?.pauseGrammar === false && !capabilities.thinkingBudgetPauseGrammar ? "thinkingBudget.pauseGrammar" : null,
     sampling.grammarOptions?.lazy === true && !capabilities.lazyGrammar ? "grammarLazy" : null,
     sampling.grammarOptions != null && sampling.grammarOptions.root !== "root" && !capabilities.lazyGrammar ? "grammarRoot" : null,
@@ -5397,9 +5413,13 @@ var LlamaWebGpuBridgeRuntime = class {
     if (!core || typeof core._llamadart_webgpu_completion_capabilities_json !== "function") {
       return { ...NO_COMPLETION_CAPABILITIES };
     }
-    return completionCapabilitiesFrom(
+    const capabilities = completionCapabilitiesFrom(
       core.ccall("llamadart_webgpu_completion_capabilities_json", "string", [], [])
     );
+    if (typeof core._llamadart_webgpu_begin_generation_multi_end_bytes !== "function") {
+      capabilities.thinkingBudgetMultiEnd = false;
+    }
+    return capabilities;
   }
   async createCompletion(prompt, options = {}) {
     if (this._modelBytes <= 0) {
@@ -5407,9 +5427,11 @@ var LlamaWebGpuBridgeRuntime = class {
     }
     const sampling = resolveCompletionSamplingOptions(options);
     requireCompletionCapabilities(sampling, this.getCompletionCapabilities());
+    const budget = sampling.thinkingBudget;
+    const naturalEndTags = budget?.naturalEndTags;
     const input = this._coreText(
       String(prompt),
-      "llamadart_webgpu_begin_generation_bytes",
+      naturalEndTags == null ? "llamadart_webgpu_begin_generation_bytes" : "llamadart_webgpu_begin_generation_multi_end_bytes",
       "llamadart_webgpu_begin_generation"
     );
     this._abortRequested = false;
@@ -5462,7 +5484,8 @@ var LlamaWebGpuBridgeRuntime = class {
             "string",
             "string",
             "string",
-            "number"
+            "number",
+            ...naturalEndTags == null ? [] : ["string", "number"]
           ],
           [
             ...input.args,
@@ -5474,11 +5497,12 @@ var LlamaWebGpuBridgeRuntime = class {
             seed >>> 0,
             sampling.minP,
             sampling.presencePenalty,
-            sampling.thinkingBudget?.maxTokens ?? 0,
-            sampling.thinkingBudget?.startTag ?? null,
-            sampling.thinkingBudget?.endTag ?? null,
-            sampling.thinkingBudget?.forcedMessage ?? null,
-            sampling.penaltyPromptTokensWithGrammar ? 2 : sampling.penaltyPromptTokens ? 0 : 1
+            budget?.maxTokens ?? 0,
+            budget?.startTag ?? null,
+            budget?.endTag ?? null,
+            budget?.forcedMessage ?? null,
+            sampling.penaltyPromptTokensWithGrammar ? 2 : sampling.penaltyPromptTokens ? 0 : 1,
+            ...naturalEndTags == null ? [] : [JSON.stringify(naturalEndTags), budget?.grammarReplayEndIndex ?? -1]
           ],
           { async: true }
         )
@@ -7816,7 +7840,10 @@ var LlamaWebGpuBridge = class {
   }
   async _createCompletionUnlocked(prompt, options = {}) {
     const sampling = resolveCompletionSamplingOptions(options);
-    if (sampling.penaltyPromptTokensWithGrammar || sampling.thinkingBudget?.pauseGrammar === false) {
+    if (sampling.thinkingBudget?.naturalEndTags != null) {
+      options = { ...options, thinkingBudget: sampling.thinkingBudget };
+    }
+    if (sampling.penaltyPromptTokensWithGrammar || sampling.thinkingBudget?.pauseGrammar === false || this._workerProxy && sampling.thinkingBudget?.naturalEndTags != null) {
       requireCompletionCapabilities(sampling, await this._getCompletionCapabilitiesUnlocked());
     }
     const isWarmup = options?.warmup === true;

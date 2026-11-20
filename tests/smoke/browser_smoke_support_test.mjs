@@ -500,7 +500,7 @@ assert.deepEqual(webGpuLaunchArgs('linux'), [
         p.modeResults[3].capabilitiesBeforeLoad.minP = true;
         p.modeResults[3].capabilitiesAfterLoad = null;
       }), both, [
-        "wasm64 worker: capabilities before the load: expected none, got {'presencePenalty': False, 'minP': True, 'thinkingBudget': False, 'thinkingBudgetPauseGrammar': False, "
+        "wasm64 worker: capabilities before the load: expected none, got {'presencePenalty': False, 'minP': True, 'thinkingBudget': False, 'thinkingBudgetPauseGrammar': False, 'thinkingBudgetMultiEnd': False, "
           + "'penaltyPromptTokens': False, 'penaltyPromptTokensWithGrammar': False, 'lazyGrammar': False}",
         'wasm64 worker: capabilities after the load: expected all, got None',
         `wasm64 worker: sampler outputs: {${Object.entries(samplerRuns()).map(([n, t]) => `'${n}': '${t}'`).join(', ')}}`,

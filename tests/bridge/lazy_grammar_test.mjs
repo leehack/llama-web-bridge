@@ -290,13 +290,18 @@ const CASES = [
   }],
 
   ['only a lazy grammar accepts through the catching wrapper', async () => {
-    const sample = functionBody('llama_token sample_next_token(');
+    const accept = functionBody('bool accept_generation_grammar(');
     assert.match(
-      sample,
-      /if \(!g_active_grammar_lazy\) \{\s*llama_sampler_accept\(g_active_grammar, token\);\s*\} else \{\s*std::string grammar_error;\s*if \(!llamadart_webgpu_grammar_sampler_accept\(\s*g_active_grammar, token, &grammar_error\)\) \{\s*set_error\([^;]*\);\s*return LLAMA_TOKEN_NULL;/,
+      accept,
+      /if \(!g_active_grammar_lazy\) \{\s*llama_sampler_accept\(g_active_grammar, token\);\s*return true;\s*\}/,
     );
+    assert.match(
+      accept,
+      /if \(!llamadart_webgpu_grammar_sampler_accept\(g_active_grammar, token, &grammar_error\)\) \{\s*set_error\([^;]*\);\s*return false;/,
+    );
+    assert.match(functionBody('llama_token sample_next_token('), /if \(use_grammar && !accept_generation_grammar\(token\)\)/);
     assert.ok(
-      sample.includes(`"${LAZY_GRAMMAR_REJECTED_ERROR_TEXT}: "`),
+      accept.includes(`"${LAZY_GRAMMAR_REJECTED_ERROR_TEXT}: "`),
       'the facade recognizes the core error and keeps the worker',
     );
     for (const name of ['llamadart_webgpu_grammar_sampler_init', 'llamadart_webgpu_grammar_sampler_accept']) {
