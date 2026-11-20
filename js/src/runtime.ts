@@ -2230,6 +2230,7 @@ export class LlamaWebGpuBridgeRuntime {
       // Set once this candidate's core is adopted. A candidate that was
       // discarded keeps its callbacks, which must not reach the adopted core.
       let candidateCore: LlamaCoreModule | null = null;
+      let initTimer: ReturnType<typeof globalThis.setTimeout> | undefined;
       try {
         const moduleFactory = await candidate.factoryPromise;
         factoryLoaded = true;
@@ -2315,7 +2316,7 @@ export class LlamaWebGpuBridgeRuntime {
           },
           }),
           new Promise((_, reject) => {
-            globalThis.setTimeout(() => {
+            initTimer = globalThis.setTimeout(() => {
               initTimeoutError = new Error(`Bridge core init timeout (${initTimeoutMs}ms)`);
               reject(initTimeoutError);
             }, initTimeoutMs);
@@ -2345,6 +2346,9 @@ export class LlamaWebGpuBridgeRuntime {
           continue;
         }
         throw error;
+      } finally {
+        // The pending timer would keep the core reachable after disposal or retirement.
+        if (initTimer !== undefined) globalThis.clearTimeout(initTimer);
       }
     }
 

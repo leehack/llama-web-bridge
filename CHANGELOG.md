@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Clear the core initialization timer when initialization settles so it cannot keep a disposed or retired core in memory.
+
 - Stream Qwen3-TTS PCM through `onProgress` with `streamAudio`. The bridge reports `supportsIncrementalAudio` and rejects worker failures after delivery begins so callers never receive replayed audio. (#220)
 
 - Thinking budgets accept an ordered list of natural ends. A tool opener can close reasoning and activate the paused tool grammar, and an exhausted budget emits the full forced close. The loaded core reports support through `thinkingBudgetMultiEnd`.
