@@ -175,7 +175,7 @@ it.
 | `nBatch` | `number` | llama.cpp batch size override. |
 | `nUbatch` | `number` | llama.cpp micro-batch size override. |
 | `nGpuLayers` | `number` | Default GPU layer count. `0` forces CPU/WASM execution; negative/omitted values let the bridge choose. |
-| `userAgent` | `string` | User-agent override for Safari detection and the Safari GPU layer cap's version check. |
+| `userAgent` | `string` | User-agent override for Safari detection and the Safari GPU layer cap's version check. The version check requires an Apple platform and Safari's product tokens. |
 | `remoteFetchThresholdBytes` | `number` | Size threshold for trying the native remote-fetch backend for large single-file models. |
 | `remoteFetchChunkBytes` | `number` | Chunk size used by remote-fetch streaming paths. |
 | `mediaMaxImagePixels` | `number` | Maximum image pixel count before multimodal image downscaling. |
@@ -261,7 +261,7 @@ Common `options` keys:
 | `nCtx` | Context size. Defaults to the bridge runtime default, initially 4096. |
 | `nThreads`, `nThreadsBatch` | Per-load thread overrides, capped to the active runtime. |
 | `nGpuLayers` | Per-load GPU layer override. Use `0` for CPU/WASM mode. |
-| `safariMaxGpuLayers` | Per-load Safari GPU layer cap. Safari 27 and newer default to no cap. Older and unidentified Safari versions default to one layer. |
+| `safariMaxGpuLayers` | Per-load Safari GPU layer cap. Recognized Safari 27 and newer default to no cap. Older or unidentified Safari versions default to one layer. |
 | `safariGpuProbe` | Set to `false` to skip the Safari load-time GPU probe. |
 | `nBatch`, `nUbatch` | Per-load batch and micro-batch overrides. |
 | `useCache`, `force` | Cache Storage controls for model responses. A cache miss writes the model to Cache Storage while it downloads, so progress follows the download; a failed cache write leaves the model loaded but uncached, and a cancelled load stores nothing. |
@@ -271,10 +271,15 @@ Common `options` keys:
 | `loadMtp` | Loads the model's MTP layers, which `draft-mtp` speculative decoding needs. Defaults to `false`. |
 | `speculativeRollbackTokenMax` | llama.cpp's `n_rs_seq`: rollback snapshots per sequence. A model with recurrent state, such as Qwen3.5, needs at least the draft length for `draft-*` speculative decoding. Defaults to `0`. |
 
-The default Safari cap uses the `Version/` major in the user agent. The GPU
-probe runs a short completion for a text model or checks the norm of a
-normalized embedding for a pooled-embedding model. If the probe fails, the
-bridge retries at one GPU layer when possible, then on the CPU.
+The default Safari cap uses the major version from a standalone numeric
+`Version/` product in the Apple Safari user agent. Safari-like user agents
+that match the legacy detector continue to use its one-layer default cap and
+completion probe. For a pooled-embedding model on recognized Apple Safari,
+the probe runs two distinct prompts and requires finite normalized embeddings
+whose L2 norms differ from 1 by less than 0.01 and whose cosine similarity is
+below 0.999. Text models and older cores without embedding capabilities use
+the completion probe. If the probe fails, the bridge retries at one GPU layer
+when possible, then on the CPU.
 
 Returns the underlying load result from the active runtime. After a successful
 load, metadata and capability helpers reflect the loaded model.

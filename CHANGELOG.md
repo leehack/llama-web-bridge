@@ -2,8 +2,8 @@
 
 ## Unreleased
 
-- Safari 27 and newer lift the default one-layer GPU cap. In a macOS Safari 27 worker test, Qwen3.5-0.8B went from 17 to 31 tokens per second with 99 layers requested. Older and unidentified Safari versions keep the one-layer cap. `safariMaxGpuLayers` overrides either default.
-- The Safari GPU probe checks a normalized embedding for pooled-embedding models and reports `safari_gpu_probe_embedding`. This keeps EmbeddingGemma-2 on the GPU when its embeddings pass the probe.
+- Recognized Safari 27 and newer lift the default one-layer GPU cap. In a macOS Safari 27 worker test, Qwen3.5-0.8B went from 17 to 31 tokens per second with 99 layers requested. Older and unidentified Safari versions keep the one-layer cap. `safariMaxGpuLayers` overrides either default.
+- On Apple Safari, the GPU probe checks two distinct normalized embeddings for pooled-embedding models and reports `safari_gpu_probe_embedding`. This keeps EmbeddingGemma-2 on the GPU when its embeddings pass the probe.
 
 - When memory64 initialization fails, report `core_mem64_unavailable:<reason>` in model metadata and log the same reason at warn level before trying wasm32. The existing `core_mem64_unavailable` note remains available.
 

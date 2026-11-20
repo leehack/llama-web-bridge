@@ -1555,12 +1555,23 @@ function isSafariUserAgent(userAgent) {
   return hasSafariToken && !hasOtherBrowserToken;
 }
 var SAFARI_UNCAPPED_GPU_MIN_MAJOR = 27;
+var APPLE_SAFARI_PLATFORM = /^Mozilla\/5\.0 \((?:Macintosh; Intel Mac OS X \d+(?:_\d+)*|(?:iPhone|iPad|iPod touch); CPU (?:iPhone )?OS \d+(?:_\d+)* like Mac OS X)\) AppleWebKit\/\d+(?:\.\d+)* \(KHTML, like Gecko\) /;
+var SAFARI_PRODUCTS = /^(?:Version\/(\d+(?:\.\d+)*) )?(?:Mobile\/[A-Za-z0-9]+ )?Safari\/\d+(?:\.\d+)*$/;
+function appleSafariProducts(userAgent) {
+  if (typeof userAgent !== "string") return null;
+  const platform = APPLE_SAFARI_PLATFORM.exec(userAgent);
+  if (!platform) return null;
+  const products = SAFARI_PRODUCTS.exec(userAgent.slice(platform[0].length));
+  if (products?.[1] === "60.5" && userAgent.endsWith("Safari/605.1.15")) return null;
+  return products;
+}
+function isAppleSafariUserAgent(userAgent) {
+  return appleSafariProducts(userAgent) !== null;
+}
 function safariMajorVersion(userAgent) {
-  if (!isSafariUserAgent(userAgent)) {
-    return null;
-  }
-  const match = /\bVersion\/(\d+)/.exec(userAgent);
-  return match ? Number(match[1]) : null;
+  const version = appleSafariProducts(userAgent)?.[1];
+  const major = Number(version?.split(".")[0]);
+  return Number.isSafeInteger(major) ? major : null;
 }
 function safariDefaultMaxGpuLayers(userAgent) {
   const major = safariMajorVersion(userAgent);
@@ -1736,6 +1747,7 @@ function scoredTokensFrom(entries) {
 
 // js/src/runtime.ts
 var pendingModelCacheStores = /* @__PURE__ */ new WeakMap();
+var SAFARI_EMBEDDING_PROBE_MAX_COSINE = 0.999;
 var textEncoder = new TextEncoder();
 var LlamaWebGpuBridgeRuntime = class {
   constructor(config = {}) {
@@ -1797,6 +1809,7 @@ var LlamaWebGpuBridgeRuntime = class {
     this._speculativeRollbackTokenMax = 0;
     const userAgent = this._config.userAgent ?? globalThis.navigator?.userAgent ?? "";
     this._isSafari = isSafariUserAgent(userAgent);
+    this._isAppleSafari = isAppleSafariUserAgent(userAgent);
     this._safariDefaultMaxGpuLayers = safariDefaultMaxGpuLayers(userAgent);
     this._coreVariant = "uninitialized";
     this._preferMemory64 = this._config.preferMemory64 !== false;
@@ -3813,41 +3826,37 @@ var LlamaWebGpuBridgeRuntime = class {
         const probeTokensRaw = Number(options.safariProbeTokens);
         const probeTokens = Number.isFinite(probeTokensRaw) && probeTokensRaw > 0 ? Math.min(Math.trunc(probeTokensRaw), 96) : 48;
         let probesEmbedding = false;
-        try {
-          probesEmbedding = (await this.getEmbeddingCapabilities()).text === true;
-        } catch (_) {
+        if (this._isAppleSafari) {
+          try {
+            probesEmbedding = (await this.getEmbeddingCapabilities()).text === true;
+          } catch (_) {
+          }
         }
         if (probesEmbedding) {
           this._runtimeNotes.push("safari_gpu_probe_embedding");
         }
-        const runProbe = async (probePrompt, probeSeed) => {
+        const runProbe = async (seedOffset) => {
           try {
             if (probesEmbedding) {
-              const vector = await this.embed(probePrompt, { normalize: true });
-              return Math.abs(Math.hypot(...vector) - 1) < 0.01;
+              return await this._probeSafariEmbeddings();
             }
-            const probeOutput = await this.createCompletion(probePrompt, {
-              nPredict: probeTokens,
-              temp: 0,
-              topK: 1,
-              topP: 1,
-              penalty: 1,
-              seed: probeSeed
-            });
-            return !looksLikeCorruptedGeneration(probeOutput);
+            for (const [index, prompt] of probePrompts.entries()) {
+              const probeOutput = await this.createCompletion(prompt, {
+                nPredict: probeTokens,
+                temp: 0,
+                topK: 1,
+                topP: 1,
+                penalty: 1,
+                seed: index + seedOffset
+              });
+              if (looksLikeCorruptedGeneration(probeOutput)) return false;
+            }
+            return true;
           } catch (_) {
             return false;
           }
         };
-        let initialProbePassed = true;
-        for (let i = 0; i < probePrompts.length; i += 1) {
-          const ok = await runProbe(probePrompts[i], i + 1);
-          if (!ok) {
-            initialProbePassed = false;
-            break;
-          }
-        }
-        if (!initialProbePassed) {
+        if (!await runProbe(1)) {
           this._runtimeNotes.push("safari_gpu_probe_failed");
           const retryCandidates = [];
           if (this._nGpuLayers > 1) {
@@ -3935,15 +3944,7 @@ var LlamaWebGpuBridgeRuntime = class {
               stabilized = true;
               break;
             }
-            let retryProbePassed = true;
-            for (let i = 0; i < probePrompts.length; i += 1) {
-              const ok = await runProbe(probePrompts[i], i + 11);
-              if (!ok) {
-                retryProbePassed = false;
-                break;
-              }
-            }
-            if (retryProbePassed) {
+            if (await runProbe(11)) {
               this._runtimeNotes.push(`safari_gpu_layers_capped:${candidateLayers}`);
               stabilized = true;
               break;
@@ -5636,14 +5637,19 @@ var LlamaWebGpuBridgeRuntime = class {
       this._clearPendingMedia();
     }
   }
-  async embed(text, options = {}) {
-    if (Array.isArray(text)) {
-      const parts = snapshotEmbedInput(text);
-      this._abortRequested = false;
-      await this._preflightEmbeddingInputs([parts]);
-      if (this._abortRequested) throw createAbortError("Embedding was cancelled.");
-      return this._embedParts(parts, options);
-    }
+  async _probeSafariEmbeddings() {
+    const options = { normalize: true };
+    const first = await this._readTextEmbedding("The Eiffel Tower is in Paris.", options);
+    const second = await this._readTextEmbedding("WebGPU runs matrix math on the GPU.", options);
+    const finite = (vector) => vector.every(Number.isFinite);
+    if (first.length !== second.length || !finite(first) || !finite(second)) return false;
+    const firstNorm = Math.hypot(...first);
+    const secondNorm = Math.hypot(...second);
+    if (Math.abs(firstNorm - 1) >= 0.01 || Math.abs(secondNorm - 1) >= 0.01) return false;
+    const dot = first.reduce((sum, value, index) => sum + value * second[index], 0);
+    return dot / (firstNorm * secondNorm) < SAFARI_EMBEDDING_PROBE_MAX_COSINE;
+  }
+  async _readTextEmbedding(text, options) {
     if (this._modelBytes <= 0) {
       throw new Error("No model loaded. Call loadModelFromUrl first.");
     }
@@ -5663,10 +5669,21 @@ var LlamaWebGpuBridgeRuntime = class {
     }
     const raw = this._core.ccall("llamadart_webgpu_last_embedding_json", "string", [], []) || "[]";
     const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? parsed.map((v) => {
-      const numeric = Number(v);
+    return Array.isArray(parsed) ? parsed : [];
+  }
+  async embed(text, options = {}) {
+    if (Array.isArray(text)) {
+      const parts = snapshotEmbedInput(text);
+      this._abortRequested = false;
+      await this._preflightEmbeddingInputs([parts]);
+      if (this._abortRequested) throw createAbortError("Embedding was cancelled.");
+      return this._embedParts(parts, options);
+    }
+    const values = await this._readTextEmbedding(text, options);
+    return values.map((value) => {
+      const numeric = Number(value);
       return Number.isFinite(numeric) ? numeric : 0;
-    }) : [];
+    });
   }
   async embedBatch(texts, options = {}) {
     const normalized = Array.isArray(texts) ? texts : Array.from(texts || []);
