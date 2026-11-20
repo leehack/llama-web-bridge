@@ -204,8 +204,10 @@ node scripts/smoke/js_model_staging_remount.mjs \
   "$OUT_DIR" "$TINY_GGUF_PATH" "$LLAMA_WEBGPU_SMOKE_MODEL_SHA256"
 ```
 
-The smoke replaces the staging directory during cleanup, removes the
-replacement after disposal, and loads the model again on the same core.
+The smoke replaces the staging directory during cleanup and removes the
+replacement after disposal. It checks both a native remount of the original
+path and a model load on a second bridge sharing the core, each with fresh
+staging state.
 
 To check that a second bridge preserves a renamed mount while the owning
 bridge is still staging, split the same tiny GGUF with `llama-gguf-split` and

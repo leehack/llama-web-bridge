@@ -13,7 +13,7 @@ import {
   withTempDir,
 } from './support.mjs';
 
-async function checkRemount() {
+async function checkRemount(nativeOnly) {
   const { LlamaWebGpuBridge } = await import('/llama_webgpu_bridge.js');
   const { default: createCore } = await import('/llama_webgpu_core.js');
   const core = await createCore();
@@ -72,6 +72,15 @@ async function checkRemount() {
   core.FS.rmdir(mountPath);
   assert(mountId() === 0 && !core.FS.readdir('/').includes('jsmodels-1'), 'staging path is still present');
 
+  if (nativeOnly) {
+    // A later bridge can choose a different path and miss the stale registration.
+    const rc = ccall('llamadart_webgpu_mount_js_model_fs', 'number', ['string'], [mountPath]);
+    assert(rc === 0, `native remount of ${mountPath} returned ${rc}`);
+    const unmountRc = ccall('llamadart_webgpu_unmount_js_model_fs', 'number', ['string'], [mountPath]);
+    assert(unmountRc === 0, `native unmount of ${mountPath} returned ${unmountRc}`);
+    return rc;
+  }
+
   const second = newBridge();
   try {
     assert(await load(second) === 1, 'second bridge did not load the model');
@@ -84,7 +93,7 @@ async function checkRemount() {
   assert(mountResults.length === 2 && mountResults.every((rc) => rc === 0), 'expected two successful native mounts');
   const allocatedAfterRemount = allocatedBytes();
   assert(allocatedAfterRemount === 0, 'new mount retained staged chunks');
-  return { ok: true, originalId, mountResults, allocatedAfterDispose, allocatedAfterRemount };
+  return { originalId, mountResults, allocatedAfterDispose, allocatedAfterRemount };
 }
 
 async function main([distDir, modelPath, modelSha256] = process.argv.slice(2)) {
@@ -94,16 +103,20 @@ async function main([distDir, modelPath, modelSha256] = process.argv.slice(2)) {
     await copyBridgeArtifacts(distDir, webRoot);
     await fsp.copyFile(modelPath, path.join(webRoot, 'tiny.gguf'));
     await fsp.writeFile(path.join(webRoot, 'index.html'), `<script type="module">
-      (${checkRemount.toString()})().then(
-        (result) => { window.__smokeResult = result; },
-        (error) => { window.__smokeResult = { ok: false, error: error.stack }; },
-      );
+      const checkRemount = ${checkRemount.toString()};
+      try {
+        const nativeRemountRc = await checkRemount(true);
+        const bridgeResult = await checkRemount(false);
+        window.__smokeResult = { ok: true, nativeRemountRc, ...bridgeResult };
+      } catch (error) {
+        window.__smokeResult = { ok: false, error: error.stack };
+      }
     </script>`);
     return withServer(webRoot, (url) => runPlaywright(url, 60000, null));
   });
   ensure(payload.ok, payload.error);
-  const { originalId, mountResults, allocatedAfterDispose, allocatedAfterRemount } = payload;
-  console.log(JSON.stringify({ originalId, mountResults, allocatedAfterDispose, allocatedAfterRemount }));
+  const { originalId, nativeRemountRc, mountResults, allocatedAfterDispose, allocatedAfterRemount } = payload;
+  console.log(JSON.stringify({ originalId, nativeRemountRc, mountResults, allocatedAfterDispose, allocatedAfterRemount }));
   return 0;
 }
 
