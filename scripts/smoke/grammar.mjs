@@ -193,7 +193,7 @@ const INVALID_SAMPLER_OPTIONS = Object.freeze([
 ]);
 // speculative.mjs checks the speculativeDecoding capabilities.
 export const COMPLETION_CAPABILITIES = Object.freeze([
-  'presencePenalty', 'minP', 'thinkingBudget', 'thinkingBudgetPauseGrammar', 'penaltyPromptTokens', 'penaltyPromptTokensWithGrammar', 'lazyGrammar',
+  'presencePenalty', 'minP', 'thinkingBudget', 'thinkingBudgetPauseGrammar', 'thinkingBudgetMultiEnd', 'penaltyPromptTokens', 'penaltyPromptTokensWithGrammar', 'lazyGrammar',
 ]);
 // Each tag follows a space: SentencePiece vocabularies tokenize a tag at the
 // start of text with a space prefix, so only a spaced tag in the prompt
@@ -255,6 +255,15 @@ export const THINKING_RUNS = Object.freeze([
   }],
 ]);
 const INVALID_THINKING_BUDGET = { ...THINK_TAGS, maxTokens: -1 };
+export const INVALID_NATIVE_MULTI_ENDS = Object.freeze([
+  { name: 'past-end index', json: '["</think>"]', index: 1, error: 'replay index' },
+  { name: 'negative index', json: '["</think>"]', index: -2, error: 'replay index' },
+  { name: 'non-string entry', json: '[42]', index: -1, error: 'tags must be strings' },
+  { name: 'NUL in entry', json: JSON.stringify(['before\0after']), index: -1, error: 'without NUL bytes' },
+  { name: 'nested array', json: '[["</think>"]]', index: -1, error: 'non-empty JSON array' },
+  { name: 'empty array', json: '[]', index: -1, error: 'non-empty JSON array' },
+  { name: 'null JSON pointer', json: null, index: -1, error: 'non-empty JSON array' },
+]);
 // Greedy runs whose first tokens are unconstrained text. The first window of
 // triggerTokens tokens after at least minBeforeTokens tokens whose text does
 // not occur earlier, searched up to maxBeforeTokens, becomes the trigger.
@@ -296,6 +305,7 @@ export function renderHarness(nCtx, memoryModes) {
     thinkingRuns: THINKING_RUNS,
     promptPenalty: PROMPT_PENALTY,
     invalidThinkingBudget: INVALID_THINKING_BUDGET,
+    invalidNativeMultiEnds: INVALID_NATIVE_MULTI_ENDS,
     lazyGrammar: LAZY_GRAMMAR,
     lazyTriggerRuns: LAZY_TRIGGER_RUNS,
     completionCapabilities: COMPLETION_CAPABILITIES,
@@ -498,6 +508,125 @@ export function renderHarness(nCtx, memoryModes) {
       return result;
     };
 
+    const probeNativeMultiEndValidation = async (bridge, prompt) => {
+      const core = bridge._runtime._core;
+      const bytes = new TextEncoder().encode(prompt);
+      const rejected = [];
+      for (const test of config.invalidNativeMultiEnds) {
+        const rc = await core.ccall(
+          'llamadart_webgpu_begin_generation_multi_end_bytes', 'number',
+          ['array', 'number', 'number', 'number', 'number', 'number', 'string', 'number',
+            'number', 'number', 'number', 'string', 'string', 'string', 'number', 'string', 'number'],
+          [bytes, bytes.length, 0, 1, 1, 1, null, 1, 0, 0, 0, '<think>', '</think>', null, 0, test.json, test.index],
+          { async: true },
+        );
+        const error = core.ccall('llamadart_webgpu_last_error', 'string', [], []);
+        if (rc === 0) {
+          await core.ccall('llamadart_webgpu_end_generation', null, [], [], { async: true });
+        }
+        assert(rc === -2 && error?.includes(test.error),
+          'native multi-end validation failed for ' + test.name + ' (rc=' + rc + ', error=' + error + ')');
+        rejected.push(test.name);
+      }
+      return rejected;
+    };
+
+    const probeMultiEndBudget = async (bridge, runtimeMode) => {
+      const prompt = '<|im_start|>user\\nCall get_weather for Seoul.<|im_end|>\\n<|im_start|>assistant\\n<think>\\n';
+      const opener = '<tool_call>';
+      const endTag = '</think>';
+      const forcedClose = opener + '\\n' + endTag;
+      const embeddedClose = endTag + ' then <think> ' + forcedClose;
+      const options = { temp: 0, topK: 1, penalty: 1, seed: 1, nPredict: 16 };
+      const budget = { maxTokens: 0, startTag: '<think>', endTag };
+      const naturalEndTags = ['\\n' + endTag, endTag, opener];
+      const multi = { ...budget, naturalEndTags, grammarReplayEndIndex: 2 };
+      const neverReplayGrammar = 'root ::= "yes"';
+      const run = (thinkingBudget, overrides = {}, input = prompt) =>
+        bridge.createCompletion(input, { ...options, ...overrides, thinkingBudget });
+      const tokens = await bridge.tokenize(forcedClose, false);
+      assert(tokens.join(',') === '248058,198,248069', 'Qwen3.5 forced close tokenization changed');
+
+      const invalidNativeMultiEnds = runtimeMode === 'direct'
+        ? await probeNativeMultiEndValidation(bridge, prompt) : null;
+      const forced = { forcedMessage: opener + '\\n' };
+      const legacy = await run({ ...budget, ...forced }, { nPredict: tokens.length });
+      const full = await run({ ...multi, ...forced }, { grammar: neverReplayGrammar });
+      assert(legacy === forcedClose, 'legacy singleton changed the forced close: ' + JSON.stringify(legacy));
+      assert(full === forcedClose + 'yes', 'multi-end did not emit the full close then resume grammar: ' + JSON.stringify(full));
+      const embedded = await run(
+        { ...multi, forcedMessage: embeddedClose.slice(0, -endTag.length) },
+        { grammar: neverReplayGrammar },
+      );
+      assert(embedded === embeddedClose + 'yes', 'embedded delimiters truncated forcing: ' + JSON.stringify(embedded));
+
+      const prefilled = prompt + opener + '\\n<function=get_weather>\\n';
+      const prefilledControl = await run(null, { nPredict: 6 }, prefilled);
+      const prefilledBudgeted = await run({ ...multi, forcedMessage: 'BUDGET1949' }, { nPredict: 6 }, prefilled);
+      assert(prefilledBudgeted === prefilledControl && !prefilledBudgeted.includes('BUDGET1949'),
+        'the prefilled opener did not close the budget: ' + JSON.stringify(prefilledBudgeted));
+
+      const activeGrammar = 'root ::= <[248058]> "weather"';
+      const activeControl = await run(null, { grammar: activeGrammar });
+      const active = await run(
+        { ...multi, maxTokens: 1, forcedMessage: 'BUDGET1949', pauseGrammar: false },
+        { grammar: activeGrammar },
+      );
+      assert(activeControl === opener + 'weather' && active === activeControl,
+        'a generated XML opener at the final allowed token changed the active grammar: ' + JSON.stringify(active));
+
+      const { top } = await bridge.scoreNextToken(prompt, { topK: 1 });
+      const greedyToken = top[0].token;
+      const greedyText = await bridge.detokenize([greedyToken], true);
+      assert((await bridge.tokenize(greedyText, false)).join(',') === String(greedyToken),
+        'the greedy marker did not round-trip to the same token');
+      const closing = { ...multi, maxTokens: 1, naturalEndTags: [endTag, greedyText], grammarReplayEndIndex: 1 };
+      const greedyGrammar = 'root ::= <[' + greedyToken + ']> "weather"';
+      const eager = await run(closing, { grammar: greedyGrammar });
+      const lazy = await run(closing, {
+        grammar: greedyGrammar,
+        grammarLazy: true,
+        grammarTriggers: [{ type: 'token', token: greedyToken }],
+      });
+      const unrelated = await run({ ...closing, grammarReplayEndIndex: -1 }, { grammar: 'root ::= "weather"' });
+      const nonSelected = await run(
+        { ...closing, naturalEndTags: [endTag, greedyText, opener], grammarReplayEndIndex: 2 },
+        { grammar: 'root ::= "weather"' },
+      );
+      assert([eager, lazy, unrelated, nonSelected].every((text) => text === greedyText + 'weather'),
+        'natural replay routed the marker to the wrong grammar: ' + JSON.stringify({ eager, lazy, unrelated, nonSelected }));
+
+      const noGrammar = await run(closing, { nPredict: 1 });
+      assert(noGrammar === greedyText, 'a natural end tried to replay without a grammar: ' + JSON.stringify(noGrammar));
+
+      let rejected = false;
+      try {
+        await run(closing, { grammar: neverReplayGrammar });
+      } catch (error) {
+        rejected = errorText(error).includes("paused grammar rejected the thinking budget's natural end");
+      }
+      assert(rejected, 'eager grammar accepted an invalid replay');
+
+      const abort = new AbortController();
+      try {
+        await run({ ...multi, ...forced }, {
+          signal: abort.signal,
+          tokenEventEncoding: 'text',
+          onToken: () => abort.abort(),
+        });
+      } catch (error) {
+        if (error.name !== 'AbortError') throw error;
+      }
+      assert(abort.signal.aborted, 'multi-end generation was not cancelled during forcing');
+      const singletonAfterCancel = await run({ ...budget, forcedMessage: 'BUDGET1949' }, { nPredict: 8 }, prefilled);
+      assert(singletonAfterCancel.startsWith('BUDGET1949' + endTag),
+        'multi-end state leaked into the next singleton request: ' + JSON.stringify(singletonAfterCancel));
+      return {
+        tokens, legacy, full, embedded, prefilledBudgeted, active, eager, lazy, unrelated, nonSelected, noGrammar,
+        singletonAfterCancel, invalidNativeMultiEnds,
+      };
+    };
+
     const runMode = async (memoryMode, runtimeMode) => {
       const mode = \`\${memoryMode} \${runtimeMode}\`;
       const useMemory64 = memoryMode === 'wasm64';
@@ -609,6 +738,8 @@ export function renderHarness(nCtx, memoryModes) {
         const lazyGrammar = await probeLazyGrammar(bridge);
 
         const metadata = bridge.getModelMetadata();
+        const multiEndBudget = metadata['general.architecture'] === 'qwen35'
+          ? await probeMultiEndBudget(bridge, runtimeMode) : null;
         return {
           mode,
           cases,
@@ -619,6 +750,7 @@ export function renderHarness(nCtx, memoryModes) {
           samplerAfterInvalid,
           promptPenalty,
           thinkingRuns,
+          multiEndBudget,
           invalidThinkingBudgetError,
           lazyGrammar,
           plainCompletionError: plainError,

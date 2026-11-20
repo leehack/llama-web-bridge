@@ -16,6 +16,7 @@ const SUPPORTED = {
   minP: true,
   thinkingBudget: true,
   thinkingBudgetPauseGrammar: true,
+  thinkingBudgetMultiEnd: true,
   penaltyPromptTokens: true,
   penaltyPromptTokensWithGrammar: true,
   lazyGrammar: true,
@@ -26,6 +27,7 @@ const NONE = {
   minP: false,
   thinkingBudget: false,
   thinkingBudgetPauseGrammar: false,
+  thinkingBudgetMultiEnd: false,
   penaltyPromptTokens: false,
   penaltyPromptTokensWithGrammar: false,
   lazyGrammar: false,
@@ -60,7 +62,7 @@ function nativeParameterNames(name) {
 function coreCapabilityJson() {
   const body = functionBody('llamadart_webgpu_completion_capabilities_json()');
   const literal = body.match(
-    /"\{\\"presencePenalty\\":true,\\"minP\\":true,\\"thinkingBudget\\":true,"\s*"\\"thinkingBudgetPauseGrammar\\":true,"\s*"\\"penaltyPromptTokens\\":true,\\"penaltyPromptTokensWithGrammar\\":true,\\"lazyGrammar\\":true,"/,
+    /"\{\\"presencePenalty\\":true,\\"minP\\":true,\\"thinkingBudget\\":true,"\s*"\\"thinkingBudgetPauseGrammar\\":true,\\"thinkingBudgetMultiEnd\\":true,"\s*"\\"penaltyPromptTokens\\":true,\\"penaltyPromptTokensWithGrammar\\":true,\\"lazyGrammar\\":true,"/,
   );
   assert.ok(literal, 'the capability export must start with its fixed flags');
   const strategies = [...body.matchAll(/\{"([a-z0-9-]+)",\s*([^}]*)\}/g)];
@@ -70,8 +72,9 @@ function coreCapabilityJson() {
     minP: true,
     thinkingBudget: true,
     thinkingBudgetPauseGrammar: true,
+    thinkingBudgetMultiEnd: true,
     penaltyPromptTokens: true,
-  penaltyPromptTokensWithGrammar: true,
+    penaltyPromptTokensWithGrammar: true,
     lazyGrammar: true,
     speculativeDecoding: Object.fromEntries(
       strategies.map(([, name, flag]) => [name, flag.trim() === 'true']),
@@ -326,6 +329,89 @@ const CASES = [
     assert.deepEqual(structuredClone(sent).thinkingBudget, { ...BUDGET, pauseGrammar: false });
   }],
 
+  ['multi-end budgets require the advertised core and checked export', async () => {
+    const ends = ['\n</think>', '</think>', '<tool_call>'];
+    const thinkingBudget = { ...BUDGET, naturalEndTags: ends, grammarReplayEndIndex: 2 };
+    const exportName = 'llamadart_webgpu_begin_generation_multi_end_bytes';
+    for (const bit of [undefined, false, 'true', 1, true]) {
+      const { bridge, core, begins } = directBridge(JSON.stringify({
+        thinkingBudget: true,
+        thinkingBudgetMultiEnd: bit,
+      }));
+      if (bit !== true) {
+        core[`_${exportName}`] = () => 0;
+      }
+      await assert.rejects(
+        bridge.createCompletion('hello', { thinkingBudget }),
+        /does not support CompletionOptions\.thinkingBudget\.naturalEndTags\.$/,
+      );
+      assert.equal((await bridge.getCompletionCapabilities()).thinkingBudgetMultiEnd, false);
+      await bridge.createCompletion('hello', { thinkingBudget: BUDGET });
+      assert.equal(begins.length, 1);
+    }
+
+    const { bridge, core, begins } = directBridge('{"thinkingBudget":true,"thinkingBudgetMultiEnd":true}');
+    core[`_${exportName}`] = () => 0;
+    const ccall = core.ccall.bind(core);
+    const multi = [];
+    core.ccall = (name, returnType, argTypes, args) => {
+      if (name === exportName) {
+        multi.push({ argTypes, args });
+        return ccall('llamadart_webgpu_begin_generation_bytes', returnType, argTypes.slice(0, -2), args.slice(0, -2));
+      }
+      return ccall(name, returnType, argTypes, args);
+    };
+    assert.equal((await bridge.getCompletionCapabilities()).thinkingBudgetMultiEnd, true);
+    await bridge.createCompletion('hello', { thinkingBudget });
+    assert.deepEqual(multi[0].argTypes.slice(-2), ['string', 'number']);
+    assert.deepEqual(multi[0].args.slice(-2), [JSON.stringify(ends), 2]);
+    await bridge.createCompletion('hello', { thinkingBudget: BUDGET });
+    assert.equal(multi.length, 1);
+    assert.equal(begins.length, 2);
+  }],
+
+  ['workers validate and forward the complete multi-end request', async () => {
+    const ends = ['\n</think>', '</think>', '<tool_call>'];
+    const thinkingBudget = { ...BUDGET, naturalEndTags: ends, grammarReplayEndIndex: 2 };
+    for (const bit of [undefined, false, 'true', true]) {
+      const calls = [];
+      const bridge = createWorkerBridge({
+        _callWorker: async (method, args) => {
+          calls.push(method);
+          if (method === 'getCompletionCapabilities') {
+            return { thinkingBudget: true, thinkingBudgetMultiEnd: bit };
+          }
+          assert.deepEqual(structuredClone(args[1]).thinkingBudget.naturalEndTags, ends);
+          assert.equal(args[1].thinkingBudget.grammarReplayEndIndex, 2);
+          return 'x';
+        },
+      });
+      for (const fields of [
+        { naturalEndTags: [] }, { naturalEndTags: [null] },
+        { naturalEndTags: ['  '] }, { naturalEndTags: ['text\0tail'] },
+        { naturalEndTags: Array(2) }, { naturalEndTags: 'text' },
+        { grammarReplayEndIndex: -2 }, { grammarReplayEndIndex: ends.length },
+        { grammarReplayEndIndex: 1.5 }, { naturalEndTags: undefined },
+      ]) {
+        await assert.rejects(
+          bridge.createCompletion('hello', { thinkingBudget: { ...thinkingBudget, ...fields } }),
+          /thinkingBudget\.(naturalEndTags|grammarReplayEndIndex)/,
+        );
+      }
+      assert.deepEqual(calls, []);
+      if (bit === true) {
+        assert.equal(await bridge.createCompletion('hello', { thinkingBudget }), 'x');
+        assert.deepEqual(calls, ['getCompletionCapabilities', 'createCompletion']);
+      } else {
+        await assert.rejects(
+          bridge.createCompletion('hello', { thinkingBudget }),
+          /does not support CompletionOptions\.thinkingBudget\.naturalEndTags\.$/,
+        );
+        assert.deepEqual(calls, ['getCompletionCapabilities']);
+      }
+    }
+  }],
+
   ['a core without the probe reports nothing and rejects a nonzero option', async () => {
     const { bridge, begins } = directBridge(undefined);
     assert.deepEqual(await bridge.getCompletionCapabilities(), NONE);
@@ -366,7 +452,8 @@ const CASES = [
       ),
     };
     assert.deepEqual(completionCapabilitiesFrom(coreCapabilityJson()), expected);
-    const { bridge } = directBridge(coreCapabilityJson());
+    const { bridge, core } = directBridge(coreCapabilityJson());
+    core._llamadart_webgpu_begin_generation_multi_end_bytes = () => 0;
     assert.deepEqual(await bridge.getCompletionCapabilities(), expected);
   }],
 

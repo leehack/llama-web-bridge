@@ -2153,7 +2153,11 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
     options: BridgeCompletionOptions = {},
   ): Promise<string> {
     const sampling = resolveCompletionSamplingOptions(options);
-    if (sampling.penaltyPromptTokensWithGrammar || sampling.thinkingBudget?.pauseGrammar === false) {
+    if (sampling.thinkingBudget?.naturalEndTags != null) {
+      options = { ...options, thinkingBudget: sampling.thinkingBudget };
+    }
+    if (sampling.penaltyPromptTokensWithGrammar || sampling.thinkingBudget?.pauseGrammar === false
+        || (this._workerProxy && sampling.thinkingBudget?.naturalEndTags != null)) {
       // Probe the actual worker too: an older worker wrapper may ignore options.
       requireCompletionCapabilities(sampling, await this._getCompletionCapabilitiesUnlocked());
     }

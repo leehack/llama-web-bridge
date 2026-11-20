@@ -2,6 +2,77 @@
 // Part of llama_webgpu_core.cpp, included inside its anonymous namespace;
 // not a standalone translation unit.
 
+struct multi_end_reasoning_budget {
+  const llama_vocab * vocab;
+  llama_tokens start_tokens;
+  std::vector<llama_tokens> end_tokens;
+  llama_tokens forced_tokens;
+  int32_t max_tokens;
+  llama_sampler_ptr child;
+  bool forcing = false;
+
+  void set_natural_child(common_reasoning_budget_state state) {
+    forcing = false;
+    child.reset(common_reasoning_budget_init(
+        vocab, {start_tokens}, end_tokens, forced_tokens, max_tokens, state));
+    enter_forcing_if_needed();
+  }
+
+  void enter_forcing_if_needed() {
+    if (common_reasoning_budget_get_state(child.get()) == REASONING_BUDGET_FORCING) {
+      // The upstream FORCING state completes on any end match. The forced
+      // payload can contain delimiters, so only its last token may end it.
+      child.reset(common_reasoning_budget_init(
+          vocab, {}, {}, forced_tokens, 0, REASONING_BUDGET_FORCING));
+      forcing = true;
+    }
+  }
+
+  void accept(llama_token token) {
+    llama_sampler_accept(child.get(), token);
+    if (!forcing) {
+      enter_forcing_if_needed();
+    } else if (common_reasoning_budget_get_state(child.get()) == REASONING_BUDGET_DONE) {
+      set_natural_child(REASONING_BUDGET_DONE);
+    }
+  }
+};
+
+multi_end_reasoning_budget & multi_end_budget_context(llama_sampler * sampler) {
+  return *static_cast<multi_end_reasoning_budget *>(sampler->ctx);
+}
+
+llama_sampler_i multi_end_reasoning_budget_interface = {
+    /* .name */ [](const llama_sampler *) { return "webgpu-multi-end-reasoning-budget"; },
+    /* .accept */ [](llama_sampler * sampler, llama_token token) {
+      multi_end_budget_context(sampler).accept(token);
+    },
+    /* .apply */ [](llama_sampler * sampler, llama_token_data_array * candidates) {
+      llama_sampler_apply(multi_end_budget_context(sampler).child.get(), candidates);
+    },
+    /* .reset */ [](llama_sampler * sampler) {
+      multi_end_budget_context(sampler).set_natural_child(REASONING_BUDGET_IDLE);
+    },
+    /* .clone */ [](const llama_sampler * sampler) {
+      const auto & budget = *static_cast<const multi_end_reasoning_budget *>(sampler->ctx);
+      auto cloned = std::make_unique<multi_end_reasoning_budget>(multi_end_reasoning_budget{
+          budget.vocab, budget.start_tokens, budget.end_tokens, budget.forced_tokens,
+          budget.max_tokens, llama_sampler_ptr(llama_sampler_clone(budget.child.get())), budget.forcing});
+      return llama_sampler_init(sampler->iface, cloned.release());
+    },
+    /* .free */ [](llama_sampler * sampler) {
+      delete &multi_end_budget_context(sampler);
+    },
+};
+
+llama_sampler * active_reasoning_budget_child() {
+  if (g_active_reasoning_budget != nullptr &&
+      g_active_reasoning_budget->iface == &multi_end_reasoning_budget_interface) {
+    return multi_end_budget_context(g_active_reasoning_budget).child.get();
+  }
+  return g_active_reasoning_budget;
+}
+
 // Takes ownership of reasoning_budget, which may be null. The penalty window
 // starts with penalty_prompt_tokens; no other sampler sees them.
 llama_sampler * create_sampler(
@@ -65,7 +136,7 @@ bool grammar_is_active() {
     return true;
   }
   const common_reasoning_budget_state state =
-      common_reasoning_budget_get_state(g_active_reasoning_budget);
+      common_reasoning_budget_get_state(active_reasoning_budget_child());
   return state == REASONING_BUDGET_IDLE || state == REASONING_BUDGET_DONE;
 }
 
@@ -74,6 +145,44 @@ bool grammar_accepts_token(const llama_token token) {
   llama_token_data_array single_token_array = {&single_token, 1, -1, false};
   llama_sampler_apply(g_active_grammar, &single_token_array);
   return single_token_array.data[0].logit != -INFINITY;
+}
+
+bool accept_generation_grammar(const llama_token token) {
+  if (!g_active_grammar_lazy) {
+    llama_sampler_accept(g_active_grammar, token);
+    return true;
+  }
+  std::string grammar_error;
+  if (!llamadart_webgpu_grammar_sampler_accept(g_active_grammar, token, &grammar_error)) {
+    set_error("The lazy grammar rejected the text that triggered it: " + grammar_error);
+    return false;
+  }
+  return true;
+}
+
+bool replay_natural_reasoning_end(const common_reasoning_budget_state previous_state) {
+  if (previous_state != REASONING_BUDGET_COUNTING &&
+      previous_state != REASONING_BUDGET_WAITING_UTF8) {
+    return true;
+  }
+  const llama_sampler * child = active_reasoning_budget_child();
+  if (common_reasoning_budget_get_state(child) != REASONING_BUDGET_DONE) {
+    return true;
+  }
+  const llama_tokens * matched = common_reasoning_budget_get_end_match(child);
+  if (matched == nullptr || *matched != g_active_grammar_replay_end) {
+    return true;
+  }
+  for (const llama_token token : *matched) {
+    if (!g_active_grammar_lazy && !grammar_accepts_token(token)) {
+      set_error("The paused grammar rejected the thinking budget's natural end");
+      return false;
+    }
+    if (!accept_generation_grammar(token)) {
+      return false;
+    }
+  }
+  return true;
 }
 
 // Fills cur_p from the logits of batch_index (-1: the last output) and runs
@@ -146,21 +255,17 @@ llama_token sample_next_token(const int32_t batch_index = -1) {
     }
   }
 
-  if (use_grammar) {
-    if (!g_active_grammar_lazy) {
-      llama_sampler_accept(g_active_grammar, token);
-    } else {
-      std::string grammar_error;
-      if (!llamadart_webgpu_grammar_sampler_accept(
-              g_active_grammar, token, &grammar_error)) {
-        set_error(
-            "The lazy grammar rejected the text that triggered it: " +
-            grammar_error);
-        return LLAMA_TOKEN_NULL;
-      }
-    }
+  if (use_grammar && !accept_generation_grammar(token)) {
+    return LLAMA_TOKEN_NULL;
   }
+  const bool may_replay = !use_grammar && !g_active_grammar_replay_end.empty();
+  const auto previous_state = may_replay
+      ? common_reasoning_budget_get_state(active_reasoning_budget_child())
+      : REASONING_BUDGET_IDLE;
   llama_sampler_accept(g_active_sampler, token);
+  if (may_replay && !replay_natural_reasoning_end(previous_state)) {
+    return LLAMA_TOKEN_NULL;
+  }
   return token;
 }
 
@@ -269,9 +374,55 @@ bool evaluate_prompt_tokens(
 struct reasoning_budget_config {
   int32_t max_tokens = 0;
   llama_tokens start_tokens;
-  llama_tokens end_tokens;
+  std::vector<llama_tokens> end_tokens;
   llama_tokens forced_tokens;
 };
+
+struct reasoning_budget_ends {
+  std::vector<std::string> tags;
+  int32_t grammar_replay_index = -1;
+};
+
+bool parse_reasoning_budget_ends(
+    const char * tags_json,
+    const int32_t grammar_replay_index,
+    reasoning_budget_ends & ends) {
+  using json = nlohmann::json;
+  // Reject nested values without building a recursively owned value tree.
+  bool nested = false;
+  const auto flat_array = [&nested](int depth, json::parse_event_t event, json &) {
+    if (depth > 0 && (event == json::parse_event_t::array_start ||
+                      event == json::parse_event_t::object_start)) {
+      nested = true;
+    }
+    return !nested;
+  };
+  const auto parsed = tags_json == nullptr ? json() : json::parse(tags_json, flat_array, false);
+  if (nested || !parsed.is_array() || parsed.empty()) {
+    set_error("thinking budget natural end tags must be a non-empty JSON array of strings");
+    return false;
+  }
+  if (grammar_replay_index < -1 ||
+      (grammar_replay_index >= 0 && static_cast<size_t>(grammar_replay_index) >= parsed.size())) {
+    set_error("thinking budget grammar replay index must be -1 or an index into the natural end tags");
+    return false;
+  }
+  for (const auto & value : parsed) {
+    if (!value.is_string()) {
+      set_error("thinking budget natural end tags must be strings");
+      return false;
+    }
+    const auto & tag = value.get_ref<const std::string &>();
+    if (tag.find_first_not_of(" \t\r\n\v\f") == std::string::npos ||
+        tag.find('\0') != std::string::npos) {
+      set_error("thinking budget natural end tags must be non-empty strings without NUL bytes");
+      return false;
+    }
+    ends.tags.push_back(tag);
+  }
+  ends.grammar_replay_index = grammar_replay_index;
+  return true;
+}
 
 // Returns false after set_error() when a tag is empty or yields no tokens.
 bool resolve_reasoning_budget(
@@ -279,6 +430,7 @@ bool resolve_reasoning_budget(
     const char * start_tag,
     const char * end_tag,
     const char * forced_message,
+    const reasoning_budget_ends & natural_ends,
     reasoning_budget_config & out) {
   if (max_tokens < 0) {
     set_error("thinking budget max_tokens must be non-negative");
@@ -290,12 +442,22 @@ bool resolve_reasoning_budget(
   }
   out.max_tokens = max_tokens;
   out.start_tokens = common_tokenize(g_state.vocab, start_tag, false, true);
-  out.end_tokens = common_tokenize(g_state.vocab, end_tag, false, true);
+  const auto tokenize_end = [&](const std::string & tag) {
+    out.end_tokens.push_back(common_tokenize(g_state.vocab, tag, false, true));
+  };
+  if (natural_ends.tags.empty()) {
+    tokenize_end(end_tag);
+  } else {
+    for (const auto & tag : natural_ends.tags) {
+      tokenize_end(tag);
+    }
+  }
   std::string forced_text = forced_message == nullptr ? "" : forced_message;
   forced_text += end_tag;
   out.forced_tokens = common_tokenize(g_state.vocab, forced_text, false, true);
-  if (out.start_tokens.empty() || out.end_tokens.empty() ||
-      out.forced_tokens.empty()) {
+  if (out.start_tokens.empty() || out.forced_tokens.empty() ||
+      std::any_of(out.end_tokens.begin(), out.end_tokens.end(),
+                  [](const llama_tokens & end) { return end.empty(); })) {
     set_error("thinking budget tags produce no tokens for this vocabulary");
     return false;
   }
@@ -320,9 +482,14 @@ common_reasoning_budget_state reasoning_budget_initial_state(
     if (token_sequence_at(prompt_tokens, index, config.start_tokens)) {
       state = REASONING_BUDGET_COUNTING;
       index += config.start_tokens.size();
-    } else if (token_sequence_at(prompt_tokens, index, config.end_tokens)) {
+      continue;
+    }
+    const auto end = std::find_if(
+        config.end_tokens.begin(), config.end_tokens.end(),
+        [&](const llama_tokens & tokens) { return token_sequence_at(prompt_tokens, index, tokens); });
+    if (end != config.end_tokens.end()) {
       state = REASONING_BUDGET_IDLE;
-      index += config.end_tokens.size();
+      index += end->size();
     } else {
       index++;
     }
@@ -345,7 +512,10 @@ int32_t begin_generation_impl(
     const char * thinking_start_tag,
     const char * thinking_end_tag,
     const char * thinking_forced_message,
-    const int32_t prompt_penalty_mode) {
+    const int32_t prompt_penalty_mode,
+    const char * natural_end_tags_json = nullptr,
+    const int32_t grammar_replay_end_index = -1,
+    const bool multi_end = false) {
   // Defence in depth behind the bridge's single-writer queue: reject before
   // touching any shared state, so a stray second begin cannot destroy the
   // in-flight generation's output, sampler, or g_last_error. The caller maps
@@ -417,6 +587,16 @@ int32_t begin_generation_impl(
   }
 
   const bool has_reasoning_budget = thinking_start_tag != nullptr;
+  reasoning_budget_ends natural_ends;
+  if (multi_end) {
+    if (!has_reasoning_budget) {
+      set_error("thinking budget start and end tags must be non-empty");
+      return -2;
+    }
+    if (!parse_reasoning_budget_ends(natural_end_tags_json, grammar_replay_end_index, natural_ends)) {
+      return -2;
+    }
+  }
   reasoning_budget_config reasoning_budget;
   if (has_reasoning_budget) {
     if (!g_pending_media.empty()) {
@@ -428,6 +608,7 @@ int32_t begin_generation_impl(
             thinking_start_tag,
             thinking_end_tag,
             thinking_forced_message,
+            natural_ends,
             reasoning_budget)) {
       return -2;
     }
@@ -492,6 +673,7 @@ int32_t begin_generation_impl(
       !g_pending_media.empty();
 
   llama_sampler_ptr reasoning_budget_sampler;
+  llama_tokens grammar_replay_end;
   std::vector<llama_token> penalty_prompt_tokens;
   if (!g_pending_media.empty()) {
     llama_memory_clear(llama_get_memory(g_state.ctx), false);
@@ -541,13 +723,27 @@ int32_t begin_generation_impl(
     g_usage_cached_prompt_tokens = static_cast<int32_t>(reused_tokens);
 
     if (has_reasoning_budget) {
-      reasoning_budget_sampler.reset(common_reasoning_budget_init(
-          g_state.vocab,
-          {reasoning_budget.start_tokens},
-          {reasoning_budget.end_tokens},
-          reasoning_budget.forced_tokens,
-          reasoning_budget.max_tokens,
-          reasoning_budget_initial_state(reasoning_budget, prompt_tokens)));
+      const auto initial_state = reasoning_budget_initial_state(reasoning_budget, prompt_tokens);
+      if (multi_end) {
+        if (grammar_sampler && grammar_options.pause_while_reasoning &&
+            natural_ends.grammar_replay_index >= 0) {
+          grammar_replay_end = reasoning_budget.end_tokens[natural_ends.grammar_replay_index];
+        }
+        auto budget = std::make_unique<multi_end_reasoning_budget>(multi_end_reasoning_budget{
+            g_state.vocab, std::move(reasoning_budget.start_tokens),
+            std::move(reasoning_budget.end_tokens), std::move(reasoning_budget.forced_tokens),
+            reasoning_budget.max_tokens, nullptr});
+        budget->set_natural_child(initial_state);
+        reasoning_budget_sampler.reset(llama_sampler_init(&multi_end_reasoning_budget_interface, budget.release()));
+      } else {
+        reasoning_budget_sampler.reset(common_reasoning_budget_init(
+            g_state.vocab,
+            {reasoning_budget.start_tokens},
+            reasoning_budget.end_tokens,
+            reasoning_budget.forced_tokens,
+            reasoning_budget.max_tokens,
+            initial_state));
+      }
       if (!reasoning_budget_sampler) {
         set_error("Failed to initialize the thinking budget sampler");
         return -5;
@@ -581,6 +777,7 @@ int32_t begin_generation_impl(
   }
 
   g_active_reasoning_budget = reasoning_budget_ptr;
+  g_active_grammar_replay_end = std::move(grammar_replay_end);
   g_active_grammar = grammar_sampler.release();
   g_active_grammar_lazy = g_active_grammar != nullptr && grammar_options.lazy;
   g_active_grammar_pauses_while_reasoning = grammar_options.pause_while_reasoning;

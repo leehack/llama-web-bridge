@@ -5,6 +5,17 @@ cores run with one CPU thread. WebGPU can still offload model layers, and the
 cores support vision, speech recognition and speech synthesis. Use the wasm32
 core in Safari, where memory64 is unavailable.
 
+The default pthread cores require cross-origin isolation. Serve the page with
+`Cross-Origin-Opener-Policy: same-origin` and
+`Cross-Origin-Embedder-Policy: require-corp`.
+
+`allowSingleThreadCore` skips the bridge's initial isolation check. A core that
+starts a pthread pool can stall if the page cannot share memory with workers.
+When initialization stalls, the bridge retries once. Each runtime can wait for
+`coreInitTimeoutMs` twice before reporting `Bridge core init timeout`, or four
+times if both the memory64 and wasm32 cores stall. A shorter worker load
+timeout can trigger a retry on the main thread.
+
 A worker with automatic fetch-backed loading falls back to streamed staging
 and reports `model_fetch_backend_requires_pthreads`. Forcing the fetch backend
 on a single-thread worker raises `SingleThreadCoreError`. Every single-thread

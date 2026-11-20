@@ -248,7 +248,7 @@ export type GrammarTrigger =
   | { type: 'word' | 'pattern' | 'pattern-full'; value: string }
   | { type: 'token'; token: number };
 
-/** llama.cpp's reasoning budget: after `maxTokens` tokens inside a reasoning block, plus any that finish a UTF-8 character, the sampler forces `forcedMessage` and `endTag`. A grammar pauses after `startTag` until `endTag` completes, unless `pauseGrammar` is false. */
+/** llama.cpp's reasoning budget: after `maxTokens` tokens inside a reasoning block, plus any that finish a UTF-8 character, the sampler forces `forcedMessage` and `endTag`. A grammar pauses after `startTag` until a natural end or the forced close completes, unless `pauseGrammar` is false. */
 export interface ThinkingBudgetOptions {
   /** Integer from 0 to 2147483647. 0 forces the end as soon as a block opens, or at once when the prompt ends inside one. */
   maxTokens: number;
@@ -258,6 +258,10 @@ export interface ThinkingBudgetOptions {
   endTag: string;
   /** Text forced before `endTag` when the budget runs out; empty by default. */
   forcedMessage?: string;
+  /** Complete ordered list of natural ends, including any normal close. Omit to use only `endTag`. Needs `thinkingBudgetMultiEnd`. */
+  naturalEndTags?: string[];
+  /** Index of the natural end that a paused tool grammar must accept when thinking closes. Omit or pass -1 to disable replay. */
+  grammarReplayEndIndex?: number;
   /** `false` keeps `grammar` applied inside a reasoning block, for a grammar that takes the block and `endTag` itself, such as one written for a prompt that ends inside the block; paused, it would resume at its start and take the reply as reasoning. It must accept `forcedMessage` and `endTag` wherever the budget can run out. Omitted, null or true pauses the grammar. Needs the `thinkingBudgetPauseGrammar` capability. */
   pauseGrammar?: boolean | null;
 }
@@ -272,6 +276,8 @@ export interface CompletionCapabilities {
   thinkingBudget: boolean;
   /** `CompletionOptions.thinkingBudget.pauseGrammar` is applied. A core without it pauses every grammar inside a reasoning block. */
   thinkingBudgetPauseGrammar: boolean;
+  /** The core applies ordered natural ends and emits the complete forced close. */
+  thinkingBudgetMultiEnd: boolean;
   /** The penalties count the prompt, and `CompletionOptions.penaltyPromptTokens` is applied. A core without it never counts the prompt, so `penaltyPromptTokens: false` holds there too. */
   penaltyPromptTokens: boolean;
   /** The loaded core applies CompletionOptions.penaltyPromptTokensWithGrammar. Only literal true permits the opt-in. */
