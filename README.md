@@ -229,6 +229,8 @@ playback and WAV encoding belong to the consuming application. Both direct and
 worker runtimes support progress, cancellation, language selection, and
 optional encoded speaker-reference audio when the loaded projector reports the
 capability.
+When `supportsIncrementalAudio` is true, `streamAudio` delivers PCM chunks
+through the synthesis progress callback.
 
 The validated Qwen3-TTS 1.7B model/projector pair totals about 1.48 GB before
 runtime buffers. It requires the memory64 browser runtime in practice and has a

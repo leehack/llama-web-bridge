@@ -26,6 +26,7 @@ const NATIVE_EXPORTS = [
   'llamadart_webgpu_tts_step',
   'llamadart_webgpu_tts_progress_json',
   'llamadart_webgpu_tts_write_pcm',
+  'llamadart_webgpu_tts_write_pcm_chunk',
   'llamadart_webgpu_tts_reset',
 ];
 
@@ -44,6 +45,11 @@ function includesAll(text, ...needles) {
 require(
   HEADER.includes('LLAMADART_WEBGPU_TTS_API_VERSION = 1'),
   'TTS wrapper API must have an explicit version',
+);
+require(
+  HEADER.includes('LLAMADART_WEBGPU_TTS_CAPABILITY_STREAMING_PCM = 1u << 3')
+    && includesAll(TTS, 'mtmd_helper_gen_audio_flush', 'input.stream = tts->stream'),
+  'TTS streaming must use capability bit 3 and flush the upstream PCM tail',
 );
 for (const symbol of NATIVE_EXPORTS) {
   require(CORE.includes(symbol), `missing core wrapper ${symbol}`);
@@ -181,8 +187,23 @@ require(
   'runtime dispose must inspect projector unload status and release the staged WasmFS file after shutdown',
 );
 require(
-  /async synthesizeSpeech\(options(?::[^=]*)? = \{\}\).*?if \(this\._textToSpeechActive\).*?this\._ensureTextToSpeechDir\(\)/s.test(JS),
+  /if \(this\._textToSpeechActive\).*?this\._ensureTextToSpeechDir\(\)/s.test(
+    methodBody(RUNTIME_JS, 'async synthesizeSpeech('),
+  ),
   'direct TTS must reserve the operation before writing temporary speaker input',
+);
+
+require(
+  includesAll(DTS, 'supportsIncrementalAudio: boolean', 'streamAudio?: boolean', 'sampleOffset?: number'),
+  'TTS declarations must expose the streaming capability, option and PCM offset',
+);
+require(
+  includesAll(API_DOCS_FLAT, 'supportsIncrementalAudio', 'streamAudio', 'sampleOffset', '5.76', 'completing progress'),
+  'TTS API docs must describe the capability, streaming option and chunk timing',
+);
+require(
+  includesAll(SMOKE, '--skip-streaming', 'streamingTested', 'streamChunkCount', 'streamWindowChunkTested'),
+  'TTS browser smoke must exercise streamed audio and report chunk delivery',
 );
 
 if (errors.length > 0) {

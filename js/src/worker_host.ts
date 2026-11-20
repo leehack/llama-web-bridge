@@ -6,6 +6,7 @@ import { EMBED_BATCH_PROGRESS_OPTION, EmbeddingError } from './internal/embeddin
 import { ModelUnloadedError } from './internal/core_guard.ts';
 import { CrossOriginIsolationError, SingleThreadCoreError } from './internal/isolation.ts';
 import { ModelStagingError } from './internal/model_staging.ts';
+import { textToSpeechProgressTransfers } from './internal/text_to_speech.ts';
 import { BlobWorkerBlockedError } from './internal/worker_start.ts';
 import type { EmbedBatchProgressHook } from './internal/embedding.ts';
 import { toUint8Array } from './internal/typed_values.ts';
@@ -90,7 +91,7 @@ export function installBridgeWorkerHost() {
         // Posted when the core retires, so it reaches the facade before the
         // reply of the call that hit the abort, whatever that reply carries.
         bridge._onCoreRetired = () => self.postMessage({ type: 'core-retired' });
-        self.postMessage({ type: 'ready' });
+        self.postMessage({ type: 'ready', supportsIncrementalAudio: true });
         return;
       }
 
@@ -350,8 +351,14 @@ export function installBridgeWorkerHost() {
       if (method === 'synthesizeSpeech') {
         const options: Partial<TextToSpeechOptions> = (args[0] && typeof args[0] === 'object') ? { ...args[0] } : {};
         delete options.signal;
-        options.onProgress = (progress: unknown) => {
-          self.postMessage({ type: 'event', id, event: 'progress', payload: progress || {} });
+        options.onProgress = (progress) => {
+          const event = { type: 'event', id, event: 'progress', payload: progress || {} };
+          const transfers = textToSpeechProgressTransfers(progress);
+          if (transfers.length > 0) {
+            self.postMessage(event, transfers);
+          } else {
+            self.postMessage(event);
+          }
         };
         const value = await bridge.synthesizeSpeech(options);
         const transfers = value?.pcm?.buffer instanceof ArrayBuffer

@@ -9,6 +9,8 @@
   `worker_start_blocked:csp|unavailable|script`. A blocked pthread start
   rejects with `BlobWorkerBlockedError` (`BLOB_WORKER_BLOCKED`).
 
+- Stream Qwen3-TTS PCM through `onProgress` with `streamAudio`. The bridge reports `supportsIncrementalAudio` and rejects worker failures after delivery begins so callers never receive replayed audio. (#220)
+
 - Thinking budgets accept an ordered list of natural ends. A tool opener can close reasoning and activate the paused tool grammar, and an exhausted budget emits the full forced close. The loaded core reports support through `thinkingBudgetMultiEnd`.
 
 - Escape control characters in tensor names in wasm32 GGUF size errors and report an overflowed declared size as at least 2^64 bytes.

@@ -42,7 +42,7 @@ export const RUNTIME_MODES = Object.freeze(['direct', 'worker']);
 
 export function renderHarness({
   prompt, modelSha256, mmprojSha256, speakerAudioSha256, memoryModes, runtimeModes, maxFrames, gpuLayers,
-  testCancellation,
+  testCancellation, testStreaming = true,
 }) {
   return `
 <!doctype html>
@@ -175,7 +175,7 @@ export function renderHarness({
           const progress = [];
           setStage(\`\${memoryMode}:\${runtimeMode}:synthesize\`);
           const synthesisStartedAt = performance.now();
-          const output = await bridge.synthesizeSpeech({
+          const request = {
             text: ${pyJson(prompt)},
             language: 'en',
             speakerAudio: speakerAudio || undefined,
@@ -186,6 +186,9 @@ export function renderHarness({
             minP: 0,
             temperature: 0.8,
             seed: 1,
+          };
+          const output = await bridge.synthesizeSpeech({
+            ...request,
             onProgress: (event) => progress.push({
               state: event.state,
               promptTokensRemaining: event.promptTokensRemaining,
@@ -211,6 +214,42 @@ export function renderHarness({
           assert(rms > 0.0001, \`synthesized audio RMS is too low: \${rms}\`);
           assert(progress.some((event) => event.state === 2), 'generation progress was not observed');
           assert(progress.some((event) => event.state === 3), 'completion progress was not observed');
+
+          let streamingTested = false;
+          let streamChunkCount = 0;
+          let streamWindowChunkTested = false;
+          if (${pyJson(testStreaming)}) {
+            setStage(\`\${memoryMode}:\${runtimeMode}:synthesize-streamed\`);
+            assert(capabilities.supportsIncrementalAudio === true, 'incremental audio capability is absent');
+            const chunks = [];
+            const streamed = await bridge.synthesizeSpeech({
+              ...request,
+              streamAudio: true,
+              onProgress: (event) => {
+                if (event.pcm !== undefined) chunks.push(event);
+              },
+            });
+            const expectedBytes = new Uint8Array(output.pcm.buffer, output.pcm.byteOffset, output.pcm.byteLength);
+            let received = 0;
+            for (const chunk of chunks) {
+              assert(chunk.pcm instanceof Float32Array, 'streamed PCM is not Float32Array');
+              assert(chunk.pcm.length > 0, 'streamed PCM chunk is empty');
+              assert(chunk.sampleOffset === received, 'streamed PCM offset is not contiguous');
+              assert(chunk.sampleRate === output.sampleRate && chunk.channels === output.channels, 'streamed PCM format mismatch');
+              const bytes = new Uint8Array(chunk.pcm.buffer, chunk.pcm.byteOffset, chunk.pcm.byteLength);
+              const byteOffset = received * Float32Array.BYTES_PER_ELEMENT;
+              const mismatch = bytes.findIndex((byte, index) => byte !== expectedBytes[byteOffset + index]);
+              assert(mismatch === -1, \`streamed PCM differs at byte \${byteOffset + mismatch}\`);
+              received += chunk.pcm.length;
+              streamWindowChunkTested ||= chunk.state === 2 && chunk.pcm.length === 138240;
+            }
+            assert(streamed.pcm instanceof Float32Array && streamed.pcm.length === 0, 'streamed result contains final PCM');
+            assert(received === output.sampleCount && streamed.sampleCount === received, 'streamed sample count mismatch');
+            assert(streamed.framesGenerated === output.framesGenerated, 'streamed frame count mismatch');
+            assert(streamed.truncated === output.truncated, 'streamed truncation status mismatch');
+            streamingTested = true;
+            streamChunkCount = chunks.length;
+          }
 
           let cancellationTested = false;
           let reuseSampleCount = 0;
@@ -238,6 +277,37 @@ export function renderHarness({
             }
             assert(abortRequested, 'cancellation was not requested during audio generation');
 
+            let streamRejected = false;
+            let chunkAfterRejection = false;
+            if (${pyJson(testStreaming)}) {
+              setStage(\`\${memoryMode}:\${runtimeMode}:cancel-streamed\`);
+              const streamController = new AbortController();
+              let firstChunkState = null;
+              try {
+                await bridge.synthesizeSpeech({
+                  ...request,
+                  streamAudio: true,
+                  signal: streamController.signal,
+                  onProgress: (event) => {
+                    if (event.pcm === undefined) return;
+                    chunkAfterRejection ||= streamRejected;
+                    if (firstChunkState === null) {
+                      firstChunkState = event.state;
+                      streamController.abort();
+                    }
+                  },
+                });
+                throw new Error('cancelled streamed synthesis unexpectedly completed');
+              } catch (error) {
+                assert(error?.name === 'AbortError', \`unexpected streamed cancellation error: \${error}\`);
+                streamRejected = true;
+              }
+              assert(
+                firstChunkState === (streamWindowChunkTested ? 2 : 3),
+                'streaming was not cancelled on the first PCM chunk',
+              );
+            }
+
             setStage(\`\${memoryMode}:\${runtimeMode}:reuse\`);
             const reuse = await bridge.synthesizeSpeech({
               text: 'Ready.',
@@ -247,6 +317,7 @@ export function renderHarness({
             });
             assert(reuse.pcm instanceof Float32Array, 'reuse PCM output is invalid');
             assert(reuse.sampleCount > 0, 'runtime reuse after cancellation returned no audio');
+            assert(!chunkAfterRejection, 'received streamed PCM after cancellation rejected');
             cancellationTested = true;
             reuseSampleCount = reuse.sampleCount;
           }
@@ -272,12 +343,17 @@ export function renderHarness({
             synthesisMs,
             sampleRate: output.sampleRate,
             sampleCount: output.sampleCount,
+            pcmSha256: Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', output.pcm)),
+              (byte) => byte.toString(16).padStart(2, '0')).join(''),
             durationSeconds: output.sampleCount / output.sampleRate,
             framesGenerated: output.framesGenerated,
             truncated: output.truncated,
             peak,
             rms,
             cancellationTested,
+            streamingTested,
+            streamChunkCount,
+            streamWindowChunkTested,
             preAbortedTested: true,
             reuseSampleCount,
             speakerReferenceTested: speakerAudio !== null,
@@ -324,6 +400,7 @@ export function parseArgs(argv) {
       { flag: '--runtime-mode', type: 'string', choices: ['all', ...RUNTIME_MODES], default: () => 'all' },
       { flag: '--timeout-ms', type: 'int', default: () => 1_200_000 },
       { flag: '--skip-cancellation', type: 'flag', default: () => false },
+      { flag: '--skip-streaming', type: 'flag', default: () => false },
       { flag: '--artifacts-dir', type: 'path' },
     ],
   });
@@ -397,6 +474,7 @@ export async function main(argv = process.argv.slice(2)) {
       maxFrames: args.maxFrames,
       gpuLayers: args.gpuLayers,
       testCancellation: !args.skipCancellation,
+      testStreaming: !args.skipStreaming,
     }), 'utf8');
     const artifactsDir = args.artifactsDir !== null ? resolvePath(args.artifactsDir) : null;
     if (artifactsDir !== null) {
