@@ -16,6 +16,11 @@ import {
 import { MODEL_UNLOADED_AFTER_CORE_ABORT, ModelUnloadedError } from './internal/core_guard.ts';
 import { ModelStagingError, isModelStagingErrorCode } from './internal/model_staging.ts';
 import type { LlamaWebGpuBridgeConfig } from './llama_webgpu_bridge.d.ts';
+import {
+  BLOB_WORKER_BLOCKED, BlobWorkerBlockedError, isCrossOriginScriptUrl, probeBlobWorker, recordBlobWorkerBlocked,
+  watchBlobWorkerCsp,
+} from './internal/worker_start.ts';
+import type { WorkerStartMode } from './internal/worker_start.ts';
 import { bridgeWorkerModeParam } from './worker_protocol.ts';
 import type { WorkerEventHandler, WorkerResponse } from './worker_protocol.ts';
 
@@ -30,16 +35,22 @@ function createBridgeWorkerSource(moduleUrl: string): string {
   return `import * as workerModule from ${JSON.stringify(moduleUrl)};\nif (workerModule && typeof workerModule.enableBridgeWorkerHost === 'function') { workerModule.enableBridgeWorkerHost(); }\n`;
 }
 
+function resolveAbsoluteWorkerUrl(moduleUrl: string): string {
+  try {
+    const base = typeof window !== 'undefined' ? window.location?.href : undefined;
+    return new URL(moduleUrl, base).href;
+  } catch (_) {
+    return moduleUrl;
+  }
+}
+
 function resolveWorkerEntryUrl(moduleUrl: unknown): string | null {
   if (typeof moduleUrl !== 'string' || moduleUrl.length === 0) {
     return null;
   }
 
   try {
-    const base = (typeof window !== 'undefined' && window.location?.href)
-      ? window.location.href
-      : undefined;
-    const url = new URL(moduleUrl, base);
+    const url = new URL(moduleUrl);
     const path = url.pathname || '';
     const usesDedicatedWorkerEntry = path.endsWith('_worker.js');
     if (!usesDedicatedWorkerEntry) {
@@ -57,10 +68,7 @@ function deriveBridgeModuleUrlFromWorkerEntry(moduleUrl: unknown): string | null
   }
 
   try {
-    const base = (typeof window !== 'undefined' && window.location?.href)
-      ? window.location.href
-      : undefined;
-    const url = new URL(moduleUrl, base);
+    const url = new URL(moduleUrl);
     const path = url.pathname || '';
     if (!path.endsWith('_worker.js')) {
       return null;
@@ -79,6 +87,9 @@ export class BridgeWorkerProxy {
   declare _nextId: number;
   declare _pending: Map<number, PendingRequest>;
   declare _workerBlobUrl: string | null;
+  declare _readySettled: boolean;
+  declare _stopCspWatch: (() => boolean) | null;
+  declare startMode: WorkerStartMode;
   declare _worker: Worker;
   declare _ready: Promise<void>;
   declare _readyResolve: () => void;
@@ -96,13 +107,19 @@ export class BridgeWorkerProxy {
     this.coreRetired = false;
 
     let workerInitError: unknown = null;
-    const moduleCandidates = [moduleUrl];
-    const bridgeModuleFallback = deriveBridgeModuleUrlFromWorkerEntry(moduleUrl);
-    if (bridgeModuleFallback && bridgeModuleFallback !== moduleUrl) {
+    const absoluteModuleUrl = resolveAbsoluteWorkerUrl(moduleUrl);
+    const moduleCandidates = [absoluteModuleUrl];
+    const bridgeModuleFallback = deriveBridgeModuleUrlFromWorkerEntry(absoluteModuleUrl);
+    if (bridgeModuleFallback && bridgeModuleFallback !== absoluteModuleUrl) {
       moduleCandidates.push(bridgeModuleFallback);
     }
 
-    for (const candidate of moduleCandidates) {
+    const crossOrigin = isCrossOriginScriptUrl(absoluteModuleUrl);
+    this.startMode = 'direct';
+    this._readySettled = false;
+    this._stopCspWatch = null;
+
+    for (const candidate of crossOrigin ? [] : moduleCandidates) {
       if (this._worker) {
         break;
       }
@@ -119,22 +136,31 @@ export class BridgeWorkerProxy {
       }
     }
 
-    for (const candidate of moduleCandidates) {
+    // A synchronous failure to construct a cross-origin script's blob worker
+    // happens before its script loads. Another blob URL cannot fix it.
+    for (const candidate of crossOrigin ? [absoluteModuleUrl] : moduleCandidates) {
       if (this._worker) {
         break;
       }
 
-      const source = createBridgeWorkerSource(candidate);
-      this._workerBlobUrl = URL.createObjectURL(
-        new Blob([source], { type: 'text/javascript' }),
-      );
-
       try {
+        const source = createBridgeWorkerSource(candidate);
+        this._workerBlobUrl = URL.createObjectURL(
+          new Blob([source], { type: 'text/javascript' }),
+        );
+        this._stopCspWatch = watchBlobWorkerCsp();
         this._worker = new Worker(this._workerBlobUrl, { type: 'module' });
+        this.startMode = 'blob';
       } catch (error) {
-        workerInitError = error;
-        URL.revokeObjectURL(this._workerBlobUrl);
-        this._workerBlobUrl = null;
+        const refused = this._endCspWatch();
+        if (refused) recordBlobWorkerBlocked('csp');
+        workerInitError = crossOrigin
+          ? new BlobWorkerBlockedError(refused ? 'csp' : 'unavailable', 'bridge_worker')
+          : error;
+        if (this._workerBlobUrl) {
+          URL.revokeObjectURL(this._workerBlobUrl);
+          this._workerBlobUrl = null;
+        }
       }
     }
 
@@ -153,7 +179,10 @@ export class BridgeWorkerProxy {
       const message: WorkerResponse = event.data || {};
       const type = message.type;
       if (type === 'ready') {
+        if (this._readySettled) return;
         this._clearReadyTimeout();
+        this._readySettled = true;
+        this._endCspWatch();
         this._readyResolve?.();
         return;
       }
@@ -185,6 +214,8 @@ export class BridgeWorkerProxy {
               ? new CrossOriginIsolationError(errorMessage)
               : message.errorCode === SINGLE_THREAD_CORE_UNSUPPORTED
                 ? new SingleThreadCoreError(errorMessage)
+                : message.errorCode === BLOB_WORKER_BLOCKED
+                  ? new BlobWorkerBlockedError(message.blobWorkerBlockReason ?? 'unavailable', 'pthread', errorMessage)
                 : message.errorCode === MODEL_UNLOADED_AFTER_CORE_ABORT
                   ? new ModelUnloadedError(errorMessage)
                   : message.errorCode === 'MODEL_TRANSFER_LENGTH_ERROR'
@@ -211,7 +242,14 @@ export class BridgeWorkerProxy {
       error.llamadartWorkerCrash = true;
 
       this._clearReadyTimeout();
-      this._readyReject?.(error);
+      if (!this._readySettled) {
+        this._readySettled = true;
+        if (this.startMode === 'blob') {
+          void this._classifyBlobStartFailure(error);
+        } else {
+          this._readyReject(error);
+        }
+      }
 
       for (const pending of this._pending.values()) {
         pending.reject(error);
@@ -219,7 +257,7 @@ export class BridgeWorkerProxy {
       this._pending.clear();
     };
 
-    this._worker.postMessage({ type: 'init', config });
+    this._worker.postMessage({ type: 'init', config: { ...config, workerStart: this.startMode } });
   }
 
   async call(
@@ -289,6 +327,26 @@ export class BridgeWorkerProxy {
     return Math.max(3000, Math.min(120000, Math.trunc(configured)));
   }
 
+  async _classifyBlobStartFailure(crash: Error) {
+    // The CSP violation event may follow the worker's error event.
+    await new Promise((resolve) => globalThis.setTimeout(resolve, 0));
+    if (!this._stopCspWatch) {
+      this._readyReject(crash);
+      return;
+    }
+    const refused = this._endCspWatch();
+    if (refused) recordBlobWorkerBlocked('csp');
+    const reason = refused ? 'csp' : (await probeBlobWorker()) ?? 'script';
+    const error = new BlobWorkerBlockedError(reason, 'bridge_worker');
+    this._readyReject(Object.assign(error, { llamadartWorkerCrash: true }));
+  }
+
+  _endCspWatch() {
+    const refused = this._stopCspWatch?.() ?? false;
+    this._stopCspWatch = null;
+    return refused;
+  }
+
   _clearReadyTimeout() {
     if (this._readyTimeoutHandle != null) {
       globalThis.clearTimeout(this._readyTimeoutHandle);
@@ -301,6 +359,8 @@ export class BridgeWorkerProxy {
     const timeoutMs = this._resolveWorkerReadyTimeoutMs();
     this._readyTimeoutHandle = globalThis.setTimeout(() => {
       this._readyTimeoutHandle = null;
+      this._readySettled = true;
+      this._endCspWatch();
       const timeoutError = new Error(`Bridge worker init timeout (${timeoutMs}ms)`);
       this._readyReject?.(timeoutError);
       try {
@@ -360,6 +420,7 @@ export class BridgeWorkerProxy {
 
   async dispose() {
     this._clearReadyTimeout();
+    this._endCspWatch();
     let didTimeout = false;
     try {
       await Promise.race([

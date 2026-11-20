@@ -176,12 +176,12 @@ it.
 
 | Option | Type | Description |
 | --- | --- | --- |
-| `coreModuleUrl` | `string` | URL for the wasm32 Emscripten JS loader, usually `llama_webgpu_core.js`. |
-| `coreModuleUrlMem64` | `string` | URL for the optional wasm64 Emscripten JS loader. |
+| `coreModuleUrl` | `string` | Same-origin or CDN URL for the wasm32 Emscripten JS loader, usually `llama_webgpu_core.js`. Cross-origin pthreads use module `blob:` wrappers. |
+| `coreModuleUrlMem64` | `string` | Same-origin or CDN URL for the optional wasm64 Emscripten JS loader. Cross-origin pthreads use module `blob:` wrappers. |
 | `wasmUrl` | `string` | URL for the wasm32 `llama_webgpu_core.wasm` binary. |
 | `wasmUrlMem64` | `string` | URL for the optional wasm64 wasm binary. |
 | `coreModuleFactory` | `LlamaCoreModuleFactory \| Promise<LlamaCoreModuleFactory>` | Preloaded Emscripten factory. Supplying this disables worker mode because factories cannot be transferred to the worker. It also skips the default isolation check. A core that starts a pthread pool can hit `coreInitTimeoutMs` if the page cannot share memory with workers. See [the custom core contract](#custom-core-factory). A core instance holds one loaded model. Bridges that share the same core instance must not hold models at the same time. A load on either bridge releases the model in that core. Return a separate core instance for each bridge that needs an independent model. |
-| `workerUrl` | `string` | URL for `llama_webgpu_bridge_worker.js`. Defaults to a sibling of the bridge module when possible. |
+| `workerUrl` | `string` | Same-origin or CDN URL for the bridge worker entry. Cross-origin entries start from a module `blob:` wrapper. Defaults to `llama_webgpu_bridge_worker.js` next to the bridge module. |
 | `disableWorker` | `boolean` | Force direct runtime mode. |
 | `allowSingleThreadCore` | `boolean` | Set to `true` with explicit `_st` core URLs to load on pages without cross-origin isolation. Single-thread cores use one CPU thread and report `core_single_thread`. A core that starts a pthread pool can still hit `Bridge core init timeout` if the page cannot share memory with workers. See [single-thread setup and timeout behavior](single_thread.md). |
 | `jsBackedModelStaging` | `boolean` | Opt-in (`false` by default). Use for models over ~1 GB on `wasm32`, or large models on `memory64` to cut peak wasm heap; streams models and multimodal projectors directly into 64 MiB JS `Uint8Array` chunks under a private per-operation `/jsmodels-<n>` mount (`model_staging_js_backed`, `mmproj_staging_js_backed`) and releases that mount's chunks on completion or failure, at the cost of slightly slower small loads and temporary JS heap storage. |
@@ -229,6 +229,8 @@ warning at the `warn` log level and sets `llamadart.webgpu.execution` to
 `main-thread` and `llamadart.webgpu.worker_fallback_reason` in
 `getModelMetadata()`. A result returned after a fallback did not run in the
 worker.
+A blocked blob start also adds `worker_start_blocked:<reason>` to the direct
+runtime's notes, including after a later core replacement.
 
 ### Custom core factory
 
@@ -242,6 +244,15 @@ genuine `WebAssembly.RuntimeError` constructor as
 bridge trusts the supplied constructor. Built cores expose it. An older
 cross-realm core without this export still retires through `onAbort` and
 rethrows a bare trap with the core left in use.
+
+For a wrapper loaded through `coreModuleUrl` or `coreModuleUrlMem64`, pass the
+original options object to the Emscripten factory. A spread or
+`Object.assign({}, options)` drops the non-enumerable `mainScriptUrlOrBlob`
+property the cross-origin pthread startup uses. On the first cross-origin
+pthread start in a realm, the bridge may call the factory twice while it checks
+whether the worker can start. A wrapper must discard state from the first,
+rejected call. Custom cross-origin cores that first request a pthread after
+initialization, such as builds with a pool size of zero, are unsupported.
 
 ### Static properties
 
@@ -1239,7 +1250,7 @@ include:
 | `llamadart.webgpu.core_variant` | `wasm32`, `wasm64`, or initialization state. |
 | `llamadart.webgpu.model_source` | Model load source, such as network/cache/remote fetch. |
 | `llamadart.webgpu.model_cache_state` | Cache Storage state for the loaded model. |
-| `llamadart.webgpu.runtime_notes` | Semicolon-separated bridge notes. When a memory64 core attempt fails, `core_mem64_unavailable:<reason>` accompanies `core_mem64_unavailable` and the bridge logs a warning with the same code before trying wasm32. The codes are `unsupported` (the engine rejects a memory64 feature probe after the core factory fails), `timeout` (the bridge's core initialization timer expires), and `init_error` (other failures, including module import). Single-thread cores report `core_single_thread` and `core_pthreads:0`. Automatic fetch-backed loading on a single-thread worker reports `model_fetch_backend_requires_pthreads` and streams into staging. `model_staging_js_backed` identifies JS-backed staging. Model downloads report `model_stream_resume_validated` for verified resumes, `model_stream_resume_unvalidated` for resumes without sufficient validation, and `model_stream_restart:<reason>` when a response requires restarting at zero. `gpu_unavailable:<reason>` (`no_webgpu`, `no_adapter`, `adapter_missing_shader_f16`, `unknown`) says why a load with `nGpuLayers > 0` runs on the CPU. The bridge also logs one warning. Chrome hides `shader-f16` on NVIDIA drivers older than 615.71, and ggml-webgpu then registers no device. Safari reports `safari_gpu_layers_capped:<n>` when the cap lowers the requested count, `safari_gpu_probe_embedding` when probing with embeddings, `safari_gpu_probe_passed` or `safari_gpu_probe_failed` for the initial probe, `safari_gpu_probe_skipped_input_too_long` when both embedding prompt pairs exceed the effective microbatch, and `safari_fallback_cpu` when a retry loads on the CPU. |
+| `llamadart.webgpu.runtime_notes` | Semicolon-separated bridge notes. `worker_start:direct` and `worker_start:blob` report how the bridge worker started. `pthread_start:direct` and `pthread_start:blob` report the pthread start mode when the loaded core supports pthreads. `worker_start_blocked:<reason>` reports why the bridge worker fell back to the page thread. When a memory64 core attempt fails, `core_mem64_unavailable:<reason>` accompanies `core_mem64_unavailable` and the bridge logs a warning with the same code before trying wasm32. The codes are `unsupported` (the engine rejects a memory64 feature probe after the core factory fails), `timeout` (the bridge's core initialization timer expires), and `init_error` (other failures, including module import). Single-thread cores report `core_single_thread` and `core_pthreads:0`. Automatic fetch-backed loading on a single-thread worker reports `model_fetch_backend_requires_pthreads` and streams into staging. `model_staging_js_backed` identifies JS-backed staging. Model downloads report `model_stream_resume_validated` for verified resumes, `model_stream_resume_unvalidated` for resumes without sufficient validation, and `model_stream_restart:<reason>` when a response requires restarting at zero. `gpu_unavailable:<reason>` (`no_webgpu`, `no_adapter`, `adapter_missing_shader_f16`, `unknown`) says why a load with `nGpuLayers > 0` runs on the CPU. The bridge also logs one warning. Chrome hides `shader-f16` on NVIDIA drivers older than 615.71, and ggml-webgpu then registers no device. Safari reports `safari_gpu_layers_capped:<n>` when the cap lowers the requested count, `safari_gpu_probe_embedding` when probing with embeddings, `safari_gpu_probe_passed` or `safari_gpu_probe_failed` for the initial probe, `safari_gpu_probe_skipped_input_too_long` when both embedding prompt pairs exceed the effective microbatch, and `safari_fallback_cpu` when a retry loads on the CPU. |
 | `llamadart.webgpu.mmproj_loaded` | `1` when a projector is loaded. |
 | `llamadart.webgpu.supports_vision` | `1` when the active projector supports vision. |
 | `llamadart.webgpu.supports_audio` | `1` when the active projector supports audio. |
@@ -1337,8 +1348,22 @@ this function themselves.
   `wasmUrl` and `wasmUrlMem64` if the binaries are served separately.
   Single-thread cores support vision, speech recognition and speech synthesis.
   See the [size measurements and limits](single_thread.md).
-- Serve `llama_webgpu_core.js` and `llama_webgpu_core.wasm` from URLs reachable
-  by both the page and worker. If using wasm64, also serve the `_mem64` files.
+- The bridge, worker script, and core JS and Wasm may use URLs on the page's
+  origin or a CDN. The CDN must allow CORS and serve the assets under COEP
+  `require-corp`. Cross-origin workers use module `blob:` wrappers. Cross-origin
+  pthread workers require core assets built with the `mainScriptUrlOrBlob` hook.
+- With CSP, allow `worker-src blob: <asset-origin>`,
+  `script-src <asset-origin> 'wasm-unsafe-eval'`, and `connect-src` for the asset
+  and model hosts, in addition to the application's own sources. If the page
+  forbids blob workers, a cross-origin bridge worker or pthread start can
+  generate a `worker-src` violation.
+  Blob-worker support is probed once per realm and core URL, so reload the
+  page after changing its CSP.
+- In Chromium opaque-origin frames, such as an iframe sandbox without
+  `allow-same-origin`, a cross-origin single-thread worker falls back to the
+  page thread. If the script is blocked after the blob starts, as with
+  `worker-src 'self' blob:` omitting the CDN, or if the origin is opaque, the
+  bridge starts one short-lived diagnostic blob worker before it falls back.
 - Keep `llama_webgpu_bridge.js`, `llama_webgpu_bridge_worker.js`, the core JS,
   and wasm files from the same published bridge asset set.
 - Use `dispose()` before dropping references when switching models or tearing
@@ -1384,3 +1409,15 @@ this function themselves.
   and `wasm32` Qwen3-8B-Q4_K_M (4.68 GiB) hit the `4 GiB`
   `gguf_init_from_reader` tensor size-overflow ceiling (`4,288,489,984 +
   9,437,184` > `4,294,967,295`).
+
+### `BlobWorkerBlockedError`
+
+A cross-origin pthread core rejects with `BlobWorkerBlockedError`
+(`code: 'BLOB_WORKER_BLOCKED'`, `target: 'pthread'`) when its blob workers
+cannot start. A blocked bridge worker uses `target: 'bridge_worker'`
+internally and switches to the page thread. Inspect the runtime notes for
+`worker_start_blocked:<reason>`.
+
+The `reason` is `csp` when the policy refuses the blob, `unavailable` when
+the current context cannot start a module blob worker, or `script` when the
+worker cannot import the cross-origin script, for example due to CSP or CORS.

@@ -179,6 +179,20 @@ Run the same single-thread smoke with `--memory-mode wasm64` as well. Both
 non-isolated runs check that the worker rejects a forced fetch-backend load,
 and that auto mode stages the model. CI and candidate qualification require both runs.
 
+For worker-start or core URL changes, run the two-origin Chromium smoke with
+the same checksum-pinned model:
+
+```bash
+node scripts/smoke/cross_origin_assets.mjs \
+  --dist-dir "$OUT_DIR" \
+  --model-url "$LLAMA_WEBGPU_SMOKE_MODEL_URL" \
+  --model-sha256 "$LLAMA_WEBGPU_SMOKE_MODEL_SHA256"
+```
+
+It checks CDN-only assets, CSP fallback and typed rejections, and direct
+single-thread loads that start no worker. Run again with `--memory-mode wasm64`
+to verify the memory64 cores.
+
 The resume integrity smoke uses the model already downloaded by state
 persistence. Set the model URL, SHA-256 and cache directory to the same values
 as the state smoke and run:

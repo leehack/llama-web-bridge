@@ -61,6 +61,7 @@ applies:
 - state-persistence or workflow changes:
   `scripts/smoke/state_persistence.mjs` (both default pthreads and
   `--threading single` for wasm32 and wasm64) against a built `OUT_DIR`;
+- worker-start or core URL changes: `scripts/smoke/cross_origin_assets.mjs`;
 - llama.cpp pin or multimodal changes: `scripts/smoke/multimodal.mjs`
   through both direct and worker runtimes;
 - sampler or grammar changes: `scripts/smoke/grammar.mjs` with the

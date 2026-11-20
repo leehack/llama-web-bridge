@@ -318,6 +318,14 @@ export class CrossOriginIsolationError extends Error {
   constructor(message?: string);
 }
 
+/** A cross-origin script could not start from a module blob worker. */
+export class BlobWorkerBlockedError extends Error {
+  readonly code: 'BLOB_WORKER_BLOCKED';
+  readonly reason: 'csp' | 'unavailable' | 'script';
+  readonly target: 'bridge_worker' | 'pthread';
+  constructor(reason: 'csp' | 'unavailable' | 'script', target: 'bridge_worker' | 'pthread', message?: string);
+}
+
 /** Thrown when a worker load forces the fetch backend on a single-thread core. */
 export class SingleThreadCoreError extends Error {
   readonly code: 'SINGLE_THREAD_CORE_UNSUPPORTED';

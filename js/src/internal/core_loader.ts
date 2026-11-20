@@ -29,3 +29,14 @@ export async function importCoreFactory(moduleUrl: string): Promise<LlamaCoreMod
   const exportedModule = await import(moduleUrl);
   return normalizeFactory(exportedModule);
 }
+
+// The URL import() loads for `moduleUrl`: resolved against this module and
+// through the page's import map, like the import above.
+export function resolveCoreModuleUrl(moduleUrl: string): string {
+  try {
+    const resolve = (import.meta as { resolve?: (specifier: string) => string }).resolve;
+    return typeof resolve === 'function' ? resolve.call(import.meta, moduleUrl) : new URL(moduleUrl, import.meta.url).href;
+  } catch (_) {
+    return '';
+  }
+}

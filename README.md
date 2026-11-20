@@ -88,7 +88,9 @@ On pages without cross-origin isolation, pass the explicit `_st` core URLs
 with `allowSingleThreadCore: true`. A single-thread load reports
 `core_single_thread`. Worker loads use streamed staging when automatic
 fetch-backed loading is enabled. Forcing the fetch backend in a worker
-raises `SingleThreadCoreError`. See the [single-thread measurements](docs/single_thread.md).
+raises `SingleThreadCoreError`. The bridge can run a single-thread core in a
+worker with the model and bridge assets served from a CDN. See the
+[single-thread measurements](docs/single_thread.md).
 
 ### JS-backed model staging
 
@@ -565,6 +567,16 @@ Tags published before this rule, such as `v0.1.47-1`, and the shared native
 forms (`vMAJOR.MINOR.PATCH-N`, `bNNNN`, `bNNNN-N`) stay readable. Historical
 `bNNNN-llamadart.N` and earlier wrapper forms are accepted only when reading
 existing manifests and are never emitted.
+
+The bridge script, worker script, and both core files can all use CDN URLs.
+Cross-origin workers, including a threaded core's pthreads, start from
+same-origin module `blob:` wrappers. Use a bridge asset set built with the
+pthread worker hook. The CDN must allow CORS and serve the assets under COEP
+`require-corp`. jsDelivr sends both CORS and CORP headers.
+
+If the page sets a Content Security Policy, allow `blob:` and the asset
+origin in `worker-src`, the asset origin and `'wasm-unsafe-eval'` in
+`script-src`, and the asset and model origins in `connect-src`.
 
 After publish, assets are CDN-available at:
 

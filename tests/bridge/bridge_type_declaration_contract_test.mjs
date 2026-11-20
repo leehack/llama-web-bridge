@@ -1,9 +1,18 @@
 import assert from 'node:assert/strict';
+
+import * as bridge from '../../js/llama_webgpu_bridge.js';
 import { spawnSync } from 'node:child_process';
 import { copyFileSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+
+const blocked = new bridge.BlobWorkerBlockedError('csp', 'pthread');
+assert.equal(blocked.code, 'BLOB_WORKER_BLOCKED');
+assert.equal(blocked.reason, 'csp');
+assert.equal(blocked.target, 'pthread');
+assert.equal(blocked.name, 'BlobWorkerBlockedError');
+assert.equal('PthreadStartProbeRequired' in bridge, false);
 
 const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const temporaryDir = mkdtempSync(path.join(tmpdir(), 'llama-web-bridge-types-'));
@@ -32,7 +41,7 @@ try {
     path.join(temporaryDir, 'consumer.ts'),
     [
       "import type { CompletionOptions, DecisionHeadOptions, DecisionSequence, EmbedOptions, LlamaWebGpuBridgeConfig, LoraAdapterLoadOptions, ModelStagingError, ModelStagingErrorCode } from './bridge.js';",
-      "import { SingleThreadCoreError } from './bridge.js';",
+      "import { BlobWorkerBlockedError, SingleThreadCoreError } from './bridge.js';",
       '',
       'export const acceptedConfig: LlamaWebGpuBridgeConfig = { jsBackedModelStaging: true };',
       'export const acceptedStagingCode: ModelStagingErrorCode = "MODEL_STAGING_ALLOCATION_FAILED";',
@@ -40,6 +49,12 @@ try {
       'export const acceptedMountCode: ModelStagingErrorCode = "MODEL_STAGING_MOUNT_FAILED";',
       'export const acceptedUnsupportedCode: ModelStagingErrorCode = "MODEL_STAGING_UNSUPPORTED";',
       'export declare const stagingErrorCheck: ModelStagingError;',
+      "const blockedWorker = new BlobWorkerBlockedError('script', 'pthread');",
+      'export const blobWorkerCode: "BLOB_WORKER_BLOCKED" = blockedWorker.code;',
+      'export const blobWorkerReason: "csp" | "unavailable" | "script" = blockedWorker.reason;',
+      'export const blobWorkerTarget: "bridge_worker" | "pthread" = blockedWorker.target;',
+      '// @ts-expect-error worker targets are limited to the bridge worker and pthreads.',
+      "new BlobWorkerBlockedError('csp', 'main-thread');",
       'const fetchError = new SingleThreadCoreError();',
       'export const singleThreadCode: "SINGLE_THREAD_CORE_UNSUPPORTED" = fetchError.code;',
       'export const unsupportedFeature: "remote_fetch_backend" = fetchError.feature;',

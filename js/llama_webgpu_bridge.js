@@ -948,6 +948,145 @@ var SingleThreadCoreError = class extends Error {
 };
 var CROSS_ORIGIN_ISOLATION_MESSAGE = 'The llama.cpp web core needs shared memory, which this page cannot use because it is not cross-origin isolated. Serve the page with "Cross-Origin-Opener-Policy: same-origin" and "Cross-Origin-Embedder-Policy: require-corp". "credentialless" does not isolate Safari.';
 
+// js/src/internal/worker_start.ts
+var BLOB_WORKER_BLOCKED = "BLOB_WORKER_BLOCKED";
+var BlobWorkerBlockedError = class extends Error {
+  code = BLOB_WORKER_BLOCKED;
+  constructor(reason, target, message) {
+    super(message ?? blobWorkerBlockedMessage(reason, target));
+    this.name = "BlobWorkerBlockedError";
+    this.reason = reason;
+    this.target = target;
+  }
+};
+function blobWorkerBlockedMessage(reason, target) {
+  const what = target === "pthread" ? "The core pthread workers" : "The bridge worker";
+  const why = reason === "csp" ? 'the Content Security Policy does not allow "worker-src blob:"' : reason === "unavailable" ? "this context cannot start module workers from blob: URLs" : 'a blob: worker could not import that script (check that "worker-src" allows its origin and that it is served with CORS)';
+  return `${what} must start from a blob: URL for a cross-origin script, but ${why}.`;
+}
+function isCrossOriginScriptUrl(absoluteUrl) {
+  const origin = globalThis.origin;
+  if (typeof origin !== "string" || origin.length === 0) return false;
+  try {
+    const url = new URL(absoluteUrl);
+    return (url.protocol === "http:" || url.protocol === "https:") && url.origin !== origin;
+  } catch (_) {
+    return false;
+  }
+}
+function moduleBlobUrl(source) {
+  return URL.createObjectURL(new Blob([source], { type: "text/javascript" }));
+}
+var pthreadBlobUrls = /* @__PURE__ */ new Map();
+function pthreadWorkerBlobUrl(absoluteCoreUrl) {
+  let url = pthreadBlobUrls.get(absoluteCoreUrl);
+  if (!url) {
+    url = moduleBlobUrl(`import ${JSON.stringify(absoluteCoreUrl)};
+`);
+    pthreadBlobUrls.set(absoluteCoreUrl, url);
+  }
+  return url;
+}
+function watchBlobWorkerCsp() {
+  let refused = false;
+  const onViolation = (event) => {
+    const { blockedURI, disposition, effectiveDirective } = event;
+    if (blockedURI === "blob" && disposition === "enforce" && effectiveDirective === "worker-src") {
+      refused = true;
+    }
+  };
+  globalThis.addEventListener?.("securitypolicyviolation", onViolation);
+  return () => {
+    globalThis.removeEventListener?.("securitypolicyviolation", onViolation);
+    return refused;
+  };
+}
+function runBlobWorkerProbe(importUrl) {
+  return new Promise((resolve) => {
+    const stopWatching = watchBlobWorkerCsp();
+    let url;
+    let worker;
+    let timer;
+    let settled = false;
+    const finish = (failed) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      const cspBlocked = stopWatching();
+      worker?.terminate();
+      if (url) URL.revokeObjectURL(url);
+      resolve(failed ? cspBlocked ? "csp" : importUrl ? "script" : "unavailable" : null);
+    };
+    try {
+      const importSource = importUrl ? `import ${JSON.stringify(importUrl)};
+` : "";
+      url = moduleBlobUrl(`${importSource}postMessage(0);`);
+      worker = new Worker(url, { type: "module" });
+    } catch (_) {
+      finish(true);
+      return;
+    }
+    worker.onmessage = () => finish(false);
+    worker.onerror = () => setTimeout(() => finish(true), 0);
+    timer = setTimeout(() => finish(false), 5e3);
+  });
+}
+var blobWorkerProbes = /* @__PURE__ */ new Map();
+function probeBlobWorker(importUrl = "") {
+  const existing = blobWorkerProbes.get(importUrl);
+  if (existing) return existing.ready;
+  const probe = {
+    result: void 0,
+    ready: (importUrl ? probeBlobWorker().then((blocked) => blocked ?? runBlobWorkerProbe(importUrl)) : runBlobWorkerProbe("")).then((result) => {
+      probe.result = result;
+      return result;
+    })
+  };
+  blobWorkerProbes.set(importUrl, probe);
+  return probe.ready;
+}
+function recordBlobWorkerBlocked(reason) {
+  blobWorkerProbes.set("", { result: reason, ready: Promise.resolve(reason) });
+}
+function blobWorkerProbeResult(importUrl = "") {
+  return blobWorkerProbes.get("")?.result || blobWorkerProbes.get(importUrl)?.result;
+}
+var PthreadStartProbeRequired = class extends Error {
+  constructor() {
+    super("The bridge is probing blob: worker support and will start the core again.");
+    this.name = "PthreadStartProbeRequired";
+  }
+};
+function pthreadScriptProperty(coreUrl, onUse) {
+  return {
+    configurable: true,
+    enumerable: false,
+    get() {
+      const blocked = blobWorkerProbeResult(coreUrl);
+      if (blocked === void 0) {
+        void probeBlobWorker(coreUrl);
+        throw new PthreadStartProbeRequired();
+      }
+      if (blocked) {
+        throw new BlobWorkerBlockedError(blocked, "pthread");
+      }
+      onUse();
+      return pthreadWorkerBlobUrl(coreUrl);
+    }
+  };
+}
+async function withPthreadStartProbe(coreUrl, start) {
+  try {
+    return await start();
+  } catch (error) {
+    if (!(error instanceof PthreadStartProbeRequired)) {
+      throw error;
+    }
+    await probeBlobWorker(coreUrl);
+    return start();
+  }
+}
+
 // js/src/internal/logging.ts
 function logLevelForName(level) {
   switch (level) {
@@ -1167,6 +1306,14 @@ function normalizeFactory(moduleExport) {
 async function importCoreFactory(moduleUrl) {
   const exportedModule = await import(moduleUrl);
   return normalizeFactory(exportedModule);
+}
+function resolveCoreModuleUrl(moduleUrl) {
+  try {
+    const resolve = import.meta.resolve;
+    return typeof resolve === "function" ? resolve.call(import.meta, moduleUrl) : new URL(moduleUrl, import.meta.url).href;
+  } catch (_) {
+    return "";
+  }
 }
 
 // js/src/internal/parse.ts
@@ -2017,6 +2164,9 @@ var LlamaWebGpuBridgeRuntime = class {
     this._textToSpeechDone = null;
     this._resolveTextToSpeechDone = null;
     this._runtimeNotes = [];
+    const workerStart = config.workerStart;
+    this._startNotes = workerStart === "direct" || workerStart === "blob" ? [`worker_start:${workerStart}`] : [];
+    this._pthreadStart = "direct";
     this._threadPoolSizeHint = Number(config.threadPoolSize) > 0 ? Math.max(1, Math.trunc(Number(config.threadPoolSize))) : null;
     const requestedThreads = Number(config.threads) > 0 ? Number(config.threads) : this._resolveAutoThreadCount();
     this._threads = this._capThreadsToPool(requestedThreads);
@@ -3523,13 +3673,16 @@ var LlamaWebGpuBridgeRuntime = class {
       if (this._preferMemory64 && typeof this._config.coreModuleUrlMem64 === "string" && this._config.coreModuleUrlMem64.length > 0) {
         candidates.push({
           variant: "wasm64",
+          moduleUrl: this._config.coreModuleUrlMem64,
           factoryPromise: importCoreFactory(this._config.coreModuleUrlMem64),
           wasmUrl: this._config.wasmUrlMem64 || this._config.wasmUrl
         });
       }
+      const moduleUrl = this._config.coreModuleUrl ?? "./llama_webgpu_core.js";
       candidates.push({
         variant: "wasm32",
-        factoryPromise: importCoreFactory(this._config.coreModuleUrl ?? "./llama_webgpu_core.js"),
+        moduleUrl,
+        factoryPromise: importCoreFactory(moduleUrl),
         wasmUrl: this._config.wasmUrl
       });
     }
@@ -3546,8 +3699,13 @@ var LlamaWebGpuBridgeRuntime = class {
         const moduleFactory = await candidate.factoryPromise;
         factoryLoaded = true;
         const initTimeoutMs = this._resolveCoreInitTimeoutMs();
-        candidateCore = guardCore(await Promise.race([
-          moduleFactory({
+        const absoluteCoreUrl = candidate.moduleUrl ? resolveCoreModuleUrl(candidate.moduleUrl) : "";
+        let pthreadStart = "direct";
+        const pthreadScript = isCrossOriginScriptUrl(absoluteCoreUrl) ? { mainScriptUrlOrBlob: pthreadScriptProperty(absoluteCoreUrl, () => {
+          pthreadStart = "blob";
+        }) } : {};
+        candidateCore = guardCore(await withPthreadStartProbe(absoluteCoreUrl, () => Promise.race([
+          moduleFactory(Object.defineProperties({
             locateFile: (path, prefix) => {
               if (path.endsWith(".wasm") && candidate.wasmUrl) {
                 return candidate.wasmUrl;
@@ -3614,15 +3772,16 @@ var LlamaWebGpuBridgeRuntime = class {
               }
               retireCore(candidateCore, reason);
             }
-          }),
+          }, pthreadScript)),
           new Promise((_, reject) => {
             globalThis.setTimeout(() => {
               initTimeoutError = new Error(`Bridge core init timeout (${initTimeoutMs}ms)`);
               reject(initTimeoutError);
             }, initTimeoutMs);
           })
-        ]), (cause, stats) => this._handleCoreRetired(cause, stats));
+        ])), (cause, stats) => this._handleCoreRetired(cause, stats));
         this._core = candidateCore;
+        this._pthreadStart = pthreadStart;
         this._coreVariant = candidate.variant === "wasm64" ? "wasm64" : "wasm32";
         this._memory64FallbackReason = memory64FallbackReason;
         if (candidate.variant === "wasm64") {
@@ -3676,7 +3835,10 @@ var LlamaWebGpuBridgeRuntime = class {
     const abortMessage = "Model load was cancelled.";
     throwIfAborted(operationSignal, abortMessage);
     this._abortRequested = false;
-    this._runtimeNotes = this._core && this._memory64FallbackReason ? ["core_mem64_unavailable", `core_mem64_unavailable:${this._memory64FallbackReason}`] : [];
+    this._runtimeNotes = [
+      ...this._startNotes,
+      ...this._core && this._memory64FallbackReason ? ["core_mem64_unavailable", `core_mem64_unavailable:${this._memory64FallbackReason}`] : []
+    ];
     this._suppressedWarmupWarningCount = 0;
     this._didReportWarmupWarningSuppression = false;
     await this._probeBackends();
@@ -3693,7 +3855,9 @@ var LlamaWebGpuBridgeRuntime = class {
     this._syncThreadPoolSizeHintFromCore();
     const coreSupportsPthreads = this._coreSupportsPthreads();
     this._pushRuntimeNote(`core_pthreads:${coreSupportsPthreads ? 1 : 0}`);
-    if (!coreSupportsPthreads) {
+    if (coreSupportsPthreads) {
+      this._pushRuntimeNote(`pthread_start:${this._pthreadStart}`);
+    } else {
       this._pushRuntimeNote("core_single_thread");
     }
     if (!coreSupportsPthreads && Number.isFinite(configuredPoolHint) && configuredPoolHint > 1) {
@@ -6312,13 +6476,20 @@ function createBridgeWorkerSource(moduleUrl) {
 if (workerModule && typeof workerModule.enableBridgeWorkerHost === 'function') { workerModule.enableBridgeWorkerHost(); }
 `;
 }
+function resolveAbsoluteWorkerUrl(moduleUrl) {
+  try {
+    const base = typeof window !== "undefined" ? window.location?.href : void 0;
+    return new URL(moduleUrl, base).href;
+  } catch (_) {
+    return moduleUrl;
+  }
+}
 function resolveWorkerEntryUrl(moduleUrl) {
   if (typeof moduleUrl !== "string" || moduleUrl.length === 0) {
     return null;
   }
   try {
-    const base = typeof window !== "undefined" && window.location?.href ? window.location.href : void 0;
-    const url = new URL(moduleUrl, base);
+    const url = new URL(moduleUrl);
     const path = url.pathname || "";
     const usesDedicatedWorkerEntry = path.endsWith("_worker.js");
     if (!usesDedicatedWorkerEntry) {
@@ -6334,8 +6505,7 @@ function deriveBridgeModuleUrlFromWorkerEntry(moduleUrl) {
     return null;
   }
   try {
-    const base = typeof window !== "undefined" && window.location?.href ? window.location.href : void 0;
-    const url = new URL(moduleUrl, base);
+    const url = new URL(moduleUrl);
     const path = url.pathname || "";
     if (!path.endsWith("_worker.js")) {
       return null;
@@ -6355,12 +6525,17 @@ var BridgeWorkerProxy = class {
     this._workerBlobUrl = null;
     this.coreRetired = false;
     let workerInitError = null;
-    const moduleCandidates = [moduleUrl];
-    const bridgeModuleFallback = deriveBridgeModuleUrlFromWorkerEntry(moduleUrl);
-    if (bridgeModuleFallback && bridgeModuleFallback !== moduleUrl) {
+    const absoluteModuleUrl = resolveAbsoluteWorkerUrl(moduleUrl);
+    const moduleCandidates = [absoluteModuleUrl];
+    const bridgeModuleFallback = deriveBridgeModuleUrlFromWorkerEntry(absoluteModuleUrl);
+    if (bridgeModuleFallback && bridgeModuleFallback !== absoluteModuleUrl) {
       moduleCandidates.push(bridgeModuleFallback);
     }
-    for (const candidate of moduleCandidates) {
+    const crossOrigin = isCrossOriginScriptUrl(absoluteModuleUrl);
+    this.startMode = "direct";
+    this._readySettled = false;
+    this._stopCspWatch = null;
+    for (const candidate of crossOrigin ? [] : moduleCandidates) {
       if (this._worker) {
         break;
       }
@@ -6374,20 +6549,26 @@ var BridgeWorkerProxy = class {
         workerInitError = error;
       }
     }
-    for (const candidate of moduleCandidates) {
+    for (const candidate of crossOrigin ? [absoluteModuleUrl] : moduleCandidates) {
       if (this._worker) {
         break;
       }
-      const source = createBridgeWorkerSource(candidate);
-      this._workerBlobUrl = URL.createObjectURL(
-        new Blob([source], { type: "text/javascript" })
-      );
       try {
+        const source = createBridgeWorkerSource(candidate);
+        this._workerBlobUrl = URL.createObjectURL(
+          new Blob([source], { type: "text/javascript" })
+        );
+        this._stopCspWatch = watchBlobWorkerCsp();
         this._worker = new Worker(this._workerBlobUrl, { type: "module" });
+        this.startMode = "blob";
       } catch (error) {
-        workerInitError = error;
-        URL.revokeObjectURL(this._workerBlobUrl);
-        this._workerBlobUrl = null;
+        const refused = this._endCspWatch();
+        if (refused) recordBlobWorkerBlocked("csp");
+        workerInitError = crossOrigin ? new BlobWorkerBlockedError(refused ? "csp" : "unavailable", "bridge_worker") : error;
+        if (this._workerBlobUrl) {
+          URL.revokeObjectURL(this._workerBlobUrl);
+          this._workerBlobUrl = null;
+        }
       }
     }
     if (!this._worker) {
@@ -6403,7 +6584,10 @@ var BridgeWorkerProxy = class {
       const message = event.data || {};
       const type = message.type;
       if (type === "ready") {
+        if (this._readySettled) return;
         this._clearReadyTimeout();
+        this._readySettled = true;
+        this._endCspWatch();
         this._readyResolve?.();
         return;
       }
@@ -6423,7 +6607,7 @@ var BridgeWorkerProxy = class {
       this._pending.delete(id);
       if (type === "error") {
         const errorMessage = String(message.message || "Worker request failed");
-        const workerError = message.embeddingErrorCode ? new EmbeddingError(message.embeddingErrorCode, errorMessage) : this._config.jsBackedModelStaging === true && isModelStagingErrorCode(message.modelStagingErrorCode) ? new ModelStagingError(message.modelStagingErrorCode, errorMessage) : message.errorCode === CROSS_ORIGIN_ISOLATION_REQUIRED ? new CrossOriginIsolationError(errorMessage) : message.errorCode === SINGLE_THREAD_CORE_UNSUPPORTED ? new SingleThreadCoreError(errorMessage) : message.errorCode === MODEL_UNLOADED_AFTER_CORE_ABORT ? new ModelUnloadedError(errorMessage) : message.errorCode === "MODEL_TRANSFER_LENGTH_ERROR" ? createModelTransferLengthError(errorMessage) : new Error(errorMessage);
+        const workerError = message.embeddingErrorCode ? new EmbeddingError(message.embeddingErrorCode, errorMessage) : this._config.jsBackedModelStaging === true && isModelStagingErrorCode(message.modelStagingErrorCode) ? new ModelStagingError(message.modelStagingErrorCode, errorMessage) : message.errorCode === CROSS_ORIGIN_ISOLATION_REQUIRED ? new CrossOriginIsolationError(errorMessage) : message.errorCode === SINGLE_THREAD_CORE_UNSUPPORTED ? new SingleThreadCoreError(errorMessage) : message.errorCode === BLOB_WORKER_BLOCKED ? new BlobWorkerBlockedError(message.blobWorkerBlockReason ?? "unavailable", "pthread", errorMessage) : message.errorCode === MODEL_UNLOADED_AFTER_CORE_ABORT ? new ModelUnloadedError(errorMessage) : message.errorCode === "MODEL_TRANSFER_LENGTH_ERROR" ? createModelTransferLengthError(errorMessage) : new Error(errorMessage);
         if (isDecisionErrorCode(message.decisionErrorCode)) {
           withDecisionErrorCode(workerError, message.decisionErrorCode);
         }
@@ -6440,13 +6624,20 @@ var BridgeWorkerProxy = class {
       const error = new Error(String(message));
       error.llamadartWorkerCrash = true;
       this._clearReadyTimeout();
-      this._readyReject?.(error);
+      if (!this._readySettled) {
+        this._readySettled = true;
+        if (this.startMode === "blob") {
+          void this._classifyBlobStartFailure(error);
+        } else {
+          this._readyReject(error);
+        }
+      }
       for (const pending of this._pending.values()) {
         pending.reject(error);
       }
       this._pending.clear();
     };
-    this._worker.postMessage({ type: "init", config });
+    this._worker.postMessage({ type: "init", config: { ...config, workerStart: this.startMode } });
   }
   async call(method, args, onEvent, transferList = [], operationMeta = null) {
     await this._ready;
@@ -6500,6 +6691,23 @@ var BridgeWorkerProxy = class {
     }
     return Math.max(3e3, Math.min(12e4, Math.trunc(configured)));
   }
+  async _classifyBlobStartFailure(crash) {
+    await new Promise((resolve) => globalThis.setTimeout(resolve, 0));
+    if (!this._stopCspWatch) {
+      this._readyReject(crash);
+      return;
+    }
+    const refused = this._endCspWatch();
+    if (refused) recordBlobWorkerBlocked("csp");
+    const reason = refused ? "csp" : await probeBlobWorker() ?? "script";
+    const error = new BlobWorkerBlockedError(reason, "bridge_worker");
+    this._readyReject(Object.assign(error, { llamadartWorkerCrash: true }));
+  }
+  _endCspWatch() {
+    const refused = this._stopCspWatch?.() ?? false;
+    this._stopCspWatch = null;
+    return refused;
+  }
   _clearReadyTimeout() {
     if (this._readyTimeoutHandle != null) {
       globalThis.clearTimeout(this._readyTimeoutHandle);
@@ -6511,6 +6719,8 @@ var BridgeWorkerProxy = class {
     const timeoutMs = this._resolveWorkerReadyTimeoutMs();
     this._readyTimeoutHandle = globalThis.setTimeout(() => {
       this._readyTimeoutHandle = null;
+      this._readySettled = true;
+      this._endCspWatch();
       const timeoutError = new Error(`Bridge worker init timeout (${timeoutMs}ms)`);
       this._readyReject?.(timeoutError);
       try {
@@ -6556,6 +6766,7 @@ var BridgeWorkerProxy = class {
   }
   async dispose() {
     this._clearReadyTimeout();
+    this._endCspWatch();
     let didTimeout = false;
     try {
       await Promise.race([
@@ -6614,6 +6825,7 @@ var LlamaWebGpuBridge = class {
     this._workerDisposePromise = null;
     this._retiringWorkerDisposals = /* @__PURE__ */ new Set();
     this._retiredWorkerProxies = /* @__PURE__ */ new WeakSet();
+    this._workerStartBlocked = null;
     this._workerFallbackReason = null;
     this._metadata = {};
     this._contextSize = 0;
@@ -6665,6 +6877,9 @@ var LlamaWebGpuBridge = class {
       ...this._config,
       disableWorker: true
     });
+    if (this._workerStartBlocked) {
+      runtime._startNotes = [`worker_start_blocked:${this._workerStartBlocked}`];
+    }
     runtime._onCoreRetired = (retired) => this._handleRuntimeCoreRetired(retired);
     return runtime;
   }
@@ -7685,6 +7900,9 @@ var LlamaWebGpuBridge = class {
     if (isCoreRetiredError(error) || error instanceof SingleThreadCoreError || this._isNonRecoverableStagingError(error)) {
       return false;
     }
+    if (error instanceof BlobWorkerBlockedError) {
+      return error.target === "bridge_worker";
+    }
     const text = serializeWorkerError(error).toLowerCase();
     if (text.includes("aborted(native code called abort())")) {
       return false;
@@ -7787,6 +8005,12 @@ var LlamaWebGpuBridge = class {
   _disableWorkerFallback(error) {
     const reason = serializeWorkerError(error);
     this._workerFallbackReason = reason;
+    if (error instanceof BlobWorkerBlockedError && error.target === "bridge_worker") {
+      this._workerStartBlocked = error.reason;
+      if (this._runtime) {
+        this._runtime._startNotes = [`worker_start_blocked:${error.reason}`];
+      }
+    }
     if (typeof globalThis !== "undefined") {
       globalThis.__llamadartBridgeWorkerFallbackReason = reason;
     }
@@ -9507,6 +9731,7 @@ function installBridgeWorkerHost() {
       ...error instanceof CrossOriginIsolationError || error instanceof SingleThreadCoreError || error instanceof ModelUnloadedError ? { errorCode: error.code } : {},
       ...error instanceof Error && error.name === "ModelTransferLengthError" ? { errorCode: "MODEL_TRANSFER_LENGTH_ERROR" } : {},
       ...error instanceof ModelStagingError ? { modelStagingErrorCode: error.code } : {},
+      ...error instanceof BlobWorkerBlockedError ? { errorCode: error.code, blobWorkerBlockReason: error.reason } : {},
       ...decisionErrorCode ? { decisionErrorCode } : {},
       state
     });
@@ -9875,6 +10100,7 @@ if (typeof window !== "undefined") {
   }
 }
 export {
+  BlobWorkerBlockedError,
   CrossOriginIsolationError,
   EmbeddingError,
   LlamaWebGpuBridge,

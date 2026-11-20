@@ -18,6 +18,8 @@ import {
 } from './internal/decision.ts';
 import { ModelUnloadedError } from './internal/core_guard.ts';
 import { SingleThreadCoreError } from './internal/isolation.ts';
+import { BlobWorkerBlockedError } from './internal/worker_start.ts';
+import type { BlobWorkerBlockReason } from './internal/worker_start.ts';
 import { logLevelForName, logThresholdForConfiguredLevel } from './internal/logging.ts';
 import {
   LORA_API_VERSION,
@@ -204,6 +206,7 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
   declare _workerDisposePromise: Promise<void> | null;
   declare _retiringWorkerDisposals: Set<Promise<void>>;
   declare _retiredWorkerProxies: WeakSet<object>;
+  declare _workerStartBlocked: BlobWorkerBlockReason | null;
   declare _workerFallbackReason: string | null;
   declare _metadata: ModelMetadata;
   declare _contextSize: number;
@@ -249,6 +252,7 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
     this._workerDisposePromise = null;
     this._retiringWorkerDisposals = new Set();
     this._retiredWorkerProxies = new WeakSet();
+    this._workerStartBlocked = null;
     this._workerFallbackReason = null;
 
     this._metadata = {};
@@ -312,6 +316,9 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
       ...this._config,
       disableWorker: true,
     });
+    if (this._workerStartBlocked) {
+      runtime._startNotes = [`worker_start_blocked:${this._workerStartBlocked}`];
+    }
     runtime._onCoreRetired = (retired) => this._handleRuntimeCoreRetired(retired);
     return runtime;
   }
@@ -1619,6 +1626,9 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
     ) {
       return false;
     }
+    if (error instanceof BlobWorkerBlockedError) {
+      return error.target === 'bridge_worker';
+    }
 
     const text = serializeWorkerError(error).toLowerCase();
 
@@ -1741,6 +1751,12 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
   _disableWorkerFallback(error: unknown) {
     const reason = serializeWorkerError(error);
     this._workerFallbackReason = reason;
+    if (error instanceof BlobWorkerBlockedError && error.target === 'bridge_worker') {
+      this._workerStartBlocked = error.reason;
+      if (this._runtime) {
+        this._runtime._startNotes = [`worker_start_blocked:${error.reason}`];
+      }
+    }
 
     if (typeof globalThis !== 'undefined') {
       (globalThis as WorkerFallbackGlobals).__llamadartBridgeWorkerFallbackReason = reason;
