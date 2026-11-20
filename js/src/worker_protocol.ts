@@ -29,7 +29,8 @@ export interface WorkerResponse {
   embeddingErrorCode?: EmbeddingErrorCode;
   decisionErrorCode?: DecisionErrorCode;
   modelStagingErrorCode?: ModelStagingErrorCode;
-  errorCode?: 'CROSS_ORIGIN_ISOLATION_REQUIRED' | 'SINGLE_THREAD_CORE_UNSUPPORTED' | 'MODEL_TRANSFER_LENGTH_ERROR';
+  errorCode?: 'CROSS_ORIGIN_ISOLATION_REQUIRED' | 'SINGLE_THREAD_CORE_UNSUPPORTED' | 'MODEL_TRANSFER_LENGTH_ERROR'
+    | 'MODEL_UNLOADED_AFTER_CORE_ABORT';
   event?: string;
   payload?: unknown;
 }
@@ -55,6 +56,8 @@ export interface WorkerRequestError extends Error {
   state?: BridgeStateSnapshot;
   llamadartWorkerCrash?: boolean;
   llamadartWorkerTimeout?: boolean;
+  // The worker reported that its core aborted; the facade already replaced it.
+  llamadartCoreRetired?: boolean;
 }
 
 type BridgeStateSource = Pick<
@@ -85,6 +88,12 @@ export function serializeWorkerError(error: unknown): string {
   } catch (_) {
     return String(error);
   }
+}
+
+// Whether `_callWorker` marked this error as the reply of a worker whose core aborted.
+export function isCoreRetiredError(error: unknown): boolean {
+  return !!error && typeof error === 'object'
+    && (error as WorkerRequestError).llamadartCoreRetired === true;
 }
 
 export const bridgeWorkerModeParam = '__llamadartBridgeWorker';

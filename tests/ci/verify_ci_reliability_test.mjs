@@ -636,6 +636,11 @@ assertRejected(validatePublicationPatContract('jobs: [unterminated', EXPECTED_ST
         return [CI_PATH, `        run: ${command}\n`, `        if: false\n        run: ${command}\n`,
           `job build-webgpu-bridge must run "${command}" unconditionally without continue-on-error`];
       }),
+    ...['', ' --threading single'].map((flags) => {
+      const command = `node scripts/smoke/core_abort_recovery.mjs${flags}`;
+      return [CI_PATH, `        run: ${command}\n`, `        if: false\n        run: ${command}\n`,
+        `job build-webgpu-bridge must run "${command}" unconditionally without continue-on-error`];
+    }),
     [PUBLISH_PATH, '          set -euo pipefail\n          node publication-policy/scripts/release/qualification.mjs verify-attestation',
       '          set -euo pipefail\n          # WEBGPU_BRIDGE_BUILD_SINGLE_THREAD\n          node publication-policy/scripts/release/qualification.mjs verify-attestation',
       'never rebuild the candidate or run a validator from the historical build source'],

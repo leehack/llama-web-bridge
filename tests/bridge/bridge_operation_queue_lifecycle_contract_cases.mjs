@@ -331,7 +331,7 @@ export const LIFECYCLE_CONTRACT_CASES = [
       assert.equal(disposalResolved, false, 'queued disposal must still be pending');
 
       // Only an unusable worker falls back; its trapped core posts the abort text.
-      driver.error(activeCall.id, 'RuntimeError: Aborted(undefined). Build with -sASSERTIONS for more info.');
+      driver.error(activeCall.id, 'Bridge worker crashed');
       assert.equal(await active, 'user: hi\nassistant: ');
       await driver.settle();
 

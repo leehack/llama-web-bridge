@@ -11,6 +11,8 @@
 
 - Allocate JS-backed staging paths per core and skip occupied filesystem paths. A bridge sharing a core through `coreModuleFactory` can load a model even when an earlier bridge left a busy staging mount or stale native registration.
 
+- Retire the native core after its abort callback or a genuine WebAssembly runtime error. Direct callers receive `ModelUnloadedError` on later model operations until a load succeeds. Worker mode replaces the worker and restores the remembered model and its active LoRA adapters. Media completion and speech synthesis on a GPU-loaded model retry once on the replacement worker with a CPU-only restore. Abort-like error text alone no longer restarts a worker or selects CPU offload. All four cores expose their realm's `WebAssembly.RuntimeError` and a hook that releases pthreads and JS-backed staging data. Older cross-realm cores without the constructor export retire through `onAbort`. Use bridge JS and the worker script from the same release.
+
 - Carry strong ETag and expected size evidence across repeated streamed GGUF interruptions. Restart overlong interrupted ranges, and enforce the declared span and consistent totals when a full GET returns an identity-encoded byte range starting at zero.
 
 - Treat visible empty `Content-Encoding` lists as identity and compare coding lists independent of spacing and case. Worker model downloads preserve the `ModelTransferLengthError` name on rejected transfers.

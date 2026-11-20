@@ -16,6 +16,7 @@ import {
   normalizeDecisionSequences,
   withDecisionErrorCode,
 } from './internal/decision.ts';
+import { ModelUnloadedError } from './internal/core_guard.ts';
 import { SingleThreadCoreError } from './internal/isolation.ts';
 import { logLevelForName, logThresholdForConfiguredLevel } from './internal/logging.ts';
 import {
@@ -30,7 +31,7 @@ import { ModelStagingError } from './internal/model_staging.ts';
 import { withoutNul } from './internal/text.ts';
 import { bufferSourceBytes, toUint8Array } from './internal/typed_values.ts';
 import { LlamaWebGpuBridgeRuntime } from './runtime.ts';
-import { emptyBridgeState, serializeWorkerError } from './worker_protocol.ts';
+import { emptyBridgeState, isCoreRetiredError, serializeWorkerError } from './worker_protocol.ts';
 import { BridgeWorkerProxy } from './worker_proxy.ts';
 import type { ModelSource } from './internal/model_source.ts';
 import type { LogMethod } from './internal/types.ts';
@@ -186,6 +187,15 @@ interface WorkerFallbackGlobals {
   __llamadartBridgeWorkerFallbackReason?: string;
 }
 
+// Operations that reject with "No model loaded" on a bridge without a model.
+// Decision calls are left out: they report it as their own `no-model` code.
+const MODEL_OPERATION_KINDS: ReadonlySet<string> = new Set([
+  'generation', 'projector-load', 'draft-model-load', 'text-to-speech',
+  'lora-adapter-load', 'lora-adapter-set', 'lora-adapter-remove', 'lora-adapters-clear',
+  'tokenize', 'detokenize', 'state-save-file', 'state-load-file', 'state-save-bytes',
+  'state-load-bytes', 'embedding', 'embedding-batch', 'next-token-scoring',
+]);
+
 export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
   declare _config: LlamaWebGpuBridgeConfig;
   declare _runtime: LlamaWebGpuBridgeRuntime | null;
@@ -207,6 +217,9 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
   declare _loadedDraftModel: RememberedDraftModel | null;
   declare _multimodalWorkerCpuMode: boolean;
   declare _workerModelMissing: boolean;
+  declare _coreRetirements: number;
+  declare _modelUnloadedAfterCoreAbort: boolean;
+  declare _onCoreRetired: (() => void) | null;
   declare _bridgeWarnRecent: Map<string, number>;
   declare _operationQueueTail: Promise<unknown> | null;
   declare _activeOperation: BridgeOperation | null;
@@ -252,6 +265,10 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
     // True while the current worker is a replacement that has not yet loaded
     // _loadedModelUrl. A replacement worker always starts without a model.
     this._workerModelMissing = false;
+    this._coreRetirements = 0;
+    // True from a core abort that unloaded the model until a load succeeds.
+    this._modelUnloadedAfterCoreAbort = false;
+    this._onCoreRetired = null;
     this._bridgeWarnRecent = new Map();
     this._operationQueueTail = null;
     this._activeOperation = null;
@@ -291,10 +308,37 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
   }
 
   _createRuntime() {
-    return new LlamaWebGpuBridgeRuntime({
+    const runtime = new LlamaWebGpuBridgeRuntime({
       ...this._config,
       disableWorker: true,
     });
+    runtime._onCoreRetired = (retired) => this._handleRuntimeCoreRetired(retired);
+    return runtime;
+  }
+
+  // A runtime owns one core for life, so an aborted core takes its runtime
+  // with it. The model is gone: later calls that need one reject with
+  // ModelUnloadedError until a load succeeds.
+  _handleRuntimeCoreRetired(runtime: LlamaWebGpuBridgeRuntime) {
+    if (this._runtime !== runtime) {
+      return;
+    }
+    this._coreRetirements = (this._coreRetirements || 0) + 1;
+    const replacement = this._lifecycleState === 'disposed' ? null : this._createRuntime();
+    if (replacement) {
+      if (Array.isArray(replacement._runtimeNotes) && Array.isArray(runtime._runtimeNotes)) {
+        replacement._runtimeNotes.push(...runtime._runtimeNotes.filter(
+          (note) => note.startsWith('core_abort') || note.startsWith('core_retired'),
+        ));
+      }
+      this._activeOperation?.runtimes?.add(replacement);
+    }
+    this._runtime = replacement;
+    if (!this._workerProxy) {
+      this._forgetLoadedModel();
+      this._modelUnloadedAfterCoreAbort = true;
+    }
+    this._onCoreRetired?.();
   }
 
   _operationSignal(operation = this._activeOperation) {
@@ -636,6 +680,12 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
       operation.state = 'running';
       let operationFailed = false;
       try {
+        if (
+          this._modelUnloadedAfterCoreAbort === true
+          && MODEL_OPERATION_KINDS.has(operation.kind)
+        ) {
+          throw new ModelUnloadedError();
+        }
         return await run(operation);
       } catch (error) {
         operationFailed = true;
@@ -869,6 +919,7 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
     this._loadedDraftModel = null;
     this._multimodalWorkerCpuMode = this._workerProxy != null;
     this._workerModelMissing = false;
+    this._modelUnloadedAfterCoreAbort = false;
     if (this._activeOperation) {
       this._activeOperation.modelSource = cloneModelSource(normalizedUrl);
       this._activeOperation.modelOptions = { ...this._loadedModelOptions };
@@ -989,7 +1040,11 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
   }
 
   _isRecoverableWorkerFsError(error: unknown) {
-    if (error instanceof SingleThreadCoreError || this._isNonRecoverableStagingError(error)) {
+    if (
+      isCoreRetiredError(error)
+      || error instanceof SingleThreadCoreError
+      || this._isNonRecoverableStagingError(error)
+    ) {
       return false;
     }
     const text = serializeWorkerError(error).toLowerCase();
@@ -1057,6 +1112,7 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
       return true;
     } catch (error) {
       this._throwIfDisposed();
+      this._throwIfWorkerCoreRetired(error);
       if (this._isOperationCancellation(error)) {
         // The cancelled load may already have released the worker's model.
         this._workerModelMissing = true;
@@ -1105,6 +1161,7 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
       } catch (error) {
         this._throwIfOperationCancelled(error, 'Draft model reload was cancelled.');
         this._forgetDraftModelAfterReloadFailure(error);
+        this._throwIfWorkerCoreRetired(error);
       }
     }
     this._throwIfDisposed();
@@ -1126,6 +1183,10 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
    * next restore skips it too. The chat template never reads the model.
    */
   async _restoreWorkerModelIfMissing() {
+    if (this._workerProxy?.coreRetired === true) {
+      // The core aborted while no call was waiting on this worker.
+      await this._replaceWorkerAfterCoreRetired(this._workerProxy);
+    }
     if (
       !this._workerProxy
       || this._workerModelMissing !== true
@@ -1142,6 +1203,31 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
     );
   }
 
+  /**
+   * A media completion or speech request whose core aborted on a GPU-loaded
+   * model is rerun on the replacement worker with a CPU-only reload, as the
+   * main-thread fallback did when it matched the abort text. It runs once:
+   * the reload leaves the model in CPU mode. Every other case rethrows, and
+   * the next call reloads the model as it was.
+   */
+  async _rerunOnCpuAfterCoreAbort<T>(error: unknown, rerun: () => Promise<T>): Promise<T> {
+    if (
+      !this._workerProxy
+      || this._workerModelMissing !== true
+      || !hasModelSource(this._loadedModelUrl)
+      || this._isCpuModelMode()
+    ) {
+      throw error;
+    }
+    this._loadedModelOptions = this._createCpuSafeMultimodalLoadOptions(
+      this._loadedModelOptions || {},
+    );
+    this._emitBridgeWarn(
+      'llamadart: retrying once with CPU fallback after the bridge worker core aborted.',
+    );
+    return rerun();
+  }
+
   _isDispatchWorkgroupLimitError(error: unknown) {
     const text = serializeWorkerError(error).toLowerCase();
     return (
@@ -1149,36 +1235,28 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
       || text.includes('max compute workgroups per dimension')
       || text.includes('invalid commandbuffer')
       || text.includes('ggml_webgpu: device error')
-      || text.includes('runtimeerror: aborted')
-      || text.includes('aborted()')
     );
   }
 
-  // An aborted or trapped Wasm core stays dead. The worker host posts only
-  // the message text, so a worker-side RuntimeError arrives without its name.
-  _isWasmCoreAbortError(error: unknown) {
-    if (typeof WebAssembly !== 'undefined' && error instanceof WebAssembly.RuntimeError) {
-      return true;
+  // The reply of a worker whose core aborted. `_callWorker` already replaced
+  // that worker, so no catch may restart it or fall back for the same error.
+  _throwIfWorkerCoreRetired(error: unknown) {
+    if (isCoreRetiredError(error)) {
+      throw error;
     }
-
-    const text = serializeWorkerError(error).toLowerCase();
-    return (
-      text.includes('aborted(')
-      || text.includes('runtimeerror')
-      || text.includes('unreachable')
-      || text.includes('memory access out of bounds')
-      || text.includes('function signature mismatch')
-      || text.includes('program terminated with exit')
-    );
   }
 
   // A worker request falls back only when the worker can no longer serve
-  // requests: it crashed, stalled, timed out, never initialized, or its core
-  // aborted. A core error from a healthy worker (invalid grammar, a context
+  // requests: it crashed, stalled, timed out or never initialized. A core
+  // abort is not one of these: `_callWorker` replaces that worker itself.
+  // A core error from a healthy worker (invalid grammar, a context
   // limit, an unsupported template, a model without embeddings) is
   // deterministic; retrying on the main thread fails the same way and strands
   // the session there.
   _isWorkerUnusableError(error: unknown) {
+    if (isCoreRetiredError(error)) {
+      return false;
+    }
     if (
       error
       && typeof error === 'object'
@@ -1189,7 +1267,6 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
 
     return (
       this._isWorkerTimeoutError(error)
-      || this._isWasmCoreAbortError(error)
       || this._shouldFallbackToMainThread(error)
     );
   }
@@ -1535,7 +1612,11 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
   }
 
   _shouldFallbackToMainThread(error: unknown) {
-    if (error instanceof SingleThreadCoreError || this._isNonRecoverableStagingError(error)) {
+    if (
+      isCoreRetiredError(error)
+      || error instanceof SingleThreadCoreError
+      || this._isNonRecoverableStagingError(error)
+    ) {
       return false;
     }
 
@@ -1722,6 +1803,10 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
     onEvent?: WorkerEventHandler | null,
     transferList: Transferable[] = [],
   ): Promise<T> {
+    if (this._workerProxy?.coreRetired === true) {
+      // The core aborted while no call was waiting on this worker.
+      await this._replaceWorkerAfterCoreRetired(this._workerProxy);
+    }
     const proxy = this._workerProxy;
     if (!proxy) {
       throw new Error('Bridge worker proxy is not available');
@@ -1762,15 +1847,56 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
         this._sendWorkerCancel(proxy, operation);
       }
       const response = await pending;
+      if (proxy.coreRetired === true) {
+        // The worker swallowed the abort in cleanup; what the call did is lost with its core.
+        throw new Error(`The bridge worker core aborted during ${method}.`);
+      }
       if (response?.state) {
         this._acceptWorkerState(operation, proxy, response.state);
       }
       return response?.value as T;
     } catch (error) {
+      if (proxy.coreRetired === true) {
+        throw await this._workerCoreRetiredError(proxy, error);
+      }
       if (error && typeof error === 'object' && (error as WorkerRequestError).state) {
         this._acceptWorkerState(operation, proxy, (error as WorkerRequestError).state!);
       }
       throw error;
+    }
+  }
+
+  /**
+   * Replaces the worker whose core aborted and returns the error to rethrow,
+   * marked so no catch handles the same abort again. The reply's state is
+   * never accepted: it describes the empty runtime of a worker that no longer
+   * exists, and the facade still holds the model the next call reloads.
+   */
+  async _workerCoreRetiredError(proxy: BridgeWorkerProxy, error: unknown) {
+    await this._replaceWorkerAfterCoreRetired(proxy);
+    const retired = (error && typeof error === 'object'
+      ? error
+      : new Error(serializeWorkerError(error))) as WorkerRequestError;
+    retired.llamadartCoreRetired = true;
+    return retired;
+  }
+
+  // The only place a worker is replaced for a core abort (A1, worker mode).
+  async _replaceWorkerAfterCoreRetired(retired: BridgeWorkerProxy) {
+    if (retired !== this._workerProxy) {
+      return;
+    }
+    this._coreRetirements = (this._coreRetirements || 0) + 1;
+    this._emitBridgeWarn('llamadart: bridge worker core aborted; restarting the worker.');
+    try {
+      await this._replaceWorkerProxyForMultimodalCpuMode();
+    } catch (_) {
+      // No worker could be created, so the facade fell back to a direct
+      // runtime that holds no model, or the bridge is being disposed.
+      if (!this._workerProxy) {
+        this._forgetLoadedModel();
+        this._modelUnloadedAfterCoreAbort = true;
+      }
     }
   }
 
@@ -2062,6 +2188,12 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
           );
           return '';
         }
+        if (isCoreRetiredError(error)) {
+          return this._rerunOnCpuAfterCoreAbort(
+            error,
+            () => this._createCompletionUnlocked(prompt, options),
+          );
+        }
 
         this._emitBridgeWarn(
           `llamadart: unable to prepare multimodal worker CPU mode (${reason}).`,
@@ -2235,6 +2367,12 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
           );
           return '';
         }
+        if (isCoreRetiredError(error)) {
+          return this._rerunOnCpuAfterCoreAbort(
+            error,
+            () => this._createCompletionUnlocked(prompt, options),
+          );
+        }
 
         if (this._isNonRecoverableStagingError(error)) {
           throw error;
@@ -2305,6 +2443,7 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
       return result;
     } catch (error) {
       this._throwIfOperationCancelled(error, 'Projector operation was cancelled.');
+      this._throwIfWorkerCoreRetired(error);
       if (!startedWithWorker || this._isNonRecoverableStagingError(error)) {
         throw error;
       }
@@ -2363,6 +2502,7 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
       return result;
     } catch (error) {
       this._throwIfOperationCancelled(error, 'Projector operation was cancelled.');
+      this._throwIfWorkerCoreRetired(error);
       this._disableWorkerFallback(error);
       await this._waitForWorkerDisposal();
       const result = await this._runtime!.unloadMultimodalProjector();
@@ -2517,6 +2657,7 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
       return await this._callWorker<TextToSpeechCapabilities>('getTextToSpeechCapabilities', []);
     } catch (error) {
       this._throwIfOperationCancelled(error, 'Text-to-speech capability probe was cancelled.');
+      this._throwIfWorkerCoreRetired(error);
       this._disableWorkerFallback(error);
       await this._waitForWorkerDisposal();
       await this._ensureRuntimeReadyAfterWorkerFallback({}, error);
@@ -2541,7 +2682,9 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
     );
   }
 
-  async _synthesizeSpeechUnlocked(options: Partial<TextToSpeechOptions> = {}) {
+  async _synthesizeSpeechUnlocked(
+    options: Partial<TextToSpeechOptions> = {},
+  ): Promise<TextToSpeechResult> {
     if (options.signal?.aborted) {
       throw new DOMException('Text-to-speech synthesis was cancelled.', 'AbortError');
     }
@@ -2575,6 +2718,12 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
       return result;
     } catch (error) {
       this._throwIfOperationCancelled(error, 'Text-to-speech synthesis was cancelled.');
+      if (isCoreRetiredError(error)) {
+        return this._rerunOnCpuAfterCoreAbort(
+          error,
+          () => this._synthesizeSpeechUnlocked(options),
+        );
+      }
       if (
         (error as Error | null)?.name === 'AbortError'
         || options.signal?.aborted
@@ -3606,6 +3755,7 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
       this._workerFallbackReason = null;
       this._multimodalWorkerCpuMode = false;
       this._workerModelMissing = false;
+      this._modelUnloadedAfterCoreAbort = false;
       this._decisionHeads?.clear();
       this._forgetLoraAdapters();
       this._lifecycleState = 'disposed';

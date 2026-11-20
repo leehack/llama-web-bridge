@@ -807,6 +807,127 @@ function decodeDecisionOutputs(bytes, count) {
   return outputs;
 }
 
+// js/src/internal/core_guard.ts
+var MODEL_UNLOADED_AFTER_CORE_ABORT = "MODEL_UNLOADED_AFTER_CORE_ABORT";
+var MODEL_UNLOADED_AFTER_CORE_ABORT_MESSAGE = "The native core aborted and was replaced, which unloaded the model. Call loadModelFromUrl again.";
+var ModelUnloadedError = class extends Error {
+  code = MODEL_UNLOADED_AFTER_CORE_ABORT;
+  constructor(message = MODEL_UNLOADED_AFTER_CORE_ABORT_MESSAGE) {
+    super(message);
+    this.name = "ModelUnloadedError";
+  }
+};
+function isWasmRuntimeError(error, coreRuntimeError = null) {
+  if (typeof WebAssembly !== "undefined" && error instanceof WebAssembly.RuntimeError) {
+    return true;
+  }
+  if (typeof coreRuntimeError !== "function") {
+    return false;
+  }
+  try {
+    return error instanceof coreRuntimeError;
+  } catch (_) {
+    return false;
+  }
+}
+var guardStates = /* @__PURE__ */ new WeakMap();
+var rawCores = /* @__PURE__ */ new WeakMap();
+function unguardedCore(core) {
+  return rawCores.get(core) ?? core;
+}
+function isCoreRetired(core) {
+  return !!core && typeof core === "object" && guardStates.get(core)?.retired === true;
+}
+function retireCore(core, reason) {
+  if (core && typeof core === "object") {
+    guardStates.get(core)?.retire(new Error(`Aborted(${String(reason ?? "")})`), false);
+  }
+}
+function guardCore(rawModule, onRetired) {
+  const wrappers = /* @__PURE__ */ new WeakMap();
+  const coreRuntimeError = rawModule.llamadartWasmRuntimeError;
+  const isTrap = (error) => isWasmRuntimeError(error, coreRuntimeError);
+  const state = {
+    retired: false,
+    cause: null,
+    retire(cause, fromThrow) {
+      if (state.retired) {
+        if (fromThrow && !isTrap(state.cause)) {
+          state.cause = cause;
+        }
+        return;
+      }
+      state.retired = true;
+      state.cause = cause;
+      let stats;
+      try {
+        stats = rawModule.llamadartRetire?.();
+      } catch (_) {
+      }
+      onRetired(cause, stats);
+    }
+  };
+  const observe = (error) => {
+    if (isTrap(error)) {
+      state.retire(error, true);
+    }
+  };
+  const wrapValue = (value, owner) => {
+    if (typeof value !== "function") {
+      return value;
+    }
+    const cached = wrappers.get(value);
+    if (cached) {
+      return cached;
+    }
+    const wrapped = function guarded(...args) {
+      if (state.retired) {
+        throw state.cause;
+      }
+      let result;
+      try {
+        result = Reflect.apply(value, this === proxy || this === fsProxy ? owner : this, args);
+      } catch (error) {
+        observe(error);
+        throw error;
+      }
+      if (typeof result === "function") {
+        return wrapValue(result, owner);
+      }
+      if (result && typeof result.then === "function") {
+        return result.then(
+          (settled) => settled,
+          (error) => {
+            observe(error);
+            throw error;
+          }
+        );
+      }
+      return result;
+    };
+    wrappers.set(value, wrapped);
+    return wrapped;
+  };
+  let fsProxy = null;
+  const proxy = new Proxy(rawModule, {
+    get(target, property) {
+      const value = Reflect.get(target, property, target);
+      if (property === "FS" && value && typeof value === "object") {
+        fsProxy ??= new Proxy(value, {
+          get(fsTarget, fsProperty) {
+            return wrapValue(Reflect.get(fsTarget, fsProperty, fsTarget), fsTarget);
+          }
+        });
+        return fsProxy;
+      }
+      return wrapValue(value, target);
+    }
+  });
+  guardStates.set(proxy, state);
+  rawCores.set(proxy, rawModule);
+  return proxy;
+}
+
 // js/src/internal/isolation.ts
 var CROSS_ORIGIN_ISOLATION_REQUIRED = "CROSS_ORIGIN_ISOLATION_REQUIRED";
 var CrossOriginIsolationError = class extends Error {
@@ -1925,6 +2046,8 @@ var LlamaWebGpuBridgeRuntime = class {
     this._isAppleSafari = isAppleSafariUserAgent(userAgent);
     this._safariDefaultMaxGpuLayers = safariDefaultMaxGpuLayers(userAgent);
     this._coreVariant = "uninitialized";
+    this._coreRetired = false;
+    this._onCoreRetired = null;
     this._memory64FallbackReason = null;
     this._preferMemory64 = this._config.preferMemory64 !== false;
     this._modelSource = "network";
@@ -2802,7 +2925,8 @@ var LlamaWebGpuBridgeRuntime = class {
     return mountPath;
   }
   _mountAtFreeJsStagingPath(core) {
-    const previousMountNumber = jsStagingMountCounters.get(core) ?? 0;
+    const counterKey = unguardedCore(core);
+    const previousMountNumber = jsStagingMountCounters.get(counterKey) ?? 0;
     for (let offset = 1; offset <= MAX_JS_STAGING_PATH_PROBES; offset += 1) {
       const mountNumber = previousMountNumber + offset;
       const mountPath = `/jsmodels-${mountNumber}`;
@@ -2818,7 +2942,7 @@ var LlamaWebGpuBridgeRuntime = class {
           );
         }
       }
-      jsStagingMountCounters.set(core, mountNumber);
+      jsStagingMountCounters.set(counterKey, mountNumber);
       const mountRc = Number(
         core.ccall("llamadart_webgpu_mount_js_model_fs", "number", ["string"], [mountPath])
       );
@@ -2878,7 +3002,7 @@ var LlamaWebGpuBridgeRuntime = class {
         return;
       }
       closed = true;
-      if (core.ABORT === true) {
+      if (isCoreRetired(core)) {
         return;
       }
       assertMountOwned();
@@ -2965,7 +3089,7 @@ var LlamaWebGpuBridgeRuntime = class {
     if (targets.size === 0) {
       return;
     }
-    if (!core || core.ABORT === true) {
+    if (!core || isCoreRetired(core)) {
       for (const targetMount of targets.keys()) {
         this._activeJsStagingMounts.delete(targetMount);
         this._failedUnmountJsStagingMounts.delete(targetMount);
@@ -3364,6 +3488,22 @@ var LlamaWebGpuBridgeRuntime = class {
       return false;
     }
   }
+  _handleCoreRetired(cause, stats) {
+    if (this._coreRetired) {
+      return;
+    }
+    this._coreRetired = true;
+    this._runtimeNotes.push("core_retired");
+    if (!stats) {
+      this._runtimeNotes.push("core_retired_threads_unavailable");
+    } else {
+      if (stats.threads >= 0) {
+        this._runtimeNotes.push(`core_retired_threads:${stats.threads}`);
+      }
+      this._runtimeNotes.push(`core_retired_staged_bytes:${stats.stagedBytes}`);
+    }
+    this._onCoreRetired?.(this, cause);
+  }
   async _ensureCore() {
     if (this._core) {
       this._applyCoreLogLevel();
@@ -3401,11 +3541,12 @@ var LlamaWebGpuBridgeRuntime = class {
       }
       let factoryLoaded = false;
       let initTimeoutError = null;
+      let candidateCore = null;
       try {
         const moduleFactory = await candidate.factoryPromise;
         factoryLoaded = true;
         const initTimeoutMs = this._resolveCoreInitTimeoutMs();
-        this._core = await Promise.race([
+        candidateCore = guardCore(await Promise.race([
           moduleFactory({
             locateFile: (path, prefix) => {
               if (path.endsWith(".wasm") && candidate.wasmUrl) {
@@ -3471,6 +3612,7 @@ var LlamaWebGpuBridgeRuntime = class {
                 this._runtimeNotes.push("core_abort");
                 this._emitLogger("error", "core abort");
               }
+              retireCore(candidateCore, reason);
             }
           }),
           new Promise((_, reject) => {
@@ -3479,7 +3621,8 @@ var LlamaWebGpuBridgeRuntime = class {
               reject(initTimeoutError);
             }, initTimeoutMs);
           })
-        ]);
+        ]), (cause, stats) => this._handleCoreRetired(cause, stats));
+        this._core = candidateCore;
         this._coreVariant = candidate.variant === "wasm64" ? "wasm64" : "wasm32";
         this._memory64FallbackReason = memory64FallbackReason;
         if (candidate.variant === "wasm64") {
@@ -3857,7 +4000,7 @@ var LlamaWebGpuBridgeRuntime = class {
                 await this._settleModelCacheStore(response);
                 break;
               } catch (error) {
-                if (assertMountOwned && core.ABORT !== true) {
+                if (assertMountOwned && !isCoreRetired(core)) {
                   assertMountOwned();
                 }
                 const text = String(error || "").toLowerCase();
@@ -4005,7 +4148,7 @@ var LlamaWebGpuBridgeRuntime = class {
           }
           if (useJsBackedStaging) {
             try {
-              if (core.ABORT !== true) {
+              if (!isCoreRetired(core)) {
                 assertMountOwned?.();
               }
             } finally {
@@ -4316,7 +4459,7 @@ var LlamaWebGpuBridgeRuntime = class {
           this._deleteFsFile(createdMmprojPath);
         }
         try {
-          if (assertMountOwned && core.ABORT !== true) {
+          if (assertMountOwned && !isCoreRetired(core)) {
             assertMountOwned();
           }
         } catch (ownershipError) {
@@ -6138,6 +6281,9 @@ function serializeWorkerError(error) {
     return String(error);
   }
 }
+function isCoreRetiredError(error) {
+  return !!error && typeof error === "object" && error.llamadartCoreRetired === true;
+}
 var bridgeWorkerModeParam = "__llamadartBridgeWorker";
 function emptyBridgeState() {
   return {
@@ -6207,6 +6353,7 @@ var BridgeWorkerProxy = class {
     this._nextId = 1;
     this._pending = /* @__PURE__ */ new Map();
     this._workerBlobUrl = null;
+    this.coreRetired = false;
     let workerInitError = null;
     const moduleCandidates = [moduleUrl];
     const bridgeModuleFallback = deriveBridgeModuleUrlFromWorkerEntry(moduleUrl);
@@ -6260,6 +6407,10 @@ var BridgeWorkerProxy = class {
         this._readyResolve?.();
         return;
       }
+      if (type === "core-retired") {
+        this.coreRetired = true;
+        return;
+      }
       const id = Number(message.id || 0);
       const pending = this._pending.get(id);
       if (!pending) {
@@ -6272,7 +6423,7 @@ var BridgeWorkerProxy = class {
       this._pending.delete(id);
       if (type === "error") {
         const errorMessage = String(message.message || "Worker request failed");
-        const workerError = message.embeddingErrorCode ? new EmbeddingError(message.embeddingErrorCode, errorMessage) : this._config.jsBackedModelStaging === true && isModelStagingErrorCode(message.modelStagingErrorCode) ? new ModelStagingError(message.modelStagingErrorCode, errorMessage) : message.errorCode === CROSS_ORIGIN_ISOLATION_REQUIRED ? new CrossOriginIsolationError(errorMessage) : message.errorCode === SINGLE_THREAD_CORE_UNSUPPORTED ? new SingleThreadCoreError(errorMessage) : message.errorCode === "MODEL_TRANSFER_LENGTH_ERROR" ? createModelTransferLengthError(errorMessage) : new Error(errorMessage);
+        const workerError = message.embeddingErrorCode ? new EmbeddingError(message.embeddingErrorCode, errorMessage) : this._config.jsBackedModelStaging === true && isModelStagingErrorCode(message.modelStagingErrorCode) ? new ModelStagingError(message.modelStagingErrorCode, errorMessage) : message.errorCode === CROSS_ORIGIN_ISOLATION_REQUIRED ? new CrossOriginIsolationError(errorMessage) : message.errorCode === SINGLE_THREAD_CORE_UNSUPPORTED ? new SingleThreadCoreError(errorMessage) : message.errorCode === MODEL_UNLOADED_AFTER_CORE_ABORT ? new ModelUnloadedError(errorMessage) : message.errorCode === "MODEL_TRANSFER_LENGTH_ERROR" ? createModelTransferLengthError(errorMessage) : new Error(errorMessage);
         if (isDecisionErrorCode(message.decisionErrorCode)) {
           withDecisionErrorCode(workerError, message.decisionErrorCode);
         }
@@ -6433,6 +6584,25 @@ var BridgeWorkerProxy = class {
 };
 
 // js/src/bridge.ts
+var MODEL_OPERATION_KINDS = /* @__PURE__ */ new Set([
+  "generation",
+  "projector-load",
+  "draft-model-load",
+  "text-to-speech",
+  "lora-adapter-load",
+  "lora-adapter-set",
+  "lora-adapter-remove",
+  "lora-adapters-clear",
+  "tokenize",
+  "detokenize",
+  "state-save-file",
+  "state-load-file",
+  "state-save-bytes",
+  "state-load-bytes",
+  "embedding",
+  "embedding-batch",
+  "next-token-scoring"
+]);
 var LlamaWebGpuBridge = class {
   static supportsSafariAdaptiveGpu = LlamaWebGpuBridgeRuntime.supportsSafariAdaptiveGpu === true;
   static supportsCompletionUsage = true;
@@ -6457,6 +6627,9 @@ var LlamaWebGpuBridge = class {
     this._loadedDraftModel = null;
     this._multimodalWorkerCpuMode = false;
     this._workerModelMissing = false;
+    this._coreRetirements = 0;
+    this._modelUnloadedAfterCoreAbort = false;
+    this._onCoreRetired = null;
     this._bridgeWarnRecent = /* @__PURE__ */ new Map();
     this._operationQueueTail = null;
     this._activeOperation = null;
@@ -6488,10 +6661,36 @@ var LlamaWebGpuBridge = class {
     }
   }
   _createRuntime() {
-    return new LlamaWebGpuBridgeRuntime({
+    const runtime = new LlamaWebGpuBridgeRuntime({
       ...this._config,
       disableWorker: true
     });
+    runtime._onCoreRetired = (retired) => this._handleRuntimeCoreRetired(retired);
+    return runtime;
+  }
+  // A runtime owns one core for life, so an aborted core takes its runtime
+  // with it. The model is gone: later calls that need one reject with
+  // ModelUnloadedError until a load succeeds.
+  _handleRuntimeCoreRetired(runtime) {
+    if (this._runtime !== runtime) {
+      return;
+    }
+    this._coreRetirements = (this._coreRetirements || 0) + 1;
+    const replacement = this._lifecycleState === "disposed" ? null : this._createRuntime();
+    if (replacement) {
+      if (Array.isArray(replacement._runtimeNotes) && Array.isArray(runtime._runtimeNotes)) {
+        replacement._runtimeNotes.push(...runtime._runtimeNotes.filter(
+          (note) => note.startsWith("core_abort") || note.startsWith("core_retired")
+        ));
+      }
+      this._activeOperation?.runtimes?.add(replacement);
+    }
+    this._runtime = replacement;
+    if (!this._workerProxy) {
+      this._forgetLoadedModel();
+      this._modelUnloadedAfterCoreAbort = true;
+    }
+    this._onCoreRetired?.();
   }
   _operationSignal(operation = this._activeOperation) {
     return operation?.abortController?.signal || null;
@@ -6773,6 +6972,9 @@ var LlamaWebGpuBridge = class {
       operation.state = "running";
       let operationFailed = false;
       try {
+        if (this._modelUnloadedAfterCoreAbort === true && MODEL_OPERATION_KINDS.has(operation.kind)) {
+          throw new ModelUnloadedError();
+        }
         return await run(operation);
       } catch (error) {
         operationFailed = true;
@@ -6962,6 +7164,7 @@ var LlamaWebGpuBridge = class {
     this._loadedDraftModel = null;
     this._multimodalWorkerCpuMode = this._workerProxy != null;
     this._workerModelMissing = false;
+    this._modelUnloadedAfterCoreAbort = false;
     if (this._activeOperation) {
       this._activeOperation.modelSource = cloneModelSource(normalizedUrl);
       this._activeOperation.modelOptions = { ...this._loadedModelOptions };
@@ -7058,7 +7261,7 @@ var LlamaWebGpuBridge = class {
     return error instanceof ModelStagingError || error.name === "ModelStagingError";
   }
   _isRecoverableWorkerFsError(error) {
-    if (error instanceof SingleThreadCoreError || this._isNonRecoverableStagingError(error)) {
+    if (isCoreRetiredError(error) || error instanceof SingleThreadCoreError || this._isNonRecoverableStagingError(error)) {
       return false;
     }
     const text = serializeWorkerError(error).toLowerCase();
@@ -7105,6 +7308,7 @@ var LlamaWebGpuBridge = class {
       return true;
     } catch (error) {
       this._throwIfDisposed();
+      this._throwIfWorkerCoreRetired(error);
       if (this._isOperationCancellation(error)) {
         this._workerModelMissing = true;
         throw createAbortError("Bridge operation was cancelled.");
@@ -7150,6 +7354,7 @@ var LlamaWebGpuBridge = class {
       } catch (error) {
         this._throwIfOperationCancelled(error, "Draft model reload was cancelled.");
         this._forgetDraftModelAfterReloadFailure(error);
+        this._throwIfWorkerCoreRetired(error);
       }
     }
     this._throwIfDisposed();
@@ -7170,6 +7375,9 @@ var LlamaWebGpuBridge = class {
    * next restore skips it too. The chat template never reads the model.
    */
   async _restoreWorkerModelIfMissing() {
+    if (this._workerProxy?.coreRetired === true) {
+      await this._replaceWorkerAfterCoreRetired(this._workerProxy);
+    }
     if (!this._workerProxy || this._workerModelMissing !== true || !hasModelSource(this._loadedModelUrl)) {
       return;
     }
@@ -7180,30 +7388,51 @@ var LlamaWebGpuBridge = class {
       this._sanitizeModelLoadOptions(this._loadedModelOptions || {})
     );
   }
+  /**
+   * A media completion or speech request whose core aborted on a GPU-loaded
+   * model is rerun on the replacement worker with a CPU-only reload, as the
+   * main-thread fallback did when it matched the abort text. It runs once:
+   * the reload leaves the model in CPU mode. Every other case rethrows, and
+   * the next call reloads the model as it was.
+   */
+  async _rerunOnCpuAfterCoreAbort(error, rerun) {
+    if (!this._workerProxy || this._workerModelMissing !== true || !hasModelSource(this._loadedModelUrl) || this._isCpuModelMode()) {
+      throw error;
+    }
+    this._loadedModelOptions = this._createCpuSafeMultimodalLoadOptions(
+      this._loadedModelOptions || {}
+    );
+    this._emitBridgeWarn(
+      "llamadart: retrying once with CPU fallback after the bridge worker core aborted."
+    );
+    return rerun();
+  }
   _isDispatchWorkgroupLimitError(error) {
     const text = serializeWorkerError(error).toLowerCase();
-    return text.includes("dispatch workgroup count") || text.includes("max compute workgroups per dimension") || text.includes("invalid commandbuffer") || text.includes("ggml_webgpu: device error") || text.includes("runtimeerror: aborted") || text.includes("aborted()");
+    return text.includes("dispatch workgroup count") || text.includes("max compute workgroups per dimension") || text.includes("invalid commandbuffer") || text.includes("ggml_webgpu: device error");
   }
-  // An aborted or trapped Wasm core stays dead. The worker host posts only
-  // the message text, so a worker-side RuntimeError arrives without its name.
-  _isWasmCoreAbortError(error) {
-    if (typeof WebAssembly !== "undefined" && error instanceof WebAssembly.RuntimeError) {
-      return true;
+  // The reply of a worker whose core aborted. `_callWorker` already replaced
+  // that worker, so no catch may restart it or fall back for the same error.
+  _throwIfWorkerCoreRetired(error) {
+    if (isCoreRetiredError(error)) {
+      throw error;
     }
-    const text = serializeWorkerError(error).toLowerCase();
-    return text.includes("aborted(") || text.includes("runtimeerror") || text.includes("unreachable") || text.includes("memory access out of bounds") || text.includes("function signature mismatch") || text.includes("program terminated with exit");
   }
   // A worker request falls back only when the worker can no longer serve
-  // requests: it crashed, stalled, timed out, never initialized, or its core
-  // aborted. A core error from a healthy worker (invalid grammar, a context
+  // requests: it crashed, stalled, timed out or never initialized. A core
+  // abort is not one of these: `_callWorker` replaces that worker itself.
+  // A core error from a healthy worker (invalid grammar, a context
   // limit, an unsupported template, a model without embeddings) is
   // deterministic; retrying on the main thread fails the same way and strands
   // the session there.
   _isWorkerUnusableError(error) {
+    if (isCoreRetiredError(error)) {
+      return false;
+    }
     if (error && typeof error === "object" && error.llamadartWorkerCrash === true) {
       return true;
     }
-    return this._isWorkerTimeoutError(error) || this._isWasmCoreAbortError(error) || this._shouldFallbackToMainThread(error);
+    return this._isWorkerTimeoutError(error) || this._shouldFallbackToMainThread(error);
   }
   _isWorkerTimeoutError(error) {
     if (error && typeof error === "object" && error.llamadartWorkerTimeout === true) {
@@ -7453,7 +7682,7 @@ var LlamaWebGpuBridge = class {
     }
   }
   _shouldFallbackToMainThread(error) {
-    if (error instanceof SingleThreadCoreError || this._isNonRecoverableStagingError(error)) {
+    if (isCoreRetiredError(error) || error instanceof SingleThreadCoreError || this._isNonRecoverableStagingError(error)) {
       return false;
     }
     const text = serializeWorkerError(error).toLowerCase();
@@ -7586,6 +7815,9 @@ var LlamaWebGpuBridge = class {
     }
   }
   async _callWorker(method, args, onEvent, transferList = []) {
+    if (this._workerProxy?.coreRetired === true) {
+      await this._replaceWorkerAfterCoreRetired(this._workerProxy);
+    }
     const proxy = this._workerProxy;
     if (!proxy) {
       throw new Error("Bridge worker proxy is not available");
@@ -7611,15 +7843,49 @@ var LlamaWebGpuBridge = class {
         this._sendWorkerCancel(proxy, operation);
       }
       const response = await pending;
+      if (proxy.coreRetired === true) {
+        throw new Error(`The bridge worker core aborted during ${method}.`);
+      }
       if (response?.state) {
         this._acceptWorkerState(operation, proxy, response.state);
       }
       return response?.value;
     } catch (error) {
+      if (proxy.coreRetired === true) {
+        throw await this._workerCoreRetiredError(proxy, error);
+      }
       if (error && typeof error === "object" && error.state) {
         this._acceptWorkerState(operation, proxy, error.state);
       }
       throw error;
+    }
+  }
+  /**
+   * Replaces the worker whose core aborted and returns the error to rethrow,
+   * marked so no catch handles the same abort again. The reply's state is
+   * never accepted: it describes the empty runtime of a worker that no longer
+   * exists, and the facade still holds the model the next call reloads.
+   */
+  async _workerCoreRetiredError(proxy, error) {
+    await this._replaceWorkerAfterCoreRetired(proxy);
+    const retired = error && typeof error === "object" ? error : new Error(serializeWorkerError(error));
+    retired.llamadartCoreRetired = true;
+    return retired;
+  }
+  // The only place a worker is replaced for a core abort (A1, worker mode).
+  async _replaceWorkerAfterCoreRetired(retired) {
+    if (retired !== this._workerProxy) {
+      return;
+    }
+    this._coreRetirements = (this._coreRetirements || 0) + 1;
+    this._emitBridgeWarn("llamadart: bridge worker core aborted; restarting the worker.");
+    try {
+      await this._replaceWorkerProxyForMultimodalCpuMode();
+    } catch (_) {
+      if (!this._workerProxy) {
+        this._forgetLoadedModel();
+        this._modelUnloadedAfterCoreAbort = true;
+      }
     }
   }
   /**
@@ -7869,6 +8135,12 @@ var LlamaWebGpuBridge = class {
           );
           return "";
         }
+        if (isCoreRetiredError(error)) {
+          return this._rerunOnCpuAfterCoreAbort(
+            error,
+            () => this._createCompletionUnlocked(prompt, options)
+          );
+        }
         this._emitBridgeWarn(
           `llamadart: unable to prepare multimodal worker CPU mode (${reason}).`
         );
@@ -8004,6 +8276,12 @@ var LlamaWebGpuBridge = class {
           );
           return "";
         }
+        if (isCoreRetiredError(error)) {
+          return this._rerunOnCpuAfterCoreAbort(
+            error,
+            () => this._createCompletionUnlocked(prompt, options)
+          );
+        }
         if (this._isNonRecoverableStagingError(error)) {
           throw error;
         }
@@ -8062,6 +8340,7 @@ var LlamaWebGpuBridge = class {
       return result;
     } catch (error) {
       this._throwIfOperationCancelled(error, "Projector operation was cancelled.");
+      this._throwIfWorkerCoreRetired(error);
       if (!startedWithWorker || this._isNonRecoverableStagingError(error)) {
         throw error;
       }
@@ -8114,6 +8393,7 @@ var LlamaWebGpuBridge = class {
       return result;
     } catch (error) {
       this._throwIfOperationCancelled(error, "Projector operation was cancelled.");
+      this._throwIfWorkerCoreRetired(error);
       this._disableWorkerFallback(error);
       await this._waitForWorkerDisposal();
       const result = await this._runtime.unloadMultimodalProjector();
@@ -8255,6 +8535,7 @@ var LlamaWebGpuBridge = class {
       return await this._callWorker("getTextToSpeechCapabilities", []);
     } catch (error) {
       this._throwIfOperationCancelled(error, "Text-to-speech capability probe was cancelled.");
+      this._throwIfWorkerCoreRetired(error);
       this._disableWorkerFallback(error);
       await this._waitForWorkerDisposal();
       await this._ensureRuntimeReadyAfterWorkerFallback({}, error);
@@ -8310,6 +8591,12 @@ var LlamaWebGpuBridge = class {
       return result;
     } catch (error) {
       this._throwIfOperationCancelled(error, "Text-to-speech synthesis was cancelled.");
+      if (isCoreRetiredError(error)) {
+        return this._rerunOnCpuAfterCoreAbort(
+          error,
+          () => this._synthesizeSpeechUnlocked(options)
+        );
+      }
       if (error?.name === "AbortError" || options.signal?.aborted || serializeWorkerError(error).toLowerCase().includes("cancel")) {
         throw new DOMException("Text-to-speech synthesis was cancelled.", "AbortError");
       }
@@ -9163,6 +9450,7 @@ var LlamaWebGpuBridge = class {
       this._workerFallbackReason = null;
       this._multimodalWorkerCpuMode = false;
       this._workerModelMissing = false;
+      this._modelUnloadedAfterCoreAbort = false;
       this._decisionHeads?.clear();
       this._forgetLoraAdapters();
       this._lifecycleState = "disposed";
@@ -9216,7 +9504,7 @@ function installBridgeWorkerHost() {
       id,
       message: serializeWorkerError(error),
       ...error instanceof EmbeddingError ? { embeddingErrorCode: error.code } : {},
-      ...error instanceof CrossOriginIsolationError || error instanceof SingleThreadCoreError ? { errorCode: error.code } : {},
+      ...error instanceof CrossOriginIsolationError || error instanceof SingleThreadCoreError || error instanceof ModelUnloadedError ? { errorCode: error.code } : {},
       ...error instanceof Error && error.name === "ModelTransferLengthError" ? { errorCode: "MODEL_TRANSFER_LENGTH_ERROR" } : {},
       ...error instanceof ModelStagingError ? { modelStagingErrorCode: error.code } : {},
       ...decisionErrorCode ? { decisionErrorCode } : {},
@@ -9234,6 +9522,7 @@ function installBridgeWorkerHost() {
           ...message.config || {},
           disableWorker: true
         });
+        bridge._onCoreRetired = () => self.postMessage({ type: "core-retired" });
         self.postMessage({ type: "ready" });
         return;
       }
@@ -9590,6 +9879,7 @@ export {
   EmbeddingError,
   LlamaWebGpuBridge,
   ModelStagingError,
+  ModelUnloadedError,
   SingleThreadCoreError,
   enableBridgeWorkerHost
 };

@@ -78,6 +78,32 @@ active bridge runtime.
 Most methods require a model loaded by `loadModelFromUrl()` and reject with
 `Error` when the model or runtime capability is unavailable.
 
+### Native core aborts
+
+The bridge retires a core after its native abort callback or a
+`WebAssembly.RuntimeError`. It stops calling that core, terminates its
+pthread pool when available, and releases its JS-backed staging data.
+
+- In direct mode, the call fails with the original error and the model is
+  unloaded. Calls that need a model reject with `ModelUnloadedError` (code
+  `MODEL_UNLOADED_AFTER_CORE_ABORT`) until `loadModelFromUrl()` succeeds again.
+  LoRA handles from the retired core are stale.
+- In worker mode, the bridge replaces the worker and restores the remembered
+  model on the next call that needs it. If a new load aborts, the previous
+  model remains the one to restore. LoRA handles with a retained source remain
+  valid. Media completion and speech synthesis on a GPU-loaded model retry
+  once on the replacement worker with a CPU-only restore.
+
+Decision heads stay tied to their original core and report `head-lost` after
+retirement. State file paths also belong to that core. Applications can keep
+serialized state bytes outside it.
+
+Runtime notes include `core_retired`, `core_retired_threads:<n>` when a
+pthread pool was stopped, and `core_retired_staged_bytes:<n>` for released
+staging data. Older cores without a retirement hook report
+`core_retired_threads_unavailable`. These notes appear only in direct mode.
+Worker mode never shows them: the replacement worker starts with no notes.
+
 ## Operation serialization
 
 Runtime-backed methods execute through a per-instance single-writer FIFO queue in
@@ -154,7 +180,7 @@ it.
 | `coreModuleUrlMem64` | `string` | URL for the optional wasm64 Emscripten JS loader. |
 | `wasmUrl` | `string` | URL for the wasm32 `llama_webgpu_core.wasm` binary. |
 | `wasmUrlMem64` | `string` | URL for the optional wasm64 wasm binary. |
-| `coreModuleFactory` | `LlamaCoreModuleFactory \| Promise<LlamaCoreModuleFactory>` | Preloaded Emscripten factory. Supplying this disables worker mode because factories cannot be transferred to the worker. It also skips the default isolation check. A core that starts a pthread pool can hit `coreInitTimeoutMs` if the page cannot share memory with workers. A core instance holds one loaded model. Bridges that share the same core instance must not hold models at the same time. A load on either bridge releases the model in that core. Return a separate core instance for each bridge that needs an independent model. |
+| `coreModuleFactory` | `LlamaCoreModuleFactory \| Promise<LlamaCoreModuleFactory>` | Preloaded Emscripten factory. Supplying this disables worker mode because factories cannot be transferred to the worker. It also skips the default isolation check. A core that starts a pthread pool can hit `coreInitTimeoutMs` if the page cannot share memory with workers. See [the custom core contract](#custom-core-factory). A core instance holds one loaded model. Bridges that share the same core instance must not hold models at the same time. A load on either bridge releases the model in that core. Return a separate core instance for each bridge that needs an independent model. |
 | `workerUrl` | `string` | URL for `llama_webgpu_bridge_worker.js`. Defaults to a sibling of the bridge module when possible. |
 | `disableWorker` | `boolean` | Force direct runtime mode. |
 | `allowSingleThreadCore` | `boolean` | Set to `true` with explicit `_st` core URLs to load on pages without cross-origin isolation. Single-thread cores use one CPU thread and report `core_single_thread`. A core that starts a pthread pool can still hit `Bridge core init timeout` if the page cannot share memory with workers. See [single-thread setup and timeout behavior](single_thread.md). |
@@ -203,6 +229,19 @@ warning at the `warn` log level and sets `llamadart.webgpu.execution` to
 `main-thread` and `llamadart.webgpu.worker_fallback_reason` in
 `getModelMetadata()`. A result returned after a fallback did not run in the
 worker.
+
+### Custom core factory
+
+Return an Emscripten module with writable or configurable `ccall`, `cwrap`,
+`FS`, and filesystem method properties. The bridge wraps these properties to
+prevent further native calls once the core retires.
+
+A core instantiated in another JavaScript realm must expose that realm's
+genuine `WebAssembly.RuntimeError` constructor as
+`Module.llamadartWasmRuntimeError` for bare traps to retire the core. The
+bridge trusts the supplied constructor. Built cores expose it. An older
+cross-realm core without this export still retires through `onAbort` and
+rethrows a bare trap with the core left in use.
 
 ### Static properties
 
@@ -922,8 +961,7 @@ only when the model was not already loaded CPU-only and the error text matches
 one of these existing recovery classifiers:
 
 - WebGPU failure: `dispatch workgroup count`, `max compute workgroups per
-  dimension`, `invalid commandbuffer`, `ggml_webgpu: device error`,
-  `RuntimeError: Aborted`, or `Aborted()`.
+  dimension`, `invalid commandbuffer`, or `ggml_webgpu: device error`.
 - Worker timeout: `worker request timeout`, `worker init timeout`, or `worker
   timed out`.
 
@@ -936,6 +974,10 @@ no CPU-fallback warning. The retry itself is never recovered a second time.
 
 Every other worker failure is rejected as-is. A timeout-classified failure
 disposes the worker even when the model was already CPU-only and no retry runs.
+
+If the core aborts during synthesis on a GPU-loaded model, the bridge
+replaces the worker, restores the model CPU-only, and reruns synthesis once
+on that worker. An abort on a CPU-only model surfaces to the caller.
 
 Cancellation is classified before recovery. An aborted `signal`, `cancel()`, an
 `AbortError`, or a worker error containing `cancel` rejects with an `AbortError`

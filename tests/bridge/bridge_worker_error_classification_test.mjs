@@ -808,17 +808,20 @@ const CASES = [
       'Failed to start generation (code=-5)',
       'Failed to start generation: prompt exceeds context size',
       'No model loaded. Call loadModelFromUrl first.',
-    ]) {
-      assert.equal(unusable(new Error(text)), false, text);
-    }
-
-    // The worker or its core can no longer serve requests.
-    for (const text of [
       'Aborted(undefined). Build with -sASSERTIONS for more info.',
       'RuntimeError: Aborted(undefined). Build with -sASSERTIONS for more info.',
       'Aborted(native code called abort())',
       'memory access out of bounds',
       'unreachable',
+    ]) {
+      assert.equal(unusable(new Error(text)), false, text);
+    }
+    assert.equal(unusable(Object.assign(new Error('Bridge worker crashed'), {
+      llamadartCoreRetired: true,
+    })), false);
+
+    for (const text of [
+
       'Worker request timeout (createCompletion, 5000ms)',
       'Bridge worker init timeout (3000ms)',
       'Bridge worker completion stalled for 5000ms.',
@@ -952,46 +955,33 @@ const CASES = [
     assert.ok(!warnings.some((message) => message.includes('falling back')));
   }],
 
-  ['worker completion core abort still falls back to the main thread', async () => {
-    const abortText = 'Aborted(undefined). Build with -sASSERTIONS for more info.';
-    let completions = 0;
+  ['worker completion core abort rejects and replaces the worker once', async () => {
+    const error = new Error('Aborted(undefined). Build with -sASSERTIONS for more info.');
     const proxy = createProxy('aborted', async (method) => {
-      if (method !== 'createCompletion') {
-        return { value: undefined };
+      if (method === 'createCompletion') {
+        proxy.coreRetired = true;
+        throw error;
       }
-      completions += 1;
-      throw new Error(abortText);
+      return { value: undefined };
     });
-    const runtimeCompletions = [];
-    const runtime = createRuntime({
-      async createCompletion(prompt) {
-        runtimeCompletions.push(prompt);
-        return 'main-thread';
-      },
-    });
+    const replacement = createProxy('replacement', async () => ({ value: undefined }));
+    let replacements = 0;
     const { bridge } = createBridge({
       _workerProxy: proxy,
       _loadedModelUrl: 'model.gguf',
       _loadedModelOptions: { nGpuLayers: 0 },
-      _createRuntime: () => runtime,
+      _createWorkerProxy: () => {
+        replacements += 1;
+        return replacement;
+      },
     });
-    let fallbackCalls = 0;
-    const disableWorkerFallback = bridge._disableWorkerFallback;
-    bridge._disableWorkerFallback = (error) => {
-      fallbackCalls += 1;
-      disableWorkerFallback.call(bridge, error);
-    };
 
-    assert.equal(await bridge.createCompletion('prompt', { nPredict: 4 }), 'main-thread');
-
-    assert.equal(completions, 1);
-    assert.equal(fallbackCalls, 1);
-    assert.equal(bridge._workerProxy, null);
+    await assert.rejects(bridge.createCompletion('prompt', { nPredict: 4 }), (actual) => actual === error);
+    assert.equal(replacements, 1);
     assert.equal(proxy.disposeCalls, 1);
-    assert.equal(bridge._runtime, runtime);
-    assert.equal(runtime.loadCalls.length, 1, 'the model is reloaded on the main thread');
-    assert.deepEqual(runtimeCompletions, ['prompt']);
-    assert.equal(bridge._workerFallbackReason, abortText);
+    assert.equal(bridge._workerProxy, replacement);
+    assert.equal(bridge._workerModelMissing, true);
+    assert.equal(bridge._workerFallbackReason, null);
   }],
 
   ['facade worker core errors are rethrown and keep the worker', async () => {
@@ -1029,7 +1019,7 @@ const CASES = [
         llamadartWorkerCrash: true,
       }),
       () => new Error('Worker request timeout (tokenize, 5000ms)'),
-      () => new Error('Aborted(undefined). Build with -sASSERTIONS for more info.'),
+      () => new Error('Bridge worker crashed'),
     ];
     for (const { method, invoke, mainThreadResult } of FACADE_WORKER_METHODS) {
       for (const makeError of unusableErrors) {
@@ -1278,7 +1268,11 @@ const CASES = [
     assert.equal(flagged.options.nGpuLayers, 0);
     assert.ok(flagged.notes.includes('worker_fallback_timeout'));
 
-    const webgpu = await run(new Error('Aborted()'));
+    const abortText = await run(new Error('Aborted()'));
+    assert.equal(abortText.options.nGpuLayers, 99);
+    assert.ok(!abortText.notes.includes('worker_fallback_cpu_multimodal'));
+
+    const webgpu = await run(new Error('ggml_webgpu: device error'));
     assert.equal(webgpu.options.nGpuLayers, 0);
     assert.ok(webgpu.notes.includes('worker_fallback_cpu_multimodal'));
     assert.ok(!webgpu.notes.includes('worker_fallback_timeout'));
