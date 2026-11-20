@@ -2183,20 +2183,16 @@ export class LlamaWebGpuBridgeRuntime {
         && typeof this._config.coreModuleUrlMem64 === 'string'
         && this._config.coreModuleUrlMem64.length > 0
       ) {
-        const moduleUrl = this._config.coreModuleUrlMem64;
         candidates.push({
           variant: 'wasm64',
-          moduleUrl,
-          factoryPromise: importCoreFactory(moduleUrl),
+          factoryPromise: importCoreFactory(this._config.coreModuleUrlMem64),
           wasmUrl: this._config.wasmUrlMem64 || this._config.wasmUrl,
         });
       }
 
-      const moduleUrl = this._config.coreModuleUrl ?? './llama_webgpu_core.js';
       candidates.push({
         variant: 'wasm32',
-        moduleUrl,
-        factoryPromise: importCoreFactory(moduleUrl),
+        factoryPromise: importCoreFactory(this._config.coreModuleUrl ?? './llama_webgpu_core.js'),
         wasmUrl: this._config.wasmUrl,
       });
     }
@@ -2313,7 +2309,7 @@ export class LlamaWebGpuBridgeRuntime {
       } catch (error) {
         lastError = error;
         if (initTimeoutError && error === initTimeoutError) {
-          appendCoreInitTimeoutHint(initTimeoutError, candidate.moduleUrl);
+          appendCoreInitTimeoutHint(initTimeoutError);
         }
         if (candidate.variant === 'wasm64') {
           const reason = initTimeoutError && error === initTimeoutError

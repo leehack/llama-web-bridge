@@ -27,15 +27,12 @@ export const CROSS_ORIGIN_ISOLATION_MESSAGE =
   + 'cross-origin isolated. Serve the page with "Cross-Origin-Opener-Policy: same-origin" and '
   + '"Cross-Origin-Embedder-Policy: require-corp". "credentialless" does not isolate Safari.';
 
-export function appendCoreInitTimeoutHint(error: Error, moduleUrl: string | undefined): void {
+export function appendCoreInitTimeoutHint(error: Error): void {
   try {
-    if (!moduleUrl || globalThis.crossOriginIsolated !== false) return;
-    const { protocol, pathname } = new URL(moduleUrl, import.meta.url);
-    if (protocol !== 'http:' && protocol !== 'https:' && protocol !== 'file:') return;
-    if (!/\/llama_webgpu_core(?:_mem64)?\.js$/.test(pathname)) return;
-    error.message += '. If this URL serves a pthread core, its worker pool can stall on a page without '
-      + 'cross-origin isolation. Use the single-thread "_st" cores with "allowSingleThreadCore", or serve '
-      + 'the page with "Cross-Origin-Opener-Policy: same-origin" and "Cross-Origin-Embedder-Policy: require-corp".';
+    if (globalThis.crossOriginIsolated !== false) return;
+    error.message += '. If this core was built with pthreads, its worker pool may need cross-origin isolation. '
+      + 'Serve the page with "Cross-Origin-Opener-Policy: same-origin" and "Cross-Origin-Embedder-Policy: require-corp", '
+      + 'or use the single-thread "_st" cores with "allowSingleThreadCore".';
   } catch (_) {
     // The diagnostic must preserve the timeout and fallback even if the environment is unavailable.
   }

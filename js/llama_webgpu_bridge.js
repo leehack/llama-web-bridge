@@ -826,13 +826,10 @@ var SingleThreadCoreError = class extends Error {
   }
 };
 var CROSS_ORIGIN_ISOLATION_MESSAGE = 'The llama.cpp web core needs shared memory, which this page cannot use because it is not cross-origin isolated. Serve the page with "Cross-Origin-Opener-Policy: same-origin" and "Cross-Origin-Embedder-Policy: require-corp". "credentialless" does not isolate Safari.';
-function appendCoreInitTimeoutHint(error, moduleUrl) {
+function appendCoreInitTimeoutHint(error) {
   try {
-    if (!moduleUrl || globalThis.crossOriginIsolated !== false) return;
-    const { protocol, pathname } = new URL(moduleUrl, import.meta.url);
-    if (protocol !== "http:" && protocol !== "https:" && protocol !== "file:") return;
-    if (!/\/llama_webgpu_core(?:_mem64)?\.js$/.test(pathname)) return;
-    error.message += '. If this URL serves a pthread core, its worker pool can stall on a page without cross-origin isolation. Use the single-thread "_st" cores with "allowSingleThreadCore", or serve the page with "Cross-Origin-Opener-Policy: same-origin" and "Cross-Origin-Embedder-Policy: require-corp".';
+    if (globalThis.crossOriginIsolated !== false) return;
+    error.message += '. If this core was built with pthreads, its worker pool may need cross-origin isolation. Serve the page with "Cross-Origin-Opener-Policy: same-origin" and "Cross-Origin-Embedder-Policy: require-corp", or use the single-thread "_st" cores with "allowSingleThreadCore".';
   } catch (_) {
   }
 }
@@ -3391,19 +3388,15 @@ var LlamaWebGpuBridgeRuntime = class {
       });
     } else {
       if (this._preferMemory64 && typeof this._config.coreModuleUrlMem64 === "string" && this._config.coreModuleUrlMem64.length > 0) {
-        const moduleUrl2 = this._config.coreModuleUrlMem64;
         candidates.push({
           variant: "wasm64",
-          moduleUrl: moduleUrl2,
-          factoryPromise: importCoreFactory(moduleUrl2),
+          factoryPromise: importCoreFactory(this._config.coreModuleUrlMem64),
           wasmUrl: this._config.wasmUrlMem64 || this._config.wasmUrl
         });
       }
-      const moduleUrl = this._config.coreModuleUrl ?? "./llama_webgpu_core.js";
       candidates.push({
         variant: "wasm32",
-        moduleUrl,
-        factoryPromise: importCoreFactory(moduleUrl),
+        factoryPromise: importCoreFactory(this._config.coreModuleUrl ?? "./llama_webgpu_core.js"),
         wasmUrl: this._config.wasmUrl
       });
     }
@@ -3505,7 +3498,7 @@ var LlamaWebGpuBridgeRuntime = class {
       } catch (error) {
         lastError = error;
         if (initTimeoutError && error === initTimeoutError) {
-          appendCoreInitTimeoutHint(initTimeoutError, candidate.moduleUrl);
+          appendCoreInitTimeoutHint(initTimeoutError);
         }
         if (candidate.variant === "wasm64") {
           const reason = initTimeoutError && error === initTimeoutError ? "timeout" : factoryLoaded && isMemory64Unsupported() ? "unsupported" : "init_error";
