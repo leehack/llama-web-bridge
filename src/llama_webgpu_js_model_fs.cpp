@@ -194,15 +194,6 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_mount_js_model_fs(const char * mou
     return -EINVAL;
   }
 
-  auto & mounted = mounted_js_models();
-  const auto it = find_mount_at_path(mounted, mount_path);
-  if (it != mounted.end()) {
-    if (mount_is_live(it->second)) {
-      return -EEXIST;
-    }
-    // WasmFS can rename a live mount. Its owner still releases chunks by ID.
-    erase_mount(mounted, it);
-  }
   if (wasmfs_get_backend_by_path(mount_path) != nullptr) {
     return -EEXIST;
   }
@@ -229,6 +220,12 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_mount_js_model_fs(const char * mou
     return rc;
   }
 
+  auto & mounted = mounted_js_models();
+  const auto it = find_mount_at_path(mounted, mount_path);
+  if (it != mounted.end()) {
+    // Failed mounts must preserve the ID of a backend that may be renamed back.
+    erase_mount(mounted, it);
+  }
   mounted.emplace(mount_id, MountedJsModelEntry{mount_path, backend});
   g_has_js_model_mounts = true;
   return 0;

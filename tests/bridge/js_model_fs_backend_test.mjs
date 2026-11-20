@@ -441,6 +441,7 @@ struct ChunkEntry {
 std::map<uintptr_t, ChunkEntry> g_js_chunks;
 size_t g_oom = 0;
 bool g_force_unmount_busy = false;
+bool g_force_create_failure = false;
 }
 
 extern "C" {
@@ -482,6 +483,7 @@ double _llamadart_js_model_fs_allocated_bytes() {
   return it == g_dirs.end() ? nullptr : it->second.backend;
 }
 int wasmfs_create_directory(const char* path, mode_t, ::backend_t backend) {
+  if (g_force_create_failure) return -ENOSPC;
   std::string p = path ? path : "";
   if (g_dirs.count(p)) return -EEXIST;
   g_dirs[p] = {backend};
@@ -593,8 +595,8 @@ int main() {
   old_dir_file.reset();
   assert(llamadart_webgpu_js_model_fs_allocated_bytes() == 0.0);
 
-  enum class Cleanup { remount, collision, unmount, unmount_all, release_id };
-  for (auto cleanup : {Cleanup::remount, Cleanup::collision, Cleanup::unmount,
+  enum class Cleanup { remount, unmount, unmount_all, release_id };
+  for (auto cleanup : {Cleanup::remount, Cleanup::unmount,
                        Cleanup::unmount_all, Cleanup::release_id}) {
     const char* path = "/stale";
     assert(llamadart_webgpu_mount_js_model_fs(path) == 0);
@@ -615,8 +617,6 @@ int main() {
       assert(!llamadart_webgpu_is_js_model_path("/stale/model.gguf"));
       if (cleanup == Cleanup::release_id) {
         llamadart_webgpu_js_model_fs_release_mount_chunks(stale_id);
-      } else if (cleanup == Cleanup::collision) {
-        assert(llamadart_webgpu_mount_js_model_fs(path) == -EEXIST);
       } else {
         assert(llamadart_webgpu_unmount_js_model_fs(cleanup == Cleanup::unmount ? path : nullptr) == 0);
       }
@@ -632,6 +632,21 @@ int main() {
     }
     assert(llamadart_webgpu_js_model_fs_allocated_bytes() == 0.0);
     g_dirs.erase("/moved");
+  }
+
+  for (const bool occupied : {true, false}) {
+    const char* path = "/staging";
+    assert(llamadart_webgpu_mount_js_model_fs(path) == 0);
+    const int32_t original_id = llamadart_webgpu_js_model_fs_mount_id(path);
+    const auto original = g_dirs.at(path);
+    g_dirs.erase(path);
+    if (occupied) g_dirs[path] = {g_mem_backend};
+    g_force_create_failure = !occupied;
+    assert(llamadart_webgpu_mount_js_model_fs(path) == (occupied ? -EEXIST : -ENOSPC));
+    g_force_create_failure = false;
+    g_dirs[path] = original;
+    assert(llamadart_webgpu_js_model_fs_mount_id(path) == original_id);
+    assert(llamadart_webgpu_unmount_js_model_fs(path) == 0);
   }
 
   // After unmount, path predicate returns to zero allocations again.

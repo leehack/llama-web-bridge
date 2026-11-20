@@ -211,7 +211,7 @@ staging state.
 
 To check that a second bridge preserves a renamed mount while the owning
 bridge is still staging, split the same tiny GGUF with `llama-gguf-split` and
-run both collision cases on all four built core variants:
+run the rename and restore cases on all four built core variants:
 
 ```bash
 SPLIT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/lane230-split.XXXXXX")"
