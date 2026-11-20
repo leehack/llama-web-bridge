@@ -24,6 +24,9 @@ import {
   withDecisionErrorCode,
 } from './internal/decision.ts';
 import {
+  captureResumeIdentity,
+  classifyResumeResponse,
+  createModelTransferLengthError,
   drainResponseWithProgress,
   ensureFsDirectory,
   hasReadableResponseStream,
@@ -78,7 +81,7 @@ import {
 } from './internal/text.ts';
 import { bufferSourceBytes, isInt32, toFloat32Array, toUint8Array } from './internal/typed_values.ts';
 import type { ResolvedGrammarOptions, ResolvedSpeculativeOptions } from './internal/completion_options.ts';
-import type { DirectFileChunkWriter, ProgressCallback } from './internal/download.ts';
+import type { DirectFileChunkWriter, ProgressCallback, ResumeIdentity } from './internal/download.ts';
 import type { EmbedBatchProgressHook } from './internal/embedding.ts';
 import type { ModelSource } from './internal/model_source.ts';
 import type { CcallArg, CcallArgType, LlamaCoreModule, LogMethod, TextBytesExport } from './internal/types.ts';
@@ -2535,6 +2538,7 @@ export class LlamaWebGpuBridgeRuntime {
           let resumeAttempt = 0;
           let activeShardUrl = shardUrl;
           let knownTotalBytes = 0;
+          let resumeIdentity: ResumeIdentity | null = null;
 
           while (true) {
             throwIfAborted(operationSignal, abortMessage);
@@ -2573,6 +2577,30 @@ export class LlamaWebGpuBridgeRuntime {
               );
             }
 
+            let expectedShardBytes: number | null = null;
+            if (resumeOffset > 0 && resumeIdentity) {
+              const resume = classifyResumeResponse(resumeIdentity, response, responseUrl, resumeOffset);
+              if (resume.verdict === 'changed') {
+                await response.body?.cancel().catch(() => {});
+                this._runtimeNotes.push('model_stream_restart:' + resume.reason);
+                if (resumeAttempt >= maxStreamResumeRetries) {
+                  throw new Error('Model shard changed during download and the retry limit was reached.');
+                }
+                resumeAttempt += 1;
+                activeShardUrl = shardUrl;
+                resumeOffset = 0;
+                knownTotalBytes = 0;
+                resumeIdentity = null;
+                shardLoaded[shardIndex] = 0;
+                shardTotals[shardIndex] = 0;
+                emitAggregateProgress();
+                continue;
+              }
+              this._runtimeNotes.push('model_stream_resume_' + resume.verdict);
+              expectedShardBytes = resume.expectedBytes;
+              resumeIdentity.total = resume.total;
+            }
+
             if (!hasReadableResponseStream(response)) {
               this._runtimeNotes.push('model_response_nostream');
               const declaredBytes = inferResponseTotalBytes(response, 0);
@@ -2584,6 +2612,10 @@ export class LlamaWebGpuBridgeRuntime {
             this._runtimeNotes.push('model_response_stream');
 
             const responseTotal = inferResponseTotalBytes(response, knownTotalBytes);
+            if (resumeOffset === 0) {
+              resumeIdentity = captureResumeIdentity(response, responseUrl);
+              expectedShardBytes = resumeIdentity.total;
+            }
             if (responseTotal > 0) {
               knownTotalBytes = responseTotal;
               shardTotals[shardIndex] = responseTotal;
@@ -2629,6 +2661,11 @@ export class LlamaWebGpuBridgeRuntime {
                   abortMessage,
                 },
               );
+              if (expectedShardBytes !== null && shardBytes !== expectedShardBytes) {
+                throw createModelTransferLengthError(
+                  'Model response staged ' + shardBytes + ' bytes, expected ' + expectedShardBytes + '.',
+                );
+              }
               await this._settleModelCacheStore(response);
               break;
             } catch (error) {
