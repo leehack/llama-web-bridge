@@ -1808,6 +1808,7 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
     args: unknown[],
     onEvent?: WorkerEventHandler | null,
     transferList: Transferable[] = [],
+    beforePost?: () => void,
   ): Promise<T> {
     if (this._workerProxy?.coreRetired === true) {
       // The core aborted while no call was waiting on this worker.
@@ -1846,6 +1847,7 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
         operation
           ? { operationId: operation.id, workerGeneration: operation.workerGeneration }
           : undefined,
+        beforePost,
       );
       if (operation?.cancelRequested) {
         // The worker drops a cancel that reached it before this call, so the
@@ -2761,6 +2763,7 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
     let cancelledAfterChunk = false;
     let progressFailure: { error: unknown } | undefined;
     let result: TextToSpeechResult;
+    const operation = this._activeOperation;
     try {
       await this._restoreWorkerModelIfMissing();
       if (streamAudio) {
@@ -2800,6 +2803,9 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
           }
         },
         transferList,
+        streamAudio
+          ? () => this._throwIfOperationCancelled(undefined, TEXT_TO_SPEECH_CANCELLED, operation)
+          : undefined,
       );
     } catch (error) {
       if (progressFailure) {

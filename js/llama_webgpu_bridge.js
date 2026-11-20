@@ -6527,7 +6527,7 @@ var BridgeWorkerProxy = class {
     };
     this._worker.postMessage({ type: "init", config });
   }
-  async call(method, args, onEvent, transferList = [], operationMeta = null) {
+  async call(method, args, onEvent, transferList = [], operationMeta = null, beforePost) {
     await this._ready;
     if (method === "synthesizeSpeech" && args[0]?.streamAudio === true && !this._supportsIncrementalAudio) {
       throw new TextToSpeechStreamingUnsupportedError();
@@ -6535,6 +6535,7 @@ var BridgeWorkerProxy = class {
     const id = this._nextId++;
     const timeoutMs = this._resolveRequestTimeoutMs(method, args);
     const transfers = Array.isArray(transferList) ? transferList.filter((item) => item != null) : [];
+    beforePost?.();
     return new Promise((resolve, reject) => {
       let timeoutHandle = null;
       const clearTimer = () => {
@@ -7898,7 +7899,7 @@ var LlamaWebGpuBridge = class {
       this._runtime._runtimeNotes.push(note);
     }
   }
-  async _callWorker(method, args, onEvent, transferList = []) {
+  async _callWorker(method, args, onEvent, transferList = [], beforePost) {
     if (this._workerProxy?.coreRetired === true) {
       await this._replaceWorkerAfterCoreRetired(this._workerProxy);
     }
@@ -7921,7 +7922,8 @@ var LlamaWebGpuBridge = class {
         args,
         guardedEvent,
         transferList,
-        operation ? { operationId: operation.id, workerGeneration: operation.workerGeneration } : void 0
+        operation ? { operationId: operation.id, workerGeneration: operation.workerGeneration } : void 0,
+        beforePost
       );
       if (operation?.cancelRequested) {
         this._sendWorkerCancel(proxy, operation);
@@ -8711,6 +8713,7 @@ var LlamaWebGpuBridge = class {
     let cancelledAfterChunk = false;
     let progressFailure;
     let result;
+    const operation = this._activeOperation;
     try {
       await this._restoreWorkerModelIfMissing();
       if (streamAudio) {
@@ -8749,7 +8752,8 @@ var LlamaWebGpuBridge = class {
             }
           }
         },
-        transferList
+        transferList,
+        streamAudio ? () => this._throwIfOperationCancelled(void 0, TEXT_TO_SPEECH_CANCELLED, operation) : void 0
       );
     } catch (error) {
       if (progressFailure) {

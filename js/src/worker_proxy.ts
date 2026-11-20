@@ -232,6 +232,7 @@ export class BridgeWorkerProxy {
     onEvent?: WorkerEventHandler | null,
     transferList: Transferable[] = [],
     operationMeta: Record<string, unknown> | null = null,
+    beforePost?: () => void,
   ): Promise<WorkerResponse> {
     await this._ready;
     if (
@@ -247,6 +248,7 @@ export class BridgeWorkerProxy {
       ? transferList.filter((item) => item != null)
       : [];
 
+    beforePost?.();
     return new Promise((resolve, reject) => {
       let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
       const clearTimer = () => {

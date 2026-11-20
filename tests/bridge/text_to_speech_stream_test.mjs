@@ -167,7 +167,7 @@ test('default synthesis still reads full PCM and never reads a chunk', async () 
 });
 
 async function runWorkerSpeech(options, {
-  legacy = false, onBridge, emitSecond = true, afterProgress, beforeResult, afterResult,
+  legacy = false, onBridge, afterStart, emitSecond = true, afterProgress, beforeResult, afterResult,
 } = {}) {
   return withStubWorkerEnvironment(async ({ workers }) => {
     const bridge = createRealWorkerBridge();
@@ -181,6 +181,7 @@ async function runWorkerSpeech(options, {
       (value) => ({ value }),
       (error) => ({ error }),
     );
+    afterStart?.(bridge);
     await driver.settle();
     const calls = driver.calls('synthesizeSpeech');
     for (const { id } of calls) {
@@ -217,6 +218,26 @@ async function runWorkerSpeech(options, {
 }
 
 const cancellationScript = [{ state: 2, pcm: first }, { state: 3, pcm: tail }];
+
+for (const [label, cancel] of [
+  ['bridge.cancel()', (bridge) => bridge.cancel()],
+  ['AbortController.abort()', (_bridge, controller) => controller.abort()],
+]) {
+  test(`streamed worker dispatch is skipped after ${label} during readiness`, async () => {
+    const controller = new AbortController();
+    const result = await runWorkerSpeech({
+      text: 'Hello.',
+      streamAudio: true,
+      signal: controller.signal,
+      onProgress() {},
+    }, {
+      afterStart(bridge) { queueMicrotask(() => cancel(bridge, controller)); },
+    });
+    assert.ok(result.error instanceof DOMException);
+    assert.equal(result.error.name, 'AbortError');
+    assert.equal(result.calls.length, 0, 'no synthesis message was posted');
+  });
+}
 
 test('a queued one-shot request keeps its admitted mode in direct synthesis', async () => {
   const { bridge, calls } = createSpeechBridge({ script: cancellationScript });
