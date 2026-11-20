@@ -92,6 +92,45 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_begin_generation_bytes(
       prompt_penalty_mode);
 }
 
+EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_begin_generation_multi_end_bytes(
+    const char * prompt,
+    int32_t prompt_length,
+    float temp,
+    int32_t top_k,
+    float top_p,
+    float repeat_penalty,
+    const char * grammar,
+    uint32_t seed,
+    float min_p,
+    float presence_penalty,
+    int32_t thinking_budget_tokens,
+    const char * thinking_start_tag,
+    const char * thinking_end_tag,
+    const char * thinking_forced_message,
+    int32_t prompt_penalty_mode,
+    const char * natural_end_tags_json,
+    int32_t grammar_replay_end_index) {
+  return begin_generation_impl(
+      prompt,
+      prompt_length,
+      temp,
+      top_k,
+      top_p,
+      repeat_penalty,
+      grammar,
+      seed,
+      min_p,
+      presence_penalty,
+      thinking_budget_tokens,
+      thinking_start_tag,
+      thinking_end_tag,
+      thinking_forced_message,
+      prompt_penalty_mode,
+      natural_end_tags_json,
+      grammar_replay_end_index,
+      true);
+}
+
 EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_begin_generation(
     const char * prompt,
     float temp,
@@ -204,7 +243,7 @@ EMSCRIPTEN_KEEPALIVE const char * llamadart_webgpu_completion_capabilities_json(
   };
   g_completion_capabilities_json =
       "{\"presencePenalty\":true,\"minP\":true,\"thinkingBudget\":true,"
-      "\"thinkingBudgetPauseGrammar\":true,"
+      "\"thinkingBudgetPauseGrammar\":true,\"thinkingBudgetMultiEnd\":true,"
       "\"penaltyPromptTokens\":true,\"penaltyPromptTokensWithGrammar\":true,\"lazyGrammar\":true,"
       "\"speculativeDecoding\":{";
   bool first = true;

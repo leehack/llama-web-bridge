@@ -337,6 +337,7 @@ void free_draft_model() {
 void end_generation_state() {
   free_speculative_session();
   g_active_reasoning_budget = nullptr;
+  g_active_grammar_replay_end.clear();
   if (g_active_sampler != nullptr) {
     llama_sampler_free(g_active_sampler);
     g_active_sampler = nullptr;

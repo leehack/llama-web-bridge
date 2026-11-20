@@ -33,6 +33,7 @@ bool g_active_grammar_lazy = false;
 bool g_active_grammar_pauses_while_reasoning = true;
 // Borrowed from g_active_sampler's chain, which owns and frees it.
 llama_sampler * g_active_reasoning_budget = nullptr;
+llama_tokens g_active_grammar_replay_end;
 std::vector<llama_token_data> g_sampler_candidates;
 std::atomic<int32_t> g_log_level{3};
 std::atomic<int32_t> g_last_non_cont_level{GGML_LOG_LEVEL_NONE};
