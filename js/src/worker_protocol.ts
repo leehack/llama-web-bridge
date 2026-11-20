@@ -22,6 +22,7 @@ export interface BridgeStateSnapshot {
 // A message from the worker host: a result, an error, or a progress, token or usage event.
 export interface WorkerResponse {
   type: string;
+  supportsIncrementalAudio?: boolean;
   id?: number;
   value?: unknown;
   state?: BridgeStateSnapshot;

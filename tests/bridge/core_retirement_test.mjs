@@ -715,6 +715,56 @@ test('media completion and speech on a GPU-loaded model rerun once on CPU', asyn
     && text.bridge._loadedModelOptions.nGpuLayers === 99 && text.created.length === 1);
 });
 
+test('streamed speech retries a retired core only before delivering PCM', async () => {
+  for (const deliverAudio of [false, true]) {
+    const original = new Error('Aborted()');
+    const pcm = new Float32Array([0.25]);
+    const dead = abortingProxy('dead', 'synthesizeSpeech', original.message);
+    dead.hasModel = true;
+    dead.call = async (method, args, onEvent) => {
+      assert.equal(method, 'synthesizeSpeech');
+      assert.equal(args[0].streamAudio, true);
+      onEvent({ event: 'progress', payload: deliverAudio ? { pcm, sampleOffset: 0 } : { state: 2 } });
+      dead.coreRetired = true;
+      throw original;
+    };
+    const loads = [];
+    const { bridge, created, runtimes } = createBridge({
+      proxy: dead,
+      overrides: { ...loaded, _loadedModelOptions: { nGpuLayers: 99 } },
+      nextProxy() {
+        const replacement = createProxy('replacement', (method, args) => {
+          if (method === 'loadModelFromUrl') loads.push(args[1]);
+          if (method === 'synthesizeSpeech') return { value: { pcm: new Float32Array(0), sampleCount: 0 } };
+          return healthyImpl(method, args, replacement);
+        });
+        return replacement;
+      },
+    });
+    const chunks = [];
+    const result = await outcome(bridge.synthesizeSpeech({
+      text: 'Hello.',
+      streamAudio: true,
+      onProgress(event) { if (event.pcm) chunks.push(event.pcm); },
+    }));
+    assert.equal(created.length, 1);
+    assert.equal(runtimes.length, 0);
+    if (deliverAudio) {
+      assert.equal(result.error, original);
+      assert.equal(original.llamadartCoreRetired, true);
+      assert.deepEqual(chunks, [pcm]);
+      assert.deepEqual(created[0].calls.filter((method) => method !== 'setLogLevel'), []);
+      assert.equal(bridge._loadedModelOptions.nGpuLayers, 99);
+    } else {
+      assert.equal(result.ok, true);
+      assert.equal(loads.length, 1);
+      assert.equal(loads[0].nGpuLayers, 0);
+      assert.ok(created[0].calls.includes('synthesizeSpeech'));
+    }
+    await bridge.dispose();
+  }
+});
+
 test('no replacement worker can be created', async () => {
   const dead = abortingProxy('dead', 'tokenize');
   dead.hasModel = true;

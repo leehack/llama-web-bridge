@@ -31,6 +31,8 @@ struct llama_webgpu_tts {
   int32_t sample_rate = 0;
   int64_t sample_count = 0;
   std::vector<float> pcm;
+  bool stream = false;
+  std::vector<float> stream_chunk;
   std::string language;
   std::string error;
 };
@@ -70,6 +72,7 @@ llama_webgpu_tts_status fail(
   if (tts != nullptr) {
     tts->state = LLAMADART_WEBGPU_TTS_STATE_FAILED;
     tts->error = message != nullptr ? message : "unknown TTS error";
+    tts->stream_chunk.clear();
     release_task_resources(tts);
   }
   return status;
@@ -104,6 +107,7 @@ uint32_t capabilities_for(
     return 0;
   }
   return LLAMADART_WEBGPU_TTS_CAPABILITY_LANGUAGE |
+      LLAMADART_WEBGPU_TTS_CAPABILITY_STREAMING_PCM |
       (mtmd_support_audio(mtmd)
            ? LLAMADART_WEBGPU_TTS_CAPABILITY_SPEAKER_REFERENCE
            : 0u);
@@ -143,7 +147,68 @@ llama_sampler * init_sampler(
   return sampler;
 }
 
+// Appends what upstream decoded since the previous call. Upstream's buffer is
+// valid only until its next call, so the delta is copied.
+bool collect_stream_pcm(llama_webgpu_tts * tts) {
+  int32_t sample_rate = 0;
+  const char * data = nullptr;
+  size_t data_len = 0;
+  int64_t sample_count = 0;
+  if (mtmd_helper_gen_audio_get_output(
+          tts->generator,
+          &sample_rate,
+          &data,
+          &data_len,
+          &sample_count) != 0) {
+    return false;
+  }
+  if (sample_rate <= 0 || sample_count < 0 ||
+      static_cast<uint64_t>(sample_count) >
+          std::numeric_limits<size_t>::max() / sizeof(float) ||
+      data_len != static_cast<size_t>(sample_count) * sizeof(float) ||
+      (data_len > 0 && data == nullptr)) {
+    return false;
+  }
+  if (sample_count > 0) {
+    const size_t old_size = tts->stream_chunk.size();
+    tts->stream_chunk.resize(old_size + static_cast<size_t>(sample_count));
+    std::memcpy(tts->stream_chunk.data() + old_size, data, data_len);
+    tts->sample_count += sample_count;
+  }
+  tts->sample_rate = sample_rate;
+  return true;
+}
+
+llama_webgpu_tts_status finish_streamed_output(llama_webgpu_tts * tts) {
+  const int32_t flush_status = mtmd_helper_gen_audio_flush(tts->generator);
+  if (tts->cancel_requested.load(std::memory_order_acquire)) {
+    tts->state = LLAMADART_WEBGPU_TTS_STATE_CANCELLED;
+    tts->error = "TTS task cancelled";
+    tts->stream_chunk.clear();
+    release_task_resources(tts);
+    return LLAMADART_WEBGPU_TTS_STATUS_CANCELLED;
+  }
+  if (flush_status != 0) {
+    return fail(
+        tts,
+        LLAMADART_WEBGPU_TTS_STATUS_UPSTREAM_ERROR,
+        "audio flush failed");
+  }
+  if (!collect_stream_pcm(tts) || tts->sample_count <= 0) {
+    return fail(
+        tts,
+        LLAMADART_WEBGPU_TTS_STATUS_UPSTREAM_ERROR,
+        "audio output metadata is invalid");
+  }
+  tts->state = LLAMADART_WEBGPU_TTS_STATE_COMPLETED;
+  release_task_resources(tts);
+  return LLAMADART_WEBGPU_TTS_STATUS_OK;
+}
+
 llama_webgpu_tts_status finish_output(llama_webgpu_tts * tts) {
+  if (tts->stream) {
+    return finish_streamed_output(tts);
+  }
   int32_t sample_rate = 0;
   const char * data = nullptr;
   size_t data_len = 0;
@@ -288,6 +353,8 @@ llama_webgpu_tts_status llama_webgpu_tts_start(
 
   release_task_resources(tts);
   tts->pcm.clear();
+  tts->stream = request.stream_audio;
+  tts->stream_chunk.clear();
   tts->sample_rate = 0;
   tts->sample_count = 0;
   tts->frames_generated = 0;
@@ -346,6 +413,7 @@ llama_webgpu_tts_status llama_webgpu_tts_start(
   input.top_p = request.top_p;
   input.seed = request.seed;
   input.out_type = MTMD_HELPER_GEN_AUDIO_OUTTYPE_PCM;
+  input.stream = tts->stream;
   if (mtmd_helper_gen_audio_set_input(tts->generator, &input) != 0) {
     return fail(
         tts,
@@ -370,6 +438,7 @@ llama_webgpu_tts_status llama_webgpu_tts_step(
   if (active && tts->cancel_requested.load(std::memory_order_acquire)) {
     tts->state = LLAMADART_WEBGPU_TTS_STATE_CANCELLED;
     tts->error = "TTS task cancelled";
+    tts->stream_chunk.clear();
     release_task_resources(tts);
     write_progress(tts, out_progress);
     return LLAMADART_WEBGPU_TTS_STATUS_CANCELLED;
@@ -445,6 +514,14 @@ llama_webgpu_tts_status llama_webgpu_tts_step(
       write_progress(tts, out_progress);
       return status;
     }
+    if (tts->stream && !collect_stream_pcm(tts)) {
+      const auto status = fail(
+          tts,
+          LLAMADART_WEBGPU_TTS_STATUS_UPSTREAM_ERROR,
+          "audio output metadata is invalid");
+      write_progress(tts, out_progress);
+      return status;
+    }
     if (next_state != nullptr) {
       ++tts->frames_generated;
     }
@@ -483,6 +560,8 @@ llama_webgpu_tts_status llama_webgpu_tts_reset(llama_webgpu_tts * tts) {
   tts->sample_rate = 0;
   tts->sample_count = 0;
   tts->pcm.clear();
+  tts->stream = false;
+  tts->stream_chunk.clear();
   tts->language.clear();
   tts->error.clear();
   return LLAMADART_WEBGPU_TTS_STATUS_OK;
@@ -508,6 +587,39 @@ llama_webgpu_tts_status llama_webgpu_tts_write_pcm(
   if (written != tts->pcm.size() || close_result != 0) {
     return LLAMADART_WEBGPU_TTS_STATUS_UPSTREAM_ERROR;
   }
+  return LLAMADART_WEBGPU_TTS_STATUS_OK;
+}
+
+llama_webgpu_tts_status llama_webgpu_tts_write_stream_chunk(
+    llama_webgpu_tts * tts,
+    const char * output_path,
+    int64_t * out_sample_count) {
+  if (tts == nullptr || output_path == nullptr || output_path[0] == '\0' ||
+      out_sample_count == nullptr) {
+    return LLAMADART_WEBGPU_TTS_STATUS_INVALID_ARGUMENT;
+  }
+  *out_sample_count = 0;
+  if (!tts->stream ||
+      (tts->state != LLAMADART_WEBGPU_TTS_STATE_GENERATING &&
+       tts->state != LLAMADART_WEBGPU_TTS_STATE_COMPLETED)) {
+    return LLAMADART_WEBGPU_TTS_STATUS_INVALID_STATE;
+  }
+  if (tts->stream_chunk.empty()) {
+    return LLAMADART_WEBGPU_TTS_STATUS_OK;
+  }
+
+  FILE * output = std::fopen(output_path, "wb");
+  if (output == nullptr) {
+    return LLAMADART_WEBGPU_TTS_STATUS_UPSTREAM_ERROR;
+  }
+  const size_t written = std::fwrite(
+      tts->stream_chunk.data(), sizeof(float), tts->stream_chunk.size(), output);
+  const int close_result = std::fclose(output);
+  if (written != tts->stream_chunk.size() || close_result != 0) {
+    return LLAMADART_WEBGPU_TTS_STATUS_UPSTREAM_ERROR;
+  }
+  *out_sample_count = static_cast<int64_t>(tts->stream_chunk.size());
+  tts->stream_chunk.clear();
   return LLAMADART_WEBGPU_TTS_STATUS_OK;
 }
 

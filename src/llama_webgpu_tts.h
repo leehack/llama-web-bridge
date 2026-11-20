@@ -30,6 +30,8 @@ enum llama_webgpu_tts_model_type {
 enum llama_webgpu_tts_capability {
   LLAMADART_WEBGPU_TTS_CAPABILITY_LANGUAGE = 1u << 0,
   LLAMADART_WEBGPU_TTS_CAPABILITY_SPEAKER_REFERENCE = 1u << 1,
+  // Bit 2 is llamadart-native's VOICE capability; the numbering stays aligned.
+  LLAMADART_WEBGPU_TTS_CAPABILITY_STREAMING_PCM = 1u << 3,
 };
 
 enum llama_webgpu_tts_state {
@@ -63,6 +65,7 @@ struct llama_webgpu_tts_request {
   float min_p;
   float temperature;
   uint32_t seed;
+  bool stream_audio;
 };
 
 struct llama_webgpu_tts_progress {
@@ -96,6 +99,13 @@ llama_webgpu_tts_status llama_webgpu_tts_reset(llama_webgpu_tts * tts);
 llama_webgpu_tts_status llama_webgpu_tts_write_pcm(
     const llama_webgpu_tts * tts,
     const char * output_path);
+
+// Writes the PCM a streamed task decoded since the previous call and forgets
+// it. *out_sample_count == 0 means nothing was decoded and no file is written.
+llama_webgpu_tts_status llama_webgpu_tts_write_stream_chunk(
+    llama_webgpu_tts * tts,
+    const char * output_path,
+    int64_t * out_sample_count);
 
 const char * llama_webgpu_tts_last_error(const llama_webgpu_tts * tts);
 

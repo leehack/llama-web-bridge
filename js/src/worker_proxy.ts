@@ -15,7 +15,8 @@ import {
 } from './internal/isolation.ts';
 import { MODEL_UNLOADED_AFTER_CORE_ABORT, ModelUnloadedError } from './internal/core_guard.ts';
 import { ModelStagingError, isModelStagingErrorCode } from './internal/model_staging.ts';
-import type { LlamaWebGpuBridgeConfig } from './llama_webgpu_bridge.d.ts';
+import { TextToSpeechStreamingUnsupportedError } from './internal/text_to_speech.ts';
+import type { LlamaWebGpuBridgeConfig, TextToSpeechOptions } from './llama_webgpu_bridge.d.ts';
 import { bridgeWorkerModeParam } from './worker_protocol.ts';
 import type { WorkerEventHandler, WorkerResponse } from './worker_protocol.ts';
 
@@ -84,6 +85,7 @@ export class BridgeWorkerProxy {
   declare _readyResolve: () => void;
   declare _readyReject: (reason?: unknown) => void;
   declare _readyTimeoutHandle: ReturnType<typeof setTimeout> | null;
+  declare _supportsIncrementalAudio: boolean;
   // Set once the worker reports that its core aborted. It never clears: the
   // facade replaces this worker.
   declare coreRetired: boolean;
@@ -93,6 +95,7 @@ export class BridgeWorkerProxy {
     this._nextId = 1;
     this._pending = new Map();
     this._workerBlobUrl = null;
+    this._supportsIncrementalAudio = false;
     this.coreRetired = false;
 
     let workerInitError: unknown = null;
@@ -153,6 +156,7 @@ export class BridgeWorkerProxy {
       const message: WorkerResponse = event.data || {};
       const type = message.type;
       if (type === 'ready') {
+        this._supportsIncrementalAudio = message.supportsIncrementalAudio === true;
         this._clearReadyTimeout();
         this._readyResolve?.();
         return;
@@ -230,6 +234,13 @@ export class BridgeWorkerProxy {
     operationMeta: Record<string, unknown> | null = null,
   ): Promise<WorkerResponse> {
     await this._ready;
+    if (
+      method === 'synthesizeSpeech'
+      && (args[0] as Partial<TextToSpeechOptions> | undefined)?.streamAudio === true
+      && !this._supportsIncrementalAudio
+    ) {
+      throw new TextToSpeechStreamingUnsupportedError();
+    }
     const id = this._nextId++;
     const timeoutMs = this._resolveRequestTimeoutMs(method, args);
     const transfers = Array.isArray(transferList)
