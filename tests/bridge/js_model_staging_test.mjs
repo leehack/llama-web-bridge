@@ -714,6 +714,12 @@ int main(int argc, char ** argv) {
       !check_wasm32_gguf_tensor_size_limit(def.c_str());
   assert(!would_run);
   assert(g_freads == 0 && g_fseeks == 0);
+
+  const std::string oversized = dir + "/oversized.gguf";
+  write_gguf(oversized, 1, 0, 0, {{"oversized.weight", 1200000000ULL}});
+  g_error.clear();
+  assert(!check_wasm32_gguf_tensor_size_limit(oversized.c_str()));
+  std::puts(g_error.c_str());
   return 0;
 }
 `;
@@ -727,6 +733,7 @@ int main(int argc, char ** argv) {
     assert.equal(comp.status, 0, comp.stderr);
     const run = spawnSync(exe, [dir], { encoding: 'utf8' });
     assert.equal(run.status, 0, `${run.signal}: ${run.stderr}`);
+    assert.match(run.stdout, /tensor 'oversized\.weight' declares 4800000000 bytes, accumulated 0 bytes, limit 4294967295 bytes/);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

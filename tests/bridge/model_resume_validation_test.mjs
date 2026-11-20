@@ -162,6 +162,7 @@ function runTransfer(t, replies, options = {}) {
 
 const fullGet = ['GET', MODEL, []];
 const rangeGet = ['GET', MODEL, [['range', 'bytes=2-']]];
+const secondRangeGet = ['GET', MODEL, [['range', 'bytes=3-']]];
 const first = (headers) => transfer(A.slice(0, 2), { headers: { 'Content-Length': '4', ...headers }, cut: true });
 const tail = (bytes, headers, extra = {}) => transfer(bytes, {
   status: 206, headers: { 'Content-Range': RANGE, ...headers }, ...extra,
@@ -196,16 +197,161 @@ for (const type of ['basic', 'cors']) {
   });
 }
 
-test('model download: retains the original validator visibility across later ranges', async (t) => {
+test('model download: restarts when comparable strong ETags first seen on ranges disagree', async (t) => {
   const firstRange = transfer([3], {
     status: 206, headers: { ETag: '"a"', 'Content-Range': 'bytes 2-3/4' }, cut: true,
   });
-  const finalRange = tail([4], { ETag: '"b"', 'Content-Range': 'bytes 3-3/4' });
+  const finalRange = tail(B.slice(3), { ETag: '"b"', 'Content-Range': 'bytes 3-3/4' });
+  const { load, loads, requests, notes } = runTransfer(t, [first(), firstRange, finalRange, fullB()]);
+  await load;
+  assert.deepEqual(loads, [B]);
+  assert.deepEqual(requests, [fullGet, rangeGet, secondRangeGet, fullGet]);
+  assert.deepEqual(notes().filter((note) => note === validated || note === unvalidated
+    || note.startsWith('model_stream_restart:')), [unvalidated, 'model_stream_restart:etag']);
+  assert.ok(finalRange.wasCancelled());
+});
+
+test('model download: matching range ETags leave the original prefix unvalidated', async (t) => {
+  const firstRange = tail([3], { ETag: '"a"' }, { cut: true });
+  const finalRange = tail([4], { ETag: '"a"', 'Content-Range': 'bytes 3-3/4' });
   const { load, loads, requests, notes } = runTransfer(t, [first(), firstRange, finalRange]);
   await load;
   assert.deepEqual(loads, [A]);
-  assert.deepEqual(requests, [fullGet, rangeGet, ['GET', MODEL, [['range', 'bytes=3-']]]]);
-  assert.deepEqual(notes().filter((note) => note === unvalidated), [unvalidated, unvalidated]);
+  assert.deepEqual(requests, [fullGet, rangeGet, secondRangeGet]);
+  assert.deepEqual(notes().filter((note) => note === validated || note === unvalidated),
+    [unvalidated, unvalidated]);
+});
+
+test('model download: differing range ETags remain incomparable when encoding changes', async (t) => {
+  const firstRange = tail([3], { ETag: '"a"' }, { cut: true });
+  const finalRange = tail([4], { ETag: '"b"', 'Content-Encoding': 'gzip' });
+  const { load, loads, requests } = runTransfer(t, [first(), firstRange, finalRange]);
+  await load;
+  assert.deepEqual(loads, [A]);
+  assert.deepEqual(requests, [fullGet, rangeGet, secondRangeGet]);
+});
+
+for (const headers of [{ 'Content-Length': '2' }, { 'Content-Range': 'bytes 2-3/*' }]) {
+  test(`model download: retains the expected end from ${Object.keys(headers)[0]} across interruptions`, async (t) => {
+    const initial = transfer(A.slice(0, 2), { cut: true });
+    const firstRange = transfer([3], { status: 206, headers, cut: true });
+    const finalRange = transfer([], { status: 206 });
+    const { load, loads, requests } = runTransfer(t, [initial, firstRange, finalRange]);
+    await assert.rejects(load, { name: 'ModelTransferLengthError', message: /staged 3 bytes, expected (at least )?4/ });
+    assert.deepEqual(loads, []);
+    assert.deepEqual(requests, [fullGet, rangeGet, secondRangeGet]);
+  });
+}
+
+test('model download: a later explicit total replaces an earlier inferred end', async (t) => {
+  const initial = transfer(A.slice(0, 2), { cut: true });
+  const firstRange = tail([3], { 'Content-Range': 'bytes 2-3/*' }, { cut: true });
+  const finalRange = tail([4, 5], { 'Content-Range': 'bytes 3-4/5' });
+  const { load, loads, requests } = runTransfer(t, [initial, firstRange, finalRange]);
+  await load;
+  assert.deepEqual(loads, [[...A, 5]]);
+  assert.deepEqual(requests, [fullGet, rangeGet, secondRangeGet]);
+});
+
+test('model download: a shorter wildcard range cannot erase an earlier declared end', async (t) => {
+  const initial = transfer([1], { cut: true });
+  const firstRange = tail([2], { 'Content-Range': 'bytes 1-3/*' }, { cut: true });
+  const finalRange = tail([3], { 'Content-Range': 'bytes 2-2/*' });
+  const { load, loads, requests } = runTransfer(t, [initial, firstRange, finalRange]);
+  await assert.rejects(load, { name: 'ModelTransferLengthError', message: /staged 3 bytes, expected at least 4/ });
+  assert.deepEqual(loads, []);
+  assert.deepEqual(requests, [fullGet, ['GET', MODEL, [['range', 'bytes=1-']]], rangeGet]);
+});
+
+test('model download: restarts when a later explicit total contradicts an earlier declared end', async (t) => {
+  const initial = transfer(A.slice(0, 2), { cut: true });
+  const firstRange = tail([3], { 'Content-Range': 'bytes 2-4/*' }, { cut: true });
+  const finalRange = tail([4], { 'Content-Range': 'bytes 3-3/4' });
+  const { load, loads, requests, notes } = runTransfer(t, [initial, firstRange, finalRange, fullB()]);
+  await load;
+  assert.deepEqual(loads, [B]);
+  assert.deepEqual(requests, [fullGet, rangeGet, secondRangeGet, fullGet]);
+  assert.ok(notes().includes('model_stream_restart:range'));
+});
+
+test('model download: an interrupted full GET 206 retains its declared end', async (t) => {
+  const initial = tail(A.slice(0, 2), { 'Content-Range': 'bytes 0-3/*' }, { cut: true });
+  const finalRange = transfer([3], { status: 206 });
+  const { load, loads, requests } = runTransfer(t, [initial, finalRange]);
+  await assert.rejects(load, { name: 'ModelTransferLengthError', message: /staged 3 bytes, expected (at least )?4/ });
+  assert.deepEqual(loads, []);
+  assert.deepEqual(requests, [fullGet, rangeGet]);
+});
+
+test('model download: a later range can extend beyond the span of an interrupted full GET 206', async (t) => {
+  const initial = tail(A.slice(0, 2), { 'Content-Range': 'bytes 0-2/*' }, { cut: true });
+  const finalRange = transfer(A.slice(2), { status: 206 });
+  const { load, loads, requests } = runTransfer(t, [initial, finalRange]);
+  await load;
+  assert.deepEqual(loads, [A]);
+  assert.deepEqual(requests, [fullGet, rangeGet]);
+});
+
+test('model download: rejects a short wildcard 206 answering a full GET', async (t) => {
+  const initial = transfer(A.slice(0, 3), { status: 206, headers: { 'Content-Range': 'bytes 0-3/*' } });
+  const { load, loads, requests } = runTransfer(t, [initial]);
+  await assert.rejects(load, { name: 'ModelTransferLengthError', message: /staged 3 bytes, expected 4/ });
+  assert.deepEqual(loads, []);
+  assert.deepEqual(requests, [fullGet]);
+});
+
+test('model download: enforces the span of a full GET 206 even if the body matches the numeric total', async (t) => {
+  const initial = tail(A, { 'Content-Range': 'bytes 0-2/4' });
+  const { load, loads, requests } = runTransfer(t, [initial]);
+  await assert.rejects(load, { name: 'ModelTransferLengthError', message: /staged 4 bytes, expected 3/ });
+  assert.deepEqual(loads, []);
+  assert.deepEqual(requests, [fullGet]);
+});
+
+test('model download: accepts a complete wildcard 206 answering a full GET', async (t) => {
+  const initial = tail(A, { 'Content-Range': 'bytes 0-3/*' });
+  const { load, loads, requests } = runTransfer(t, [initial]);
+  await load;
+  assert.deepEqual(loads, [A]);
+  assert.deepEqual(requests, [fullGet]);
+});
+
+test('model download: restarts after an interrupted full GET 206 overruns its declared span', async (t) => {
+  const initial = tail([...A, 9], { 'Content-Range': 'bytes 0-3/*' }, { cut: true });
+  const replacement = transfer(B, { status: 206 });
+  const { load, loads, requests, notes } = runTransfer(t, [initial, replacement]);
+  await load;
+  assert.deepEqual(loads, [B]);
+  assert.deepEqual(requests, [fullGet, fullGet]);
+  assert.ok(notes().includes('model_stream_restart:range'));
+});
+
+test('model download: restarts after an interrupted resumed 206 overruns its declared span', async (t) => {
+  const initial = transfer(A.slice(0, 2), { cut: true });
+  const resumed = tail([3, 4, 9], { 'Content-Range': 'bytes 2-3/*' }, { cut: true });
+  const replacement = transfer(B, { status: 206 });
+  const { load, loads, requests, notes } = runTransfer(t, [initial, resumed, replacement]);
+  await load;
+  assert.deepEqual(loads, [B]);
+  assert.deepEqual(requests, [fullGet, rangeGet, fullGet]);
+  assert.ok(notes().includes('model_stream_restart:range'));
+});
+
+test('model download: rejects a full GET 206 with conflicting Content-Range and linked totals', async (t) => {
+  const initial = tail(A, { 'Content-Range': 'bytes 0-3/5', 'X-Linked-Size': '4' });
+  const { load, loads, requests } = runTransfer(t, [initial]);
+  await assert.rejects(load, { name: 'ModelTransferLengthError', message: /conflicting.*totals/ });
+  assert.deepEqual(loads, []);
+  assert.deepEqual(requests, [fullGet]);
+  assert.ok(initial.wasCancelled());
+});
+
+test('model download: accepts a full GET 206 with matching Content-Range and linked totals', async (t) => {
+  const initial = tail(A, { 'Content-Range': 'bytes 0-3/4', 'X-Linked-Size': '4' });
+  const { load, loads, requests } = runTransfer(t, [initial]);
+  await load;
+  assert.deepEqual(loads, [A]);
+  assert.deepEqual(requests, [fullGet]);
 });
 
 for (const exposure of ['*', 'ETag, Content-Range, Content-Encoding, Access-Control-Expose-Headers']) {

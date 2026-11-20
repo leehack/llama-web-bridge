@@ -1168,18 +1168,24 @@ function parseByteRange(value) {
 }
 function captureResumeIdentity(response, finalUrl) {
   const encoding = contentEncodingOf(response);
-  let total = parseByteLength(response.headers.get("x-linked-size"));
+  const range = response.status === 206 && encoding === "identity" ? parseByteRange(response.headers.get("content-range")) : null;
+  const rangeTotal = range?.total ?? null;
+  const linkedSize = parseByteLength(response.headers.get("x-linked-size"));
+  if (rangeTotal !== null && linkedSize !== null && rangeTotal !== linkedSize) return null;
+  let total = linkedSize;
   if (total === null && encoding === "identity") {
-    total = response.status === 206 ? parseByteRange(response.headers.get("content-range"))?.total ?? null : parseByteLength(response.headers.get("content-length"));
+    total = response.status === 206 ? rangeTotal : parseByteLength(response.headers.get("content-length"));
   }
   return {
     url: finalUrl,
     strongEtag: strongEtagOf(response.headers.get("etag")),
     encoding,
-    total
+    total,
+    initialSpanBytes: range?.start === 0 ? range.end + 1 : null,
+    resumedStrongEtags: /* @__PURE__ */ new Map()
   };
 }
-function classifyResumeResponse(identity, response, finalUrl, offset) {
+function classifyResumeResponse(identity, response, finalUrl, offset, minimumBytes = 0) {
   if (finalUrl !== identity.url) return { verdict: "changed", reason: "url" };
   const encoding = contentEncodingOf(response);
   const contentRange = response.headers.get("content-range");
@@ -1187,7 +1193,7 @@ function classifyResumeResponse(identity, response, finalUrl, offset) {
   const length = encoding === "identity" ? parseByteLength(response.headers.get("content-length")) : null;
   const linkedSize = parseByteLength(response.headers.get("x-linked-size"));
   const total = range?.total ?? linkedSize ?? identity.total;
-  if (total !== null && (identity.total !== null && total !== identity.total || linkedSize !== null && total !== linkedSize)) {
+  if (total !== null && (total < minimumBytes || identity.total !== null && total !== identity.total || linkedSize !== null && total !== linkedSize)) {
     return { verdict: "changed", reason: "range" };
   }
   let rangeVerified = false;
@@ -1201,13 +1207,21 @@ function classifyResumeResponse(identity, response, finalUrl, offset) {
     rangeVerified = contentRange === null;
   }
   const etag = strongEtagOf(response.headers.get("etag"));
-  const comparableTags = identity.strongEtag !== null && etag !== null && encoding !== null && identity.encoding === encoding;
-  if (comparableTags && etag !== identity.strongEtag) return { verdict: "changed", reason: "etag" };
+  const originalTag = encoding !== null && identity.encoding === encoding ? identity.strongEtag : null;
+  const validator = etag !== null && encoding !== null ? { etag, encoding } : null;
+  if (validator) {
+    const earlierTag = originalTag ?? identity.resumedStrongEtags.get(validator.encoding);
+    if (earlierTag !== void 0 && earlierTag !== validator.etag) {
+      return { verdict: "changed", reason: "etag" };
+    }
+  }
   const tailBytes = range ? range.end + 1 : length === null ? null : offset + length;
   return {
-    verdict: comparableTags && rangeVerified ? "validated" : "unvalidated",
+    // A tag first seen on a range can check later ranges but cannot verify the original prefix.
+    verdict: validator && originalTag !== null && rangeVerified ? "validated" : "unvalidated",
     total,
-    expectedBytes: total ?? tailBytes
+    expectedBytes: total ?? tailBytes,
+    validator
   };
 }
 function isRetryableStreamNetworkError(error) {
@@ -1628,6 +1642,29 @@ function isSafariUserAgent(userAgent) {
   const hasOtherBrowserToken = /(Chrome|Chromium|CriOS|Edg|OPR|Firefox|FxiOS)\//.test(userAgent);
   return hasSafariToken && !hasOtherBrowserToken;
 }
+var SAFARI_UNCAPPED_GPU_MIN_MAJOR = 27;
+var APPLE_SAFARI_PLATFORM = /^Mozilla\/5\.0 \((?:Macintosh; Intel Mac OS X \d+(?:_\d+)*|(?:iPhone|iPad|iPod touch); CPU (?:iPhone )?OS \d+(?:_\d+)* like Mac OS X)\) AppleWebKit\/\d+(?:\.\d+)* \(KHTML, like Gecko\) /;
+var SAFARI_PRODUCTS = /^(?:Version\/(\d+(?:\.\d+)*) )?(?:Mobile\/[A-Za-z0-9]+ )?Safari\/\d+(?:\.\d+)*$/;
+function appleSafariProducts(userAgent) {
+  if (typeof userAgent !== "string") return null;
+  const platform = APPLE_SAFARI_PLATFORM.exec(userAgent);
+  if (!platform) return null;
+  const products = SAFARI_PRODUCTS.exec(userAgent.slice(platform[0].length));
+  if (products?.[1] === "60.5" && userAgent.endsWith("Safari/605.1.15")) return null;
+  return products;
+}
+function isAppleSafariUserAgent(userAgent) {
+  return appleSafariProducts(userAgent) !== null;
+}
+function safariMajorVersion(userAgent) {
+  const version = appleSafariProducts(userAgent)?.[1];
+  const major = Number(version?.split(".")[0]);
+  return Number.isSafeInteger(major) ? major : null;
+}
+function safariDefaultMaxGpuLayers(userAgent) {
+  const major = safariMajorVersion(userAgent);
+  return major !== null && major >= SAFARI_UNCAPPED_GPU_MIN_MAJOR ? Infinity : 1;
+}
 function canPostSharedMemory() {
   if (typeof MessageChannel !== "function" || typeof WebAssembly === "undefined") {
     return true;
@@ -1798,6 +1835,7 @@ function scoredTokensFrom(entries) {
 
 // js/src/runtime.ts
 var pendingModelCacheStores = /* @__PURE__ */ new WeakMap();
+var SAFARI_EMBEDDING_PROBE_MAX_COSINE = 0.999;
 var textEncoder = new TextEncoder();
 var LlamaWebGpuBridgeRuntime = class {
   constructor(config = {}) {
@@ -1857,7 +1895,10 @@ var LlamaWebGpuBridgeRuntime = class {
     this._mainGpu = -1;
     this._loadMtp = false;
     this._speculativeRollbackTokenMax = 0;
-    this._isSafari = isSafariUserAgent(this._config.userAgent ?? globalThis.navigator?.userAgent ?? "");
+    const userAgent = this._config.userAgent ?? globalThis.navigator?.userAgent ?? "";
+    this._isSafari = isSafariUserAgent(userAgent);
+    this._isAppleSafari = isAppleSafariUserAgent(userAgent);
+    this._safariDefaultMaxGpuLayers = safariDefaultMaxGpuLayers(userAgent);
     this._coreVariant = "uninitialized";
     this._preferMemory64 = this._config.preferMemory64 !== false;
     this._modelSource = "network";
@@ -3535,7 +3576,7 @@ var LlamaWebGpuBridgeRuntime = class {
     }
     if (this._isSafari && this._nGpuLayers > 0) {
       const requestedSafariMaxLayers = Number(options.safariMaxGpuLayers);
-      const safariMaxGpuLayers = Number.isFinite(requestedSafariMaxLayers) ? Math.max(1, Math.trunc(requestedSafariMaxLayers)) : 1;
+      const safariMaxGpuLayers = Number.isFinite(requestedSafariMaxLayers) ? Math.max(1, Math.trunc(requestedSafariMaxLayers)) : this._safariDefaultMaxGpuLayers;
       if (this._nGpuLayers > safariMaxGpuLayers) {
         this._nGpuLayers = safariMaxGpuLayers;
         this._runtimeNotes.push(`safari_gpu_layers_capped:${safariMaxGpuLayers}`);
@@ -3620,6 +3661,22 @@ var LlamaWebGpuBridgeRuntime = class {
             let activeShardUrl = shardUrl;
             let knownTotalBytes = 0;
             let resumeIdentity = null;
+            let minimumShardBytes = 0;
+            const restartShard = (reason) => {
+              this._runtimeNotes.push("model_stream_restart:" + reason);
+              if (resumeAttempt >= maxStreamResumeRetries) {
+                throw new Error("Model shard changed during download and the retry limit was reached.");
+              }
+              resumeAttempt += 1;
+              activeShardUrl = shardUrl;
+              resumeOffset = 0;
+              knownTotalBytes = 0;
+              resumeIdentity = null;
+              minimumShardBytes = 0;
+              shardLoaded[shardIndex] = 0;
+              shardTotals[shardIndex] = 0;
+              emitAggregateProgress();
+            };
             while (true) {
               throwIfAborted(operationSignal, abortMessage);
               const requestHeaders = resumeOffset > 0 ? { Range: `bytes=${resumeOffset}-` } : null;
@@ -3650,27 +3707,25 @@ var LlamaWebGpuBridgeRuntime = class {
               }
               let expectedShardBytes = null;
               if (resumeOffset > 0 && resumeIdentity) {
-                const resume = classifyResumeResponse(resumeIdentity, response, responseUrl, resumeOffset);
+                const resume = classifyResumeResponse(
+                  resumeIdentity,
+                  response,
+                  responseUrl,
+                  resumeOffset,
+                  minimumShardBytes
+                );
                 if (resume.verdict === "changed") {
                   await response.body?.cancel().catch(() => {
                   });
-                  this._runtimeNotes.push("model_stream_restart:" + resume.reason);
-                  if (resumeAttempt >= maxStreamResumeRetries) {
-                    throw new Error("Model shard changed during download and the retry limit was reached.");
-                  }
-                  resumeAttempt += 1;
-                  activeShardUrl = shardUrl;
-                  resumeOffset = 0;
-                  knownTotalBytes = 0;
-                  resumeIdentity = null;
-                  shardLoaded[shardIndex] = 0;
-                  shardTotals[shardIndex] = 0;
-                  emitAggregateProgress();
+                  restartShard(resume.reason);
                   continue;
                 }
                 this._runtimeNotes.push("model_stream_resume_" + resume.verdict);
                 expectedShardBytes = resume.expectedBytes;
                 resumeIdentity.total = resume.total;
+                if (resume.validator) {
+                  resumeIdentity.resumedStrongEtags.set(resume.validator.encoding, resume.validator.etag);
+                }
               }
               if (!hasReadableResponseStream(response)) {
                 this._runtimeNotes.push("model_response_nostream");
@@ -3682,10 +3737,19 @@ var LlamaWebGpuBridgeRuntime = class {
               }
               this._runtimeNotes.push("model_response_stream");
               const responseTotal = inferResponseTotalBytes(response, knownTotalBytes);
+              let fullGetSpanBytes = null;
               if (resumeOffset === 0) {
                 resumeIdentity = captureResumeIdentity(response, responseUrl);
+                if (!resumeIdentity) {
+                  await response.body?.cancel().catch(() => {
+                  });
+                  throw createModelTransferLengthError("Model response reported conflicting Content-Range and X-Linked-Size totals.");
+                }
                 expectedShardBytes = resumeIdentity.total;
+                fullGetSpanBytes = resumeIdentity.initialSpanBytes;
               }
+              const responseEndBytes = response.status === 206 ? fullGetSpanBytes ?? expectedShardBytes : null;
+              minimumShardBytes = Math.max(minimumShardBytes, expectedShardBytes ?? 0, fullGetSpanBytes ?? 0);
               if (responseTotal > 0) {
                 knownTotalBytes = responseTotal;
                 shardTotals[shardIndex] = responseTotal;
@@ -3726,9 +3790,15 @@ var LlamaWebGpuBridgeRuntime = class {
                     abortMessage
                   }
                 );
-                if (expectedShardBytes !== null && shardBytes !== expectedShardBytes) {
+                const expectedBytes = fullGetSpanBytes !== null && shardBytes !== fullGetSpanBytes ? fullGetSpanBytes : expectedShardBytes;
+                if (expectedBytes !== null && shardBytes !== expectedBytes) {
                   throw createModelTransferLengthError(
-                    "Model response staged " + shardBytes + " bytes, expected " + expectedShardBytes + "."
+                    "Model response staged " + shardBytes + " bytes, expected " + expectedBytes + "."
+                  );
+                }
+                if (shardBytes < minimumShardBytes) {
+                  throw createModelTransferLengthError(
+                    "Model response staged " + shardBytes + " bytes, expected at least " + minimumShardBytes + "."
                   );
                 }
                 await this._settleModelCacheStore(response);
@@ -3741,10 +3811,11 @@ var LlamaWebGpuBridgeRuntime = class {
                 const loadedBytes = Number(
                   error?.llamadartLoadedBytes
                 );
+                const rangeOverrun = responseEndBytes !== null && loadedBytes > responseEndBytes;
                 if (Number.isFinite(loadedBytes) && loadedBytes >= 0) {
                   const normalizedLoaded = Math.trunc(loadedBytes);
                   this._runtimeNotes.push(`model_fs_write_loaded:${normalizedLoaded}`);
-                  if (normalizedLoaded > resumeOffset) {
+                  if (!rangeOverrun && normalizedLoaded > resumeOffset) {
                     resumeOffset = normalizedLoaded;
                     shardLoaded[shardIndex] = normalizedLoaded;
                     if (knownTotalBytes > 0 && shardTotals[shardIndex] < knownTotalBytes) {
@@ -3758,7 +3829,12 @@ var LlamaWebGpuBridgeRuntime = class {
                   error,
                   knownTotalBytes > 0 ? knownTotalBytes : resumeOffset
                 ) : null;
-                const shouldRetryResume = !stagingAllocError && isRetryableStreamNetworkError(error) && resumeOffset > 0 && resumeAttempt < maxStreamResumeRetries;
+                const retryableNetworkError = isRetryableStreamNetworkError(error);
+                if (!stagingAllocError && retryableNetworkError && rangeOverrun) {
+                  restartShard("range");
+                  continue;
+                }
+                const shouldRetryResume = !stagingAllocError && retryableNetworkError && resumeOffset > 0 && resumeAttempt < maxStreamResumeRetries;
                 if (shouldRetryResume) {
                   resumeAttempt += 1;
                   this._runtimeNotes.push(`model_stream_resume_retry:${resumeAttempt}`);
@@ -3774,7 +3850,7 @@ var LlamaWebGpuBridgeRuntime = class {
                   this._runtimeNotes.push("model_fs_write_abort");
                 } else if (text.includes("array buffer allocation failed")) {
                   this._runtimeNotes.push("model_fs_write_arraybuffer_oom");
-                } else if (isRetryableStreamNetworkError(error)) {
+                } else if (retryableNetworkError) {
                   this._runtimeNotes.push("model_fs_write_network_error");
                   this._runtimeNotes.push("model_fs_write_failed");
                 } else {
@@ -3906,30 +3982,38 @@ var LlamaWebGpuBridgeRuntime = class {
         const probePrompts = Array.isArray(options.safariProbePrompts) ? options.safariProbePrompts.map((v) => String(v || "").trim()).filter((v) => v.length > 0) : typeof options.safariProbePrompt === "string" && options.safariProbePrompt.trim().length > 0 ? [options.safariProbePrompt.trim()] : defaultProbePrompts;
         const probeTokensRaw = Number(options.safariProbeTokens);
         const probeTokens = Number.isFinite(probeTokensRaw) && probeTokensRaw > 0 ? Math.min(Math.trunc(probeTokensRaw), 96) : 48;
-        const runProbe = async (probePrompt, probeSeed) => {
+        let probesEmbedding = false;
+        if (this._isAppleSafari) {
           try {
-            const probeOutput = await this.createCompletion(probePrompt, {
-              nPredict: probeTokens,
-              temp: 0,
-              topK: 1,
-              topP: 1,
-              penalty: 1,
-              seed: probeSeed
-            });
-            return !looksLikeCorruptedGeneration(probeOutput);
+            probesEmbedding = (await this.getEmbeddingCapabilities()).text === true;
+          } catch (_) {
+          }
+        }
+        if (probesEmbedding) {
+          this._runtimeNotes.push("safari_gpu_probe_embedding");
+        }
+        const runProbe = async (seedOffset) => {
+          try {
+            if (probesEmbedding) {
+              return await this._probeSafariEmbeddings();
+            }
+            for (const [index, prompt] of probePrompts.entries()) {
+              const probeOutput = await this.createCompletion(prompt, {
+                nPredict: probeTokens,
+                temp: 0,
+                topK: 1,
+                topP: 1,
+                penalty: 1,
+                seed: index + seedOffset
+              });
+              if (looksLikeCorruptedGeneration(probeOutput)) return false;
+            }
+            return true;
           } catch (_) {
             return false;
           }
         };
-        let initialProbePassed = true;
-        for (let i = 0; i < probePrompts.length; i += 1) {
-          const ok = await runProbe(probePrompts[i], i + 1);
-          if (!ok) {
-            initialProbePassed = false;
-            break;
-          }
-        }
-        if (!initialProbePassed) {
+        if (!await runProbe(1)) {
           this._runtimeNotes.push("safari_gpu_probe_failed");
           const retryCandidates = [];
           if (this._nGpuLayers > 1) {
@@ -4017,15 +4101,7 @@ var LlamaWebGpuBridgeRuntime = class {
               stabilized = true;
               break;
             }
-            let retryProbePassed = true;
-            for (let i = 0; i < probePrompts.length; i += 1) {
-              const ok = await runProbe(probePrompts[i], i + 11);
-              if (!ok) {
-                retryProbePassed = false;
-                break;
-              }
-            }
-            if (retryProbePassed) {
+            if (await runProbe(11)) {
               this._runtimeNotes.push(`safari_gpu_layers_capped:${candidateLayers}`);
               stabilized = true;
               break;
@@ -5718,14 +5794,19 @@ var LlamaWebGpuBridgeRuntime = class {
       this._clearPendingMedia();
     }
   }
-  async embed(text, options = {}) {
-    if (Array.isArray(text)) {
-      const parts = snapshotEmbedInput(text);
-      this._abortRequested = false;
-      await this._preflightEmbeddingInputs([parts]);
-      if (this._abortRequested) throw createAbortError("Embedding was cancelled.");
-      return this._embedParts(parts, options);
-    }
+  async _probeSafariEmbeddings() {
+    const options = { normalize: true };
+    const first = await this._readTextEmbedding("The Eiffel Tower is in Paris.", options);
+    const second = await this._readTextEmbedding("WebGPU runs matrix math on the GPU.", options);
+    const finite = (vector) => vector.every(Number.isFinite);
+    if (first.length !== second.length || !finite(first) || !finite(second)) return false;
+    const firstNorm = Math.hypot(...first);
+    const secondNorm = Math.hypot(...second);
+    if (Math.abs(firstNorm - 1) >= 0.01 || Math.abs(secondNorm - 1) >= 0.01) return false;
+    const dot = first.reduce((sum, value, index) => sum + value * second[index], 0);
+    return dot / (firstNorm * secondNorm) < SAFARI_EMBEDDING_PROBE_MAX_COSINE;
+  }
+  async _readTextEmbedding(text, options) {
     if (this._modelBytes <= 0) {
       throw new Error("No model loaded. Call loadModelFromUrl first.");
     }
@@ -5745,10 +5826,21 @@ var LlamaWebGpuBridgeRuntime = class {
     }
     const raw = this._core.ccall("llamadart_webgpu_last_embedding_json", "string", [], []) || "[]";
     const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? parsed.map((v) => {
-      const numeric = Number(v);
+    return Array.isArray(parsed) ? parsed : [];
+  }
+  async embed(text, options = {}) {
+    if (Array.isArray(text)) {
+      const parts = snapshotEmbedInput(text);
+      this._abortRequested = false;
+      await this._preflightEmbeddingInputs([parts]);
+      if (this._abortRequested) throw createAbortError("Embedding was cancelled.");
+      return this._embedParts(parts, options);
+    }
+    const values = await this._readTextEmbedding(text, options);
+    return values.map((value) => {
+      const numeric = Number(value);
       return Number.isFinite(numeric) ? numeric : 0;
-    }) : [];
+    });
   }
   async embedBatch(texts, options = {}) {
     const normalized = Array.isArray(texts) ? texts : Array.from(texts || []);
