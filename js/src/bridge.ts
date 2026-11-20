@@ -981,7 +981,7 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
   }
 
   _isNonRecoverableStagingError(error: unknown) {
-    if (!error || typeof error !== 'object') {
+    if (this._config.jsBackedModelStaging !== true || !error || typeof error !== 'object') {
       return false;
     }
     return error instanceof ModelStagingError || (error as { name?: unknown }).name === 'ModelStagingError';
@@ -2319,7 +2319,6 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
           );
           return retryResult;
         } catch (retryError) {
-          this._throwIfOperationCancelled(retryError, 'Projector operation was cancelled.');
           if (this._isNonRecoverableStagingError(retryError)) {
             throw retryError;
           }

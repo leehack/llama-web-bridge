@@ -461,42 +461,53 @@ export async function writeResponseToFsFileWithProgress(
   }
 
   if (!response.body || typeof response.body.getReader !== 'function') {
-    throwIfAborted(signal, abortMessage);
-    const bytes = new Uint8Array(await response.arrayBuffer());
-    throwIfAborted(signal, abortMessage);
-    let directLoaded = 0;
-    if (directWriter) {
-      try {
-        writeDirectChunk(directWriter, bytes, startOffset, (written) => {
-          directLoaded += written;
-        });
-      } catch (error) {
-        if (error && typeof error === 'object') {
-          (error as TransferError).llamadartLoadedBytes = startOffset + directLoaded;
-          (error as TransferError).llamadartFilePath = filePath;
+    const skipReservation = directWriter != null || writeOptions.skipMemoryReservation === true;
+    const exactLength = skipReservation ? exactExpectedTransferLength(response, startOffset) : 0;
+    try {
+      throwIfAborted(signal, abortMessage);
+      const bytes = new Uint8Array(await response.arrayBuffer());
+      throwIfAborted(signal, abortMessage);
+      if (exactLength > 0 && bytes.byteLength !== exactLength) {
+        throw createModelTransferLengthError(
+          bytes.byteLength < exactLength
+            ? 'Model response ended before its declared byte length.'
+            : 'Model response exceeded its declared byte length.',
+        );
+      }
+      let directLoaded = 0;
+      if (directWriter) {
+        try {
+          writeDirectChunk(directWriter, bytes, startOffset, (written) => {
+            directLoaded += written;
+          });
+        } catch (error) {
+          if (error && typeof error === 'object') {
+            (error as TransferError).llamadartLoadedBytes = startOffset + directLoaded;
+            (error as TransferError).llamadartFilePath = filePath;
+          }
+          throw error;
         }
-        throw error;
-      } finally {
-        directWriter.close?.();
+      } else if (appendMode) {
+        const stream = fs.open(filePath, 'r+');
+        try {
+          throwIfAborted(signal, abortMessage);
+          const position = useBigIntPosition ? BigInt(startOffset) : startOffset;
+          fs.write(stream, bytes, 0, bytes.length, position);
+        } finally {
+          fs.close(stream);
+        }
+      } else {
+        fs.writeFile(filePath, bytes);
       }
-    } else if (appendMode) {
-      const stream = fs.open(filePath, 'r+');
-      try {
-        throwIfAborted(signal, abortMessage);
-        const position = useBigIntPosition ? BigInt(startOffset) : startOffset;
-        fs.write(stream, bytes, 0, bytes.length, position);
-      } finally {
-        fs.close(stream);
-      }
-    } else {
-      fs.writeFile(filePath, bytes);
-    }
 
-    const finalLoaded = startOffset + (directWriter ? directLoaded : bytes.byteLength);
-    if (typeof progressCallback === 'function') {
-      progressCallback({ loaded: finalLoaded, total: total || finalLoaded });
+      const finalLoaded = startOffset + (directWriter ? directLoaded : bytes.byteLength);
+      if (typeof progressCallback === 'function') {
+        progressCallback({ loaded: finalLoaded, total: total || finalLoaded });
+      }
+      return finalLoaded;
+    } finally {
+      directWriter?.close?.();
     }
-    return finalLoaded;
   }
 
   const skipReservation = directWriter != null || writeOptions.skipMemoryReservation === true;

@@ -478,14 +478,52 @@ test('ModelStagingError preserves class and code across worker host and proxy wi
     await bridge.dispose().catch(() => {});
   });
 
-  // Verify worker_host serializes ModelStagingError cleanly over postMessage too.
+  // Verify worker_host serializes ModelStagingError cleanly over postMessage and BridgeWorkerProxy restores it.
   const replies = [];
   const oldSelf = globalThis.self;
   globalThis.self = { postMessage: (msg) => replies.push(msg) };
   try {
     installBridgeWorkerHost();
-    await self.onmessage({ data: { type: 'init', config: { jsBackedModelStaging: true } } });
+    await self.onmessage({
+      data: {
+        type: 'init',
+        config: {
+          jsBackedModelStaging: true,
+          coreInitTimeoutMs: 50,
+          coreModuleFactory: async () => ({ FS: createStubFs(), ccall: () => 0 }),
+        },
+      },
+    });
     assert.ok(replies.some((m) => m.type === 'ready'));
+
+    await self.onmessage({
+      data: {
+        type: 'call',
+        id: 42,
+        method: 'loadModelFromUrl',
+        args: ['https://models.test/unsupported.gguf', { nCtx: 512, nGpuLayers: 0, useCache: false, forceRemoteFetchBackend: false }],
+      },
+    });
+    const hostReply = replies.find((m) => m.id === 42);
+    assert.ok(hostReply, 'worker host must post error reply');
+    assert.equal(hostReply.type, 'error');
+    assert.equal(hostReply.modelStagingErrorCode, 'MODEL_STAGING_UNSUPPORTED');
+
+    await withStubWorkerEnvironment(async ({ workers }) => {
+      const roundTripBridge = createRealWorkerBridge({ jsBackedModelStaging: true });
+      const proxy = roundTripBridge._workerProxy;
+      const driver = workerDriver(proxy, workers[0]);
+      driver.ready();
+      const call = proxy.call('loadModelFromUrl', ['https://models.test/unsupported.gguf', {}]);
+      await driver.settle();
+      const pending = driver.calls('loadModelFromUrl').at(-1);
+      proxy._worker.onmessage({ data: { ...hostReply, id: pending.id } });
+      const err = await call.then(() => assert.fail('must reject'), (e) => e);
+      assert.ok(err instanceof ModelStagingError, `Expected ModelStagingError, got ${err?.name}: ${err?.message}`);
+      assert.equal(err.code, 'MODEL_STAGING_UNSUPPORTED');
+      proxy._worker.onmessage({ data: { type: 'result', id: 0 } });
+      await roundTripBridge.dispose().catch(() => {});
+    });
   } finally {
     if (oldSelf === undefined) delete globalThis.self;
     else globalThis.self = oldSelf;
@@ -1113,5 +1151,198 @@ test('projector ENOMEM after 503 worker-replacement retry preserves ModelStaging
   assert.equal(err instanceof ModelStagingError, true, `Expected ModelStagingError, got ${err?.name}: ${err?.message}`);
   assert.equal(err.code, 'MODEL_STAGING_ALLOCATION_FAILED');
   await b.dispose();
+});
+
+test('projector mount collision preserves pre-existing /mmproj file', async () => {
+  const harness = createStagingHarness({
+    jsBackedModelStaging: true,
+    mountResult: -20,
+  });
+  harness.runtime._modelBytes = 1024;
+  harness.fs.dirs.add('/mmproj');
+  harness.fs.files.set('/mmproj/existing.gguf', 4096);
+
+  const err = await harness.runtime
+    .loadMultimodalProjector('https://models.test/existing.gguf')
+    .then(() => assert.fail('must reject mount collision'), (e) => e);
+  assert.ok(err instanceof ModelStagingError, String(err));
+  assert.equal(err.code, 'MODEL_STAGING_MOUNT_FAILED');
+  assert.equal(
+    harness.fs.files.get('/mmproj/existing.gguf'),
+    4096,
+    'failed /jsmodels mount must not delete pre-existing /mmproj file',
+  );
+});
+
+test('failed Safari GPU probe fallback unmounts and releases JS-backed staged model', async () => {
+  const harness = createStagingHarness({
+    jsBackedModelStaging: true,
+    pthreads: false,
+    onLoadModel: ({ args }) => (args[6] === 999 ? 0 : -1),
+  });
+  harness.runtime._isSafari = true;
+  harness.runtime._resolveNativeLoadOptions = (opts) => {
+    harness.runtime._nCtx = opts.nCtx;
+    harness.runtime._nGpuLayers = opts.nGpuLayers;
+  };
+  harness.runtime.createCompletion = async () => {
+    throw new Error('corrupted safari gpu output');
+  };
+
+  await assert.rejects(
+    harness.runtime.loadModelFromUrl('https://models.test/safari-fail.gguf', {
+      nCtx: 2048,
+      nGpuLayers: 999,
+      safariMaxGpuLayers: 999,
+      useCache: false,
+      forceRemoteFetchBackend: false,
+    }),
+    /Safari GPU probe failed and fallback attempts were unsuccessful/,
+  );
+  assert.equal(harness.runtime._jsBackedStagingMounted, false);
+  assert.deepEqual(harness.fs.unmountedPaths, ['/jsmodels']);
+  assert.equal(harness.openDirectHandles.size, 0);
+});
+
+test('staging off preserves main cancellation error on replacement worker projector retry and parity behaviors', async () => {
+  // 1) Cancellation during replacement-worker projector retry wraps as plain Error when staging is off.
+  let projectorAttempt = 0;
+  let b;
+  b = new LlamaWebGpuBridge({ disableWorker: true });
+  b._shouldUseWorker = () => true;
+  b._createWorkerProxy = () => {
+    const state = {
+      modelBytes: 0,
+      metadata: {},
+      contextSize: 128,
+      gpuActive: false,
+      backendName: 'WASM (CPU)',
+      supportsVision: false,
+      supportsAudio: false,
+    };
+    return {
+      dispose() {},
+      terminate() {},
+      async call(method) {
+        if (method === 'loadModelFromUrl') {
+          state.modelBytes = 1024;
+          state.metadata = { 'llamadart.webgpu.model_bytes': '1024' };
+          return { result: 1, state: { ...state } };
+        }
+        if (method === 'loadMultimodalProjector') {
+          projectorAttempt += 1;
+          if (projectorAttempt === 1) {
+            throw new Error('Bridge worker crashed');
+          }
+          b.cancel();
+          throw new Error('Projector operation was cancelled.');
+        }
+        return { result: 1, state: { ...state } };
+      },
+    };
+  };
+  b._runtime = null;
+  b._workerProxy = b._createWorkerProxy();
+  b._workerGeneration = 1;
+
+  await b.loadModelFromUrl('https://models.test/cpu.gguf', { nCtx: 128, nGpuLayers: 0 });
+  const cancelErr = await b.loadMultimodalProjector('https://models.test/mmproj.gguf')
+    .then(() => assert.fail('must reject'), (e) => e);
+  assert.equal(cancelErr.name, 'Error');
+  assert.match(cancelErr.message, /^CPU multimodal projector setup failed \(/);
+  await b.dispose();
+
+  // 2) Custom core returning -4 with staging off throws plain Error, not ModelStagingError.
+  const offHarness = createStagingHarness({
+    jsBackedModelStaging: false,
+    onLoadModel: () => -4,
+  });
+  const offErr = await offHarness.runtime.loadModelFromUrl('https://models.test/custom.gguf', {
+    nCtx: 2048,
+    nGpuLayers: 0,
+    useCache: false,
+    forceRemoteFetchBackend: false,
+  }).then(() => assert.fail('must reject -4'), (e) => e);
+  assert.equal(offErr instanceof ModelStagingError, false);
+  assert.equal(offErr.name, 'Error');
+
+  // 3) Unknown-length projector with staging off performs the exact 6 header reads.
+  const headerGets = [];
+  const offMmprojHarness = createStagingHarness({ jsBackedModelStaging: false });
+  offMmprojHarness.runtime._modelBytes = 1024;
+  offMmprojHarness.runtime._fetchWithTimeout = async () => ({
+    ok: true,
+    status: 200,
+    type: 'basic',
+    headers: {
+      get(name) {
+        headerGets.push(String(name).toLowerCase());
+        return null;
+      },
+      has() {
+        return false;
+      },
+    },
+    body: new ReadableStream({
+      start(controller) {
+        controller.enqueue(new Uint8Array([1, 2, 3, 4]));
+        controller.close();
+      },
+    }),
+  });
+  await offMmprojHarness.runtime.loadMultimodalProjector('https://models.test/unknown.gguf');
+  assert.equal(headerGets.length, 6, `expected 6 header reads matching main, got ${headerGets.length}: ${headerGets.join(', ')}`);
+});
+
+test('no-stream empty-body 1 GiB response rejects with ModelTransferLengthError before writing or loading projector', async () => {
+  const fs = createStubFs();
+  let writes = 0;
+  let closed = false;
+  await assert.rejects(
+    writeResponseToFsFileWithProgress(
+      new Response(null, {
+        status: 200,
+        headers: {
+          'content-length': String(2 ** 30),
+          'content-encoding': 'identity',
+        },
+      }),
+      fs,
+      '/jsmodels/empty.gguf',
+      null,
+      {
+        skipMemoryReservation: true,
+        directWriter: {
+          writeChunk() {
+            writes += 1;
+            return 0;
+          },
+          close() {
+            closed = true;
+          },
+        },
+      },
+    ),
+    { name: 'ModelTransferLengthError' },
+  );
+  assert.equal(writes, 0);
+  assert.equal(closed, true);
+
+  // Full projector path: empty-body 200 claiming 1 GiB must never invoke llamadart_webgpu_mmproj_load.
+  const harness = createStagingHarness({ jsBackedModelStaging: true });
+  harness.runtime._modelBytes = 1024;
+  harness.runtime._fetchWithTimeout = async () => new Response(null, {
+    status: 200,
+    headers: {
+      'content-length': String(2 ** 30),
+      'content-encoding': 'identity',
+    },
+  });
+  await assert.rejects(
+    harness.runtime.loadMultimodalProjector('https://models.test/empty-mmproj.gguf'),
+    { name: 'ModelTransferLengthError' },
+  );
+  assert.equal(harness.ccalls.some((c) => c[0] === 'llamadart_webgpu_mmproj_load'), false);
+  assert.deepEqual(harness.fs.unmountedPaths, ['/jsmodels']);
 });
 

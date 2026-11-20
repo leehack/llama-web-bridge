@@ -2262,7 +2262,8 @@ export class LlamaWebGpuBridgeRuntime {
       this._runtimeNotes.push('model_fetch_backend_skipped_split');
     }
 
-    if (!loadedViaRemoteFetch) {
+    try {
+      if (!loadedViaRemoteFetch) {
       const useJsBackedStaging = this._config.jsBackedModelStaging === true;
       let modelDir = '/models';
       if (useJsBackedStaging) {
@@ -2538,9 +2539,11 @@ export class LlamaWebGpuBridgeRuntime {
 
         if (rc !== 0) {
           const errorMessage = this._coreErrorMessage('Failed to load GGUF model', rc);
-          const combined = `${errorMessage} ${this._lastCoreErrorHint} ${this._lastCoreErrorText}`;
-          if (rc === -4 || isWasm32TensorLimitText(combined)) {
-            throw new ModelStagingError('MODEL_TENSOR_SIZE_LIMIT_EXCEEDED', errorMessage);
+          if (useJsBackedStaging) {
+            const combined = `${errorMessage} ${this._lastCoreErrorHint} ${this._lastCoreErrorText}`;
+            if (rc === -4 || isWasm32TensorLimitText(combined)) {
+              throw new ModelStagingError('MODEL_TENSOR_SIZE_LIMIT_EXCEEDED', errorMessage);
+            }
           }
           throw new Error(errorMessage);
         }
@@ -2558,7 +2561,6 @@ export class LlamaWebGpuBridgeRuntime {
         for (const modelPath of modelPaths) {
           this._deleteFsFile(modelPath);
         }
-        this._releaseJsModelStaging(core);
         throw error;
       }
     }
@@ -2751,8 +2753,11 @@ export class LlamaWebGpuBridgeRuntime {
     this._stagedMediaPaths = [];
     this._gpuActive = this._gpuActive && this._nGpuLayers > 0;
 
-    if (this._releaseModelFiles() > 0) {
-      this._runtimeNotes.push('model_file_released');
+      if (this._releaseModelFiles() > 0) {
+        this._runtimeNotes.push('model_file_released');
+      }
+    } finally {
+      this._releaseJsModelStaging(core);
     }
 
     this._emitSuppressedWarmupWarningSummaryIfNeeded();
@@ -2778,6 +2783,7 @@ export class LlamaWebGpuBridgeRuntime {
 
     for (let attempt = 0; attempt < 2; attempt += 1) {
       let mmprojPath = `/mmproj/${fileName}`;
+      let createdMmprojPath: string | null = null;
       try {
         if (useJsBackedStaging) {
           const mmprojDir = this._mountJsBackedStaging(core, 'mmproj_staging_js_backed');
@@ -2798,10 +2804,13 @@ export class LlamaWebGpuBridgeRuntime {
         }
 
         this._mmProjPath = mmprojPath;
-        const knownTotalBytes = inferResponseTotalBytes(response, 0);
-        const directWriter = useJsBackedStaging
-          ? this._openDirectJsWriter(core, this._mmProjPath, knownTotalBytes, false)
-          : null;
+        createdMmprojPath = mmprojPath;
+        let knownTotalBytes = 0;
+        let directWriter: DirectFileChunkWriter | null = null;
+        if (useJsBackedStaging) {
+          knownTotalBytes = inferResponseTotalBytes(response, 0);
+          directWriter = this._openDirectJsWriter(core, this._mmProjPath, knownTotalBytes, false);
+        }
         await writeResponseToFsFileWithProgress(
           response,
           core.FS,
@@ -2811,7 +2820,7 @@ export class LlamaWebGpuBridgeRuntime {
             useBigIntPosition: this._coreVariant === 'wasm64',
             skipMemoryReservation: useJsBackedStaging,
             directWriter,
-            totalBytes: knownTotalBytes,
+            ...(useJsBackedStaging ? { totalBytes: knownTotalBytes } : {}),
             chunkTimeoutMs,
           },
         );
@@ -2842,15 +2851,15 @@ export class LlamaWebGpuBridgeRuntime {
         if (this._deleteFsFile(mmprojPath)) {
           this._runtimeNotes.push('mmproj_file_released');
         }
-        this._releaseJsModelStaging(core);
         return 1;
       } catch (error) {
         lastError = error;
         this._mmProjPath = null;
         this._mmSupportsVision = false;
         this._mmSupportsAudio = false;
-        this._deleteFsFile(mmprojPath);
-        this._releaseJsModelStaging(core);
+        if (createdMmprojPath) {
+          this._deleteFsFile(createdMmprojPath);
+        }
 
         const stagingAllocError = useJsBackedStaging
           ? this._consumeStagingAllocFailure(core, error, 0)
@@ -2868,6 +2877,8 @@ export class LlamaWebGpuBridgeRuntime {
         }
 
         this._runtimeNotes.push(`mmproj_load_retry:${attempt + 1}`);
+      } finally {
+        this._releaseJsModelStaging(core);
       }
     }
 

@@ -114,6 +114,8 @@ public:
   }
 };
 
+bool g_has_js_model_mounts = false;
+
 std::unordered_set<std::string> & mounted_js_model_paths() {
   static auto * paths = new std::unordered_set<std::string>();
   return *paths;
@@ -146,9 +148,11 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_mount_js_model_fs(const char * mou
   if (existing_backend != nullptr) {
     if (existing_backend == reinterpret_cast<::backend_t>(backend)) {
       mounted.insert(path_str);
+      g_has_js_model_mounts = true;
       return 0;
     }
     mounted.erase(path_str);
+    g_has_js_model_mounts = !mounted.empty();
     return -EEXIST;
   }
 
@@ -161,11 +165,13 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_mount_js_model_fs(const char * mou
   }
 
   mounted.insert(path_str);
+  g_has_js_model_mounts = true;
   return 0;
 }
 
 bool llamadart_webgpu_is_js_model_path(const char * path) {
-  if (path == nullptr || std::strlen(path) == 0) {
+  // Fast zero-allocation check so staging-off builds never construct the set.
+  if (!g_has_js_model_mounts || path == nullptr || std::strlen(path) == 0) {
     return false;
   }
   const auto & mounted = mounted_js_model_paths();
@@ -199,10 +205,12 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_unmount_js_model_fs(const char * m
       }
     }
     mounted.clear();
+    g_has_js_model_mounts = false;
     return first_error;
   }
 
   mounted.erase(std::string(mount_path));
+  g_has_js_model_mounts = !mounted.empty();
   const int rc = wasmfs_unmount(mount_path);
   return rc == -ENOENT ? 0 : rc;
 }

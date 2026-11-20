@@ -397,10 +397,23 @@ inline WasmFS wasmFS;
 #include <cassert>
 #include <cerrno>
 #include <cstdint>
+#include <cstdlib>
 #include <map>
 #include <memory>
+#include <new>
 #include <string>
 #include <sys/stat.h>
+
+static size_t g_alloc_calls = 0;
+static bool g_track_allocs = false;
+void* operator new(size_t sz) {
+  if (g_track_allocs) ++g_alloc_calls;
+  void* p = std::malloc(sz);
+  if (!p) throw std::bad_alloc();
+  return p;
+}
+void operator delete(void* p) noexcept { std::free(p); }
+void operator delete(void* p, size_t) noexcept { std::free(p); }
 
 #include "backend.h"
 #include "file.h"
@@ -469,6 +482,14 @@ bool llamadart_webgpu_is_js_model_path(const char* path);
 }
 
 int main() {
+  // 0) Path predicate must make zero heap allocations when nothing is mounted.
+  g_alloc_calls = 0;
+  g_track_allocs = true;
+  assert(!llamadart_webgpu_is_js_model_path("/models/a.gguf"));
+  assert(!llamadart_webgpu_is_js_model_path("/jsmodels/a.gguf"));
+  g_track_allocs = false;
+  assert(g_alloc_calls == 0);
+
   // 1) An existing ordinary /jsmodels directory must fail mount with -EEXIST and not emit path match.
   g_dirs["/jsmodels"] = {g_mem_backend};
   assert(llamadart_webgpu_mount_js_model_fs("/jsmodels") == -EEXIST);
@@ -491,6 +512,13 @@ int main() {
     assert(llamadart_webgpu_unmount_js_model_fs("/jsmodels") == 0);
     assert(llamadart_webgpu_js_model_fs_allocated_bytes() == 0.0);
   }
+
+  // After unmount, path predicate returns to zero allocations again.
+  g_alloc_calls = 0;
+  g_track_allocs = true;
+  assert(!llamadart_webgpu_is_js_model_path("/models/a.gguf"));
+  g_track_allocs = false;
+  assert(g_alloc_calls == 0);
   return 0;
 }
 `;
