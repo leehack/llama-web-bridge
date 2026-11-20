@@ -1115,6 +1115,24 @@ var REQUIRED_JS_MODEL_STAGING_EXPORTS = [
   "_llamadart_webgpu_js_model_fs_release_mount_chunks",
   "llamadartJsModelFsWriteDirect"
 ];
+var HEAP_RESIDENT_STAGING_EXPORTS = [
+  "_llamadart_webgpu_js_model_fs_supports_heap_resident",
+  "_llamadart_webgpu_js_model_fs_open_direct_heap",
+  "_llamadart_webgpu_js_model_fs_heap_resident_bytes"
+];
+var HEAP_RESIDENT_STAGING_API_VERSION = 4;
+function supportsHeapResidentStaging(core, apiVersion) {
+  return Number.isInteger(apiVersion) && apiVersion >= HEAP_RESIDENT_STAGING_API_VERSION && HEAP_RESIDENT_STAGING_EXPORTS.every((name) => typeof core?.[name] === "function") && core?.ccall("llamadart_webgpu_js_model_fs_supports_heap_resident", "number", [], []) === 1;
+}
+function effectiveOffloadedGpuLayers(requestedGpuLayers) {
+  if (!Number.isFinite(requestedGpuLayers) || requestedGpuLayers < 0) {
+    return Infinity;
+  }
+  return Math.trunc(requestedGpuLayers);
+}
+function shouldUseHeapResidentStaging(inputs) {
+  return inputs.jsBackedStaging === true && effectiveOffloadedGpuLayers(inputs.nativeGpuLayers) <= 1 && inputs.useMmapDisabled !== true && inputs.useMlock !== true && inputs.shardCount === 1;
+}
 var ModelStagingError = class extends Error {
   constructor(code, message) {
     super(message);
@@ -1245,6 +1263,16 @@ function writeDirectChunk(directWriter, chunk, position, onBytesWritten) {
     onBytesWritten?.(written);
   }
   return offset;
+}
+function releaseChunkBuffer(chunk) {
+  const buffer = chunk.buffer;
+  if (chunk.byteOffset !== 0 || chunk.byteLength !== buffer.byteLength || typeof buffer.transfer !== "function") {
+    return;
+  }
+  try {
+    buffer.transfer(0);
+  } catch (_) {
+  }
 }
 function parseTotalFromContentRangeHeader(contentRangeHeader) {
   if (typeof contentRangeHeader !== "string" || contentRangeHeader.length === 0) {
@@ -1592,6 +1620,7 @@ async function writeResponseToFsFileWithProgress(response, fs, filePath, progres
   const total = parsePositiveInteger(writeOptions.totalBytes) || inferResponseTotalBytes(response, 0);
   const useBigIntPosition = writeOptions.useBigIntPosition === true;
   const directWriter = writeOptions.directWriter || null;
+  const releaseConsumedChunks = directWriter != null && writeOptions.releaseConsumedChunks === true;
   const startOffset = parsePositiveInteger(writeOptions.startOffset);
   const preservePartialOnError = writeOptions.preservePartialOnError === true;
   const appendMode = startOffset > 0;
@@ -1709,6 +1738,9 @@ async function writeResponseToFsFileWithProgress(response, fs, filePath, progres
           loaded += written;
           emitProgressIfNeeded();
         });
+        if (releaseConsumedChunks) {
+          releaseChunkBuffer(value);
+        }
       } else {
         const chunk = value.slice ? value.slice() : new Uint8Array(value);
         throwIfAborted(signal, abortMessage);
@@ -1781,6 +1813,9 @@ function isSafariUserAgent(userAgent) {
   const hasSafariToken = /Safari\//.test(userAgent);
   const hasOtherBrowserToken = /(Chrome|Chromium|CriOS|Edg|OPR|Firefox|FxiOS)\//.test(userAgent);
   return hasSafariToken && !hasOtherBrowserToken;
+}
+function isWebKitUserAgent(userAgent) {
+  return typeof userAgent === "string" && /AppleWebKit\//.test(userAgent) && !/(Chrome|Chromium|Edg|OPR)\//.test(userAgent);
 }
 var SAFARI_UNCAPPED_GPU_MIN_MAJOR = 27;
 var APPLE_SAFARI_PLATFORM = /^Mozilla\/5\.0 \((?:Macintosh; Intel Mac OS X \d+(?:_\d+)*|(?:iPhone|iPad|iPod touch); CPU (?:iPhone )?OS \d+(?:_\d+)* like Mac OS X)\) AppleWebKit\/\d+(?:\.\d+)* \(KHTML, like Gecko\) /;
@@ -2031,6 +2066,8 @@ var LlamaWebGpuBridgeRuntime = class {
     this._nSeqMax = 0;
     this._useMmap = false;
     this._useMlock = false;
+    this._useMmapDisabled = false;
+    this._jsModelStagingApiVersion = 0;
     this._flashAttention = -1;
     this._cacheTypeK = 1;
     this._cacheTypeV = 1;
@@ -2044,6 +2081,7 @@ var LlamaWebGpuBridgeRuntime = class {
     const userAgent = this._config.userAgent ?? globalThis.navigator?.userAgent ?? "";
     this._isSafari = isSafariUserAgent(userAgent);
     this._isAppleSafari = isAppleSafariUserAgent(userAgent);
+    this._isWebKit = isWebKitUserAgent(userAgent);
     this._safariDefaultMaxGpuLayers = safariDefaultMaxGpuLayers(userAgent);
     this._coreVariant = "uninitialized";
     this._coreRetired = false;
@@ -2530,6 +2568,7 @@ var LlamaWebGpuBridgeRuntime = class {
   _resolveNativeLoadOptions(options = {}) {
     this._nSeqMax = parsePositiveInteger(options.nSeqMax);
     this._useMmap = parseBooleanFlag(options.useMmap, false);
+    this._useMmapDisabled = !parseBooleanFlag(options.useMmap, true);
     this._useMlock = parseBooleanFlag(options.useMlock, false);
     this._flashAttention = parseEnumValue(options.flashAttention, [-1, 0, 1], -1);
     this._cacheTypeK = parseEnumValue(options.cacheTypeK, [1, 2, 8], 1);
@@ -2588,6 +2627,7 @@ var LlamaWebGpuBridgeRuntime = class {
       _nUbatch: this._nUbatch,
       _nSeqMax: this._nSeqMax,
       _useMmap: this._useMmap,
+      _useMmapDisabled: this._useMmapDisabled,
       _useMlock: this._useMlock,
       _flashAttention: this._flashAttention,
       _cacheTypeK: this._cacheTypeK,
@@ -2904,6 +2944,7 @@ var LlamaWebGpuBridgeRuntime = class {
         `JS-backed model staging requires native ABI version >= 3 (got ${apiVersion}). Update the core build or disable jsBackedModelStaging.`
       );
     }
+    this._jsModelStagingApiVersion = apiVersion;
     const mountPath = this._mountAtFreeJsStagingPath(core);
     const mountId = Number(
       core.ccall("llamadart_webgpu_js_model_fs_mount_id", "number", ["string"], [mountPath])
@@ -2974,16 +3015,38 @@ var LlamaWebGpuBridgeRuntime = class {
       return false;
     }
   }
-  _openDirectJsWriter(core, filePath, preallocBytes, append, assertMountOwned) {
+  _openDirectJsWriter(core, filePath, preallocBytes, append, assertMountOwned, heapBytes = 0) {
     assertMountOwned();
-    const directHandle = Number(
-      core.ccall(
-        "llamadart_webgpu_js_model_fs_open_direct",
-        "number",
-        ["string", "number", "number"],
-        [filePath, preallocBytes, append ? 1 : 0]
-      )
-    );
+    let heapResident = false;
+    let directHandle = 0;
+    if (heapBytes > 0 && !append) {
+      if (supportsHeapResidentStaging(core, this._jsModelStagingApiVersion)) {
+        directHandle = Number(
+          core.ccall(
+            "llamadart_webgpu_js_model_fs_open_direct_heap",
+            "number",
+            ["string", "number"],
+            [filePath, heapBytes]
+          )
+        );
+        heapResident = Number.isInteger(directHandle) && directHandle > 0;
+        if (!heapResident) {
+          this._pushRuntimeNote(`model_staging_heap_resident_unavailable:${directHandle}`);
+        }
+      } else {
+        this._pushRuntimeNote("model_staging_heap_resident_unavailable:unsupported");
+      }
+    }
+    if (!heapResident) {
+      directHandle = Number(
+        core.ccall(
+          "llamadart_webgpu_js_model_fs_open_direct",
+          "number",
+          ["string", "number", "number"],
+          [filePath, preallocBytes, append ? 1 : 0]
+        )
+      );
+    }
     if (!Number.isInteger(directHandle) || directHandle <= 0) {
       const openErr = new Error(
         `Failed to open direct JS-backed model file (rc=${directHandle}).`
@@ -3031,7 +3094,8 @@ var LlamaWebGpuBridgeRuntime = class {
         return rc;
       },
       close,
-      assertMountOwned
+      assertMountOwned,
+      heapResident
     };
   }
   _assertJsStagingMountOwned(core, mountPath, mountId) {
@@ -3815,6 +3879,13 @@ var LlamaWebGpuBridgeRuntime = class {
         } else {
           ensureFsDirectory(core.FS, "/models");
         }
+        const heapResidentStaging = shouldUseHeapResidentStaging({
+          jsBackedStaging: useJsBackedStaging,
+          nativeGpuLayers: this._nGpuLayers,
+          useMmapDisabled: this._useMmapDisabled,
+          useMlock: this._useMlock,
+          shardCount: modelUrls.length
+        });
         const progressCallback = typeof options.progressCallback === "function" ? options.progressCallback : null;
         const shardLoaded = new Array(modelUrls.length).fill(0);
         const shardTotals = new Array(modelUrls.length).fill(0);
@@ -3959,8 +4030,13 @@ var LlamaWebGpuBridgeRuntime = class {
                   modelPath,
                   resumeOffset === 0 && knownTotalBytes > 0 ? knownTotalBytes : 0,
                   resumeOffset > 0,
-                  assertMountOwned
+                  assertMountOwned,
+                  // The block cannot grow, so it needs the exact decoded size.
+                  heapResidentStaging && resumeOffset === 0 && expectedShardBytes !== null ? expectedShardBytes : 0
                 ) : null;
+                if (directWriter?.heapResident) {
+                  this._pushRuntimeNote("model_staging_heap_resident");
+                }
                 shardBytes = await writeResponseToFsFileWithProgress(
                   response,
                   core.FS,
@@ -3978,6 +4054,10 @@ var LlamaWebGpuBridgeRuntime = class {
                     useBigIntPosition: this._coreVariant === "wasm64",
                     skipMemoryReservation: useJsBackedStaging,
                     directWriter,
+                    // Detaching frees a chunk at once on WebKit, which otherwise keeps
+                    // it past the load; Chromium keeps a detached chunk longer than a
+                    // dropped one. A cache tee still reads the chunks.
+                    releaseConsumedChunks: this._isWebKit && !pendingModelCacheStores.has(response),
                     startOffset: resumeOffset,
                     preservePartialOnError: true,
                     totalBytes: knownTotalBytes,

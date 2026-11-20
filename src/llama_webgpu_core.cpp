@@ -49,6 +49,8 @@
 #include "llama_webgpu_tts.h"
 
 extern "C" bool llamadart_webgpu_is_js_model_path(const char * path);
+extern "C" bool llamadart_webgpu_is_heap_model_path(const char * path);
+extern "C" void llamadart_webgpu_release_heap_model_mappings();
 
 namespace {
 

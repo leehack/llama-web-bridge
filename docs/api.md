@@ -184,7 +184,7 @@ it.
 | `workerUrl` | `string` | URL for `llama_webgpu_bridge_worker.js`. Defaults to a sibling of the bridge module when possible. |
 | `disableWorker` | `boolean` | Force direct runtime mode. |
 | `allowSingleThreadCore` | `boolean` | Set to `true` with explicit `_st` core URLs to load on pages without cross-origin isolation. Single-thread cores use one CPU thread and report `core_single_thread`. A core that starts a pthread pool can still hit `Bridge core init timeout` if the page cannot share memory with workers. See [single-thread setup and timeout behavior](single_thread.md). |
-| `jsBackedModelStaging` | `boolean` | Opt-in (`false` by default). Use for models over ~1 GB on `wasm32`, or large models on `memory64` to cut peak wasm heap; streams models and multimodal projectors directly into 64 MiB JS `Uint8Array` chunks under a private per-operation `/jsmodels-<n>` mount (`model_staging_js_backed`, `mmproj_staging_js_backed`) and releases that mount's chunks on completion or failure, at the cost of slightly slower small loads and temporary JS heap storage. |
+| `jsBackedModelStaging` | `boolean` | Opt-in (`false` by default). Stages model and projector GGUFs in a private per-operation `/jsmodels-<n>` mount. A supported core stages a single model file of known decoded size in one memory-mapped wasm heap block when the effective GPU layer count after the Safari cap is 0 or 1. Other cases use 64 MiB JS `Uint8Array` chunks. |
 | `preferMemory64` | `boolean` | Prefer the wasm64 core when available. Defaults to `true`; the runtime can still fall back to wasm32. |
 | `workerRequestTimeoutMs` | `number` | Default timeout for worker RPC calls, 2 minutes unless a method has its own default. It also sets the `embed`/`embedBatch` budget, which defaults to 10 minutes when an input has image or audio parts. |
 | `workerInitTimeoutMs` | `number` | Timeout for worker initialization. |
@@ -200,7 +200,7 @@ it.
 | `threadPoolSize` | `number` | Hint for the compiled pthread pool size, used before the core can report it. |
 | `nBatch` | `number` | llama.cpp batch size override. |
 | `nUbatch` | `number` | llama.cpp micro-batch size override. |
-| `nGpuLayers` | `number` | Default GPU layer count. `0` forces CPU/WASM execution; negative/omitted values let the bridge choose. |
+| `nGpuLayers` | `number` | Default GPU layer count. `0` forces CPU/WASM execution. The bridge defaults to full offload when the count is omitted or negative. An effective count of `0` or `1` enables heap staging for eligible JS-backed loads. |
 | `userAgent` | `string` | User-agent override for Safari detection and the Safari GPU layer cap's version check. The version check requires an Apple platform and Safari's product tokens. |
 | `remoteFetchThresholdBytes` | `number` | Size threshold for trying the native remote-fetch backend for large single-file models. |
 | `remoteFetchChunkBytes` | `number` | Chunk size used by remote-fetch streaming paths. |
@@ -323,7 +323,8 @@ Common `options` keys:
 | `signal` | `AbortSignal` used to cancel model transfer. |
 | `nCtx` | Context size. Defaults to the bridge runtime default, initially 4096. |
 | `nThreads`, `nThreadsBatch` | Per-load thread overrides, capped to the active runtime. |
-| `nGpuLayers` | Per-load GPU layer override. Use `0` for CPU/WASM mode. |
+| `nGpuLayers` | Per-load GPU layer override. Use `0` for CPU/WASM mode. An effective count of `0` or `1` after the Safari cap selects heap staging for eligible JS-backed model loads. With the bridge default, an omitted or negative count requests full offload and uses JS chunks. |
+| `useMmap` | Pass `false` to keep eligible JS-backed model loads on JS chunks. |
 | `safariMaxGpuLayers` | Per-load Safari GPU layer cap. Recognized Safari 27 and newer default to no cap. Older or unidentified Safari versions default to one layer. |
 | `safariGpuProbe` | Set to `false` to skip the Safari load-time GPU probe. |
 | `nBatch`, `nUbatch` | Per-load batch and micro-batch overrides. |
@@ -1239,7 +1240,7 @@ include:
 | `llamadart.webgpu.core_variant` | `wasm32`, `wasm64`, or initialization state. |
 | `llamadart.webgpu.model_source` | Model load source, such as network/cache/remote fetch. |
 | `llamadart.webgpu.model_cache_state` | Cache Storage state for the loaded model. |
-| `llamadart.webgpu.runtime_notes` | Semicolon-separated bridge notes. When a memory64 core attempt fails, `core_mem64_unavailable:<reason>` accompanies `core_mem64_unavailable` and the bridge logs a warning with the same code before trying wasm32. The codes are `unsupported` (the engine rejects a memory64 feature probe after the core factory fails), `timeout` (the bridge's core initialization timer expires), and `init_error` (other failures, including module import). Single-thread cores report `core_single_thread` and `core_pthreads:0`. Automatic fetch-backed loading on a single-thread worker reports `model_fetch_backend_requires_pthreads` and streams into staging. `model_staging_js_backed` identifies JS-backed staging. Model downloads report `model_stream_resume_validated` for verified resumes, `model_stream_resume_unvalidated` for resumes without sufficient validation, and `model_stream_restart:<reason>` when a response requires restarting at zero. `gpu_unavailable:<reason>` (`no_webgpu`, `no_adapter`, `adapter_missing_shader_f16`, `unknown`) says why a load with `nGpuLayers > 0` runs on the CPU. The bridge also logs one warning. Chrome hides `shader-f16` on NVIDIA drivers older than 615.71, and ggml-webgpu then registers no device. Safari reports `safari_gpu_layers_capped:<n>` when the cap lowers the requested count, `safari_gpu_probe_embedding` when probing with embeddings, `safari_gpu_probe_passed` or `safari_gpu_probe_failed` for the initial probe, `safari_gpu_probe_skipped_input_too_long` when both embedding prompt pairs exceed the effective microbatch, and `safari_fallback_cpu` when a retry loads on the CPU. |
+| `llamadart.webgpu.runtime_notes` | Semicolon-separated bridge notes. When a memory64 core attempt fails, `core_mem64_unavailable:<reason>` accompanies `core_mem64_unavailable` and the bridge logs a warning with the same code before trying wasm32. The codes are `unsupported` (the engine rejects a memory64 feature probe after the core factory fails), `timeout` (the bridge's core initialization timer expires), and `init_error` (other failures, including module import). Single-thread cores report `core_single_thread` and `core_pthreads:0`. Automatic fetch-backed loading on a single-thread worker reports `model_fetch_backend_requires_pthreads` and streams into staging. `model_staging_js_backed` identifies JS-backed staging. `model_staging_heap_resident` identifies a staged model file backed by a wasm heap block. `model_staging_heap_resident_unavailable:<rc>` records the native error code when the bridge falls back to JS chunks. Fixed-memory or older cores without the capability report `model_staging_heap_resident_unavailable:unsupported` on an otherwise eligible load. Model downloads report `model_stream_resume_validated` for verified resumes, `model_stream_resume_unvalidated` for resumes without sufficient validation, and `model_stream_restart:<reason>` when a response requires restarting at zero. `gpu_unavailable:<reason>` (`no_webgpu`, `no_adapter`, `adapter_missing_shader_f16`, `unknown`) says why a load with `nGpuLayers > 0` runs on the CPU. The bridge also logs one warning. Chrome hides `shader-f16` on NVIDIA drivers older than 615.71, and ggml-webgpu then registers no device. Safari reports `safari_gpu_layers_capped:<n>` when the cap lowers the requested count, `safari_gpu_probe_embedding` when probing with embeddings, `safari_gpu_probe_passed` or `safari_gpu_probe_failed` for the initial probe, `safari_gpu_probe_skipped_input_too_long` when both embedding prompt pairs exceed the effective microbatch, and `safari_fallback_cpu` when a retry loads on the CPU. |
 | `llamadart.webgpu.mmproj_loaded` | `1` when a projector is loaded. |
 | `llamadart.webgpu.supports_vision` | `1` when the active projector supports vision. |
 | `llamadart.webgpu.supports_audio` | `1` when the active projector supports audio. |
@@ -1346,8 +1347,12 @@ this function themselves.
 - Use `jsBackedModelStaging: true` for models over about 1 GB on `wasm32`, or
   for any large model on `memory64` to cut the peak wasm heap (for example, when
   serving without cross-origin isolation using `WEBGPU_BRIDGE_PTHREADS=0` +
-  `allowSingleThreadCore: true`). It streams fetched model and multimodal
-  projector GGUFs directly into 64 MiB JS `Uint8Array` chunks under a private
+  `allowSingleThreadCore: true`). For single-file models with a known decoded
+  size and an effective GPU layer count of 0 or 1 after the Safari cap, a
+  supported growable core downloads into one memory-mapped wasm heap block. The block
+  remains resident for the model's lifetime. Split GGUFs, multimodal projectors,
+  `useMmap: false`, `useMlock: true`, and full or higher GPU offload use
+  64 MiB JS `Uint8Array` chunks. Both paths use a private
   per-operation `/jsmodels-<n>` mount without copying through WASMFS. The path is
   unique per core instance, including across bridges that share one through
   `coreModuleFactory` from the same bridge bundle. Later loads use a fresh path

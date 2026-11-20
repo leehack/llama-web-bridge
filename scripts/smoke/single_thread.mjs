@@ -40,6 +40,9 @@ export function parseArgs(argv) {
       { flag: '--runtime-mode', type: 'string', choices: ['direct', 'worker'], default: () => 'worker' },
       { flag: '--gpu-layers', type: 'int', default: () => 999 },
       { flag: '--js-backed-model-staging', type: 'flag', default: () => false },
+      { flag: '--heap-staging-lifecycle', type: 'flag', default: () => false },
+      { flag: '--heap-staging-reuse', type: 'flag', default: () => false },
+      { flag: '--expect-heap-fallback', type: 'string', choices: ['unsupported', 'allocation'] },
       { flag: '--timeout-ms', type: 'int', default: () => 180000 },
       { flag: '--artifacts-dir', type: 'path' },
     ],
@@ -72,6 +75,7 @@ const parseGpuOffload = ${parseGpuOffload.toString()};
 export default async (options) => {
   let memory;
   let gpuOffload = null;
+  let jsStagedBytesAtLoad = 0;
   const { instantiate, instantiateStreaming } = WebAssembly;
   const captureMemory = (load) => async (...args) => {
     const result = await load(...args);
@@ -98,8 +102,29 @@ export default async (options) => {
   if (!memory) throw new Error('single-thread core did not export its wasm memory');
 
   const channel = new BroadcastChannel(${JSON.stringify(CORE_PROBE_CHANNEL)});
+  const id = crypto.randomUUID();
   channel.onmessage = ({ data }) => {
+    if (data === 'arm load failure') {
+      core._llamadart_webgpu_test_fail_next_model_load();
+    }
+    if (data === 'heap staging' || data === 'arm load failure') {
+      channel.postMessage({
+        id,
+        bytes: core._llamadart_webgpu_js_model_fs_heap_resident_bytes(),
+        heapBytes: memory.buffer.byteLength,
+        jsStagedBytesAtLoad,
+      });
+      return;
+    }
     channel.postMessage(data === 'gpu offload' ? gpuOffload : memory.buffer.byteLength);
+  };
+  const ccall = core.ccall.bind(core);
+  core.ccall = (name, ...args) => {
+    if (name === 'llamadart_webgpu_load_model') {
+      jsStagedBytesAtLoad = core._llamadart_webgpu_js_model_fs_allocated_bytes?.();
+    }
+    if (name === 'llamadart_webgpu_shutdown') channel.close();
+    return ccall(name, ...args);
   };
   return core;
 };
@@ -126,7 +151,73 @@ self.onmessage = async ({ data: modelUrl }) => {
 `;
 }
 
-export function renderHarness({ memoryMode, runtimeMode, gpuLayers, jsBackedModelStaging }, modelBytes) {
+async function verifyHeapStagingLifecycle({
+  bridge, createBridge, modelUrl, options, readCoreProbe, modelBytes, loadNotes, reuseOnly, assert,
+}) {
+  const hasHeapNote = (notes) => notes.includes('model_staging_heap_resident');
+  assert(hasHeapNote(loadNotes), 'missing heap staging note');
+  const expectedBytes = Math.ceil(modelBytes / 65536) * 65536;
+  const first = await readCoreProbe('heap staging');
+  const checkBytes = async (phase, bytes, coreId) => {
+    const current = await readCoreProbe('heap staging');
+    assert(current.bytes === bytes, phase + ': heap-resident bytes ' + current.bytes + ', expected ' + bytes);
+    if (coreId) assert(current.id === coreId, phase + ': core was replaced');
+    return current;
+  };
+
+  assert(first.bytes === expectedBytes, 'initial load did not retain exactly one heap block');
+  assert(first.jsStagedBytesAtLoad === 0, 'initial load allocated JS staging chunks');
+  await bridge.loadModelFromUrl(modelUrl, options);
+  const second = await checkBytes('same-core replacement', expectedBytes, first.id);
+  assert(second.jsStagedBytesAtLoad === 0, 'same-core replacement allocated JS staging chunks');
+  assert(second.heapBytes === first.heapBytes, 'same-core replacement grew the wasm heap');
+  const reuse = {
+    bytes: expectedBytes,
+    sameCoreHeapBytes: second.heapBytes,
+    sameCoreJsStagedBytes: second.jsStagedBytesAtLoad,
+  };
+  const completion = (instance) => instance.createCompletion('The capital of France is', { nPredict: 12, temp: 0, seed: 1 });
+  const reloadedOutput = await completion(bridge);
+  if (reuseOnly) return { ...reuse, reloadedOutput };
+
+  await readCoreProbe('arm load failure');
+  let rejection;
+  try {
+    await bridge.loadModelFromUrl(modelUrl, options);
+  } catch (error) {
+    rejection = String(error.message);
+  }
+  assert(rejection?.includes('llama_model_load_from_file failed'), 'expected native load failure: ' + rejection);
+  await checkBytes('after failed load', 0, first.id);
+  await bridge.loadModelFromUrl(modelUrl, options);
+  await checkBytes('same-core reload after failure', expectedBytes, first.id);
+  const recoveredOutput = await completion(bridge);
+  assert(recoveredOutput === reloadedOutput, 'generation changed after failed load');
+  await bridge.dispose();
+
+  const replacement = createBridge();
+  try {
+    const { nGpuLayers, ...omitted } = options;
+    for (const loadOptions of [omitted, { ...omitted, nGpuLayers: -1 }]) {
+      await replacement.loadModelFromUrl(modelUrl, loadOptions);
+      await checkBytes('full offload', 0);
+      const notes = replacement.getModelMetadata()['llamadart.webgpu.runtime_notes'].split(';');
+      assert(!hasHeapNote(notes), 'full offload used heap staging');
+    }
+    await replacement.loadModelFromUrl(modelUrl, options);
+    await checkBytes('reload after dispose', expectedBytes);
+    const replacementOutput = await completion(replacement);
+    assert(replacementOutput === reloadedOutput, 'generation changed on reload after dispose');
+    return { ...reuse, reloadedOutput, replacementOutput };
+  } finally {
+    await replacement.dispose();
+  }
+}
+
+export function renderHarness({
+  memoryMode, runtimeMode, gpuLayers, jsBackedModelStaging, heapStagingLifecycle = false,
+  heapStagingReuse = false, expectHeapFallback = null,
+}, modelBytes, contextOptions = {}) {
   const worker = runtimeMode === 'worker';
   const coreOptions = {
     allowSingleThreadCore: true,
@@ -154,6 +245,7 @@ const assert = (condition, message) => {
   if (!condition) throw new Error(message);
 };
 const verifyGpuOffload = ${verifyGpuOffload.toString()};
+const verifyHeapStagingLifecycle = ${verifyHeapStagingLifecycle.toString()};
 const readCoreProbe = async (request) => {
   const channel = new BroadcastChannel(${JSON.stringify(CORE_PROBE_CHANNEL)});
   try {
@@ -165,15 +257,16 @@ const readCoreProbe = async (request) => {
     channel.close();
   }
 };
-const options = { nCtx: 2048, nThreads: 4, nGpuLayers: ${gpuLayers}, useCache: false };
+const options = ${JSON.stringify({ nCtx: 2048, nThreads: 4, nGpuLayers: gpuLayers, useCache: false, ...contextOptions })};
 const modelUrl = '/${MODEL_FILENAME}';
+const createBridge = () => new bridgeModule.LlamaWebGpuBridge(${JSON.stringify(coreOptions)});
 let bridge;
 let stagedBytes = 0;
 let nativeFetchGuard;
 try {
   assert(crossOriginIsolated === false, 'test page must be non-isolated');
   assert(typeof SharedArrayBuffer === 'undefined', 'test page must not expose SharedArrayBuffer');
-  bridge = new bridgeModule.LlamaWebGpuBridge(${JSON.stringify(coreOptions)});
+  bridge = createBridge();
 
   if (${worker}) {
     window.__smokeStage = 'rejecting forced fetch';
@@ -231,12 +324,21 @@ try {
   assert(loadNotes.includes('model_fetch_backend_requires_pthreads') === ${worker}, 'unexpected fetch fallback note');
   assert(metadata['llamadart.webgpu.model_source'] === 'network', 'model did not use streamed staging');
   assert(loadNotes.includes('model_staging_js_backed') === ${jsBackedModelStaging}, 'unexpected staging mode');
+  const expectedFallback = ${JSON.stringify(expectHeapFallback)};
+  if (expectedFallback) {
+    const note = 'model_staging_heap_resident_unavailable:' + (expectedFallback === 'unsupported' ? 'unsupported' : '-48');
+    assert(loadNotes.includes(note), 'missing heap staging fallback note ' + note);
+    assert(!loadNotes.includes('model_staging_heap_resident'), 'fallback retained a heap block');
+    const snapshot = await readCoreProbe('heap staging');
+    assert(snapshot.bytes === 0, 'fallback retained heap-resident bytes');
+    assert(snapshot.jsStagedBytesAtLoad >= ${modelBytes}, 'fallback did not stage the file in JS chunks');
+  }
   assert(stagedBytes === ${modelBytes} && Number(metadata['llamadart.webgpu.model_bytes']) === stagedBytes,
     'staged byte count differs from the verified model size');
 
   window.__smokeStage = 'generating';
   let usage;
-  await bridge.createCompletion('The capital of France is', {
+  const output = await bridge.createCompletion('The capital of France is', {
     nPredict: 12,
     temp: 0,
     seed: 1,
@@ -248,6 +350,15 @@ try {
   const peakWasmHeapBytes = await readCoreProbe('peak heap');
   assert(Number.isSafeInteger(peakWasmHeapBytes) && peakWasmHeapBytes > 0, 'missing wasm heap measurement');
 
+  let heapStagingLifecycle;
+  if (${heapStagingLifecycle || heapStagingReuse}) {
+    window.__smokeStage = 'checking heap staging lifecycle';
+    heapStagingLifecycle = await verifyHeapStagingLifecycle({
+      bridge, createBridge, modelUrl, options, readCoreProbe, modelBytes: ${modelBytes}, loadNotes,
+      reuseOnly: ${heapStagingReuse}, assert,
+    });
+    assert(heapStagingLifecycle.reloadedOutput === output, 'generation changed after same-core replacement');
+  }
   window.__smokeResult = {
     ok: true,
     browser: navigator.userAgent,
@@ -263,6 +374,8 @@ try {
     stagedBytes,
     peakWasmHeapBytes,
     usage,
+    output,
+    heapStagingLifecycle,
     notes,
     nativeFetchGuard,
   };
@@ -289,10 +402,20 @@ export async function main(argv = process.argv.slice(2)) {
   ensure(isDirectory(distDir), `dist directory does not exist: ${distDir}`);
   ensure(args.gpuLayers >= 0, '--gpu-layers must be non-negative');
   ensure(args.timeoutMs > 0, '--timeout-ms must be positive');
+  const heapStagingCheck = args.heapStagingLifecycle || args.heapStagingReuse;
+  if (heapStagingCheck || args.expectHeapFallback) {
+    ensure(args.jsBackedModelStaging && args.gpuLayers === 0,
+      'heap staging checks require --js-backed-model-staging and --gpu-layers 0');
+    ensure(!heapStagingCheck || !args.expectHeapFallback,
+      'heap staging and fallback checks require separate runs');
+    ensure(!args.heapStagingLifecycle || !args.heapStagingReuse,
+      'select one heap staging check');
+  }
   const model = await resolvePinnedModel(args);
   const { size } = await fsp.stat(model);
   const memory64 = args.memoryMode === 'wasm64';
-  const page = renderHarness(args, size);
+  const contextOptions = heapStagingCheck ? { nCtx: 128, nBatch: 16, nUbatch: 16 } : {};
+  const page = renderHarness(args, size, contextOptions);
   const payload = await withTempDir('single-thread-smoke-', async (webRoot) => {
     await copyBridgeArtifacts(distDir, webRoot);
     await copySingleThreadArtifacts(distDir, webRoot, { memory64 });
@@ -307,11 +430,23 @@ export async function main(argv = process.argv.slice(2)) {
     }
     await fsp.writeFile(path.join(webRoot, 'index.html'), page);
     await writeTextArtifact(artifactsDir, 'index.html', page);
-    return withServer(webRoot, (url) => runPollingPlaywright(url, args.timeoutMs, artifactsDir, {
-      artifactPrefix: ARTIFACT_PREFIX,
-      stagePrefix: ARTIFACT_PREFIX,
-      launchArgs: webGpuLaunchArgs(process.platform, { sharedArrayBuffer: false }),
-    }), { isolated: false });
+    return withServer(webRoot, async (url) => {
+      const run = (pageUrl, artifactPrefix) => runPollingPlaywright(pageUrl, args.timeoutMs, artifactsDir, {
+        artifactPrefix,
+        stagePrefix: artifactPrefix,
+        launchArgs: webGpuLaunchArgs(process.platform, { sharedArrayBuffer: false }),
+      });
+      const staged = await run(url, ARTIFACT_PREFIX);
+      if (staged.ok && args.heapStagingLifecycle) {
+        await fsp.writeFile(path.join(webRoot, 'baseline.html'), renderHarness({
+          ...args, jsBackedModelStaging: false, heapStagingLifecycle: false,
+        }, size, contextOptions));
+        const baseline = await run(new URL('/baseline.html', url).href, ARTIFACT_PREFIX + '-baseline');
+        ensure(baseline.ok, baseline.error || 'staging-off baseline failed');
+        ensure(staged.output === baseline.output, 'heap staging changed generation relative to staging off');
+      }
+      return staged;
+    }, { isolated: false });
   });
   process.stdout.write(`${JSON.stringify(payload, null, 2)}\n`);
   return payload.ok ? 0 : 1;

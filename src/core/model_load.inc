@@ -442,7 +442,13 @@ int32_t load_model_internal(
     int32_t n_rs_seq) {
   llama_model_params mparams = llama_model_default_params();
   mparams.n_gpu_layers = n_gpu_layers;
-  mparams.load_mode = resolve_load_mode(use_mmap, use_mlock);
+  const llama_load_mode requested_load_mode = resolve_load_mode(use_mmap, use_mlock);
+  mparams.load_mode = requested_load_mode;
+  // A heap-resident staged file is one aligned block; mapping it is the only
+  // way to load it without a second copy.
+  if (!use_mlock && llamadart_webgpu_is_heap_model_path(model_path)) {
+    mparams.load_mode = LLAMA_LOAD_MODE_MMAP;
+  }
   mparams.vocab_only = false;
   mparams.load_mtp = load_mtp;
   if (split_mode >= LLAMA_SPLIT_MODE_NONE &&
@@ -472,11 +478,19 @@ int32_t load_model_internal(
   }
 #endif
 
+  if (g_test_fail_next_model_load) {
+    g_test_fail_next_model_load = false;
+    // Cancels in load_all_data, after load_tensors has mapped the file.
+    mparams.progress_callback = [](float, void *) { return false; };
+  }
   g_state.model = llama_model_load_from_file(model_path, mparams);
   if (g_state.model == nullptr) {
+    // llama.cpp destroyed its model and loader, and with them every mapping.
+    llamadart_webgpu_release_heap_model_mappings();
     set_error("llama_model_load_from_file failed");
     return -2;
   }
+  mparams.progress_callback = nullptr;
 
   llama_context_params cparams = llama_context_default_params();
   if (n_ctx > 0) {
@@ -554,6 +568,8 @@ int32_t load_model_internal(
   g_state.vocab = llama_model_get_vocab(g_state.model);
   g_state.n_ctx = llama_n_ctx(g_state.ctx);
   g_model_params = mparams;
+  // Draft models reuse these params but are never heap-resident.
+  g_model_params.load_mode = requested_load_mode;
   g_context_params = cparams;
   g_model_loaded_mtp = load_mtp;
   llama_set_abort_callback(g_state.ctx, should_abort_callback, nullptr);

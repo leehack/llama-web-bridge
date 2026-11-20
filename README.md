@@ -95,10 +95,18 @@ raises `SingleThreadCoreError`. See the [single-thread measurements](docs/single
 Use `jsBackedModelStaging: true` for models over about 1 GB on `wasm32`, or for
 any large model on `memory64` to cut the peak wasm heap. When running without
 cross-origin isolation (`WEBGPU_BRIDGE_PTHREADS=0` + `allowSingleThreadCore: true`),
-it streams the model (and any `loadMultimodalProjector` GGUF) directly into 64 MiB JS `Uint8Array` chunks under a private per-operation `/jsmodels-<n>` mount
+it can stream the model (and any `loadMultimodalProjector` GGUF) directly into 64 MiB JS `Uint8Array` chunks under a private per-operation `/jsmodels-<n>` mount
 without copying through WASMFS, unmounts/releases only that mount's chunks after load or
 failure (without adopting existing mounts), and turns staging allocation, mount collision, version-skew, or 4 GiB
 tensor-limit failures into typed `ModelStagingError` errors.
+
+For a single-file GGUF with a known decoded size, JS-backed staging uses one
+memory-mapped wasm heap block when the effective `nGpuLayers` is 0 or 1 after
+the Safari cap. Split models, full offload (the default or a negative
+`nGpuLayers`), more than one effective GPU layer, older or fixed-memory cores, and
+`useMmap: false` use JS chunks. On iOS Safari below 27, pass an explicit
+`nGpuLayers`. Setting it to 0 raises the model-size ceiling by keeping model
+weights on the CPU. See the [iOS measurements](docs/single_thread.md#ios-safari).
 
 Bridges from the same bundle that share a core through `coreModuleFactory`
 use a shared sequence of staging paths. Later loads skip occupied paths and

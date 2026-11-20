@@ -32,6 +32,7 @@ export function parseArgs(argv) {
       { flag: '--baseline-dist-dir', type: 'path' },
       { flag: '--threading', type: 'string', choices: ['default', 'single'], default: () => 'default' },
       { flag: '--js-backed-model-staging', type: 'flag', default: () => false },
+      { flag: '--no-mmap', type: 'flag', default: () => false },
       { flag: '--model-path', type: 'path', default: () => env.optionalPath('LLAMA_WEBGPU_SMOKE_MODEL_PATH') },
       { flag: '--model-sha256', type: 'string', default: () => env.string('LLAMA_WEBGPU_SMOKE_MODEL_SHA256') },
       { flag: '--model-cache-dir', type: 'path', default: () => env.path('LLAMA_WEBGPU_SMOKE_MODEL_CACHE', DEFAULT_MODEL_CACHE) },
@@ -68,7 +69,7 @@ function makeRevisions(revA) {
   };
 }
 
-export function renderHarness({ threading, jsBackedModelStaging }, { modelUrl, worker, recover }) {
+export function renderHarness({ threading, jsBackedModelStaging, noMmap }, { modelUrl, worker, recover }) {
   const single = threading === 'single';
   const config = {
     disableWorker: !worker,
@@ -92,7 +93,7 @@ channel.onmessage = ({ data }) => {
 };
 const bridge = new LlamaWebGpuBridge(${JSON.stringify(config)});
 const progress = [];
-const options = { nCtx: 128, nThreads: 1, nGpuLayers: 0, useCache: false };
+const options = { nCtx: 128, nThreads: 1, nGpuLayers: 0, useCache: false${noMmap ? ', useMmap: false' : ''} };
 const result = { crossOriginIsolated, sharedArrayBuffer: typeof SharedArrayBuffer, progress, staged };
 try {
   let originalCore;
@@ -385,6 +386,9 @@ async function runCase(browser, args, revisions, name, { worker = false, parity 
 }
 
 function verifyCase(args, revisions, name, result, worker = false) {
+  if (args.noMmap) {
+    assert.ok(!result.notes?.includes('model_staging_heap_resident'), `${name}: useMmap:false staged into the heap`);
+  }
   const scenario = CASES[name];
   const single = args.threading === 'single';
   assert.equal(result.harnessError, undefined);

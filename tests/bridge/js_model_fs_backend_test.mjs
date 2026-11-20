@@ -7,6 +7,8 @@ import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import vm from 'node:vm';
 
+import { heapBlocksHarness } from './fixtures/heap_blocks.mjs';
+
 const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const jsFsSource = readFileSync(path.join(rootDir, 'src/llama_webgpu_js_model_fs.js'), 'utf8');
 const cppFsSource = readFileSync(path.join(rootDir, 'src/llama_webgpu_js_model_fs.cpp'), 'utf8');
@@ -17,6 +19,7 @@ function instantiateJsModelFsLibrary({
   wasm64 = false,
   heapWindowBase = 0,
   failingChunkAlloc = null,
+  onHeapFill = null,
 } = {}) {
   const heapBacking = new Uint8Array(4 * 1024 * 1024);
   const view = new DataView(heapBacking.buffer);
@@ -29,7 +32,7 @@ function instantiateJsModelFsLibrary({
     );
     return local;
   };
-  const HEAPU8 = heapWindowBase === 0
+  const HEAPU8 = heapWindowBase === 0 && !onHeapFill
     ? heapBacking
     : {
         subarray(start, end) {
@@ -39,10 +42,14 @@ function instantiateJsModelFsLibrary({
           heapBacking.set(src, toWindowIndex(offset));
         },
         fill(val, start, end) {
+          onHeapFill?.(val, start, end);
           heapBacking.fill(val, toWindowIndex(start), toWindowIndex(end));
         },
+        copyWithin(dst, start, end) {
+          heapBacking.copyWithin(toWindowIndex(dst), toWindowIndex(start), toWindowIndex(end));
+        },
       };
-  const cDefs = { EBADF: 8, ENOMEM: 12, EINVAL: 28 };
+  const cDefs = { EBADF: 8, EFBIG: 22, ENOMEM: 12, EINVAL: 28 };
   const heapRef = HEAPU8;
 
   const transformed = mutatedSource
@@ -141,6 +148,7 @@ function instantiateJsModelFsLibrary({
 test('js model fs backend C++ and JS signatures enforce 64-bit i53 ABI', () => {
   const { registered } = instantiateJsModelFsLibrary();
 
+  assert.equal(registered._llamadart_js_model_fs_alloc_file__sig, 'vpipp');
   assert.equal(registered._llamadart_js_model_fs_set_next_prealloc_bytes__sig, 'vj');
   assert.equal(registered._llamadart_js_model_fs_set_next_prealloc_bytes__i53abi, true);
   assert.equal(registered._llamadart_js_model_fs_write__sig, 'ippij');
@@ -326,6 +334,84 @@ test('wasm64 BigInt pointers (> 4 GiB) and i53 offsets/sizes round-trip cleanly'
   assert.equal(callNative('_llamadart_js_model_fs_allocated_bytes'), 0);
 });
 
+for (const wasm64 of [false, true]) {
+  test(`heap model file exposes only written bytes and zeroes only readable gaps (wasm${wasm64 ? 64 : 32})`, () => {
+    const heapWindowBase = wasm64 ? 2 ** 32 : 0;
+    const heapStart = 65536;
+    const capacity = 2 * heapStart;
+    const scratch = heapStart + capacity;
+    const fills = [];
+    const { callNative, writeDirect, heapBacking, view, cDefs } = instantiateJsModelFsLibrary({
+      wasm64,
+      heapWindowBase,
+      onHeapFill: (value, start, end) => fills.push([value, start - heapWindowBase, end - heapWindowBase]),
+    });
+    const call = (suffix, ...args) => callNative(`_llamadart_js_model_fs_${suffix}`, args);
+    const fileId = heapWindowBase + 7;
+    const pointer = (offset) => heapWindowBase + offset;
+    const size = () => {
+      call('get_size', fileId, pointer(scratch));
+      return Number(view.getBigInt64(scratch, true));
+    };
+    const read = (offset, len) => {
+      heapBacking.fill(0xee, scratch, scratch + len);
+      const count = call('read', fileId, pointer(scratch), len, offset);
+      assert.equal(heapBacking[scratch + count], 0xee);
+      return [...heapBacking.subarray(scratch, scratch + count)];
+    };
+
+    heapBacking.fill(0xaa, heapStart, scratch);
+    call('alloc_file', fileId, 1, pointer(heapStart), capacity);
+    const handle = call('bind_direct', fileId);
+    assert.equal(writeDirect(handle, Uint8Array.of(1, 2), 0), 2);
+    heapBacking[scratch] = 3;
+    assert.equal(call('write', fileId, pointer(scratch), 1, 2), 1);
+    assert.deepEqual([...heapBacking.subarray(heapStart, heapStart + 4)], [1, 2, 3, 0xaa]);
+    assert.deepEqual(fills, []);
+    assert.equal(size(), 3);
+
+    assert.equal(writeDirect(handle, Uint8Array.of(9), 6), 1);
+    assert.deepEqual(fills, [[0, heapStart + 3, heapStart + 6]]);
+    assert.deepEqual(read(0, 10), [1, 2, 3, 0, 0, 0, 9]);
+    assert.deepEqual(read(7, 1), []);
+    assert.equal(heapBacking[heapStart + 7], 0xaa);
+
+    assert.equal(call('set_size', fileId, 2), 0);
+    assert.deepEqual(read(0, 10), [1, 2]);
+    assert.equal(call('set_size', fileId, 8), 0);
+    assert.deepEqual(fills.at(-1), [0, heapStart + 2, heapStart + 8]);
+    assert.deepEqual(read(0, 10), [1, 2, 0, 0, 0, 0, 0, 0]);
+    assert.equal(heapBacking[heapStart + 8], 0xaa);
+
+    assert.equal(writeDirect(handle, Uint8Array.of(1), capacity), -cDefs.EFBIG);
+    assert.equal(call('write', fileId, pointer(scratch), 1, capacity), -cDefs.EFBIG);
+    assert.equal(call('set_size', fileId, capacity + 1), -cDefs.EFBIG);
+    assert.equal(size(), 8);
+    assert.equal(call('allocated_bytes'), 0);
+  });
+}
+
+test('native heap blocks stay mapped until model release and enforce mapping bounds', () => {
+  const dir = mkdtempSync(path.join(tmpdir(), 'lane257-heap-blocks-'));
+  try {
+    const fixture = path.join(dir, 'heap_blocks.cpp');
+    writeFileSync(fixture, heapBlocksHarness);
+    const exe = path.join(dir, 'heap_blocks');
+    const comp = spawnSync(process.env.CXX || 'c++', [
+      '-std=c++17', '-fsanitize=address', '-fno-omit-frame-pointer',
+      '-I', path.join(rootDir, 'src'), fixture, '-o', exe,
+    ], { encoding: 'utf8' });
+    assert.equal(comp.status, 0, comp.error?.message ?? comp.stderr);
+    const run = spawnSync(exe, [], {
+      encoding: 'utf8',
+      env: { ...process.env, ASAN_OPTIONS: 'detect_leaks=0' },
+    });
+    assert.equal(run.status, 0, `${run.signal}: ${run.stderr}`);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('C++ mount rejects ordinary /jsmodels collision and unmount releases unlinked open files to 0 bytes', () => {
   const { callNative } = instantiateJsModelFsLibrary();
   const dir = mkdtempSync(path.join(tmpdir(), 'bridge-js-model-fs-cpp-'));
@@ -407,6 +493,7 @@ inline WasmFS wasmFS;
 #include <memory>
 #include <new>
 #include <string>
+#include <sys/mman.h>
 #include <sys/stat.h>
 
 static size_t g_alloc_calls = 0;
@@ -445,7 +532,11 @@ bool g_force_unmount_busy = false;
 
 extern "C" {
 void _llamadart_js_model_fs_set_next_prealloc_bytes(int64_t b) { g_prealloc = b; }
-void _llamadart_js_model_fs_alloc_file(uintptr_t id, int32_t mount_id) {
+void * __real_mmap(void * addr, size_t len, int prot, int flags, int fd, off_t off) {
+  return ::mmap(addr, len, prot, flags, fd, off);
+}
+int __real_munmap(void * addr, size_t len) { return ::munmap(addr, len); }
+void _llamadart_js_model_fs_alloc_file(uintptr_t id, int32_t mount_id, uint8_t*, size_t) {
   g_js_chunks[id] = {g_prealloc > 0 ? static_cast<size_t>(g_prealloc) : 0, mount_id};
   g_prealloc = 0;
 }
@@ -497,6 +588,8 @@ int wasmfs_unmount(const char* path) {
   return 0;
 }
 int32_t llamadart_webgpu_js_model_fs_api_version();
+int32_t llamadart_webgpu_js_model_fs_supports_heap_resident();
+int32_t llamadart_webgpu_js_model_fs_open_direct_heap(const char*, double);
 int32_t llamadart_webgpu_js_model_fs_mount_id(const char* mount_path);
 int32_t llamadart_webgpu_mount_js_model_fs(const char* mount_path);
 int32_t llamadart_webgpu_unmount_js_model_fs(const char* mount_path);
@@ -506,7 +599,9 @@ bool llamadart_webgpu_is_js_model_path(const char* path);
 }
 
 int main() {
-  assert(llamadart_webgpu_js_model_fs_api_version() == 3);
+  assert(llamadart_webgpu_js_model_fs_api_version() == 4);
+  assert(llamadart_webgpu_js_model_fs_supports_heap_resident() == 0);
+  assert(llamadart_webgpu_js_model_fs_open_direct_heap("/jsmodels/model.gguf", 2 * 1024 * 1024) == -ENOSYS);
   // 0) Path predicate must make zero heap allocations when nothing is mounted.
   g_alloc_calls = 0;
   g_track_allocs = true;
@@ -605,6 +700,12 @@ int main() {
     const emInc = path.join(dir, 'emscripten');
     mkdirSync(emInc, { recursive: true });
     writeFileSync(path.join(emInc, 'emscripten.h'), '#pragma once\n#define EMSCRIPTEN_KEEPALIVE\n');
+    writeFileSync(path.join(emInc, 'heap.h'), `
+#pragma once
+#include <cstddef>
+inline size_t emscripten_get_heap_max() { return 32 * 1024 * 1024; }
+inline size_t emscripten_get_heap_size() { return 16 * 1024 * 1024; }
+`);
     writeFileSync(path.join(emInc, 'wasmfs.h'), `
 #pragma once
 #include <sys/stat.h>
@@ -621,23 +722,23 @@ int wasmfs_unmount(const char* path);
     const exe = path.join(dir, 'test_js_model_fs');
     const comp = spawnSync(
       process.env.CXX || 'c++',
-      ['-std=c++17', '-I', dir, cppSourcePath, harnessPath, '-o', exe],
+      ['-std=c++17', '-DLLAMADART_WEBGPU_ALLOW_MEMORY_GROWTH=0', '-I', dir, cppSourcePath, harnessPath, '-o', exe],
       { encoding: 'utf8' },
     );
     assert.equal(comp.status, 0, comp.stderr);
     const run = spawnSync(exe, [], { encoding: 'utf8' });
     assert.equal(run.status, 0, `${run.signal}: ${run.stderr}`);
 
-    // Mutation check: removing _llamadart_js_model_fs_release_mount(it->second.mount_id) from unmount must fail.
+    // Mutation check: a forgotten mount release leaks chunks from a still-open file.
     const mutatedCppPath = path.join(dir, 'mutated.cpp');
     const mutatedExe = path.join(dir, 'test_js_model_fs_mutated');
     writeFileSync(
       mutatedCppPath,
-      cppFsSource.replaceAll('  _llamadart_js_model_fs_release_mount(it->second.mount_id);\n', '  /* mutated_release_removed */\n'),
+      cppFsSource.replaceAll('  release_js_model_mount(it->second.mount_id);\n', '  /* mutated_release_removed */\n'),
     );
     const mutComp = spawnSync(
       process.env.CXX || 'c++',
-      ['-std=c++17', '-I', dir, mutatedCppPath, harnessPath, '-o', mutatedExe],
+      ['-std=c++17', '-DLLAMADART_WEBGPU_ALLOW_MEMORY_GROWTH=0', '-I', dir, '-I', path.join(rootDir, 'src'), mutatedCppPath, harnessPath, '-o', mutatedExe],
       { encoding: 'utf8' },
     );
     assert.equal(mutComp.status, 0, mutComp.stderr);

@@ -266,6 +266,16 @@ jobs:
           BRIDGE_DIST_DIR: ${{ runner.temp }}/webgpu_bridge_dist
         run: node scripts/smoke/resume_integrity.mjs --baseline-dist-dir "$BRIDGE_DIST_DIR" --threading single --js-backed-model-staging
 
+      - name: Run threaded resume integrity with JS-backed staging and mmap disabled
+        env:
+          BRIDGE_DIST_DIR: ${{ runner.temp }}/webgpu_bridge_dist
+        run: node scripts/smoke/resume_integrity.mjs --baseline-dist-dir "$BRIDGE_DIST_DIR" --js-backed-model-staging --no-mmap
+
+      - name: Run single-thread resume integrity with JS-backed staging and mmap disabled
+        env:
+          BRIDGE_DIST_DIR: ${{ runner.temp }}/webgpu_bridge_dist
+        run: node scripts/smoke/resume_integrity.mjs --baseline-dist-dir "$BRIDGE_DIST_DIR" --threading single --js-backed-model-staging --no-mmap
+
       - name: Run native abort recovery browser smoke
         env:
           BRIDGE_DIST_DIR: ${{ runner.temp }}/webgpu_bridge_dist

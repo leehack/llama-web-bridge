@@ -31,7 +31,7 @@ load reports `core_single_thread`.
   allocations and filesystem growth.
 - **JS-backed staging.** With `jsBackedModelStaging: true`, the 2.50 GB
   Qwen3-4B-Q4_K_M generated on WebGPU in both modes and used 643 MiB peak wasm
-  heap. The model file lives in JS chunks during staging. The browser's JS
+  heap. This full-offload case uses JS chunks during staging. The browser's JS
   heap and device memory still limit model size. Qwen3-8B-Q4_K_M (4.68 GiB)
   returned `MODEL_TENSOR_SIZE_LIMIT_EXCEEDED` after staging because its
   tensor payload exceeds the wasm32 4 GiB bound.
@@ -39,6 +39,23 @@ load reports `core_single_thread`.
 Use JS-backed staging for models over about 1 GB. The
 [API measurements](api.md#browser-and-asset-requirements) include staging and
 heap costs on wasm32 and memory64.
+
+## iOS Safari
+
+On iOS Safari below 27, pass an explicit `nGpuLayers`. With
+`jsBackedModelStaging: true`, set `nGpuLayers: 0` for the highest model-size
+ceiling. A positive request defaults to at most one GPU layer on Safari below
+27, which keeps GPU acceleration with a lower memory ceiling. The default
+full-offload request uses JS chunks.
+
+The memory estimates below come from Qwen3-0.6B-Q8_0 (767 MiB, `nCtx: 512`)
+and memory-headroom probes on an iPhone 17 Pro running iOS 26.5. The model
+architecture and context and batch settings affect the ceiling.
+
+| Effective GPU layers | Q8 result with heap staging | Estimated model-size ceiling |
+| --- | --- | --- |
+| 0 | Loads and generates with 448 MiB of additional JS allocations | About 1.2–1.4 GiB |
+| 1 | Loads and generates; smaller batches leave more memory for weights | About 0.8–1.1 GiB at batch size 64 |
 
 ## Local WebGPU acceptance inputs
 

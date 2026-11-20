@@ -32,6 +32,7 @@ export interface DirectFileChunkWriter {
   writeChunk(chunk: Uint8Array, position: number): number | void;
   close?: () => void;
   assertMountOwned?: () => void;
+  heapResident?: boolean;
 }
 
 export interface WriteResponseOptions {
@@ -39,6 +40,9 @@ export interface WriteResponseOptions {
   useBigIntPosition?: boolean;
   skipMemoryReservation?: boolean;
   directWriter?: DirectFileChunkWriter | null;
+  // Free each network chunk once it is copied. Only for a response nothing
+  // else reads: a cache tee shares these buffers.
+  releaseConsumedChunks?: boolean;
   startOffset?: unknown;
   preservePartialOnError?: boolean;
   chunkTimeoutMs?: unknown;
@@ -94,6 +98,24 @@ function writeDirectChunk(
     onBytesWritten?.(written);
   }
   return offset;
+}
+
+// Safari keeps consumed stream chunks alive long after they are dropped;
+// detaching returns the memory at once.
+function releaseChunkBuffer(chunk: Uint8Array): void {
+  const buffer = chunk.buffer as ArrayBuffer & { transfer?: (length: number) => ArrayBuffer };
+  if (
+    chunk.byteOffset !== 0
+    || chunk.byteLength !== buffer.byteLength
+    || typeof buffer.transfer !== 'function'
+  ) {
+    return;
+  }
+  try {
+    buffer.transfer(0);
+  } catch (_) {
+    // A shared or non-detachable buffer stays as it is.
+  }
 }
 
 function parseTotalFromContentRangeHeader(contentRangeHeader: string | null): number {
@@ -589,6 +611,7 @@ export async function writeResponseToFsFileWithProgress(
     || inferResponseTotalBytes(response, 0);
   const useBigIntPosition = writeOptions.useBigIntPosition === true;
   const directWriter = writeOptions.directWriter || null;
+  const releaseConsumedChunks = directWriter != null && writeOptions.releaseConsumedChunks === true;
   const startOffset = parsePositiveInteger(writeOptions.startOffset);
   const preservePartialOnError = writeOptions.preservePartialOnError === true;
   const appendMode = startOffset > 0;
@@ -730,6 +753,9 @@ export async function writeResponseToFsFileWithProgress(
           loaded += written;
           emitProgressIfNeeded();
         });
+        if (releaseConsumedChunks) {
+          releaseChunkBuffer(value);
+        }
       } else {
         // Some browsers may reuse the same Uint8Array backing store across reads.
         // Clone each chunk before writing to avoid transient buffer aliasing.

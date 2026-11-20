@@ -104,5 +104,8 @@ export interface LlamaCoreModule {
   _llamadart_webgpu_js_model_fs_consume_oom_bytes?: unknown;
   _llamadart_webgpu_js_model_fs_allocated_bytes?: unknown;
   _llamadart_webgpu_js_model_fs_release_mount_chunks?: unknown;
+  _llamadart_webgpu_js_model_fs_supports_heap_resident?: unknown;
+  _llamadart_webgpu_js_model_fs_open_direct_heap?: unknown;
+  _llamadart_webgpu_js_model_fs_heap_resident_bytes?: unknown;
   llamadartJsModelFsWriteDirect?: (handle: number, source: Uint8Array, offset: number) => number;
 }

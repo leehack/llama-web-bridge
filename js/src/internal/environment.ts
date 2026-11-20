@@ -10,6 +10,13 @@ export function isSafariUserAgent(userAgent: unknown): boolean {
   return hasSafariToken && !hasOtherBrowserToken;
 }
 
+// Every iOS browser runs on WebKit, whatever its product token says.
+export function isWebKitUserAgent(userAgent: unknown): boolean {
+  return typeof userAgent === 'string'
+    && /AppleWebKit\//.test(userAgent)
+    && !/(Chrome|Chromium|Edg|OPR)\//.test(userAgent);
+}
+
 // Safari 27 is the first version validated for full GPU offload.
 const SAFARI_UNCAPPED_GPU_MIN_MAJOR = 27;
 

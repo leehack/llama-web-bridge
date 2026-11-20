@@ -42,6 +42,7 @@ std::string g_last_error;
 // Test hook: bit 1 fails the snapshot copy of a state load, bit 2 its copy
 // of the current state, bit 4 the heap probe that allows both.
 int32_t g_state_load_test_failures = 0;
+bool g_test_fail_next_model_load = false;
 std::string g_last_output;
 std::string g_last_output_bytes_json = "[]";
 std::string g_last_piece;

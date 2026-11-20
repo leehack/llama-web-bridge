@@ -41,6 +41,7 @@ import {
   canPostSharedMemory,
   describeWebGpuUnavailable,
   isAppleSafariUserAgent,
+  isWebKitUserAgent,
   isMemory64Unsupported,
   isSafariUserAgent,
   safariDefaultMaxGpuLayers,
@@ -72,6 +73,8 @@ import {
   isJsAllocationError,
   isWasm32TensorLimitText,
   missingJsModelStagingExports,
+  shouldUseHeapResidentStaging,
+  supportsHeapResidentStaging,
 } from './internal/model_staging.ts';
 import { nextTokenCandidateIds, scoredTokensFrom } from './internal/next_token_scores.ts';
 import {
@@ -143,7 +146,7 @@ export type RuntimeLoadModelOptions = {
 // public option parser on a recovery reload.
 type ResolvedLoadState = Pick<LlamaWebGpuBridgeRuntime,
   | '_nCtx' | '_threads' | '_threadsBatch' | '_nBatch' | '_nUbatch'
-  | '_nSeqMax' | '_useMmap' | '_useMlock' | '_flashAttention'
+  | '_nSeqMax' | '_useMmap' | '_useMmapDisabled' | '_useMlock' | '_flashAttention'
   | '_cacheTypeK' | '_cacheTypeV' | '_kvUnified'
   | '_ropeFrequencyBase' | '_ropeFrequencyScale' | '_splitMode' | '_mainGpu'
   | '_loadMtp' | '_speculativeRollbackTokenMax'>;
@@ -250,6 +253,8 @@ export class LlamaWebGpuBridgeRuntime {
   declare _nSeqMax: number;
   declare _useMmap: boolean;
   declare _useMlock: boolean;
+  declare _useMmapDisabled: boolean;
+  declare _jsModelStagingApiVersion: number;
   declare _flashAttention: number;
   declare _cacheTypeK: number;
   declare _cacheTypeV: number;
@@ -262,6 +267,7 @@ export class LlamaWebGpuBridgeRuntime {
   declare _speculativeRollbackTokenMax: number;
   declare _isSafari: boolean;
   declare _isAppleSafari: boolean;
+  declare _isWebKit: boolean;
   declare _safariDefaultMaxGpuLayers: number;
   declare _coreVariant: string;
   declare _coreRetired: boolean;
@@ -345,6 +351,8 @@ export class LlamaWebGpuBridgeRuntime {
     this._nSeqMax = 0;
     this._useMmap = false;
     this._useMlock = false;
+    this._useMmapDisabled = false;
+    this._jsModelStagingApiVersion = 0;
     this._flashAttention = -1;
     this._cacheTypeK = 1;
     this._cacheTypeV = 1;
@@ -358,6 +366,7 @@ export class LlamaWebGpuBridgeRuntime {
     const userAgent = this._config.userAgent ?? globalThis.navigator?.userAgent ?? '';
     this._isSafari = isSafariUserAgent(userAgent);
     this._isAppleSafari = isAppleSafariUserAgent(userAgent);
+    this._isWebKit = isWebKitUserAgent(userAgent);
     this._safariDefaultMaxGpuLayers = safariDefaultMaxGpuLayers(userAgent);
     this._coreVariant = 'uninitialized';
     this._coreRetired = false;
@@ -1001,6 +1010,8 @@ export class LlamaWebGpuBridgeRuntime {
   _resolveNativeLoadOptions(options: RuntimeLoadModelOptions = {}) {
     this._nSeqMax = parsePositiveInteger(options.nSeqMax);
     this._useMmap = parseBooleanFlag(options.useMmap, false);
+    // An explicit false, unlike the default, opts out of heap-resident staging.
+    this._useMmapDisabled = !parseBooleanFlag(options.useMmap, true);
     this._useMlock = parseBooleanFlag(options.useMlock, false);
     this._flashAttention = parseEnumValue(options.flashAttention, [-1, 0, 1], -1);
     this._cacheTypeK = parseEnumValue(options.cacheTypeK, [1, 2, 8], 1);
@@ -1063,6 +1074,7 @@ export class LlamaWebGpuBridgeRuntime {
       _nUbatch: this._nUbatch,
       _nSeqMax: this._nSeqMax,
       _useMmap: this._useMmap,
+      _useMmapDisabled: this._useMmapDisabled,
       _useMlock: this._useMlock,
       _flashAttention: this._flashAttention,
       _cacheTypeK: this._cacheTypeK,
@@ -1450,6 +1462,7 @@ export class LlamaWebGpuBridgeRuntime {
         `JS-backed model staging requires native ABI version >= 3 (got ${apiVersion}). Update the core build or disable jsBackedModelStaging.`,
       );
     }
+    this._jsModelStagingApiVersion = apiVersion;
     const mountPath = this._mountAtFreeJsStagingPath(core);
     const mountId = Number(
       core.ccall('llamadart_webgpu_js_model_fs_mount_id', 'number', ['string'], [mountPath]),
@@ -1537,17 +1550,41 @@ export class LlamaWebGpuBridgeRuntime {
     preallocBytes: number,
     append: boolean,
     assertMountOwned: () => void,
+    heapBytes = 0,
   ): DirectFileChunkWriter {
     // The native open unlinks or truncates the destination synchronously.
     assertMountOwned();
-    const directHandle = Number(
-      core.ccall(
-        'llamadart_webgpu_js_model_fs_open_direct',
-        'number',
-        ['string', 'number', 'number'],
-        [filePath, preallocBytes, append ? 1 : 0],
-      ),
-    );
+    let heapResident = false;
+    let directHandle = 0;
+    if (heapBytes > 0 && !append) {
+      if (supportsHeapResidentStaging(core, this._jsModelStagingApiVersion)) {
+        directHandle = Number(
+          core.ccall(
+            'llamadart_webgpu_js_model_fs_open_direct_heap',
+            'number',
+            ['string', 'number'],
+            [filePath, heapBytes],
+          ),
+        );
+        heapResident = Number.isInteger(directHandle) && directHandle > 0;
+        if (!heapResident) {
+          // The heap cannot hold the block; JS chunks still can.
+          this._pushRuntimeNote(`model_staging_heap_resident_unavailable:${directHandle}`);
+        }
+      } else {
+        this._pushRuntimeNote('model_staging_heap_resident_unavailable:unsupported');
+      }
+    }
+    if (!heapResident) {
+      directHandle = Number(
+        core.ccall(
+          'llamadart_webgpu_js_model_fs_open_direct',
+          'number',
+          ['string', 'number', 'number'],
+          [filePath, preallocBytes, append ? 1 : 0],
+        ),
+      );
+    }
     if (!Number.isInteger(directHandle) || directHandle <= 0) {
       const openErr = new Error(
         `Failed to open direct JS-backed model file (rc=${directHandle}).`,
@@ -1597,6 +1634,7 @@ export class LlamaWebGpuBridgeRuntime {
       },
       close,
       assertMountOwned,
+      heapResident,
     };
   }
 
@@ -2569,6 +2607,13 @@ export class LlamaWebGpuBridgeRuntime {
       } else {
         ensureFsDirectory(core.FS, '/models');
       }
+      const heapResidentStaging = shouldUseHeapResidentStaging({
+        jsBackedStaging: useJsBackedStaging,
+        nativeGpuLayers: this._nGpuLayers,
+        useMmapDisabled: this._useMmapDisabled,
+        useMlock: this._useMlock,
+        shardCount: modelUrls.length,
+      });
 
       const progressCallback = typeof options.progressCallback === 'function'
         ? options.progressCallback
@@ -2735,8 +2780,15 @@ export class LlamaWebGpuBridgeRuntime {
                     resumeOffset === 0 && knownTotalBytes > 0 ? knownTotalBytes : 0,
                     resumeOffset > 0,
                     assertMountOwned,
+                    // The block cannot grow, so it needs the exact decoded size.
+                    heapResidentStaging && resumeOffset === 0 && expectedShardBytes !== null
+                      ? expectedShardBytes
+                      : 0,
                   )
                 : null;
+              if (directWriter?.heapResident) {
+                this._pushRuntimeNote('model_staging_heap_resident');
+              }
               shardBytes = await writeResponseToFsFileWithProgress(
                 response,
                 core.FS,
@@ -2756,6 +2808,10 @@ export class LlamaWebGpuBridgeRuntime {
                   useBigIntPosition: this._coreVariant === 'wasm64',
                   skipMemoryReservation: useJsBackedStaging,
                   directWriter,
+                  // Detaching frees a chunk at once on WebKit, which otherwise keeps
+                  // it past the load; Chromium keeps a detached chunk longer than a
+                  // dropped one. A cache tee still reads the chunks.
+                  releaseConsumedChunks: this._isWebKit && !pendingModelCacheStores.has(response),
                   startOffset: resumeOffset,
                   preservePartialOnError: true,
                   totalBytes: knownTotalBytes,

@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
 import { setTimeout as delay } from 'node:timers/promises';
 
-import { teeResponseForCache } from '../../js/src/internal/download.ts';
+import { teeResponseForCache, writeResponseToFsFileWithProgress } from '../../js/src/internal/download.ts';
+import * as environment from '../../js/src/internal/environment.ts';
 import { createDirectBridge } from './bridge_operation_queue_fixtures.mjs';
 
 const MODEL_URL = 'https://models.test/model.gguf';
@@ -294,6 +295,91 @@ const CASES = [
     source.push([3, 4]);
     source.close();
     assert.deepEqual([...await body], [1, 2, 3, 4]);
+  }],
+
+  ['consumed chunks detach only when enabled and only for whole buffers', async () => {
+    for (const releaseConsumedChunks of [true, false]) {
+      const whole = Uint8Array.of(1, 2);
+      const backing = Uint8Array.of(0, 3, 4, 0);
+      const subarray = backing.subarray(1, 3);
+      const response = new Response(new ReadableStream({
+        start(controller) {
+          controller.enqueue(whole);
+          controller.enqueue(subarray);
+          controller.close();
+        },
+      }), { headers: { 'content-length': '4' } });
+      const written = new Uint8Array(4);
+      const count = await writeResponseToFsFileWithProgress(response, {}, '/model.gguf', null, {
+        directWriter: {
+          writeChunk(bytes, position) {
+            written.set(bytes, position);
+            return bytes.length;
+          },
+        },
+        releaseConsumedChunks,
+      });
+      assert.equal(count, 4);
+      assert.deepEqual([...written], [1, 2, 3, 4]);
+      assert.equal(whole.byteLength, releaseConsumedChunks ? 0 : 2);
+      assert.deepEqual([...backing], [0, 3, 4, 0]);
+    }
+  }],
+
+  ['the WebKit model staging writer preserves chunks shared with the cache', async () => {
+    const { promise: holdPut, resolve: allowPut } = Promise.withResolvers();
+    const caches = installCaches({ holdPut });
+    try {
+      const chunk = Uint8Array.of(1, 2, 3, 4);
+      const source = new Response(new ReadableStream({
+        start(controller) {
+          controller.enqueue(chunk);
+          controller.close();
+        },
+      }), { headers: { 'content-length': '4' } });
+      const { runtime, core, loads } = createRuntime(() => source);
+      runtime._isWebKit = true;
+      runtime._config.jsBackedModelStaging = true;
+      runtime._mountJsBackedStaging = () => '/jsmodels';
+      runtime._assertJsStagingMountOwned = () => {};
+      const { promise: consumed, resolve: afterWrite } = Promise.withResolvers();
+      runtime._openDirectJsWriter = (_core, filePath) => {
+        const handle = core.FS.open(filePath, 'w');
+        return {
+          writeChunk(bytes, position) {
+            const count = core.FS.write(handle, bytes, 0, bytes.length, position);
+            afterWrite();
+            return count;
+          },
+        };
+      };
+      const loading = runtime.loadModelFromUrl(MODEL_URL, loadOptions());
+      loading.catch(afterWrite);
+      await consumed;
+      const chunkLength = chunk.byteLength;
+      allowPut();
+      assert.equal(await loading, 1);
+      assert.equal(chunkLength, 4);
+      assert.deepEqual([...loads[0]], [1, 2, 3, 4]);
+      assert.deepEqual([...caches.entries.get(MODEL_URL)], [1, 2, 3, 4]);
+    } finally {
+      allowPut();
+      caches.restore();
+    }
+  }],
+
+  ['WebKit detection distinguishes browsers sharing the AppleWebKit token', () => {
+    for (const [ua, expected] of [
+      ['Mozilla/5.0 (iPhone) AppleWebKit/605.1.15 CriOS/153.0 Mobile/15E148 Safari/604.1', true],
+      ['Mozilla/5.0 (iPad) AppleWebKit/605.1.15 FxiOS/150.0 Mobile/15E148 Safari/604.1', true],
+      ['Mozilla/5.0 (Macintosh) AppleWebKit/605.1.15 Version/27.0 Safari/605.1.15', true],
+      ['Mozilla/5.0 AppleWebKit/537.36 Chrome/153.0 Safari/537.36', false],
+      ['Mozilla/5.0 AppleWebKit/537.36 Chrome/153.0 Safari/537.36 Edg/153.0', false],
+      ['Mozilla/5.0 AppleWebKit/537.36 Chrome/153.0 Safari/537.36 OPR/135.0', false],
+      ['Mozilla/5.0 Gecko/20100101 Firefox/150.0', false],
+    ]) {
+      assert.equal(environment.isWebKitUserAgent(ua), expected, ua);
+    }
   }],
 
   ['a cache miss reports progress while downloading and caches the model after the load', async () => {
