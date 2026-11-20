@@ -179,6 +179,19 @@ Run the same single-thread smoke with `--memory-mode wasm64` as well. Both
 non-isolated runs check that the worker rejects a forced fetch-backend load,
 and that auto mode stages the model. CI and candidate qualification require both runs.
 
+The resume integrity smoke uses the model already downloaded by state
+persistence. Set the model URL, SHA-256 and cache directory to the same values
+as the state smoke and run:
+
+```bash
+node scripts/smoke/resume_integrity.mjs --dist-dir "$OUT_DIR" --baseline-dist-dir "$OUT_DIR"
+```
+
+Repeat with `--threading single`, `--js-backed-model-staging`, and both flags
+together. The baseline flag enables direct and worker comparisons for the
+control cases. CI passes the built dist as its own baseline. To compare two
+revisions locally, pass a separately built dist as the baseline.
+
 The shared-core staging regression uses the same pinned model and cache. Run it
 against a dist with all four cores to verify that a new bridge can load after
 an earlier bridge leaves a busy staging mount, when the application occupies

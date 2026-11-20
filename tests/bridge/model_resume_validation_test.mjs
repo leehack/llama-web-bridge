@@ -2,7 +2,11 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import * as download from '../../js/src/internal/download.ts';
-import { createDirectBridge } from './bridge_operation_queue_fixtures.mjs';
+import { LlamaWebGpuBridgeRuntime } from '../../js/src/runtime.ts';
+import { installBridgeWorkerHost } from '../../js/src/worker_host.ts';
+import {
+  createDirectBridge, createRealWorkerBridge, withStubWorkerEnvironment,
+} from './bridge_operation_queue_fixtures.mjs';
 
 const MODEL = 'https://models.test/model.gguf';
 const OTHER = 'https://models.test/other.gguf';
@@ -18,6 +22,30 @@ test('strong ETags use quoted opaque-tag syntax', () => {
   }
   for (const value of ['W/"a"', 'w/"a"', 'abc', '"a", "b"', '\u00a0"a"', '"a', '', null]) {
     assert.equal(download.strongEtagOf(value), null, String(value));
+  }
+});
+
+test('visible empty coding lists share the identity validator, while hidden and malformed lists do not', () => {
+  const { response: initial } = transfer([], { headers: { 'Content-Encoding': 'identity', ETag: '"a"' } });
+  const identity = download.captureResumeIdentity(initial, MODEL);
+  for (const [encoding, verdict] of [
+    ['', 'validated'], [', ,', 'validated'], [null, 'unvalidated'], ['identity\u00a0', 'unvalidated'],
+  ]) {
+    const headers = { 'Content-Range': RANGE, ETag: '"a"' };
+    if (encoding !== null) headers['Content-Encoding'] = encoding;
+    const { response } = transfer([], { status: 206, headers, type: 'cors' });
+    assert.equal(download.classifyResumeResponse(identity, response, MODEL, 2).verdict, verdict);
+  }
+});
+
+test('coding lists compare independent of spacing and case, preserving order', () => {
+  const { response: initial } = transfer([], { headers: { 'Content-Encoding': 'GZip, \tbr', ETag: '"a"' } });
+  const identity = download.captureResumeIdentity(initial, MODEL);
+  for (const [encoding, verdict] of [['gzip,BR', 'changed'], ['br,gzip', 'unvalidated']]) {
+    const { response } = transfer([], {
+      status: 206, headers: { 'Content-Encoding': encoding, ETag: '"b"' },
+    });
+    assert.equal(download.classifyResumeResponse(identity, response, MODEL, 2).verdict, verdict);
   }
 });
 
@@ -292,12 +320,43 @@ test('model download: a later range can extend beyond the span of an interrupted
   assert.deepEqual(requests, [fullGet, rangeGet]);
 });
 
-test('model download: rejects a short wildcard 206 answering a full GET', async (t) => {
-  const initial = transfer(A.slice(0, 3), { status: 206, headers: { 'Content-Range': 'bytes 0-3/*' } });
-  const { load, loads, requests } = runTransfer(t, [initial]);
-  await assert.rejects(load, { name: 'ModelTransferLengthError', message: /staged 3 bytes, expected 4/ });
-  assert.deepEqual(loads, []);
-  assert.deepEqual(requests, [fullGet]);
+for (const [label, encoding] of [['absent', null], ['empty', '']]) {
+  test(`model download: rejects a short full-GET wildcard 206 with ${label} Content-Encoding`, async (t) => {
+    const headers = { 'Content-Range': 'bytes 0-3/*' };
+    if (encoding !== null) headers['Content-Encoding'] = encoding;
+    const initial = transfer(A.slice(0, 3), { status: 206, headers });
+    const { load, loads, requests } = runTransfer(t, [initial]);
+    await assert.rejects(load, { name: 'ModelTransferLengthError', message: /staged 3 bytes, expected 4/ });
+    assert.deepEqual(loads, []);
+    assert.deepEqual(requests, [fullGet]);
+  });
+}
+
+test('the transfer length error survives the worker host and proxy round trip', async (t) => {
+  const message = 'Model response staged 3 bytes, expected 4.';
+  t.mock.method(LlamaWebGpuBridgeRuntime.prototype, 'loadModelFromUrl', async () => {
+    throw download.createModelTransferLengthError(message);
+  });
+  await withStubWorkerEnvironment(async ({ workers }) => {
+    const bridge = createRealWorkerBridge();
+    const [worker] = workers;
+    const host = { postMessage: (response) => worker.onmessage({ data: structuredClone(response) }) };
+    const oldSelf = globalThis.self;
+    globalThis.self = host;
+    try {
+      installBridgeWorkerHost();
+      worker.postMessage = (request) => host.onmessage({ data: structuredClone(request) });
+      await worker.postMessage(worker.posted[0]);
+      await assert.rejects(bridge.loadModelFromUrl(MODEL), {
+        name: 'ModelTransferLengthError', message,
+      });
+      assert.equal(bridge._workerProxy._worker, worker);
+    } finally {
+      await bridge.dispose();
+      if (oldSelf === undefined) delete globalThis.self;
+      else globalThis.self = oldSelf;
+    }
+  });
 });
 
 test('model download: enforces the span of a full GET 206 even if the body matches the numeric total', async (t) => {

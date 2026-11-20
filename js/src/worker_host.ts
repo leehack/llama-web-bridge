@@ -59,6 +59,8 @@ export function installBridgeWorkerHost() {
       ...(error instanceof EmbeddingError ? { embeddingErrorCode: error.code } : {}),
       ...(error instanceof CrossOriginIsolationError || error instanceof SingleThreadCoreError
         ? { errorCode: error.code } : {}),
+      ...(error instanceof Error && error.name === 'ModelTransferLengthError'
+        ? { errorCode: 'MODEL_TRANSFER_LENGTH_ERROR' } : {}),
       ...(error instanceof ModelStagingError ? { modelStagingErrorCode: error.code } : {}),
       ...(decisionErrorCode ? { decisionErrorCode } : {}),
       state,
