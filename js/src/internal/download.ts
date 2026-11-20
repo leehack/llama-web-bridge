@@ -191,15 +191,19 @@ function parseByteRange(value: string | null): { start: number; end: number; tot
 export function captureResumeIdentity(
   response: Response,
   finalUrl: string,
-): ResumeIdentity {
+): ResumeIdentity | null {
   const encoding = contentEncodingOf(response);
   const range = response.status === 206 && encoding === 'identity'
     ? parseByteRange(response.headers.get('content-range'))
     : null;
-  let total = parseByteLength(response.headers.get('x-linked-size'));
+  const rangeTotal = range?.total ?? null;
+  const linkedSize = parseByteLength(response.headers.get('x-linked-size'));
+  if (rangeTotal !== null && linkedSize !== null && rangeTotal !== linkedSize) return null;
+
+  let total = linkedSize;
   if (total === null && encoding === 'identity') {
     total = response.status === 206
-      ? range?.total ?? null
+      ? rangeTotal
       : parseByteLength(response.headers.get('content-length'));
   }
   return {

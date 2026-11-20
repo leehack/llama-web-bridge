@@ -1169,9 +1169,12 @@ function parseByteRange(value) {
 function captureResumeIdentity(response, finalUrl) {
   const encoding = contentEncodingOf(response);
   const range = response.status === 206 && encoding === "identity" ? parseByteRange(response.headers.get("content-range")) : null;
-  let total = parseByteLength(response.headers.get("x-linked-size"));
+  const rangeTotal = range?.total ?? null;
+  const linkedSize = parseByteLength(response.headers.get("x-linked-size"));
+  if (rangeTotal !== null && linkedSize !== null && rangeTotal !== linkedSize) return null;
+  let total = linkedSize;
   if (total === null && encoding === "identity") {
-    total = response.status === 206 ? range?.total ?? null : parseByteLength(response.headers.get("content-length"));
+    total = response.status === 206 ? rangeTotal : parseByteLength(response.headers.get("content-length"));
   }
   return {
     url: finalUrl,
@@ -3632,6 +3635,21 @@ var LlamaWebGpuBridgeRuntime = class {
             let knownTotalBytes = 0;
             let resumeIdentity = null;
             let minimumShardBytes = 0;
+            const restartShard = (reason) => {
+              this._runtimeNotes.push("model_stream_restart:" + reason);
+              if (resumeAttempt >= maxStreamResumeRetries) {
+                throw new Error("Model shard changed during download and the retry limit was reached.");
+              }
+              resumeAttempt += 1;
+              activeShardUrl = shardUrl;
+              resumeOffset = 0;
+              knownTotalBytes = 0;
+              resumeIdentity = null;
+              minimumShardBytes = 0;
+              shardLoaded[shardIndex] = 0;
+              shardTotals[shardIndex] = 0;
+              emitAggregateProgress();
+            };
             while (true) {
               throwIfAborted(operationSignal, abortMessage);
               const requestHeaders = resumeOffset > 0 ? { Range: `bytes=${resumeOffset}-` } : null;
@@ -3672,19 +3690,7 @@ var LlamaWebGpuBridgeRuntime = class {
                 if (resume.verdict === "changed") {
                   await response.body?.cancel().catch(() => {
                   });
-                  this._runtimeNotes.push("model_stream_restart:" + resume.reason);
-                  if (resumeAttempt >= maxStreamResumeRetries) {
-                    throw new Error("Model shard changed during download and the retry limit was reached.");
-                  }
-                  resumeAttempt += 1;
-                  activeShardUrl = shardUrl;
-                  resumeOffset = 0;
-                  knownTotalBytes = 0;
-                  resumeIdentity = null;
-                  minimumShardBytes = 0;
-                  shardLoaded[shardIndex] = 0;
-                  shardTotals[shardIndex] = 0;
-                  emitAggregateProgress();
+                  restartShard(resume.reason);
                   continue;
                 }
                 this._runtimeNotes.push("model_stream_resume_" + resume.verdict);
@@ -3707,9 +3713,15 @@ var LlamaWebGpuBridgeRuntime = class {
               let fullGetSpanBytes = null;
               if (resumeOffset === 0) {
                 resumeIdentity = captureResumeIdentity(response, responseUrl);
+                if (!resumeIdentity) {
+                  await response.body?.cancel().catch(() => {
+                  });
+                  throw createModelTransferLengthError("Model response reported conflicting Content-Range and X-Linked-Size totals.");
+                }
                 expectedShardBytes = resumeIdentity.total;
                 fullGetSpanBytes = resumeIdentity.initialSpanBytes;
               }
+              const responseEndBytes = response.status === 206 ? fullGetSpanBytes ?? expectedShardBytes : null;
               minimumShardBytes = Math.max(minimumShardBytes, expectedShardBytes ?? 0, fullGetSpanBytes ?? 0);
               if (responseTotal > 0) {
                 knownTotalBytes = responseTotal;
@@ -3772,10 +3784,11 @@ var LlamaWebGpuBridgeRuntime = class {
                 const loadedBytes = Number(
                   error?.llamadartLoadedBytes
                 );
+                const rangeOverrun = responseEndBytes !== null && loadedBytes > responseEndBytes;
                 if (Number.isFinite(loadedBytes) && loadedBytes >= 0) {
                   const normalizedLoaded = Math.trunc(loadedBytes);
                   this._runtimeNotes.push(`model_fs_write_loaded:${normalizedLoaded}`);
-                  if (normalizedLoaded > resumeOffset) {
+                  if (!rangeOverrun && normalizedLoaded > resumeOffset) {
                     resumeOffset = normalizedLoaded;
                     shardLoaded[shardIndex] = normalizedLoaded;
                     if (knownTotalBytes > 0 && shardTotals[shardIndex] < knownTotalBytes) {
@@ -3789,7 +3802,12 @@ var LlamaWebGpuBridgeRuntime = class {
                   error,
                   knownTotalBytes > 0 ? knownTotalBytes : resumeOffset
                 ) : null;
-                const shouldRetryResume = !stagingAllocError && isRetryableStreamNetworkError(error) && resumeOffset > 0 && resumeAttempt < maxStreamResumeRetries;
+                const retryableNetworkError = isRetryableStreamNetworkError(error);
+                if (!stagingAllocError && retryableNetworkError && rangeOverrun) {
+                  restartShard("range");
+                  continue;
+                }
+                const shouldRetryResume = !stagingAllocError && retryableNetworkError && resumeOffset > 0 && resumeAttempt < maxStreamResumeRetries;
                 if (shouldRetryResume) {
                   resumeAttempt += 1;
                   this._runtimeNotes.push(`model_stream_resume_retry:${resumeAttempt}`);
@@ -3805,7 +3823,7 @@ var LlamaWebGpuBridgeRuntime = class {
                   this._runtimeNotes.push("model_fs_write_abort");
                 } else if (text.includes("array buffer allocation failed")) {
                   this._runtimeNotes.push("model_fs_write_arraybuffer_oom");
-                } else if (isRetryableStreamNetworkError(error)) {
+                } else if (retryableNetworkError) {
                   this._runtimeNotes.push("model_fs_write_network_error");
                   this._runtimeNotes.push("model_fs_write_failed");
                 } else {

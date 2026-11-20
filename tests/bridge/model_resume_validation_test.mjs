@@ -316,6 +316,44 @@ test('model download: accepts a complete wildcard 206 answering a full GET', asy
   assert.deepEqual(requests, [fullGet]);
 });
 
+test('model download: restarts after an interrupted full GET 206 overruns its declared span', async (t) => {
+  const initial = tail([...A, 9], { 'Content-Range': 'bytes 0-3/*' }, { cut: true });
+  const replacement = transfer(B, { status: 206 });
+  const { load, loads, requests, notes } = runTransfer(t, [initial, replacement]);
+  await load;
+  assert.deepEqual(loads, [B]);
+  assert.deepEqual(requests, [fullGet, fullGet]);
+  assert.ok(notes().includes('model_stream_restart:range'));
+});
+
+test('model download: restarts after an interrupted resumed 206 overruns its declared span', async (t) => {
+  const initial = transfer(A.slice(0, 2), { cut: true });
+  const resumed = tail([3, 4, 9], { 'Content-Range': 'bytes 2-3/*' }, { cut: true });
+  const replacement = transfer(B, { status: 206 });
+  const { load, loads, requests, notes } = runTransfer(t, [initial, resumed, replacement]);
+  await load;
+  assert.deepEqual(loads, [B]);
+  assert.deepEqual(requests, [fullGet, rangeGet, fullGet]);
+  assert.ok(notes().includes('model_stream_restart:range'));
+});
+
+test('model download: rejects a full GET 206 with conflicting Content-Range and linked totals', async (t) => {
+  const initial = tail(A, { 'Content-Range': 'bytes 0-3/5', 'X-Linked-Size': '4' });
+  const { load, loads, requests } = runTransfer(t, [initial]);
+  await assert.rejects(load, { name: 'ModelTransferLengthError', message: /conflicting.*totals/ });
+  assert.deepEqual(loads, []);
+  assert.deepEqual(requests, [fullGet]);
+  assert.ok(initial.wasCancelled());
+});
+
+test('model download: accepts a full GET 206 with matching Content-Range and linked totals', async (t) => {
+  const initial = tail(A, { 'Content-Range': 'bytes 0-3/4', 'X-Linked-Size': '4' });
+  const { load, loads, requests } = runTransfer(t, [initial]);
+  await load;
+  assert.deepEqual(loads, [A]);
+  assert.deepEqual(requests, [fullGet]);
+});
+
 for (const exposure of ['*', 'ETag, Content-Range, Content-Encoding, Access-Control-Expose-Headers']) {
   test(`model download: restarts on different strong ETags with visible CORS encoding metadata (${exposure})`, async (t) => {
     const exposed = { 'Access-Control-Expose-Headers': exposure };

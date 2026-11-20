@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- Carry strong ETag and expected size evidence across repeated streamed GGUF interruptions, and enforce the declared span when a full GET returns an identity-encoded byte range starting at zero.
+- Carry strong ETag and expected size evidence across repeated streamed GGUF interruptions. Restart overlong interrupted ranges, and enforce the declared span and consistent totals when a full GET returns an identity-encoded byte range starting at zero.
 
 - Validate streamed GGUF resumes against the final URL, visible validators, and range metadata. Restart a shard when the response contradicts the original download and reject incorrect resumed byte counts before native load. Progress can decrease on a restart.
 
