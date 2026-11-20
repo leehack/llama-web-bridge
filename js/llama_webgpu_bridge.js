@@ -815,6 +815,10 @@ function isWasmRuntimeError(error, coreRuntimeError = null) {
   }
 }
 var guardStates = /* @__PURE__ */ new WeakMap();
+var rawCores = /* @__PURE__ */ new WeakMap();
+function unguardedCore(core) {
+  return rawCores.get(core) ?? core;
+}
 function isCoreRetired(core) {
   return !!core && typeof core === "object" && guardStates.get(core)?.retired === true;
 }
@@ -904,6 +908,7 @@ function guardCore(rawModule, onRetired) {
     }
   });
   guardStates.set(proxy, state);
+  rawCores.set(proxy, rawModule);
   return proxy;
 }
 
@@ -2904,7 +2909,8 @@ var LlamaWebGpuBridgeRuntime = class {
     return mountPath;
   }
   _mountAtFreeJsStagingPath(core) {
-    const previousMountNumber = jsStagingMountCounters.get(core) ?? 0;
+    const counterKey = unguardedCore(core);
+    const previousMountNumber = jsStagingMountCounters.get(counterKey) ?? 0;
     for (let offset = 1; offset <= MAX_JS_STAGING_PATH_PROBES; offset += 1) {
       const mountNumber = previousMountNumber + offset;
       const mountPath = `/jsmodels-${mountNumber}`;
@@ -2920,7 +2926,7 @@ var LlamaWebGpuBridgeRuntime = class {
           );
         }
       }
-      jsStagingMountCounters.set(core, mountNumber);
+      jsStagingMountCounters.set(counterKey, mountNumber);
       const mountRc = Number(
         core.ccall("llamadart_webgpu_mount_js_model_fs", "number", ["string"], [mountPath])
       );

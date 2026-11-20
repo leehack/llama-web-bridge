@@ -47,6 +47,12 @@ interface CoreRetirementStats {
 }
 
 const guardStates = new WeakMap<object, CoreGuardState>();
+const rawCores = new WeakMap<object, object>();
+
+// Per-core state must survive a second bridge guarding the same core.
+export function unguardedCore<T extends object>(core: T): T {
+  return (rawCores.get(core) as T | undefined) ?? core;
+}
 
 export function isCoreRetired(core: unknown): boolean {
   return !!core && typeof core === 'object' && guardStates.get(core)?.retired === true;
@@ -153,5 +159,6 @@ export function guardCore<T extends object>(
     },
   });
   guardStates.set(proxy, state);
+  rawCores.set(proxy, rawModule);
   return proxy;
 }

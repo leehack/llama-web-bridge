@@ -45,7 +45,7 @@ import {
   isSafariUserAgent,
   safariDefaultMaxGpuLayers,
 } from './internal/environment.ts';
-import { guardCore, isCoreRetired, retireCore } from './internal/core_guard.ts';
+import { guardCore, isCoreRetired, retireCore, unguardedCore } from './internal/core_guard.ts';
 import { CrossOriginIsolationError, SingleThreadCoreError } from './internal/isolation.ts';
 import { decodeImageBytesToRgb } from './internal/image.ts';
 import {
@@ -1473,7 +1473,8 @@ export class LlamaWebGpuBridgeRuntime {
   }
 
   _mountAtFreeJsStagingPath(core: LlamaCoreModule): string {
-    const previousMountNumber = jsStagingMountCounters.get(core) ?? 0;
+    const counterKey = unguardedCore(core);
+    const previousMountNumber = jsStagingMountCounters.get(counterKey) ?? 0;
     for (let offset = 1; offset <= MAX_JS_STAGING_PATH_PROBES; offset += 1) {
       const mountNumber = previousMountNumber + offset;
       const mountPath = `/jsmodels-${mountNumber}`;
@@ -1489,7 +1490,7 @@ export class LlamaWebGpuBridgeRuntime {
           );
         }
       }
-      jsStagingMountCounters.set(core, mountNumber);
+      jsStagingMountCounters.set(counterKey, mountNumber);
       const mountRc = Number(
         core.ccall('llamadart_webgpu_mount_js_model_fs', 'number', ['string'], [mountPath]),
       );

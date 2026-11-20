@@ -5,6 +5,7 @@ import vm from 'node:vm';
 import ts from 'typescript';
 
 import { guardCore, isCoreRetired, retireCore } from '../../js/src/internal/core_guard.ts';
+import { LlamaWebGpuBridgeRuntime } from '../../js/src/runtime.ts';
 import { EmbeddingError, ModelStagingError } from '../../js/src/llama_webgpu_bridge.js';
 
 function check(label, condition, detail = '') {
@@ -313,4 +314,23 @@ test('the runtime only adopts guarded factory results', () => {
   }
   assert.equal(factoryCalls, 1);
   assert.equal(adoptions, 1);
+});
+
+test('two guards over one core share its staging mount numbering', () => {
+  const mounted = new Set();
+  const attempts = [];
+  const core = {
+    FS: { lstat() { throw Object.assign(new Error('missing'), { errno: 44 }); } },
+    ccall(name, _type, _types, [path]) {
+      if (name !== 'llamadart_webgpu_mount_js_model_fs') return 0;
+      attempts.push(path);
+      if (mounted.has(path)) return -20;
+      mounted.add(path);
+      return 0;
+    },
+  };
+  // A native registration the filesystem cannot see: only the counter avoids a retry on it.
+  const paths = [0, 1].map(() => new LlamaWebGpuBridgeRuntime({})._mountAtFreeJsStagingPath(guardCore(core, () => {})));
+  assert.deepEqual(paths, ['/jsmodels-1', '/jsmodels-2']);
+  assert.deepEqual(attempts, paths);
 });
