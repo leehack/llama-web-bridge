@@ -66,7 +66,8 @@ for (const blocked of [false, true]) {
     const state = stubWorkerStart(t, { construct: blocked ? emitsError : emitsMessage });
     const start = await workerStartModules(`descriptor-${blocked}`);
     let used = 0;
-    const options = Object.defineProperty({}, 'mainScriptUrlOrBlob', start.pthreadScriptProperty(coreUrl, () => { used++; }));
+    const options = Object.defineProperties({}, start.pthreadScriptProperties(10_000, () => { used++; }));
+    options[Symbol.for('llamadart.pthreadScriptUrl')](coreUrl);
     assert.deepEqual(Object.assign({}, options), {});
     assert.deepEqual({ ...options }, {});
     assert.equal(state.workers.length, 0);
@@ -92,21 +93,21 @@ test('threaded factory retry is specific to the internal signal and happens once
   const state = stubWorkerStart(t, { construct: emitsMessage });
   const start = await workerStartModules('retry');
   const { withPthreadStartProbe, PthreadStartProbeRequired } = start;
-  assert.equal(await withPthreadStartProbe(coreUrl, () => 42), 42);
+  assert.equal(await withPthreadStartProbe(() => 42), 42);
   const other = new Error('factory failure');
-  await assert.rejects(withPthreadStartProbe(coreUrl, () => { throw other; }), (error) => error === other);
+  await assert.rejects(withPthreadStartProbe(() => { throw other; }), (error) => error === other);
   assert.equal(state.workers.length, 0);
   let calls = 0;
-  assert.equal(await withPthreadStartProbe(coreUrl, () => {
-    if (++calls === 1) throw new PthreadStartProbeRequired();
+  assert.equal(await withPthreadStartProbe(() => {
+    if (++calls === 1) throw new PthreadStartProbeRequired(start.probeBlobWorker(coreUrl));
     assert.equal(start.blobWorkerProbeResult(coreUrl), null);
     return 42;
   }), 42);
   assert.equal(calls, 2);
   calls = 0;
-  await assert.rejects(withPthreadStartProbe(coreUrl, () => {
+  await assert.rejects(withPthreadStartProbe(() => {
     calls++;
-    throw new PthreadStartProbeRequired();
+    throw new PthreadStartProbeRequired(start.probeBlobWorker(coreUrl));
   }), PthreadStartProbeRequired);
   assert.equal(calls, 2);
 });
@@ -206,4 +207,52 @@ test('disposing a worker that never became ready releases the CSP listener', asy
   await proxy.dispose();
   assert.equal(state.listeners.size, 0);
   assert.equal(state.workers[0].terminated, true);
+});
+
+test('a slow failed script import never grants permission to start pthreads', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const state = stubWorkerStart(t, {
+    construct(worker, count) {
+      if (count === 1) emitsMessage(worker);
+    },
+  });
+  const { probeBlobWorker, blobWorkerProbeResult } = await workerStartModules('slow-import');
+  assert.equal(await probeBlobWorker(), null);
+  const probe = probeBlobWorker(coreUrl, 10_000);
+  await Promise.resolve();
+  t.mock.timers.tick(5500);
+  await Promise.resolve();
+  assert.equal(blobWorkerProbeResult(coreUrl), undefined);
+  assert.equal(state.workers[1].terminated, false);
+  state.workers[1].onerror({});
+  t.mock.timers.tick(0);
+  assert.equal(await probe, 'script');
+  assert.equal(state.workers[1].terminated, true);
+});
+
+test('a shared pending probe respects this pthread initialization budget', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const state = stubWorkerStart(t, {
+    construct(worker, count) {
+      if (count === 1) emitsMessage(worker);
+    },
+  });
+  const start = await workerStartModules('shared-probe');
+  assert.equal(await start.probeBlobWorker(), null);
+  const longerProbe = start.probeBlobWorker(coreUrl, 20_000);
+  const options = Object.defineProperties({}, start.pthreadScriptProperties(10_000, assert.fail));
+  options[Symbol.for('llamadart.pthreadScriptUrl')](coreUrl);
+  let factoryCalls = 0;
+  const failure = assert.rejects(start.withPthreadStartProbe(() => {
+    factoryCalls++;
+    return options.mainScriptUrlOrBlob;
+  }), { name: 'BlobWorkerBlockedError', target: 'pthread', reason: 'script' });
+  await Promise.resolve();
+  t.mock.timers.tick(10_000);
+  await failure;
+  assert.equal(factoryCalls, 1);
+  assert.equal(state.workers.length, 2);
+  state.workers[1].onerror({});
+  t.mock.timers.tick(0);
+  assert.equal(await longerProbe, 'script');
 });

@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import { readFileSync } from 'node:fs';
 
 import {
   coreFileStem, coreWithoutWorkerHook, parseArgs, renderHarness, verifyScenario,
@@ -78,4 +79,33 @@ test('CSP acceptance requires a prompt typed pthread rejection', () => {
   assert.throws(() => verifyScenario('csp-threaded', 'wasm32', slow, [], 0), /did not reject promptly/);
   const untyped = { ...blocked, error: { ...blocked.error, typed: false } };
   assert.throws(() => verifyScenario('csp-threaded', 'wasm32', untyped, [], 0));
+});
+
+test('a worker response CSP reports csp in Chromium and unavailable in Firefox', () => {
+  const error = {
+    name: 'BlobWorkerBlockedError', code: 'BLOB_WORKER_BLOCKED', reason: 'csp',
+    target: 'pthread', typed: true, elapsedMs: 50,
+  };
+  const blocked = { isolated: true, sharedMemory: 'function', violations: [], error };
+  const firefox = { ...blocked, error: { ...error, reason: 'unavailable' } };
+  verifyScenario('csp-threaded-worker-response', 'wasm32', blocked, ['http://app.test/worker.js'], 0, 'chromium');
+  verifyScenario('csp-threaded-worker-response', 'wasm32', firefox, ['http://app.test/worker.js'], 0, 'firefox');
+  assert.throws(() => verifyScenario('csp-threaded-worker-response', 'wasm32', blocked, [], 0, 'firefox'));
+  assert.throws(() => verifyScenario('csp-threaded-worker-response', 'wasm32', firefox, [], 0, 'chromium'));
+  assert.equal(parseArgs(['--browser', 'firefox']).browser, 'firefox');
+  const docs = readFileSync(new URL('../../docs/api.md', import.meta.url), 'utf8');
+  assert.match(docs, /reason` is best-effort[\s\S]*Firefox reports `unavailable`/);
+  assert.match(docs, /Firefox can report a second `worker-src` violation/);
+});
+
+test('Firefox can emit a second page violation before single-thread fallback', () => {
+  const fallback = result({ single: true, direct: true, notes: ['worker_start_blocked:csp'] });
+  const violation = { directive: 'worker-src', blocked: 'blob' };
+  fallback.violations = [violation, violation];
+  fallback.metadata['llamadart.webgpu.worker_fallback_reason'] = 'worker-src blob: forbidden';
+  fallback.fallbackMs = 100;
+  verifyScenario('csp-st', 'wasm32', fallback, ['blob:http://app.test/attempt'], 1, 'firefox');
+  assert.throws(() => verifyScenario('csp-st', 'wasm32', fallback, ['http://app.test/unexpected'], 1, 'firefox'),
+    /unexpected worker during CSP rejection/);
+  assert.throws(() => verifyScenario('csp-st', 'wasm32', fallback, [], 1, 'chromium'), /CSP violations/);
 });

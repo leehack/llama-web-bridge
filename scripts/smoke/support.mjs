@@ -501,11 +501,12 @@ async function handleRequest(root, req, res, headers = ISOLATION_HEADERS) {
 
 // Serve `webRoot` on 127.0.0.1 at a free port until `close()`.
 export async function serveIsolated(webRoot, { isolated = true, extraHeaders = [], onRequest } = {}) {
-  const headers = [...(isolated ? ISOLATION_HEADERS : NON_ISOLATED_HEADERS), ...extraHeaders];
+  const headers = isolated ? ISOLATION_HEADERS : NON_ISOLATED_HEADERS;
   const root = path.resolve(webRoot);
   const server = http.createServer((req, res) => {
     onRequest?.(req);
-    handleRequest(root, req, res, headers).catch(() => res.destroy());
+    const additional = typeof extraHeaders === 'function' ? extraHeaders(req) : extraHeaders;
+    handleRequest(root, req, res, [...headers, ...additional]).catch(() => res.destroy());
   });
   await new Promise((resolve, reject) => {
     server.once('error', reject);

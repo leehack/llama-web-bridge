@@ -807,6 +807,32 @@ function decodeDecisionOutputs(bytes, count) {
   return outputs;
 }
 
+// js/src/internal/core_loader.ts
+function normalizeFactory(moduleExport) {
+  if (typeof moduleExport === "function") {
+    return moduleExport;
+  }
+  if (moduleExport && typeof moduleExport.default === "function") {
+    return moduleExport.default;
+  }
+  if (moduleExport && typeof moduleExport.createLlamaWebGpuCoreModule === "function") {
+    return moduleExport.createLlamaWebGpuCoreModule;
+  }
+  throw new Error("Unable to resolve llama_webgpu_core factory function");
+}
+async function importCoreFactory(moduleUrl) {
+  const exportedModule = await import(moduleUrl);
+  return normalizeFactory(exportedModule);
+}
+function resolveCoreModuleUrl(moduleUrl) {
+  try {
+    const resolve = import.meta.resolve;
+    return typeof resolve === "function" ? resolve.call(import.meta, moduleUrl) : new URL(moduleUrl, import.meta.url).href;
+  } catch (_) {
+    return "";
+  }
+}
+
 // js/src/internal/core_guard.ts
 var MODEL_UNLOADED_AFTER_CORE_ABORT = "MODEL_UNLOADED_AFTER_CORE_ABORT";
 var MODEL_UNLOADED_AFTER_CORE_ABORT_MESSAGE = "The native core aborted and was replaced, which unloaded the model. Call loadModelFromUrl again.";
@@ -1001,7 +1027,7 @@ function watchBlobWorkerCsp() {
     return refused;
   };
 }
-function runBlobWorkerProbe(importUrl) {
+function runBlobWorkerProbe(importUrl, timeoutMs) {
   return new Promise((resolve) => {
     const stopWatching = watchBlobWorkerCsp();
     let url;
@@ -1028,16 +1054,21 @@ function runBlobWorkerProbe(importUrl) {
     }
     worker.onmessage = () => finish(false);
     worker.onerror = () => setTimeout(() => finish(true), 0);
-    timer = setTimeout(() => finish(false), 5e3);
+    timer = setTimeout(() => finish(true), timeoutMs);
   });
 }
 var blobWorkerProbes = /* @__PURE__ */ new Map();
-function probeBlobWorker(importUrl = "") {
+function probeBlobWorker(importUrl = "", timeoutMs = 5e3) {
   const existing = blobWorkerProbes.get(importUrl);
   if (existing) return existing.ready;
+  const deadline = performance.now() + timeoutMs;
   const probe = {
     result: void 0,
-    ready: (importUrl ? probeBlobWorker().then((blocked) => blocked ?? runBlobWorkerProbe(importUrl)) : runBlobWorkerProbe("")).then((result) => {
+    ready: (importUrl ? probeBlobWorker("", timeoutMs).then((blocked) => {
+      if (blocked) return blocked;
+      const remaining = deadline - performance.now();
+      return remaining > 0 ? runBlobWorkerProbe(importUrl, remaining) : "script";
+    }) : runBlobWorkerProbe("", timeoutMs)).then((result) => {
       probe.result = result;
       return result;
     })
@@ -1051,38 +1082,62 @@ function recordBlobWorkerBlocked(reason) {
 function blobWorkerProbeResult(importUrl = "") {
   return blobWorkerProbes.get("")?.result || blobWorkerProbes.get(importUrl)?.result;
 }
+function waitForPthreadProbe(scriptUrl, timeoutMs) {
+  const probe = probeBlobWorker(scriptUrl, timeoutMs);
+  let timer;
+  return Promise.race([
+    probe,
+    new Promise((resolve) => {
+      timer = setTimeout(() => resolve(void 0), timeoutMs);
+    })
+  ]).finally(() => clearTimeout(timer));
+}
 var PthreadStartProbeRequired = class extends Error {
-  constructor() {
+  constructor(ready) {
     super("The bridge is probing blob: worker support and will start the core again.");
     this.name = "PthreadStartProbeRequired";
+    this.ready = ready;
   }
 };
-function pthreadScriptProperty(coreUrl, onUse) {
+function pthreadScriptProperties(timeoutMs, onUse) {
+  let scriptUrl = "";
   return {
-    configurable: true,
-    enumerable: false,
-    get() {
-      const blocked = blobWorkerProbeResult(coreUrl);
-      if (blocked === void 0) {
-        void probeBlobWorker(coreUrl);
-        throw new PthreadStartProbeRequired();
+    // A redirect or re-export can load the factory from a different origin
+    // than the caller's specifier. Only the core knows its worker script URL.
+    [/* @__PURE__ */ Symbol.for("llamadart.pthreadScriptUrl")]: {
+      value(url) {
+        scriptUrl = url;
       }
-      if (blocked) {
-        throw new BlobWorkerBlockedError(blocked, "pthread");
+    },
+    mainScriptUrlOrBlob: {
+      configurable: true,
+      enumerable: false,
+      get() {
+        if (!scriptUrl || !isCrossOriginScriptUrl(scriptUrl)) return void 0;
+        const blocked = blobWorkerProbeResult(scriptUrl);
+        if (blocked === void 0) {
+          throw new PthreadStartProbeRequired(waitForPthreadProbe(scriptUrl, timeoutMs));
+        }
+        if (blocked) {
+          throw new BlobWorkerBlockedError(blocked, "pthread");
+        }
+        onUse();
+        return pthreadWorkerBlobUrl(scriptUrl);
       }
-      onUse();
-      return pthreadWorkerBlobUrl(coreUrl);
     }
   };
 }
-async function withPthreadStartProbe(coreUrl, start) {
+async function withPthreadStartProbe(start) {
   try {
     return await start();
   } catch (error) {
     if (!(error instanceof PthreadStartProbeRequired)) {
       throw error;
     }
-    await probeBlobWorker(coreUrl);
+    if (await error.ready === void 0) {
+      const reason = blobWorkerProbeResult() === null ? "script" : "unavailable";
+      throw new BlobWorkerBlockedError(reason, "pthread");
+    }
     return start();
   }
 }
@@ -1288,32 +1343,6 @@ function isJsAllocationError(error) {
 function isWasm32TensorLimitText(text) {
   const normalized = text.toLowerCase();
   return normalized.includes("wasm32 4 gib") || normalized.includes("gguf_init_from_reader") && normalized.includes("size overflow");
-}
-
-// js/src/internal/core_loader.ts
-function normalizeFactory(moduleExport) {
-  if (typeof moduleExport === "function") {
-    return moduleExport;
-  }
-  if (moduleExport && typeof moduleExport.default === "function") {
-    return moduleExport.default;
-  }
-  if (moduleExport && typeof moduleExport.createLlamaWebGpuCoreModule === "function") {
-    return moduleExport.createLlamaWebGpuCoreModule;
-  }
-  throw new Error("Unable to resolve llama_webgpu_core factory function");
-}
-async function importCoreFactory(moduleUrl) {
-  const exportedModule = await import(moduleUrl);
-  return normalizeFactory(exportedModule);
-}
-function resolveCoreModuleUrl(moduleUrl) {
-  try {
-    const resolve = import.meta.resolve;
-    return typeof resolve === "function" ? resolve.call(import.meta, moduleUrl) : new URL(moduleUrl, import.meta.url).href;
-  } catch (_) {
-    return "";
-  }
 }
 
 // js/src/internal/parse.ts
@@ -3673,7 +3702,6 @@ var LlamaWebGpuBridgeRuntime = class {
       if (this._preferMemory64 && typeof this._config.coreModuleUrlMem64 === "string" && this._config.coreModuleUrlMem64.length > 0) {
         candidates.push({
           variant: "wasm64",
-          moduleUrl: this._config.coreModuleUrlMem64,
           factoryPromise: importCoreFactory(this._config.coreModuleUrlMem64),
           wasmUrl: this._config.wasmUrlMem64 || this._config.wasmUrl
         });
@@ -3681,7 +3709,6 @@ var LlamaWebGpuBridgeRuntime = class {
       const moduleUrl = this._config.coreModuleUrl ?? "./llama_webgpu_core.js";
       candidates.push({
         variant: "wasm32",
-        moduleUrl,
         factoryPromise: importCoreFactory(moduleUrl),
         wasmUrl: this._config.wasmUrl
       });
@@ -3699,12 +3726,11 @@ var LlamaWebGpuBridgeRuntime = class {
         const moduleFactory = await candidate.factoryPromise;
         factoryLoaded = true;
         const initTimeoutMs = this._resolveCoreInitTimeoutMs();
-        const absoluteCoreUrl = candidate.moduleUrl ? resolveCoreModuleUrl(candidate.moduleUrl) : "";
         let pthreadStart = "direct";
-        const pthreadScript = isCrossOriginScriptUrl(absoluteCoreUrl) ? { mainScriptUrlOrBlob: pthreadScriptProperty(absoluteCoreUrl, () => {
+        const pthreadScript = candidate.variant === "custom" ? {} : pthreadScriptProperties(initTimeoutMs, () => {
           pthreadStart = "blob";
-        }) } : {};
-        candidateCore = guardCore(await withPthreadStartProbe(absoluteCoreUrl, () => Promise.race([
+        });
+        candidateCore = guardCore(await withPthreadStartProbe(() => Promise.race([
           moduleFactory(Object.defineProperties({
             locateFile: (path, prefix) => {
               if (path.endsWith(".wasm") && candidate.wasmUrl) {
@@ -7841,6 +7867,12 @@ var LlamaWebGpuBridge = class {
   }
   _workerConfig() {
     const config = this._config || {};
+    const assetUrl = (value) => typeof value === "string" && value.length > 0 ? normalizeAbsoluteUrl(value) : void 0;
+    const coreSpecifier = (value) => {
+      if (typeof value !== "string" || value.length === 0) return void 0;
+      if (/^(?:\.{1,2}\/|\/)/.test(value)) return normalizeAbsoluteUrl(value);
+      return resolveCoreModuleUrl(value) || value;
+    };
     return {
       workerRequestTimeoutMs: config.workerRequestTimeoutMs,
       workerInitTimeoutMs: config.workerInitTimeoutMs,
@@ -7849,10 +7881,10 @@ var LlamaWebGpuBridge = class {
       workerCompletionTimeoutMs: config.workerCompletionTimeoutMs,
       workerTextToSpeechTimeoutMs: config.workerTextToSpeechTimeoutMs,
       coreInitTimeoutMs: config.coreInitTimeoutMs,
-      wasmUrl: typeof config.wasmUrl === "string" ? config.wasmUrl : void 0,
-      wasmUrlMem64: typeof config.wasmUrlMem64 === "string" ? config.wasmUrlMem64 : void 0,
-      coreModuleUrl: typeof config.coreModuleUrl === "string" ? config.coreModuleUrl : void 0,
-      coreModuleUrlMem64: typeof config.coreModuleUrlMem64 === "string" ? config.coreModuleUrlMem64 : void 0,
+      wasmUrl: assetUrl(config.wasmUrl),
+      wasmUrlMem64: assetUrl(config.wasmUrlMem64),
+      coreModuleUrl: coreSpecifier(config.coreModuleUrl),
+      coreModuleUrlMem64: coreSpecifier(config.coreModuleUrlMem64),
       preferMemory64: typeof config.preferMemory64 === "boolean" ? config.preferMemory64 : void 0,
       allowSingleThreadCore: config.allowSingleThreadCore === true ? true : void 0,
       ...config.jsBackedModelStaging === true ? { jsBackedModelStaging: true } : {},

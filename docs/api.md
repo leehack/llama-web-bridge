@@ -176,10 +176,10 @@ it.
 
 | Option | Type | Description |
 | --- | --- | --- |
-| `coreModuleUrl` | `string` | Same-origin or CDN URL for the wasm32 Emscripten JS loader, usually `llama_webgpu_core.js`. Cross-origin pthreads use module `blob:` wrappers. |
-| `coreModuleUrlMem64` | `string` | Same-origin or CDN URL for the optional wasm64 Emscripten JS loader. Cross-origin pthreads use module `blob:` wrappers. |
-| `wasmUrl` | `string` | URL for the wasm32 `llama_webgpu_core.wasm` binary. |
-| `wasmUrlMem64` | `string` | URL for the optional wasm64 wasm binary. |
+| `coreModuleUrl` | `string` | Same-origin or CDN URL for the wasm32 Emscripten JS loader, usually `llama_webgpu_core.js`. Cross-origin pthreads use module `blob:` wrappers. Worker mode resolves relative paths against the page base URL. |
+| `coreModuleUrlMem64` | `string` | Same-origin or CDN URL for the optional wasm64 Emscripten JS loader. Cross-origin pthreads use module `blob:` wrappers. Worker mode resolves relative paths against the page base URL. |
+| `wasmUrl` | `string` | URL for the wasm32 `llama_webgpu_core.wasm` binary. Worker mode resolves relative paths against the page base URL. |
+| `wasmUrlMem64` | `string` | URL for the optional wasm64 wasm binary. Worker mode resolves relative paths against the page base URL. |
 | `coreModuleFactory` | `LlamaCoreModuleFactory \| Promise<LlamaCoreModuleFactory>` | Preloaded Emscripten factory. Supplying this disables worker mode because factories cannot be transferred to the worker. It also skips the default isolation check. A core that starts a pthread pool can hit `coreInitTimeoutMs` if the page cannot share memory with workers. See [the custom core contract](#custom-core-factory). A core instance holds one loaded model. Bridges that share the same core instance must not hold models at the same time. A load on either bridge releases the model in that core. Return a separate core instance for each bridge that needs an independent model. |
 | `workerUrl` | `string` | Same-origin or CDN URL for the bridge worker entry. Cross-origin entries start from a module `blob:` wrapper. Defaults to `llama_webgpu_bridge_worker.js` next to the bridge module. |
 | `disableWorker` | `boolean` | Force direct runtime mode. |
@@ -1351,7 +1351,8 @@ this function themselves.
 - The bridge, worker script, and core JS and Wasm may use URLs on the page's
   origin or a CDN. The CDN must allow CORS and serve the assets under COEP
   `require-corp`. Cross-origin workers use module `blob:` wrappers. Cross-origin
-  pthread workers require core assets built with the `mainScriptUrlOrBlob` hook.
+  pthread workers require rebuilt core assets that report their own script URL
+  to the bridge. Redirects and re-exports use the loaded core's origin.
 - With CSP, allow `worker-src blob: <asset-origin>`,
   `script-src <asset-origin> 'wasm-unsafe-eval'`, and `connect-src` for the asset
   and model hosts, in addition to the application's own sources. If the page
@@ -1359,6 +1360,9 @@ this function themselves.
   generate a `worker-src` violation.
   Blob-worker support is probed once per realm and core URL, so reload the
   page after changing its CSP.
+  Firefox can report a second `worker-src` violation when a CDN bridge worker
+  for a single-thread core falls back under `worker-src 'self'`. The model
+  still loads on the page thread.
 - In Chromium opaque-origin frames, such as an iframe sandbox without
   `allow-same-origin`, a cross-origin single-thread worker falls back to the
   page thread. If the script is blocked after the blob starts, as with
@@ -1418,6 +1422,10 @@ cannot start. A blocked bridge worker uses `target: 'bridge_worker'`
 internally and switches to the page thread. Inspect the runtime notes for
 `worker_start_blocked:<reason>`.
 
-The `reason` is `csp` when the policy refuses the blob, `unavailable` when
-the current context cannot start a module blob worker, or `script` when the
-worker cannot import the cross-origin script, for example due to CSP or CORS.
+The `reason` is best-effort. The bridge reports `csp` when it receives a
+blocking CSP event, `unavailable` when the browser cannot start or confirm
+a generic module blob worker, and `script` when a worker cannot import or
+confirm the cross-origin script. For example, when a same-origin bridge worker
+response uses `worker-src 'self'` and blocks a nested blob pthread, Chromium
+reports `csp` while Firefox reports `unavailable` because it does not dispatch
+the CSP event to the bridge worker.

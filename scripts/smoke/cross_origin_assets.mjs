@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
 
-import { chromium } from 'playwright';
+import { chromium, firefox } from 'playwright';
 
 import {
   DEFAULT_MODEL_CACHE, copyBridgeArtifacts, copyMemory64Artifacts, copySingleThreadArtifacts,
@@ -25,16 +25,24 @@ const scenarios = {
   'isolated-threaded-direct': { direct: true },
   'csp-threaded': { csp: 'self', direct: true, blocked: 'csp', workers: 0, violations: 1 },
   'csp-threaded-worker': { csp: 'self', blocked: 'csp', workers: 0, violations: 1 },
+  'csp-threaded-worker-response': { workerResponseCsp: true, blocked: 'csp' },
   'csp-blob-only-threaded': { csp: 'blob', direct: true, blocked: 'script' },
   'csp-blob-only-threaded-worker': { csp: 'blob', blocked: 'script' },
   'same-origin': { sameOrigin: true },
   'old-core': { direct: true, oldCore: true, workers: 0 },
 };
 
+const firefoxScenarios = [
+  'plain-st-direct', 'csp-st-direct', 'plain-st', 'csp-st',
+  'isolated-threaded', 'isolated-threaded-direct',
+  'csp-threaded', 'csp-threaded-worker', 'csp-threaded-worker-response',
+  'csp-blob-only-threaded',
+];
+
 export function parseArgs(argv) {
   return parseSmokeArgs(argv, {
     prog: 'cross_origin_assets.mjs',
-    description: 'Exercise CDN-only worker and pthread startup in Chromium.',
+    description: 'Exercise CDN-only worker and pthread startup in a real browser.',
     options: [
       { flag: '--dist-dir', type: 'path', default: () => env.path('BRIDGE_DIST_DIR', 'dist') },
       { flag: '--model-path', type: 'path' },
@@ -43,6 +51,7 @@ export function parseArgs(argv) {
       { flag: '--model-cache-dir', type: 'path', default: () => env.path('LLAMA_WEBGPU_SMOKE_MODEL_CACHE', DEFAULT_MODEL_CACHE) },
       { flag: '--memory-mode', type: 'string', choices: ['wasm32', 'wasm64'], default: () => 'wasm32' },
       { flag: '--case', type: 'string', choices: Object.keys(scenarios) },
+      { flag: '--browser', type: 'string', choices: ['chromium', 'firefox'], default: () => 'chromium' },
       { flag: '--artifacts-dir', type: 'path' },
       { flag: '--timeout-ms', type: 'int', default: () => 90_000 },
     ],
@@ -56,7 +65,8 @@ export function coreFileStem(memoryMode, single) {
 export function renderHarness(name, assetOrigin, memoryMode) {
   const scenario = scenarios[name];
   const core = coreFileStem(memoryMode, scenario.single);
-  const bridgeUrl = `${assetOrigin}/llama_webgpu_bridge.js`;
+  const bridgeOrigin = scenario.workerResponseCsp ? '' : assetOrigin;
+  const bridgeUrl = `${bridgeOrigin}/llama_webgpu_bridge.js`;
   const coreUrl = `${assetOrigin}/${scenario.oldCore ? 'old/' : ''}${core}.js`;
   const wasmUrl = `${assetOrigin}/${core}.wasm`;
   return `
@@ -109,21 +119,32 @@ try {
 `;
 }
 
-export function verifyScenario(name, memoryMode, result, workers, wasmRequests) {
+export function verifyScenario(name, memoryMode, result, workers, wasmRequests, browser = 'chromium') {
   const scenario = scenarios[name];
   assert.equal(result.isolated, !scenario.single, 'page isolation');
   assert.equal(result.sharedMemory, scenario.single ? 'undefined' : 'function', 'SharedArrayBuffer');
-  if (scenario.workers !== undefined) assert.equal(workers.length, scenario.workers, 'worker count');
+  if (scenario.workers !== undefined) {
+    if (browser === 'firefox' && scenario.csp === 'self' && scenario.workers === 0) {
+      // Playwright can report a Firefox worker event for a CSP-rejected attempt.
+      assert.ok(workers.length <= result.violations.length && workers.every((url) => url.startsWith('blob:')),
+        'unexpected worker during CSP rejection');
+    } else {
+      assert.equal(workers.length, scenario.workers, 'worker count');
+    }
+  }
   if (scenario.violations !== undefined) {
-    assert.deepEqual(result.violations, Array.from({ length: scenario.violations }, () => ({
-      directive: 'worker-src', blocked: 'blob',
-    })), 'worker-src CSP violations');
+    const count = result.violations.length;
+    const firefoxDuplicate = browser === 'firefox' && name === 'csp-st' && count === 2;
+    assert.ok(count === scenario.violations || firefoxDuplicate, 'worker-src CSP violations');
+    assert.ok(result.violations.every(({ directive, blocked }) => directive === 'worker-src' && blocked === 'blob'),
+      'unexpected CSP violation');
   }
 
   if (scenario.blocked) {
     assert.equal(result.error?.name, 'BlobWorkerBlockedError', result.error?.message);
     assert.equal(result.error.code, 'BLOB_WORKER_BLOCKED');
-    assert.equal(result.error.reason, scenario.blocked);
+    const reason = scenario.workerResponseCsp && browser === 'firefox' ? 'unavailable' : scenario.blocked;
+    assert.equal(result.error.reason, reason);
     assert.equal(result.error.target, 'pthread');
     assert.equal(result.error.typed, true);
     assert.ok(result.error.elapsedMs < 2_000, 'blocked pthread startup did not reject promptly');
@@ -201,13 +222,19 @@ async function runScenario(browser, pageDir, assetOrigin, name, options, wasmReq
       const result = await page.evaluate(() => window.__crossOriginSmoke);
       const fetched = (wasmRequests.get(corePath) ?? 0) - initialRequests;
       await writeJsonArtifact(options.artifactsDir, `${name}.json`, { ...result, workers, wasmRequests: fetched, console });
-      verifyScenario(name, options.memoryMode, result, workers, fetched);
+      verifyScenario(name, options.memoryMode, result, workers, fetched, options.browser);
     } catch (error) {
       throw new Error(`${name}: ${error.message}\n${console.slice(-20).join('\n')}`, { cause: error });
     } finally {
       await page.close();
     }
-  }, { isolated: !scenario.single, extraHeaders: policy, onRequest: wasmRequests.record });
+  }, {
+    isolated: !scenario.single,
+    extraHeaders: (req) => scenario.workerResponseCsp && req.url === '/llama_webgpu_bridge_worker.js'
+      ? [['Content-Security-Policy', "worker-src 'self'"]]
+      : policy,
+    onRequest: wasmRequests.record,
+  });
 }
 
 async function main() {
@@ -242,16 +269,19 @@ async function main() {
         requests.set(req.url, (requests.get(req.url) ?? 0) + 1);
       }
     };
-    const cases = options.case ? [options.case] : Object.keys(scenarios);
+    const browserScenarios = options.browser === 'firefox' ? firefoxScenarios : Object.keys(scenarios);
+    const cases = options.case ? [options.case] : browserScenarios;
     await withServer(assetDir, async (url) => {
       const assetOrigin = new URL(url).origin;
       for (const single of [true, false]) {
         const selected = cases.filter((name) => Boolean(scenarios[name].single) === single);
         if (!selected.length) continue;
-        const browser = await chromium.launch({ args: webGpuLaunchArgs(process.platform, { sharedArrayBuffer: !single }) });
+        const browser = options.browser === 'firefox'
+          ? await firefox.launch()
+          : await chromium.launch({ args: webGpuLaunchArgs(process.platform, { sharedArrayBuffer: !single }) });
         try {
           for (const name of selected) {
-            if (scenarios[name].sameOrigin) await stageAssets(pageDir);
+            if (scenarios[name].sameOrigin || scenarios[name].workerResponseCsp) await stageAssets(pageDir);
             await runScenario(browser, pageDir, assetOrigin, name, options, {
               get: (file) => requests.get(file), record: recordRequest,
             });

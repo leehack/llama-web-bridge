@@ -2,11 +2,12 @@ import { registerHooks } from 'node:module';
 
 import { LlamaWebGpuBridgeRuntime } from '../../js/src/runtime.ts';
 
-const coreUrl = 'https://cdn.test/core.js';
-
-export async function withCrossOriginCore({ readsWorkerScript, blocked = false }, run) {
+export async function withCrossOriginCore({
+  readsWorkerScript, blocked = false, coreUrl = 'https://cdn.test/core.js', actualUrl = coreUrl,
+}, run) {
   const source = `export default async (options) => {
     globalThis.__pthreadStartGateCalls.push(options);
+    if (${readsWorkerScript}) options[Symbol.for('llamadart.pthreadScriptUrl')]?.(${JSON.stringify(actualUrl)});
     return { script: ${readsWorkerScript} ? options.mainScriptUrlOrBlob : undefined };
   };`;
   const hook = registerHooks({

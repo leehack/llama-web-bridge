@@ -16,6 +16,7 @@ import {
   normalizeDecisionSequences,
   withDecisionErrorCode,
 } from './internal/decision.ts';
+import { resolveCoreModuleUrl } from './internal/core_loader.ts';
 import { ModelUnloadedError } from './internal/core_guard.ts';
 import { SingleThreadCoreError } from './internal/isolation.ts';
 import { BlobWorkerBlockedError } from './internal/worker_start.ts';
@@ -1538,6 +1539,14 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
 
   _workerConfig() {
     const config = this._config || {};
+    const assetUrl = (value: unknown) => typeof value === 'string' && value.length > 0
+      ? normalizeAbsoluteUrl(value)
+      : undefined;
+    const coreSpecifier = (value: unknown) => {
+      if (typeof value !== 'string' || value.length === 0) return undefined;
+      if (/^(?:\.{1,2}\/|\/)/.test(value)) return normalizeAbsoluteUrl(value);
+      return resolveCoreModuleUrl(value) || value;
+    };
     return {
       workerRequestTimeoutMs: config.workerRequestTimeoutMs,
       workerInitTimeoutMs: config.workerInitTimeoutMs,
@@ -1546,16 +1555,10 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
       workerCompletionTimeoutMs: config.workerCompletionTimeoutMs,
       workerTextToSpeechTimeoutMs: config.workerTextToSpeechTimeoutMs,
       coreInitTimeoutMs: config.coreInitTimeoutMs,
-      wasmUrl: typeof config.wasmUrl === 'string' ? config.wasmUrl : undefined,
-      wasmUrlMem64: typeof config.wasmUrlMem64 === 'string'
-        ? config.wasmUrlMem64
-        : undefined,
-      coreModuleUrl: typeof config.coreModuleUrl === 'string'
-        ? config.coreModuleUrl
-        : undefined,
-      coreModuleUrlMem64: typeof config.coreModuleUrlMem64 === 'string'
-        ? config.coreModuleUrlMem64
-        : undefined,
+      wasmUrl: assetUrl(config.wasmUrl),
+      wasmUrlMem64: assetUrl(config.wasmUrlMem64),
+      coreModuleUrl: coreSpecifier(config.coreModuleUrl),
+      coreModuleUrlMem64: coreSpecifier(config.coreModuleUrlMem64),
       preferMemory64: typeof config.preferMemory64 === 'boolean'
         ? config.preferMemory64
         : undefined,

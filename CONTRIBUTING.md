@@ -191,7 +191,8 @@ node scripts/smoke/cross_origin_assets.mjs \
 
 It checks CDN-only assets, CSP fallback and typed rejections, and direct
 single-thread loads that start no worker. Run again with `--memory-mode wasm64`
-to verify the memory64 cores.
+to verify the memory64 cores. With the Playwright Firefox browser installed,
+run with `--browser firefox` to check the platform-specific CSP behavior.
 
 The resume integrity smoke uses the model already downloaded by state
 persistence. Set the model URL, SHA-256 and cache directory to the same values

@@ -12,7 +12,7 @@ import {
   requireCompletionCapabilities,
   resolveCompletionSamplingOptions,
 } from './internal/completion_options.ts';
-import { importCoreFactory, resolveCoreModuleUrl } from './internal/core_loader.ts';
+import { importCoreFactory } from './internal/core_loader.ts';
 import {
   DECISION_API_VERSION,
   decisionCoreStatusCode,
@@ -47,7 +47,7 @@ import {
 } from './internal/environment.ts';
 import { guardCore, isCoreRetired, retireCore, unguardedCore } from './internal/core_guard.ts';
 import { CrossOriginIsolationError, SingleThreadCoreError } from './internal/isolation.ts';
-import { isCrossOriginScriptUrl, pthreadScriptProperty, withPthreadStartProbe } from './internal/worker_start.ts';
+import { pthreadScriptProperties, withPthreadStartProbe } from './internal/worker_start.ts';
 import type { WorkerStartMode } from './internal/worker_start.ts';
 import { decodeImageBytesToRgb } from './internal/image.ts';
 import {
@@ -2213,7 +2213,6 @@ export class LlamaWebGpuBridgeRuntime {
       ) {
         candidates.push({
           variant: 'wasm64',
-          moduleUrl: this._config.coreModuleUrlMem64,
           factoryPromise: importCoreFactory(this._config.coreModuleUrlMem64),
           wasmUrl: this._config.wasmUrlMem64 || this._config.wasmUrl,
         });
@@ -2222,7 +2221,6 @@ export class LlamaWebGpuBridgeRuntime {
       const moduleUrl = this._config.coreModuleUrl ?? './llama_webgpu_core.js';
       candidates.push({
         variant: 'wasm32',
-        moduleUrl,
         factoryPromise: importCoreFactory(moduleUrl),
         wasmUrl: this._config.wasmUrl,
       });
@@ -2244,12 +2242,11 @@ export class LlamaWebGpuBridgeRuntime {
         const moduleFactory = await candidate.factoryPromise;
         factoryLoaded = true;
         const initTimeoutMs = this._resolveCoreInitTimeoutMs();
-        const absoluteCoreUrl = candidate.moduleUrl ? resolveCoreModuleUrl(candidate.moduleUrl) : '';
         let pthreadStart: WorkerStartMode = 'direct';
-        const pthreadScript: PropertyDescriptorMap = isCrossOriginScriptUrl(absoluteCoreUrl)
-          ? { mainScriptUrlOrBlob: pthreadScriptProperty(absoluteCoreUrl, () => { pthreadStart = 'blob'; }) }
-          : {};
-        candidateCore = guardCore(await withPthreadStartProbe(absoluteCoreUrl, () => Promise.race([
+        const pthreadScript = candidate.variant === 'custom'
+          ? {}
+          : pthreadScriptProperties(initTimeoutMs, () => { pthreadStart = 'blob'; });
+        candidateCore = guardCore(await withPthreadStartProbe(() => Promise.race([
           moduleFactory(Object.defineProperties({
           locateFile: (path: string, prefix: string) => {
             if (path.endsWith('.wasm') && candidate.wasmUrl) {

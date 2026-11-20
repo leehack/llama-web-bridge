@@ -101,3 +101,37 @@ test('the pthread error survives the worker protocol without a direct retry', as
     await bridge.dispose();
   }
 });
+
+for (const [mode, assetOrigin] of [['blob', 'https://cdn.test'], ['direct', 'https://app.test']]) {
+  test(`worker init resolves asset URLs against the page base in ${mode} mode`, async (t) => {
+    const state = stubWorkerStart(t);
+    const originalDocument = Object.getOwnPropertyDescriptor(globalThis, 'document');
+    Object.defineProperty(globalThis, 'document', {
+      configurable: true, value: { baseURI: 'https://app.test/asset-base/' },
+    });
+    t.after(() => {
+      if (originalDocument) Object.defineProperty(globalThis, 'document', originalDocument);
+      else delete globalThis.document;
+    });
+    const bridge = new LlamaWebGpuBridge({
+      workerUrl: assetOrigin + '/off-origin-path/llama_webgpu_bridge_worker.js',
+      wasmUrl: '/models/core.wasm',
+      wasmUrlMem64: './core64.wasm',
+      coreModuleUrl: './models/core.js',
+      coreModuleUrlMem64: '/models/core64.js',
+    });
+    const [worker] = state.workers;
+    const driver = workerDriver(bridge._workerProxy, worker);
+    driver.ready();
+    try {
+      const { config } = worker.posted[0];
+      assert.equal(config.workerStart, mode);
+      assert.equal(config.wasmUrl, 'https://app.test/models/core.wasm');
+      assert.equal(config.wasmUrlMem64, 'https://app.test/asset-base/core64.wasm');
+      assert.equal(config.coreModuleUrl, 'https://app.test/asset-base/models/core.js');
+      assert.equal(config.coreModuleUrlMem64, 'https://app.test/models/core64.js');
+    } finally {
+      await bridge.dispose();
+    }
+  });
+}

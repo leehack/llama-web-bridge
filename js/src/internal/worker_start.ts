@@ -75,7 +75,7 @@ export function watchBlobWorkerCsp(): () => boolean {
 
 type ProbeResult = BlobWorkerBlockReason | null;
 
-function runBlobWorkerProbe(importUrl: string): Promise<ProbeResult> {
+function runBlobWorkerProbe(importUrl: string, timeoutMs: number): Promise<ProbeResult> {
   return new Promise((resolve) => {
     const stopWatching = watchBlobWorkerCsp();
     let url: string | undefined;
@@ -103,22 +103,26 @@ function runBlobWorkerProbe(importUrl: string): Promise<ProbeResult> {
     worker.onmessage = () => finish(false);
     // The CSP violation event may follow the worker's error event.
     worker.onerror = () => setTimeout(() => finish(true), 0);
-    // Inconclusive: let the real start decide.
-    timer = setTimeout(() => finish(false), 5000);
+    timer = setTimeout(() => finish(true), timeoutMs);
   });
 }
 
 const blobWorkerProbes = new Map<string, { ready: Promise<ProbeResult>; result?: ProbeResult }>();
 
-export function probeBlobWorker(importUrl = ''): Promise<ProbeResult> {
+export function probeBlobWorker(importUrl = '', timeoutMs = 5_000): Promise<ProbeResult> {
   const existing = blobWorkerProbes.get(importUrl);
   if (existing) return existing.ready;
 
+  const deadline = performance.now() + timeoutMs;
   const probe = {
     result: undefined as ProbeResult | undefined,
     ready: (importUrl
-      ? probeBlobWorker().then((blocked) => blocked ?? runBlobWorkerProbe(importUrl))
-      : runBlobWorkerProbe('')
+      ? probeBlobWorker('', timeoutMs).then((blocked) => {
+        if (blocked) return blocked;
+        const remaining = deadline - performance.now();
+        return remaining > 0 ? runBlobWorkerProbe(importUrl, remaining) : 'script';
+      })
+      : runBlobWorkerProbe('', timeoutMs)
     ).then((result) => {
       probe.result = result;
       return result;
@@ -136,43 +140,66 @@ export function blobWorkerProbeResult(importUrl = ''): ProbeResult | undefined {
   return blobWorkerProbes.get('')?.result || blobWorkerProbes.get(importUrl)?.result;
 }
 
+function waitForPthreadProbe(scriptUrl: string, timeoutMs: number): Promise<ProbeResult | undefined> {
+  // An in-flight probe shared with another bridge may have a longer budget.
+  const probe = probeBlobWorker(scriptUrl, timeoutMs);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  return Promise.race([
+    probe,
+    new Promise<undefined>((resolve) => {
+      timer = setTimeout(() => resolve(undefined), timeoutMs);
+    }),
+  ]).finally(() => clearTimeout(timer));
+}
+
 export class PthreadStartProbeRequired extends Error {
-  constructor() {
+  declare readonly ready: Promise<ProbeResult | undefined>;
+
+  constructor(ready: Promise<ProbeResult | undefined>) {
     super('The bridge is probing blob: worker support and will start the core again.');
     this.name = 'PthreadStartProbeRequired';
+    this.ready = ready;
   }
 }
 
-// Emscripten reads the property synchronously inside allocateUnusedWorker(),
-// so a core that starts no worker never reads it and never causes a probe.
-export function pthreadScriptProperty(coreUrl: string, onUse: () => void): PropertyDescriptor {
+export function pthreadScriptProperties(timeoutMs: number, onUse: () => void): PropertyDescriptorMap {
+  let scriptUrl = '';
   return {
-    configurable: true,
-    enumerable: false,
-    get() {
-      const blocked = blobWorkerProbeResult(coreUrl);
-      if (blocked === undefined) {
-        // Started here so that a later read finds a result even if nobody retries.
-        void probeBlobWorker(coreUrl);
-        throw new PthreadStartProbeRequired();
-      }
-      if (blocked) {
-        throw new BlobWorkerBlockedError(blocked, 'pthread');
-      }
-      onUse();
-      return pthreadWorkerBlobUrl(coreUrl);
+    // A redirect or re-export can load the factory from a different origin
+    // than the caller's specifier. Only the core knows its worker script URL.
+    [Symbol.for('llamadart.pthreadScriptUrl')]: {
+      value(url: string) { scriptUrl = url; },
+    },
+    mainScriptUrlOrBlob: {
+      configurable: true,
+      enumerable: false,
+      get() {
+        if (!scriptUrl || !isCrossOriginScriptUrl(scriptUrl)) return undefined;
+        const blocked = blobWorkerProbeResult(scriptUrl);
+        if (blocked === undefined) {
+          throw new PthreadStartProbeRequired(waitForPthreadProbe(scriptUrl, timeoutMs));
+        }
+        if (blocked) {
+          throw new BlobWorkerBlockedError(blocked, 'pthread');
+        }
+        onUse();
+        return pthreadWorkerBlobUrl(scriptUrl);
+      },
     },
   };
 }
 
-export async function withPthreadStartProbe<T>(coreUrl: string, start: () => T | Promise<T>): Promise<T> {
+export async function withPthreadStartProbe<T>(start: () => T | Promise<T>): Promise<T> {
   try {
     return await start();
   } catch (error) {
     if (!(error instanceof PthreadStartProbeRequired)) {
       throw error;
     }
-    await probeBlobWorker(coreUrl);
+    if (await error.ready === undefined) {
+      const reason = blobWorkerProbeResult() === null ? 'script' : 'unavailable';
+      throw new BlobWorkerBlockedError(reason, 'pthread');
+    }
     return start();
   }
 }
