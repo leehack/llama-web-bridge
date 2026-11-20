@@ -6,7 +6,12 @@ import {
   withDecisionErrorCode,
 } from './internal/decision.ts';
 import { EMBEDDING_MEDIA_WORKER_TIMEOUT_MS, EmbeddingError, hasEmbeddingMediaParts } from './internal/embedding.ts';
-import { CROSS_ORIGIN_ISOLATION_REQUIRED, CrossOriginIsolationError } from './internal/isolation.ts';
+import {
+  CROSS_ORIGIN_ISOLATION_REQUIRED,
+  CrossOriginIsolationError,
+  SINGLE_THREAD_CORE_UNSUPPORTED,
+  SingleThreadCoreError,
+} from './internal/isolation.ts';
 import { ModelStagingError, isModelStagingErrorCode } from './internal/model_staging.ts';
 import type { LlamaWebGpuBridgeConfig } from './llama_webgpu_bridge.d.ts';
 import { bridgeWorkerModeParam } from './worker_protocol.ts';
@@ -168,7 +173,9 @@ export class BridgeWorkerProxy {
             ? new ModelStagingError(message.modelStagingErrorCode, errorMessage)
             : message.errorCode === CROSS_ORIGIN_ISOLATION_REQUIRED
               ? new CrossOriginIsolationError(errorMessage)
-              : new Error(errorMessage);
+              : message.errorCode === SINGLE_THREAD_CORE_UNSUPPORTED
+                ? new SingleThreadCoreError(errorMessage)
+                : new Error(errorMessage);
         if (isDecisionErrorCode(message.decisionErrorCode)) {
           withDecisionErrorCode(workerError, message.decisionErrorCode);
         }

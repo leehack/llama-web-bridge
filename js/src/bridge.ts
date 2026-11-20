@@ -16,6 +16,7 @@ import {
   normalizeDecisionSequences,
   withDecisionErrorCode,
 } from './internal/decision.ts';
+import { SingleThreadCoreError } from './internal/isolation.ts';
 import { logLevelForName, logThresholdForConfiguredLevel } from './internal/logging.ts';
 import {
   LORA_API_VERSION,
@@ -988,7 +989,7 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
   }
 
   _isRecoverableWorkerFsError(error: unknown) {
-    if (this._isNonRecoverableStagingError(error)) {
+    if (error instanceof SingleThreadCoreError || this._isNonRecoverableStagingError(error)) {
       return false;
     }
     const text = serializeWorkerError(error).toLowerCase();
@@ -1534,7 +1535,7 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
   }
 
   _shouldFallbackToMainThread(error: unknown) {
-    if (this._isNonRecoverableStagingError(error)) {
+    if (error instanceof SingleThreadCoreError || this._isNonRecoverableStagingError(error)) {
       return false;
     }
 

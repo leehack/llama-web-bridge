@@ -157,7 +157,7 @@ it.
 | `coreModuleFactory` | `LlamaCoreModuleFactory \| Promise<LlamaCoreModuleFactory>` | Preloaded Emscripten factory. Supplying this disables worker mode because factories cannot be transferred to the worker. It also skips the cross-origin isolation check, so a custom pthread core on a page that is not isolated still waits for `coreInitTimeoutMs`. |
 | `workerUrl` | `string` | URL for `llama_webgpu_bridge_worker.js`. Defaults to a sibling of the bridge module when possible. |
 | `disableWorker` | `boolean` | Force direct runtime mode. |
-| `allowSingleThreadCore` | `boolean` | Set for a `coreModuleUrl` core built without pthreads (`WEBGPU_BRIDGE_PTHREADS=0`). It then loads on a page that is not cross-origin isolated, capped to one thread (`threads_capped_no_coi`), instead of rejecting with `CrossOriginIsolationError`. |
+| `allowSingleThreadCore` | `boolean` | Set to `true` with explicit `_st` core URLs to load on pages without cross-origin isolation. Single-thread cores use one CPU thread and report `core_single_thread`. |
 | `jsBackedModelStaging` | `boolean` | Opt-in (`false` by default). Use for models over ~1 GB on `wasm32`, or large models on `memory64` to cut peak wasm heap; streams models and multimodal projectors directly into 64 MiB JS `Uint8Array` chunks under a private per-operation `/jsmodels-<n>` mount (`model_staging_js_backed`, `mmproj_staging_js_backed`) and releases that mount's chunks on completion or failure, at the cost of slightly slower small loads and temporary JS heap storage. |
 | `preferMemory64` | `boolean` | Prefer the wasm64 core when available. Defaults to `true`; the runtime can still fall back to wasm32. |
 | `workerRequestTimeoutMs` | `number` | Default timeout for worker RPC calls, 2 minutes unless a method has its own default. It also sets the `embed`/`embedBatch` budget, which defaults to 10 minutes when an input has image or audio parts. |
@@ -181,7 +181,7 @@ it.
 | `mediaMaxImagePixels` | `number` | Maximum image pixel count before multimodal image downscaling. |
 | `mediaMaxImageEdge` | `number` | Maximum image width/height before multimodal image downscaling. |
 | `disableImageDownscale` | `boolean` | Disable bridge-side image downscaling for multimodal image parts. |
-| `allowAutoRemoteFetchBackend` | `boolean` | Allow automatic selection of the native remote-fetch backend when the model size qualifies. |
+| `allowAutoRemoteFetchBackend` | `boolean` | Allow automatic selection of the native remote-fetch backend in a pthread worker when a single-file model qualifies. A single-thread worker uses streamed staging and reports `model_fetch_backend_requires_pthreads`. |
 | `logLevel` | `string \| number` | Bridge/core logging level. Numeric values are clamped to the supported core range. |
 
 Unknown config keys are accepted and may be consumed by current or future bridge
@@ -264,6 +264,7 @@ Common `options` keys:
 | `useCache`, `force` | Cache Storage controls for model responses. A cache miss writes the model to Cache Storage while it downloads, so progress follows the download; a failed cache write leaves the model loaded but uncached, and a cancelled load stores nothing. |
 | `streamResumeRetries` | Retry count for resumable streamed model loads. |
 | `remoteFetchThresholdBytes`, `remoteFetchChunkBytes` | Per-load remote-fetch tuning. |
+| `forceRemoteFetchBackend` | Force the native fetch backend for a single-file model in a worker. On a single-thread worker, the load rejects with `SingleThreadCoreError` (`code: 'SINGLE_THREAD_CORE_UNSUPPORTED'`, `feature: 'remote_fetch_backend'`). Page-thread loads use streamed staging. |
 | `loadMtp` | Loads the model's MTP layers, which `draft-mtp` speculative decoding needs. Defaults to `false`. |
 | `speculativeRollbackTokenMax` | llama.cpp's `n_rs_seq`: rollback snapshots per sequence. A model with recurrent state, such as Qwen3.5, needs at least the draft length for `draft-*` speculative decoding. Defaults to `0`. |
 
@@ -1155,7 +1156,7 @@ include:
 | `llamadart.webgpu.core_variant` | `wasm32`, `wasm64`, or initialization state. |
 | `llamadart.webgpu.model_source` | Model load source, such as network/cache/remote fetch. |
 | `llamadart.webgpu.model_cache_state` | Cache Storage state for the loaded model. |
-| `llamadart.webgpu.runtime_notes` | Semicolon-separated bridge notes such as thread caps, staging mode (`model_staging_js_backed`), or fallback reasons. `gpu_unavailable:<reason>` (`no_webgpu`, `no_adapter`, `adapter_missing_shader_f16`, `unknown`) says why a load with `nGpuLayers > 0` runs on the CPU; the bridge also logs one warning. Chrome hides `shader-f16` on NVIDIA drivers older than 615.71, and ggml-webgpu then registers no device. |
+| `llamadart.webgpu.runtime_notes` | Semicolon-separated bridge notes. Single-thread cores report `core_single_thread` and `core_pthreads:0`. Automatic fetch-backed loading on a single-thread worker reports `model_fetch_backend_requires_pthreads` and streams into staging. `model_staging_js_backed` identifies JS-backed staging. `gpu_unavailable:<reason>` (`no_webgpu`, `no_adapter`, `adapter_missing_shader_f16`, `unknown`) says why a load with `nGpuLayers > 0` runs on the CPU. The bridge also logs one warning. Chrome hides `shader-f16` on NVIDIA drivers older than 615.71, and ggml-webgpu then registers no device. |
 | `llamadart.webgpu.mmproj_loaded` | `1` when a projector is loaded. |
 | `llamadart.webgpu.supports_vision` | `1` when the active projector supports vision. |
 | `llamadart.webgpu.supports_audio` | `1` when the active projector supports audio. |
@@ -1241,13 +1242,18 @@ this function themselves.
 ## Browser and asset requirements
 
 - Use a secure context for WebGPU.
-- Large single-file model loads and pthread-backed runtime paths require
+- The default pthread cores require
   cross-origin isolation (`Cross-Origin-Opener-Policy: same-origin` and
   `Cross-Origin-Embedder-Policy: require-corp`) so `SharedArrayBuffer` is
   available. `credentialless` does not isolate Safari. On a page that cannot
-  share memory with workers, a load rejects immediately with
-  `CrossOriginIsolationError` (`code: 'CROSS_ORIGIN_ISOLATION_REQUIRED'`)
-  instead of waiting for the core init timeout.
+  share memory with workers, loading the default core configuration rejects
+  with `CrossOriginIsolationError` (`code: 'CROSS_ORIGIN_ISOLATION_REQUIRED'`).
+- On pages without isolation, set `allowSingleThreadCore: true` and
+  `coreModuleUrl: '/llama_webgpu_core_st.js'`. To opt into memory64, also set
+  `coreModuleUrlMem64: '/llama_webgpu_core_mem64_st.js'`. Supply matching
+  `wasmUrl` and `wasmUrlMem64` if the binaries are served separately.
+  Single-thread cores support vision, speech recognition and speech synthesis.
+  See the [size measurements and limits](single_thread.md).
 - Serve `llama_webgpu_core.js` and `llama_webgpu_core.wasm` from URLs reachable
   by both the page and worker. If using wasm64, also serve the `_mem64` files.
 - Keep `llama_webgpu_bridge.js`, `llama_webgpu_bridge_worker.js`, the core JS,

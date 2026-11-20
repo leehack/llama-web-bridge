@@ -84,6 +84,12 @@ Optional single-thread outputs (when `WEBGPU_BRIDGE_BUILD_SINGLE_THREAD=1`, plus
 - `dist/llama_webgpu_core_mem64_st.js`
 - `dist/llama_webgpu_core_mem64_st.wasm`
 
+On pages without cross-origin isolation, pass the explicit `_st` core URLs
+with `allowSingleThreadCore: true`. A single-thread load reports
+`core_single_thread`. Worker loads use streamed staging when automatic
+fetch-backed loading is enabled. Forcing the fetch backend in a worker
+raises `SingleThreadCoreError`. See the [single-thread measurements](docs/single_thread.md).
+
 ### JS-backed model staging
 
 Use `jsBackedModelStaging: true` for models over about 1 GB on `wasm32`, or for

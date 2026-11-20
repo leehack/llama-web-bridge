@@ -653,9 +653,9 @@ async function runHarnessPage(page, Bridge, extraDocument = {}, { crossOriginIso
   const body = page.slice(page.indexOf('<script type="module">\n') + '<script type="module">\n'.length, page.lastIndexOf('</script>'));
   const importCall = "await import('/llama_webgpu_bridge.js')";
   assert.equal(body.split(importCall).length, 2, 'the harness must import the bridge exactly once');
-  const script = body.replace(importCall, '({ LlamaWebGpuBridge: window.__FakeBridge })').trim();
+  const script = body.replace(importCall, '({ LlamaWebGpuBridge: window.__FakeBridge, SingleThreadCoreError: window.__FakeSingleThreadError })').trim();
   const result = { textContent: 'pending' };
-  const window = { crossOriginIsolated, __FakeBridge: Bridge };
+  const window = { crossOriginIsolated, __FakeBridge: Bridge, __FakeSingleThreadError: FakeSingleThreadError };
   const document = { getElementById: (id) => (id === 'result' ? result : null), ...extraDocument };
   if (hideSharedArrayBuffer) {
     await new Function('window', 'document', 'SharedArrayBuffer', `'use strict'; return ${script}`)(window, document, undefined);
@@ -711,13 +711,19 @@ const decodeSnapshot = (bytes, capacity) => {
 // `tweak.usage(context)` returns the usages to report for one completion,
 // `tweak.corruptSnapshot` changes how a corrupt snapshot is handled, and
 // `tweak.cString` names a method that drops its text after U+0000.
+class FakeSingleThreadError extends Error {
+  code = 'SINGLE_THREAD_CORE_UNSUPPORTED';
+  feature = 'remote_fetch_backend';
+}
+
 const stateBridge = (tweak = {}) => class FakeStateBridge {
-  constructor({ disableWorker, preferMemory64, allowSingleThreadCore, coreModuleUrl, coreModuleUrlMem64 }) {
+  constructor({ disableWorker, preferMemory64, allowSingleThreadCore, coreModuleUrl, coreModuleUrlMem64, allowAutoRemoteFetchBackend }) {
     this.mode = disableWorker ? 'direct runtime' : 'worker runtime';
     this.coreVariant = preferMemory64 ? 'wasm64' : 'wasm32';
     this.allowSingleThreadCore = allowSingleThreadCore === true;
     this.coreModuleUrl = coreModuleUrl;
     this.coreModuleUrlMem64 = coreModuleUrlMem64;
+    this.allowAutoRemoteFetchBackend = allowAutoRemoteFetchBackend;
     this.loaded = false;
     this.cache = [];
     this.calls = 0;
@@ -740,8 +746,12 @@ const stateBridge = (tweak = {}) => class FakeStateBridge {
     return {
       'llamadart.webgpu.core_variant': tweak.coreVariant || this.coreVariant,
       'llamadart.webgpu.execution': tweak.execution || (this.mode === 'worker runtime' ? 'worker' : 'main-thread'),
+      'llamadart.webgpu.model_source': 'network',
       'llamadart.webgpu.n_threads': tweak.nThreads ?? '1',
-      'llamadart.webgpu.runtime_notes': tweak.runtimeNotes ?? 'core_pthreads:0;threads_capped_no_coi',
+      'llamadart.webgpu.runtime_notes': tweak.runtimeNotes ?? [
+        'core_pthreads:0', 'threads_capped_no_coi', 'core_single_thread',
+        ...(this.autoFetchFallback ? ['model_fetch_backend_requires_pthreads'] : []),
+      ].join(';'),
     };
   }
 
@@ -753,6 +763,10 @@ const stateBridge = (tweak = {}) => class FakeStateBridge {
     }
     if (tweak.expectedCoreModuleUrl !== undefined) assert.equal(this.coreModuleUrl, tweak.expectedCoreModuleUrl);
     if (tweak.expectedCoreModuleUrlMem64 !== undefined) assert.equal(this.coreModuleUrlMem64, tweak.expectedCoreModuleUrlMem64);
+    if (this.allowAutoRemoteFetchBackend && options.forceRemoteFetchBackend === true) {
+      throw new FakeSingleThreadError();
+    }
+    if (!this.loaded) this.autoFetchFallback = this.allowAutoRemoteFetchBackend && options.forceRemoteFetchBackend === undefined;
     assert.equal(url, '/state-smoke-model.gguf');
     for (let loaded = 1; loaded <= 3; loaded += 1) options.progressCallback?.({ loaded, total: 3 });
     this.loaded = true;

@@ -176,7 +176,25 @@ node scripts/smoke/state_persistence.mjs \
 ```
 
 Run the same single-thread smoke with `--memory-mode wasm64` as well. Both
-non-isolated runs are required in CI and candidate qualification.
+non-isolated runs check that the worker rejects a forced fetch-backend load,
+and that auto mode stages the model. CI and candidate qualification require both runs.
+
+For local WebGPU acceptance on a non-isolated page, use the model and checksum
+for each memory mode in the [single-thread measurements](docs/single_thread.md):
+
+```bash
+node scripts/smoke/single_thread.mjs \
+  --dist-dir /private/tmp/llama_web_bridge_dist \
+  --model-path "$MODEL_PATH" --model-sha256 "$MODEL_SHA256" \
+  --memory-mode wasm32 --runtime-mode worker --gpu-layers 999 \
+  --artifacts-dir /private/tmp/llama-web-bridge-single-thread-smoke
+```
+
+Run each memory mode in worker and direct mode, with and without
+`--js-backed-model-staging`. Use separate artifact directories to retain each
+run's staged byte count and peak wasm heap. The worker run also calls the
+native URL loader directly and checks that it returns `-7`. This is a local
+acceptance check.
 
 For the v0.7.0 embedding scheduler repair and its exact source fingerprint, see
 [the qualification notes](docs/v070_qualification.md). The build compiles a

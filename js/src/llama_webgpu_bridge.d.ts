@@ -308,6 +308,13 @@ export class CrossOriginIsolationError extends Error {
   constructor(message?: string);
 }
 
+/** Thrown when a worker load forces the fetch backend on a single-thread core. */
+export class SingleThreadCoreError extends Error {
+  readonly code: 'SINGLE_THREAD_CORE_UNSUPPORTED';
+  readonly feature: 'remote_fetch_backend';
+  constructor(message?: string);
+}
+
 export type ModelStagingErrorCode =
   | 'MODEL_STAGING_ALLOCATION_FAILED'
   | 'MODEL_TENSOR_SIZE_LIMIT_EXCEEDED'
