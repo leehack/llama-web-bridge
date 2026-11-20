@@ -1151,6 +1151,26 @@ function isWasm32TensorLimitText(text) {
   return normalized.includes("wasm32 4 gib") || normalized.includes("gguf_init_from_reader") && normalized.includes("size overflow");
 }
 
+// js/src/internal/text_to_speech.ts
+var STREAMING_PCM = 1 << 3;
+var TEXT_TO_SPEECH_CANCELLED = "Text-to-speech synthesis was cancelled.";
+var TextToSpeechStreamingUnsupportedError = class extends Error {
+  code = "TTS_STREAMING_UNSUPPORTED";
+  constructor() {
+    super("The worker did not declare supportsIncrementalAudio. The bridge and worker scripts must come from the same release.");
+    this.name = "TextToSpeechStreamingUnsupportedError";
+  }
+};
+function withTextToSpeechStreaming(capabilities) {
+  return {
+    ...capabilities,
+    supportsIncrementalAudio: capabilities.supported === true && (capabilities.capabilities & STREAMING_PCM) !== 0
+  };
+}
+function textToSpeechProgressTransfers({ pcm }) {
+  return pcm?.buffer instanceof ArrayBuffer ? [pcm.buffer] : [];
+}
+
 // js/src/internal/core_loader.ts
 function normalizeFactory(moduleExport) {
   if (typeof moduleExport === "function") {
@@ -4779,6 +4799,7 @@ var LlamaWebGpuBridgeRuntime = class {
         capabilities: 0,
         supportsLanguage: false,
         supportsSpeakerReference: false,
+        supportsIncrementalAudio: false,
         sampleRate: 0,
         channels: 0,
         reason: "WebGPU core is not initialized"
@@ -4791,7 +4812,7 @@ var LlamaWebGpuBridgeRuntime = class {
       []
     ) || "{}";
     try {
-      return JSON.parse(raw);
+      return withTextToSpeechStreaming(JSON.parse(raw));
     } catch (_) {
       return {
         apiVersion: 0,
@@ -4800,6 +4821,7 @@ var LlamaWebGpuBridgeRuntime = class {
         capabilities: 0,
         supportsLanguage: false,
         supportsSpeakerReference: false,
+        supportsIncrementalAudio: false,
         sampleRate: 0,
         channels: 0,
         reason: "WebGPU TTS capability response is invalid"
@@ -4812,7 +4834,28 @@ var LlamaWebGpuBridgeRuntime = class {
     } catch (_) {
     }
   }
-  async synthesizeSpeech(options = {}) {
+  _takeTextToSpeechChunk(path) {
+    const samples = Number(this._core.ccall(
+      "llamadart_webgpu_tts_write_pcm_chunk",
+      "number",
+      ["string"],
+      [path]
+    ));
+    if (samples < 0) {
+      throw new Error(this._coreErrorMessage("Failed to read synthesized speech", samples));
+    }
+    if (samples === 0) {
+      return null;
+    }
+    const bytes = this._core.FS.readFile(path);
+    if (!(bytes instanceof Uint8Array) || bytes.byteLength !== samples * Float32Array.BYTES_PER_ELEMENT) {
+      throw new Error("Synthesized PCM chunk is malformed.");
+    }
+    const chunk = new Float32Array(new Uint8Array(bytes).buffer);
+    this._deleteFsFile(path);
+    return chunk;
+  }
+  async synthesizeSpeech(options, streamAudio) {
     if (this._modelBytes <= 0) {
       throw new Error("No model loaded. Call loadModelFromUrl first.");
     }
@@ -4820,6 +4863,9 @@ var LlamaWebGpuBridgeRuntime = class {
       throw new DOMException("Text-to-speech synthesis was cancelled.", "AbortError");
     }
     const capabilities = this.getTextToSpeechCapabilities();
+    if (streamAudio && capabilities.supportsIncrementalAudio !== true) {
+      throw new Error("Loaded text-to-speech runtime cannot stream audio.");
+    }
     if (capabilities.supported !== true) {
       throw new Error(
         capabilities.reason || "Loaded model/projector does not support text-to-speech."
@@ -4836,6 +4882,7 @@ var LlamaWebGpuBridgeRuntime = class {
     const taskId = `${Date.now()}_${++this._mediaFileCounter}`;
     const speakerPath = `/tts/speaker_${taskId}.bin`;
     const outputPath = `/tts/output_${taskId}.pcm`;
+    const chunkPath = `/tts/chunk_${taskId}.pcm`;
     const speakerBytes = toUint8Array(options.speakerAudio);
     if (speakerBytes && speakerBytes.length > 0) {
       this._core.FS.writeFile(speakerPath, speakerBytes);
@@ -4859,7 +4906,7 @@ var LlamaWebGpuBridgeRuntime = class {
         await this._core.ccall(
           "llamadart_webgpu_tts_start",
           "number",
-          ["string", "string", "string", "number", "number", "number", "number", "number", "number", "number"],
+          ["string", "string", "string", "number", "number", "number", "number", "number", "number", "number", "number"],
           [
             text,
             language,
@@ -4870,7 +4917,8 @@ var LlamaWebGpuBridgeRuntime = class {
             topP,
             minP,
             temperature,
-            seed
+            seed,
+            streamAudio ? 1 : 0
           ],
           { async: true }
         )
@@ -4880,6 +4928,7 @@ var LlamaWebGpuBridgeRuntime = class {
       }
       started = true;
       let progress = {};
+      let streamedSampleCount = 0;
       for (; ; ) {
         if (this._abortRequested || options.signal?.aborted) {
           this.cancel();
@@ -4893,6 +4942,9 @@ var LlamaWebGpuBridgeRuntime = class {
             { async: true }
           )
         );
+        if (streamAudio && (this._abortRequested || options.signal?.aborted)) {
+          throw createAbortError(TEXT_TO_SPEECH_CANCELLED);
+        }
         const rawProgress = this._core.ccall(
           "llamadart_webgpu_tts_progress_json",
           "string",
@@ -4900,7 +4952,21 @@ var LlamaWebGpuBridgeRuntime = class {
           []
         ) || "{}";
         progress = JSON.parse(rawProgress);
-        options.onProgress?.(progress);
+        let chunk = null;
+        if (streamAudio && stepRc === 0 && (progress.state === 2 || progress.state === 3)) {
+          chunk = this._takeTextToSpeechChunk(chunkPath);
+          if (chunk) {
+            progress.pcm = chunk;
+            progress.sampleOffset = streamedSampleCount;
+            progress.sampleRate = Number(capabilities.sampleRate) || 0;
+            progress.channels = Number(capabilities.channels) || 1;
+            streamedSampleCount += chunk.length;
+          }
+        }
+        options.onProgress?.(streamAudio ? { ...progress } : progress);
+        if (chunk && (this._abortRequested || options.signal?.aborted)) {
+          throw createAbortError(TEXT_TO_SPEECH_CANCELLED);
+        }
         if (stepRc === -6 || progress.state === 4) {
           throw new DOMException("Text-to-speech synthesis was cancelled.", "AbortError");
         }
@@ -4912,28 +4978,36 @@ var LlamaWebGpuBridgeRuntime = class {
         }
         await new Promise((resolve) => setTimeout(resolve, 0));
       }
-      const outputRc = Number(
-        this._core.ccall(
-          "llamadart_webgpu_tts_write_pcm",
-          "number",
-          ["string"],
-          [outputPath]
-        )
-      );
-      if (outputRc !== 0) {
-        throw new Error(this._coreErrorMessage("Failed to read synthesized speech", outputRc));
+      let pcm;
+      if (streamAudio) {
+        if (streamedSampleCount === 0) {
+          throw new Error("Synthesized PCM output is empty or malformed.");
+        }
+        pcm = new Float32Array(0);
+      } else {
+        const outputRc = Number(
+          this._core.ccall(
+            "llamadart_webgpu_tts_write_pcm",
+            "number",
+            ["string"],
+            [outputPath]
+          )
+        );
+        if (outputRc !== 0) {
+          throw new Error(this._coreErrorMessage("Failed to read synthesized speech", outputRc));
+        }
+        const bytes = this._core.FS.readFile(outputPath);
+        if (!(bytes instanceof Uint8Array) || bytes.byteLength === 0 || bytes.byteLength % 4 !== 0) {
+          throw new Error("Synthesized PCM output is empty or malformed.");
+        }
+        const copy = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+        pcm = new Float32Array(copy);
       }
-      const bytes = this._core.FS.readFile(outputPath);
-      if (!(bytes instanceof Uint8Array) || bytes.byteLength === 0 || bytes.byteLength % 4 !== 0) {
-        throw new Error("Synthesized PCM output is empty or malformed.");
-      }
-      const copy = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
-      const pcm = new Float32Array(copy);
       return {
         pcm,
         sampleRate: Number(capabilities.sampleRate) || 0,
         channels: Number(capabilities.channels) || 1,
-        sampleCount: pcm.length,
+        sampleCount: streamAudio ? streamedSampleCount : pcm.length,
         framesGenerated: Number(progress.framesGenerated) || 0,
         truncated: progress.truncated === true
       };
@@ -4946,6 +5020,9 @@ var LlamaWebGpuBridgeRuntime = class {
       }
       this._deleteFsFile(speakerPath);
       this._deleteFsFile(outputPath);
+      if (streamAudio) {
+        this._deleteFsFile(chunkPath);
+      }
       this._textToSpeechActive = false;
       this._resolveTextToSpeechDone?.();
       this._resolveTextToSpeechDone = null;
@@ -6356,6 +6433,7 @@ var BridgeWorkerProxy = class {
     this._nextId = 1;
     this._pending = /* @__PURE__ */ new Map();
     this._workerBlobUrl = null;
+    this._supportsIncrementalAudio = false;
     this.coreRetired = false;
     let workerInitError = null;
     const moduleCandidates = [moduleUrl];
@@ -6406,6 +6484,7 @@ var BridgeWorkerProxy = class {
       const message = event.data || {};
       const type = message.type;
       if (type === "ready") {
+        this._supportsIncrementalAudio = message.supportsIncrementalAudio === true;
         this._clearReadyTimeout();
         this._readyResolve?.();
         return;
@@ -6451,11 +6530,15 @@ var BridgeWorkerProxy = class {
     };
     this._worker.postMessage({ type: "init", config });
   }
-  async call(method, args, onEvent, transferList = [], operationMeta = null) {
+  async call(method, args, onEvent, transferList = [], operationMeta = null, beforePost) {
     await this._ready;
+    if (method === "synthesizeSpeech" && args[0]?.streamAudio === true && !this._supportsIncrementalAudio) {
+      throw new TextToSpeechStreamingUnsupportedError();
+    }
     const id = this._nextId++;
     const timeoutMs = this._resolveRequestTimeoutMs(method, args);
     const transfers = Array.isArray(transferList) ? transferList.filter((item) => item != null) : [];
+    beforePost?.();
     return new Promise((resolve, reject) => {
       let timeoutHandle = null;
       const clearTimer = () => {
@@ -7016,7 +7099,9 @@ var LlamaWebGpuBridge = class {
             reject(abortError());
             return;
           }
-          this._cancelOperation(operation, "signal");
+          if (!options.cancelSignalWhileActiveOnly || this._activeOperation === operation) {
+            this._cancelOperation(operation, "signal");
+          }
         };
         signal.addEventListener("abort", onAbort, { once: true });
         removeAbortListener = () => signal.removeEventListener("abort", onAbort);
@@ -7817,7 +7902,7 @@ var LlamaWebGpuBridge = class {
       this._runtime._runtimeNotes.push(note);
     }
   }
-  async _callWorker(method, args, onEvent, transferList = []) {
+  async _callWorker(method, args, onEvent, transferList = [], beforePost) {
     if (this._workerProxy?.coreRetired === true) {
       await this._replaceWorkerAfterCoreRetired(this._workerProxy);
     }
@@ -7840,7 +7925,8 @@ var LlamaWebGpuBridge = class {
         args,
         guardedEvent,
         transferList,
-        operation ? { operationId: operation.id, workerGeneration: operation.workerGeneration } : void 0
+        operation ? { operationId: operation.id, workerGeneration: operation.workerGeneration } : void 0,
+        beforePost
       );
       if (operation?.cancelRequested) {
         this._sendWorkerCancel(proxy, operation);
@@ -8546,31 +8632,97 @@ var LlamaWebGpuBridge = class {
     }
   }
   async synthesizeSpeech(options = {}) {
+    const streamAudio = options?.streamAudio === true;
+    let operation = null;
+    let consumerFailure;
+    let synthesisOptions = options;
+    if (streamAudio) {
+      const onProgress = options.onProgress;
+      if (typeof onProgress !== "function") {
+        throw new TypeError("streamAudio requires an onProgress callback.");
+      }
+      synthesisOptions = {
+        text: options.text,
+        language: options.language,
+        speakerAudio: options.speakerAudio,
+        promptBatchSize: options.promptBatchSize,
+        maxFrames: options.maxFrames,
+        topK: options.topK,
+        topP: options.topP,
+        minP: options.minP,
+        temperature: options.temperature,
+        seed: options.seed,
+        signal: options.signal,
+        streamAudio: true,
+        onProgress: (progress) => {
+          try {
+            onProgress.call(options, progress);
+          } catch (error) {
+            if (!this._isOperationCancellation(void 0, operation)) {
+              consumerFailure = { error };
+            }
+            throw error;
+          }
+        }
+      };
+    }
     for (const field of ["text", "language"]) {
-      const value = options?.[field];
+      const value = synthesisOptions?.[field];
       if (typeof value === "string") {
         withoutNul(value, `TextToSpeechOptions.${field}`);
       }
     }
-    return this._runExclusive(
-      () => this._synthesizeSpeechUnlocked(options),
+    const synthesis = this._runExclusive(
+      (active) => {
+        operation = active;
+        if (streamAudio) {
+          this._settlingStreamedSpeechOperation = active;
+        }
+        return this._synthesizeSpeechUnlocked(synthesisOptions, streamAudio);
+      },
       {
-        signal: options?.signal,
-        abortMessage: "Text-to-speech synthesis was cancelled.",
-        kind: "text-to-speech"
+        signal: synthesisOptions?.signal,
+        abortMessage: TEXT_TO_SPEECH_CANCELLED,
+        kind: "text-to-speech",
+        cancelSignalWhileActiveOnly: streamAudio
       }
     );
+    if (!streamAudio) {
+      return synthesis;
+    }
+    try {
+      return await synthesis;
+    } finally {
+      if (this._settlingStreamedSpeechOperation === operation) {
+        this._settlingStreamedSpeechOperation = void 0;
+      }
+      if (consumerFailure) {
+        throw consumerFailure.error;
+      }
+      this._throwIfOperationCancelled(void 0, TEXT_TO_SPEECH_CANCELLED, operation);
+    }
   }
-  async _synthesizeSpeechUnlocked(options = {}) {
+  async _synthesizeSpeechUnlocked(options, streamAudio) {
+    if (streamAudio) {
+      this._throwIfOperationCancelled(void 0, TEXT_TO_SPEECH_CANCELLED);
+    }
     if (options.signal?.aborted) {
       throw new DOMException("Text-to-speech synthesis was cancelled.", "AbortError");
     }
     if (!this._workerProxy) {
-      return this._runtime.synthesizeSpeech(options);
+      return this._runtime.synthesizeSpeech(options, streamAudio);
     }
+    let deliveredSampleCount = 0;
+    let cancelledAfterChunk = false;
+    let progressFailure;
+    let result;
+    const operation = this._activeOperation;
     try {
       await this._restoreWorkerModelIfMissing();
-      const workerOptions = { ...options };
+      if (streamAudio) {
+        this._throwIfOperationCancelled(void 0, TEXT_TO_SPEECH_CANCELLED);
+      }
+      const workerOptions = { ...options, streamAudio };
       delete workerOptions.onProgress;
       delete workerOptions.signal;
       const transferList = [];
@@ -8580,30 +8732,54 @@ var LlamaWebGpuBridge = class {
         workerOptions.speakerAudio = copy;
         transferList.push(copy.buffer);
       }
-      const result = await this._callWorker(
+      result = await this._callWorker(
         "synthesizeSpeech",
         [workerOptions],
         (event) => {
-          if (event.event === "progress") {
-            options.onProgress?.(event.payload || {});
+          if (event.event === "progress" && !cancelledAfterChunk && !progressFailure) {
+            const progress = event.payload || {};
+            const chunkSamples = streamAudio ? progress.pcm?.length ?? 0 : 0;
+            deliveredSampleCount += chunkSamples;
+            try {
+              options.onProgress?.(progress);
+            } catch (error) {
+              if (!streamAudio) {
+                throw error;
+              }
+              progressFailure = { error };
+              this._sendWorkerCancel(this._workerProxy, this._activeOperation);
+              return;
+            }
+            if (chunkSamples > 0) {
+              cancelledAfterChunk = this._isOperationCancellation(void 0);
+            }
           }
         },
-        transferList
+        transferList,
+        streamAudio ? () => this._throwIfOperationCancelled(void 0, TEXT_TO_SPEECH_CANCELLED, operation) : void 0
       );
-      this._throwIfCallerCancelled("Text-to-speech synthesis was cancelled.");
-      return result;
     } catch (error) {
+      if (progressFailure) {
+        if (!isCoreRetiredError(error) && this._isWorkerRequestTimeoutError(error)) {
+          this._disableWorkerFallback(error);
+          await this._waitForWorkerDisposal();
+        }
+        throw progressFailure.error;
+      }
       this._throwIfOperationCancelled(error, "Text-to-speech synthesis was cancelled.");
       if (isCoreRetiredError(error)) {
+        if (deliveredSampleCount > 0) {
+          throw error;
+        }
         return this._rerunOnCpuAfterCoreAbort(
           error,
-          () => this._synthesizeSpeechUnlocked(options)
+          () => this._synthesizeSpeechUnlocked(options, streamAudio)
         );
       }
       if (error?.name === "AbortError" || options.signal?.aborted || serializeWorkerError(error).toLowerCase().includes("cancel")) {
         throw new DOMException("Text-to-speech synthesis was cancelled.", "AbortError");
       }
-      const canRetryOnCpu = !this._isCpuModelMode() && (this._isDispatchWorkgroupLimitError(error) || this._isWorkerRequestTimeoutError(error));
+      const canRetryOnCpu = deliveredSampleCount === 0 && !this._isCpuModelMode() && (this._isDispatchWorkgroupLimitError(error) || this._isWorkerRequestTimeoutError(error));
       if (canRetryOnCpu) {
         this._disableWorkerFallback(error);
         await this._waitForWorkerDisposal();
@@ -8614,10 +8790,13 @@ var LlamaWebGpuBridge = class {
           },
           error
         );
+        if (streamAudio) {
+          this._throwIfOperationCancelled(void 0, TEXT_TO_SPEECH_CANCELLED);
+        }
         if (options.signal?.aborted) {
           throw new DOMException("Text-to-speech synthesis was cancelled.", "AbortError");
         }
-        return this._runtime.synthesizeSpeech(options);
+        return this._runtime.synthesizeSpeech(options, streamAudio);
       }
       if (this._isWorkerRequestTimeoutError(error)) {
         this._disableWorkerFallback(error);
@@ -8625,6 +8804,21 @@ var LlamaWebGpuBridge = class {
       }
       throw error;
     }
+    if (progressFailure) {
+      throw progressFailure.error;
+    }
+    if (streamAudio) {
+      if (cancelledAfterChunk) {
+        throw createAbortError(TEXT_TO_SPEECH_CANCELLED);
+      }
+      this._throwIfOperationCancelled(void 0, TEXT_TO_SPEECH_CANCELLED);
+      if (result.pcm.length !== 0 || result.sampleCount !== deliveredSampleCount) {
+        throw new Error("Worker streamed PCM sample count does not match the delivered audio.");
+      }
+    } else {
+      this._throwIfCallerCancelled(TEXT_TO_SPEECH_CANCELLED);
+    }
+    return result;
   }
   _decisionHeadMap() {
     if (!(this._decisionHeads instanceof Map)) {
@@ -9378,8 +9572,9 @@ var LlamaWebGpuBridge = class {
     if (this._lifecycleState === "disposing" || this._lifecycleState === "disposed") {
       return;
     }
-    if (this._activeOperation) {
-      this._cancelOperation(this._activeOperation);
+    const operation = this._activeOperation ?? this._settlingStreamedSpeechOperation;
+    if (operation) {
+      this._cancelOperation(operation);
       return;
     }
     if (this._workerProxy) {
@@ -9526,7 +9721,7 @@ function installBridgeWorkerHost() {
           disableWorker: true
         });
         bridge._onCoreRetired = () => self.postMessage({ type: "core-retired" });
-        self.postMessage({ type: "ready" });
+        self.postMessage({ type: "ready", supportsIncrementalAudio: true });
         return;
       }
       if (type !== "call") {
@@ -9738,7 +9933,13 @@ function installBridgeWorkerHost() {
         const options = args[0] && typeof args[0] === "object" ? { ...args[0] } : {};
         delete options.signal;
         options.onProgress = (progress) => {
-          self.postMessage({ type: "event", id, event: "progress", payload: progress || {} });
+          const event = { type: "event", id, event: "progress", payload: progress || {} };
+          const transfers2 = textToSpeechProgressTransfers(progress);
+          if (transfers2.length > 0) {
+            self.postMessage(event, transfers2);
+          } else {
+            self.postMessage(event);
+          }
         };
         const value2 = await bridge.synthesizeSpeech(options);
         const transfers = value2?.pcm?.buffer instanceof ArrayBuffer ? [value2.pcm.buffer] : [];
@@ -9884,5 +10085,6 @@ export {
   ModelStagingError,
   ModelUnloadedError,
   SingleThreadCoreError,
+  TextToSpeechStreamingUnsupportedError,
   enableBridgeWorkerHost
 };

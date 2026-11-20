@@ -50,7 +50,8 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_tts_start(
     float top_p,
     float min_p,
     float temperature,
-    uint32_t seed) {
+    uint32_t seed,
+    int32_t stream_audio) {
   clear_error();
   if (!ensure_loaded()) {
     return LLAMADART_WEBGPU_TTS_STATUS_INVALID_STATE;
@@ -95,6 +96,7 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_tts_start(
       min_p,
       temperature,
       seed,
+      stream_audio != 0,
   };
   // Cancellation is shared with token generation through the llama.cpp abort
   // callback. A completed TTS cancellation must not poison the next task.
@@ -155,6 +157,23 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_tts_write_pcm(
         : "Text-to-speech task is unavailable");
   }
   return status;
+}
+
+EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_tts_write_pcm_chunk(
+    const char * output_path) {
+  clear_error();
+  int64_t sample_count = 0;
+  const auto status =
+      llama_webgpu_tts_write_stream_chunk(g_tts, output_path, &sample_count);
+  if (status != LLAMADART_WEBGPU_TTS_STATUS_OK) {
+    set_error("Could not write streamed PCM");
+    return status;
+  }
+  if (sample_count > std::numeric_limits<int32_t>::max()) {
+    set_error("Streamed PCM sample count is too large");
+    return LLAMADART_WEBGPU_TTS_STATUS_UPSTREAM_ERROR;
+  }
+  return static_cast<int32_t>(sample_count);
 }
 
 EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_tts_reset() {

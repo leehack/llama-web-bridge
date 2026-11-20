@@ -72,9 +72,10 @@ const sha256 = (bytes) => createHash('sha256').update(bytes).digest('hex');
   assert.deepEqual(ttsSmoke.parseArgs(['--model-path', '/m', '--mmproj-path', '/p']), {
     distDir: 'dist', modelPath: '/m', mmprojPath: '/p', modelSha256: '', mmprojSha256: '', speakerAudioPath: null,
     speakerAudioSha256: '', prompt: 'Hello from llamadart.', maxFrames: 96, gpuLayers: 0, memoryMode: 'all', runtimeMode: 'all',
-    timeoutMs: 1200000, skipCancellation: false, artifactsDir: null,
+    timeoutMs: 1200000, skipCancellation: false, skipStreaming: false, artifactsDir: null,
   });
   assert.equal(ttsSmoke.parseArgs(['--model-path', '/m', '--mmproj-path', '/p', '--skip-c']).skipCancellation, true);
+  assert.equal(ttsSmoke.parseArgs(['--model-path', '/m', '--mmproj-path', '/p', '--skip-streaming']).skipStreaming, true);
   assert.deepEqual(decisionSmoke.parseArgs(['--model-path', '/m', '--head-path', '/h', '--fixture-path', '/f', '--max-logit-diff', '-1']), {
     distDir: 'dist', modelPath: '/m', headPath: '/h', configPath: null, fixturePath: '/f', modelSha256: '', headSha256: '',
     configSha256: '', gpuLayers: 0, contextSize: 512, headSource: 'url', maxLogitDiff: -1, maxProbabilityDiff: 0.06,

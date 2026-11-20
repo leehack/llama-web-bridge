@@ -365,6 +365,12 @@ export interface NextTokenScores {
   promptTokens: number;
 }
 
+/** Thrown when a worker script does not declare streamed PCM support. */
+export class TextToSpeechStreamingUnsupportedError extends Error {
+  readonly code: 'TTS_STREAMING_UNSUPPORTED';
+  constructor();
+}
+
 export interface TextToSpeechCapabilities {
   apiVersion: number;
   supported: boolean;
@@ -372,6 +378,7 @@ export interface TextToSpeechCapabilities {
   capabilities: number;
   supportsLanguage: boolean;
   supportsSpeakerReference: boolean;
+  supportsIncrementalAudio: boolean;
   sampleRate: number;
   channels: number;
   reason: string;
@@ -382,6 +389,12 @@ export interface TextToSpeechProgress {
   promptTokensRemaining: number;
   framesGenerated: number;
   truncated: boolean;
+  /** PCM decoded since the previous chunk, present only with streamAudio. */
+  pcm?: Float32Array;
+  /** Index of the first PCM sample in the utterance. */
+  sampleOffset?: number;
+  sampleRate?: number;
+  channels?: number;
 }
 
 export interface TextToSpeechOptions {
@@ -396,10 +409,13 @@ export interface TextToSpeechOptions {
   temperature?: number;
   seed?: number;
   signal?: AbortSignal;
+  /** Deliver PCM chunks via onProgress, which is required when enabled. */
+  streamAudio?: boolean;
   onProgress?: (progress: TextToSpeechProgress) => void;
 }
 
 export interface TextToSpeechResult {
+  /** Empty with streamAudio. In that case sampleCount is the streamed total. */
   pcm: Float32Array;
   sampleRate: number;
   channels: number;

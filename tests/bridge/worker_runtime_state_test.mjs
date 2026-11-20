@@ -37,8 +37,11 @@ try {
     this.__diagnostic = 'generation_stopped_context_limit';
     return 'completion';
   };
-  LlamaWebGpuBridge.prototype.synthesizeSpeech = async function synthesizeSpeech() {
+  const chunk = new Float32Array([0.125]);
+  LlamaWebGpuBridge.prototype.synthesizeSpeech = async function synthesizeSpeech(options) {
     this.__diagnostic = 'tts_runtime_diagnostic';
+    options.onProgress({ state: 1 });
+    options.onProgress({ state: 2, pcm: chunk, sampleOffset: 0 });
     return {
       pcm: new Float32Array([0.25]),
       sampleRate: 24000,
@@ -49,6 +52,7 @@ try {
   enableBridgeWorkerHost();
   await globalThis.self.onmessage({ data: { type: 'init', config: {} } });
   assert.equal(posted.at(-1)?.message?.type, 'ready');
+  assert.equal(posted.at(-1).message.supportsIncrementalAudio, true);
 
   await globalThis.self.onmessage({
     data: { type: 'call', id: 1, method: 'createCompletion', args: ['prompt', {}] },
@@ -66,6 +70,11 @@ try {
   const speechResponse = posted.at(-1);
   assert.equal(speechResponse.message.state.metadata.diagnostic, 'tts_runtime_diagnostic');
   assert.deepEqual(speechResponse.transfers, [speechResponse.message.value.pcm.buffer]);
+  const progress = posted.filter(({ message }) => message.id === 2 && message.event === 'progress');
+  assert.equal(progress.length, 2);
+  assert.deepEqual(progress[0].transfers, []);
+  assert.equal(progress[1].message.payload.pcm, chunk);
+  assert.deepEqual(progress[1].transfers, [chunk.buffer]);
 
   const publicBridge = Object.create(LlamaWebGpuBridge.prototype);
   Object.assign(publicBridge, {
