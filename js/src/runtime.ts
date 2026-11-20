@@ -193,9 +193,13 @@ export class LlamaWebGpuBridgeRuntime {
   declare _gpuActive: boolean;
   declare _modelPath: string | null;
   declare _modelPaths: string[];
+  declare _ownedModelPaths: string[];
   declare _jsBackedStagingMounted: boolean;
+  declare _jsStagingMountCounter: number;
+  declare _activeJsStagingMounts: Set<string>;
   declare _modelBytes: number;
   declare _mmProjPath: string | null;
+  declare _ownedMmProjPath: string | null;
   declare _mmSupportsVision: boolean;
   declare _mmSupportsAudio: boolean;
   declare _mediaFileCounter: number;
@@ -258,9 +262,13 @@ export class LlamaWebGpuBridgeRuntime {
     this._gpuActive = false;
     this._modelPath = null;
     this._modelPaths = [];
+    this._ownedModelPaths = [];
     this._jsBackedStagingMounted = false;
+    this._jsStagingMountCounter = 0;
+    this._activeJsStagingMounts = new Set();
     this._modelBytes = 0;
     this._mmProjPath = null;
+    this._ownedMmProjPath = null;
     this._mmSupportsVision = false;
     this._mmSupportsAudio = false;
     this._mediaFileCounter = 0;
@@ -1375,22 +1383,25 @@ export class LlamaWebGpuBridgeRuntime {
         `JS-backed model staging ('jsBackedModelStaging' / 'model_staging_js_backed') is not supported by this core binary (missing exports: ${missingExports.join(', ')}). Update the core build or disable jsBackedModelStaging.`,
       );
     }
+    this._jsStagingMountCounter += 1;
+    const mountPath = `/jsmodels-${this._jsStagingMountCounter}`;
     const mountRc = Number(
-      core.ccall('llamadart_webgpu_mount_js_model_fs', 'number', ['string'], ['/jsmodels']),
+      core.ccall('llamadart_webgpu_mount_js_model_fs', 'number', ['string'], [mountPath]),
     );
     if (mountRc !== 0) {
       this._pushRuntimeNote('model_staging_mount_failed');
       const detail = mountRc === -20 || mountRc === -17
-        ? 'the /jsmodels path already exists under another filesystem backend'
+        ? `the ${mountPath} path already exists under another filesystem backend`
         : `rc=${mountRc}`;
       throw new ModelStagingError(
         'MODEL_STAGING_MOUNT_FAILED',
-        `Failed to mount JS-backed model filesystem at /jsmodels (${detail}).`,
+        `Failed to mount JS-backed model filesystem at ${mountPath} (${detail}).`,
       );
     }
+    this._activeJsStagingMounts.add(mountPath);
     this._jsBackedStagingMounted = true;
     this._pushRuntimeNote(noteTag);
-    return '/jsmodels';
+    return mountPath;
   }
 
   _openDirectJsWriter(
@@ -1481,27 +1492,36 @@ export class LlamaWebGpuBridgeRuntime {
     );
   }
 
-  _releaseJsModelStaging(core: LlamaCoreModule | null = this._core) {
-    if (!core || !this._jsBackedStagingMounted) {
-      this._jsBackedStagingMounted = false;
+  _releaseJsModelStaging(
+    core: LlamaCoreModule | null = this._core,
+    mountPath: string | null = null,
+  ) {
+    const targets = mountPath
+      ? (this._activeJsStagingMounts.delete(mountPath) ? [mountPath] : [])
+      : [...this._activeJsStagingMounts];
+    if (!mountPath) {
+      this._activeJsStagingMounts.clear();
+    }
+    this._jsBackedStagingMounted = this._activeJsStagingMounts.size > 0;
+    if (!core || targets.length === 0) {
       return;
     }
 
-    this._jsBackedStagingMounted = false;
     if ((core as { ABORT?: unknown }).ABORT === true) {
       return;
     }
-    try {
-      core.ccall('llamadart_webgpu_unmount_js_model_fs', 'number', ['string'], ['/jsmodels']);
-    } catch (_) {
-      // Ignore cleanup failures against a dead or custom core missing unmount.
+    for (const targetMount of targets) {
+      try {
+        core.ccall('llamadart_webgpu_unmount_js_model_fs', 'number', ['string'], [targetMount]);
+      } catch (_) {
+        // Ignore cleanup failures against a dead or custom core missing unmount.
+      }
     }
   }
 
-  _releaseModelFiles() {
-    const paths = Array.isArray(this._modelPaths) && this._modelPaths.length > 0
-      ? [...this._modelPaths]
-      : (this._modelPath ? [this._modelPath] : []);
+  _releaseModelFiles(mountPath: string | null = null) {
+    const paths = [...this._ownedModelPaths];
+    this._ownedModelPaths = [];
 
     let removed = 0;
     for (const path of paths) {
@@ -1511,7 +1531,10 @@ export class LlamaWebGpuBridgeRuntime {
     }
 
     this._modelPaths = [];
-    this._releaseJsModelStaging();
+    this._modelPath = null;
+    if (mountPath) {
+      this._releaseJsModelStaging(this._core, mountPath);
+    }
     return removed;
   }
 
@@ -1520,9 +1543,9 @@ export class LlamaWebGpuBridgeRuntime {
   // The core refuses while a generation or speech synthesis is still active,
   // which leaves the current model untouched.
   async _releaseLoadedModel(core: LlamaCoreModule) {
-    const projectorPath = this._mmProjPath;
-    const hasModelFiles = Array.isArray(this._modelPaths) && this._modelPaths.length > 0;
-    if (this._modelBytes <= 0 && !projectorPath && !hasModelFiles) {
+    const hasModelFiles = this._ownedModelPaths.length > 0
+      || (Array.isArray(this._modelPaths) && this._modelPaths.length > 0);
+    if (this._modelBytes <= 0 && !this._mmProjPath && !this._ownedMmProjPath && !hasModelFiles) {
       return false;
     }
 
@@ -1535,8 +1558,12 @@ export class LlamaWebGpuBridgeRuntime {
 
     this._loraAdaptersLoaded = false;
     this._clearStagedMediaFiles();
-    this._deleteFsFile(projectorPath);
+    if (this._ownedMmProjPath) {
+      this._deleteFsFile(this._ownedMmProjPath);
+      this._ownedMmProjPath = null;
+    }
     this._releaseModelFiles();
+    this._releaseJsModelStaging(core);
     this._modelPath = null;
     this._modelBytes = 0;
     this._modelSource = 'network';
@@ -2262,12 +2289,14 @@ export class LlamaWebGpuBridgeRuntime {
       this._runtimeNotes.push('model_fetch_backend_skipped_split');
     }
 
+    let stagingMountPath: string | null = null;
     try {
       if (!loadedViaRemoteFetch) {
       const useJsBackedStaging = this._config.jsBackedModelStaging === true;
       let modelDir = '/models';
       if (useJsBackedStaging) {
-        modelDir = this._mountJsBackedStaging(core, 'model_staging_js_backed');
+        stagingMountPath = this._mountJsBackedStaging(core, 'model_staging_js_backed');
+        modelDir = stagingMountPath;
       } else {
         ensureFsDirectory(core.FS, '/models');
       }
@@ -2291,6 +2320,8 @@ export class LlamaWebGpuBridgeRuntime {
       };
 
       const modelPaths = [];
+      const ownedPaths: string[] = [];
+      this._ownedModelPaths = ownedPaths;
       let totalModelBytes = 0;
       const maxStreamResumeRetries = Number.isFinite(options.streamResumeRetries)
         ? Math.max(0, Math.trunc(options.streamResumeRetries as number))
@@ -2367,6 +2398,9 @@ export class LlamaWebGpuBridgeRuntime {
             }
 
             try {
+              if (!ownedPaths.includes(modelPath)) {
+                ownedPaths.push(modelPath);
+              }
               const directWriter = useJsBackedStaging
                 ? this._openDirectJsWriter(
                     core,
@@ -2558,9 +2592,7 @@ export class LlamaWebGpuBridgeRuntime {
         if (operationSignal?.aborted) {
           this._loadedModelUrl = null;
         }
-        for (const modelPath of modelPaths) {
-          this._deleteFsFile(modelPath);
-        }
+        this._releaseModelFiles(stagingMountPath);
         throw error;
       }
     }
@@ -2753,11 +2785,12 @@ export class LlamaWebGpuBridgeRuntime {
     this._stagedMediaPaths = [];
     this._gpuActive = this._gpuActive && this._nGpuLayers > 0;
 
-      if (this._releaseModelFiles() > 0) {
+      if (this._releaseModelFiles(stagingMountPath) > 0) {
         this._runtimeNotes.push('model_file_released');
       }
     } finally {
-      this._releaseJsModelStaging(core);
+      this._releaseModelFiles(stagingMountPath);
+      this._releaseJsModelStaging(core, stagingMountPath);
     }
 
     this._emitSuppressedWarmupWarningSummaryIfNeeded();
@@ -2779,17 +2812,19 @@ export class LlamaWebGpuBridgeRuntime {
     const fileName = basenameFromUrl(url);
     const fetchTimeoutMs = this._resolveFetchTimeoutMs({}, 180000);
     const chunkTimeoutMs = this._resolveStreamChunkTimeoutMs({}, 90000);
+    if (!useJsBackedStaging) {
+      ensureFsDirectory(core.FS, '/mmproj');
+    }
     let lastError = null;
 
     for (let attempt = 0; attempt < 2; attempt += 1) {
+      let stagingMountPath: string | null = null;
       let mmprojPath = `/mmproj/${fileName}`;
       let createdMmprojPath: string | null = null;
       try {
         if (useJsBackedStaging) {
-          const mmprojDir = this._mountJsBackedStaging(core, 'mmproj_staging_js_backed');
-          mmprojPath = `${mmprojDir}/${fileName}`;
-        } else {
-          ensureFsDirectory(core.FS, '/mmproj');
+          stagingMountPath = this._mountJsBackedStaging(core, 'mmproj_staging_js_backed');
+          mmprojPath = `${stagingMountPath}/${fileName}`;
         }
 
         const response = await this._fetchWithTimeout(
@@ -2804,6 +2839,7 @@ export class LlamaWebGpuBridgeRuntime {
         }
 
         this._mmProjPath = mmprojPath;
+        this._ownedMmProjPath = mmprojPath;
         createdMmprojPath = mmprojPath;
         let knownTotalBytes = 0;
         let directWriter: DirectFileChunkWriter | null = null;
@@ -2851,10 +2887,12 @@ export class LlamaWebGpuBridgeRuntime {
         if (this._deleteFsFile(mmprojPath)) {
           this._runtimeNotes.push('mmproj_file_released');
         }
+        this._ownedMmProjPath = null;
         return 1;
       } catch (error) {
         lastError = error;
         this._mmProjPath = null;
+        this._ownedMmProjPath = null;
         this._mmSupportsVision = false;
         this._mmSupportsAudio = false;
         if (createdMmprojPath) {
@@ -2867,7 +2905,7 @@ export class LlamaWebGpuBridgeRuntime {
         if (stagingAllocError) {
           throw stagingAllocError;
         }
-        if (error instanceof ModelStagingError) {
+        if (useJsBackedStaging && error instanceof ModelStagingError) {
           throw error;
         }
 
@@ -2878,7 +2916,7 @@ export class LlamaWebGpuBridgeRuntime {
 
         this._runtimeNotes.push(`mmproj_load_retry:${attempt + 1}`);
       } finally {
-        this._releaseJsModelStaging(core);
+        this._releaseJsModelStaging(core, stagingMountPath);
       }
     }
 
@@ -2892,6 +2930,7 @@ export class LlamaWebGpuBridgeRuntime {
   async unloadMultimodalProjector() {
     if (!this._core) {
       this._mmProjPath = null;
+      this._ownedMmProjPath = null;
       this._mmSupportsVision = false;
       this._mmSupportsAudio = false;
       this._mmProjSourceUrl = null;
@@ -2905,7 +2944,10 @@ export class LlamaWebGpuBridgeRuntime {
     if (rc !== 0) {
       throw new Error(this._coreErrorMessage('Failed to unload multimodal projector', rc));
     }
-    this._deleteFsFile(mmprojPath);
+    if (mmprojPath && this._ownedMmProjPath === mmprojPath) {
+      this._deleteFsFile(mmprojPath);
+    }
+    this._ownedMmProjPath = null;
     this._mmProjPath = null;
     this._mmSupportsVision = false;
     this._mmSupportsAudio = false;
@@ -4847,17 +4889,23 @@ export class LlamaWebGpuBridgeRuntime {
         );
       }
       await this._core.ccall('llamadart_webgpu_shutdown', null, [], [], { async: true });
-      this._deleteFsFile(mmprojPath);
+      if (mmprojPath && this._ownedMmProjPath === mmprojPath) {
+        this._deleteFsFile(mmprojPath);
+      }
+      this._releaseModelFiles();
       this._releaseJsModelStaging(this._core);
     }
     this._modelPath = null;
     this._modelPaths = [];
+    this._ownedModelPaths = [];
     this._jsBackedStagingMounted = false;
+    this._activeJsStagingMounts.clear();
     this._modelBytes = 0;
     this._modelSource = 'network';
     this._modelCacheState = 'disabled';
     this._loadedModelUrl = null;
     this._mmProjPath = null;
+    this._ownedMmProjPath = null;
     this._mmProjSourceUrl = null;
     this._mmSupportsVision = false;
     this._mmSupportsAudio = false;

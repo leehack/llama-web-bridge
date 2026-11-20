@@ -76,12 +76,12 @@ addToLibrary({
     llamadartJsModelFsState.nextPreallocBytes = bytes > 0 ? bytes : 0;
   },
 
-  _llamadart_js_model_fs_alloc_file__sig: 'vp',
+  _llamadart_js_model_fs_alloc_file__sig: 'vpi',
   _llamadart_js_model_fs_alloc_file__deps: [
     '$llamadartJsModelFsState',
     '$llamadartJsModelFsFiles',
   ],
-  _llamadart_js_model_fs_alloc_file: (fileId) => {
+  _llamadart_js_model_fs_alloc_file: (fileId, mountId) => {
     const chunkSize = llamadartJsModelFsState.chunkSize;
     const preallocBytes = llamadartJsModelFsState.nextPreallocBytes;
     llamadartJsModelFsState.nextPreallocBytes = 0;
@@ -104,6 +104,7 @@ addToLibrary({
     }
 
     llamadartJsModelFsFiles().set(fileId, {
+      mountId: Number(mountId) | 0,
       size: 0,
       chunkSize,
       chunks,
@@ -322,22 +323,28 @@ addToLibrary({
     return 0;
   },
 
-  _llamadart_js_model_fs_release_all__sig: 'v',
-  _llamadart_js_model_fs_release_all__deps: [
-    '$llamadartJsModelFsState',
+  _llamadart_js_model_fs_release_mount__sig: 'vi',
+  _llamadart_js_model_fs_release_mount__deps: [
     '$llamadartJsModelFsFiles',
     '$llamadartJsModelFsHandles',
   ],
-  _llamadart_js_model_fs_release_all: () => {
+  _llamadart_js_model_fs_release_mount: (mountId) => {
     const files = llamadartJsModelFsFiles();
-    for (const file of files.values()) {
+    const handles = llamadartJsModelFsHandles();
+    const targetMountId = Number(mountId) | 0;
+    for (const [fileId, file] of files.entries()) {
+      if ((file.mountId | 0) !== targetMountId) {
+        continue;
+      }
       file.chunks.length = 0;
       file.size = 0;
+      files.delete(fileId);
     }
-    files.clear();
-    llamadartJsModelFsHandles().clear();
-    llamadartJsModelFsState.nextHandle = 1;
-    llamadartJsModelFsState.nextPreallocBytes = 0;
+    for (const [handle, fileId] of handles.entries()) {
+      if (!files.has(fileId)) {
+        handles.delete(handle);
+      }
+    }
   },
 
   _llamadart_js_model_fs_consume_oom_bytes__sig: 'd',

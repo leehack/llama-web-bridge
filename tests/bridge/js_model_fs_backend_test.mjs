@@ -241,27 +241,32 @@ test('js allocation failure records OOM bytes, leaks zero chunks, and releases c
 
   // Preallocation OOM returns -ENOMEM on write and leaks zero chunks.
   callNative('_llamadart_js_model_fs_set_next_prealloc_bytes', [8192]);
-  callNative('_llamadart_js_model_fs_alloc_file', [1]);
+  callNative('_llamadart_js_model_fs_alloc_file', [1, 11]);
   assert.equal(callNative('_llamadart_js_model_fs_allocated_bytes'), 0);
   assert.equal(callNative('_llamadart_js_model_fs_write', [1, 0, 16, 0]), -cDefs.ENOMEM);
   assert.equal(callNative('_llamadart_js_model_fs_consume_oom_bytes'), 8192);
   assert.equal(callNative('_llamadart_js_model_fs_consume_oom_bytes'), 0);
-  callNative('_llamadart_js_model_fs_release_all');
+  callNative('_llamadart_js_model_fs_release_mount', [11]);
   assert.equal(callNative('_llamadart_js_model_fs_allocated_bytes'), 0);
 
   // Mid-stream write OOM releases file chunks too and allows subsequent retry.
-  callNative('_llamadart_js_model_fs_alloc_file', [2]);
+  callNative('_llamadart_js_model_fs_alloc_file', [2, 12]);
   assert.equal(callNative('_llamadart_js_model_fs_write', [2, 0, 16, 0]), -cDefs.ENOMEM);
   assert.equal(callNative('_llamadart_js_model_fs_allocated_bytes'), 0);
   assert.ok(callNative('_llamadart_js_model_fs_consume_oom_bytes') > 0);
-  callNative('_llamadart_js_model_fs_release_all');
+  callNative('_llamadart_js_model_fs_release_mount', [12]);
 
   failAlloc = false;
   callNative('_llamadart_js_model_fs_set_next_prealloc_bytes', [4096]);
-  callNative('_llamadart_js_model_fs_alloc_file', [3]);
-  assert.equal(callNative('_llamadart_js_model_fs_allocated_bytes'), 4096);
+  callNative('_llamadart_js_model_fs_alloc_file', [3, 13]);
+  callNative('_llamadart_js_model_fs_set_next_prealloc_bytes', [4096]);
+  callNative('_llamadart_js_model_fs_alloc_file', [4, 14]);
+  assert.equal(callNative('_llamadart_js_model_fs_allocated_bytes'), 8192);
   assert.equal(callNative('_llamadart_js_model_fs_write', [3, 0, 16, 0]), 16);
-  callNative('_llamadart_js_model_fs_release_all');
+  // Releasing mount 13 frees only file 3, preserving mount 14's file 4.
+  callNative('_llamadart_js_model_fs_release_mount', [13]);
+  assert.equal(callNative('_llamadart_js_model_fs_allocated_bytes'), 4096);
+  callNative('_llamadart_js_model_fs_release_mount', [14]);
   assert.equal(callNative('_llamadart_js_model_fs_allocated_bytes'), 0);
 });
 
@@ -429,31 +434,45 @@ struct DummyMemBackend {};
 DummyMemBackend g_mem_backend_obj;
 ::backend_t g_mem_backend = reinterpret_cast<::backend_t>(&g_mem_backend_obj);
 int64_t g_prealloc = 0;
-std::map<uintptr_t, size_t> g_js_chunks;
+struct ChunkEntry {
+  size_t bytes = 0;
+  int32_t mount_id = 0;
+};
+std::map<uintptr_t, ChunkEntry> g_js_chunks;
 size_t g_oom = 0;
 }
 
 extern "C" {
 void _llamadart_js_model_fs_set_next_prealloc_bytes(int64_t b) { g_prealloc = b; }
-void _llamadart_js_model_fs_alloc_file(uintptr_t id) {
-  g_js_chunks[id] = g_prealloc > 0 ? static_cast<size_t>(g_prealloc) : 0;
+void _llamadart_js_model_fs_alloc_file(uintptr_t id, int32_t mount_id) {
+  g_js_chunks[id] = {g_prealloc > 0 ? static_cast<size_t>(g_prealloc) : 0, mount_id};
   g_prealloc = 0;
 }
 void _llamadart_js_model_fs_free_file(uintptr_t id) { g_js_chunks.erase(id); }
 int32_t _llamadart_js_model_fs_bind_direct(uintptr_t id) { return g_js_chunks.count(id) ? 1 : -EBADF; }
 void _llamadart_js_model_fs_unbind_direct(int32_t) {}
 int32_t _llamadart_js_model_fs_write(uintptr_t id, const uint8_t*, uint32_t len, int64_t) {
-  if (g_js_chunks[id] < 64u * 1024u * 1024u) g_js_chunks[id] = 64u * 1024u * 1024u;
+  if (g_js_chunks[id].bytes < 64u * 1024u * 1024u) {
+    g_js_chunks[id].bytes = 64u * 1024u * 1024u;
+  }
   return static_cast<int32_t>(len);
 }
 int32_t _llamadart_js_model_fs_read(uintptr_t, uint8_t*, uint32_t, int64_t) { return 0; }
 void _llamadart_js_model_fs_get_size(uintptr_t, int64_t* out) { *out = 0; }
 int32_t _llamadart_js_model_fs_set_size(uintptr_t, int64_t) { return 0; }
-void _llamadart_js_model_fs_release_all() { g_js_chunks.clear(); }
+void _llamadart_js_model_fs_release_mount(int32_t mount_id) {
+  for (auto it = g_js_chunks.begin(); it != g_js_chunks.end(); ) {
+    if (it->second.mount_id == mount_id) {
+      it = g_js_chunks.erase(it);
+    } else {
+      ++it;
+    }
+  }
+}
 double _llamadart_js_model_fs_consume_oom_bytes() { double r = g_oom; g_oom = 0; return r; }
 double _llamadart_js_model_fs_allocated_bytes() {
   size_t total = 0;
-  for (const auto& kv : g_js_chunks) total += kv.second;
+  for (const auto& kv : g_js_chunks) total += kv.second.bytes;
   return static_cast<double>(total);
 }
 
@@ -501,15 +520,28 @@ int main() {
   assert(llamadart_webgpu_is_js_model_path("/jsmodels/a.gguf"));
   assert(!llamadart_webgpu_is_js_model_path("/models/a.gguf"));
 
-  // 3) An unlinked file still open (shared_ptr held across unmount) must release all chunks to 0 bytes.
+  // 2b) Remounting an existing JS-model mount must fail with -EEXIST (never adopt it).
+  assert(llamadart_webgpu_mount_js_model_fs("/jsmodels") == -EEXIST);
+  assert(llamadart_webgpu_is_js_model_path("/jsmodels/a.gguf"));
+
+  // 3) Multiple independent mounts isolate chunk release on unmount.
+  assert(llamadart_webgpu_mount_js_model_fs("/snapshots") == 0);
   auto* backend = reinterpret_cast<wasmfs::Backend*>(g_dirs["/jsmodels"].backend);
+  auto* snap_backend = reinterpret_cast<wasmfs::Backend*>(g_dirs["/snapshots"].backend);
+  assert(backend != snap_backend);
   {
     std::shared_ptr<wasmfs::DataFile> open_fd = backend->createFile(0666);
+    std::shared_ptr<wasmfs::DataFile> snap_fd = snap_backend->createFile(0666);
     uint8_t byte = 42;
     assert(open_fd->write(&byte, 1, 0) == 1);
-    assert(llamadart_webgpu_js_model_fs_allocated_bytes() == 64.0 * 1024.0 * 1024.0);
-    // Unmount while open_fd still holds a strong reference (simulating open unlinked fd).
+    assert(snap_fd->write(&byte, 1, 0) == 1);
+    assert(llamadart_webgpu_js_model_fs_allocated_bytes() == 128.0 * 1024.0 * 1024.0);
+    // Unmount /jsmodels while open_fd still holds a strong reference; /snapshots must stay intact.
     assert(llamadart_webgpu_unmount_js_model_fs("/jsmodels") == 0);
+    assert(llamadart_webgpu_js_model_fs_allocated_bytes() == 64.0 * 1024.0 * 1024.0);
+    assert(llamadart_webgpu_is_js_model_path("/snapshots/keep.bin"));
+    assert(!llamadart_webgpu_is_js_model_path("/jsmodels/a.gguf"));
+    assert(llamadart_webgpu_unmount_js_model_fs("/snapshots") == 0);
     assert(llamadart_webgpu_js_model_fs_allocated_bytes() == 0.0);
   }
 
@@ -548,12 +580,12 @@ int wasmfs_unmount(const char* path);
     const run = spawnSync(exe, [], { encoding: 'utf8' });
     assert.equal(run.status, 0, `${run.signal}: ${run.stderr}`);
 
-    // Mutation check: removing _llamadart_js_model_fs_release_all() from unmount must fail.
+    // Mutation check: removing _llamadart_js_model_fs_release_mount(mount_id) from unmount must fail.
     const mutatedCppPath = path.join(dir, 'mutated.cpp');
     const mutatedExe = path.join(dir, 'test_js_model_fs_mutated');
     writeFileSync(
       mutatedCppPath,
-      cppFsSource.replace('  _llamadart_js_model_fs_release_all();\n', '  /* mutated_release_removed */\n'),
+      cppFsSource.replace('  _llamadart_js_model_fs_release_mount(mount_id);\n', '  /* mutated_release_removed */\n'),
     );
     const mutComp = spawnSync(
       process.env.CXX || 'c++',

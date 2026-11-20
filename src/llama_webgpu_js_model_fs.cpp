@@ -7,7 +7,7 @@
 #include <string>
 #include <sys/stat.h>
 #include <unistd.h>
-#include <unordered_set>
+#include <unordered_map>
 
 #include <emscripten/emscripten.h>
 #include <emscripten/wasmfs.h>
@@ -19,7 +19,7 @@
 
 extern "C" {
 void _llamadart_js_model_fs_set_next_prealloc_bytes(int64_t bytes);
-void _llamadart_js_model_fs_alloc_file(uintptr_t file_id);
+void _llamadart_js_model_fs_alloc_file(uintptr_t file_id, int32_t mount_id);
 void _llamadart_js_model_fs_free_file(uintptr_t file_id);
 int32_t _llamadart_js_model_fs_bind_direct(uintptr_t file_id);
 void _llamadart_js_model_fs_unbind_direct(int32_t handle);
@@ -35,7 +35,7 @@ int32_t _llamadart_js_model_fs_read(
     int64_t offset);
 void _llamadart_js_model_fs_get_size(uintptr_t file_id, int64_t * out_size);
 int32_t _llamadart_js_model_fs_set_size(uintptr_t file_id, int64_t size);
-void _llamadart_js_model_fs_release_all();
+void _llamadart_js_model_fs_release_mount(int32_t mount_id);
 double _llamadart_js_model_fs_consume_oom_bytes();
 double _llamadart_js_model_fs_allocated_bytes();
 }
@@ -89,9 +89,9 @@ class ChunkedJsModelFile : public wasmfs::DataFile {
   }
 
 public:
-  ChunkedJsModelFile(mode_t mode, wasmfs::backend_t backend)
+  ChunkedJsModelFile(mode_t mode, wasmfs::backend_t backend, int32_t mount_id)
       : wasmfs::DataFile(mode, backend) {
-    _llamadart_js_model_fs_alloc_file(getFileIndex());
+    _llamadart_js_model_fs_alloc_file(getFileIndex(), mount_id);
   }
 
   ~ChunkedJsModelFile() override {
@@ -100,9 +100,13 @@ public:
 };
 
 class ChunkedJsModelBackend : public wasmfs::Backend {
+  int32_t mount_id_;
+
 public:
+  explicit ChunkedJsModelBackend(int32_t mount_id) : mount_id_(mount_id) {}
+
   std::shared_ptr<wasmfs::DataFile> createFile(mode_t mode) override {
-    return std::make_shared<ChunkedJsModelFile>(mode, this);
+    return std::make_shared<ChunkedJsModelFile>(mode, this, mount_id_);
   }
 
   std::shared_ptr<wasmfs::Directory> createDirectory(mode_t mode) override {
@@ -116,16 +120,9 @@ public:
 
 bool g_has_js_model_mounts = false;
 
-std::unordered_set<std::string> & mounted_js_model_paths() {
-  static auto * paths = new std::unordered_set<std::string>();
+std::unordered_map<std::string, int32_t> & mounted_js_model_paths() {
+  static auto * paths = new std::unordered_map<std::string, int32_t>();
   return *paths;
-}
-
-wasmfs::backend_t shared_js_model_backend() {
-  // Reuse one backend across unmount/remount retries so wasmFS.backends stays bounded.
-  static wasmfs::backend_t backend =
-      wasmfs::wasmFS.addBackend(std::make_unique<ChunkedJsModelBackend>());
-  return backend;
 }
 
 }  // namespace
@@ -139,21 +136,21 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_mount_js_model_fs(const char * mou
 
   std::string path_str(mount_path);
   auto & mounted = mounted_js_model_paths();
-  wasmfs::backend_t backend = shared_js_model_backend();
-  if (backend == nullptr) {
-    return -ENOMEM;
+  if (wasmfs_get_backend_by_path(mount_path) != nullptr ||
+      mounted.find(path_str) != mounted.end()) {
+    return -EEXIST;
   }
 
-  ::backend_t existing_backend = wasmfs_get_backend_by_path(mount_path);
-  if (existing_backend != nullptr) {
-    if (existing_backend == reinterpret_cast<::backend_t>(backend)) {
-      mounted.insert(path_str);
-      g_has_js_model_mounts = true;
-      return 0;
-    }
-    mounted.erase(path_str);
-    g_has_js_model_mounts = !mounted.empty();
-    return -EEXIST;
+  static int32_t next_mount_id = 1;
+  int32_t mount_id = next_mount_id++;
+  if (next_mount_id <= 0) {
+    next_mount_id = 1;
+  }
+
+  wasmfs::backend_t backend =
+      wasmfs::wasmFS.addBackend(std::make_unique<ChunkedJsModelBackend>(mount_id));
+  if (backend == nullptr) {
+    return -ENOMEM;
   }
 
   const int rc = wasmfs_create_directory(
@@ -164,13 +161,13 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_mount_js_model_fs(const char * mou
     return rc;
   }
 
-  mounted.insert(path_str);
+  mounted.emplace(std::move(path_str), mount_id);
   g_has_js_model_mounts = true;
   return 0;
 }
 
 bool llamadart_webgpu_is_js_model_path(const char * path) {
-  // Fast zero-allocation check so staging-off builds never construct the set.
+  // Fast zero-allocation check so staging-off builds never construct the map.
   if (!g_has_js_model_mounts || path == nullptr || std::strlen(path) == 0) {
     return false;
   }
@@ -179,7 +176,8 @@ bool llamadart_webgpu_is_js_model_path(const char * path) {
     return false;
   }
   std::string path_str(path);
-  for (const std::string & mount : mounted) {
+  for (const auto & entry : mounted) {
+    const std::string & mount = entry.first;
     if (path_str == mount) {
       return true;
     }
@@ -193,13 +191,13 @@ bool llamadart_webgpu_is_js_model_path(const char * path) {
 }
 
 EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_unmount_js_model_fs(const char * mount_path) {
-  _llamadart_js_model_fs_release_all();
   auto & mounted = mounted_js_model_paths();
 
   if (mount_path == nullptr || std::strlen(mount_path) == 0) {
     int first_error = 0;
-    for (const std::string & path_str : mounted) {
-      const int rc = wasmfs_unmount(path_str.c_str());
+    for (const auto & entry : mounted) {
+      _llamadart_js_model_fs_release_mount(entry.second);
+      const int rc = wasmfs_unmount(entry.first.c_str());
       if (rc != 0 && rc != -ENOENT && first_error == 0) {
         first_error = rc;
       }
@@ -209,7 +207,14 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_unmount_js_model_fs(const char * m
     return first_error;
   }
 
-  mounted.erase(std::string(mount_path));
+  auto it = mounted.find(std::string(mount_path));
+  if (it == mounted.end()) {
+    return wasmfs_get_backend_by_path(mount_path) != nullptr ? -EINVAL : 0;
+  }
+
+  const int32_t mount_id = it->second;
+  _llamadart_js_model_fs_release_mount(mount_id);
+  mounted.erase(it);
   g_has_js_model_mounts = !mounted.empty();
   const int rc = wasmfs_unmount(mount_path);
   return rc == -ENOENT ? 0 : rc;

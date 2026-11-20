@@ -158,7 +158,7 @@ it.
 | `workerUrl` | `string` | URL for `llama_webgpu_bridge_worker.js`. Defaults to a sibling of the bridge module when possible. |
 | `disableWorker` | `boolean` | Force direct runtime mode. |
 | `allowSingleThreadCore` | `boolean` | Set for a `coreModuleUrl` core built without pthreads (`WEBGPU_BRIDGE_PTHREADS=0`). It then loads on a page that is not cross-origin isolated, capped to one thread (`threads_capped_no_coi`), instead of rejecting with `CrossOriginIsolationError`. |
-| `jsBackedModelStaging` | `boolean` | Opt-in (`false` by default). Use for models over ~1 GB on `wasm32`, or large models on `memory64` to cut peak wasm heap; streams models and multimodal projectors directly into 64 MiB JS `Uint8Array` chunks under `/jsmodels` (`model_staging_js_backed`, `mmproj_staging_js_backed`) and releases all chunks on completion or failure, at the cost of slightly slower small loads and temporary JS heap storage. |
+| `jsBackedModelStaging` | `boolean` | Opt-in (`false` by default). Use for models over ~1 GB on `wasm32`, or large models on `memory64` to cut peak wasm heap; streams models and multimodal projectors directly into 64 MiB JS `Uint8Array` chunks under a private per-operation `/jsmodels-<n>` mount (`model_staging_js_backed`, `mmproj_staging_js_backed`) and releases that mount's chunks on completion or failure, at the cost of slightly slower small loads and temporary JS heap storage. |
 | `preferMemory64` | `boolean` | Prefer the wasm64 core when available. Defaults to `true`; the runtime can still fall back to wasm32. |
 | `workerRequestTimeoutMs` | `number` | Default timeout for worker RPC calls, 2 minutes unless a method has its own default. It also sets the `embed`/`embedBatch` budget, which defaults to 10 minutes when an input has image or audio parts. |
 | `workerInitTimeoutMs` | `number` | Timeout for worker initialization. |
@@ -1258,9 +1258,9 @@ this function themselves.
   for any large model on `memory64` to cut the peak wasm heap (for example, when
   serving without cross-origin isolation using `WEBGPU_BRIDGE_PTHREADS=0` +
   `allowSingleThreadCore: true`). It streams fetched model and multimodal
-  projector GGUFs directly into 64 MiB JS `Uint8Array` chunks under `/jsmodels`
-  without copying through WASMFS, and unmounts/releases all chunks after load
-  completes or fails. Its
+  projector GGUFs directly into 64 MiB JS `Uint8Array` chunks under a private
+  per-operation `/jsmodels-<n>` mount without copying through WASMFS, and
+  unmounts/releases only that mount's chunks after load completes or fails. Its
   cost is slightly slower native chunk reads on small loads (`Qwen3-0.6B-Q8_0`
   3-run median `nativeLoadMs` `480.9 ms` vs `444.6 ms` off; total load
   `1,317.7 ms` vs `1,660.5 ms` as direct staging skips wasm memory growth) and
@@ -1268,8 +1268,8 @@ this function themselves.
   JS allocation failure during staging throws `ModelStagingError` with code
   `'MODEL_STAGING_ALLOCATION_FAILED'`, an unsupported older core missing
   JS-backed exports throws `'MODEL_STAGING_UNSUPPORTED'`, an existing
-  non-backend path collision at `/jsmodels` throws
-  `'MODEL_STAGING_MOUNT_FAILED'`, and a single or split GGUF whose tensor
+  directory or mount at the staging path throws
+  `'MODEL_STAGING_MOUNT_FAILED'` (without adopting it), and a single or split GGUF whose tensor
   payload exceeds the wasm32 `4 GiB` (`SIZE_MAX`) limit throws
   `ModelStagingError` with code `'MODEL_TENSOR_SIZE_LIMIT_EXCEEDED'`. Measured
   on Chrome WebGPU (Apple Metal-3, `nCtx: 2048`, `nGpuLayers: 999`,

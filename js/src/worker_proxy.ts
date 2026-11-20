@@ -163,7 +163,8 @@ export class BridgeWorkerProxy {
         const errorMessage = String(message.message || 'Worker request failed');
         const workerError: Error & { state?: unknown } = message.embeddingErrorCode
           ? new EmbeddingError(message.embeddingErrorCode, errorMessage)
-          : isModelStagingErrorCode(message.modelStagingErrorCode)
+          : (this._config.jsBackedModelStaging === true
+            && isModelStagingErrorCode(message.modelStagingErrorCode))
             ? new ModelStagingError(message.modelStagingErrorCode, errorMessage)
             : message.errorCode === CROSS_ORIGIN_ISOLATION_REQUIRED
               ? new CrossOriginIsolationError(errorMessage)
