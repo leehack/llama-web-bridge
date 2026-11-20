@@ -68,7 +68,7 @@ export function sumProgressValues(values: Iterable<unknown> | null | undefined):
   return total;
 }
 
-function createModelTransferLengthError(message: string): Error {
+export function createModelTransferLengthError(message: string): Error {
   const error = new Error(message);
   error.name = 'ModelTransferLengthError';
   return error;
@@ -135,6 +135,87 @@ export function inferResponseTotalBytes(
   }
 
   return parsePositiveInteger(loadedFallback);
+}
+
+export interface ResumeIdentity {
+  url: string;
+  strongEtag: string | null;
+  etag: string | null;
+  lastModified: string | null;
+  total: number;
+}
+
+type ResumeVerdict =
+  | { verdict: 'changed'; reason: 'url' | 'range' | 'etag' | 'last_modified' }
+  | { verdict: 'validated' | 'unvalidated'; total: number };
+
+export function strongEtagOf(value: string | null): string | null {
+  return value !== null && /^"[\x21\x23-\x7E\x80-\xFF]*"$/.test(value) ? value : null;
+}
+
+export function captureResumeIdentity(
+  response: Response,
+  finalUrl: string,
+  total: number,
+): ResumeIdentity {
+  const etag = response.headers.get('etag');
+  return {
+    url: finalUrl,
+    strongEtag: strongEtagOf(etag),
+    etag,
+    lastModified: response.headers.get('last-modified'),
+    total,
+  };
+}
+
+export function classifyResumeResponse(
+  identity: ResumeIdentity,
+  response: Response,
+  finalUrl: string,
+  offset: number,
+): ResumeVerdict {
+  if (finalUrl !== identity.url) return { verdict: 'changed', reason: 'url' };
+
+  let total = identity.total;
+  let rangeVerified = false;
+  const contentRange = response.headers.get('content-range');
+  if (contentRange !== null) {
+    const match = /^bytes (\d+)-(\d+)\/(\d+)$/.exec(contentRange);
+    if (!match) return { verdict: 'changed', reason: 'range' };
+    const [, start, end, declaredTotal] = match.map(Number);
+    if (!Number.isSafeInteger(declaredTotal) || start !== offset || end < start
+      || end !== declaredTotal - 1 || (total > 0 && declaredTotal !== total)) {
+      return { verdict: 'changed', reason: 'range' };
+    }
+    total = declaredTotal;
+    rangeVerified = true;
+  } else {
+    const contentLength = response.headers.get('content-length');
+    if (total > 0 && contentLength !== null && /^\d+$/.test(contentLength)) {
+      if (Number(contentLength) !== total - offset) return { verdict: 'changed', reason: 'range' };
+      rangeVerified = true;
+    }
+  }
+
+  // A resumed Content-Length counts the tail. X-Linked-Size describes the full shard.
+  const linkedSize = parsePositiveInteger(response.headers.get('x-linked-size'));
+  if (linkedSize > 0 && total > 0 && linkedSize !== total) {
+    return { verdict: 'changed', reason: 'range' };
+  }
+
+  const etag = response.headers.get('etag');
+  if (identity.strongEtag !== null) {
+    if (strongEtagOf(etag) !== identity.strongEtag) return { verdict: 'changed', reason: 'etag' };
+  } else {
+    if (etag !== identity.etag) return { verdict: 'changed', reason: 'etag' };
+    const lastModified = response.headers.get('last-modified');
+    if (lastModified !== identity.lastModified) return { verdict: 'changed', reason: 'last_modified' };
+  }
+
+  return {
+    verdict: identity.strongEtag !== null && rangeVerified ? 'validated' : 'unvalidated',
+    total: total || linkedSize,
+  };
 }
 
 export function isRetryableStreamNetworkError(error: unknown): boolean {
