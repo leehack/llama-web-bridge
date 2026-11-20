@@ -196,6 +196,17 @@ run's staged byte count and peak wasm heap. The worker run also calls the
 native URL loader directly and checks that it returns `-7`. This is a local
 acceptance check.
 
+For JS-backed staging cleanup changes, run the remount regression against the
+built dist and a local copy of the same checksum-pinned tiny GGUF:
+
+```bash
+node scripts/smoke/js_model_staging_remount.mjs \
+  "$OUT_DIR" "$TINY_GGUF_PATH" "$LLAMA_WEBGPU_SMOKE_MODEL_SHA256"
+```
+
+The smoke replaces the staging directory during cleanup, removes the
+replacement after disposal, and loads the model again on the same core.
+
 For the v0.7.0 embedding scheduler repair and its exact source fingerprint, see
 [the qualification notes](docs/v070_qualification.md). The build compiles a
 corrected copy under `BUILD_DIR/generated` and leaves the upstream checkout

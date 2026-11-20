@@ -593,6 +593,37 @@ int main() {
   old_dir_file.reset();
   assert(llamadart_webgpu_js_model_fs_allocated_bytes() == 0.0);
 
+  enum class Cleanup { mount, unmount, unmount_all, release_id };
+  for (auto cleanup : {Cleanup::mount, Cleanup::unmount, Cleanup::unmount_all, Cleanup::release_id}) {
+    const char* path = "/stale";
+    assert(llamadart_webgpu_mount_js_model_fs(path) == 0);
+    const int32_t stale_id = llamadart_webgpu_js_model_fs_mount_id(path);
+    auto* stale_backend = reinterpret_cast<wasmfs::Backend*>(g_dirs[path].backend);
+    auto held_file = stale_backend->createFile(0666);
+    assert(held_file->write(&byte, 1, 0) == 1);
+
+    if (cleanup == Cleanup::mount) {
+      g_dirs.erase(path);
+      assert(llamadart_webgpu_mount_js_model_fs(path) == 0);
+      assert(llamadart_webgpu_js_model_fs_mount_id(path) > stale_id);
+      assert(llamadart_webgpu_unmount_js_model_fs(path) == 0);
+    } else {
+      g_dirs[path] = {g_mem_backend};
+      assert(llamadart_webgpu_js_model_fs_mount_id(path) == 0);
+      assert(!llamadart_webgpu_is_js_model_path("/stale/model.gguf"));
+      if (cleanup == Cleanup::release_id) {
+        llamadart_webgpu_js_model_fs_release_mount_chunks(stale_id);
+      } else {
+        assert(llamadart_webgpu_unmount_js_model_fs(cleanup == Cleanup::unmount ? path : nullptr) == 0);
+      }
+      assert(g_dirs.at(path).backend == g_mem_backend);
+      assert(llamadart_webgpu_unmount_js_model_fs(path) == -EINVAL);
+      assert(llamadart_webgpu_mount_js_model_fs(path) == -EEXIST);
+      g_dirs.erase(path);
+    }
+    assert(llamadart_webgpu_js_model_fs_allocated_bytes() == 0.0);
+  }
+
   // After unmount, path predicate returns to zero allocations again.
   g_alloc_calls = 0;
   g_track_allocs = true;
@@ -628,12 +659,12 @@ int wasmfs_unmount(const char* path);
     const run = spawnSync(exe, [], { encoding: 'utf8' });
     assert.equal(run.status, 0, `${run.signal}: ${run.stderr}`);
 
-    // Mutation check: removing _llamadart_js_model_fs_release_mount(it->second.mount_id) from unmount must fail.
+    // Keep a file open across unmount so skipping chunk release is observable.
     const mutatedCppPath = path.join(dir, 'mutated.cpp');
     const mutatedExe = path.join(dir, 'test_js_model_fs_mutated');
     writeFileSync(
       mutatedCppPath,
-      cppFsSource.replaceAll('  _llamadart_js_model_fs_release_mount(it->second.mount_id);\n', '  /* mutated_release_removed */\n'),
+      cppFsSource.replace('  _llamadart_js_model_fs_release_mount(it->first);\n', ''),
     );
     const mutComp = spawnSync(
       process.env.CXX || 'c++',

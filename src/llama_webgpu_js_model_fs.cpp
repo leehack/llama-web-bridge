@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
@@ -119,15 +120,38 @@ public:
 };
 
 struct MountedJsModelEntry {
-  int32_t mount_id = 0;
-  wasmfs::backend_t backend = nullptr;
+  std::string path;
+  wasmfs::backend_t backend;
 };
+
+using JsModelMounts = std::unordered_map<int32_t, MountedJsModelEntry>;
 
 bool g_has_js_model_mounts = false;
 
-std::unordered_map<std::string, MountedJsModelEntry> & mounted_js_model_paths() {
-  static auto * paths = new std::unordered_map<std::string, MountedJsModelEntry>();
-  return *paths;
+JsModelMounts & mounted_js_models() {
+  static auto * mounts = new JsModelMounts();
+  return *mounts;
+}
+
+auto find_mount_at_path(JsModelMounts & mounted, const char * path) {
+  return std::find_if(mounted.begin(), mounted.end(), [path](const auto & entry) {
+    return entry.second.path == path;
+  });
+}
+
+bool mount_is_live(const MountedJsModelEntry & entry) {
+  return wasmfs_get_backend_by_path(entry.path.c_str()) == reinterpret_cast<::backend_t>(entry.backend);
+}
+
+auto release_and_erase_mount(JsModelMounts & mounted, JsModelMounts::iterator it) {
+  _llamadart_js_model_fs_release_mount(it->first);
+  const auto next = mounted.erase(it);
+  g_has_js_model_mounts = !mounted.empty();
+  return next;
+}
+
+int unmount_if_live(const MountedJsModelEntry & entry) {
+  return mount_is_live(entry) ? wasmfs_unmount(entry.path.c_str()) : 0;
 }
 
 }  // namespace
@@ -142,23 +166,22 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_js_model_fs_mount_id(const char * 
   if (mount_path == nullptr || std::strlen(mount_path) == 0) {
     return 0;
   }
-  const auto & mounted = mounted_js_model_paths();
-  const auto it = mounted.find(std::string(mount_path));
-  if (it == mounted.end()) {
-    return 0;
-  }
-  const auto current_backend =
-      reinterpret_cast<wasmfs::backend_t>(wasmfs_get_backend_by_path(mount_path));
-  if (current_backend == nullptr || current_backend != it->second.backend) {
-    return 0;
-  }
-  return it->second.mount_id;
+  auto & mounted = mounted_js_models();
+  const auto it = find_mount_at_path(mounted, mount_path);
+  return it != mounted.end() && mount_is_live(it->second) ? it->first : 0;
 }
 
 EMSCRIPTEN_KEEPALIVE void llamadart_webgpu_js_model_fs_release_mount_chunks(int32_t mount_id) {
-  if (mount_id > 0) {
-    _llamadart_js_model_fs_release_mount(mount_id);
+  if (mount_id <= 0) {
+    return;
   }
+  auto & mounted = mounted_js_models();
+  const auto it = mounted.find(mount_id);
+  if (it != mounted.end() && !mount_is_live(it->second)) {
+    release_and_erase_mount(mounted, it);
+    return;
+  }
+  _llamadart_js_model_fs_release_mount(mount_id);
 }
 
 EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_mount_js_model_fs(const char * mount_path) {
@@ -166,10 +189,15 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_mount_js_model_fs(const char * mou
     return -EINVAL;
   }
 
-  std::string path_str(mount_path);
-  auto & mounted = mounted_js_model_paths();
-  if (wasmfs_get_backend_by_path(mount_path) != nullptr ||
-      mounted.find(path_str) != mounted.end()) {
+  auto & mounted = mounted_js_models();
+  const auto it = find_mount_at_path(mounted, mount_path);
+  if (it != mounted.end()) {
+    if (mount_is_live(it->second)) {
+      return -EEXIST;
+    }
+    release_and_erase_mount(mounted, it);
+  }
+  if (wasmfs_get_backend_by_path(mount_path) != nullptr) {
     return -EEXIST;
   }
 
@@ -195,7 +223,7 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_mount_js_model_fs(const char * mou
     return rc;
   }
 
-  mounted.emplace(std::move(path_str), MountedJsModelEntry{mount_id, backend});
+  mounted.emplace(mount_id, MountedJsModelEntry{mount_path, backend});
   g_has_js_model_mounts = true;
   return 0;
 }
@@ -205,19 +233,14 @@ bool llamadart_webgpu_is_js_model_path(const char * path) {
   if (!g_has_js_model_mounts || path == nullptr || std::strlen(path) == 0) {
     return false;
   }
-  const auto & mounted = mounted_js_model_paths();
-  if (mounted.empty()) {
-    return false;
-  }
+  const auto & mounted = mounted_js_models();
   std::string path_str(path);
   for (const auto & entry : mounted) {
-    const std::string & mount = entry.first;
-    if (path_str == mount) {
-      return true;
-    }
-    if (path_str.size() > mount.size() &&
-        path_str.compare(0, mount.size(), mount) == 0 &&
-        path_str[mount.size()] == '/') {
+    const std::string & mount = entry.second.path;
+    const bool within_mount = path_str == mount ||
+        (path_str.size() > mount.size() && path_str.compare(0, mount.size(), mount) == 0 &&
+         path_str[mount.size()] == '/');
+    if (within_mount && mount_is_live(entry.second)) {
       return true;
     }
   }
@@ -225,12 +248,12 @@ bool llamadart_webgpu_is_js_model_path(const char * path) {
 }
 
 EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_unmount_js_model_fs(const char * mount_path) {
-  auto & mounted = mounted_js_model_paths();
+  auto & mounted = mounted_js_models();
 
   if (mount_path == nullptr || std::strlen(mount_path) == 0) {
     int first_error = 0;
     for (auto it = mounted.begin(); it != mounted.end(); ) {
-      const int rc = wasmfs_unmount(it->first.c_str());
+      const int rc = unmount_if_live(it->second);
       if (rc != 0 && rc != -ENOENT) {
         if (first_error == 0) {
           first_error = rc;
@@ -238,26 +261,22 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_unmount_js_model_fs(const char * m
         ++it;
         continue;
       }
-      _llamadart_js_model_fs_release_mount(it->second.mount_id);
-      it = mounted.erase(it);
+      it = release_and_erase_mount(mounted, it);
     }
-    g_has_js_model_mounts = !mounted.empty();
     return first_error;
   }
 
-  auto it = mounted.find(std::string(mount_path));
+  const auto it = find_mount_at_path(mounted, mount_path);
   if (it == mounted.end()) {
     return wasmfs_get_backend_by_path(mount_path) != nullptr ? -EINVAL : 0;
   }
 
-  const int rc = wasmfs_unmount(mount_path);
+  const int rc = unmount_if_live(it->second);
   if (rc != 0 && rc != -ENOENT) {
     return rc;
   }
 
-  _llamadart_js_model_fs_release_mount(it->second.mount_id);
-  mounted.erase(it);
-  g_has_js_model_mounts = !mounted.empty();
+  release_and_erase_mount(mounted, it);
   return 0;
 }
 
