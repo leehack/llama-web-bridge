@@ -1570,6 +1570,13 @@ function canPostSharedMemory() {
     channel?.port2.close();
   }
 }
+function isMemory64Unsupported() {
+  try {
+    return typeof WebAssembly !== "undefined" && WebAssembly.validate(Uint8Array.of(0, 97, 115, 109, 1, 0, 0, 0, 5, 3, 1, 4, 0)) === false;
+  } catch (_) {
+    return false;
+  }
+}
 async function describeWebGpuUnavailable() {
   const gpu = globalThis.navigator?.gpu;
   if (!gpu || typeof gpu.requestAdapter !== "function") {
@@ -3226,8 +3233,11 @@ var LlamaWebGpuBridgeRuntime = class {
       if (candidate.variant === "wasm64") {
         this._runtimeNotes.push("core_mem64_attempt");
       }
+      let factoryLoaded = false;
+      let initTimeoutError = null;
       try {
         const moduleFactory = await candidate.factoryPromise;
+        factoryLoaded = true;
         const initTimeoutMs = this._resolveCoreInitTimeoutMs();
         this._core = await Promise.race([
           moduleFactory({
@@ -3299,7 +3309,8 @@ var LlamaWebGpuBridgeRuntime = class {
           }),
           new Promise((_, reject) => {
             globalThis.setTimeout(() => {
-              reject(new Error(`Bridge core init timeout (${initTimeoutMs}ms)`));
+              initTimeoutError = new Error(`Bridge core init timeout (${initTimeoutMs}ms)`);
+              reject(initTimeoutError);
             }, initTimeoutMs);
           })
         ]);
@@ -3313,7 +3324,10 @@ var LlamaWebGpuBridgeRuntime = class {
       } catch (error) {
         lastError = error;
         if (candidate.variant === "wasm64") {
+          const reason = initTimeoutError && error === initTimeoutError ? "timeout" : factoryLoaded && isMemory64Unsupported() ? "unsupported" : "init_error";
           this._runtimeNotes.push("core_mem64_unavailable");
+          this._runtimeNotes.push(`core_mem64_unavailable:${reason}`);
+          this._emitLogger("warn", `Memory64 core unavailable (${reason}). Trying the wasm32 core.`);
           continue;
         }
         throw error;
