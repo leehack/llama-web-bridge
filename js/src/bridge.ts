@@ -215,7 +215,6 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
   declare _deferredShadowState: BridgeStateSnapshot | null;
   declare _disposed: boolean;
   declare _disposePromise: Promise<void> | null;
-  declare _disposeIncomplete: boolean;
   declare _disposalWaiters: Set<() => void>;
   declare _decisionHeads: Map<number, DecisionHeadEntry>;
   declare _nextDecisionHandle: number;
@@ -261,7 +260,6 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
     this._deferredShadowState = null;
     this._disposed = false;
     this._disposePromise = null;
-    this._disposeIncomplete = false;
     this._disposalWaiters = new Set();
     // Facade decision handles map to { owner, handle } so a head loaded by a
     // retired worker or runtime can never resolve to a newer owner's head.
@@ -3535,12 +3533,11 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
    * back the identical teardown promise.
    */
   dispose() {
-    if (this._disposed && (!this._disposeIncomplete || this._disposePromise)) {
+    if (this._disposed) {
       return this._disposePromise!;
     }
 
     this._disposed = true;
-    this._disposeIncomplete = false;
     this._lifecycleState = 'disposing';
 
     // Reserve the public promise before teardown can run synchronously. A
@@ -3549,11 +3546,10 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
     // than the still-unassigned field.
     let resolveDispose: (value?: void | PromiseLike<void>) => void = () => {};
     let rejectDispose: (reason?: unknown) => void = () => {};
-    const pendingDisposePromise = new Promise<void>((resolve, reject) => {
+    this._disposePromise = new Promise((resolve, reject) => {
       resolveDispose = resolve;
       rejectDispose = reject;
     });
-    this._disposePromise = pendingDisposePromise;
     this._notifyDisposalWaiters();
 
     const teardown = this._runExclusive(
@@ -3561,21 +3557,10 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
       { allowDisposed: true, kind: 'dispose' },
     );
     teardown.then(
-      () => {
-        this._disposeIncomplete = false;
-        resolveDispose();
-      },
-      (error) => {
-        if (this._runtime) {
-          this._disposeIncomplete = true;
-          if (this._disposePromise === pendingDisposePromise) {
-            this._disposePromise = null;
-          }
-        }
-        rejectDispose(error);
-      },
+      () => resolveDispose(),
+      (error) => rejectDispose(error),
     );
-    return pendingDisposePromise;
+    return this._disposePromise;
   }
 
   async _disposeUnlocked() {
@@ -3598,10 +3583,8 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
 
       if (this._runtime) {
         const runtime = this._runtime;
+        this._runtime = null;
         await runtime.dispose();
-        if (this._runtime === runtime) {
-          this._runtime = null;
-        }
       }
     } finally {
       // The getters read this snapshot, so teardown must clear it in both modes.

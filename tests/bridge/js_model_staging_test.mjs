@@ -1516,7 +1516,7 @@ test('jsBackedModelStaging rejects pre-v2 core missing _llamadart_webgpu_js_mode
   assert.equal(harness.ccalls.length, 0, 'must reject v1 core before calling ccall');
 });
 
-test('failed unmount stays tracked and retries on next cleanup and on dispose', async () => {
+test('failed unmount stays tracked and retries on next staging cleanup', async () => {
   const harness = createStagingHarness({ jsBackedModelStaging: true });
   harness.runtime._resolveNativeLoadOptions = (opts) => {
     harness.runtime._nCtx = opts.nCtx;
@@ -1553,8 +1553,9 @@ test('failed unmount stays tracked and retries on next cleanup and on dispose', 
   assert.equal(harness.runtime._activeJsStagingMounts.has('/jsmodels-2'), true);
   assert.equal(harness.runtime._jsBackedStagingMounted, true);
 
-  // dispose() retries /jsmodels-2 and clears it once unmount succeeds.
+  // The next staging cleanup retries /jsmodels-2 once unmount succeeds.
   busyMounts.clear();
+  await harness.runtime.loadMultimodalProjector('https://models.test/mmproj.gguf');
   await harness.bridge.dispose();
   assert.equal(harness.runtime._activeJsStagingMounts.size, 0);
   assert.equal(harness.runtime._jsBackedStagingMounted, false);
@@ -1613,17 +1614,22 @@ test('failed-unmount retry checks native mount identity and never deletes a repl
   assert.equal(harness.fs.files.has('/jsmodels-1/checkpoint.bin'), true);
 });
 
-test('terminal dispose releases chunks by mount id even when unmount fails, rejects with MODEL_STAGING_CLEANUP_INCOMPLETE, and retries on second dispose', async () => {
+test('dispose releases chunks by mount id before shutdown even when unmount fails', async () => {
   const harness = createStagingHarness({ jsBackedModelStaging: true });
   harness.runtime._resolveNativeLoadOptions = (opts) => {
     harness.runtime._nCtx = opts.nCtx;
     harness.runtime._nGpuLayers = opts.nGpuLayers;
   };
+  harness.runtime._fetchWithTimeout = async () => new Response(new Uint8Array([1, 2, 3, 4]));
   const origCcall = harness.core.ccall.bind(harness.core);
-  let blockUnmount = true;
+  let shutdownCalls = 0;
   harness.core.ccall = (name, returnType, argTypes, args = [], opts) => {
-    if (name === 'llamadart_webgpu_unmount_js_model_fs' && blockUnmount && args[0] === '/jsmodels-1') {
+    if (name === 'llamadart_webgpu_unmount_js_model_fs') {
       return -28;
+    }
+    if (name === 'llamadart_webgpu_shutdown') {
+      shutdownCalls += 1;
+      assert.deepEqual(harness.releasedChunkMountIds, [1, 2]);
     }
     return origCcall(name, returnType, argTypes, args, opts);
   };
@@ -1634,23 +1640,35 @@ test('terminal dispose releases chunks by mount id even when unmount fails, reje
     useCache: false,
     forceRemoteFetchBackend: false,
   });
+  await harness.runtime.loadMultimodalProjector('https://models.test/mmproj.gguf');
 
   const first = harness.bridge.dispose();
-  const firstErr = await first.then(() => assert.fail('dispose must reject while unmount is blocked'), (e) => e);
-  assert.ok(firstErr instanceof ModelStagingError, String(firstErr));
-  assert.equal(firstErr.code, 'MODEL_STAGING_CLEANUP_INCOMPLETE');
-  assert.ok(harness.releasedChunkMountIds.includes(1), 'terminal dispose must release chunks by mount id even on unmount failure');
-  assert.ok(harness.bridge._runtime !== null, 'runtime stays retained until retry dispose finishes unmount');
-  assert.equal(harness.runtime._activeJsStagingMounts.has('/jsmodels-1'), true);
-
-  blockUnmount = false;
-  const second = harness.bridge.dispose();
-  assert.notEqual(second, first, 'second dispose after incomplete cleanup must return a fresh retry promise');
-  await second;
+  await first;
   assert.equal(harness.bridge._runtime, null);
-  assert.equal(harness.runtime._activeJsStagingMounts.size, 0);
-  assert.equal(harness.runtime._failedUnmountJsStagingMounts.size, 0);
-  assert.equal(harness.bridge.dispose(), second, 'completed dispose caches its resolved promise');
+  assert.equal(harness.bridge.dispose(), first);
+  assert.equal(shutdownCalls, 1);
+});
+
+test('staging off dispose keeps the same rejected promise after native shutdown fails', async () => {
+  const { bridge, core } = createStagingHarness({ jsBackedModelStaging: false });
+  const nativeError = new Error('injected shutdown failure');
+  let shutdownCalls = 0;
+  const ccall = core.ccall.bind(core);
+  core.ccall = (name, ...args) => {
+    if (name === 'llamadart_webgpu_shutdown' && ++shutdownCalls === 1) {
+      throw nativeError;
+    }
+    return ccall(name, ...args);
+  };
+
+  const first = bridge.dispose();
+  assert.equal(bridge.dispose(), first);
+  await assert.rejects(first, (error) => error === nativeError);
+  const second = bridge.dispose();
+  assert.equal(second, first);
+  await assert.rejects(second, (error) => error === nativeError);
+  assert.equal(shutdownCalls, 1);
+  assert.equal(bridge.getContextSize(), 0);
 });
 
 test('staging off parity trace avoids Response.type, core.ABORT, _ownedModelPaths, and undefined worker key', async () => {

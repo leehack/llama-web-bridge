@@ -200,7 +200,6 @@ export class LlamaWebGpuBridgeRuntime {
   declare _jsStagingMountCounter: number;
   declare _activeJsStagingMounts: Map<string, number>;
   declare _failedUnmountJsStagingMounts: Map<string, number>;
-  declare _disposedCoreShutdown: boolean;
   declare _modelBytes: number;
   declare _mmProjPath: string | null;
   declare _ownedMmProjPath: string | null;
@@ -275,7 +274,6 @@ export class LlamaWebGpuBridgeRuntime {
     this._jsStagingMountCounter = 0;
     this._activeJsStagingMounts = new Map();
     this._failedUnmountJsStagingMounts = new Map();
-    this._disposedCoreShutdown = false;
     this._modelBytes = 0;
     this._mmProjPath = null;
     this._ownedMmProjPath = null;
@@ -1547,13 +1545,20 @@ export class LlamaWebGpuBridgeRuntime {
     );
   }
 
+  _releaseJsStagingMountChunks(core: LlamaCoreModule, mountId: number) {
+    try {
+      core.ccall('llamadart_webgpu_js_model_fs_release_mount_chunks', null, ['number'], [mountId]);
+    } catch (_) {
+      // ignore best-effort chunk cleanup failures
+    }
+  }
+
   _releaseJsModelStaging(
     core: LlamaCoreModule | null = this._core,
     mountPath: string | null = null,
-    { releaseChunksOnFailure = false }: { releaseChunksOnFailure?: boolean } = {},
-  ): Array<{ mountPath: string; mountId: number; rc: number }> {
+  ) {
     if (this._activeJsStagingMounts.size === 0 && this._failedUnmountJsStagingMounts.size === 0) {
-      return [];
+      return;
     }
 
     const targets = new Map<string, number>();
@@ -1572,7 +1577,7 @@ export class LlamaWebGpuBridgeRuntime {
     }
 
     if (targets.size === 0) {
-      return [];
+      return;
     }
 
     if (!core || (core as { ABORT?: unknown }).ABORT === true) {
@@ -1581,61 +1586,34 @@ export class LlamaWebGpuBridgeRuntime {
         this._failedUnmountJsStagingMounts.delete(targetMount);
       }
       this._jsBackedStagingMounted = this._activeJsStagingMounts.size > 0;
-      return [];
+      return;
     }
 
-    const failedMounts: Array<{ mountPath: string; mountId: number; rc: number }> = [];
     for (const [targetMount, expectedMountId] of targets) {
       if (!this._isJsStagingMountOwned(core, targetMount, expectedMountId)) {
-        try {
-          core.ccall(
-            'llamadart_webgpu_js_model_fs_release_mount_chunks',
-            null,
-            ['number'],
-            [expectedMountId],
-          );
-        } catch (_) {
-          // ignore best-effort chunk cleanup for an already-replaced mount
-        }
+        this._releaseJsStagingMountChunks(core, expectedMountId);
         this._activeJsStagingMounts.delete(targetMount);
         this._failedUnmountJsStagingMounts.delete(targetMount);
         continue;
       }
 
       let unmounted = false;
-      let lastRc = -1;
       try {
-        lastRc = Number(
+        unmounted = Number(
           core.ccall('llamadart_webgpu_unmount_js_model_fs', 'number', ['string'], [targetMount]),
-        );
-        unmounted = lastRc === 0;
+        ) === 0;
       } catch (_) {
-        unmounted = false;
-        lastRc = -1;
+        // retry on the next staging cleanup
       }
       if (unmounted) {
         this._activeJsStagingMounts.delete(targetMount);
         this._failedUnmountJsStagingMounts.delete(targetMount);
       } else {
-        if (releaseChunksOnFailure && expectedMountId > 0) {
-          try {
-            core.ccall(
-              'llamadart_webgpu_js_model_fs_release_mount_chunks',
-              null,
-              ['number'],
-              [expectedMountId],
-            );
-          } catch (_) {
-            // ignore chunk release errors when reporting incomplete cleanup
-          }
-        }
         this._activeJsStagingMounts.set(targetMount, expectedMountId);
         this._failedUnmountJsStagingMounts.set(targetMount, expectedMountId);
-        failedMounts.push({ mountPath: targetMount, mountId: expectedMountId, rc: lastRc });
       }
     }
     this._jsBackedStagingMounted = this._activeJsStagingMounts.size > 0;
-    return failedMounts;
   }
 
   _releaseModelFiles(mountPath: string | null = null) {
@@ -5093,61 +5071,33 @@ export class LlamaWebGpuBridgeRuntime {
       this._activeTransferAbortController = null;
     }
 
-    let failedMounts: Array<{ mountPath: string; mountId: number; rc: number }> = [];
     if (this._core) {
-      if (!this._disposedCoreShutdown) {
-        this._disposedCoreShutdown = true;
-        this._clearPendingMedia();
-        const mmprojPath = this._mmProjPath;
-        const mmprojFreeRc = Number(
-          this._core.ccall('llamadart_webgpu_mmproj_free', 'number', [], []),
-        );
-        if (mmprojFreeRc !== 0) {
-          this._emitLogger(
-            'warn',
-            this._coreErrorMessage('Failed to unload multimodal projector during dispose', mmprojFreeRc),
-          );
-        }
-        await this._core.ccall('llamadart_webgpu_shutdown', null, [], [], { async: true });
-        if (
-          !this._mmProjUsesJsStaging
-          || (
-            mmprojPath
-            && this._ownedMmProjPath === mmprojPath
-            && this._isJsStagingMountOwned(
-              this._core,
-              this._ownedMmProjMount?.mountPath,
-              this._ownedMmProjMount?.mountId,
-            )
-          )
-        ) {
-          this._deleteFsFile(mmprojPath);
-        }
-        if (this._modelFilesUseJsStaging) {
-          this._releaseModelFiles();
-        }
+      for (const mountId of this._activeJsStagingMounts.values()) {
+        this._releaseJsStagingMountChunks(this._core, mountId);
       }
-      failedMounts = this._releaseJsModelStaging(this._core, null, {
-        releaseChunksOnFailure: true,
-      });
-    } else {
-      failedMounts = this._releaseJsModelStaging(null, null, {
-        releaseChunksOnFailure: true,
-      });
+      this._clearPendingMedia();
+      const mmprojPath = this._mmProjPath;
+      const mmprojFreeRc = Number(
+        this._core.ccall('llamadart_webgpu_mmproj_free', 'number', [], []),
+      );
+      if (mmprojFreeRc !== 0) {
+        this._emitLogger(
+          'warn',
+          this._coreErrorMessage('Failed to unload multimodal projector during dispose', mmprojFreeRc),
+        );
+      }
+      await this._core.ccall('llamadart_webgpu_shutdown', null, [], [], { async: true });
+      if (!this._mmProjUsesJsStaging) {
+        this._deleteFsFile(mmprojPath);
+      }
     }
     this._modelPath = null;
     this._modelPaths = [];
-    this._ownedModelPaths = [];
-    this._ownedModelMount = null;
-    this._modelFilesUseJsStaging = false;
     this._modelBytes = 0;
     this._modelSource = 'network';
     this._modelCacheState = 'disabled';
     this._loadedModelUrl = null;
     this._mmProjPath = null;
-    this._ownedMmProjPath = null;
-    this._ownedMmProjMount = null;
-    this._mmProjUsesJsStaging = false;
     this._mmProjSourceUrl = null;
     this._mmSupportsVision = false;
     this._mmSupportsAudio = false;
@@ -5159,15 +5109,6 @@ export class LlamaWebGpuBridgeRuntime {
     this._activeTransferAbortController = null;
     this._suppressedWarmupWarningCount = 0;
     this._didReportWarmupWarningSuppression = false;
-    if (failedMounts.length > 0) {
-      const detail = failedMounts
-        .map((mount) => `${mount.mountPath} (mountId=${mount.mountId}, rc=${mount.rc})`)
-        .join(', ');
-      throw new ModelStagingError(
-        'MODEL_STAGING_CLEANUP_INCOMPLETE',
-        `Bridge disposal released JS-backed model chunks, but staging unmount failed for ${detail}. Close open file handles and call dispose() again to finish cleanup.`,
-      );
-    }
   }
 
   async applyChatTemplate(

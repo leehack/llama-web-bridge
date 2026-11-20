@@ -31,7 +31,6 @@ export function isModelStagingErrorCode(value: unknown): value is ModelStagingEr
   return value === 'MODEL_STAGING_ALLOCATION_FAILED'
     || value === 'MODEL_TENSOR_SIZE_LIMIT_EXCEEDED'
     || value === 'MODEL_STAGING_MOUNT_FAILED'
-    || value === 'MODEL_STAGING_CLEANUP_INCOMPLETE'
     || value === 'MODEL_STAGING_UNSUPPORTED';
 }
 
