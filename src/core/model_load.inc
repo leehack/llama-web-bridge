@@ -265,12 +265,11 @@ bool check_wasm32_gguf_shard(
     if (!reader.read_bytes(&name_len, sizeof(name_len))) {
       return true;
     }
-    char name_buf[65] = {};
-    const size_t capture = static_cast<size_t>(std::min<uint64_t>(name_len, 64));
+    char name_buf[64];
+    const size_t capture = static_cast<size_t>(std::min<uint64_t>(name_len, sizeof(name_buf)));
     if (capture > 0 && !reader.read_bytes(name_buf, capture)) {
       return true;
     }
-    name_buf[capture] = '\0';
     if (name_len > capture && !reader.skip_bytes(name_len - capture)) {
       return true;
     }
@@ -308,12 +307,14 @@ bool check_wasm32_gguf_shard(
     }
 
     uint64_t nbytes = ne[0] / blck_size;
-    if (type_size > 0 && nbytes > std::numeric_limits<uint64_t>::max() / type_size) {
+    bool size_overflow = type_size > 0 && nbytes > std::numeric_limits<uint64_t>::max() / type_size;
+    if (size_overflow) {
       nbytes = std::numeric_limits<uint64_t>::max();
     } else {
       nbytes *= type_size;
       for (int d = 1; d < GGML_MAX_DIMS; ++d) {
         if (ne[d] > 0 && nbytes > std::numeric_limits<uint64_t>::max() / ne[d]) {
+          size_overflow = true;
           nbytes = std::numeric_limits<uint64_t>::max();
           break;
         }
@@ -329,9 +330,35 @@ bool check_wasm32_gguf_shard(
     if (nbytes_overflows || tensor_offset > kWasm32SizeMax ||
         kWasm32SizeMax - shard_accumulated < padded_size ||
         kWasm32SizeMax - prior_total < padded_size) {
+      constexpr char hex_digits[] = "0123456789abcdef";
+      std::string escaped_name;
+      escaped_name.reserve(capture);
+      for (size_t j = 0; j < capture; ++j) {
+        auto byte = static_cast<unsigned char>(name_buf[j]);
+        const char * escape = nullptr;
+        if (byte < 0x20 || byte == 0x7f) {
+          escape = "\\x";
+        } else if (byte == 0xc2 && j + 1 < capture) {
+          // UTF-8 encodes C1 controls as C2 80 through C2 9F.
+          const auto next = static_cast<unsigned char>(name_buf[j + 1]);
+          if (next >= 0x80 && next <= 0x9f) {
+            escape = "\\u00";
+            byte = next;
+            ++j;
+          }
+        }
+        if (escape != nullptr) {
+          escaped_name += escape;
+          escaped_name += hex_digits[byte >> 4];
+          escaped_name += hex_digits[byte & 0x0f];
+        } else {
+          escaped_name += name_buf[j];
+        }
+      }
+      const std::string declared_size = size_overflow ? "at least 2^64" : std::to_string(nbytes);
       set_error(
           "GGUF tensor payload exceeds the wasm32 4 GiB address space limit (tensor '" +
-          std::string(name_buf) + "' declares " + std::to_string(nbytes) +
+          escaped_name + "' declares " + declared_size +
           " bytes, accumulated " + std::to_string(prior_total) +
           " bytes, limit " + std::to_string(kWasm32SizeMax) +
           " bytes); use the memory64 core or a smaller quantization");

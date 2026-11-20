@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Escape control characters in tensor names in wasm32 GGUF size errors and report an overflowed declared size as at least 2^64 bytes.
+
 - Keep both memory64 fallback notes in metadata for later loads that reuse the fallback wasm32 core.
 - Document the single loaded model slot for bridges sharing a `coreModuleFactory` core instance.
 
