@@ -1614,6 +1614,125 @@ test('failed-unmount retry checks native mount identity and never deletes a repl
   assert.equal(harness.fs.files.has('/jsmodels-1/checkpoint.bin'), true);
 });
 
+for (const kind of ['model', 'projector']) {
+  for (const replacement of ['another mount', 'an ordinary directory']) {
+    test(`${kind} staging rejects when ${replacement} replaces the mount during fetch`, async () => {
+      const { bridge, runtime, core, fs, mountIds, releasedChunkMountIds, ccalls } = createStagingHarness();
+      const mountPath = '/jsmodels-1';
+      const filePath = `${mountPath}/one.gguf`;
+      const checkpoint = new Uint8Array([17, 23, 41, 97]);
+      const requested = Promise.withResolvers();
+      const response = Promise.withResolvers();
+      const pendingFetch = () => {
+        requested.resolve();
+        return response.promise;
+      };
+      runtime._getCachedModelResponse = pendingFetch;
+      runtime._fetchWithTimeout = pendingFetch;
+      if (kind === 'projector') {
+        runtime._modelBytes = 4;
+      }
+      const url = 'https://models.test/one.gguf';
+      const pendingLoad = kind === 'model'
+        ? bridge.loadModelFromUrl(url, { nGpuLayers: 0, useCache: false, forceRemoteFetchBackend: false })
+        : bridge.loadMultimodalProjector(url);
+
+      await requested.promise;
+      const oldId = mountIds.get(mountPath);
+      assert.ok(oldId > 0);
+      if (replacement === 'another mount') {
+        core.ccall('llamadart_webgpu_unmount_js_model_fs', 'number', ['string'], [mountPath]);
+        core.ccall('llamadart_webgpu_mount_js_model_fs', 'number', ['string'], [mountPath]);
+        assert.notEqual(mountIds.get(mountPath), oldId);
+      } else {
+        mountIds.delete(mountPath);
+      }
+      fs.files.set(filePath, checkpoint);
+      const callStart = ccalls.length;
+      releasedChunkMountIds.length = 0;
+      response.resolve(new Response(new Uint8Array([1, 2, 3, 4, 5])));
+
+      await assert.rejects(pendingLoad, { name: 'ModelStagingError', code: 'MODEL_STAGING_MOUNT_FAILED' });
+      assert.deepEqual(fs.files.get(filePath), checkpoint);
+      assert.equal(fs.dirs.has(mountPath), true);
+      assert.equal(ccalls.slice(callStart).some(([name]) => name === 'llamadart_webgpu_js_model_fs_open_direct'), false);
+      assert.deepEqual(releasedChunkMountIds, [oldId]);
+      await bridge.dispose();
+    });
+  }
+
+  for (const phase of ['write', 'close', 'reader cancellation', 'native load']) {
+    test(`${kind} staging preserves a replacement file after the writer opens (${phase})`, async () => {
+      const { bridge, runtime, core, fs, mountIds, releasedChunkMountIds, ccalls, directWrites } = createStagingHarness();
+      const mountPath = '/jsmodels-1';
+      const filePath = `${mountPath}/one.gguf`;
+      const checkpoint = new Uint8Array([17, 23, 41, 97]);
+      let replacedId = 0;
+      const replaceMount = () => {
+        if (replacedId === 0) {
+          replacedId = mountIds.get(mountPath);
+          mountIds.delete(mountPath);
+          fs.files.set(filePath, checkpoint);
+        }
+      };
+      const write = core.llamadartJsModelFsWriteDirect;
+      core.llamadartJsModelFsWriteDirect = (...args) => {
+        const written = write(...args);
+        if (phase === 'write' || phase === 'close') {
+          replaceMount();
+        }
+        return written;
+      };
+      const nativeLoadName = kind === 'model' ? 'llamadart_webgpu_load_model' : 'llamadart_webgpu_mmproj_load';
+      const ccall = core.ccall.bind(core);
+      core.ccall = (name, ...args) => {
+        const result = ccall(name, ...args);
+        if (phase === 'native load' && name === nativeLoadName) {
+          replaceMount();
+        }
+        return result;
+      };
+      const transfer = async () => new Response(new ReadableStream({
+        start(controller) {
+          if (phase !== 'reader cancellation') {
+            controller.enqueue(new Uint8Array([1, 2, 3]));
+            if (phase === 'write') {
+              controller.enqueue(new Uint8Array([4, 5]));
+            }
+            controller.close();
+          }
+        },
+        cancel: replaceMount,
+      }));
+      runtime._getCachedModelResponse = transfer;
+      runtime._fetchWithTimeout = transfer;
+      if (phase === 'reader cancellation') {
+        runtime._resolveStreamChunkTimeoutMs = () => 1;
+      }
+      if (kind === 'projector') {
+        runtime._modelBytes = 4;
+      }
+      const url = 'https://models.test/one.gguf';
+      const pendingLoad = kind === 'model'
+        ? bridge.loadModelFromUrl(url, { nGpuLayers: 0, useCache: false, forceRemoteFetchBackend: false })
+        : bridge.loadMultimodalProjector(url);
+
+      await assert.rejects(pendingLoad, { name: 'ModelStagingError', code: 'MODEL_STAGING_MOUNT_FAILED' });
+      assert.equal(replacedId, 1);
+      assert.deepEqual(fs.files.get(filePath), checkpoint);
+      assert.deepEqual(releasedChunkMountIds, [replacedId]);
+      if (phase === 'native load') {
+        const freeName = kind === 'model' ? 'llamadart_webgpu_free_model' : 'llamadart_webgpu_mmproj_free';
+        assert.ok(ccalls.some(([name]) => name === freeName));
+      } else if (phase === 'write' || phase === 'close') {
+        assert.equal(directWrites.length, 1);
+        assert.equal(ccalls.some(([name]) => name === 'llamadart_webgpu_js_model_fs_close_direct'), false);
+      }
+      await bridge.dispose();
+    });
+  }
+}
+
 test('dispose releases chunks by mount id before shutdown even when unmount fails', async () => {
   const harness = createStagingHarness({ jsBackedModelStaging: true });
   harness.runtime._resolveNativeLoadOptions = (opts) => {

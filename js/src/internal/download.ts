@@ -31,6 +31,7 @@ export interface DrainOptions {
 export interface DirectFileChunkWriter {
   writeChunk(chunk: Uint8Array, position: number): number | void;
   close?: () => void;
+  assertMountOwned?: () => void;
 }
 
 export interface WriteResponseOptions {
@@ -643,6 +644,7 @@ export async function writeResponseToFsFileWithProgress(
       || (error as Error | null)?.name === 'AbortError'
       || (error as Error | null)?.name === 'ModelTransferLengthError') {
       try {
+        directWriter?.assertMountOwned?.();
         fs.unlink(filePath);
       } catch (_) {
         // ignore best-effort cleanup failures
