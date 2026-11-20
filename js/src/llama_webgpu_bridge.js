@@ -22,3 +22,4 @@ if (typeof window !== 'undefined') {
 export { LlamaWebGpuBridge, enableBridgeWorkerHost };
 export { EmbeddingError } from './internal/embedding.ts';
 export { CrossOriginIsolationError } from './internal/isolation.ts';
+export { ModelStagingError } from './internal/model_staging.ts';

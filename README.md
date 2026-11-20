@@ -84,6 +84,43 @@ Optional single-thread outputs (when `WEBGPU_BRIDGE_BUILD_SINGLE_THREAD=1`, plus
 - `dist/llama_webgpu_core_mem64_st.js`
 - `dist/llama_webgpu_core_mem64_st.wasm`
 
+### JS-backed model staging
+
+Use `jsBackedModelStaging: true` for models over about 1 GB on `wasm32`, or for
+any large model on `memory64` to cut the peak wasm heap. When running without
+cross-origin isolation (`WEBGPU_BRIDGE_PTHREADS=0` + `allowSingleThreadCore: true`),
+it streams the model (and any `loadMultimodalProjector` GGUF) directly into 64 MiB JS `Uint8Array` chunks under a private per-operation `/jsmodels-<n>` mount
+without copying through WASMFS, unmounts/releases only that mount's chunks after load or
+failure (without adopting existing mounts), and turns staging allocation, mount collision, version-skew, or 4 GiB
+tensor-limit failures into typed `ModelStagingError` errors.
+
+Tradeoffs: small models see slightly slower native reads from JS chunks
+(`Qwen3-0.6B-Q8_0` 767 MiB 3-run median native load `480.9 ms` vs `444.6 ms`
+off, total load `1,317.7 ms` vs `1,660.5 ms` as direct staging skips wasm
+memory growth), and the full model file is temporarily held in JS heap until
+loaded and released.
+
+Measured in Chromium WebGPU (Apple Metal-3, `nCtx: 2048`, `nGpuLayers: 999`,
+non-isolated with `typeof SharedArrayBuffer === 'undefined'`, `llama.cpp` v1.0.0):
+
+| Model (size) | Staging / Mode | Load time | Peak wasm heap | Peak JS heap | Prefill / Decode | Outcome |
+| --- | --- | --- | --- | --- | --- | --- |
+| Qwen3-0.6B-Q8_0 (767 MiB) | `wasm32` Off (`/models`), direct | 1,660.5 ms (3-run median) | 2.00 GiB | 300 MB | 359.6 / 119.4 tok/s | Pass |
+| Qwen3-0.6B-Q8_0 (767 MiB) | `wasm32` JS-backed (`/jsmodels`), direct | 1,317.7 ms (3-run median) | 349 MiB | 1.18 GB | 373.5 / 123.1 tok/s | Pass |
+| Qwen3-0.6B-Q8_0 (767 MiB) | `wasm32` JS-backed (`/jsmodels`), worker | 731.8 ms | 349 MiB | — | 377.8 / 115.5 tok/s | Pass |
+| Qwen3-4B-Q4_K_M (2.33 GiB) | `wasm32` Off (`/models`), direct | — | 2.75 GiB | 863 MB | — | Fail in `FS.write` at 1.37 GiB |
+| Qwen3-4B-Q4_K_M (2.33 GiB) | `wasm32` JS-backed (`/jsmodels`), direct | 3,274 ms | 643 MiB | 4.26 GB (before GC) | 124.2 / 45.9 tok/s | Pass (`37/37` GPU layers) |
+| Qwen3-4B-Q4_K_M (2.33 GiB) | `wasm32` JS-backed (`/jsmodels`), worker | 1,475 ms | 643 MiB | — | 135.4 / 53.2 tok/s | Pass (`37/37` GPU layers) |
+| Qwen3-4B-Q4_K_M (2.33 GiB) | `memory64` Off (`/models`), direct | 4,131 ms | 8.01 GiB (8.60 GB) | 1.06 GB (drops to 8.1 MB) | 127.2 / 43.5 tok/s | Pass |
+| Qwen3-4B-Q4_K_M (2.33 GiB) | `memory64` Off (`/models`), worker | 4,388 ms | 8.01 GiB (8.60 GB) | — | 124.9 / 42.0 tok/s | Pass |
+| Qwen3-4B-Q4_K_M (2.33 GiB) | `memory64` JS-backed (`/jsmodels`), direct | 2,049 ms | 656 MiB (0.69 GB) | 3.79 GB (drops to 23.5 MB) | 124.8 / 50.7 tok/s | Pass |
+| Qwen3-4B-Q4_K_M (2.33 GiB) | `memory64` JS-backed (`/jsmodels`), worker | 1,585 ms | 656 MiB (0.69 GB) | — | 128.6 / 50.0 tok/s | Pass |
+| Qwen3-8B-Q4_K_M (4.68 GiB) | `wasm32` JS-backed (`/jsmodels`), direct | — | — | — | — | Fail: wasm32 4 GiB `gguf_init_from_reader` tensor overflow |
+
+Note that V8 `usedJSHeapSize` approaches Chrome's `~4.4 GB` `jsHeapSizeLimit`
+during 4B staging before chunks are released, and models whose padded GGUF
+tensor payload exceeds 4 GiB cannot pass wasm32's 32-bit `SIZE_MAX` ceiling.
+
 ## Multimodal embeddings
 
 `embed(input)` and `embedBatch(inputs)` accept strings or ordered text/image/audio

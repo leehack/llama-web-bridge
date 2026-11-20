@@ -944,6 +944,56 @@ function expandModelShardUrls(modelUrlOrUrls) {
   }
 }
 
+// js/src/internal/model_staging.ts
+var REQUIRED_JS_MODEL_STAGING_EXPORTS = [
+  "_llamadart_webgpu_js_model_fs_api_version",
+  "_llamadart_webgpu_js_model_fs_mount_id",
+  "_llamadart_webgpu_mount_js_model_fs",
+  "_llamadart_webgpu_unmount_js_model_fs",
+  "_llamadart_webgpu_js_model_fs_prealloc_next",
+  "_llamadart_webgpu_js_model_fs_open_direct",
+  "_llamadart_webgpu_js_model_fs_close_direct",
+  "_llamadart_webgpu_js_model_fs_consume_oom_bytes",
+  "_llamadart_webgpu_js_model_fs_allocated_bytes",
+  "_llamadart_webgpu_js_model_fs_release_mount_chunks",
+  "llamadartJsModelFsWriteDirect"
+];
+var ModelStagingError = class extends Error {
+  constructor(code, message) {
+    super(message);
+    this.name = "ModelStagingError";
+    this.code = code;
+  }
+};
+function isModelStagingErrorCode(value) {
+  return value === "MODEL_STAGING_ALLOCATION_FAILED" || value === "MODEL_TENSOR_SIZE_LIMIT_EXCEEDED" || value === "MODEL_STAGING_MOUNT_FAILED" || value === "MODEL_STAGING_UNSUPPORTED";
+}
+function missingJsModelStagingExports(core) {
+  const missing = [];
+  for (const name of REQUIRED_JS_MODEL_STAGING_EXPORTS) {
+    if (typeof core?.[name] !== "function") {
+      missing.push(name);
+    }
+  }
+  return missing;
+}
+function isJsAllocationError(error) {
+  if (!error || typeof error !== "object") {
+    const text2 = String(error || "").toLowerCase();
+    return text2.includes("array buffer allocation failed") || text2.includes("out of memory") || text2.includes("enomem");
+  }
+  const candidate = error;
+  if (candidate.code === "ENOMEM" || candidate.errno === 12 || candidate.errno === 48) {
+    return true;
+  }
+  const text = `${String(candidate.name || "")} ${String(candidate.message || "")}`.toLowerCase();
+  return text.includes("array buffer allocation failed") || text.includes("cannot allocate") || text.includes("allocation failed") || text.includes("out of memory") || text.includes("enomem") || candidate.name === "RangeError" && text.includes("buffer");
+}
+function isWasm32TensorLimitText(text) {
+  const normalized = text.toLowerCase();
+  return normalized.includes("wasm32 4 gib") || normalized.includes("gguf_init_from_reader") && normalized.includes("size overflow");
+}
+
 // js/src/internal/core_loader.ts
 function normalizeFactory(moduleExport) {
   if (typeof moduleExport === "function") {
@@ -1017,6 +1067,27 @@ function sumProgressValues(values) {
     }
   }
   return total;
+}
+function createModelTransferLengthError(message) {
+  const error = new Error(message);
+  error.name = "ModelTransferLengthError";
+  return error;
+}
+function writeDirectChunk(directWriter, chunk, position, onBytesWritten) {
+  let offset = 0;
+  while (offset < chunk.byteLength) {
+    const remaining = offset === 0 ? chunk : chunk.subarray(offset);
+    const result = directWriter.writeChunk(remaining, position + offset);
+    const written = result === void 0 ? remaining.byteLength : Number(result);
+    if (!Number.isInteger(written) || written <= 0 || written > remaining.byteLength) {
+      throw new Error(
+        `Direct file writer returned invalid byte count (${String(result)} for ${remaining.byteLength} bytes).`
+      );
+    }
+    offset += written;
+    onBytesWritten?.(written);
+  }
+  return offset;
 }
 function parseTotalFromContentRangeHeader(contentRangeHeader) {
   if (typeof contentRangeHeader !== "string" || contentRangeHeader.length === 0) {
@@ -1246,18 +1317,33 @@ function unlinkFsFile(fs, filePath) {
     return false;
   }
 }
-function reservableResponseLength(response, startOffset, bigInt) {
-  if (startOffset !== 0 || bigInt || response.status !== 200 || response.headers.has("content-range")) return 0;
+function parseIdentityLength(response, startOffset) {
+  if (startOffset !== 0 || response.status !== 200 || response.headers.has("content-range")) {
+    return { length: 0, encoding: void 0 };
+  }
   const encoding = response.headers.get("content-encoding")?.trim().toLowerCase();
-  if (encoding && encoding !== "identity") return 0;
+  if (encoding && encoding !== "identity") return { length: 0, encoding };
   const header = response.headers.get("content-length")?.trim() || "";
-  if (!/^[0-9]+$/.test(header)) return 0;
+  if (!/^[0-9]+$/.test(header)) return { length: 0, encoding };
   const length = Number(header);
-  return Number.isSafeInteger(length) && length >= 1073741824 && length <= 2147483647 ? length : 0;
+  if (!Number.isSafeInteger(length) || length < 1073741824) {
+    return { length: 0, encoding };
+  }
+  return { length, encoding };
+}
+function reservableResponseLength(response, startOffset, bigInt) {
+  if (bigInt) return 0;
+  const { length } = parseIdentityLength(response, startOffset);
+  return length <= 2147483647 ? length : 0;
+}
+function exactExpectedTransferLength(response, startOffset) {
+  const { length, encoding } = parseIdentityLength(response, startOffset);
+  return length > 0 && (response.type === "basic" || encoding === "identity") ? length : 0;
 }
 async function writeResponseToFsFileWithProgress(response, fs, filePath, progressCallback, writeOptions = {}) {
   const total = parsePositiveInteger(writeOptions.totalBytes) || inferResponseTotalBytes(response, 0);
   const useBigIntPosition = writeOptions.useBigIntPosition === true;
+  const directWriter = writeOptions.directWriter || null;
   const startOffset = parsePositiveInteger(writeOptions.startOffset);
   const preservePartialOnError = writeOptions.preservePartialOnError === true;
   const appendMode = startOffset > 0;
@@ -1265,43 +1351,80 @@ async function writeResponseToFsFileWithProgress(response, fs, filePath, progres
   const signal = writeOptions.signal || null;
   const abortMessage = writeOptions.abortMessage || "Model transfer was cancelled.";
   throwIfAborted(signal, abortMessage);
-  if (!appendMode) {
+  if (!appendMode && !directWriter) {
     unlinkFsFile(fs, filePath);
   }
   if (!response.body || typeof response.body.getReader !== "function") {
-    throwIfAborted(signal, abortMessage);
-    const bytes = new Uint8Array(await response.arrayBuffer());
-    throwIfAborted(signal, abortMessage);
-    if (appendMode) {
-      const stream2 = fs.open(filePath, "r+");
-      try {
-        throwIfAborted(signal, abortMessage);
-        const position = useBigIntPosition ? BigInt(startOffset) : startOffset;
-        fs.write(stream2, bytes, 0, bytes.length, position);
-      } finally {
-        fs.close(stream2);
+    const skipReservation2 = directWriter != null || writeOptions.skipMemoryReservation === true;
+    const exactLength2 = skipReservation2 ? exactExpectedTransferLength(response, startOffset) : 0;
+    try {
+      throwIfAborted(signal, abortMessage);
+      const bytes = new Uint8Array(await response.arrayBuffer());
+      throwIfAborted(signal, abortMessage);
+      if (exactLength2 > 0 && bytes.byteLength !== exactLength2) {
+        throw createModelTransferLengthError(
+          bytes.byteLength < exactLength2 ? "Model response ended before its declared byte length." : "Model response exceeded its declared byte length."
+        );
       }
-    } else {
-      fs.writeFile(filePath, bytes);
+      let directLoaded = 0;
+      if (directWriter) {
+        try {
+          writeDirectChunk(directWriter, bytes, startOffset, (written) => {
+            directLoaded += written;
+          });
+        } catch (error) {
+          if (error && typeof error === "object") {
+            error.llamadartLoadedBytes = startOffset + directLoaded;
+            error.llamadartFilePath = filePath;
+          }
+          throw error;
+        }
+      } else if (appendMode) {
+        const stream2 = fs.open(filePath, "r+");
+        try {
+          throwIfAborted(signal, abortMessage);
+          const position = useBigIntPosition ? BigInt(startOffset) : startOffset;
+          fs.write(stream2, bytes, 0, bytes.length, position);
+        } finally {
+          fs.close(stream2);
+        }
+      } else {
+        fs.writeFile(filePath, bytes);
+      }
+      const finalLoaded2 = startOffset + (directWriter ? directLoaded : bytes.byteLength);
+      if (typeof progressCallback === "function") {
+        progressCallback({ loaded: finalLoaded2, total: total || finalLoaded2 });
+      }
+      return finalLoaded2;
+    } finally {
+      directWriter?.close?.();
     }
-    const finalLoaded2 = startOffset + bytes.byteLength;
-    if (typeof progressCallback === "function") {
-      progressCallback({ loaded: finalLoaded2, total: total || finalLoaded2 });
-    }
-    return finalLoaded2;
   }
-  const reservedLength = reservableResponseLength(response, startOffset, useBigIntPosition);
+  const skipReservation = directWriter != null || writeOptions.skipMemoryReservation === true;
+  const reservedLength = skipReservation ? 0 : reservableResponseLength(response, startOffset, useBigIntPosition);
   const encoding = response.headers.get("content-encoding")?.trim().toLowerCase();
-  const exactLength = reservedLength > 0 && (response.type === "basic" || encoding === "identity") ? reservedLength : 0;
+  const exactLength = skipReservation ? exactExpectedTransferLength(response, startOffset) : reservedLength > 0 && (response.type === "basic" || encoding === "identity") ? reservedLength : 0;
   const reader = response.body.getReader();
   const openMode = appendMode ? "r+" : "w";
-  const stream = fs.open(filePath, openMode);
+  const stream = directWriter ? null : fs.open(filePath, openMode);
   let loaded = 0;
   let lastBucket = -1;
   let writePosition = startOffset;
   let writePositionBigInt = null;
+  const emitProgressIfNeeded = () => {
+    if (typeof progressCallback !== "function") {
+      return;
+    }
+    const effectiveLoaded = startOffset + loaded;
+    const effectiveTotal = total || effectiveLoaded;
+    const bucket = effectiveTotal > 0 ? Math.floor(effectiveLoaded / effectiveTotal * 100) : -1;
+    if (bucket > lastBucket) {
+      lastBucket = bucket;
+      progressCallback({ loaded: effectiveLoaded, total: effectiveTotal });
+    }
+  };
   try {
-    if (reservedLength > 0) {
+    if (reservedLength > 0 && stream != null) {
       try {
         const written = fs.write(stream, new Uint8Array(1), 0, 1, reservedLength - 1);
         if (written !== 1) throw new Error("Filesystem reservation returned a short write.");
@@ -1321,9 +1444,7 @@ async function writeResponseToFsFileWithProgress(response, fs, filePath, progres
       if (done) {
         throwIfAborted(signal, abortMessage);
         if (exactLength > 0 && loaded !== exactLength) {
-          const error = new Error("Model response ended before its declared byte length.");
-          error.name = "ModelTransferLengthError";
-          throw error;
+          throw createModelTransferLengthError("Model response ended before its declared byte length.");
         }
         break;
       }
@@ -1331,31 +1452,30 @@ async function writeResponseToFsFileWithProgress(response, fs, filePath, progres
         continue;
       }
       if (exactLength > 0 && value.length > exactLength - loaded) {
-        const error = new Error("Model response exceeded its declared byte length.");
-        error.name = "ModelTransferLengthError";
-        throw error;
+        throw createModelTransferLengthError("Model response exceeded its declared byte length.");
       }
-      const chunk = value.slice ? value.slice() : new Uint8Array(value);
-      throwIfAborted(signal, abortMessage);
-      if (useBigIntPosition) {
-        if (writePositionBigInt == null) {
-          writePositionBigInt = BigInt(startOffset);
-        }
-        fs.write(stream, chunk, 0, chunk.length, writePositionBigInt);
-        writePositionBigInt += BigInt(chunk.length);
+      if (directWriter) {
+        throwIfAborted(signal, abortMessage);
+        writeDirectChunk(directWriter, value, writePosition, (written) => {
+          writePosition += written;
+          loaded += written;
+          emitProgressIfNeeded();
+        });
       } else {
-        fs.write(stream, chunk, 0, chunk.length, writePosition);
-        writePosition += chunk.length;
-      }
-      loaded += chunk.length;
-      if (typeof progressCallback === "function") {
-        const effectiveLoaded = startOffset + loaded;
-        const effectiveTotal = total || effectiveLoaded;
-        const bucket = effectiveTotal > 0 ? Math.floor(effectiveLoaded / effectiveTotal * 100) : -1;
-        if (bucket > lastBucket) {
-          lastBucket = bucket;
-          progressCallback({ loaded: effectiveLoaded, total: effectiveTotal });
+        const chunk = value.slice ? value.slice() : new Uint8Array(value);
+        throwIfAborted(signal, abortMessage);
+        if (useBigIntPosition) {
+          if (writePositionBigInt == null) {
+            writePositionBigInt = BigInt(startOffset);
+          }
+          fs.write(stream, chunk, 0, chunk.length, writePositionBigInt);
+          writePositionBigInt += BigInt(chunk.length);
+        } else {
+          fs.write(stream, chunk, 0, chunk.length, writePosition);
+          writePosition += chunk.length;
         }
+        loaded += chunk.length;
+        emitProgressIfNeeded();
       }
     }
   } catch (error) {
@@ -1369,9 +1489,16 @@ async function writeResponseToFsFileWithProgress(response, fs, filePath, progres
       }
     } catch (_) {
     }
-    try {
-      fs.close(stream);
-    } catch (_) {
+    if (directWriter) {
+      try {
+        directWriter.close?.();
+      } catch (_) {
+      }
+    } else if (stream != null) {
+      try {
+        fs.close(stream);
+      } catch (_) {
+      }
     }
     try {
       await reader.cancel?.();
@@ -1379,13 +1506,18 @@ async function writeResponseToFsFileWithProgress(response, fs, filePath, progres
     }
     if (!preservePartialOnError || startOffset + loaded === 0 || signal?.aborted || error?.name === "AbortError" || error?.name === "ModelTransferLengthError") {
       try {
+        directWriter?.assertMountOwned?.();
         fs.unlink(filePath);
       } catch (_) {
       }
     }
     throw error;
   }
-  fs.close(stream);
+  if (directWriter) {
+    directWriter.close?.();
+  } else if (stream != null) {
+    fs.close(stream);
+  }
   const finalLoaded = startOffset + loaded;
   if (typeof progressCallback === "function") {
     progressCallback({ loaded: finalLoaded, total: total || finalLoaded });
@@ -1585,8 +1717,18 @@ var LlamaWebGpuBridgeRuntime = class {
     this._gpuActive = false;
     this._modelPath = null;
     this._modelPaths = [];
+    this._ownedModelPaths = [];
+    this._ownedModelMount = null;
+    this._modelFilesUseJsStaging = false;
+    this._jsBackedStagingMounted = false;
+    this._jsStagingMountCounter = 0;
+    this._activeJsStagingMounts = /* @__PURE__ */ new Map();
+    this._failedUnmountJsStagingMounts = /* @__PURE__ */ new Map();
     this._modelBytes = 0;
     this._mmProjPath = null;
+    this._ownedMmProjPath = null;
+    this._ownedMmProjMount = null;
+    this._mmProjUsesJsStaging = false;
     this._mmSupportsVision = false;
     this._mmSupportsAudio = false;
     this._mediaFileCounter = 0;
@@ -2450,7 +2592,242 @@ var LlamaWebGpuBridgeRuntime = class {
     }
     return unlinkFsFile(this._core.FS, path);
   }
-  _releaseModelFiles() {
+  _mountJsBackedStaging(core, noteTag) {
+    const missingExports = missingJsModelStagingExports(core);
+    if (missingExports.length > 0) {
+      this._pushRuntimeNote("model_staging_js_backed_unsupported");
+      throw new ModelStagingError(
+        "MODEL_STAGING_UNSUPPORTED",
+        `JS-backed model staging ('jsBackedModelStaging' / 'model_staging_js_backed') is not supported by this core binary (missing exports: ${missingExports.join(", ")}). Update the core build or disable jsBackedModelStaging.`
+      );
+    }
+    const apiVersion = Number(
+      core.ccall("llamadart_webgpu_js_model_fs_api_version", "number", [], [])
+    );
+    if (!Number.isInteger(apiVersion) || apiVersion < 3) {
+      this._pushRuntimeNote("model_staging_js_backed_unsupported");
+      throw new ModelStagingError(
+        "MODEL_STAGING_UNSUPPORTED",
+        `JS-backed model staging requires native ABI version >= 3 (got ${apiVersion}). Update the core build or disable jsBackedModelStaging.`
+      );
+    }
+    this._jsStagingMountCounter += 1;
+    const mountPath = `/jsmodels-${this._jsStagingMountCounter}`;
+    const mountRc = Number(
+      core.ccall("llamadart_webgpu_mount_js_model_fs", "number", ["string"], [mountPath])
+    );
+    if (mountRc !== 0) {
+      this._pushRuntimeNote("model_staging_mount_failed");
+      const detail = mountRc === -20 || mountRc === -17 ? `the ${mountPath} path already exists under another filesystem backend` : `rc=${mountRc}`;
+      throw new ModelStagingError(
+        "MODEL_STAGING_MOUNT_FAILED",
+        `Failed to mount JS-backed model filesystem at ${mountPath} (${detail}).`
+      );
+    }
+    const mountId = Number(
+      core.ccall("llamadart_webgpu_js_model_fs_mount_id", "number", ["string"], [mountPath])
+    );
+    if (!Number.isInteger(mountId) || mountId <= 0) {
+      try {
+        core.ccall("llamadart_webgpu_unmount_js_model_fs", "number", ["string"], [mountPath]);
+      } catch (_) {
+      }
+      this._pushRuntimeNote("model_staging_mount_failed");
+      throw new ModelStagingError(
+        "MODEL_STAGING_MOUNT_FAILED",
+        `Failed to verify native mount identity for ${mountPath} (mountId=${mountId}).`
+      );
+    }
+    this._activeJsStagingMounts.set(mountPath, mountId);
+    this._jsBackedStagingMounted = true;
+    this._pushRuntimeNote(noteTag);
+    return mountPath;
+  }
+  _isJsStagingMountOwned(core, mountPath, expectedMountId) {
+    if (!core || !mountPath || !expectedMountId || expectedMountId <= 0) {
+      return false;
+    }
+    try {
+      const liveMountId = Number(
+        core.ccall("llamadart_webgpu_js_model_fs_mount_id", "number", ["string"], [mountPath])
+      );
+      return Number.isInteger(liveMountId) && liveMountId > 0 && liveMountId === expectedMountId;
+    } catch (_) {
+      return false;
+    }
+  }
+  _openDirectJsWriter(core, filePath, preallocBytes, append, assertMountOwned) {
+    assertMountOwned();
+    const directHandle = Number(
+      core.ccall(
+        "llamadart_webgpu_js_model_fs_open_direct",
+        "number",
+        ["string", "number", "number"],
+        [filePath, preallocBytes, append ? 1 : 0]
+      )
+    );
+    if (!Number.isInteger(directHandle) || directHandle <= 0) {
+      const openErr = new Error(
+        `Failed to open direct JS-backed model file (rc=${directHandle}).`
+      );
+      if (directHandle < 0) {
+        openErr.errno = -directHandle;
+        if (directHandle === -12 || directHandle === -48) {
+          openErr.code = "ENOMEM";
+        }
+      }
+      throw openErr;
+    }
+    let closed = false;
+    const close = () => {
+      if (closed) {
+        return;
+      }
+      closed = true;
+      if (core.ABORT === true) {
+        return;
+      }
+      assertMountOwned();
+      try {
+        core.ccall("llamadart_webgpu_js_model_fs_close_direct", null, ["number"], [directHandle]);
+      } catch (_) {
+      }
+    };
+    const writeDirect = core.llamadartJsModelFsWriteDirect;
+    return {
+      writeChunk(chunk, position) {
+        assertMountOwned();
+        const rc = Number(writeDirect(directHandle, chunk, position));
+        if (!Number.isFinite(rc) || !Number.isInteger(rc) || rc < 0 || rc > chunk.byteLength) {
+          const writeErr = new Error(
+            `Failed to write direct JS-backed model chunk (rc=${rc}).`
+          );
+          if (rc < 0) {
+            writeErr.errno = -rc;
+            if (rc === -12 || rc === -48) {
+              writeErr.code = "ENOMEM";
+            }
+          }
+          throw writeErr;
+        }
+        return rc;
+      },
+      close,
+      assertMountOwned
+    };
+  }
+  _assertJsStagingMountOwned(core, mountPath, mountId) {
+    if (!this._isJsStagingMountOwned(core, mountPath, mountId)) {
+      throw new ModelStagingError(
+        "MODEL_STAGING_MOUNT_FAILED",
+        `JS-backed model staging lost ownership of ${mountPath} during load.`
+      );
+    }
+  }
+  _consumeStagingAllocFailure(core, error, fallbackBytes) {
+    let jsOomBytes = 0;
+    try {
+      jsOomBytes = Number(
+        core.ccall("llamadart_webgpu_js_model_fs_consume_oom_bytes", "number", [], [])
+      ) || 0;
+    } catch (_) {
+      jsOomBytes = 0;
+    }
+    if (jsOomBytes <= 0 && !isJsAllocationError(error)) {
+      return null;
+    }
+    this._runtimeNotes.push("model_fs_write_arraybuffer_oom");
+    const detailBytes = jsOomBytes > 0 ? jsOomBytes : fallbackBytes;
+    const detailText = detailBytes > 0 ? ` (${detailBytes} bytes)` : "";
+    return new ModelStagingError(
+      "MODEL_STAGING_ALLOCATION_FAILED",
+      `Failed to allocate JavaScript memory while staging the model${detailText}. Close other tabs or use a smaller quantization.`
+    );
+  }
+  _releaseJsStagingMountChunks(core, mountId) {
+    try {
+      core.ccall("llamadart_webgpu_js_model_fs_release_mount_chunks", null, ["number"], [mountId]);
+    } catch (_) {
+    }
+  }
+  _releaseJsModelStaging(core = this._core, mountPath = null) {
+    if (this._activeJsStagingMounts.size === 0 && this._failedUnmountJsStagingMounts.size === 0) {
+      return;
+    }
+    const targets = /* @__PURE__ */ new Map();
+    for (const [failedPath, failedId] of this._failedUnmountJsStagingMounts) {
+      targets.set(failedPath, failedId);
+    }
+    if (mountPath) {
+      const activeId = this._activeJsStagingMounts.get(mountPath);
+      if (activeId) {
+        targets.set(mountPath, activeId);
+      }
+    } else {
+      for (const [activeMount, activeId] of this._activeJsStagingMounts) {
+        targets.set(activeMount, activeId);
+      }
+    }
+    if (targets.size === 0) {
+      return;
+    }
+    if (!core || core.ABORT === true) {
+      for (const targetMount of targets.keys()) {
+        this._activeJsStagingMounts.delete(targetMount);
+        this._failedUnmountJsStagingMounts.delete(targetMount);
+      }
+      this._jsBackedStagingMounted = this._activeJsStagingMounts.size > 0;
+      return;
+    }
+    for (const [targetMount, expectedMountId] of targets) {
+      if (!this._isJsStagingMountOwned(core, targetMount, expectedMountId)) {
+        this._releaseJsStagingMountChunks(core, expectedMountId);
+        this._activeJsStagingMounts.delete(targetMount);
+        this._failedUnmountJsStagingMounts.delete(targetMount);
+        continue;
+      }
+      let unmounted = false;
+      try {
+        unmounted = Number(
+          core.ccall("llamadart_webgpu_unmount_js_model_fs", "number", ["string"], [targetMount])
+        ) === 0;
+      } catch (_) {
+      }
+      if (unmounted) {
+        this._activeJsStagingMounts.delete(targetMount);
+        this._failedUnmountJsStagingMounts.delete(targetMount);
+      } else {
+        this._activeJsStagingMounts.set(targetMount, expectedMountId);
+        this._failedUnmountJsStagingMounts.set(targetMount, expectedMountId);
+      }
+    }
+    this._jsBackedStagingMounted = this._activeJsStagingMounts.size > 0;
+  }
+  _releaseModelFiles(mountPath = null, assertMountOwned) {
+    if (this._modelFilesUseJsStaging) {
+      const paths2 = [...this._ownedModelPaths];
+      const ownedMount = this._ownedModelMount;
+      let removed2 = 0;
+      for (const path of paths2) {
+        if (assertMountOwned) {
+          assertMountOwned();
+        } else if (!this._isJsStagingMountOwned(this._core, ownedMount?.mountPath, ownedMount?.mountId)) {
+          break;
+        }
+        if (this._deleteFsFile(path)) {
+          removed2 += 1;
+        }
+      }
+      this._ownedModelPaths = [];
+      this._ownedModelMount = null;
+      this._modelFilesUseJsStaging = false;
+      this._modelPaths = [];
+      this._modelPath = null;
+      if (mountPath) {
+        this._releaseJsModelStaging(this._core, mountPath);
+      }
+      return removed2;
+    }
     const paths = Array.isArray(this._modelPaths) && this._modelPaths.length > 0 ? [...this._modelPaths] : this._modelPath ? [this._modelPath] : [];
     let removed = 0;
     for (const path of paths) {
@@ -2467,8 +2844,8 @@ var LlamaWebGpuBridgeRuntime = class {
   // which leaves the current model untouched.
   async _releaseLoadedModel(core) {
     const projectorPath = this._mmProjPath;
-    const hasModelFiles = Array.isArray(this._modelPaths) && this._modelPaths.length > 0;
-    if (this._modelBytes <= 0 && !projectorPath && !hasModelFiles) {
+    const hasModelFiles = this._ownedModelPaths.length > 0 || Array.isArray(this._modelPaths) && this._modelPaths.length > 0;
+    if (this._modelBytes <= 0 && !projectorPath && !this._ownedMmProjPath && !hasModelFiles) {
       return false;
     }
     const rc = Number(await core.ccall("llamadart_webgpu_free_model", "number", [], [], { async: true }));
@@ -2477,8 +2854,18 @@ var LlamaWebGpuBridgeRuntime = class {
     }
     this._loraAdaptersLoaded = false;
     this._clearStagedMediaFiles();
-    this._deleteFsFile(projectorPath);
+    if (!this._mmProjUsesJsStaging || projectorPath && this._ownedMmProjPath === projectorPath && this._isJsStagingMountOwned(
+      core,
+      this._ownedMmProjMount?.mountPath,
+      this._ownedMmProjMount?.mountId
+    )) {
+      this._deleteFsFile(projectorPath);
+    }
+    this._ownedMmProjPath = null;
+    this._ownedMmProjMount = null;
+    this._mmProjUsesJsStaging = false;
     this._releaseModelFiles();
+    this._releaseJsModelStaging(core);
     this._modelPath = null;
     this._modelBytes = 0;
     this._modelSource = "network";
@@ -3061,322 +3448,212 @@ var LlamaWebGpuBridgeRuntime = class {
     } else {
       this._runtimeNotes.push("model_fetch_backend_skipped_split");
     }
-    if (!loadedViaRemoteFetch) {
-      ensureFsDirectory(core.FS, "/models");
-      const progressCallback = typeof options.progressCallback === "function" ? options.progressCallback : null;
-      const shardLoaded = new Array(modelUrls.length).fill(0);
-      const shardTotals = new Array(modelUrls.length).fill(0);
-      const emitAggregateProgress = () => {
-        if (!progressCallback) {
-          return;
+    let stagingMountPath = null;
+    let useJsBackedStaging = false;
+    let assertMountOwned;
+    try {
+      if (!loadedViaRemoteFetch) {
+        useJsBackedStaging = this._config.jsBackedModelStaging === true;
+        let modelDir = "/models";
+        let stagingMountId = 0;
+        if (useJsBackedStaging) {
+          const mountPath = this._mountJsBackedStaging(core, "model_staging_js_backed");
+          stagingMountPath = mountPath;
+          stagingMountId = this._activeJsStagingMounts.get(mountPath) || 0;
+          assertMountOwned = () => this._assertJsStagingMountOwned(core, mountPath, stagingMountId);
+          modelDir = mountPath;
+        } else {
+          ensureFsDirectory(core.FS, "/models");
         }
-        const loaded = sumProgressValues(shardLoaded);
-        const total = sumProgressValues(shardTotals);
-        progressCallback({
-          loaded,
-          total: total > 0 ? total : loaded
-        });
-      };
-      const modelPaths = [];
-      let totalModelBytes = 0;
-      const maxStreamResumeRetries = Number.isFinite(options.streamResumeRetries) ? Math.max(0, Math.trunc(options.streamResumeRetries)) : 8;
-      const streamChunkTimeoutMs = this._resolveStreamChunkTimeoutMs(
-        options,
-        9e4
-      );
-      try {
-        for (let shardIndex = 0; shardIndex < modelUrls.length; shardIndex += 1) {
-          const shardUrl = modelUrls[shardIndex];
-          const fileName = basenameFromUrl(shardUrl);
-          const modelPath = `/models/${fileName}`;
-          modelPaths.push(modelPath);
-          let shardBytes = 0;
-          let resumeOffset = 0;
-          let resumeAttempt = 0;
-          let activeShardUrl = shardUrl;
-          let knownTotalBytes = 0;
-          while (true) {
-            throwIfAborted(operationSignal, abortMessage);
-            const requestHeaders = resumeOffset > 0 ? { Range: `bytes=${resumeOffset}-` } : null;
-            const response = await this._getCachedModelResponse(activeShardUrl, {
-              ...options,
-              requireReadableStream: true,
-              useCache: requestHeaders ? false : options.useCache,
-              force: requestHeaders ? true : options.force,
-              requestHeaders
-            });
-            if (!response.ok) {
-              throw new Error(
-                `Failed to fetch model shard: ${response.status} ${response.statusText}`
-              );
-            }
-            const responseUrl = typeof response.url === "string" && response.url.length > 0 ? response.url : activeShardUrl;
-            if (responseUrl !== activeShardUrl) {
-              activeShardUrl = responseUrl;
-              if (resumeOffset > 0) {
-                this._runtimeNotes.push("model_stream_resume_redirect");
-              }
-            }
-            if (resumeOffset > 0 && response.status !== 206) {
-              this._runtimeNotes.push(`model_stream_resume_status:${response.status}`);
-              throw new Error(
-                `Range resume not honored for model shard: ${response.status} ${response.statusText}`
-              );
-            }
-            if (!hasReadableResponseStream(response)) {
-              this._runtimeNotes.push("model_response_nostream");
-              const declaredBytes = inferResponseTotalBytes(response, 0);
-              const declaredText = declaredBytes > 0 ? `${declaredBytes} bytes` : "unknown size";
-              throw new Error(
-                `Model response did not expose a readable stream (${declaredText}).`
-              );
-            }
-            this._runtimeNotes.push("model_response_stream");
-            const responseTotal = inferResponseTotalBytes(response, knownTotalBytes);
-            if (responseTotal > 0) {
-              knownTotalBytes = responseTotal;
-              shardTotals[shardIndex] = responseTotal;
-            }
-            try {
-              shardBytes = await writeResponseToFsFileWithProgress(
-                response,
-                core.FS,
-                modelPath,
-                progressCallback ? (progress) => {
-                  const loaded = Number(progress?.loaded) || 0;
-                  const total = Number(progress?.total) || 0;
-                  shardLoaded[shardIndex] = loaded;
-                  if (total > 0) {
-                    shardTotals[shardIndex] = total;
-                  }
-                  emitAggregateProgress();
-                } : null,
-                {
-                  useBigIntPosition: this._coreVariant === "wasm64",
-                  startOffset: resumeOffset,
-                  preservePartialOnError: true,
-                  totalBytes: knownTotalBytes,
-                  chunkTimeoutMs: streamChunkTimeoutMs,
-                  signal: operationSignal,
-                  abortMessage
-                }
-              );
-              await this._settleModelCacheStore(response);
-              break;
-            } catch (error) {
-              const text = String(error || "").toLowerCase();
-              const loadedBytes = Number(
-                error?.llamadartLoadedBytes
-              );
-              if (Number.isFinite(loadedBytes) && loadedBytes >= 0) {
-                const normalizedLoaded = Math.trunc(loadedBytes);
-                this._runtimeNotes.push(`model_fs_write_loaded:${normalizedLoaded}`);
-                if (normalizedLoaded > resumeOffset) {
-                  resumeOffset = normalizedLoaded;
-                  shardLoaded[shardIndex] = normalizedLoaded;
-                  if (knownTotalBytes > 0 && shardTotals[shardIndex] < knownTotalBytes) {
-                    shardTotals[shardIndex] = knownTotalBytes;
-                  }
-                  emitAggregateProgress();
-                }
-              }
-              const shouldRetryResume = isRetryableStreamNetworkError(error) && resumeOffset > 0 && resumeAttempt < maxStreamResumeRetries;
-              if (shouldRetryResume) {
-                resumeAttempt += 1;
-                this._runtimeNotes.push(`model_stream_resume_retry:${resumeAttempt}`);
-                this._runtimeNotes.push(`model_stream_resume_offset:${resumeOffset}`);
-                continue;
-              }
-              if (text.includes("bigint")) {
-                this._runtimeNotes.push("model_fs_write_bigint_error");
-              } else if (text.includes("abort")) {
-                this._runtimeNotes.push("model_fs_write_abort");
-              } else if (text.includes("array buffer allocation failed")) {
-                this._runtimeNotes.push("model_fs_write_arraybuffer_oom");
-              } else if (isRetryableStreamNetworkError(error)) {
-                this._runtimeNotes.push("model_fs_write_network_error");
-                this._runtimeNotes.push("model_fs_write_failed");
-              } else {
-                this._runtimeNotes.push("model_fs_write_failed");
-              }
-              throw error;
-            }
+        const progressCallback = typeof options.progressCallback === "function" ? options.progressCallback : null;
+        const shardLoaded = new Array(modelUrls.length).fill(0);
+        const shardTotals = new Array(modelUrls.length).fill(0);
+        const emitAggregateProgress = () => {
+          if (!progressCallback) {
+            return;
           }
-          shardLoaded[shardIndex] = shardBytes;
-          if (shardTotals[shardIndex] < shardBytes) {
-            shardTotals[shardIndex] = shardBytes;
-          }
-          totalModelBytes += shardBytes;
-          emitAggregateProgress();
-        }
-        this._modelPaths = modelPaths;
-        this._modelPath = modelPaths[0] || null;
-        this._modelBytes = totalModelBytes;
-        let rc = 0;
-        let nativeLoadStarted = false;
-        let nativeAbortCleanupDone = false;
-        try {
-          throwIfAborted(operationSignal, abortMessage);
-          nativeLoadStarted = true;
-          rc = Number(
-            await core.ccall(
-              "llamadart_webgpu_load_model",
-              "number",
-              [
-                "string",
-                "number",
-                "number",
-                "number",
-                "number",
-                "number",
-                "number",
-                ...this._nativeLoadOptionTypes()
-              ],
-              [
-                this._modelPath,
-                this._nCtx,
-                this._threads,
-                this._threadsBatch,
-                this._nBatch,
-                this._nUbatch,
-                this._nGpuLayers,
-                ...this._nativeLoadOptionValues()
-              ],
-              { async: true }
-            )
-          );
-          if (operationSignal?.aborted) {
-            try {
-              await core.ccall("llamadart_webgpu_shutdown", null, [], [], { async: true });
-              nativeAbortCleanupDone = true;
-            } catch (_) {
-            }
-            throw createAbortError(abortMessage);
-          }
-        } catch (error) {
-          if (operationSignal?.aborted && nativeLoadStarted && !nativeAbortCleanupDone) {
-            try {
-              await core.ccall("llamadart_webgpu_shutdown", null, [], [], { async: true });
-              nativeAbortCleanupDone = true;
-            } catch (_) {
-            }
-            error = createAbortError(abortMessage);
-          }
-          const text = String(error || "").toLowerCase();
-          if (text.includes("bigint")) {
-            this._runtimeNotes.push("model_load_ccall_bigint_error");
-          } else if (text.includes("abort")) {
-            this._runtimeNotes.push("model_load_ccall_abort");
-          } else {
-            this._runtimeNotes.push("model_load_ccall_failed");
-          }
-          throw error;
-        }
-        if (rc !== 0) {
-          throw new Error(this._coreErrorMessage("Failed to load GGUF model", rc));
-        }
-        if (modelUrls.length > 1) {
-          this._runtimeNotes.push(`model_split_loaded:${modelUrls.length}`);
-        }
-      } catch (error) {
-        this._modelBytes = 0;
-        this._modelPath = null;
-        this._modelPaths = [];
-        if (operationSignal?.aborted) {
-          this._loadedModelUrl = null;
-        }
-        for (const modelPath of modelPaths) {
-          this._deleteFsFile(modelPath);
-        }
-        throw error;
-      }
-    }
-    const shouldProbeSafariGpu = this._isSafari && this._nGpuLayers > 0 && options.safariGpuProbe !== false;
-    if (shouldProbeSafariGpu) {
-      if (loadedViaRemoteFetch) {
-        this._runtimeNotes.push("safari_probe_on_fetch_backend");
-      }
-      const defaultProbePrompts = [
-        "user: hi\nassistant:",
-        "user: say hello in one short sentence\nassistant:"
-      ];
-      const probePrompts = Array.isArray(options.safariProbePrompts) ? options.safariProbePrompts.map((v) => String(v || "").trim()).filter((v) => v.length > 0) : typeof options.safariProbePrompt === "string" && options.safariProbePrompt.trim().length > 0 ? [options.safariProbePrompt.trim()] : defaultProbePrompts;
-      const probeTokensRaw = Number(options.safariProbeTokens);
-      const probeTokens = Number.isFinite(probeTokensRaw) && probeTokensRaw > 0 ? Math.min(Math.trunc(probeTokensRaw), 96) : 48;
-      const runProbe = async (probePrompt, probeSeed) => {
-        try {
-          const probeOutput = await this.createCompletion(probePrompt, {
-            nPredict: probeTokens,
-            temp: 0,
-            topK: 1,
-            topP: 1,
-            penalty: 1,
-            seed: probeSeed
+          const loaded = sumProgressValues(shardLoaded);
+          const total = sumProgressValues(shardTotals);
+          progressCallback({
+            loaded,
+            total: total > 0 ? total : loaded
           });
-          return !looksLikeCorruptedGeneration(probeOutput);
-        } catch (_) {
-          return false;
+        };
+        const modelPaths = [];
+        const ownedPaths = [];
+        if (useJsBackedStaging) {
+          this._ownedModelPaths = ownedPaths;
+          this._ownedModelMount = stagingMountPath && stagingMountId > 0 ? { mountPath: stagingMountPath, mountId: stagingMountId } : null;
+        } else {
+          this._ownedModelPaths = [];
+          this._ownedModelMount = null;
         }
-      };
-      let initialProbePassed = true;
-      for (let i = 0; i < probePrompts.length; i += 1) {
-        const ok = await runProbe(probePrompts[i], i + 1);
-        if (!ok) {
-          initialProbePassed = false;
-          break;
-        }
-      }
-      if (!initialProbePassed) {
-        this._runtimeNotes.push("safari_gpu_probe_failed");
-        const retryCandidates = [];
-        if (this._nGpuLayers > 1) {
-          retryCandidates.push(1);
-        }
-        retryCandidates.push(0);
-        let stabilized = false;
-        for (const candidateLayers of retryCandidates) {
-          try {
-            await core.ccall("llamadart_webgpu_shutdown", null, [], [], { async: true });
-          } catch (_) {
-          }
-          let retryRc = 0;
-          if (loadedViaRemoteFetch) {
-            const reloadUrl = remoteFetchReloadUrl || modelUrls[0] || null;
-            if (!reloadUrl) {
-              continue;
+        this._modelFilesUseJsStaging = useJsBackedStaging;
+        let totalModelBytes = 0;
+        const maxStreamResumeRetries = Number.isFinite(options.streamResumeRetries) ? Math.max(0, Math.trunc(options.streamResumeRetries)) : 8;
+        const streamChunkTimeoutMs = this._resolveStreamChunkTimeoutMs(
+          options,
+          9e4
+        );
+        try {
+          for (let shardIndex = 0; shardIndex < modelUrls.length; shardIndex += 1) {
+            const shardUrl = modelUrls[shardIndex];
+            const fileName = basenameFromUrl(shardUrl);
+            const modelPath = `${modelDir}/${fileName}`;
+            modelPaths.push(modelPath);
+            let shardBytes = 0;
+            let resumeOffset = 0;
+            let resumeAttempt = 0;
+            let activeShardUrl = shardUrl;
+            let knownTotalBytes = 0;
+            while (true) {
+              throwIfAborted(operationSignal, abortMessage);
+              const requestHeaders = resumeOffset > 0 ? { Range: `bytes=${resumeOffset}-` } : null;
+              const response = await this._getCachedModelResponse(activeShardUrl, {
+                ...options,
+                requireReadableStream: true,
+                useCache: requestHeaders ? false : options.useCache,
+                force: requestHeaders ? true : options.force,
+                requestHeaders
+              });
+              if (!response.ok) {
+                throw new Error(
+                  `Failed to fetch model shard: ${response.status} ${response.statusText}`
+                );
+              }
+              const responseUrl = typeof response.url === "string" && response.url.length > 0 ? response.url : activeShardUrl;
+              if (responseUrl !== activeShardUrl) {
+                activeShardUrl = responseUrl;
+                if (resumeOffset > 0) {
+                  this._runtimeNotes.push("model_stream_resume_redirect");
+                }
+              }
+              if (resumeOffset > 0 && response.status !== 206) {
+                this._runtimeNotes.push(`model_stream_resume_status:${response.status}`);
+                throw new Error(
+                  `Range resume not honored for model shard: ${response.status} ${response.statusText}`
+                );
+              }
+              if (!hasReadableResponseStream(response)) {
+                this._runtimeNotes.push("model_response_nostream");
+                const declaredBytes = inferResponseTotalBytes(response, 0);
+                const declaredText = declaredBytes > 0 ? `${declaredBytes} bytes` : "unknown size";
+                throw new Error(
+                  `Model response did not expose a readable stream (${declaredText}).`
+                );
+              }
+              this._runtimeNotes.push("model_response_stream");
+              const responseTotal = inferResponseTotalBytes(response, knownTotalBytes);
+              if (responseTotal > 0) {
+                knownTotalBytes = responseTotal;
+                shardTotals[shardIndex] = responseTotal;
+              }
+              try {
+                if (useJsBackedStaging && !ownedPaths.includes(modelPath)) {
+                  ownedPaths.push(modelPath);
+                }
+                const directWriter = assertMountOwned ? this._openDirectJsWriter(
+                  core,
+                  modelPath,
+                  resumeOffset === 0 && knownTotalBytes > 0 ? knownTotalBytes : 0,
+                  resumeOffset > 0,
+                  assertMountOwned
+                ) : null;
+                shardBytes = await writeResponseToFsFileWithProgress(
+                  response,
+                  core.FS,
+                  modelPath,
+                  progressCallback ? (progress) => {
+                    const loaded = Number(progress?.loaded) || 0;
+                    const total = Number(progress?.total) || 0;
+                    shardLoaded[shardIndex] = loaded;
+                    if (total > 0) {
+                      shardTotals[shardIndex] = total;
+                    }
+                    emitAggregateProgress();
+                  } : null,
+                  {
+                    useBigIntPosition: this._coreVariant === "wasm64",
+                    skipMemoryReservation: useJsBackedStaging,
+                    directWriter,
+                    startOffset: resumeOffset,
+                    preservePartialOnError: true,
+                    totalBytes: knownTotalBytes,
+                    chunkTimeoutMs: streamChunkTimeoutMs,
+                    signal: operationSignal,
+                    abortMessage
+                  }
+                );
+                await this._settleModelCacheStore(response);
+                break;
+              } catch (error) {
+                if (assertMountOwned && core.ABORT !== true) {
+                  assertMountOwned();
+                }
+                const text = String(error || "").toLowerCase();
+                const loadedBytes = Number(
+                  error?.llamadartLoadedBytes
+                );
+                if (Number.isFinite(loadedBytes) && loadedBytes >= 0) {
+                  const normalizedLoaded = Math.trunc(loadedBytes);
+                  this._runtimeNotes.push(`model_fs_write_loaded:${normalizedLoaded}`);
+                  if (normalizedLoaded > resumeOffset) {
+                    resumeOffset = normalizedLoaded;
+                    shardLoaded[shardIndex] = normalizedLoaded;
+                    if (knownTotalBytes > 0 && shardTotals[shardIndex] < knownTotalBytes) {
+                      shardTotals[shardIndex] = knownTotalBytes;
+                    }
+                    emitAggregateProgress();
+                  }
+                }
+                const stagingAllocError = useJsBackedStaging ? this._consumeStagingAllocFailure(
+                  core,
+                  error,
+                  knownTotalBytes > 0 ? knownTotalBytes : resumeOffset
+                ) : null;
+                const shouldRetryResume = !stagingAllocError && isRetryableStreamNetworkError(error) && resumeOffset > 0 && resumeAttempt < maxStreamResumeRetries;
+                if (shouldRetryResume) {
+                  resumeAttempt += 1;
+                  this._runtimeNotes.push(`model_stream_resume_retry:${resumeAttempt}`);
+                  this._runtimeNotes.push(`model_stream_resume_offset:${resumeOffset}`);
+                  continue;
+                }
+                if (stagingAllocError) {
+                  throw stagingAllocError;
+                }
+                if (text.includes("bigint")) {
+                  this._runtimeNotes.push("model_fs_write_bigint_error");
+                } else if (text.includes("abort")) {
+                  this._runtimeNotes.push("model_fs_write_abort");
+                } else if (text.includes("array buffer allocation failed")) {
+                  this._runtimeNotes.push("model_fs_write_arraybuffer_oom");
+                } else if (isRetryableStreamNetworkError(error)) {
+                  this._runtimeNotes.push("model_fs_write_network_error");
+                  this._runtimeNotes.push("model_fs_write_failed");
+                } else {
+                  this._runtimeNotes.push("model_fs_write_failed");
+                }
+                throw error;
+              }
             }
-            this._runtimeNotes.push(`safari_probe_remote_fetch_retry:${candidateLayers}`);
-            retryRc = Number(
-              await core.ccall(
-                "llamadart_webgpu_load_model_from_url",
-                "number",
-                [
-                  "string",
-                  "number",
-                  "number",
-                  "number",
-                  "number",
-                  "number",
-                  "number",
-                  "number",
-                  ...this._nativeLoadOptionTypes()
-                ],
-                [
-                  reloadUrl,
-                  this._nCtx,
-                  this._threads,
-                  this._threadsBatch,
-                  this._nBatch,
-                  this._nUbatch,
-                  candidateLayers,
-                  remoteFetchReloadChunkBytes,
-                  ...this._nativeLoadOptionValues()
-                ],
-                { async: true }
-              )
-            );
-          } else {
-            retryRc = Number(
+            shardLoaded[shardIndex] = shardBytes;
+            if (shardTotals[shardIndex] < shardBytes) {
+              shardTotals[shardIndex] = shardBytes;
+            }
+            totalModelBytes += shardBytes;
+            emitAggregateProgress();
+          }
+          this._modelPaths = modelPaths;
+          this._modelPath = modelPaths[0] || null;
+          this._modelBytes = totalModelBytes;
+          let rc = 0;
+          let nativeLoadStarted = false;
+          let nativeAbortCleanupDone = false;
+          try {
+            throwIfAborted(operationSignal, abortMessage);
+            assertMountOwned?.();
+            nativeLoadStarted = true;
+            rc = Number(
               await core.ccall(
                 "llamadart_webgpu_load_model",
                 "number",
@@ -3397,59 +3674,255 @@ var LlamaWebGpuBridgeRuntime = class {
                   this._threadsBatch,
                   this._nBatch,
                   this._nUbatch,
-                  candidateLayers,
+                  this._nGpuLayers,
                   ...this._nativeLoadOptionValues()
                 ],
                 { async: true }
               )
             );
+            if (operationSignal?.aborted) {
+              try {
+                await core.ccall("llamadart_webgpu_shutdown", null, [], [], { async: true });
+                nativeAbortCleanupDone = true;
+              } catch (_) {
+              }
+              throw createAbortError(abortMessage);
+            }
+          } catch (error) {
+            if (operationSignal?.aborted && nativeLoadStarted && !nativeAbortCleanupDone) {
+              try {
+                await core.ccall("llamadart_webgpu_shutdown", null, [], [], { async: true });
+                nativeAbortCleanupDone = true;
+              } catch (_) {
+              }
+              error = createAbortError(abortMessage);
+            }
+            const text = String(error || "").toLowerCase();
+            if (text.includes("bigint")) {
+              this._runtimeNotes.push("model_load_ccall_bigint_error");
+            } else if (text.includes("abort")) {
+              this._runtimeNotes.push("model_load_ccall_abort");
+            } else {
+              this._runtimeNotes.push("model_load_ccall_failed");
+            }
+            throw error;
           }
-          if (retryRc !== 0) {
-            continue;
+          if (rc !== 0) {
+            const errorMessage = this._coreErrorMessage("Failed to load GGUF model", rc);
+            if (useJsBackedStaging) {
+              const combined = `${errorMessage} ${this._lastCoreErrorHint} ${this._lastCoreErrorText}`;
+              if (rc === -4 || isWasm32TensorLimitText(combined)) {
+                throw new ModelStagingError("MODEL_TENSOR_SIZE_LIMIT_EXCEEDED", errorMessage);
+              }
+            }
+            throw new Error(errorMessage);
           }
-          this._nGpuLayers = candidateLayers;
-          if (candidateLayers === 0) {
-            this._runtimeNotes.push("safari_fallback_cpu");
-            stabilized = true;
+          if (modelUrls.length > 1) {
+            this._runtimeNotes.push(`model_split_loaded:${modelUrls.length}`);
+          }
+        } catch (error) {
+          this._modelBytes = 0;
+          this._modelPath = null;
+          this._modelPaths = [];
+          if (operationSignal?.aborted) {
+            this._loadedModelUrl = null;
+          }
+          if (useJsBackedStaging) {
+            try {
+              if (core.ABORT !== true) {
+                assertMountOwned?.();
+              }
+            } finally {
+              this._releaseModelFiles(stagingMountPath);
+            }
+          } else {
+            this._ownedModelPaths = [];
+            this._ownedModelMount = null;
+            this._modelFilesUseJsStaging = false;
+            for (const modelPath of modelPaths) {
+              this._deleteFsFile(modelPath);
+            }
+          }
+          throw error;
+        }
+      }
+      assertMountOwned?.();
+      const shouldProbeSafariGpu = this._isSafari && this._nGpuLayers > 0 && options.safariGpuProbe !== false;
+      if (shouldProbeSafariGpu) {
+        if (loadedViaRemoteFetch) {
+          this._runtimeNotes.push("safari_probe_on_fetch_backend");
+        }
+        const defaultProbePrompts = [
+          "user: hi\nassistant:",
+          "user: say hello in one short sentence\nassistant:"
+        ];
+        const probePrompts = Array.isArray(options.safariProbePrompts) ? options.safariProbePrompts.map((v) => String(v || "").trim()).filter((v) => v.length > 0) : typeof options.safariProbePrompt === "string" && options.safariProbePrompt.trim().length > 0 ? [options.safariProbePrompt.trim()] : defaultProbePrompts;
+        const probeTokensRaw = Number(options.safariProbeTokens);
+        const probeTokens = Number.isFinite(probeTokensRaw) && probeTokensRaw > 0 ? Math.min(Math.trunc(probeTokensRaw), 96) : 48;
+        const runProbe = async (probePrompt, probeSeed) => {
+          try {
+            const probeOutput = await this.createCompletion(probePrompt, {
+              nPredict: probeTokens,
+              temp: 0,
+              topK: 1,
+              topP: 1,
+              penalty: 1,
+              seed: probeSeed
+            });
+            return !looksLikeCorruptedGeneration(probeOutput);
+          } catch (_) {
+            return false;
+          }
+        };
+        let initialProbePassed = true;
+        for (let i = 0; i < probePrompts.length; i += 1) {
+          const ok = await runProbe(probePrompts[i], i + 1);
+          if (!ok) {
+            initialProbePassed = false;
             break;
           }
-          let retryProbePassed = true;
-          for (let i = 0; i < probePrompts.length; i += 1) {
-            const ok = await runProbe(probePrompts[i], i + 11);
-            if (!ok) {
-              retryProbePassed = false;
+        }
+        if (!initialProbePassed) {
+          this._runtimeNotes.push("safari_gpu_probe_failed");
+          const retryCandidates = [];
+          if (this._nGpuLayers > 1) {
+            retryCandidates.push(1);
+          }
+          retryCandidates.push(0);
+          let stabilized = false;
+          for (const candidateLayers of retryCandidates) {
+            try {
+              await core.ccall("llamadart_webgpu_shutdown", null, [], [], { async: true });
+            } catch (_) {
+            }
+            let retryRc = 0;
+            if (loadedViaRemoteFetch) {
+              const reloadUrl = remoteFetchReloadUrl || modelUrls[0] || null;
+              if (!reloadUrl) {
+                continue;
+              }
+              this._runtimeNotes.push(`safari_probe_remote_fetch_retry:${candidateLayers}`);
+              retryRc = Number(
+                await core.ccall(
+                  "llamadart_webgpu_load_model_from_url",
+                  "number",
+                  [
+                    "string",
+                    "number",
+                    "number",
+                    "number",
+                    "number",
+                    "number",
+                    "number",
+                    "number",
+                    ...this._nativeLoadOptionTypes()
+                  ],
+                  [
+                    reloadUrl,
+                    this._nCtx,
+                    this._threads,
+                    this._threadsBatch,
+                    this._nBatch,
+                    this._nUbatch,
+                    candidateLayers,
+                    remoteFetchReloadChunkBytes,
+                    ...this._nativeLoadOptionValues()
+                  ],
+                  { async: true }
+                )
+              );
+            } else {
+              assertMountOwned?.();
+              retryRc = Number(
+                await core.ccall(
+                  "llamadart_webgpu_load_model",
+                  "number",
+                  [
+                    "string",
+                    "number",
+                    "number",
+                    "number",
+                    "number",
+                    "number",
+                    "number",
+                    ...this._nativeLoadOptionTypes()
+                  ],
+                  [
+                    this._modelPath,
+                    this._nCtx,
+                    this._threads,
+                    this._threadsBatch,
+                    this._nBatch,
+                    this._nUbatch,
+                    candidateLayers,
+                    ...this._nativeLoadOptionValues()
+                  ],
+                  { async: true }
+                )
+              );
+            }
+            if (retryRc !== 0) {
+              continue;
+            }
+            this._nGpuLayers = candidateLayers;
+            if (candidateLayers === 0) {
+              this._runtimeNotes.push("safari_fallback_cpu");
+              stabilized = true;
+              break;
+            }
+            let retryProbePassed = true;
+            for (let i = 0; i < probePrompts.length; i += 1) {
+              const ok = await runProbe(probePrompts[i], i + 11);
+              if (!ok) {
+                retryProbePassed = false;
+                break;
+              }
+            }
+            if (retryProbePassed) {
+              this._runtimeNotes.push(`safari_gpu_layers_capped:${candidateLayers}`);
+              stabilized = true;
               break;
             }
           }
-          if (retryProbePassed) {
-            this._runtimeNotes.push(`safari_gpu_layers_capped:${candidateLayers}`);
-            stabilized = true;
-            break;
+          if (!stabilized) {
+            throw new Error("Safari GPU probe failed and fallback attempts were unsuccessful.");
           }
+        } else {
+          this._runtimeNotes.push("safari_gpu_probe_passed");
         }
-        if (!stabilized) {
-          throw new Error("Safari GPU probe failed and fallback attempts were unsuccessful.");
+      }
+      try {
+        const effectiveNctx = Number(core.ccall("llamadart_webgpu_get_context_size", "number", [], []));
+        if (effectiveNctx > 0) {
+          this._nCtx = effectiveNctx;
         }
-      } else {
-        this._runtimeNotes.push("safari_gpu_probe_passed");
+      } catch (_) {
       }
-    }
-    try {
-      const effectiveNctx = Number(core.ccall("llamadart_webgpu_get_context_size", "number", [], []));
-      if (effectiveNctx > 0) {
-        this._nCtx = effectiveNctx;
+      this._mmProjPath = null;
+      this._ownedMmProjPath = null;
+      this._mmProjUsesJsStaging = false;
+      this._mmSupportsVision = false;
+      this._mmSupportsAudio = false;
+      this._mediaFileCounter = 0;
+      this._stateFileCounter = 0;
+      this._stagedMediaPaths = [];
+      this._gpuActive = this._gpuActive && this._nGpuLayers > 0;
+      if (this._releaseModelFiles(stagingMountPath, assertMountOwned) > 0) {
+        this._runtimeNotes.push("model_file_released");
       }
-    } catch (_) {
-    }
-    this._mmProjPath = null;
-    this._mmSupportsVision = false;
-    this._mmSupportsAudio = false;
-    this._mediaFileCounter = 0;
-    this._stateFileCounter = 0;
-    this._stagedMediaPaths = [];
-    this._gpuActive = this._gpuActive && this._nGpuLayers > 0;
-    if (this._releaseModelFiles() > 0) {
-      this._runtimeNotes.push("model_file_released");
+    } catch (error) {
+      if (assertMountOwned && this._modelBytes > 0 && error instanceof ModelStagingError && error.code === "MODEL_STAGING_MOUNT_FAILED") {
+        try {
+          await this._releaseLoadedModel(core);
+        } catch (_) {
+        }
+      }
+      throw error;
+    } finally {
+      if (useJsBackedStaging) {
+        this._releaseModelFiles(stagingMountPath);
+        this._releaseJsModelStaging(core, stagingMountPath);
+      }
     }
     this._emitSuppressedWarmupWarningSummaryIfNeeded();
     return 1;
@@ -3462,14 +3935,29 @@ var LlamaWebGpuBridgeRuntime = class {
       throw new Error("Multimodal projector URL/path is empty.");
     }
     const core = await this._ensureCore();
-    ensureFsDirectory(core.FS, "/mmproj");
+    const useJsBackedStaging = this._config.jsBackedModelStaging === true;
     const fileName = basenameFromUrl(url);
-    const mmprojPath = `/mmproj/${fileName}`;
     const fetchTimeoutMs = this._resolveFetchTimeoutMs({}, 18e4);
     const chunkTimeoutMs = this._resolveStreamChunkTimeoutMs({}, 9e4);
+    if (!useJsBackedStaging) {
+      ensureFsDirectory(core.FS, "/mmproj");
+    }
     let lastError = null;
     for (let attempt = 0; attempt < 2; attempt += 1) {
+      let stagingMountPath = null;
+      let stagingMountId = 0;
+      let mmprojPath = `/mmproj/${fileName}`;
+      let createdMmprojPath = null;
+      let assertMountOwned;
+      let projectorLoaded = false;
       try {
+        if (useJsBackedStaging) {
+          const mountPath = this._mountJsBackedStaging(core, "mmproj_staging_js_backed");
+          stagingMountPath = mountPath;
+          stagingMountId = this._activeJsStagingMounts.get(mountPath) || 0;
+          assertMountOwned = () => this._assertJsStagingMountOwned(core, mountPath, stagingMountId);
+          mmprojPath = `${mountPath}/${fileName}`;
+        }
         const response = await this._fetchWithTimeout(
           url,
           { cache: "no-store" },
@@ -3481,6 +3969,21 @@ var LlamaWebGpuBridgeRuntime = class {
           );
         }
         this._mmProjPath = mmprojPath;
+        this._mmProjUsesJsStaging = useJsBackedStaging;
+        if (useJsBackedStaging) {
+          this._ownedMmProjPath = mmprojPath;
+          this._ownedMmProjMount = stagingMountPath && stagingMountId > 0 ? { mountPath: stagingMountPath, mountId: stagingMountId } : null;
+          createdMmprojPath = mmprojPath;
+        } else {
+          this._ownedMmProjPath = null;
+          this._ownedMmProjMount = null;
+        }
+        let knownTotalBytes = 0;
+        let directWriter = null;
+        if (assertMountOwned) {
+          knownTotalBytes = inferResponseTotalBytes(response, 0);
+          directWriter = this._openDirectJsWriter(core, this._mmProjPath, knownTotalBytes, false, assertMountOwned);
+        }
         await writeResponseToFsFileWithProgress(
           response,
           core.FS,
@@ -3488,9 +3991,13 @@ var LlamaWebGpuBridgeRuntime = class {
           null,
           {
             useBigIntPosition: this._coreVariant === "wasm64",
+            skipMemoryReservation: useJsBackedStaging,
+            directWriter,
+            ...useJsBackedStaging ? { totalBytes: knownTotalBytes } : {},
             chunkTimeoutMs
           }
         );
+        assertMountOwned?.();
         const rc = Number(
           await core.ccall(
             "llamadart_webgpu_mmproj_load",
@@ -3503,6 +4010,7 @@ var LlamaWebGpuBridgeRuntime = class {
         if (rc !== 0) {
           throw new Error(this._coreErrorMessage("Failed to load multimodal projector", rc));
         }
+        projectorLoaded = true;
         this._mmSupportsVision = Number(
           core.ccall("llamadart_webgpu_mmproj_supports_vision", "number", [], [])
         ) === 1;
@@ -3510,21 +4018,54 @@ var LlamaWebGpuBridgeRuntime = class {
           core.ccall("llamadart_webgpu_mmproj_supports_audio", "number", [], [])
         ) === 1;
         this._mmProjSourceUrl = url;
+        assertMountOwned?.();
         if (this._deleteFsFile(mmprojPath)) {
           this._runtimeNotes.push("mmproj_file_released");
         }
+        this._ownedMmProjPath = null;
+        this._ownedMmProjMount = null;
         return 1;
       } catch (error) {
         lastError = error;
         this._mmProjPath = null;
+        this._ownedMmProjPath = null;
+        this._ownedMmProjMount = null;
+        this._mmProjUsesJsStaging = false;
         this._mmSupportsVision = false;
         this._mmSupportsAudio = false;
-        this._deleteFsFile(mmprojPath);
+        if (!useJsBackedStaging) {
+          this._deleteFsFile(mmprojPath);
+        } else if (createdMmprojPath && this._isJsStagingMountOwned(core, stagingMountPath, stagingMountId)) {
+          this._deleteFsFile(createdMmprojPath);
+        }
+        try {
+          if (assertMountOwned && core.ABORT !== true) {
+            assertMountOwned();
+          }
+        } catch (ownershipError) {
+          if (projectorLoaded) {
+            try {
+              core.ccall("llamadart_webgpu_mmproj_free", "number", [], []);
+            } catch (_) {
+            }
+            this._mmProjSourceUrl = null;
+          }
+          throw ownershipError;
+        }
+        const stagingAllocError = useJsBackedStaging ? this._consumeStagingAllocFailure(core, error, 0) : null;
+        if (stagingAllocError) {
+          throw stagingAllocError;
+        }
+        if (useJsBackedStaging && error instanceof ModelStagingError) {
+          throw error;
+        }
         const retryable = isRetryableStreamNetworkError(error);
         if (!retryable || attempt >= 1) {
           throw error;
         }
         this._runtimeNotes.push(`mmproj_load_retry:${attempt + 1}`);
+      } finally {
+        this._releaseJsModelStaging(core, stagingMountPath);
       }
     }
     if (lastError) {
@@ -3535,6 +4076,9 @@ var LlamaWebGpuBridgeRuntime = class {
   async unloadMultimodalProjector() {
     if (!this._core) {
       this._mmProjPath = null;
+      this._ownedMmProjPath = null;
+      this._ownedMmProjMount = null;
+      this._mmProjUsesJsStaging = false;
       this._mmSupportsVision = false;
       this._mmSupportsAudio = false;
       this._mmProjSourceUrl = null;
@@ -3547,7 +4091,16 @@ var LlamaWebGpuBridgeRuntime = class {
     if (rc !== 0) {
       throw new Error(this._coreErrorMessage("Failed to unload multimodal projector", rc));
     }
-    this._deleteFsFile(mmprojPath);
+    if (!this._mmProjUsesJsStaging || mmprojPath && this._ownedMmProjPath === mmprojPath && this._isJsStagingMountOwned(
+      this._core,
+      this._ownedMmProjMount?.mountPath,
+      this._ownedMmProjMount?.mountId
+    )) {
+      this._deleteFsFile(mmprojPath);
+    }
+    this._ownedMmProjPath = null;
+    this._ownedMmProjMount = null;
+    this._mmProjUsesJsStaging = false;
     this._mmProjPath = null;
     this._mmSupportsVision = false;
     this._mmSupportsAudio = false;
@@ -5205,6 +5758,9 @@ var LlamaWebGpuBridgeRuntime = class {
       this._activeTransferAbortController = null;
     }
     if (this._core) {
+      for (const mountId of this._activeJsStagingMounts.values()) {
+        this._releaseJsStagingMountChunks(this._core, mountId);
+      }
       this._clearPendingMedia();
       const mmprojPath = this._mmProjPath;
       const mmprojFreeRc = Number(
@@ -5217,7 +5773,9 @@ var LlamaWebGpuBridgeRuntime = class {
         );
       }
       await this._core.ccall("llamadart_webgpu_shutdown", null, [], [], { async: true });
-      this._deleteFsFile(mmprojPath);
+      if (!this._mmProjUsesJsStaging) {
+        this._deleteFsFile(mmprojPath);
+      }
     }
     this._modelPath = null;
     this._modelPaths = [];
@@ -5394,7 +5952,7 @@ var BridgeWorkerProxy = class {
       this._pending.delete(id);
       if (type === "error") {
         const errorMessage = String(message.message || "Worker request failed");
-        const workerError = message.embeddingErrorCode ? new EmbeddingError(message.embeddingErrorCode, errorMessage) : message.errorCode === CROSS_ORIGIN_ISOLATION_REQUIRED ? new CrossOriginIsolationError(errorMessage) : new Error(errorMessage);
+        const workerError = message.embeddingErrorCode ? new EmbeddingError(message.embeddingErrorCode, errorMessage) : this._config.jsBackedModelStaging === true && isModelStagingErrorCode(message.modelStagingErrorCode) ? new ModelStagingError(message.modelStagingErrorCode, errorMessage) : message.errorCode === CROSS_ORIGIN_ISOLATION_REQUIRED ? new CrossOriginIsolationError(errorMessage) : new Error(errorMessage);
         if (isDecisionErrorCode(message.decisionErrorCode)) {
           withDecisionErrorCode(workerError, message.decisionErrorCode);
         }
@@ -6173,7 +6731,16 @@ var LlamaWebGpuBridge = class {
     this._multimodalWorkerCpuMode = false;
     this._workerModelMissing = true;
   }
+  _isNonRecoverableStagingError(error) {
+    if (this._config.jsBackedModelStaging !== true || !error || typeof error !== "object") {
+      return false;
+    }
+    return error instanceof ModelStagingError || error.name === "ModelStagingError";
+  }
   _isRecoverableWorkerFsError(error) {
+    if (this._isNonRecoverableStagingError(error)) {
+      return false;
+    }
     const text = serializeWorkerError(error).toLowerCase();
     if (text.includes("model shard:")) {
       return false;
@@ -6221,6 +6788,9 @@ var LlamaWebGpuBridge = class {
       if (this._isOperationCancellation(error)) {
         this._workerModelMissing = true;
         throw createAbortError("Bridge operation was cancelled.");
+      }
+      if (this._isNonRecoverableStagingError(error)) {
+        throw error;
       }
       this._emitBridgeWarn(
         `llamadart: multimodal worker setup failed once; restarting worker (${serializeWorkerError(error)}).`
@@ -6521,6 +7091,7 @@ var LlamaWebGpuBridge = class {
       coreModuleUrlMem64: typeof config.coreModuleUrlMem64 === "string" ? config.coreModuleUrlMem64 : void 0,
       preferMemory64: typeof config.preferMemory64 === "boolean" ? config.preferMemory64 : void 0,
       allowSingleThreadCore: config.allowSingleThreadCore === true ? true : void 0,
+      ...config.jsBackedModelStaging === true ? { jsBackedModelStaging: true } : {},
       threads: Number(config.threads) > 0 ? Number(config.threads) : void 0,
       threadsBatch: Number(config.threadsBatch) > 0 ? Number(config.threadsBatch) : void 0,
       threadPoolSize: Number(config.threadPoolSize) > 0 ? Number(config.threadPoolSize) : void 0,
@@ -6562,6 +7133,9 @@ var LlamaWebGpuBridge = class {
     }
   }
   _shouldFallbackToMainThread(error) {
+    if (this._isNonRecoverableStagingError(error)) {
+      return false;
+    }
     const text = serializeWorkerError(error).toLowerCase();
     if (text.includes("aborted(native code called abort())")) {
       return false;
@@ -6975,6 +7549,9 @@ var LlamaWebGpuBridge = class {
         this._emitBridgeWarn(
           `llamadart: unable to prepare multimodal worker CPU mode (${reason}).`
         );
+        if (this._isNonRecoverableStagingError(error)) {
+          throw error;
+        }
         if (this._isCpuModelMode()) {
           throw new Error(
             `CPU multimodal worker setup failed (${reason}). Reload model and retry with a smaller image.`
@@ -7104,6 +7681,9 @@ var LlamaWebGpuBridge = class {
           );
           return "";
         }
+        if (this._isNonRecoverableStagingError(error)) {
+          throw error;
+        }
         if (this._isCpuModelMode()) {
           this._emitBridgeWarn(
             `llamadart: CPU multimodal worker request failed (${reason}); skipping main-thread fallback.`
@@ -7159,7 +7739,7 @@ var LlamaWebGpuBridge = class {
       return result;
     } catch (error) {
       this._throwIfOperationCancelled(error, "Projector operation was cancelled.");
-      if (!startedWithWorker) {
+      if (!startedWithWorker || this._isNonRecoverableStagingError(error)) {
         throw error;
       }
       const reason = serializeWorkerError(error);
@@ -7177,6 +7757,9 @@ var LlamaWebGpuBridge = class {
           );
           return retryResult;
         } catch (retryError) {
+          if (this._isNonRecoverableStagingError(retryError)) {
+            throw retryError;
+          }
           const retryReason = serializeWorkerError(retryError);
           throw new Error(
             `CPU multimodal projector setup failed (${retryReason}). Reload model and retry with a smaller image.`
@@ -8311,6 +8894,7 @@ function installBridgeWorkerHost() {
       message: serializeWorkerError(error),
       ...error instanceof EmbeddingError ? { embeddingErrorCode: error.code } : {},
       ...error instanceof CrossOriginIsolationError ? { errorCode: CROSS_ORIGIN_ISOLATION_REQUIRED } : {},
+      ...error instanceof ModelStagingError ? { modelStagingErrorCode: error.code } : {},
       ...decisionErrorCode ? { decisionErrorCode } : {},
       state
     });
@@ -8681,5 +9265,6 @@ export {
   CrossOriginIsolationError,
   EmbeddingError,
   LlamaWebGpuBridge,
+  ModelStagingError,
   enableBridgeWorkerHost
 };

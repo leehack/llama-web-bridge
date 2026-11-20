@@ -25,6 +25,7 @@ import {
   staleLoraAdapterError,
 } from './internal/lora.ts';
 import { cloneModelSource, hasModelSource, normalizeAbsoluteUrl, resolveModelSource, resolvePartUrls } from './internal/model_source.ts';
+import { ModelStagingError } from './internal/model_staging.ts';
 import { withoutNul } from './internal/text.ts';
 import { bufferSourceBytes, toUint8Array } from './internal/typed_values.ts';
 import { LlamaWebGpuBridgeRuntime } from './runtime.ts';
@@ -979,7 +980,17 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
     this._workerModelMissing = true;
   }
 
+  _isNonRecoverableStagingError(error: unknown) {
+    if (this._config.jsBackedModelStaging !== true || !error || typeof error !== 'object') {
+      return false;
+    }
+    return error instanceof ModelStagingError || (error as { name?: unknown }).name === 'ModelStagingError';
+  }
+
   _isRecoverableWorkerFsError(error: unknown) {
+    if (this._isNonRecoverableStagingError(error)) {
+      return false;
+    }
     const text = serializeWorkerError(error).toLowerCase();
     // An HTTP status from the model host ("404 Not Found") is deterministic: a
     // fresh worker gets the same answer, so a restart only discards the model
@@ -1049,6 +1060,9 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
         // The cancelled load may already have released the worker's model.
         this._workerModelMissing = true;
         throw createAbortError('Bridge operation was cancelled.');
+      }
+      if (this._isNonRecoverableStagingError(error)) {
+        throw error;
       }
       this._emitBridgeWarn(
         `llamadart: multimodal worker setup failed once; restarting worker (${serializeWorkerError(error)}).`,
@@ -1461,6 +1475,7 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
         ? config.preferMemory64
         : undefined,
       allowSingleThreadCore: config.allowSingleThreadCore === true ? true : undefined,
+      ...(config.jsBackedModelStaging === true ? { jsBackedModelStaging: true } : {}),
       threads: Number(config.threads) > 0 ? Number(config.threads) : undefined,
       threadsBatch: Number(config.threadsBatch) > 0
         ? Number(config.threadsBatch)
@@ -1519,6 +1534,10 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
   }
 
   _shouldFallbackToMainThread(error: unknown) {
+    if (this._isNonRecoverableStagingError(error)) {
+      return false;
+    }
+
     const text = serializeWorkerError(error).toLowerCase();
 
     if (text.includes('aborted(native code called abort())')) {
@@ -2043,6 +2062,9 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
           `llamadart: unable to prepare multimodal worker CPU mode (${reason}).`,
         );
 
+        if (this._isNonRecoverableStagingError(error)) {
+          throw error;
+        }
         if (this._isCpuModelMode()) {
           throw new Error(
             `CPU multimodal worker setup failed (${reason}). `
@@ -2209,6 +2231,9 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
           return '';
         }
 
+        if (this._isNonRecoverableStagingError(error)) {
+          throw error;
+        }
         if (this._isCpuModelMode()) {
           this._emitBridgeWarn(
             `llamadart: CPU multimodal worker request failed (${reason}); skipping main-thread fallback.`,
@@ -2275,7 +2300,7 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
       return result;
     } catch (error) {
       this._throwIfOperationCancelled(error, 'Projector operation was cancelled.');
-      if (!startedWithWorker) {
+      if (!startedWithWorker || this._isNonRecoverableStagingError(error)) {
         throw error;
       }
       const reason = serializeWorkerError(error);
@@ -2294,6 +2319,9 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
           );
           return retryResult;
         } catch (retryError) {
+          if (this._isNonRecoverableStagingError(retryError)) {
+            throw retryError;
+          }
           const retryReason = serializeWorkerError(retryError);
           throw new Error(
             `CPU multimodal projector setup failed (${retryReason}). `

@@ -158,6 +158,7 @@ it.
 | `workerUrl` | `string` | URL for `llama_webgpu_bridge_worker.js`. Defaults to a sibling of the bridge module when possible. |
 | `disableWorker` | `boolean` | Force direct runtime mode. |
 | `allowSingleThreadCore` | `boolean` | Set for a `coreModuleUrl` core built without pthreads (`WEBGPU_BRIDGE_PTHREADS=0`). It then loads on a page that is not cross-origin isolated, capped to one thread (`threads_capped_no_coi`), instead of rejecting with `CrossOriginIsolationError`. |
+| `jsBackedModelStaging` | `boolean` | Opt-in (`false` by default). Use for models over ~1 GB on `wasm32`, or large models on `memory64` to cut peak wasm heap; streams models and multimodal projectors directly into 64 MiB JS `Uint8Array` chunks under a private per-operation `/jsmodels-<n>` mount (`model_staging_js_backed`, `mmproj_staging_js_backed`) and releases that mount's chunks on completion or failure, at the cost of slightly slower small loads and temporary JS heap storage. |
 | `preferMemory64` | `boolean` | Prefer the wasm64 core when available. Defaults to `true`; the runtime can still fall back to wasm32. |
 | `workerRequestTimeoutMs` | `number` | Default timeout for worker RPC calls, 2 minutes unless a method has its own default. It also sets the `embed`/`embedBatch` budget, which defaults to 10 minutes when an input has image or audio parts. |
 | `workerInitTimeoutMs` | `number` | Timeout for worker initialization. |
@@ -1154,7 +1155,7 @@ include:
 | `llamadart.webgpu.core_variant` | `wasm32`, `wasm64`, or initialization state. |
 | `llamadart.webgpu.model_source` | Model load source, such as network/cache/remote fetch. |
 | `llamadart.webgpu.model_cache_state` | Cache Storage state for the loaded model. |
-| `llamadart.webgpu.runtime_notes` | Semicolon-separated bridge notes such as thread caps or fallback reasons. `gpu_unavailable:<reason>` (`no_webgpu`, `no_adapter`, `adapter_missing_shader_f16`, `unknown`) says why a load with `nGpuLayers > 0` runs on the CPU; the bridge also logs one warning. Chrome hides `shader-f16` on NVIDIA drivers older than 615.71, and ggml-webgpu then registers no device. |
+| `llamadart.webgpu.runtime_notes` | Semicolon-separated bridge notes such as thread caps, staging mode (`model_staging_js_backed`), or fallback reasons. `gpu_unavailable:<reason>` (`no_webgpu`, `no_adapter`, `adapter_missing_shader_f16`, `unknown`) says why a load with `nGpuLayers > 0` runs on the CPU; the bridge also logs one warning. Chrome hides `shader-f16` on NVIDIA drivers older than 615.71, and ggml-webgpu then registers no device. |
 | `llamadart.webgpu.mmproj_loaded` | `1` when a projector is loaded. |
 | `llamadart.webgpu.supports_vision` | `1` when the active projector supports vision. |
 | `llamadart.webgpu.supports_audio` | `1` when the active projector supports audio. |
@@ -1253,3 +1254,37 @@ this function themselves.
   and wasm files from the same published bridge asset set.
 - Use `dispose()` before dropping references when switching models or tearing
   down a page component.
+- Use `jsBackedModelStaging: true` for models over about 1 GB on `wasm32`, or
+  for any large model on `memory64` to cut the peak wasm heap (for example, when
+  serving without cross-origin isolation using `WEBGPU_BRIDGE_PTHREADS=0` +
+  `allowSingleThreadCore: true`). It streams fetched model and multimodal
+  projector GGUFs directly into 64 MiB JS `Uint8Array` chunks under a private
+  per-operation `/jsmodels-<n>` mount without copying through WASMFS, and
+  unmounts/releases only that mount's chunks after load completes or fails. Known limitation: native memory grows by a few bytes per staging mount for the core's lifetime because Emscripten's WasmFS backend table retains created backends. Its
+  cost is slightly slower native chunk reads on small loads (`Qwen3-0.6B-Q8_0`
+  3-run median `nativeLoadMs` `480.9 ms` vs `444.6 ms` off; total load
+  `1,317.7 ms` vs `1,660.5 ms` as direct staging skips wasm memory growth) and
+  temporarily holding the full file in the JS heap until loaded and released. A
+  JS allocation failure during staging throws `ModelStagingError` with code
+  `'MODEL_STAGING_ALLOCATION_FAILED'`, an unsupported older core missing
+  JS-backed exports throws `'MODEL_STAGING_UNSUPPORTED'`, an existing
+  directory or mount at the staging path throws
+  `'MODEL_STAGING_MOUNT_FAILED'` (without adopting it), and a single or split GGUF whose tensor
+  payload exceeds the wasm32 `4 GiB` (`SIZE_MAX`) limit throws
+  `ModelStagingError` with code `'MODEL_TENSOR_SIZE_LIMIT_EXCEEDED'`. Measured
+  on Chrome WebGPU (Apple Metal-3, `nCtx: 2048`, `nGpuLayers: 999`,
+  `crossOriginIsolated === false`, `typeof SharedArrayBuffer === 'undefined'`,
+  `threads_capped_no_coi`) against `llama.cpp` v1.0.0: Qwen3-0.6B-Q8_0
+  (767 MiB) cut `wasm32` peak wasm heap from `2.00 GiB` to `349 MiB` (`373.5` /
+  `123.1` tok/s direct, `377.8` / `115.5` tok/s worker); Qwen3-4B-Q4_K_M
+  (2.33 GiB; `wasm32` baseline failed at `1.37 GiB` during `FS.write`) loaded
+  with `643 MiB` peak wasm heap in direct (`3,274 ms` load, `4.26 GB` peak JS
+  heap before GC, `124.2` / `45.9` tok/s) and worker (`1,475 ms` load, `135.4` /
+  `53.2` tok/s) modes; on `memory64` (`wasm64` no-pthreads), Qwen3-4B-Q4_K_M cut
+  peak wasm heap from `8.01 GiB` (`8.60 GB`, `4,131 ms` load, `127.2` / `43.5`
+  tok/s direct; `4,388 ms` load, `124.9` / `42.0` tok/s worker) to `656 MiB`
+  (`0.69 GB`, `2,049 ms` load, `3.79 GB` peak JS heap dropping to `23.5 MB`,
+  `124.8` / `50.7` tok/s direct; `1,585 ms` load, `128.6` / `50.0` tok/s worker);
+  and `wasm32` Qwen3-8B-Q4_K_M (4.68 GiB) hit the `4 GiB`
+  `gguf_init_from_reader` tensor size-overflow ceiling (`4,288,489,984 +
+  9,437,184` > `4,294,967,295`).

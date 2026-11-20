@@ -11,6 +11,8 @@ export interface LlamaWebGpuBridgeConfig {
   coreModuleFactory?: LlamaCoreModuleFactory | Promise<LlamaCoreModuleFactory>;
   /** Set for a `coreModuleUrl` core built without pthreads (`WEBGPU_BRIDGE_PTHREADS=0`): it loads on a page that is not cross-origin isolated, capped to one thread, instead of rejecting with `CrossOriginIsolationError`. */
   allowSingleThreadCore?: boolean;
+  /** Stage fetched model files into a chunked JS-backed WASMFS mount outside wasm linear memory. */
+  jsBackedModelStaging?: boolean;
   workerUrl?: string;
   disableWorker?: boolean;
   preferMemory64?: boolean;
@@ -306,6 +308,17 @@ export type CrossOriginIsolationErrorCode = 'CROSS_ORIGIN_ISOLATION_REQUIRED';
 export class CrossOriginIsolationError extends Error {
   code: CrossOriginIsolationErrorCode;
   constructor(message?: string);
+}
+
+export type ModelStagingErrorCode =
+  | 'MODEL_STAGING_ALLOCATION_FAILED'
+  | 'MODEL_TENSOR_SIZE_LIMIT_EXCEEDED'
+  | 'MODEL_STAGING_MOUNT_FAILED'
+  | 'MODEL_STAGING_UNSUPPORTED';
+/** Thrown when JS-backed model staging fails, is unsupported by the core, collides on mount, or exceeds the wasm32 4 GiB tensor limit. */
+export class ModelStagingError extends Error {
+  code: ModelStagingErrorCode;
+  constructor(code: ModelStagingErrorCode, message: string);
 }
 
 export interface NextTokenScoreOptions {

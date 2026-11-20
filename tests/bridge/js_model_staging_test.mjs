@@ -1,0 +1,1945 @@
+import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+import test from 'node:test';
+import { fileURLToPath } from 'node:url';
+import vm from 'node:vm';
+
+import { LlamaWebGpuBridge, ModelStagingError } from '../../js/src/llama_webgpu_bridge.js';
+import { writeResponseToFsFileWithProgress } from '../../js/src/internal/download.ts';
+import { installBridgeWorkerHost } from '../../js/src/worker_host.ts';
+import {
+  createRealWorkerBridge,
+  withStubWorkerEnvironment,
+  workerDriver,
+} from './bridge_operation_queue_fixtures.mjs';
+import { readNativeCoreSource } from './native_core_source.mjs';
+
+const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
+
+function createStubFs({ failWriteWith = null } = {}) {
+  const dirs = new Set(['/']);
+  const files = new Map();
+  let nextStreamId = 1;
+  return {
+    dirs,
+    files,
+    writes: [],
+    unmountedPaths: [],
+    readdir(dir) {
+      if (!dirs.has(dir)) {
+        throw new Error(`No such directory: ${dir}`);
+      }
+      return ['.', '..'];
+    },
+    mkdir(dir) {
+      dirs.add(dir);
+    },
+    unlink(filePath) {
+      if (!files.has(filePath)) {
+        throw new Error(`ENOENT: ${filePath}`);
+      }
+      files.delete(filePath);
+    },
+    open(filePath, mode) {
+      if (mode === 'w') {
+        files.set(filePath, 0);
+      } else if (!files.has(filePath)) {
+        throw new Error(`ENOENT: ${filePath}`);
+      }
+      return { id: nextStreamId++, filePath };
+    },
+    write(stream, _bytes, _offset, length, position) {
+      if (typeof failWriteWith === 'function') {
+        const err = failWriteWith({ filePath: stream.filePath, length, position });
+        if (err) {
+          throw err;
+        }
+      }
+      this.writes.push({
+        filePath: stream.filePath,
+        length,
+        position: Number(position),
+        positionType: typeof position,
+      });
+      files.set(stream.filePath, Math.max(files.get(stream.filePath) || 0, Number(position) + length));
+      return length;
+    },
+    close() {},
+    writeFile(filePath, bytes) {
+      files.set(filePath, bytes.length);
+    },
+    readFile() {
+      return new Uint8Array();
+    },
+  };
+}
+
+function createStagingHarness({
+  pthreads = false,
+  coreVariant = 'wasm32',
+  jsBackedModelStaging = true,
+  includeJsModelFsExports = true,
+  mountResult = 0,
+  failWriteWith = null,
+  onLoadModel = null,
+} = {}) {
+  const fs = createStubFs({ failWriteWith });
+  const ccalls = [];
+  const directWrites = [];
+  const openDirectHandles = new Set();
+  const closedDirectHandles = [];
+  let nextDirectHandle = 1;
+  let nextMountId = 1;
+  const mountIds = new Map();
+  const releasedChunkMountIds = [];
+  let preallocNextBytes = 0;
+  let oomBytes = 0;
+  let lastErrorText = '';
+  let runtime = null;
+
+  const core = {
+    FS: fs,
+    UTF8ToString: () => lastErrorText,
+    ...(includeJsModelFsExports ? {
+      _llamadart_webgpu_js_model_fs_api_version: () => 3,
+      _llamadart_webgpu_js_model_fs_mount_id: () => 0,
+      _llamadart_webgpu_mount_js_model_fs: () => 0,
+      _llamadart_webgpu_unmount_js_model_fs: () => 0,
+      _llamadart_webgpu_js_model_fs_prealloc_next: () => 0,
+      _llamadart_webgpu_js_model_fs_open_direct: () => 0,
+      _llamadart_webgpu_js_model_fs_close_direct: () => 0,
+      _llamadart_webgpu_js_model_fs_consume_oom_bytes: () => 0,
+      _llamadart_webgpu_js_model_fs_allocated_bytes: () => 0,
+      _llamadart_webgpu_js_model_fs_release_mount_chunks: () => 0,
+      llamadartJsModelFsWriteDirect(handle, chunk, position) {
+        if (!openDirectHandles.has(handle)) {
+          return -8;
+        }
+        if (typeof failWriteWith === 'function') {
+          const err = failWriteWith({ filePath: null, length: chunk.byteLength, position });
+          if (err) {
+            return -(Number(err.errno) || 12);
+          }
+        }
+        directWrites.push({
+          handle,
+          chunkRef: chunk,
+          length: chunk.byteLength,
+          position,
+        });
+        return chunk.byteLength;
+      },
+    } : {}),
+    ccall(name, _returnType, _argTypes, args = []) {
+      ccalls.push([name, ...args]);
+      if (name === 'llamadart_webgpu_js_model_fs_api_version') {
+        return core._llamadart_webgpu_js_model_fs_api_version?.() ?? 0;
+      }
+      if (name === 'llamadart_webgpu_js_model_fs_mount_id') {
+        return mountIds.get(args[0]) || 0;
+      }
+      if (name === 'llamadart_webgpu_js_model_fs_release_mount_chunks') {
+        releasedChunkMountIds.push(Number(args[0]) || 0);
+        return 0;
+      }
+      if (name === 'llamadart_webgpu_mount_js_model_fs') {
+        if (mountResult !== 0) {
+          return mountResult;
+        }
+        fs.dirs.add(args[0]);
+        mountIds.set(args[0], nextMountId++);
+        return 0;
+      }
+      if (name === 'llamadart_webgpu_unmount_js_model_fs') {
+        fs.unmountedPaths.push(args[0]);
+        const releasedId = mountIds.get(args[0]) || 0;
+        if (releasedId > 0) {
+          releasedChunkMountIds.push(releasedId);
+        }
+        mountIds.delete(args[0]);
+        for (const p of [...fs.files.keys()]) {
+          if (p.startsWith(`${args[0]}/`)) {
+            fs.files.delete(p);
+          }
+        }
+        fs.dirs.delete(args[0]);
+        openDirectHandles.clear();
+        preallocNextBytes = 0;
+        return 0;
+      }
+      if (name === 'llamadart_webgpu_js_model_fs_prealloc_next') {
+        preallocNextBytes = Number(args[0]) || 0;
+        return 0;
+      }
+      if (name === 'llamadart_webgpu_js_model_fs_open_direct') {
+        const [filePath, preallocBytes = 0, append = 0] = args;
+        if (!append) {
+          fs.files.set(filePath, 0);
+          preallocNextBytes = Number(preallocBytes) || 0;
+        } else if (!fs.files.has(filePath)) {
+          return -2;
+        }
+        const handle = nextDirectHandle++;
+        openDirectHandles.add(handle);
+        return handle;
+      }
+      if (name === 'llamadart_webgpu_js_model_fs_close_direct') {
+        const [handle] = args;
+        openDirectHandles.delete(handle);
+        closedDirectHandles.push(handle);
+        return 0;
+      }
+      if (name === 'llamadart_webgpu_js_model_fs_consume_oom_bytes') {
+        const value = oomBytes;
+        oomBytes = 0;
+        return value;
+      }
+      if (name === 'llamadart_webgpu_last_error') {
+        return lastErrorText;
+      }
+      if (name === 'llamadart_webgpu_load_model' && typeof onLoadModel === 'function') {
+        return onLoadModel({
+          args,
+          setLastError: (msg) => { lastErrorText = msg; },
+          emitLog: (msg) => {
+            runtime._lastCoreErrorText = msg;
+            runtime._lastCoreErrorHint = msg;
+          },
+        });
+      }
+      if (name === 'llamadart_webgpu_get_context_size') {
+        return 2048;
+      }
+      return 0;
+    },
+  };
+
+  const bridge = new LlamaWebGpuBridge({
+    disableWorker: true,
+    allowSingleThreadCore: true,
+    preferMemory64: coreVariant === 'wasm64',
+    jsBackedModelStaging,
+  });
+  runtime = bridge._runtime;
+  runtime._core = core;
+  runtime._coreVariant = coreVariant;
+  runtime._probeBackends = async () => false;
+  runtime._ensureCore = async () => {
+    runtime._core = core;
+    runtime._coreVariant = coreVariant;
+    return core;
+  };
+  runtime._coreSupportsPthreads = () => pthreads;
+  runtime._syncThreadPoolSizeHintFromCore = () => {};
+  runtime._resolveNativeLoadOptions = () => {};
+  runtime._emitSuppressedWarmupWarningSummaryIfNeeded = () => {};
+  runtime._getCachedModelResponse = async () => new Response(new Uint8Array([1, 2, 3, 4]), {
+    status: 200,
+    headers: { 'content-length': '4', 'content-encoding': 'identity' },
+  });
+
+  return {
+    bridge,
+    runtime,
+    core,
+    fs,
+    ccalls,
+    directWrites,
+    openDirectHandles,
+    mountIds,
+    releasedChunkMountIds,
+    closedDirectHandles,
+    get preallocNextBytes() { return preallocNextBytes; },
+    setOomBytes: (bytes) => { oomBytes = bytes; },
+    setLastError: (msg) => { lastErrorText = msg; },
+  };
+}
+
+test('jsBackedModelStaging defaults off and works opt-in for threaded and non-threaded cores', async () => {
+  const defaultBridge = new LlamaWebGpuBridge({ disableWorker: true });
+  assert.equal(defaultBridge._workerConfig().jsBackedModelStaging, undefined);
+
+  const defaultHarness = createStagingHarness({ jsBackedModelStaging: false, pthreads: false });
+  await defaultHarness.runtime.loadModelFromUrl('https://models.test/default.gguf', {
+    nCtx: 2048,
+    nGpuLayers: 0,
+    useCache: false,
+    forceRemoteFetchBackend: false,
+  });
+  assert.equal(defaultHarness.fs.dirs.has('/jsmodels'), false);
+  assert.equal(defaultHarness.fs.dirs.has('/jsmodels-1'), false);
+  assert.equal(defaultHarness.fs.dirs.has('/models'), true);
+  assert.ok(!defaultHarness.runtime._runtimeNotes.includes('model_staging_js_backed'));
+
+  for (const pthreads of [false, true]) {
+    const harness = createStagingHarness({ jsBackedModelStaging: true, pthreads });
+    assert.equal(harness.bridge._workerConfig().jsBackedModelStaging, true);
+
+    await harness.runtime.loadModelFromUrl('https://models.test/demo.gguf', {
+      nCtx: 2048,
+      nGpuLayers: 0,
+      useCache: false,
+      forceRemoteFetchBackend: false,
+    });
+
+    const mountIdx = harness.ccalls.findIndex((c) => c[0] === 'llamadart_webgpu_mount_js_model_fs');
+    assert.ok(mountIdx >= 0);
+    assert.deepEqual(harness.ccalls[mountIdx], ['llamadart_webgpu_mount_js_model_fs', '/jsmodels-1']);
+    assert.ok(harness.ccalls.some((c) => c[0] === 'llamadart_webgpu_js_model_fs_open_direct' && c[1] === '/jsmodels-1/demo.gguf' && c[2] === 4 && c[3] === 0));
+    assert.ok(harness.ccalls.some((c) => c[0] === 'llamadart_webgpu_js_model_fs_close_direct'));
+    assert.ok(harness.ccalls.some((c) => c[0] === 'llamadart_webgpu_load_model' && c[1] === '/jsmodels-1/demo.gguf'));
+    assert.ok(harness.ccalls.some((c) => c[0] === 'llamadart_webgpu_unmount_js_model_fs' && c[1] === '/jsmodels-1'));
+    assert.ok(harness.runtime._runtimeNotes.includes('model_staging_js_backed'));
+    assert.equal(harness.fs.writes.length, 0);
+    assert.equal(harness.directWrites.length, 1);
+    assert.equal(harness.openDirectHandles.size, 0);
+    assert.equal(harness.fs.files.size, 0);
+    assert.deepEqual(harness.fs.unmountedPaths, ['/jsmodels-1']);
+  }
+});
+
+test('skipMemoryReservation skips the 1-byte seek write while keeping exact transfer-length validation', async () => {
+  const fs = createStubFs();
+  const gib = 1073741824;
+  const response = new Response(new Uint8Array([7, 8, 9]), {
+    status: 200,
+    headers: { 'content-length': String(gib) },
+  });
+  const written = await writeResponseToFsFileWithProgress(
+    response,
+    fs,
+    '/jsmodels/big.gguf',
+    null,
+    { skipMemoryReservation: true },
+  );
+  assert.equal(written, 3);
+  assert.deepEqual(fs.writes, [{
+    filePath: '/jsmodels/big.gguf',
+    length: 3,
+    position: 0,
+    positionType: 'number',
+  }]);
+
+  // With Content-Encoding: identity and a short body, skipMemoryReservation must still reject short transfers.
+  for (const useBigIntPosition of [false, true]) {
+    const shortFs = createStubFs();
+    const shortBody = new ReadableStream({
+      start(controller) {
+        controller.enqueue(new Uint8Array(16));
+        controller.close();
+      },
+    });
+    const shortResp = new Response(shortBody, {
+      status: 200,
+      headers: { 'content-length': String(gib), 'content-encoding': 'identity' },
+    });
+    await assert.rejects(
+      writeResponseToFsFileWithProgress(shortResp, shortFs, '/jsmodels/short.gguf', null, {
+        skipMemoryReservation: true,
+        useBigIntPosition,
+      }),
+      { name: 'ModelTransferLengthError' },
+    );
+    assert.equal(shortFs.files.has('/jsmodels/short.gguf'), false);
+  }
+});
+
+test('jsBackedModelStaging on wasm64 writes directly via handle without FS.write round-trip', async () => {
+  const harness = createStagingHarness({
+    coreVariant: 'wasm64',
+    jsBackedModelStaging: true,
+    pthreads: false,
+  });
+
+  await harness.runtime.loadModelFromUrl('https://models.test/mem64.gguf', {
+    nCtx: 2048,
+    nGpuLayers: 999,
+    useCache: false,
+    forceRemoteFetchBackend: false,
+  });
+
+  assert.equal(harness.fs.writes.length, 0);
+  assert.deepEqual(harness.directWrites.map(({ handle, length, position }) => ({
+    handle,
+    length,
+    position,
+  })), [{
+    handle: 1,
+    length: 4,
+    position: 0,
+  }]);
+  assert.ok(harness.ccalls.some((c) => c[0] === 'llamadart_webgpu_mount_js_model_fs' && c[1] === '/jsmodels-1'));
+  assert.ok(harness.ccalls.some((c) => c[0] === 'llamadart_webgpu_js_model_fs_open_direct' && c[1] === '/jsmodels-1/mem64.gguf' && c[2] === 4 && c[3] === 0));
+  assert.ok(harness.ccalls.some((c) => c[0] === 'llamadart_webgpu_unmount_js_model_fs' && c[1] === '/jsmodels-1'));
+  assert.ok(harness.runtime._runtimeNotes.includes('model_staging_js_backed'));
+  assert.equal(harness.openDirectHandles.size, 0);
+  assert.equal(harness.fs.files.size, 0);
+
+  const workerBridge = new LlamaWebGpuBridge({
+    disableWorker: false,
+    allowSingleThreadCore: true,
+    preferMemory64: true,
+    jsBackedModelStaging: true,
+  });
+  assert.equal(workerBridge._workerConfig().preferMemory64, true);
+  assert.equal(workerBridge._workerConfig().jsBackedModelStaging, true);
+});
+
+test('JS allocation failure during staging raises ModelStagingError, unmounts chunks, and retries cleanly', async () => {
+  let failAlloc = true;
+  const harness = createStagingHarness({
+    jsBackedModelStaging: true,
+    failWriteWith: () => {
+      if (!failAlloc) return null;
+      harness.setOomBytes(2_600_000_000);
+      const err = new Error('FS error');
+      err.name = 'ErrnoError';
+      err.errno = 12;
+      return err;
+    },
+  });
+
+  const err = await harness.runtime.loadModelFromUrl('https://models.test/huge.gguf', {
+    nCtx: 2048,
+    nGpuLayers: 0,
+    useCache: false,
+    forceRemoteFetchBackend: false,
+  }).then(() => assert.fail('must reject'), (e) => e);
+
+  assert.ok(err instanceof ModelStagingError, String(err));
+  assert.equal(err.code, 'MODEL_STAGING_ALLOCATION_FAILED');
+  assert.match(err.message, /JavaScript memory while staging/);
+  assert.equal(harness.fs.files.size, 0, 'failed staging must unlink partial file');
+  assert.deepEqual(harness.fs.unmountedPaths, ['/jsmodels-1'], 'failed staging must unmount/release chunks');
+
+  // Retry succeeds on the same runtime with zero leaked chunks.
+  failAlloc = false;
+  await harness.runtime.loadModelFromUrl('https://models.test/small.gguf', {
+    nCtx: 2048,
+    nGpuLayers: 0,
+    useCache: false,
+    forceRemoteFetchBackend: false,
+  });
+  assert.equal(harness.fs.files.size, 0);
+  assert.deepEqual(harness.fs.unmountedPaths, ['/jsmodels-1', '/jsmodels-2']);
+});
+
+test('wasm32 4 GiB tensor-size limit raises ModelStagingError instead of abort and cleans up for same-core retry', async () => {
+  // Clean native preflight return code (-4) without aborting the core.
+  let blockOversized = true;
+  const preflightHarness = createStagingHarness({
+    jsBackedModelStaging: true,
+    onLoadModel: ({ setLastError }) => {
+      if (blockOversized) {
+        setLastError('GGUF tensor payload exceeds the wasm32 4 GiB address space limit (4297927168 > 4294967295 bytes).');
+        return -4;
+      }
+      return 0;
+    },
+  });
+  const initialCore = preflightHarness.core;
+
+  const preflightErr = await preflightHarness.runtime.loadModelFromUrl('https://models.test/8b.gguf', {
+    nCtx: 2048,
+    nGpuLayers: 0,
+    useCache: false,
+    forceRemoteFetchBackend: false,
+  }).then(() => assert.fail('must reject'), (e) => e);
+
+  assert.ok(preflightErr instanceof ModelStagingError, String(preflightErr));
+  assert.equal(preflightErr.code, 'MODEL_TENSOR_SIZE_LIMIT_EXCEEDED');
+  assert.match(preflightErr.message, /wasm32 4 GiB/);
+  assert.equal(preflightHarness.runtime._core, initialCore, 'preflight failure must leave the core alive');
+  assert.equal(preflightHarness.fs.files.size, 0);
+  assert.deepEqual(preflightHarness.fs.unmountedPaths, ['/jsmodels-1']);
+
+  // Subsequent retry works cleanly on the still-live core.
+  blockOversized = false;
+  await preflightHarness.runtime.loadModelFromUrl('https://models.test/0.6b.gguf', {
+    nCtx: 2048,
+    nGpuLayers: 0,
+    useCache: false,
+    forceRemoteFetchBackend: false,
+  });
+  assert.equal(preflightHarness.runtime._core, initialCore);
+  assert.equal(preflightHarness.fs.files.size, 0);
+});
+
+test('ModelStagingError preserves class and code across worker host and proxy without main-thread fallback', async () => {
+  await withStubWorkerEnvironment(async ({ workers }) => {
+    const bridge = createRealWorkerBridge({ jsBackedModelStaging: true });
+    assert.equal(bridge._shouldFallbackToMainThread(
+      new ModelStagingError('MODEL_STAGING_ALLOCATION_FAILED', 'Array buffer allocation failed'),
+    ), false);
+
+    const proxy = bridge._workerProxy;
+    const driver = workerDriver(proxy, workers[0]);
+    driver.ready();
+
+    for (const code of [
+      'MODEL_STAGING_ALLOCATION_FAILED',
+      'MODEL_TENSOR_SIZE_LIMIT_EXCEEDED',
+      'MODEL_STAGING_MOUNT_FAILED',
+      'MODEL_STAGING_UNSUPPORTED',
+    ]) {
+      const call = proxy.call('loadModelFromUrl', ['https://models.test/model.gguf', {}]);
+      await driver.settle();
+      const pending = driver.calls('loadModelFromUrl').at(-1);
+      proxy._worker.onmessage({
+        data: {
+          type: 'error',
+          id: pending.id,
+          message: `staging error (${code})`,
+          modelStagingErrorCode: code,
+        },
+      });
+      const err = await call.then(() => assert.fail('must reject'), (e) => e);
+      assert.ok(err instanceof ModelStagingError, String(err));
+      assert.equal(err.code, code);
+    }
+
+    proxy._worker.onmessage({ data: { type: 'result', id: 0 } });
+    await bridge.dispose().catch(() => {});
+  });
+
+  // Verify worker_host serializes ModelStagingError cleanly over postMessage and BridgeWorkerProxy restores it.
+  const replies = [];
+  const oldSelf = globalThis.self;
+  globalThis.self = { postMessage: (msg) => replies.push(msg) };
+  try {
+    installBridgeWorkerHost();
+    await self.onmessage({
+      data: {
+        type: 'init',
+        config: {
+          jsBackedModelStaging: true,
+          coreInitTimeoutMs: 50,
+          coreModuleFactory: async () => ({ FS: createStubFs(), ccall: () => 0 }),
+        },
+      },
+    });
+    assert.ok(replies.some((m) => m.type === 'ready'));
+
+    await self.onmessage({
+      data: {
+        type: 'call',
+        id: 42,
+        method: 'loadModelFromUrl',
+        args: ['https://models.test/unsupported.gguf', { nCtx: 512, nGpuLayers: 0, useCache: false, forceRemoteFetchBackend: false }],
+      },
+    });
+    const hostReply = replies.find((m) => m.id === 42);
+    assert.ok(hostReply, 'worker host must post error reply');
+    assert.equal(hostReply.type, 'error');
+    assert.equal(hostReply.modelStagingErrorCode, 'MODEL_STAGING_UNSUPPORTED');
+
+    await withStubWorkerEnvironment(async ({ workers }) => {
+      const roundTripBridge = createRealWorkerBridge({ jsBackedModelStaging: true });
+      const proxy = roundTripBridge._workerProxy;
+      const driver = workerDriver(proxy, workers[0]);
+      driver.ready();
+      const call = proxy.call('loadModelFromUrl', ['https://models.test/unsupported.gguf', {}]);
+      await driver.settle();
+      const pending = driver.calls('loadModelFromUrl').at(-1);
+      proxy._worker.onmessage({ data: { ...hostReply, id: pending.id } });
+      const err = await call.then(() => assert.fail('must reject'), (e) => e);
+      assert.ok(err instanceof ModelStagingError, `Expected ModelStagingError, got ${err?.name}: ${err?.message}`);
+      assert.equal(err.code, 'MODEL_STAGING_UNSUPPORTED');
+      proxy._worker.onmessage({ data: { type: 'result', id: 0 } });
+      await roundTripBridge.dispose().catch(() => {});
+    });
+  } finally {
+    if (oldSelf === undefined) delete globalThis.self;
+    else globalThis.self = oldSelf;
+  }
+});
+
+test('native model_load.inc checks wasm32 GGUF tensor size limit across split shards only for JS-backed staging, using buffered I/O', () => {
+  const source = readNativeCoreSource();
+  const loader = source.slice(source.indexOf('int32_t load_model_internal('));
+  const preLoad = loader.slice(0, loader.indexOf('llama_model_load_from_file('));
+  assert.match(preLoad, /if \(llamadart_webgpu_is_js_model_path\(model_path\) &&\s*!check_wasm32_gguf_tensor_size_limit\(model_path\)\)\s*\{\s*return -4;\s*\}/);
+  assert.match(source, /SIZE_MAX <= 0xffffffffULL/);
+
+  // Compile and execute the real model_load.inc preflight against split GGUF fixtures
+  // and default-off /models/ paths on the host C++ compiler.
+  const modelLoadText = readFileSync(path.join(rootDir, 'src/core/model_load.inc'), 'utf8');
+  const start = modelLoadText.indexOf('class BufferedFileReader {');
+  const end = modelLoadText.indexOf('#endif', modelLoadText.indexOf('bool check_wasm32_gguf_tensor_size_limit('));
+  assert.ok(start >= 0 && end > start, 'preflight block must exist in model_load.inc');
+  const preflightImpl = modelLoadText
+    .slice(start, end)
+    .replaceAll('std::fread', 'counted_fread')
+    .replaceAll('fseeko(', 'counted_fseeko(');
+
+  const fixtureCpp = `#include <algorithm>
+#include <cassert>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <limits>
+#include <memory>
+#include <string>
+#include <vector>
+
+static unsigned long long g_freads = 0;
+static unsigned long long g_fseeks = 0;
+static size_t counted_fread(void * ptr, size_t sz, size_t n, std::FILE * fp) {
+  ++g_freads;
+  return std::fread(ptr, sz, n, fp);
+}
+static int counted_fseeko(std::FILE * fp, off_t off, int wh) {
+  ++g_fseeks;
+  return fseeko(fp, off, wh);
+}
+
+#undef SIZE_MAX
+#define SIZE_MAX 0xffffffffULL
+
+enum ggml_type { GGML_TYPE_F32 = 0, GGML_TYPE_COUNT = 2 };
+enum { GGML_MAX_DIMS = 4, GGUF_DEFAULT_ALIGNMENT = 32 };
+enum gguf_type {
+  GGUF_TYPE_UINT8 = 0, GGUF_TYPE_INT8 = 1, GGUF_TYPE_UINT16 = 2, GGUF_TYPE_INT16 = 3,
+  GGUF_TYPE_UINT32 = 4, GGUF_TYPE_INT32 = 5, GGUF_TYPE_FLOAT32 = 6, GGUF_TYPE_BOOL = 7,
+  GGUF_TYPE_STRING = 8, GGUF_TYPE_ARRAY = 9, GGUF_TYPE_UINT64 = 10, GGUF_TYPE_INT64 = 11,
+  GGUF_TYPE_FLOAT64 = 12,
+};
+
+size_t ggml_type_size(ggml_type) { return 4; }
+int64_t ggml_blck_size(ggml_type) { return 1; }
+int32_t llama_split_path(char * dst, size_t max, const char * prefix, int32_t no, int32_t count) {
+  int w = std::snprintf(dst, max, "%s-%05d-of-%05d.gguf", prefix, no + 1, count);
+  return (w > 0 && static_cast<size_t>(w) < max) ? w : 0;
+}
+int32_t llama_split_prefix(char * dst, size_t max, const char * path, int32_t no, int32_t count) {
+  char suf[32];
+  std::snprintf(suf, sizeof(suf), "-%05d-of-%05d.gguf", no + 1, count);
+  std::string s(path), ss(suf);
+  if (s.size() <= ss.size() || s.compare(s.size() - ss.size(), ss.size(), ss) != 0) return 0;
+  size_t len = s.size() - ss.size();
+  if (len + 1 > max) return 0;
+  std::memcpy(dst, path, len);
+  dst[len] = '\\0';
+  return static_cast<int32_t>(len);
+}
+static std::string g_error;
+void set_error(const std::string & s) { g_error = s; }
+bool llamadart_webgpu_is_js_model_path(const char * p) {
+  return p != nullptr && std::strncmp(p, "/jsmodels/", 10) == 0;
+}
+
+${preflightImpl}
+
+static void write_u32(std::vector<uint8_t> & b, uint32_t v) {
+  size_t o = b.size(); b.resize(o + 4); std::memcpy(b.data() + o, &v, 4);
+}
+static void write_i32(std::vector<uint8_t> & b, int32_t v) {
+  size_t o = b.size(); b.resize(o + 4); std::memcpy(b.data() + o, &v, 4);
+}
+static void write_u16(std::vector<uint8_t> & b, uint16_t v) {
+  size_t o = b.size(); b.resize(o + 2); std::memcpy(b.data() + o, &v, 2);
+}
+static void write_u64(std::vector<uint8_t> & b, uint64_t v) {
+  size_t o = b.size(); b.resize(o + 8); std::memcpy(b.data() + o, &v, 8);
+}
+static void write_str(std::vector<uint8_t> & b, const std::string & s) {
+  write_u64(b, s.size()); b.insert(b.end(), s.begin(), s.end());
+}
+
+static void write_gguf(
+    const std::string & path,
+    uint16_t split_count,
+    uint16_t split_no,
+    uint32_t extra_vocab_strings,
+    const std::vector<std::pair<std::string, uint64_t>> & tensors_f32_elems) {
+  std::vector<uint8_t> out;
+  out.insert(out.end(), {'G', 'G', 'U', 'F'});
+  write_u32(out, 3);
+  write_u64(out, tensors_f32_elems.size());
+  uint64_t n_kv = (split_count > 1 ? 2 : 0) + (extra_vocab_strings > 0 ? 1 : 0);
+  write_u64(out, n_kv);
+  if (split_count > 1) {
+    write_str(out, "split.count"); write_u32(out, GGUF_TYPE_UINT16); write_u16(out, split_count);
+    write_str(out, "split.no"); write_u32(out, GGUF_TYPE_UINT16); write_u16(out, split_no);
+  }
+  if (extra_vocab_strings > 0) {
+    write_str(out, "tokenizer.ggml.tokens");
+    write_u32(out, GGUF_TYPE_ARRAY);
+    write_u32(out, GGUF_TYPE_STRING);
+    write_u64(out, extra_vocab_strings);
+    for (uint32_t i = 0; i < extra_vocab_strings; ++i) write_str(out, "tok_abcdef");
+  }
+  for (const auto & kv : tensors_f32_elems) {
+    write_str(out, kv.first);
+    write_u32(out, 1);
+    write_u64(out, kv.second);
+    write_i32(out, GGML_TYPE_F32);
+    write_u64(out, 0);
+  }
+  FILE * fp = std::fopen(path.c_str(), "wb");
+  assert(fp != nullptr);
+  assert(std::fwrite(out.data(), 1, out.size(), fp) == out.size());
+  std::fclose(fp);
+}
+
+int main(int argc, char ** argv) {
+  std::string dir = argv[1];
+  // 1) Split GGUF with metadata-only shard 1 + >4 GiB tensor shard 2 must fail preflight.
+  std::string s1 = dir + "/m-00001-of-00002.gguf";
+  std::string s2 = dir + "/m-00002-of-00002.gguf";
+  write_gguf(s1, 2, 0, 10000, {});
+  write_gguf(s2, 2, 1, 0, {{"t0", 600000000ULL}, {"t1", 600000000ULL}}); // 4.8 GB > 4 GiB
+  g_error.clear(); g_freads = 0; g_fseeks = 0;
+  assert(!check_wasm32_gguf_tensor_size_limit(s1.c_str()));
+  assert(g_error.find("wasm32 4 GiB") != std::string::npos);
+  // Buffered reader must scan 10,000 KV strings with <= 1 seek and minimal fread calls.
+  assert(g_fseeks <= 1);
+  assert(g_freads < 20);
+
+  // 2) Combined >4 GiB across two individually <4 GiB shards must also fail preflight.
+  std::string c1 = dir + "/c-00001-of-00002.gguf";
+  std::string c2 = dir + "/c-00002-of-00002.gguf";
+  write_gguf(c1, 2, 0, 0, {{"a", 650000000ULL}}); // 2.6 GB
+  write_gguf(c2, 2, 1, 0, {{"b", 650000000ULL}}); // 2.6 GB => 5.2 GB combined
+  g_error.clear();
+  assert(!check_wasm32_gguf_tensor_size_limit(c1.c_str()));
+
+  // 3) Default /models/ path does NOT invoke preflight (0 reads, 0 seeks).
+  std::string def = "/models/default.gguf";
+  g_freads = 0; g_fseeks = 0;
+  bool would_run = llamadart_webgpu_is_js_model_path(def.c_str()) &&
+      !check_wasm32_gguf_tensor_size_limit(def.c_str());
+  assert(!would_run);
+  assert(g_freads == 0 && g_fseeks == 0);
+  return 0;
+}
+`;
+
+  const dir = mkdtempSync(path.join(tmpdir(), 'bridge-preflight-native-'));
+  try {
+    const cpp = path.join(dir, 'preflight.cpp');
+    const exe = path.join(dir, 'preflight');
+    writeFileSync(cpp, fixtureCpp);
+    const comp = spawnSync(process.env.CXX || 'c++', ['-std=c++17', cpp, '-o', exe], { encoding: 'utf8' });
+    assert.equal(comp.status, 0, comp.stderr);
+    const run = spawnSync(exe, [dir], { encoding: 'utf8' });
+    assert.equal(run.status, 0, `${run.signal}: ${run.stderr}`);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('jsBackedModelStaging fails cleanly with MODEL_STAGING_UNSUPPORTED on older core missing exports', async () => {
+  const harness = createStagingHarness({
+    jsBackedModelStaging: true,
+    includeJsModelFsExports: false,
+  });
+
+  const err = await harness.runtime.loadModelFromUrl('https://models.test/small.gguf', {
+    nCtx: 2048,
+    nGpuLayers: 0,
+    useCache: false,
+    forceRemoteFetchBackend: false,
+  }).then(() => assert.fail('must reject'), (e) => e);
+
+  assert.ok(err instanceof ModelStagingError, String(err));
+  assert.equal(err.code, 'MODEL_STAGING_UNSUPPORTED');
+  assert.match(err.message, /jsBackedModelStaging/);
+  assert.match(err.message, /_llamadart_webgpu_mount_js_model_fs/);
+  assert.equal(harness.ccalls.length, 0, 'must probe exports before calling ccall');
+});
+
+test('jsBackedModelStaging fails cleanly with MODEL_STAGING_MOUNT_FAILED on staging mount collision', async () => {
+  const harness = createStagingHarness({
+    jsBackedModelStaging: true,
+    mountResult: -20,
+  });
+
+  const err = await harness.runtime.loadModelFromUrl('https://models.test/small.gguf', {
+    nCtx: 2048,
+    nGpuLayers: 0,
+    useCache: false,
+    forceRemoteFetchBackend: false,
+  }).then(() => assert.fail('must reject'), (e) => e);
+
+  assert.ok(err instanceof ModelStagingError, String(err));
+  assert.equal(err.code, 'MODEL_STAGING_MOUNT_FAILED');
+  assert.match(err.message, /\/jsmodels-1/);
+  assert.ok(!harness.runtime._runtimeNotes.includes('model_staging_js_backed'));
+  assert.equal(harness.fs.unmountedPaths.length, 0, 'must not unmount pre-existing non-JS-backed directory');
+});
+
+test('direct JS-backed staging avoids slice clones and FS.write round-trips while keeping progress and length checks', async () => {
+  const chunkA = new Uint8Array([10, 20, 30, 40]);
+  const chunkB = new Uint8Array([50, 60, 70, 80, 90, 100]);
+  let sliceCount = 0;
+  for (const chunk of [chunkA, chunkB]) {
+    const origSlice = chunk.slice.bind(chunk);
+    chunk.slice = (...args) => {
+      sliceCount += 1;
+      return origSlice(...args);
+    };
+  }
+
+  let openedWriteStreams = 0;
+  let closedWriteStreams = 0;
+  const harness = createStagingHarness({
+    jsBackedModelStaging: true,
+    pthreads: false,
+  });
+  const origOpen = harness.fs.open.bind(harness.fs);
+  harness.fs.open = (...args) => {
+    openedWriteStreams += 1;
+    return origOpen(...args);
+  };
+  harness.fs.close = () => {
+    closedWriteStreams += 1;
+  };
+  harness.runtime._getCachedModelResponse = async () => new Response(new ReadableStream({
+    start(controller) {
+      controller.enqueue(chunkA);
+      controller.enqueue(chunkB);
+      controller.close();
+    },
+  }), {
+    status: 200,
+    headers: { 'content-length': '10', 'content-encoding': 'identity' },
+  });
+
+  const progressEvents = [];
+  await harness.runtime.loadModelFromUrl('https://models.test/direct.gguf', {
+    nCtx: 2048,
+    nGpuLayers: 0,
+    useCache: false,
+    forceRemoteFetchBackend: false,
+    progressCallback: (ev) => progressEvents.push(ev),
+  });
+
+  assert.equal(sliceCount, 0, 'direct path must not clone chunks with .slice()');
+  assert.equal(openedWriteStreams, 0, 'direct path must not open FS write streams');
+  assert.equal(closedWriteStreams, 0, 'direct path must not close FS write streams');
+  assert.equal(harness.fs.writes.length, 0, 'direct path must not call FS.write');
+  assert.equal(harness.directWrites.length, 2);
+  assert.equal(harness.directWrites[0].chunkRef, chunkA);
+  assert.equal(harness.directWrites[0].position, 0);
+  assert.equal(harness.directWrites[1].chunkRef, chunkB);
+  assert.equal(harness.directWrites[1].position, 4);
+  assert.equal(progressEvents[progressEvents.length - 1].loaded, 10);
+  assert.equal(progressEvents[progressEvents.length - 1].total, 10);
+
+  // Transfer-length check still rejects short >= 1 GiB streams on the direct path.
+  const gib = 1073741824;
+  harness.runtime._getCachedModelResponse = async () => new Response(new ReadableStream({
+    start(controller) {
+      controller.enqueue(new Uint8Array(16));
+      controller.close();
+    },
+  }), {
+    status: 200,
+    headers: { 'content-length': String(gib), 'content-encoding': 'identity' },
+  });
+
+  const shortErr = await harness.runtime.loadModelFromUrl('https://models.test/short-direct.gguf', {
+    nCtx: 2048,
+    nGpuLayers: 0,
+    useCache: false,
+    forceRemoteFetchBackend: false,
+  }).then(() => assert.fail('must reject short transfer'), (e) => e);
+  assert.equal(shortErr.name, 'ModelTransferLengthError');
+  assert.equal(harness.fs.writes.length, 0);
+  assert.equal(harness.openDirectHandles.size, 0);
+});
+
+test('direct JS-backed writer completes positive short writes without gaps and counts only written bytes', async () => {
+  const fullPayload = new Uint8Array(20);
+  for (let i = 0; i < fullPayload.length; i += 1) {
+    fullPayload[i] = i + 1;
+  }
+  const staged = new Uint8Array(20);
+  const harness = createStagingHarness({ jsBackedModelStaging: true, pthreads: false });
+  const baseWriteDirect = harness.core.llamadartJsModelFsWriteDirect;
+  let injectedShort = false;
+  harness.core.llamadartJsModelFsWriteDirect = (handle, chunk, position) => {
+    if (!injectedShort && position === 4 && chunk.byteLength > 3) {
+      injectedShort = true;
+      const partial = chunk.subarray(0, chunk.byteLength - 3);
+      staged.set(partial, position);
+      return baseWriteDirect(handle, partial, position);
+    }
+    staged.set(chunk, position);
+    return baseWriteDirect(handle, chunk, position);
+  };
+  harness.runtime._getCachedModelResponse = async () => new Response(new ReadableStream({
+    start(controller) {
+      controller.enqueue(fullPayload.subarray(0, 4));
+      controller.enqueue(fullPayload.subarray(4));
+      controller.close();
+    },
+  }), {
+    status: 200,
+    headers: { 'content-length': '20', 'content-encoding': 'identity' },
+  });
+
+  const progressEvents = [];
+  await harness.runtime.loadModelFromUrl('https://models.test/short-write-ok.gguf', {
+    nCtx: 2048,
+    nGpuLayers: 0,
+    useCache: false,
+    forceRemoteFetchBackend: false,
+    progressCallback: (ev) => progressEvents.push(ev),
+  });
+
+  assert.equal(injectedShort, true);
+  assert.deepEqual(staged, fullPayload);
+  assert.deepEqual(
+    harness.directWrites.map(({ position, length }) => ({ position, length })),
+    [
+      { position: 0, length: 4 },
+      { position: 4, length: 13 },
+      { position: 17, length: 3 },
+    ],
+  );
+  assert.equal(progressEvents.at(-1).loaded, 20);
+  assert.equal(progressEvents.at(-1).total, 20);
+
+  // Zero forward progress on the remainder rejects without advancing loaded/progress past 4 bytes.
+  const fs = createStubFs();
+  const stalledProgress = [];
+  let writeCall = 0;
+  const stalledErr = await writeResponseToFsFileWithProgress(
+    new Response(new ReadableStream({
+      start(controller) {
+        controller.enqueue(new Uint8Array(10).fill(7));
+        controller.close();
+      },
+    }), { status: 200, headers: { 'content-length': '10' } }),
+    fs,
+    '/jsmodels/stalled.gguf',
+    (ev) => stalledProgress.push(ev),
+    {
+      skipMemoryReservation: true,
+      preservePartialOnError: true,
+      directWriter: {
+        writeChunk() {
+          writeCall += 1;
+          return writeCall === 1 ? 4 : 0;
+        },
+      },
+    },
+  ).then(() => assert.fail('must reject zero-progress short write'), (e) => e);
+
+  assert.equal(stalledErr.llamadartLoadedBytes, 4);
+  assert.equal(stalledProgress.at(-1).loaded, 4);
+});
+
+test('resumed HTTP 206 with jsBackedModelStaging opens append handle and writes at resumeOffset', async () => {
+  const fullPayload = Uint8Array.from({ length: 10 }, (_, i) => 10 + i);
+  const makeCutResponse = () => {
+    let chunkSent = false;
+    return new Response(new ReadableStream({
+      pull(controller) {
+        if (!chunkSent) {
+          chunkSent = true;
+          controller.enqueue(fullPayload.subarray(0, 4));
+          return;
+        }
+        controller.error(new Error('network error'));
+      },
+    }), {
+      status: 200,
+      headers: { 'content-length': '10', 'content-encoding': 'identity' },
+    });
+  };
+
+  const staged = new Uint8Array(10);
+  const resumeHarness = createStagingHarness({ jsBackedModelStaging: true, pthreads: false });
+  const baseWriteDirect = resumeHarness.core.llamadartJsModelFsWriteDirect;
+  resumeHarness.core.llamadartJsModelFsWriteDirect = (handle, chunk, position) => {
+    staged.set(chunk, position);
+    return baseWriteDirect(handle, chunk, position);
+  };
+  let callIndex = 0;
+  resumeHarness.runtime._getCachedModelResponse = async (_url, opts) => {
+    callIndex += 1;
+    if (callIndex === 1) {
+      return makeCutResponse();
+    }
+    assert.deepEqual(opts?.requestHeaders, { Range: 'bytes=4-' });
+    return new Response(fullPayload.subarray(4), {
+      status: 206,
+      headers: {
+        'content-range': 'bytes 4-9/10',
+        'content-length': '6',
+        'content-encoding': 'identity',
+      },
+    });
+  };
+
+  await resumeHarness.runtime.loadModelFromUrl('https://models.test/resumed.gguf', {
+    nCtx: 2048,
+    nGpuLayers: 0,
+    useCache: false,
+    forceRemoteFetchBackend: false,
+  });
+  const openCalls = resumeHarness.ccalls
+    .filter((c) => c[0] === 'llamadart_webgpu_js_model_fs_open_direct')
+    .map(([, filePath, preallocBytes, append]) => ({ filePath, preallocBytes, append }));
+  assert.deepEqual(openCalls, [
+    { filePath: '/jsmodels-1/resumed.gguf', preallocBytes: 10, append: 0 },
+    { filePath: '/jsmodels-1/resumed.gguf', preallocBytes: 0, append: 1 },
+  ]);
+  assert.deepEqual(
+    resumeHarness.directWrites.map(({ position, length }) => ({ position, length })),
+    [
+      { position: 0, length: 4 },
+      { position: 4, length: 6 },
+    ],
+  );
+  assert.deepEqual(staged, fullPayload);
+});
+
+test('loadMultimodalProjector uses JS-backed direct staging when jsBackedModelStaging is enabled', async () => {
+  for (const coreVariant of ['wasm32', 'wasm64']) {
+    const harness = createStagingHarness({ jsBackedModelStaging: true, coreVariant });
+    harness.runtime._modelBytes = 1024;
+    harness.runtime._fetchWithTimeout = async () => new Response(new Uint8Array([5, 6, 7, 8, 9]), {
+      status: 200,
+      headers: { 'content-length': '5', 'content-encoding': 'identity' },
+    });
+
+    await harness.runtime.loadMultimodalProjector('https://models.test/mmproj-f16.gguf');
+
+    assert.equal(harness.fs.writes.length, 0, 'projector staging must avoid FS.write when enabled');
+    assert.deepEqual(
+      harness.directWrites.map(({ length, position }) => ({ length, position })),
+      [{ length: 5, position: 0 }],
+    );
+    assert.ok(harness.ccalls.some((c) => c[0] === 'llamadart_webgpu_mmproj_load' && c[1] === '/jsmodels-1/mmproj-f16.gguf'));
+    assert.ok(harness.ccalls.some((c) => c[0] === 'llamadart_webgpu_unmount_js_model_fs' && c[1] === '/jsmodels-1'));
+    assert.ok(harness.runtime._runtimeNotes.includes('mmproj_staging_js_backed'));
+    assert.ok(harness.runtime._runtimeNotes.includes('mmproj_file_released'));
+    assert.equal(harness.openDirectHandles.size, 0);
+    assert.equal(harness.fs.files.size, 0);
+  }
+
+  // OOM during projector staging translates cleanly to ModelStagingError and unmounts /jsmodels-1.
+  const oomHarness = createStagingHarness({
+    jsBackedModelStaging: true,
+    failWriteWith: () => {
+      oomHarness.setOomBytes(128 * 1024 * 1024);
+      const err = new Error('Array buffer allocation failed');
+      err.name = 'RangeError';
+      return err;
+    },
+  });
+  oomHarness.runtime._modelBytes = 1024;
+  oomHarness.runtime._fetchWithTimeout = async () => new Response(new Uint8Array([1, 2, 3]), {
+    status: 200,
+    headers: { 'content-length': '3', 'content-encoding': 'identity' },
+  });
+
+  const oomErr = await oomHarness.runtime
+    .loadMultimodalProjector('https://models.test/huge-mmproj.gguf')
+    .then(() => assert.fail('must reject OOM'), (e) => e);
+  assert.ok(oomErr instanceof ModelStagingError, String(oomErr));
+  assert.equal(oomErr.code, 'MODEL_STAGING_ALLOCATION_FAILED');
+  assert.deepEqual(oomHarness.fs.unmountedPaths, ['/jsmodels-1']);
+
+  // Native abort in llamadart_webgpu_mmproj_load resets dead core.
+});
+
+test('worker-mode loadMultimodalProjector preserves ModelStagingError without restarting or retrying worker', async () => {
+  await withStubWorkerEnvironment(async ({ workers }) => {
+    const bridge = createRealWorkerBridge({ jsBackedModelStaging: true });
+    const proxy = bridge._workerProxy;
+    const driver = workerDriver(proxy, workers[0]);
+    driver.ready();
+
+    const loadPromise = bridge.loadModelFromUrl('https://models.test/cpu-model.gguf', {
+      nCtx: 2048,
+      nGpuLayers: 0,
+      useCache: false,
+    });
+    await driver.settle();
+    const loadReq = driver.calls('loadModelFromUrl').at(-1);
+    proxy._worker.onmessage({
+      data: {
+        type: 'result',
+        id: loadReq.id,
+        value: 1,
+        state: {
+          metadata: { 'llamadart.webgpu.model_bytes': 1024 },
+          contextSize: 2048,
+          gpuActive: false,
+          backendName: 'WASM (CPU)',
+          supportsVision: false,
+          supportsAudio: false,
+          coreGeneration: 1,
+        },
+      },
+    });
+    await loadPromise;
+
+    const projPromise = bridge.loadMultimodalProjector('https://models.test/oom-mmproj.gguf');
+    await driver.settle();
+    // _ensureWorkerMultimodalCpuMode only reloads when !_multimodalWorkerCpuMode; it already is false after loadModelFromUrl.
+    const secondLoad = driver.calls('loadModelFromUrl');
+    if (secondLoad.length > 1) {
+      proxy._worker.onmessage({
+        data: {
+          type: 'result',
+          id: secondLoad.at(-1).id,
+          value: 1,
+          state: {
+            metadata: { 'llamadart.webgpu.model_bytes': 1024 },
+            contextSize: 2048,
+            gpuActive: false,
+            backendName: 'WASM (CPU)',
+            supportsVision: false,
+            supportsAudio: false,
+            coreGeneration: 1,
+          },
+        },
+      });
+      await driver.settle();
+    }
+    const projReq = driver.calls('loadMultimodalProjector').at(-1);
+    proxy._worker.onmessage({
+      data: {
+        type: 'error',
+        id: projReq.id,
+        message: 'Failed to allocate JavaScript memory while staging the model.',
+        modelStagingErrorCode: 'MODEL_STAGING_ALLOCATION_FAILED',
+      },
+    });
+
+    const err = await projPromise.then(() => assert.fail('must reject with ModelStagingError'), (e) => e);
+    assert.ok(err instanceof ModelStagingError, String(err));
+    assert.equal(err.code, 'MODEL_STAGING_ALLOCATION_FAILED');
+    assert.equal(workers.length, 1, 'must not spawn a replacement worker after ModelStagingError');
+    assert.equal(driver.calls('loadMultimodalProjector').length, 1, 'must not retry projector load after ModelStagingError');
+    assert.equal(bridge._workerProxy, proxy, 'must not fall back to main thread after ModelStagingError');
+
+    proxy._worker.onmessage({ data: { type: 'result', id: 0 } });
+    await bridge.dispose().catch(() => {});
+  });
+});
+
+test('projector ENOMEM after 503 worker-replacement retry preserves ModelStagingError code', async () => {
+  let projectorCalls = 0;
+  let proxyCreations = 0;
+  const b = new LlamaWebGpuBridge({ disableWorker: true, jsBackedModelStaging: true });
+  b._shouldUseWorker = () => true;
+  b._createWorkerProxy = () => {
+    proxyCreations += 1;
+    const state = {
+      modelBytes: 0,
+      metadata: {},
+      contextSize: 128,
+      gpuActive: false,
+      backendName: 'WASM',
+      supportsVision: false,
+      supportsAudio: false,
+    };
+    return {
+      dispose() {},
+      terminate() {},
+      async call(method) {
+        if (method === 'loadModelFromUrl') {
+          state.modelBytes = 1024;
+          state.metadata = { 'llamadart.webgpu.model_bytes': '1024' };
+          return { result: 1, state: { ...state } };
+        }
+        if (method === 'loadMultimodalProjector') {
+          projectorCalls += 1;
+          if (projectorCalls <= 1) {
+            throw new Error('Failed to fetch multimodal projector: 503 Service Unavailable');
+          }
+          throw new ModelStagingError(
+            'MODEL_STAGING_ALLOCATION_FAILED',
+            'Failed to allocate JavaScript memory while staging the model (48 bytes).',
+          );
+        }
+        return { result: 1, state: { ...state } };
+      },
+    };
+  };
+  b._runtime = null;
+  b._workerProxy = b._createWorkerProxy();
+  b._workerGeneration = 1;
+
+  await b.loadModelFromUrl('https://models.test/tiny.gguf', { nCtx: 128, nGpuLayers: 0 });
+  const err = await b.loadMultimodalProjector('https://models.test/retry-oom.gguf')
+    .then(() => assert.fail('must reject with ModelStagingError'), (e) => e);
+  assert.equal(proxyCreations, 2, 'must replace worker proxy once before retry');
+  assert.equal(err instanceof ModelStagingError, true, `Expected ModelStagingError, got ${err?.name}: ${err?.message}`);
+  assert.equal(err.code, 'MODEL_STAGING_ALLOCATION_FAILED');
+  await b.dispose();
+});
+
+test('projector mount collision preserves pre-existing /mmproj file', async () => {
+  const harness = createStagingHarness({
+    jsBackedModelStaging: true,
+    mountResult: -20,
+  });
+  harness.runtime._modelBytes = 1024;
+  harness.fs.dirs.add('/mmproj');
+  harness.fs.files.set('/mmproj/existing.gguf', 4096);
+
+  const err = await harness.runtime
+    .loadMultimodalProjector('https://models.test/existing.gguf')
+    .then(() => assert.fail('must reject mount collision'), (e) => e);
+  assert.ok(err instanceof ModelStagingError, String(err));
+  assert.equal(err.code, 'MODEL_STAGING_MOUNT_FAILED');
+  assert.equal(
+    harness.fs.files.get('/mmproj/existing.gguf'),
+    4096,
+    'failed /jsmodels mount must not delete pre-existing /mmproj file',
+  );
+});
+
+test('failed Safari GPU probe fallback unmounts and releases JS-backed staged model', async () => {
+  const harness = createStagingHarness({
+    jsBackedModelStaging: true,
+    pthreads: false,
+    onLoadModel: ({ args }) => (args[6] === 999 ? 0 : -1),
+  });
+  harness.runtime._isSafari = true;
+  harness.runtime._resolveNativeLoadOptions = (opts) => {
+    harness.runtime._nCtx = opts.nCtx;
+    harness.runtime._nGpuLayers = opts.nGpuLayers;
+  };
+  harness.runtime._fetchWithTimeout = async () => new Response(new Uint8Array([1, 2, 3, 4]));
+  harness.runtime.createCompletion = async () => {
+    throw new Error('corrupted safari gpu output');
+  };
+
+  await assert.rejects(
+    harness.runtime.loadModelFromUrl('https://models.test/safari-fail.gguf', {
+      nCtx: 2048,
+      nGpuLayers: 999,
+      safariMaxGpuLayers: 999,
+      useCache: false,
+      forceRemoteFetchBackend: false,
+    }),
+    /Safari GPU probe failed and fallback attempts were unsuccessful/,
+  );
+  assert.equal(harness.runtime._jsBackedStagingMounted, false);
+  assert.deepEqual(harness.fs.unmountedPaths, ['/jsmodels-1']);
+  assert.equal(harness.openDirectHandles.size, 0);
+});
+
+test('staging off preserves main cancellation error on replacement worker projector retry and parity behaviors', async () => {
+  // 1) Cancellation during replacement-worker projector retry wraps as plain Error when staging is off.
+  let projectorAttempt = 0;
+  let b;
+  b = new LlamaWebGpuBridge({ disableWorker: true });
+  b._shouldUseWorker = () => true;
+  b._createWorkerProxy = () => {
+    const state = {
+      modelBytes: 0,
+      metadata: {},
+      contextSize: 128,
+      gpuActive: false,
+      backendName: 'WASM (CPU)',
+      supportsVision: false,
+      supportsAudio: false,
+    };
+    return {
+      dispose() {},
+      terminate() {},
+      async call(method) {
+        if (method === 'loadModelFromUrl') {
+          state.modelBytes = 1024;
+          state.metadata = { 'llamadart.webgpu.model_bytes': '1024' };
+          return { result: 1, state: { ...state } };
+        }
+        if (method === 'loadMultimodalProjector') {
+          projectorAttempt += 1;
+          if (projectorAttempt === 1) {
+            throw new Error('Bridge worker crashed');
+          }
+          b.cancel();
+          throw new Error('Projector operation was cancelled.');
+        }
+        return { result: 1, state: { ...state } };
+      },
+    };
+  };
+  b._runtime = null;
+  b._workerProxy = b._createWorkerProxy();
+  b._workerGeneration = 1;
+
+  await b.loadModelFromUrl('https://models.test/cpu.gguf', { nCtx: 128, nGpuLayers: 0 });
+  const cancelErr = await b.loadMultimodalProjector('https://models.test/mmproj.gguf')
+    .then(() => assert.fail('must reject'), (e) => e);
+  assert.equal(cancelErr.name, 'Error');
+  assert.match(cancelErr.message, /^CPU multimodal projector setup failed \(/);
+  await b.dispose();
+
+  // 2) Custom core returning -4 with staging off throws plain Error, not ModelStagingError.
+  const offHarness = createStagingHarness({
+    jsBackedModelStaging: false,
+    onLoadModel: () => -4,
+  });
+  const offErr = await offHarness.runtime.loadModelFromUrl('https://models.test/custom.gguf', {
+    nCtx: 2048,
+    nGpuLayers: 0,
+    useCache: false,
+    forceRemoteFetchBackend: false,
+  }).then(() => assert.fail('must reject -4'), (e) => e);
+  assert.equal(offErr instanceof ModelStagingError, false);
+  assert.equal(offErr.name, 'Error');
+
+  // 3) Unknown-length projector with staging off performs the exact 6 header reads.
+  const headerGets = [];
+  const offMmprojHarness = createStagingHarness({ jsBackedModelStaging: false });
+  offMmprojHarness.runtime._modelBytes = 1024;
+  offMmprojHarness.runtime._fetchWithTimeout = async () => ({
+    ok: true,
+    status: 200,
+    type: 'basic',
+    headers: {
+      get(name) {
+        headerGets.push(String(name).toLowerCase());
+        return null;
+      },
+      has() {
+        return false;
+      },
+    },
+    body: new ReadableStream({
+      start(controller) {
+        controller.enqueue(new Uint8Array([1, 2, 3, 4]));
+        controller.close();
+      },
+    }),
+  });
+  await offMmprojHarness.runtime.loadMultimodalProjector('https://models.test/unknown.gguf');
+  assert.equal(headerGets.length, 6, `expected 6 header reads matching main, got ${headerGets.length}: ${headerGets.join(', ')}`);
+});
+
+test('no-stream empty-body 1 GiB response rejects with ModelTransferLengthError before writing or loading projector', async () => {
+  const fs = createStubFs();
+  let writes = 0;
+  let closed = false;
+  await assert.rejects(
+    writeResponseToFsFileWithProgress(
+      new Response(null, {
+        status: 200,
+        headers: {
+          'content-length': String(2 ** 30),
+          'content-encoding': 'identity',
+        },
+      }),
+      fs,
+      '/jsmodels/empty.gguf',
+      null,
+      {
+        skipMemoryReservation: true,
+        directWriter: {
+          writeChunk() {
+            writes += 1;
+            return 0;
+          },
+          close() {
+            closed = true;
+          },
+        },
+      },
+    ),
+    { name: 'ModelTransferLengthError' },
+  );
+  assert.equal(writes, 0);
+  assert.equal(closed, true);
+
+  // Full projector path: empty-body 200 claiming 1 GiB must never invoke llamadart_webgpu_mmproj_load.
+  const harness = createStagingHarness({ jsBackedModelStaging: true });
+  harness.runtime._modelBytes = 1024;
+  harness.runtime._fetchWithTimeout = async () => new Response(null, {
+    status: 200,
+    headers: {
+      'content-length': String(2 ** 30),
+      'content-encoding': 'identity',
+    },
+  });
+  await assert.rejects(
+    harness.runtime.loadMultimodalProjector('https://models.test/empty-mmproj.gguf'),
+    { name: 'ModelTransferLengthError' },
+  );
+  assert.equal(harness.ccalls.some((c) => c[0] === 'llamadart_webgpu_mmproj_load'), false);
+  assert.deepEqual(harness.fs.unmountedPaths, ['/jsmodels-1']);
+});
+
+test('staging ownership preserves user files at /jsmodels, former staging paths, and other mounts', async () => {
+  const harness = createStagingHarness({ jsBackedModelStaging: true });
+  harness.runtime._resolveNativeLoadOptions = (opts) => {
+    harness.runtime._nCtx = opts.nCtx;
+    harness.runtime._nGpuLayers = opts.nGpuLayers;
+  };
+  harness.runtime._fetchWithTimeout = async () => new Response(new Uint8Array([1, 2, 3, 4]), {
+    status: 200,
+    headers: { 'content-length': '4', 'content-encoding': 'identity' },
+  });
+  await harness.runtime.loadModelFromUrl('https://models.test/demo.gguf', {
+    nCtx: 128,
+    nGpuLayers: 0,
+    useCache: false,
+    forceRemoteFetchBackend: false,
+  });
+  await harness.runtime.loadMultimodalProjector('https://models.test/mmproj.gguf');
+
+  // Create user files at /jsmodels/*, the former staging paths /jsmodels-1/* & /jsmodels-2/*,
+  // and on an unrelated mount /snapshots/*.
+  harness.fs.mkdir('/jsmodels');
+  harness.fs.mkdir('/snapshots');
+  harness.fs.writeFile('/jsmodels/demo.gguf', new Uint8Array([1, 2, 3]));
+  harness.fs.writeFile('/jsmodels-1/demo.gguf', new Uint8Array([4, 5, 6]));
+  harness.fs.writeFile('/jsmodels-2/mmproj.gguf', new Uint8Array([7, 8, 9]));
+  harness.fs.writeFile('/snapshots/keep.bin', new Uint8Array([9, 4, 1]));
+
+  await harness.runtime.unloadMultimodalProjector();
+  assert.equal(harness.fs.files.get('/jsmodels-2/mmproj.gguf'), 3);
+  assert.equal(harness.fs.files.get('/snapshots/keep.bin'), 3);
+
+  // Replace model; user files in /jsmodels, /jsmodels-1, and /snapshots must all survive.
+  await harness.runtime.loadModelFromUrl('https://models.test/demo.gguf', {
+    nCtx: 128,
+    nGpuLayers: 0,
+    useCache: false,
+    forceRemoteFetchBackend: false,
+  });
+  assert.equal(harness.fs.files.get('/jsmodels/demo.gguf'), 3);
+  assert.equal(harness.fs.files.get('/jsmodels-1/demo.gguf'), 3);
+  assert.equal(harness.fs.files.get('/snapshots/keep.bin'), 3);
+  assert.equal(harness.fs.unmountedPaths.includes('/snapshots'), false);
+  assert.equal(harness.fs.unmountedPaths.includes('/jsmodels'), false);
+});
+
+test('staging off preserves existing projector capabilities on /mmproj mkdir failure, single root read on retry, and error semantics', async () => {
+  // 1) /mmproj directory creation failure must not clear loaded projector state, and retry reads '/' once.
+  const harness = createStagingHarness({ jsBackedModelStaging: false });
+  harness.runtime._modelBytes = 1024;
+  harness.runtime._fetchWithTimeout = async () => new Response(new Uint8Array([1, 2, 3, 4]), {
+    status: 200,
+    headers: { 'content-length': '4', 'content-encoding': 'identity' },
+  });
+  let supportsVisionNative = 1;
+  const origCcall = harness.core.ccall.bind(harness.core);
+  let mmprojAttempts = 0;
+  harness.core.ccall = (name, returnType, argTypes, args = [], opts) => {
+    if (name === 'llamadart_webgpu_mmproj_supports_vision') {
+      return supportsVisionNative;
+    }
+    if (name === 'llamadart_webgpu_mmproj_load') {
+      mmprojAttempts += 1;
+      if (mmprojAttempts === 2) {
+        throw new ModelStagingError('MODEL_STAGING_UNSUPPORTED', 'network error from custom core');
+      }
+    }
+    return origCcall(name, returnType, argTypes, args, opts);
+  };
+  await harness.runtime.loadMultimodalProjector('https://models.test/first.gguf');
+  assert.equal(harness.runtime._mmSupportsVision, true);
+
+  let rootReads = 0;
+  const origReaddir = harness.fs.readdir.bind(harness.fs);
+  harness.fs.readdir = (dir) => {
+    if (dir === '/') {
+      rootReads += 1;
+    }
+    return origReaddir(dir);
+  };
+  // Custom core throwing ModelStagingError with retryable network message still retries when staging is off,
+  // and ensureFsDirectory('/mmproj') runs once before the retry loop (1 root read total).
+  await harness.runtime.loadMultimodalProjector('https://models.test/retry.gguf');
+  assert.equal(mmprojAttempts, 3);
+  assert.equal(rootReads, 1);
+
+  const origMkdir = harness.fs.mkdir.bind(harness.fs);
+  harness.fs.readdir = (dir) => (dir === '/' ? origReaddir(dir).filter((x) => x !== 'mmproj') : origReaddir(dir));
+  harness.fs.mkdir = (dir) => {
+    if (dir === '/mmproj') {
+      throw new Error('directory unavailable');
+    }
+    return origMkdir(dir);
+  };
+  await assert.rejects(
+    harness.runtime.loadMultimodalProjector('https://models.test/fail-dir.gguf'),
+    /directory unavailable/,
+  );
+  assert.equal(harness.runtime._mmSupportsVision, true);
+  assert.ok(harness.runtime._mmProjPath !== null);
+
+  // 2) Worker proxy with jsBackedModelStaging off returns plain Error even if custom worker sends modelStagingErrorCode.
+  await withStubWorkerEnvironment(async ({ workers }) => {
+    const offBridge = createRealWorkerBridge({ jsBackedModelStaging: false });
+    const proxy = offBridge._workerProxy;
+    const driver = workerDriver(proxy, workers[0]);
+    driver.ready();
+    const pendingLoad = offBridge.loadModelFromUrl('https://models.test/x.gguf', { nCtx: 128, nGpuLayers: 0 });
+    await driver.settle();
+    const call = driver.calls('loadModelFromUrl')[0];
+    proxy._worker.onmessage({
+      data: {
+        id: call.id,
+        type: 'error',
+        modelStagingErrorCode: 'MODEL_STAGING_UNSUPPORTED',
+        message: 'custom worker refused load',
+      },
+    });
+    const err = await pendingLoad.then(() => assert.fail('must reject'), (e) => e);
+    assert.equal(err instanceof ModelStagingError, false);
+    assert.equal(err.name, 'Error');
+    assert.equal(err.message, 'custom worker refused load');
+    await offBridge.dispose();
+  });
+});
+
+test('jsBackedModelStaging rejects pre-v2 core missing _llamadart_webgpu_js_model_fs_api_version with MODEL_STAGING_UNSUPPORTED', async () => {
+  const harness = createStagingHarness({ jsBackedModelStaging: true });
+  delete harness.core._llamadart_webgpu_js_model_fs_api_version;
+
+  const err = await harness.runtime.loadModelFromUrl('https://models.test/small.gguf', {
+    nCtx: 2048,
+    nGpuLayers: 0,
+    useCache: false,
+    forceRemoteFetchBackend: false,
+  }).then(() => assert.fail('must reject'), (e) => e);
+
+  assert.ok(err instanceof ModelStagingError, String(err));
+  assert.equal(err.code, 'MODEL_STAGING_UNSUPPORTED');
+  assert.match(err.message, /_llamadart_webgpu_js_model_fs_api_version/);
+  assert.equal(harness.ccalls.length, 0, 'must reject v1 core before calling ccall');
+});
+
+test('failed unmount stays tracked and retries on next staging cleanup', async () => {
+  const harness = createStagingHarness({ jsBackedModelStaging: true });
+  harness.runtime._resolveNativeLoadOptions = (opts) => {
+    harness.runtime._nCtx = opts.nCtx;
+    harness.runtime._nGpuLayers = opts.nGpuLayers;
+  };
+  harness.runtime._fetchWithTimeout = async () => new Response(new Uint8Array([1, 2, 3, 4]));
+  let busyMounts = new Set(['/jsmodels-1', '/jsmodels-2']);
+  const origCcall = harness.core.ccall.bind(harness.core);
+  const unmountAttempts = [];
+  harness.core.ccall = (name, returnType, argTypes, args = [], opts) => {
+    if (name === 'llamadart_webgpu_unmount_js_model_fs') {
+      unmountAttempts.push(args[0]);
+      if (busyMounts.has(args[0])) {
+        return -16;
+      }
+    }
+    return origCcall(name, returnType, argTypes, args, opts);
+  };
+
+  await harness.runtime.loadModelFromUrl('https://models.test/one.gguf', {
+    nCtx: 128,
+    nGpuLayers: 0,
+    useCache: false,
+    forceRemoteFetchBackend: false,
+  });
+  assert.equal(harness.runtime._jsBackedStagingMounted, true);
+  assert.equal(harness.runtime._activeJsStagingMounts.has('/jsmodels-1'), true);
+
+  // Clear -EBUSY for /jsmodels-1 and load projector (/jsmodels-2, kept busy):
+  // per-mount cleanup of /jsmodels-2 still retries /jsmodels-1 via _failedUnmountJsStagingMounts.
+  busyMounts.delete('/jsmodels-1');
+  await harness.runtime.loadMultimodalProjector('https://models.test/mmproj.gguf');
+  assert.equal(harness.runtime._activeJsStagingMounts.has('/jsmodels-1'), false);
+  assert.equal(harness.runtime._activeJsStagingMounts.has('/jsmodels-2'), true);
+  assert.equal(harness.runtime._jsBackedStagingMounted, true);
+
+  // The next staging cleanup retries /jsmodels-2 once unmount succeeds.
+  busyMounts.clear();
+  await harness.runtime.loadMultimodalProjector('https://models.test/mmproj.gguf');
+  await harness.bridge.dispose();
+  assert.equal(harness.runtime._activeJsStagingMounts.size, 0);
+  assert.equal(harness.runtime._jsBackedStagingMounted, false);
+  assert.ok(unmountAttempts.filter((p) => p === '/jsmodels-1').length >= 2);
+  assert.ok(unmountAttempts.filter((p) => p === '/jsmodels-2').length >= 2);
+});
+
+test('failed-unmount retry checks native mount identity and never deletes a replacement mount', async () => {
+  const harness = createStagingHarness({ jsBackedModelStaging: true });
+  harness.runtime._resolveNativeLoadOptions = (opts) => {
+    harness.runtime._nCtx = opts.nCtx;
+    harness.runtime._nGpuLayers = opts.nGpuLayers;
+  };
+  const busyMounts = new Set(['/jsmodels-1']);
+  const origCcall = harness.core.ccall.bind(harness.core);
+  const unmountAttempts = [];
+  harness.core.ccall = (name, returnType, argTypes, args = [], opts) => {
+    if (name === 'llamadart_webgpu_unmount_js_model_fs') {
+      unmountAttempts.push(args[0]);
+      if (busyMounts.has(args[0])) {
+        return -28;
+      }
+    }
+    return origCcall(name, returnType, argTypes, args, opts);
+  };
+
+  await harness.runtime.loadModelFromUrl('https://models.test/one.gguf', {
+    nCtx: 128,
+    nGpuLayers: 0,
+    useCache: false,
+    forceRemoteFetchBackend: false,
+  });
+  assert.equal(harness.runtime._failedUnmountJsStagingMounts.get('/jsmodels-1'), 1);
+
+  // Another owner unmounts /jsmodels-1 and remounts the same path with a new mount id, storing a checkpoint.
+  busyMounts.delete('/jsmodels-1');
+  assert.equal(origCcall('llamadart_webgpu_unmount_js_model_fs', 'number', ['string'], ['/jsmodels-1']), 0);
+  assert.equal(origCcall('llamadart_webgpu_mount_js_model_fs', 'number', ['string'], ['/jsmodels-1']), 0);
+  const replacementMountId = origCcall('llamadart_webgpu_js_model_fs_mount_id', 'number', ['string'], ['/jsmodels-1']);
+  assert.ok(replacementMountId > 1);
+  harness.fs.writeFile('/jsmodels-1/checkpoint.bin', new Uint8Array([3, 8, 12]));
+
+  // Loading the next model retries cleanup, sees mount_id changed, drops the stale retry, and preserves the checkpoint.
+  const attemptsBeforeSecondLoad = unmountAttempts.length;
+  await harness.runtime.loadModelFromUrl('https://models.test/two.gguf', {
+    nCtx: 128,
+    nGpuLayers: 0,
+    useCache: false,
+    forceRemoteFetchBackend: false,
+  });
+  assert.equal(harness.fs.files.has('/jsmodels-1/checkpoint.bin'), true);
+  assert.equal(harness.mountIds.get('/jsmodels-1'), replacementMountId);
+  assert.equal(unmountAttempts.slice(attemptsBeforeSecondLoad).includes('/jsmodels-1'), false);
+  assert.equal(harness.runtime._failedUnmountJsStagingMounts.has('/jsmodels-1'), false);
+  await harness.bridge.dispose();
+  assert.equal(harness.fs.files.has('/jsmodels-1/checkpoint.bin'), true);
+});
+
+for (const kind of ['model', 'projector']) {
+  for (const replacement of ['another mount', 'an ordinary directory']) {
+    test(`${kind} staging rejects when ${replacement} replaces the mount during fetch`, async () => {
+      const { bridge, runtime, core, fs, mountIds, releasedChunkMountIds, ccalls } = createStagingHarness();
+      const mountPath = '/jsmodels-1';
+      const filePath = `${mountPath}/one.gguf`;
+      const checkpoint = new Uint8Array([17, 23, 41, 97]);
+      const requested = Promise.withResolvers();
+      const response = Promise.withResolvers();
+      const pendingFetch = () => {
+        requested.resolve();
+        return response.promise;
+      };
+      runtime._getCachedModelResponse = pendingFetch;
+      runtime._fetchWithTimeout = pendingFetch;
+      if (kind === 'projector') {
+        runtime._modelBytes = 4;
+      }
+      const url = 'https://models.test/one.gguf';
+      const pendingLoad = kind === 'model'
+        ? bridge.loadModelFromUrl(url, { nGpuLayers: 0, useCache: false, forceRemoteFetchBackend: false })
+        : bridge.loadMultimodalProjector(url);
+
+      await requested.promise;
+      const oldId = mountIds.get(mountPath);
+      assert.ok(oldId > 0);
+      if (replacement === 'another mount') {
+        core.ccall('llamadart_webgpu_unmount_js_model_fs', 'number', ['string'], [mountPath]);
+        core.ccall('llamadart_webgpu_mount_js_model_fs', 'number', ['string'], [mountPath]);
+        assert.notEqual(mountIds.get(mountPath), oldId);
+      } else {
+        mountIds.delete(mountPath);
+      }
+      fs.files.set(filePath, checkpoint);
+      const callStart = ccalls.length;
+      releasedChunkMountIds.length = 0;
+      response.resolve(new Response(new Uint8Array([1, 2, 3, 4, 5])));
+
+      await assert.rejects(pendingLoad, { name: 'ModelStagingError', code: 'MODEL_STAGING_MOUNT_FAILED' });
+      assert.deepEqual(fs.files.get(filePath), checkpoint);
+      assert.equal(fs.dirs.has(mountPath), true);
+      assert.equal(ccalls.slice(callStart).some(([name]) => name === 'llamadart_webgpu_js_model_fs_open_direct'), false);
+      assert.deepEqual(releasedChunkMountIds, [oldId]);
+      await bridge.dispose();
+    });
+  }
+
+  for (const phase of ['write', 'close', 'reader cancellation', 'native load']) {
+    test(`${kind} staging preserves a replacement file after the writer opens (${phase})`, async () => {
+      const { bridge, runtime, core, fs, mountIds, releasedChunkMountIds, ccalls, directWrites } = createStagingHarness();
+      const mountPath = '/jsmodels-1';
+      const filePath = `${mountPath}/one.gguf`;
+      const checkpoint = new Uint8Array([17, 23, 41, 97]);
+      let replacedId = 0;
+      const replaceMount = () => {
+        if (replacedId === 0) {
+          replacedId = mountIds.get(mountPath);
+          mountIds.delete(mountPath);
+          fs.files.set(filePath, checkpoint);
+        }
+      };
+      const write = core.llamadartJsModelFsWriteDirect;
+      core.llamadartJsModelFsWriteDirect = (...args) => {
+        const written = write(...args);
+        if (phase === 'write' || phase === 'close') {
+          replaceMount();
+        }
+        return written;
+      };
+      const nativeLoadName = kind === 'model' ? 'llamadart_webgpu_load_model' : 'llamadart_webgpu_mmproj_load';
+      const ccall = core.ccall.bind(core);
+      core.ccall = (name, ...args) => {
+        const result = ccall(name, ...args);
+        if (phase === 'native load' && name === nativeLoadName) {
+          replaceMount();
+        }
+        return result;
+      };
+      const transfer = async () => new Response(new ReadableStream({
+        start(controller) {
+          if (phase !== 'reader cancellation') {
+            controller.enqueue(new Uint8Array([1, 2, 3]));
+            if (phase === 'write') {
+              controller.enqueue(new Uint8Array([4, 5]));
+            }
+            controller.close();
+          }
+        },
+        cancel: replaceMount,
+      }));
+      runtime._getCachedModelResponse = transfer;
+      runtime._fetchWithTimeout = transfer;
+      if (phase === 'reader cancellation') {
+        runtime._resolveStreamChunkTimeoutMs = () => 1;
+      }
+      if (kind === 'projector') {
+        runtime._modelBytes = 4;
+      }
+      const url = 'https://models.test/one.gguf';
+      const pendingLoad = kind === 'model'
+        ? bridge.loadModelFromUrl(url, { nGpuLayers: 0, useCache: false, forceRemoteFetchBackend: false })
+        : bridge.loadMultimodalProjector(url);
+
+      await assert.rejects(pendingLoad, { name: 'ModelStagingError', code: 'MODEL_STAGING_MOUNT_FAILED' });
+      assert.equal(replacedId, 1);
+      assert.deepEqual(fs.files.get(filePath), checkpoint);
+      assert.deepEqual(releasedChunkMountIds, [replacedId]);
+      if (phase === 'native load') {
+        const freeName = kind === 'model' ? 'llamadart_webgpu_free_model' : 'llamadart_webgpu_mmproj_free';
+        assert.ok(ccalls.some(([name]) => name === freeName));
+      } else if (phase === 'write' || phase === 'close') {
+        assert.equal(directWrites.length, 1);
+        assert.equal(ccalls.some(([name]) => name === 'llamadart_webgpu_js_model_fs_close_direct'), false);
+      }
+      await bridge.dispose();
+    });
+  }
+}
+
+test('dispose releases chunks by mount id before shutdown even when unmount fails', async () => {
+  const harness = createStagingHarness({ jsBackedModelStaging: true });
+  harness.runtime._resolveNativeLoadOptions = (opts) => {
+    harness.runtime._nCtx = opts.nCtx;
+    harness.runtime._nGpuLayers = opts.nGpuLayers;
+  };
+  harness.runtime._fetchWithTimeout = async () => new Response(new Uint8Array([1, 2, 3, 4]));
+  const origCcall = harness.core.ccall.bind(harness.core);
+  let shutdownCalls = 0;
+  harness.core.ccall = (name, returnType, argTypes, args = [], opts) => {
+    if (name === 'llamadart_webgpu_unmount_js_model_fs') {
+      return -28;
+    }
+    if (name === 'llamadart_webgpu_shutdown') {
+      shutdownCalls += 1;
+      assert.deepEqual(harness.releasedChunkMountIds, [1, 2]);
+    }
+    return origCcall(name, returnType, argTypes, args, opts);
+  };
+
+  await harness.runtime.loadModelFromUrl('https://models.test/one.gguf', {
+    nCtx: 128,
+    nGpuLayers: 0,
+    useCache: false,
+    forceRemoteFetchBackend: false,
+  });
+  await harness.runtime.loadMultimodalProjector('https://models.test/mmproj.gguf');
+
+  const first = harness.bridge.dispose();
+  await first;
+  assert.equal(harness.bridge._runtime, null);
+  assert.equal(harness.bridge.dispose(), first);
+  assert.equal(shutdownCalls, 1);
+});
+
+test('staging off dispose keeps the same rejected promise after native shutdown fails', async () => {
+  const { bridge, core } = createStagingHarness({ jsBackedModelStaging: false });
+  const nativeError = new Error('injected shutdown failure');
+  let shutdownCalls = 0;
+  const ccall = core.ccall.bind(core);
+  core.ccall = (name, ...args) => {
+    if (name === 'llamadart_webgpu_shutdown' && ++shutdownCalls === 1) {
+      throw nativeError;
+    }
+    return ccall(name, ...args);
+  };
+
+  const first = bridge.dispose();
+  assert.equal(bridge.dispose(), first);
+  await assert.rejects(first, (error) => error === nativeError);
+  const second = bridge.dispose();
+  assert.equal(second, first);
+  await assert.rejects(second, (error) => error === nativeError);
+  assert.equal(shutdownCalls, 1);
+  assert.equal(bridge.getContextSize(), 0);
+});
+
+test('staging off parity trace avoids Response.type, core.ABORT, _ownedModelPaths, and undefined worker key', async () => {
+  const offBridge = new LlamaWebGpuBridge({ disableWorker: true });
+  assert.equal(Object.hasOwn(offBridge._workerConfig(), 'jsBackedModelStaging'), false);
+  await offBridge.dispose();
+
+  const harness = createStagingHarness({ jsBackedModelStaging: false });
+  harness.runtime._resolveNativeLoadOptions = (opts) => {
+    harness.runtime._nCtx = opts.nCtx;
+    harness.runtime._nGpuLayers = opts.nGpuLayers;
+  };
+  let responseTypeReads = 0;
+  let coreAbortReads = 0;
+  Object.defineProperty(harness.core, 'ABORT', {
+    configurable: true,
+    get() {
+      coreAbortReads += 1;
+      return false;
+    },
+  });
+
+  const stream = new ReadableStream({
+    start(controller) {
+      controller.enqueue(new Uint8Array([1, 2, 3, 4]));
+      controller.close();
+    },
+  });
+  const largeHeaders = new Headers({ 'content-length': '2497280640' });
+  const fakeResponse = {
+    ok: true,
+    status: 200,
+    statusText: 'OK',
+    headers: largeHeaders,
+    body: stream,
+    get type() {
+      responseTypeReads += 1;
+      return 'basic';
+    },
+  };
+  const fs = harness.fs;
+  await writeResponseToFsFileWithProgress(fakeResponse, fs, '/models/large.gguf', null, {
+    skipMemoryReservation: false,
+  });
+  assert.equal(responseTypeReads, 0, 'staging-off download > 2 GiB must not read Response.type');
+
+  await harness.runtime.loadModelFromUrl('https://models.test/one.gguf', {
+    nCtx: 128,
+    nGpuLayers: 0,
+    useCache: false,
+    forceRemoteFetchBackend: false,
+  });
+  assert.deepEqual(harness.runtime._ownedModelPaths, []);
+  await harness.runtime.loadModelFromUrl('https://models.test/two.gguf', {
+    nCtx: 128,
+    nGpuLayers: 0,
+    useCache: false,
+    forceRemoteFetchBackend: false,
+  });
+  assert.deepEqual(harness.runtime._ownedModelPaths, []);
+  await harness.bridge.dispose();
+  assert.equal(coreAbortReads, 0, 'staging-off cleanup and dispose must not read core.ABORT');
+});
+
+test('staging off cleanup matches main unchanged (retry-unlink, 404/503 unlink, replace/unload)', async () => {
+  const harness = createStagingHarness({ jsBackedModelStaging: false });
+  harness.runtime._resolveNativeLoadOptions = (opts) => {
+    harness.runtime._nCtx = opts.nCtx;
+    harness.runtime._nGpuLayers = opts.nGpuLayers;
+  };
+  let responseStatus = 200;
+  delete harness.runtime._getCachedModelResponse;
+  harness.runtime._fetchWithTimeout = async () => new Response(
+    responseStatus === 200 ? new Uint8Array([1, 2, 3, 4]) : null,
+    { status: responseStatus, statusText: responseStatus === 200 ? 'OK' : 'Error' },
+  );
+
+  // One-shot unlink failure on post-load cleanup leaves file until unload/replace retries and removes it.
+  let failOnce = '/models/one.gguf';
+  const attempted = [];
+  const origUnlink = harness.fs.unlink.bind(harness.fs);
+  harness.fs.unlink = (p) => {
+    const exists = harness.fs.files.has(p);
+    if (exists) {
+      attempted.push(p);
+    }
+    if (exists && failOnce === p) {
+      failOnce = '';
+      throw new Error('EBUSY');
+    }
+    return origUnlink(p);
+  };
+  await harness.runtime.loadModelFromUrl('https://models.test/one.gguf', {
+    nCtx: 128,
+    nGpuLayers: 0,
+    useCache: false,
+    forceRemoteFetchBackend: false,
+  });
+  assert.equal(harness.fs.files.has('/models/one.gguf'), true);
+
+  failOnce = '/mmproj/mmproj.gguf';
+  await harness.runtime.loadMultimodalProjector('https://models.test/mmproj.gguf');
+  assert.equal(harness.fs.files.has('/mmproj/mmproj.gguf'), true);
+
+  await harness.runtime.unloadMultimodalProjector();
+  assert.equal(harness.fs.files.has('/mmproj/mmproj.gguf'), false);
+
+  await harness.runtime.loadModelFromUrl('https://models.test/two.gguf', {
+    nCtx: 128,
+    nGpuLayers: 0,
+    useCache: false,
+    forceRemoteFetchBackend: false,
+  });
+  assert.equal(harness.fs.files.has('/models/one.gguf'), false);
+  assert.equal(attempted.filter((p) => p === '/models/one.gguf').length, 2);
+  assert.equal(attempted.filter((p) => p === '/mmproj/mmproj.gguf').length, 2);
+
+  // Pre-existing /models/* on 404 and /mmproj/* on 404/503 are unlinked when staging is off, matching main.
+  harness.fs.writeFile('/models/missing_model404.gguf', new Uint8Array([7, 3, 9]));
+  responseStatus = 404;
+  await assert.rejects(
+    harness.runtime.loadModelFromUrl('https://models.test/missing_model404.gguf', {
+      nCtx: 128,
+      nGpuLayers: 0,
+      useCache: false,
+      forceRemoteFetchBackend: false,
+    }),
+    /404/,
+  );
+  assert.equal(harness.fs.files.has('/models/missing_model404.gguf'), false);
+
+  responseStatus = 200;
+  await harness.runtime.loadModelFromUrl('https://models.test/two.gguf', {
+    nCtx: 128,
+    nGpuLayers: 0,
+    useCache: false,
+    forceRemoteFetchBackend: false,
+  });
+
+  harness.fs.writeFile('/mmproj/missing404.gguf', new Uint8Array([7, 3, 9]));
+  responseStatus = 404;
+  await assert.rejects(
+    harness.runtime.loadMultimodalProjector('https://models.test/missing404.gguf'),
+    /404/,
+  );
+  assert.equal(harness.fs.files.has('/mmproj/missing404.gguf'), false);
+
+  harness.fs.writeFile('/mmproj/err503.gguf', new Uint8Array([7, 3, 9]));
+  responseStatus = 503;
+  await assert.rejects(
+    harness.runtime.loadMultimodalProjector('https://models.test/err503.gguf'),
+    /503/,
+  );
+  assert.equal(harness.fs.files.has('/mmproj/err503.gguf'), false);
+});

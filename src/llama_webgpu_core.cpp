@@ -47,6 +47,8 @@
 #include "llama_webgpu_state.h"
 #include "llama_webgpu_tts.h"
 
+extern "C" bool llamadart_webgpu_is_js_model_path(const char * path);
+
 namespace {
 
 #include "core/state.inc"

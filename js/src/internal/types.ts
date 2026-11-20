@@ -90,4 +90,16 @@ export interface LlamaCoreModule {
   _llamadart_webgpu_begin_generation_bytes?: unknown;
   // Present only in builds that include LoRA adapters.
   _llamadart_webgpu_lora_api_version?: unknown;
+  // Present only in builds that include chunked JS-backed model staging with per-mount identity & release.
+  _llamadart_webgpu_js_model_fs_api_version?: unknown;
+  _llamadart_webgpu_js_model_fs_mount_id?: unknown;
+  _llamadart_webgpu_mount_js_model_fs?: unknown;
+  _llamadart_webgpu_unmount_js_model_fs?: unknown;
+  _llamadart_webgpu_js_model_fs_prealloc_next?: unknown;
+  _llamadart_webgpu_js_model_fs_open_direct?: unknown;
+  _llamadart_webgpu_js_model_fs_close_direct?: unknown;
+  _llamadart_webgpu_js_model_fs_consume_oom_bytes?: unknown;
+  _llamadart_webgpu_js_model_fs_allocated_bytes?: unknown;
+  _llamadart_webgpu_js_model_fs_release_mount_chunks?: unknown;
+  llamadartJsModelFsWriteDirect?: (handle: number, source: Uint8Array, offset: number) => number;
 }

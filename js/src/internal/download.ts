@@ -28,9 +28,17 @@ export interface DrainOptions {
   chunkTimeoutMs?: unknown;
 }
 
+export interface DirectFileChunkWriter {
+  writeChunk(chunk: Uint8Array, position: number): number | void;
+  close?: () => void;
+  assertMountOwned?: () => void;
+}
+
 export interface WriteResponseOptions {
   totalBytes?: unknown;
   useBigIntPosition?: boolean;
+  skipMemoryReservation?: boolean;
+  directWriter?: DirectFileChunkWriter | null;
   startOffset?: unknown;
   preservePartialOnError?: boolean;
   chunkTimeoutMs?: unknown;
@@ -58,6 +66,34 @@ export function sumProgressValues(values: Iterable<unknown> | null | undefined):
     }
   }
   return total;
+}
+
+function createModelTransferLengthError(message: string): Error {
+  const error = new Error(message);
+  error.name = 'ModelTransferLengthError';
+  return error;
+}
+
+function writeDirectChunk(
+  directWriter: DirectFileChunkWriter,
+  chunk: Uint8Array,
+  position: number,
+  onBytesWritten?: (written: number) => void,
+): number {
+  let offset = 0;
+  while (offset < chunk.byteLength) {
+    const remaining = offset === 0 ? chunk : chunk.subarray(offset);
+    const result = directWriter.writeChunk(remaining, position + offset);
+    const written = result === undefined ? remaining.byteLength : Number(result);
+    if (!Number.isInteger(written) || written <= 0 || written > remaining.byteLength) {
+      throw new Error(
+        `Direct file writer returned invalid byte count (${String(result)} for ${remaining.byteLength} bytes).`,
+      );
+    }
+    offset += written;
+    onBytesWritten?.(written);
+  }
+  return offset;
 }
 
 function parseTotalFromContentRangeHeader(contentRangeHeader: string | null): number {
@@ -371,16 +407,32 @@ export function unlinkFsFile(fs: EmscriptenFs, filePath: string): boolean {
 // near-2 GiB allocation. Reserve a bounded size hint, then truncate the
 // logical file while retaining its capacity. Small, visibly encoded,
 // resumed and unknown-length responses retain the incremental writer.
-function reservableResponseLength(response: Response, startOffset: number, bigInt: boolean): number {
-  if (startOffset !== 0 || bigInt || response.status !== 200
-    || response.headers.has('content-range')) return 0;
+function parseIdentityLength(response: Response, startOffset: number): { length: number; encoding: string | undefined } {
+  if (startOffset !== 0 || response.status !== 200 || response.headers.has('content-range')) {
+    return { length: 0, encoding: undefined };
+  }
   const encoding = response.headers.get('content-encoding')?.trim().toLowerCase();
-  if (encoding && encoding !== 'identity') return 0;
+  if (encoding && encoding !== 'identity') return { length: 0, encoding };
   const header = response.headers.get('content-length')?.trim() || '';
-  if (!/^[0-9]+$/.test(header)) return 0;
+  if (!/^[0-9]+$/.test(header)) return { length: 0, encoding };
   const length = Number(header);
-  return Number.isSafeInteger(length) && length >= 1073741824 && length <= 2147483647
-    ? length : 0;
+  if (!Number.isSafeInteger(length) || length < 1073741824) {
+    return { length: 0, encoding };
+  }
+  return { length, encoding };
+}
+
+function reservableResponseLength(response: Response, startOffset: number, bigInt: boolean): number {
+  if (bigInt) return 0;
+  const { length } = parseIdentityLength(response, startOffset);
+  return length <= 2147483647 ? length : 0;
+}
+
+function exactExpectedTransferLength(response: Response, startOffset: number): number {
+  const { length, encoding } = parseIdentityLength(response, startOffset);
+  // CORS can hide Content-Encoding while exposing compressed Content-Length.
+  // Constructed/cache responses can also lose the original response type.
+  return length > 0 && (response.type === 'basic' || encoding === 'identity') ? length : 0;
 }
 
 export async function writeResponseToFsFileWithProgress(
@@ -393,6 +445,7 @@ export async function writeResponseToFsFileWithProgress(
   const total = parsePositiveInteger(writeOptions.totalBytes)
     || inferResponseTotalBytes(response, 0);
   const useBigIntPosition = writeOptions.useBigIntPosition === true;
+  const directWriter = writeOptions.directWriter || null;
   const startOffset = parsePositiveInteger(writeOptions.startOffset);
   const preservePartialOnError = writeOptions.preservePartialOnError === true;
   const appendMode = startOffset > 0;
@@ -402,51 +455,95 @@ export async function writeResponseToFsFileWithProgress(
 
   throwIfAborted(signal, abortMessage);
 
-  if (!appendMode) {
+  if (!appendMode && !directWriter) {
     // best-effort replacement of stale temp files
     unlinkFsFile(fs, filePath);
   }
 
   if (!response.body || typeof response.body.getReader !== 'function') {
-    throwIfAborted(signal, abortMessage);
-    const bytes = new Uint8Array(await response.arrayBuffer());
-    throwIfAborted(signal, abortMessage);
-    if (appendMode) {
-      const stream = fs.open(filePath, 'r+');
-      try {
-        throwIfAborted(signal, abortMessage);
-        const position = useBigIntPosition ? BigInt(startOffset) : startOffset;
-        fs.write(stream, bytes, 0, bytes.length, position);
-      } finally {
-        fs.close(stream);
+    const skipReservation = directWriter != null || writeOptions.skipMemoryReservation === true;
+    const exactLength = skipReservation ? exactExpectedTransferLength(response, startOffset) : 0;
+    try {
+      throwIfAborted(signal, abortMessage);
+      const bytes = new Uint8Array(await response.arrayBuffer());
+      throwIfAborted(signal, abortMessage);
+      if (exactLength > 0 && bytes.byteLength !== exactLength) {
+        throw createModelTransferLengthError(
+          bytes.byteLength < exactLength
+            ? 'Model response ended before its declared byte length.'
+            : 'Model response exceeded its declared byte length.',
+        );
       }
-    } else {
-      fs.writeFile(filePath, bytes);
-    }
+      let directLoaded = 0;
+      if (directWriter) {
+        try {
+          writeDirectChunk(directWriter, bytes, startOffset, (written) => {
+            directLoaded += written;
+          });
+        } catch (error) {
+          if (error && typeof error === 'object') {
+            (error as TransferError).llamadartLoadedBytes = startOffset + directLoaded;
+            (error as TransferError).llamadartFilePath = filePath;
+          }
+          throw error;
+        }
+      } else if (appendMode) {
+        const stream = fs.open(filePath, 'r+');
+        try {
+          throwIfAborted(signal, abortMessage);
+          const position = useBigIntPosition ? BigInt(startOffset) : startOffset;
+          fs.write(stream, bytes, 0, bytes.length, position);
+        } finally {
+          fs.close(stream);
+        }
+      } else {
+        fs.writeFile(filePath, bytes);
+      }
 
-    const finalLoaded = startOffset + bytes.byteLength;
-    if (typeof progressCallback === 'function') {
-      progressCallback({ loaded: finalLoaded, total: total || finalLoaded });
+      const finalLoaded = startOffset + (directWriter ? directLoaded : bytes.byteLength);
+      if (typeof progressCallback === 'function') {
+        progressCallback({ loaded: finalLoaded, total: total || finalLoaded });
+      }
+      return finalLoaded;
+    } finally {
+      directWriter?.close?.();
     }
-    return finalLoaded;
   }
 
-  const reservedLength = reservableResponseLength(response, startOffset, useBigIntPosition);
+  const skipReservation = directWriter != null || writeOptions.skipMemoryReservation === true;
+  const reservedLength = skipReservation
+    ? 0
+    : reservableResponseLength(response, startOffset, useBigIntPosition);
   // CORS can hide Content-Encoding while exposing compressed Content-Length.
   // Constructed/cache responses can also lose the original response type.
   const encoding = response.headers.get('content-encoding')?.trim().toLowerCase();
-  const exactLength = reservedLength > 0
-    && (response.type === 'basic' || encoding === 'identity') ? reservedLength : 0;
+  const exactLength = skipReservation
+    ? exactExpectedTransferLength(response, startOffset)
+    : (reservedLength > 0 && (response.type === 'basic' || encoding === 'identity') ? reservedLength : 0);
   const reader = response.body.getReader();
   const openMode = appendMode ? 'r+' : 'w';
-  const stream = fs.open(filePath, openMode);
+  const stream = directWriter ? null : fs.open(filePath, openMode);
   let loaded = 0;
   let lastBucket = -1;
   let writePosition = startOffset;
   let writePositionBigInt: bigint | null = null;
+  const emitProgressIfNeeded = () => {
+    if (typeof progressCallback !== 'function') {
+      return;
+    }
+    const effectiveLoaded = startOffset + loaded;
+    const effectiveTotal = total || effectiveLoaded;
+    const bucket = effectiveTotal > 0
+      ? Math.floor((effectiveLoaded / effectiveTotal) * 100)
+      : -1;
+    if (bucket > lastBucket) {
+      lastBucket = bucket;
+      progressCallback({ loaded: effectiveLoaded, total: effectiveTotal });
+    }
+  };
 
   try {
-    if (reservedLength > 0) {
+    if (reservedLength > 0 && stream != null) {
       try {
         const written = fs.write(stream, new Uint8Array(1), 0, 1, reservedLength - 1);
         if (written !== 1) throw new Error('Filesystem reservation returned a short write.');
@@ -468,9 +565,7 @@ export async function writeResponseToFsFileWithProgress(
       if (done) {
         throwIfAborted(signal, abortMessage);
         if (exactLength > 0 && loaded !== exactLength) {
-          const error = new Error('Model response ended before its declared byte length.');
-          error.name = 'ModelTransferLengthError';
-          throw error;
+          throw createModelTransferLengthError('Model response ended before its declared byte length.');
         }
         break;
       }
@@ -480,37 +575,35 @@ export async function writeResponseToFsFileWithProgress(
       }
 
       if (exactLength > 0 && value.length > exactLength - loaded) {
-        const error = new Error('Model response exceeded its declared byte length.');
-        error.name = 'ModelTransferLengthError';
-        throw error;
+        throw createModelTransferLengthError('Model response exceeded its declared byte length.');
       }
 
-      // Some browsers may reuse the same Uint8Array backing store across reads.
-      // Clone each chunk before writing to avoid transient buffer aliasing.
-      const chunk = value.slice ? value.slice() : new Uint8Array(value);
-      throwIfAborted(signal, abortMessage);
-      if (useBigIntPosition) {
-        if (writePositionBigInt == null) {
-          writePositionBigInt = BigInt(startOffset);
-        }
-        fs.write(stream, chunk, 0, chunk.length, writePositionBigInt);
-        writePositionBigInt += BigInt(chunk.length);
+      if (directWriter) {
+        throwIfAborted(signal, abortMessage);
+        // Copy synchronously from the network chunk directly into the JS-backed
+        // storage chunks, avoiding value.slice() and any wasm linear memory copy.
+        writeDirectChunk(directWriter, value, writePosition, (written) => {
+          writePosition += written;
+          loaded += written;
+          emitProgressIfNeeded();
+        });
       } else {
-        fs.write(stream, chunk, 0, chunk.length, writePosition);
-        writePosition += chunk.length;
-      }
-      loaded += chunk.length;
-
-      if (typeof progressCallback === 'function') {
-        const effectiveLoaded = startOffset + loaded;
-        const effectiveTotal = total || effectiveLoaded;
-        const bucket = effectiveTotal > 0
-          ? Math.floor((effectiveLoaded / effectiveTotal) * 100)
-          : -1;
-        if (bucket > lastBucket) {
-          lastBucket = bucket;
-          progressCallback({ loaded: effectiveLoaded, total: effectiveTotal });
+        // Some browsers may reuse the same Uint8Array backing store across reads.
+        // Clone each chunk before writing to avoid transient buffer aliasing.
+        const chunk = value.slice ? value.slice() : new Uint8Array(value);
+        throwIfAborted(signal, abortMessage);
+        if (useBigIntPosition) {
+          if (writePositionBigInt == null) {
+            writePositionBigInt = BigInt(startOffset);
+          }
+          fs.write(stream, chunk, 0, chunk.length, writePositionBigInt);
+          writePositionBigInt += BigInt(chunk.length);
+        } else {
+          fs.write(stream, chunk, 0, chunk.length, writePosition);
+          writePosition += chunk.length;
         }
+        loaded += chunk.length;
+        emitProgressIfNeeded();
       }
     }
   } catch (error) {
@@ -527,10 +620,18 @@ export async function writeResponseToFsFileWithProgress(
       // ignore metadata attachment failures
     }
 
-    try {
-      fs.close(stream);
-    } catch (_) {
-      // ignore close failures during abort/error
+    if (directWriter) {
+      try {
+        directWriter.close?.();
+      } catch (_) {
+        // ignore close failures during abort/error
+      }
+    } else if (stream != null) {
+      try {
+        fs.close(stream);
+      } catch (_) {
+        // ignore close failures during abort/error
+      }
     }
 
     try {
@@ -543,6 +644,7 @@ export async function writeResponseToFsFileWithProgress(
       || (error as Error | null)?.name === 'AbortError'
       || (error as Error | null)?.name === 'ModelTransferLengthError') {
       try {
+        directWriter?.assertMountOwned?.();
         fs.unlink(filePath);
       } catch (_) {
         // ignore best-effort cleanup failures
@@ -552,7 +654,11 @@ export async function writeResponseToFsFileWithProgress(
     throw error;
   }
 
-  fs.close(stream);
+  if (directWriter) {
+    directWriter.close?.();
+  } else if (stream != null) {
+    fs.close(stream);
+  }
 
   const finalLoaded = startOffset + loaded;
   if (typeof progressCallback === 'function') {
