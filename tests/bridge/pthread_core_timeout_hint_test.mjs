@@ -6,11 +6,12 @@ import { LlamaWebGpuBridge } from '../../js/src/llama_webgpu_bridge.js';
 const TIMEOUT = 'Bridge core init timeout (10000ms)';
 const HINT = TIMEOUT + '. If this core was built with pthreads,';
 
-function onPage(t, { isolated = false, isolationThrows = false } = {}) {
+function onPage(t, { isolated = false, isolationThrows = false, onIsolationRead } = {}) {
   const saved = Object.getOwnPropertyDescriptor(globalThis, 'crossOriginIsolated');
   Object.defineProperty(globalThis, 'crossOriginIsolated', {
     configurable: true,
     get() {
+      onIsolationRead?.();
       if (isolationThrows) throw new Error('isolation unavailable');
       return isolated;
     },
@@ -80,10 +81,32 @@ test('a timeout adds conditional guidance without calling the unfinished core', 
   assert.ok(error.message.startsWith(HINT), error.message);
   assert.match(error.message, /"_st"/);
   assert.match(error.message, /allowSingleThreadCore/);
-  assert.match(error.message, /Cross-Origin-Embedder-Policy: require-corp/);
+  assert.match(error.message, /"Cross-Origin-Opener-Policy: same-origin"/);
+  assert.match(error.message, /"Cross-Origin-Embedder-Policy: require-corp"/);
   const plain = new Error(TIMEOUT);
   assert.equal(bridge._shouldFallbackToMainThread(error), bridge._shouldFallbackToMainThread(plain));
   assert.equal(bridge._isRecoverableWorkerFsError(error), bridge._isRecoverableWorkerFsError(plain));
+});
+
+test('only the final model-load deadline reads the isolation flag', async (t) => {
+  const controller = new AbortController();
+  const reads = [];
+  let starts = 0;
+  const delays = onPage(t, { onIsolationRead() {
+    reads.push(starts);
+    controller.abort();
+  } });
+  const bridge = directBridge({ coreModuleFactory() {
+    starts += 1;
+    return new Promise(() => {});
+  } });
+  await assert.rejects(
+    bridge.loadModelFromUrl('https://models.test/m.gguf', { signal: controller.signal }),
+    (error) => error.constructor === Error && error.message.startsWith(HINT),
+  );
+  assert.deepEqual(delays, [10000, 10000]);
+  assert.equal(starts, 2);
+  assert.deepEqual(reads, [2]);
 });
 
 test('a throwing inherited loader property cannot alter the timeout', async (t) => {
@@ -129,10 +152,12 @@ test('only explicitly non-isolated pages get a hint', async (t) => {
 });
 
 test('a diagnostic exception preserves the timeout and wasm32 fallback', async (t) => {
-  onPage(t, { isolationThrows: true });
+  let reads = 0;
+  onPage(t, { isolationThrows: true, onIsolationRead: () => { reads += 1; } });
   const error = await captureInitError(directBridge({ coreModuleUrl: coreUrl() }));
   assert.equal(error.constructor, Error);
   assert.equal(error.message, TIMEOUT);
+  assert.equal(reads, 1);
 
   const bridge = directBridge({
     preferMemory64: true,
@@ -141,6 +166,7 @@ test('a diagnostic exception preserves the timeout and wasm32 fallback', async (
   });
   assert.equal((await bridge._runtime._ensureCore()).kind, 'wasm32');
   assert.ok(bridge._runtime._runtimeNotes.includes('core_mem64_unavailable:timeout'));
+  assert.equal(reads, 1);
 });
 
 test('an opaque factory rejection still falls back to wasm32', async (t) => {

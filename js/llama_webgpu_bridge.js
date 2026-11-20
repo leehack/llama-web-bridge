@@ -3371,7 +3371,7 @@ var LlamaWebGpuBridgeRuntime = class {
       return false;
     }
   }
-  async _ensureCore() {
+  async _ensureCore({ reportTimeoutHint = true } = {}) {
     if (this._core) {
       this._applyCoreLogLevel();
       return this._core;
@@ -3497,9 +3497,6 @@ var LlamaWebGpuBridgeRuntime = class {
         break;
       } catch (error) {
         lastError = error;
-        if (initTimeoutError && error === initTimeoutError) {
-          appendCoreInitTimeoutHint(initTimeoutError);
-        }
         if (candidate.variant === "wasm64") {
           const reason = initTimeoutError && error === initTimeoutError ? "timeout" : factoryLoaded && isMemory64Unsupported() ? "unsupported" : "init_error";
           memory64FallbackReason = reason;
@@ -3507,6 +3504,9 @@ var LlamaWebGpuBridgeRuntime = class {
           this._runtimeNotes.push(`core_mem64_unavailable:${reason}`);
           this._emitLogger("warn", `Memory64 core unavailable (${reason}). Trying the wasm32 core.`);
           continue;
+        }
+        if (reportTimeoutHint && initTimeoutError && error === initTimeoutError) {
+          appendCoreInitTimeoutHint(initTimeoutError);
         }
         throw error;
       }
@@ -3519,7 +3519,7 @@ var LlamaWebGpuBridgeRuntime = class {
   }
   async _probeBackends() {
     try {
-      const core = await this._ensureCore();
+      const core = await this._ensureCore({ reportTimeoutHint: false });
       const probeResult = Number(
         await core.ccall("llamadart_webgpu_probe", "number", [], [], { async: true })
       );
