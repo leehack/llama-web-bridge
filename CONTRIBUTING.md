@@ -207,6 +207,17 @@ node scripts/smoke/js_model_staging_remount.mjs \
 The smoke replaces the staging directory during cleanup, removes the
 replacement after disposal, and loads the model again on the same core.
 
+To check that a second bridge preserves a renamed mount while the owning
+bridge is still staging, split the same tiny GGUF with `llama-gguf-split` and
+run both collision cases on all four built core variants:
+
+```bash
+SPLIT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/lane230-split.XXXXXX")"
+llama-gguf-split --split-max-tensors 6 "$TINY_GGUF_PATH" "$SPLIT_DIR/tiny"
+node scripts/smoke/js_model_staging_rename.mjs \
+  "$OUT_DIR" "$TINY_GGUF_PATH" "$LLAMA_WEBGPU_SMOKE_MODEL_SHA256" "$SPLIT_DIR/tiny"
+```
+
 For the v0.7.0 embedding scheduler repair and its exact source fingerprint, see
 [the qualification notes](docs/v070_qualification.md). The build compiles a
 corrected copy under `BUILD_DIR/generated` and leaves the upstream checkout

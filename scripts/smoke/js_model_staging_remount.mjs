@@ -66,7 +66,8 @@ async function checkRemount() {
   }
   assert(originalId > 0, 'the staging directory was not replaced during cleanup');
   assert(core.FS.readFile(markerPath)[0] === 42, 'cleanup changed the replacement directory');
-  assert(allocatedBytes() === 0, 'old mount retained staged chunks');
+  const allocatedAfterDispose = allocatedBytes();
+  assert(allocatedAfterDispose === 0, 'old mount retained staged chunks');
   unlink(markerPath);
   core.FS.rmdir(mountPath);
   assert(mountId() === 0 && !core.FS.readdir('/').includes('jsmodels-1'), 'staging path is still present');
@@ -81,7 +82,9 @@ async function checkRemount() {
     await second.dispose();
   }
   assert(mountResults.length === 2 && mountResults.every((rc) => rc === 0), 'expected two successful native mounts');
-  return { ok: true, originalId, mountResults };
+  const allocatedAfterRemount = allocatedBytes();
+  assert(allocatedAfterRemount === 0, 'new mount retained staged chunks');
+  return { ok: true, originalId, mountResults, allocatedAfterDispose, allocatedAfterRemount };
 }
 
 async function main([distDir, modelPath, modelSha256] = process.argv.slice(2)) {
@@ -99,7 +102,8 @@ async function main([distDir, modelPath, modelSha256] = process.argv.slice(2)) {
     return withServer(webRoot, (url) => runPlaywright(url, 60000, null));
   });
   ensure(payload.ok, payload.error);
-  console.log(JSON.stringify({ originalId: payload.originalId, mountResults: payload.mountResults }));
+  const { originalId, mountResults, allocatedAfterDispose, allocatedAfterRemount } = payload;
+  console.log(JSON.stringify({ originalId, mountResults, allocatedAfterDispose, allocatedAfterRemount }));
   return 0;
 }
 

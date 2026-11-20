@@ -143,15 +143,21 @@ bool mount_is_live(const MountedJsModelEntry & entry) {
   return wasmfs_get_backend_by_path(entry.path.c_str()) == reinterpret_cast<::backend_t>(entry.backend);
 }
 
-auto release_and_erase_mount(JsModelMounts & mounted, JsModelMounts::iterator it) {
-  _llamadart_js_model_fs_release_mount(it->first);
+auto erase_mount(JsModelMounts & mounted, JsModelMounts::iterator it) {
   const auto next = mounted.erase(it);
   g_has_js_model_mounts = !mounted.empty();
   return next;
 }
 
-int unmount_if_live(const MountedJsModelEntry & entry) {
-  return mount_is_live(entry) ? wasmfs_unmount(entry.path.c_str()) : 0;
+int unmount_if_live(const JsModelMounts::value_type & mount) {
+  if (!mount_is_live(mount.second)) {
+    return 0;
+  }
+  const int rc = wasmfs_unmount(mount.second.path.c_str());
+  if (rc == 0) {
+    _llamadart_js_model_fs_release_mount(mount.first);
+  }
+  return rc;
 }
 
 }  // namespace
@@ -178,8 +184,7 @@ EMSCRIPTEN_KEEPALIVE void llamadart_webgpu_js_model_fs_release_mount_chunks(int3
   auto & mounted = mounted_js_models();
   const auto it = mounted.find(mount_id);
   if (it != mounted.end() && !mount_is_live(it->second)) {
-    release_and_erase_mount(mounted, it);
-    return;
+    erase_mount(mounted, it);
   }
   _llamadart_js_model_fs_release_mount(mount_id);
 }
@@ -195,7 +200,8 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_mount_js_model_fs(const char * mou
     if (mount_is_live(it->second)) {
       return -EEXIST;
     }
-    release_and_erase_mount(mounted, it);
+    // WasmFS can rename a live mount. Its owner still releases chunks by ID.
+    erase_mount(mounted, it);
   }
   if (wasmfs_get_backend_by_path(mount_path) != nullptr) {
     return -EEXIST;
@@ -253,7 +259,7 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_unmount_js_model_fs(const char * m
   if (mount_path == nullptr || std::strlen(mount_path) == 0) {
     int first_error = 0;
     for (auto it = mounted.begin(); it != mounted.end(); ) {
-      const int rc = unmount_if_live(it->second);
+      const int rc = unmount_if_live(*it);
       if (rc != 0 && rc != -ENOENT) {
         if (first_error == 0) {
           first_error = rc;
@@ -261,7 +267,7 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_unmount_js_model_fs(const char * m
         ++it;
         continue;
       }
-      it = release_and_erase_mount(mounted, it);
+      it = erase_mount(mounted, it);
     }
     return first_error;
   }
@@ -271,12 +277,12 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_unmount_js_model_fs(const char * m
     return wasmfs_get_backend_by_path(mount_path) != nullptr ? -EINVAL : 0;
   }
 
-  const int rc = unmount_if_live(it->second);
+  const int rc = unmount_if_live(*it);
   if (rc != 0 && rc != -ENOENT) {
     return rc;
   }
 
-  release_and_erase_mount(mounted, it);
+  erase_mount(mounted, it);
   return 0;
 }
 

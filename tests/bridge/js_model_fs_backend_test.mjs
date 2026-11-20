@@ -593,17 +593,19 @@ int main() {
   old_dir_file.reset();
   assert(llamadart_webgpu_js_model_fs_allocated_bytes() == 0.0);
 
-  enum class Cleanup { mount, unmount, unmount_all, release_id };
-  for (auto cleanup : {Cleanup::mount, Cleanup::unmount, Cleanup::unmount_all, Cleanup::release_id}) {
+  enum class Cleanup { remount, collision, unmount, unmount_all, release_id };
+  for (auto cleanup : {Cleanup::remount, Cleanup::collision, Cleanup::unmount,
+                       Cleanup::unmount_all, Cleanup::release_id}) {
     const char* path = "/stale";
     assert(llamadart_webgpu_mount_js_model_fs(path) == 0);
     const int32_t stale_id = llamadart_webgpu_js_model_fs_mount_id(path);
     auto* stale_backend = reinterpret_cast<wasmfs::Backend*>(g_dirs[path].backend);
     auto held_file = stale_backend->createFile(0666);
     assert(held_file->write(&byte, 1, 0) == 1);
+    g_dirs["/moved"] = g_dirs.at(path);
+    g_dirs.erase(path);
 
-    if (cleanup == Cleanup::mount) {
-      g_dirs.erase(path);
+    if (cleanup == Cleanup::remount) {
       assert(llamadart_webgpu_mount_js_model_fs(path) == 0);
       assert(llamadart_webgpu_js_model_fs_mount_id(path) > stale_id);
       assert(llamadart_webgpu_unmount_js_model_fs(path) == 0);
@@ -613,6 +615,8 @@ int main() {
       assert(!llamadart_webgpu_is_js_model_path("/stale/model.gguf"));
       if (cleanup == Cleanup::release_id) {
         llamadart_webgpu_js_model_fs_release_mount_chunks(stale_id);
+      } else if (cleanup == Cleanup::collision) {
+        assert(llamadart_webgpu_mount_js_model_fs(path) == -EEXIST);
       } else {
         assert(llamadart_webgpu_unmount_js_model_fs(cleanup == Cleanup::unmount ? path : nullptr) == 0);
       }
@@ -621,7 +625,13 @@ int main() {
       assert(llamadart_webgpu_mount_js_model_fs(path) == -EEXIST);
       g_dirs.erase(path);
     }
+    assert(g_dirs.at("/moved").backend == reinterpret_cast<::backend_t>(stale_backend));
+    if (cleanup != Cleanup::release_id) {
+      assert(llamadart_webgpu_js_model_fs_allocated_bytes() == 64.0 * 1024.0 * 1024.0);
+      llamadart_webgpu_js_model_fs_release_mount_chunks(stale_id);
+    }
     assert(llamadart_webgpu_js_model_fs_allocated_bytes() == 0.0);
+    g_dirs.erase("/moved");
   }
 
   // After unmount, path predicate returns to zero allocations again.
@@ -664,7 +674,7 @@ int wasmfs_unmount(const char* path);
     const mutatedExe = path.join(dir, 'test_js_model_fs_mutated');
     writeFileSync(
       mutatedCppPath,
-      cppFsSource.replace('  _llamadart_js_model_fs_release_mount(it->first);\n', ''),
+      cppFsSource.replace('    _llamadart_js_model_fs_release_mount(mount.first);\n', ''),
     );
     const mutComp = spawnSync(
       process.env.CXX || 'c++',
