@@ -8,7 +8,6 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <unordered_map>
-#include <vector>
 
 #include <emscripten/emscripten.h>
 #include <emscripten/wasmfs.h>
@@ -104,11 +103,7 @@ class ChunkedJsModelBackend : public wasmfs::Backend {
   int32_t mount_id_ = 0;
 
 public:
-  explicit ChunkedJsModelBackend(int32_t mount_id = 0) : mount_id_(mount_id) {}
-
-  void setMountId(int32_t mount_id) {
-    mount_id_ = mount_id;
-  }
+  explicit ChunkedJsModelBackend(int32_t mount_id) : mount_id_(mount_id) {}
 
   std::shared_ptr<wasmfs::DataFile> createFile(mode_t mode) override {
     return std::make_shared<ChunkedJsModelFile>(mode, this, mount_id_);
@@ -135,19 +130,35 @@ std::unordered_map<std::string, MountedJsModelEntry> & mounted_js_model_paths() 
   return *paths;
 }
 
-// Reuse unmounted ChunkedJsModelBackend instances so repeated mounts do not grow
-// WasmFS's global backend table across the lifetime of the core.
-std::vector<wasmfs::backend_t> & free_js_model_backends() {
-  static auto * backends = new std::vector<wasmfs::backend_t>();
-  return *backends;
-}
-
 }  // namespace
 
 extern "C" {
 
 EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_js_model_fs_api_version() {
-  return 2;
+  return 3;
+}
+
+EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_js_model_fs_mount_id(const char * mount_path) {
+  if (mount_path == nullptr || std::strlen(mount_path) == 0) {
+    return 0;
+  }
+  const auto & mounted = mounted_js_model_paths();
+  const auto it = mounted.find(std::string(mount_path));
+  if (it == mounted.end()) {
+    return 0;
+  }
+  const auto current_backend =
+      reinterpret_cast<wasmfs::backend_t>(wasmfs_get_backend_by_path(mount_path));
+  if (current_backend == nullptr || current_backend != it->second.backend) {
+    return 0;
+  }
+  return it->second.mount_id;
+}
+
+EMSCRIPTEN_KEEPALIVE void llamadart_webgpu_js_model_fs_release_mount_chunks(int32_t mount_id) {
+  if (mount_id > 0) {
+    _llamadart_js_model_fs_release_mount(mount_id);
+  }
 }
 
 EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_mount_js_model_fs(const char * mount_path) {
@@ -168,27 +179,19 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_mount_js_model_fs(const char * mou
     next_mount_id = 1;
   }
 
-  auto & free_backends = free_js_model_backends();
-  wasmfs::backend_t backend = nullptr;
-  if (!free_backends.empty()) {
-    backend = free_backends.back();
-    free_backends.pop_back();
-  } else {
-    backend = wasmfs::wasmFS.addBackend(std::make_unique<ChunkedJsModelBackend>(0));
-  }
+  // Allocate one fresh backend per mount rather than recycling backends, because
+  // WasmFS retains created backends and cwd handles across unmounts.
+  wasmfs::backend_t backend =
+      wasmfs::wasmFS.addBackend(std::make_unique<ChunkedJsModelBackend>(mount_id));
   if (backend == nullptr) {
     return -ENOMEM;
   }
-
-  static_cast<ChunkedJsModelBackend *>(backend)->setMountId(mount_id);
 
   const int rc = wasmfs_create_directory(
       mount_path,
       0777,
       reinterpret_cast<::backend_t>(backend));
   if (rc != 0) {
-    static_cast<ChunkedJsModelBackend *>(backend)->setMountId(0);
-    free_backends.push_back(backend);
     return rc;
   }
 
@@ -223,7 +226,6 @@ bool llamadart_webgpu_is_js_model_path(const char * path) {
 
 EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_unmount_js_model_fs(const char * mount_path) {
   auto & mounted = mounted_js_model_paths();
-  auto & free_backends = free_js_model_backends();
 
   if (mount_path == nullptr || std::strlen(mount_path) == 0) {
     int first_error = 0;
@@ -237,10 +239,6 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_unmount_js_model_fs(const char * m
         continue;
       }
       _llamadart_js_model_fs_release_mount(it->second.mount_id);
-      if (it->second.backend != nullptr) {
-        static_cast<ChunkedJsModelBackend *>(it->second.backend)->setMountId(0);
-        free_backends.push_back(it->second.backend);
-      }
       it = mounted.erase(it);
     }
     g_has_js_model_mounts = !mounted.empty();
@@ -258,10 +256,6 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_unmount_js_model_fs(const char * m
   }
 
   _llamadart_js_model_fs_release_mount(it->second.mount_id);
-  if (it->second.backend != nullptr) {
-    static_cast<ChunkedJsModelBackend *>(it->second.backend)->setMountId(0);
-    free_backends.push_back(it->second.backend);
-  }
   mounted.erase(it);
   g_has_js_model_mounts = !mounted.empty();
   return 0;

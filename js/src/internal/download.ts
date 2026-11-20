@@ -406,22 +406,19 @@ export function unlinkFsFile(fs: EmscriptenFs, filePath: string): boolean {
 // near-2 GiB allocation. Reserve a bounded size hint, then truncate the
 // logical file while retaining its capacity. Small, visibly encoded,
 // resumed and unknown-length responses retain the incremental writer.
-function parseIdentityLength(response: Response, startOffset: number): { length: number; exact: boolean } {
+function parseIdentityLength(response: Response, startOffset: number): { length: number; encoding: string | undefined } {
   if (startOffset !== 0 || response.status !== 200 || response.headers.has('content-range')) {
-    return { length: 0, exact: false };
+    return { length: 0, encoding: undefined };
   }
   const encoding = response.headers.get('content-encoding')?.trim().toLowerCase();
-  if (encoding && encoding !== 'identity') return { length: 0, exact: false };
+  if (encoding && encoding !== 'identity') return { length: 0, encoding };
   const header = response.headers.get('content-length')?.trim() || '';
-  if (!/^[0-9]+$/.test(header)) return { length: 0, exact: false };
+  if (!/^[0-9]+$/.test(header)) return { length: 0, encoding };
   const length = Number(header);
   if (!Number.isSafeInteger(length) || length < 1073741824) {
-    return { length: 0, exact: false };
+    return { length: 0, encoding };
   }
-  // CORS can hide Content-Encoding while exposing compressed Content-Length.
-  // Constructed/cache responses can also lose the original response type.
-  const exact = response.type === 'basic' || encoding === 'identity';
-  return { length, exact };
+  return { length, encoding };
 }
 
 function reservableResponseLength(response: Response, startOffset: number, bigInt: boolean): number {
@@ -431,8 +428,10 @@ function reservableResponseLength(response: Response, startOffset: number, bigIn
 }
 
 function exactExpectedTransferLength(response: Response, startOffset: number): number {
-  const { length, exact } = parseIdentityLength(response, startOffset);
-  return exact ? length : 0;
+  const { length, encoding } = parseIdentityLength(response, startOffset);
+  // CORS can hide Content-Encoding while exposing compressed Content-Length.
+  // Constructed/cache responses can also lose the original response type.
+  return length > 0 && (response.type === 'basic' || encoding === 'identity') ? length : 0;
 }
 
 export async function writeResponseToFsFileWithProgress(

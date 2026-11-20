@@ -497,14 +497,16 @@ int wasmfs_unmount(const char* path) {
   return 0;
 }
 int32_t llamadart_webgpu_js_model_fs_api_version();
+int32_t llamadart_webgpu_js_model_fs_mount_id(const char* mount_path);
 int32_t llamadart_webgpu_mount_js_model_fs(const char* mount_path);
 int32_t llamadart_webgpu_unmount_js_model_fs(const char* mount_path);
+void llamadart_webgpu_js_model_fs_release_mount_chunks(int32_t mount_id);
 double llamadart_webgpu_js_model_fs_allocated_bytes();
 bool llamadart_webgpu_is_js_model_path(const char* path);
 }
 
 int main() {
-  assert(llamadart_webgpu_js_model_fs_api_version() == 2);
+  assert(llamadart_webgpu_js_model_fs_api_version() == 3);
   // 0) Path predicate must make zero heap allocations when nothing is mounted.
   g_alloc_calls = 0;
   g_track_allocs = true;
@@ -513,14 +515,17 @@ int main() {
   g_track_allocs = false;
   assert(g_alloc_calls == 0);
 
-  // 1) An existing ordinary /jsmodels directory must fail mount with -EEXIST and not emit path match.
+  // 1) An existing ordinary /jsmodels directory must fail mount with -EEXIST and report mount_id == 0.
   g_dirs["/jsmodels"] = {g_mem_backend};
+  assert(llamadart_webgpu_js_model_fs_mount_id("/jsmodels") == 0);
   assert(llamadart_webgpu_mount_js_model_fs("/jsmodels") == -EEXIST);
   assert(!llamadart_webgpu_is_js_model_path("/jsmodels/a.gguf"));
   g_dirs.erase("/jsmodels");
 
   // 2) Normal mount creates our backend directory; default /models/ paths do not match it.
   assert(llamadart_webgpu_mount_js_model_fs("/jsmodels") == 0);
+  const int32_t first_id = llamadart_webgpu_js_model_fs_mount_id("/jsmodels");
+  assert(first_id > 0);
   assert(llamadart_webgpu_is_js_model_path("/jsmodels/a.gguf"));
   assert(!llamadart_webgpu_is_js_model_path("/models/a.gguf"));
 
@@ -530,6 +535,8 @@ int main() {
 
   // 3) Multiple independent mounts isolate chunk release on unmount.
   assert(llamadart_webgpu_mount_js_model_fs("/snapshots") == 0);
+  const int32_t snap_id = llamadart_webgpu_js_model_fs_mount_id("/snapshots");
+  assert(snap_id > first_id);
   auto* backend = reinterpret_cast<wasmfs::Backend*>(g_dirs["/jsmodels"].backend);
   auto* snap_backend = reinterpret_cast<wasmfs::Backend*>(g_dirs["/snapshots"].backend);
   assert(backend != snap_backend);
@@ -540,32 +547,51 @@ int main() {
     assert(open_fd->write(&byte, 1, 0) == 1);
     assert(snap_fd->write(&byte, 1, 0) == 1);
     assert(llamadart_webgpu_js_model_fs_allocated_bytes() == 128.0 * 1024.0 * 1024.0);
+    // Releasing chunks by mount_id frees only that mount's chunks even while unmount is blocked.
+    llamadart_webgpu_js_model_fs_release_mount_chunks(first_id);
+    assert(llamadart_webgpu_js_model_fs_allocated_bytes() == 64.0 * 1024.0 * 1024.0);
     // Unmount /jsmodels while open_fd still holds a strong reference; /snapshots must stay intact.
     assert(llamadart_webgpu_unmount_js_model_fs("/jsmodels") == 0);
-    assert(llamadart_webgpu_js_model_fs_allocated_bytes() == 64.0 * 1024.0 * 1024.0);
+    assert(llamadart_webgpu_js_model_fs_mount_id("/jsmodels") == 0);
     assert(llamadart_webgpu_is_js_model_path("/snapshots/keep.bin"));
     assert(!llamadart_webgpu_is_js_model_path("/jsmodels/a.gguf"));
     assert(llamadart_webgpu_unmount_js_model_fs("/snapshots") == 0);
     assert(llamadart_webgpu_js_model_fs_allocated_bytes() == 0.0);
   }
 
-  // 4) Failed unmount (-EBUSY) keeps the mount tracked so a retry succeeds cleanly.
+  // 4) Failed unmount (-EBUSY) keeps the mount tracked, preserves mount_id, and replacement remount gets a new mount_id.
   assert(llamadart_webgpu_mount_js_model_fs("/busy") == 0);
+  const int32_t busy_id = llamadart_webgpu_js_model_fs_mount_id("/busy");
+  assert(busy_id > snap_id);
   g_force_unmount_busy = true;
   assert(llamadart_webgpu_unmount_js_model_fs("/busy") == -EBUSY);
+  assert(llamadart_webgpu_js_model_fs_mount_id("/busy") == busy_id);
   assert(llamadart_webgpu_is_js_model_path("/busy/model.gguf"));
   g_force_unmount_busy = false;
   assert(llamadart_webgpu_unmount_js_model_fs("/busy") == 0);
+  assert(llamadart_webgpu_js_model_fs_mount_id("/busy") == 0);
   assert(!llamadart_webgpu_is_js_model_path("/busy/model.gguf"));
+  assert(llamadart_webgpu_mount_js_model_fs("/busy") == 0);
+  assert(llamadart_webgpu_js_model_fs_mount_id("/busy") > busy_id);
+  assert(llamadart_webgpu_unmount_js_model_fs("/busy") == 0);
 
-  // 5) Backend instances are reused across thousands of mount/unmount cycles without growing wasmFS.backends.
+  // 5) Each mount allocates a fresh backend instance so old unmounted directory/cwd handles never write into a new mount.
   const size_t backends_before = wasmfs::wasmFS.backends.size();
-  for (int i = 0; i < 4100; ++i) {
-    std::string p = "/jsmodels-" + std::to_string(i);
-    assert(llamadart_webgpu_mount_js_model_fs(p.c_str()) == 0);
-    assert(llamadart_webgpu_unmount_js_model_fs(p.c_str()) == 0);
-  }
-  assert(wasmfs::wasmFS.backends.size() == backends_before);
+  assert(llamadart_webgpu_mount_js_model_fs("/first") == 0);
+  auto* first_backend = reinterpret_cast<wasmfs::Backend*>(g_dirs["/first"].backend);
+  assert(llamadart_webgpu_unmount_js_model_fs("/first") == 0);
+  assert(llamadart_webgpu_mount_js_model_fs("/fresh") == 0);
+  auto* fresh_backend = reinterpret_cast<wasmfs::Backend*>(g_dirs["/fresh"].backend);
+  assert(fresh_backend != first_backend);
+  assert(wasmfs::wasmFS.backends.size() == backends_before + 2);
+  std::shared_ptr<wasmfs::DataFile> old_dir_file = first_backend->createFile(0666);
+  uint8_t byte = 41;
+  assert(old_dir_file->write(&byte, 1, 0) == 1);
+  assert(llamadart_webgpu_unmount_js_model_fs("/fresh") == 0);
+  // Unmounting /fresh must not release the file created under the old /first backend.
+  assert(llamadart_webgpu_js_model_fs_allocated_bytes() == 64.0 * 1024.0 * 1024.0);
+  old_dir_file.reset();
+  assert(llamadart_webgpu_js_model_fs_allocated_bytes() == 0.0);
 
   // After unmount, path predicate returns to zero allocations again.
   g_alloc_calls = 0;

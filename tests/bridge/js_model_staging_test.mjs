@@ -92,6 +92,9 @@ function createStagingHarness({
   const openDirectHandles = new Set();
   const closedDirectHandles = [];
   let nextDirectHandle = 1;
+  let nextMountId = 1;
+  const mountIds = new Map();
+  const releasedChunkMountIds = [];
   let preallocNextBytes = 0;
   let oomBytes = 0;
   let lastErrorText = '';
@@ -101,7 +104,8 @@ function createStagingHarness({
     FS: fs,
     UTF8ToString: () => lastErrorText,
     ...(includeJsModelFsExports ? {
-      _llamadart_webgpu_js_model_fs_api_version: () => 2,
+      _llamadart_webgpu_js_model_fs_api_version: () => 3,
+      _llamadart_webgpu_js_model_fs_mount_id: () => 0,
       _llamadart_webgpu_mount_js_model_fs: () => 0,
       _llamadart_webgpu_unmount_js_model_fs: () => 0,
       _llamadart_webgpu_js_model_fs_prealloc_next: () => 0,
@@ -109,6 +113,7 @@ function createStagingHarness({
       _llamadart_webgpu_js_model_fs_close_direct: () => 0,
       _llamadart_webgpu_js_model_fs_consume_oom_bytes: () => 0,
       _llamadart_webgpu_js_model_fs_allocated_bytes: () => 0,
+      _llamadart_webgpu_js_model_fs_release_mount_chunks: () => 0,
       llamadartJsModelFsWriteDirect(handle, chunk, position) {
         if (!openDirectHandles.has(handle)) {
           return -8;
@@ -130,15 +135,31 @@ function createStagingHarness({
     } : {}),
     ccall(name, _returnType, _argTypes, args = []) {
       ccalls.push([name, ...args]);
+      if (name === 'llamadart_webgpu_js_model_fs_api_version') {
+        return core._llamadart_webgpu_js_model_fs_api_version?.() ?? 0;
+      }
+      if (name === 'llamadart_webgpu_js_model_fs_mount_id') {
+        return mountIds.get(args[0]) || 0;
+      }
+      if (name === 'llamadart_webgpu_js_model_fs_release_mount_chunks') {
+        releasedChunkMountIds.push(Number(args[0]) || 0);
+        return 0;
+      }
       if (name === 'llamadart_webgpu_mount_js_model_fs') {
         if (mountResult !== 0) {
           return mountResult;
         }
         fs.dirs.add(args[0]);
+        mountIds.set(args[0], nextMountId++);
         return 0;
       }
       if (name === 'llamadart_webgpu_unmount_js_model_fs') {
         fs.unmountedPaths.push(args[0]);
+        const releasedId = mountIds.get(args[0]) || 0;
+        if (releasedId > 0) {
+          releasedChunkMountIds.push(releasedId);
+        }
+        mountIds.delete(args[0]);
         for (const p of [...fs.files.keys()]) {
           if (p.startsWith(`${args[0]}/`)) {
             fs.files.delete(p);
@@ -228,6 +249,8 @@ function createStagingHarness({
     ccalls,
     directWrites,
     openDirectHandles,
+    mountIds,
+    releasedChunkMountIds,
     closedDirectHandles,
     get preallocNextBytes() { return preallocNextBytes; },
     setOomBytes: (bytes) => { oomBytes = bytes; },
@@ -262,8 +285,10 @@ test('jsBackedModelStaging defaults off and works opt-in for threaded and non-th
       forceRemoteFetchBackend: false,
     });
 
-    assert.deepEqual(harness.ccalls[0], ['llamadart_webgpu_mount_js_model_fs', '/jsmodels-1']);
-    assert.deepEqual(harness.ccalls[1], ['llamadart_webgpu_js_model_fs_open_direct', '/jsmodels-1/demo.gguf', 4, 0]);
+    const mountIdx = harness.ccalls.findIndex((c) => c[0] === 'llamadart_webgpu_mount_js_model_fs');
+    assert.ok(mountIdx >= 0);
+    assert.deepEqual(harness.ccalls[mountIdx], ['llamadart_webgpu_mount_js_model_fs', '/jsmodels-1']);
+    assert.ok(harness.ccalls.some((c) => c[0] === 'llamadart_webgpu_js_model_fs_open_direct' && c[1] === '/jsmodels-1/demo.gguf' && c[2] === 4 && c[3] === 0));
     assert.ok(harness.ccalls.some((c) => c[0] === 'llamadart_webgpu_js_model_fs_close_direct'));
     assert.ok(harness.ccalls.some((c) => c[0] === 'llamadart_webgpu_load_model' && c[1] === '/jsmodels-1/demo.gguf'));
     assert.ok(harness.ccalls.some((c) => c[0] === 'llamadart_webgpu_unmount_js_model_fs' && c[1] === '/jsmodels-1'));
@@ -346,8 +371,8 @@ test('jsBackedModelStaging on wasm64 writes directly via handle without FS.write
     length: 4,
     position: 0,
   }]);
-  assert.deepEqual(harness.ccalls[0], ['llamadart_webgpu_mount_js_model_fs', '/jsmodels-1']);
-  assert.deepEqual(harness.ccalls[1], ['llamadart_webgpu_js_model_fs_open_direct', '/jsmodels-1/mem64.gguf', 4, 0]);
+  assert.ok(harness.ccalls.some((c) => c[0] === 'llamadart_webgpu_mount_js_model_fs' && c[1] === '/jsmodels-1'));
+  assert.ok(harness.ccalls.some((c) => c[0] === 'llamadart_webgpu_js_model_fs_open_direct' && c[1] === '/jsmodels-1/mem64.gguf' && c[2] === 4 && c[3] === 0));
   assert.ok(harness.ccalls.some((c) => c[0] === 'llamadart_webgpu_unmount_js_model_fs' && c[1] === '/jsmodels-1'));
   assert.ok(harness.runtime._runtimeNotes.includes('model_staging_js_backed'));
   assert.equal(harness.openDirectHandles.size, 0);
@@ -1535,6 +1560,159 @@ test('failed unmount stays tracked and retries on next cleanup and on dispose', 
   assert.equal(harness.runtime._jsBackedStagingMounted, false);
   assert.ok(unmountAttempts.filter((p) => p === '/jsmodels-1').length >= 2);
   assert.ok(unmountAttempts.filter((p) => p === '/jsmodels-2').length >= 2);
+});
+
+test('failed-unmount retry checks native mount identity and never deletes a replacement mount', async () => {
+  const harness = createStagingHarness({ jsBackedModelStaging: true });
+  harness.runtime._resolveNativeLoadOptions = (opts) => {
+    harness.runtime._nCtx = opts.nCtx;
+    harness.runtime._nGpuLayers = opts.nGpuLayers;
+  };
+  const busyMounts = new Set(['/jsmodels-1']);
+  const origCcall = harness.core.ccall.bind(harness.core);
+  const unmountAttempts = [];
+  harness.core.ccall = (name, returnType, argTypes, args = [], opts) => {
+    if (name === 'llamadart_webgpu_unmount_js_model_fs') {
+      unmountAttempts.push(args[0]);
+      if (busyMounts.has(args[0])) {
+        return -28;
+      }
+    }
+    return origCcall(name, returnType, argTypes, args, opts);
+  };
+
+  await harness.runtime.loadModelFromUrl('https://models.test/one.gguf', {
+    nCtx: 128,
+    nGpuLayers: 0,
+    useCache: false,
+    forceRemoteFetchBackend: false,
+  });
+  assert.equal(harness.runtime._failedUnmountJsStagingMounts.get('/jsmodels-1'), 1);
+
+  // Another owner unmounts /jsmodels-1 and remounts the same path with a new mount id, storing a checkpoint.
+  busyMounts.delete('/jsmodels-1');
+  assert.equal(origCcall('llamadart_webgpu_unmount_js_model_fs', 'number', ['string'], ['/jsmodels-1']), 0);
+  assert.equal(origCcall('llamadart_webgpu_mount_js_model_fs', 'number', ['string'], ['/jsmodels-1']), 0);
+  const replacementMountId = origCcall('llamadart_webgpu_js_model_fs_mount_id', 'number', ['string'], ['/jsmodels-1']);
+  assert.ok(replacementMountId > 1);
+  harness.fs.writeFile('/jsmodels-1/checkpoint.bin', new Uint8Array([3, 8, 12]));
+
+  // Loading the next model retries cleanup, sees mount_id changed, drops the stale retry, and preserves the checkpoint.
+  const attemptsBeforeSecondLoad = unmountAttempts.length;
+  await harness.runtime.loadModelFromUrl('https://models.test/two.gguf', {
+    nCtx: 128,
+    nGpuLayers: 0,
+    useCache: false,
+    forceRemoteFetchBackend: false,
+  });
+  assert.equal(harness.fs.files.has('/jsmodels-1/checkpoint.bin'), true);
+  assert.equal(harness.mountIds.get('/jsmodels-1'), replacementMountId);
+  assert.equal(unmountAttempts.slice(attemptsBeforeSecondLoad).includes('/jsmodels-1'), false);
+  assert.equal(harness.runtime._failedUnmountJsStagingMounts.has('/jsmodels-1'), false);
+  await harness.bridge.dispose();
+  assert.equal(harness.fs.files.has('/jsmodels-1/checkpoint.bin'), true);
+});
+
+test('terminal dispose releases chunks by mount id even when unmount fails, rejects with MODEL_STAGING_CLEANUP_INCOMPLETE, and retries on second dispose', async () => {
+  const harness = createStagingHarness({ jsBackedModelStaging: true });
+  harness.runtime._resolveNativeLoadOptions = (opts) => {
+    harness.runtime._nCtx = opts.nCtx;
+    harness.runtime._nGpuLayers = opts.nGpuLayers;
+  };
+  const origCcall = harness.core.ccall.bind(harness.core);
+  let blockUnmount = true;
+  harness.core.ccall = (name, returnType, argTypes, args = [], opts) => {
+    if (name === 'llamadart_webgpu_unmount_js_model_fs' && blockUnmount && args[0] === '/jsmodels-1') {
+      return -28;
+    }
+    return origCcall(name, returnType, argTypes, args, opts);
+  };
+
+  await harness.runtime.loadModelFromUrl('https://models.test/one.gguf', {
+    nCtx: 128,
+    nGpuLayers: 0,
+    useCache: false,
+    forceRemoteFetchBackend: false,
+  });
+
+  const first = harness.bridge.dispose();
+  const firstErr = await first.then(() => assert.fail('dispose must reject while unmount is blocked'), (e) => e);
+  assert.ok(firstErr instanceof ModelStagingError, String(firstErr));
+  assert.equal(firstErr.code, 'MODEL_STAGING_CLEANUP_INCOMPLETE');
+  assert.ok(harness.releasedChunkMountIds.includes(1), 'terminal dispose must release chunks by mount id even on unmount failure');
+  assert.ok(harness.bridge._runtime !== null, 'runtime stays retained until retry dispose finishes unmount');
+  assert.equal(harness.runtime._activeJsStagingMounts.has('/jsmodels-1'), true);
+
+  blockUnmount = false;
+  const second = harness.bridge.dispose();
+  assert.notEqual(second, first, 'second dispose after incomplete cleanup must return a fresh retry promise');
+  await second;
+  assert.equal(harness.bridge._runtime, null);
+  assert.equal(harness.runtime._activeJsStagingMounts.size, 0);
+  assert.equal(harness.runtime._failedUnmountJsStagingMounts.size, 0);
+  assert.equal(harness.bridge.dispose(), second, 'completed dispose caches its resolved promise');
+});
+
+test('staging off parity trace avoids Response.type, core.ABORT, _ownedModelPaths, and undefined worker key', async () => {
+  const offBridge = new LlamaWebGpuBridge({ disableWorker: true });
+  assert.equal(Object.hasOwn(offBridge._workerConfig(), 'jsBackedModelStaging'), false);
+  await offBridge.dispose();
+
+  const harness = createStagingHarness({ jsBackedModelStaging: false });
+  harness.runtime._resolveNativeLoadOptions = (opts) => {
+    harness.runtime._nCtx = opts.nCtx;
+    harness.runtime._nGpuLayers = opts.nGpuLayers;
+  };
+  let responseTypeReads = 0;
+  let coreAbortReads = 0;
+  Object.defineProperty(harness.core, 'ABORT', {
+    configurable: true,
+    get() {
+      coreAbortReads += 1;
+      return false;
+    },
+  });
+
+  const stream = new ReadableStream({
+    start(controller) {
+      controller.enqueue(new Uint8Array([1, 2, 3, 4]));
+      controller.close();
+    },
+  });
+  const largeHeaders = new Headers({ 'content-length': '2497280640' });
+  const fakeResponse = {
+    ok: true,
+    status: 200,
+    statusText: 'OK',
+    headers: largeHeaders,
+    body: stream,
+    get type() {
+      responseTypeReads += 1;
+      return 'basic';
+    },
+  };
+  const fs = harness.fs;
+  await writeResponseToFsFileWithProgress(fakeResponse, fs, '/models/large.gguf', null, {
+    skipMemoryReservation: false,
+  });
+  assert.equal(responseTypeReads, 0, 'staging-off download > 2 GiB must not read Response.type');
+
+  await harness.runtime.loadModelFromUrl('https://models.test/one.gguf', {
+    nCtx: 128,
+    nGpuLayers: 0,
+    useCache: false,
+    forceRemoteFetchBackend: false,
+  });
+  assert.deepEqual(harness.runtime._ownedModelPaths, []);
+  await harness.runtime.loadModelFromUrl('https://models.test/two.gguf', {
+    nCtx: 128,
+    nGpuLayers: 0,
+    useCache: false,
+    forceRemoteFetchBackend: false,
+  });
+  assert.deepEqual(harness.runtime._ownedModelPaths, []);
+  await harness.bridge.dispose();
+  assert.equal(coreAbortReads, 0, 'staging-off cleanup and dispose must not read core.ABORT');
 });
 
 test('staging off cleanup matches main unchanged (retry-unlink, 404/503 unlink, replace/unload)', async () => {

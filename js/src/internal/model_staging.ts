@@ -3,6 +3,7 @@ import type { LlamaCoreModule } from './types.ts';
 
 export const REQUIRED_JS_MODEL_STAGING_EXPORTS = [
   '_llamadart_webgpu_js_model_fs_api_version',
+  '_llamadart_webgpu_js_model_fs_mount_id',
   '_llamadart_webgpu_mount_js_model_fs',
   '_llamadart_webgpu_unmount_js_model_fs',
   '_llamadart_webgpu_js_model_fs_prealloc_next',
@@ -10,6 +11,7 @@ export const REQUIRED_JS_MODEL_STAGING_EXPORTS = [
   '_llamadart_webgpu_js_model_fs_close_direct',
   '_llamadart_webgpu_js_model_fs_consume_oom_bytes',
   '_llamadart_webgpu_js_model_fs_allocated_bytes',
+  '_llamadart_webgpu_js_model_fs_release_mount_chunks',
   'llamadartJsModelFsWriteDirect',
 ] as const;
 
@@ -29,6 +31,7 @@ export function isModelStagingErrorCode(value: unknown): value is ModelStagingEr
   return value === 'MODEL_STAGING_ALLOCATION_FAILED'
     || value === 'MODEL_TENSOR_SIZE_LIMIT_EXCEEDED'
     || value === 'MODEL_STAGING_MOUNT_FAILED'
+    || value === 'MODEL_STAGING_CLEANUP_INCOMPLETE'
     || value === 'MODEL_STAGING_UNSUPPORTED';
 }
 
