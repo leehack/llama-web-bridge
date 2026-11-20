@@ -34,7 +34,7 @@ import {
   unlinkFsFile,
   writeResponseToFsFileWithProgress,
 } from './internal/download.ts';
-import { canPostSharedMemory, describeWebGpuUnavailable, isSafariUserAgent } from './internal/environment.ts';
+import { canPostSharedMemory, describeWebGpuUnavailable, isMemory64Unsupported, isSafariUserAgent } from './internal/environment.ts';
 import { CrossOriginIsolationError, SingleThreadCoreError } from './internal/isolation.ts';
 import { decodeImageBytesToRgb } from './internal/image.ts';
 import {
@@ -2148,8 +2148,11 @@ export class LlamaWebGpuBridgeRuntime {
         this._runtimeNotes.push('core_mem64_attempt');
       }
 
+      let factoryLoaded = false;
+      let initTimeoutError: Error | null = null;
       try {
         const moduleFactory = await candidate.factoryPromise;
+        factoryLoaded = true;
         const initTimeoutMs = this._resolveCoreInitTimeoutMs();
         this._core = await Promise.race([
           moduleFactory({
@@ -2232,7 +2235,8 @@ export class LlamaWebGpuBridgeRuntime {
           }),
           new Promise((_, reject) => {
             globalThis.setTimeout(() => {
-              reject(new Error(`Bridge core init timeout (${initTimeoutMs}ms)`));
+              initTimeoutError = new Error(`Bridge core init timeout (${initTimeoutMs}ms)`);
+              reject(initTimeoutError);
             }, initTimeoutMs);
           }),
         ]) as LlamaCoreModule;
@@ -2248,7 +2252,12 @@ export class LlamaWebGpuBridgeRuntime {
       } catch (error) {
         lastError = error;
         if (candidate.variant === 'wasm64') {
+          const reason = initTimeoutError && error === initTimeoutError
+            ? 'timeout'
+            : factoryLoaded && isMemory64Unsupported() ? 'unsupported' : 'init_error';
           this._runtimeNotes.push('core_mem64_unavailable');
+          this._runtimeNotes.push(`core_mem64_unavailable:${reason}`);
+          this._emitLogger('warn', `Memory64 core unavailable (${reason}). Trying the wasm32 core.`);
           continue;
         }
         throw error;
