@@ -1837,6 +1837,7 @@ function scoredTokensFrom(entries) {
 var pendingModelCacheStores = /* @__PURE__ */ new WeakMap();
 var SAFARI_EMBEDDING_PROBE_MAX_COSINE = 0.999;
 var textEncoder = new TextEncoder();
+var jsStagingMountCounters = /* @__PURE__ */ new WeakMap();
 var LlamaWebGpuBridgeRuntime = class {
   constructor(config = {}) {
     this._config = config;
@@ -1849,7 +1850,6 @@ var LlamaWebGpuBridgeRuntime = class {
     this._ownedModelMount = null;
     this._modelFilesUseJsStaging = false;
     this._jsBackedStagingMounted = false;
-    this._jsStagingMountCounter = 0;
     this._activeJsStagingMounts = /* @__PURE__ */ new Map();
     this._failedUnmountJsStagingMounts = /* @__PURE__ */ new Map();
     this._modelBytes = 0;
@@ -2755,8 +2755,9 @@ var LlamaWebGpuBridgeRuntime = class {
         `JS-backed model staging requires native ABI version >= 3 (got ${apiVersion}). Update the core build or disable jsBackedModelStaging.`
       );
     }
-    this._jsStagingMountCounter += 1;
-    const mountPath = `/jsmodels-${this._jsStagingMountCounter}`;
+    const mountNumber = (jsStagingMountCounters.get(core) ?? 0) + 1;
+    jsStagingMountCounters.set(core, mountNumber);
+    const mountPath = `/jsmodels-${mountNumber}`;
     const mountRc = Number(
       core.ccall("llamadart_webgpu_mount_js_model_fs", "number", ["string"], [mountPath])
     );

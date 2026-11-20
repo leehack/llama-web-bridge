@@ -197,6 +197,8 @@ interface RemoteFetchProbe {
 }
 
 const textEncoder = new TextEncoder();
+// A core can outlive a bridge and retain its staging mounts.
+const jsStagingMountCounters = new WeakMap<LlamaCoreModule, number>();
 
 export class LlamaWebGpuBridgeRuntime {
   declare _config: LlamaWebGpuBridgeConfig;
@@ -209,7 +211,6 @@ export class LlamaWebGpuBridgeRuntime {
   declare _ownedModelMount: { mountPath: string; mountId: number } | null;
   declare _modelFilesUseJsStaging: boolean;
   declare _jsBackedStagingMounted: boolean;
-  declare _jsStagingMountCounter: number;
   declare _activeJsStagingMounts: Map<string, number>;
   declare _failedUnmountJsStagingMounts: Map<string, number>;
   declare _modelBytes: number;
@@ -285,7 +286,6 @@ export class LlamaWebGpuBridgeRuntime {
     this._ownedModelMount = null;
     this._modelFilesUseJsStaging = false;
     this._jsBackedStagingMounted = false;
-    this._jsStagingMountCounter = 0;
     this._activeJsStagingMounts = new Map();
     this._failedUnmountJsStagingMounts = new Map();
     this._modelBytes = 0;
@@ -1435,8 +1435,9 @@ export class LlamaWebGpuBridgeRuntime {
         `JS-backed model staging requires native ABI version >= 3 (got ${apiVersion}). Update the core build or disable jsBackedModelStaging.`,
       );
     }
-    this._jsStagingMountCounter += 1;
-    const mountPath = `/jsmodels-${this._jsStagingMountCounter}`;
+    const mountNumber = (jsStagingMountCounters.get(core) ?? 0) + 1;
+    jsStagingMountCounters.set(core, mountNumber);
+    const mountPath = `/jsmodels-${mountNumber}`;
     const mountRc = Number(
       core.ccall('llamadart_webgpu_mount_js_model_fs', 'number', ['string'], [mountPath]),
     );

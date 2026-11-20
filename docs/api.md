@@ -1302,8 +1302,12 @@ this function themselves.
   serving without cross-origin isolation using `WEBGPU_BRIDGE_PTHREADS=0` +
   `allowSingleThreadCore: true`). It streams fetched model and multimodal
   projector GGUFs directly into 64 MiB JS `Uint8Array` chunks under a private
-  per-operation `/jsmodels-<n>` mount without copying through WASMFS, and
-  unmounts/releases only that mount's chunks after load completes or fails. Known limitation: native memory grows by a few bytes per staging mount for the core's lifetime because Emscripten's WasmFS backend table retains created backends. Its
+  per-operation `/jsmodels-<n>` mount without copying through WASMFS. The path is
+  unique per core instance, including across bridges that share one through
+  `coreModuleFactory`. Each bridge cleans up its own mounts. If a mount or its
+  native registration remains after cleanup, later loads use a fresh path.
+  Native memory grows by a few bytes per staging mount for the core's lifetime
+  because Emscripten's WasmFS backend table retains created backends. Its
   cost is slightly slower native chunk reads on small loads (`Qwen3-0.6B-Q8_0`
   3-run median `nativeLoadMs` `480.9 ms` vs `444.6 ms` off; total load
   `1,317.7 ms` vs `1,660.5 ms` as direct staging skips wasm memory growth) and
