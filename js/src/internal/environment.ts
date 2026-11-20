@@ -10,6 +10,40 @@ export function isSafariUserAgent(userAgent: unknown): boolean {
   return hasSafariToken && !hasOtherBrowserToken;
 }
 
+// Safari 27 is the first version validated for full GPU offload.
+const SAFARI_UNCAPPED_GPU_MIN_MAJOR = 27;
+
+// The legacy detector also matches other WebKit browsers. Require Apple's
+// platform and Safari's product sequence before enabling the new policy.
+const APPLE_SAFARI_PLATFORM = /^Mozilla\/5\.0 \((?:Macintosh; Intel Mac OS X \d+(?:_\d+)*|(?:iPhone|iPad|iPod touch); CPU (?:iPhone )?OS \d+(?:_\d+)* like Mac OS X)\) AppleWebKit\/\d+(?:\.\d+)* \(KHTML, like Gecko\) /;
+const SAFARI_PRODUCTS = /^(?:Version\/(\d+(?:\.\d+)*) )?(?:Mobile\/[A-Za-z0-9]+ )?Safari\/\d+(?:\.\d+)*$/;
+
+function appleSafariProducts(userAgent: unknown): RegExpMatchArray | null {
+  if (typeof userAgent !== 'string') return null;
+  const platform = APPLE_SAFARI_PLATFORM.exec(userAgent);
+  if (!platform) return null;
+  const products = SAFARI_PRODUCTS.exec(userAgent.slice(platform[0].length));
+  // WebKitGTK also uses this fixed version with a Macintosh platform quirk.
+  if (products?.[1] === '60.5' && userAgent.endsWith('Safari/605.1.15')) return null;
+  return products;
+}
+
+export function isAppleSafariUserAgent(userAgent: unknown): boolean {
+  return appleSafariProducts(userAgent) !== null;
+}
+
+export function safariMajorVersion(userAgent: unknown): number | null {
+  const version = appleSafariProducts(userAgent)?.[1];
+  const major = Number(version?.split('.')[0]);
+  return Number.isSafeInteger(major) ? major : null;
+}
+
+// An unknown version keeps the cap of the Safari releases it was added for.
+export function safariDefaultMaxGpuLayers(userAgent: unknown): number {
+  const major = safariMajorVersion(userAgent);
+  return major !== null && major >= SAFARI_UNCAPPED_GPU_MIN_MAJOR ? Infinity : 1;
+}
+
 // A pthread core preallocates workers and posts its shared memory to them.
 // Browsers refuse that post (DataCloneError) unless the page is cross-origin
 // isolated, and core init then never settles. Probing the post itself, rather

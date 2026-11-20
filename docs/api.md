@@ -175,7 +175,7 @@ it.
 | `nBatch` | `number` | llama.cpp batch size override. |
 | `nUbatch` | `number` | llama.cpp micro-batch size override. |
 | `nGpuLayers` | `number` | Default GPU layer count. `0` forces CPU/WASM execution; negative/omitted values let the bridge choose. |
-| `userAgent` | `string` | User-agent override for Safari-specific GPU safeguards. |
+| `userAgent` | `string` | User-agent override for Safari detection and the Safari GPU layer cap's version check. The version check requires an Apple platform and Safari's product tokens. |
 | `remoteFetchThresholdBytes` | `number` | Size threshold for trying the native remote-fetch backend for large single-file models. |
 | `remoteFetchChunkBytes` | `number` | Chunk size used by remote-fetch streaming paths. |
 | `mediaMaxImagePixels` | `number` | Maximum image pixel count before multimodal image downscaling. |
@@ -208,8 +208,9 @@ worker.
 
 #### `LlamaWebGpuBridge.supportsSafariAdaptiveGpu`
 
-`boolean` flag indicating that the bridge applies Safari-specific GPU layer
-capping logic when Safari is detected.
+`boolean` flag indicating that the bridge supports Safari's load-time GPU probe
+and can retry with one GPU layer or on the CPU. Safari versions older than 27
+and unidentified Safari versions default to a one-layer cap.
 
 #### `LlamaWebGpuBridge.supportsCompletionUsage`
 
@@ -284,6 +285,8 @@ Common `options` keys:
 | `nCtx` | Context size. Defaults to the bridge runtime default, initially 4096. |
 | `nThreads`, `nThreadsBatch` | Per-load thread overrides, capped to the active runtime. |
 | `nGpuLayers` | Per-load GPU layer override. Use `0` for CPU/WASM mode. |
+| `safariMaxGpuLayers` | Per-load Safari GPU layer cap. Recognized Safari 27 and newer default to no cap. Older or unidentified Safari versions default to one layer. |
+| `safariGpuProbe` | Set to `false` to skip the Safari load-time GPU probe. |
 | `nBatch`, `nUbatch` | Per-load batch and micro-batch overrides. |
 | `useCache`, `force` | Cache Storage controls for model responses. A cache miss writes the model to Cache Storage while it downloads, so progress follows the download; a failed cache write leaves the model loaded but uncached, and a cancelled load stores nothing. |
 | `streamResumeRetries` | Maximum retry count per shard for resuming or restarting a streamed model download. |
@@ -291,6 +294,16 @@ Common `options` keys:
 | `forceRemoteFetchBackend` | Force the native fetch backend for a single-file model in a worker. On a single-thread worker, the load rejects with `SingleThreadCoreError` (`code: 'SINGLE_THREAD_CORE_UNSUPPORTED'`, `feature: 'remote_fetch_backend'`). Page-thread loads use streamed staging. |
 | `loadMtp` | Loads the model's MTP layers, which `draft-mtp` speculative decoding needs. Defaults to `false`. |
 | `speculativeRollbackTokenMax` | llama.cpp's `n_rs_seq`: rollback snapshots per sequence. A model with recurrent state, such as Qwen3.5, needs at least the draft length for `draft-*` speculative decoding. Defaults to `0`. |
+
+The default Safari cap uses the major version from a standalone numeric
+`Version/` product in the Apple Safari user agent. Safari-like user agents
+that match the legacy detector continue to use its one-layer default cap and
+completion probe. For a pooled-embedding model on recognized Apple Safari,
+the probe runs two distinct prompts and requires finite normalized embeddings
+whose L2 norms differ from 1 by less than 0.01 and whose cosine similarity is
+below 0.999. Text models and older cores without embedding capabilities use
+the completion probe. If the probe fails, the bridge retries at one GPU layer
+when possible, then on the CPU.
 
 Returns the underlying load result from the active runtime. After a successful
 load, metadata and capability helpers reflect the loaded model.
@@ -1180,7 +1193,7 @@ include:
 | `llamadart.webgpu.core_variant` | `wasm32`, `wasm64`, or initialization state. |
 | `llamadart.webgpu.model_source` | Model load source, such as network/cache/remote fetch. |
 | `llamadart.webgpu.model_cache_state` | Cache Storage state for the loaded model. |
-| `llamadart.webgpu.runtime_notes` | Semicolon-separated bridge notes. When a memory64 core attempt fails, `core_mem64_unavailable:<reason>` accompanies `core_mem64_unavailable` and the bridge logs a warning with the same code before trying wasm32. The codes are `unsupported` (the engine rejects a memory64 feature probe after the core factory fails), `timeout` (the bridge's core initialization timer expires), and `init_error` (other failures, including module import). Single-thread cores report `core_single_thread` and `core_pthreads:0`. Automatic fetch-backed loading on a single-thread worker reports `model_fetch_backend_requires_pthreads` and streams into staging. `model_staging_js_backed` identifies JS-backed staging. Model downloads report `model_stream_resume_validated` for verified resumes, `model_stream_resume_unvalidated` for resumes without sufficient validation, and `model_stream_restart:<reason>` when a response requires restarting at zero. `gpu_unavailable:<reason>` (`no_webgpu`, `no_adapter`, `adapter_missing_shader_f16`, `unknown`) says why a load with `nGpuLayers > 0` runs on the CPU. The bridge also logs one warning. Chrome hides `shader-f16` on NVIDIA drivers older than 615.71, and ggml-webgpu then registers no device. |
+| `llamadart.webgpu.runtime_notes` | Semicolon-separated bridge notes. When a memory64 core attempt fails, `core_mem64_unavailable:<reason>` accompanies `core_mem64_unavailable` and the bridge logs a warning with the same code before trying wasm32. The codes are `unsupported` (the engine rejects a memory64 feature probe after the core factory fails), `timeout` (the bridge's core initialization timer expires), and `init_error` (other failures, including module import). Single-thread cores report `core_single_thread` and `core_pthreads:0`. Automatic fetch-backed loading on a single-thread worker reports `model_fetch_backend_requires_pthreads` and streams into staging. `model_staging_js_backed` identifies JS-backed staging. Model downloads report `model_stream_resume_validated` for verified resumes, `model_stream_resume_unvalidated` for resumes without sufficient validation, and `model_stream_restart:<reason>` when a response requires restarting at zero. `gpu_unavailable:<reason>` (`no_webgpu`, `no_adapter`, `adapter_missing_shader_f16`, `unknown`) says why a load with `nGpuLayers > 0` runs on the CPU. The bridge also logs one warning. Chrome hides `shader-f16` on NVIDIA drivers older than 615.71, and ggml-webgpu then registers no device. Safari reports `safari_gpu_layers_capped:<n>` when the cap lowers the requested count, `safari_gpu_probe_embedding` when probing with embeddings, `safari_gpu_probe_passed` or `safari_gpu_probe_failed` for the initial probe, and `safari_fallback_cpu` when a retry loads on the CPU. |
 | `llamadart.webgpu.mmproj_loaded` | `1` when a projector is loaded. |
 | `llamadart.webgpu.supports_vision` | `1` when the active projector supports vision. |
 | `llamadart.webgpu.supports_audio` | `1` when the active projector supports audio. |
