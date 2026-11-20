@@ -100,9 +100,9 @@ without copying through WASMFS, unmounts/releases only that mount's chunks after
 failure (without adopting existing mounts), and turns staging allocation, mount collision, version-skew, or 4 GiB
 tensor-limit failures into typed `ModelStagingError` errors.
 
-Each core instance assigns fresh staging paths across all bridges that share it
-through `coreModuleFactory`. A leftover staging mount or native registration
-from an earlier bridge cannot block a later bridge by reusing its path.
+Bridges from the same bundle that share a core through `coreModuleFactory`
+use a shared sequence of staging paths. Later loads skip occupied paths and
+avoid reusing paths left behind by an earlier bridge.
 
 Tradeoffs: small models see slightly slower native reads from JS chunks
 (`Qwen3-0.6B-Q8_0` 767 MiB 3-run median native load `480.9 ms` vs `444.6 ms`

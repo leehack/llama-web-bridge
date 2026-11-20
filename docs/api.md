@@ -1304,8 +1304,10 @@ this function themselves.
   projector GGUFs directly into 64 MiB JS `Uint8Array` chunks under a private
   per-operation `/jsmodels-<n>` mount without copying through WASMFS. The path is
   unique per core instance, including across bridges that share one through
-  `coreModuleFactory`. Each bridge cleans up its own mounts. If a mount or its
-  native registration remains after cleanup, later loads use a fresh path.
+  `coreModuleFactory` from the same bridge bundle. Later loads use a fresh path
+  even when a mount or its native registration remains after cleanup. The
+  allocator skips existing filesystem entries and reports `MODEL_STAGING_MOUNT_FAILED`
+  if all 64 candidate paths are occupied. Each bridge cleans up its own mounts.
   Native memory grows by a few bytes per staging mount for the core's lifetime
   because Emscripten's WasmFS backend table retains created backends. Its
   cost is slightly slower native chunk reads on small loads (`Qwen3-0.6B-Q8_0`

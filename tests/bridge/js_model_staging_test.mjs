@@ -779,6 +779,28 @@ test('jsBackedModelStaging fails cleanly with MODEL_STAGING_MOUNT_FAILED on stag
   assert.equal(harness.fs.unmountedPaths.length, 0, 'must not unmount pre-existing non-JS-backed directory');
 });
 
+test('jsBackedModelStaging bounds the search for a free staging path', async () => {
+  const harness = createStagingHarness();
+  const occupied = Array.from({ length: 64 }, (_, index) => `jsmodels-${index + 1}`);
+  harness.fs.readdir = (dir) => {
+    assert.equal(dir, '/');
+    return ['.', '..', ...occupied];
+  };
+
+  await assert.rejects(harness.runtime.loadModelFromUrl('https://models.test/small.gguf', {
+    nCtx: 128,
+    nGpuLayers: 0,
+    useCache: false,
+    forceRemoteFetchBackend: false,
+  }), {
+    name: 'ModelStagingError',
+    code: 'MODEL_STAGING_MOUNT_FAILED',
+    message: /next 64 candidates/,
+  });
+  assert.ok(!harness.ccalls.some(([name]) => name === 'llamadart_webgpu_mount_js_model_fs'));
+  assert.deepEqual(harness.fs.unmountedPaths, []);
+});
+
 test('direct JS-backed staging avoids slice clones and FS.write round-trips while keeping progress and length checks', async () => {
   const chunkA = new Uint8Array([10, 20, 30, 40]);
   const chunkB = new Uint8Array([50, 60, 70, 80, 90, 100]);

@@ -1838,6 +1838,7 @@ var pendingModelCacheStores = /* @__PURE__ */ new WeakMap();
 var SAFARI_EMBEDDING_PROBE_MAX_COSINE = 0.999;
 var textEncoder = new TextEncoder();
 var jsStagingMountCounters = /* @__PURE__ */ new WeakMap();
+var MAX_JS_STAGING_PATH_PROBES = 64;
 var LlamaWebGpuBridgeRuntime = class {
   constructor(config = {}) {
     this._config = config;
@@ -2755,9 +2756,7 @@ var LlamaWebGpuBridgeRuntime = class {
         `JS-backed model staging requires native ABI version >= 3 (got ${apiVersion}). Update the core build or disable jsBackedModelStaging.`
       );
     }
-    const mountNumber = (jsStagingMountCounters.get(core) ?? 0) + 1;
-    jsStagingMountCounters.set(core, mountNumber);
-    const mountPath = `/jsmodels-${mountNumber}`;
+    const mountPath = this._reserveJsStagingMountPath(core);
     const mountRc = Number(
       core.ccall("llamadart_webgpu_mount_js_model_fs", "number", ["string"], [mountPath])
     );
@@ -2787,6 +2786,33 @@ var LlamaWebGpuBridgeRuntime = class {
     this._jsBackedStagingMounted = true;
     this._pushRuntimeNote(noteTag);
     return mountPath;
+  }
+  _reserveJsStagingMountPath(core) {
+    let entries;
+    try {
+      entries = core.FS.readdir("/");
+      if (!Array.isArray(entries)) throw new Error("invalid root directory listing");
+    } catch (error) {
+      this._pushRuntimeNote("model_staging_mount_failed");
+      throw new ModelStagingError(
+        "MODEL_STAGING_MOUNT_FAILED",
+        `Failed to inspect JS-backed model staging paths (${String(error)}).`
+      );
+    }
+    const occupied = new Set(entries);
+    const previousMountNumber = jsStagingMountCounters.get(core) ?? 0;
+    for (let offset = 1; offset <= MAX_JS_STAGING_PATH_PROBES; offset += 1) {
+      const mountNumber = previousMountNumber + offset;
+      const name = `jsmodels-${mountNumber}`;
+      if (occupied.has(name)) continue;
+      jsStagingMountCounters.set(core, mountNumber);
+      return `/${name}`;
+    }
+    this._pushRuntimeNote("model_staging_mount_failed");
+    throw new ModelStagingError(
+      "MODEL_STAGING_MOUNT_FAILED",
+      `No free JS-backed model staging path among the next ${MAX_JS_STAGING_PATH_PROBES} candidates.`
+    );
   }
   _isJsStagingMountOwned(core, mountPath, expectedMountId) {
     if (!core || !mountPath || !expectedMountId || expectedMountId <= 0) {

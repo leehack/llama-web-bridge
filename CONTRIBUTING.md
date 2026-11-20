@@ -181,7 +181,8 @@ and that auto mode stages the model. CI and candidate qualification require both
 
 The shared-core staging regression uses the same pinned model and cache. Run it
 against a dist with all four cores to verify that a new bridge can load after
-an earlier bridge leaves a busy staging mount or a stale registration.
+an earlier bridge leaves a busy staging mount or a stale registration, or when
+the application occupies the next staging path.
 
 ```bash
 BRIDGE_DIST_DIR="$OUT_DIR" \

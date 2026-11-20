@@ -12,7 +12,7 @@ import {
   withTempDir,
 } from '../../scripts/smoke/support.mjs';
 
-async function loadOnSharedCore({ coreName, isolated, replaceMount }) {
+async function loadOnSharedCore({ coreName, isolated, scenario }) {
   const check = (condition, message) => {
     if (!condition) throw new Error(message);
   };
@@ -30,13 +30,18 @@ async function loadOnSharedCore({ coreName, isolated, replaceMount }) {
   const modelPath = '/tiny.gguf';
   const mountPath = '/jsmodels-1';
   const markerPath = `${mountPath}/replacement.bin`;
+  const appPath = '/jsmodels-2';
+  const appFile = `${appPath}/application.bin`;
+  const replaceMount = scenario === 'replaced';
+  const leaveBusy = scenario === 'busy';
+  const appOwned = !replaceMount && !leaveBusy;
   const { FS } = core;
   const ccall = core.ccall.bind(core);
-  const mountId = () => ccall('llamadart_webgpu_js_model_fs_mount_id', 'number', ['string'], [mountPath]);
+  const mountId = (path = mountPath) => ccall('llamadart_webgpu_js_model_fs_mount_id', 'number', ['string'], [path]);
   const allocatedBytes = () => ccall('llamadart_webgpu_js_model_fs_allocated_bytes', 'number', [], []);
   const mountPaths = [];
   const unmountPaths = [];
-  let busy = !replaceMount;
+  let busy = leaveBusy;
   // An intact WasmFS mount needs fault injection to return EBUSY.
   core.ccall = (name, returnType, argTypes, args, options) => {
     if (name === 'llamadart_webgpu_mount_js_model_fs') {
@@ -72,12 +77,12 @@ async function loadOnSharedCore({ coreName, isolated, replaceMount }) {
   try {
     check(await load(first) === 1, 'first bridge did not load the model');
     check(mountPaths[0] === mountPath, `new core started at ${mountPaths[0]}`);
-    if (!replaceMount) {
+    if (leaveBusy) {
       originalId = mountId();
       check(unmountPaths.length === 2 && unmountPaths.every((entry) => entry === mountPath),
         'first bridge did not hit the injected busy condition twice');
     }
-    check(originalId > 0, 'first bridge did not stage on a native mount');
+    if (!appOwned) check(originalId > 0, 'first bridge did not stage on a native mount');
   } finally {
     FS.unlink = unlink;
     await first.dispose();
@@ -89,31 +94,49 @@ async function loadOnSharedCore({ coreName, isolated, replaceMount }) {
     unlink(markerPath);
     FS.rmdir(mountPath);
     check(mountId() === 0 && !FS.readdir('/').includes('jsmodels-1'), 'replacement path still exists');
-  } else {
+  } else if (leaveBusy) {
     busy = false;
     check(mountId() === originalId, 'the busy mount did not survive disposal');
+  } else {
+    check(mountId() === 0 && !FS.readdir('/').includes('jsmodels-1'), 'first staging path was not removed');
+    if (scenario === 'application mount') {
+      check(ccall('llamadart_webgpu_mount_js_model_fs', 'number', ['string'], [appPath]) === 0,
+        'failed to create the application mount');
+    } else {
+      FS.mkdir(appPath);
+    }
+    FS.writeFile(appFile, new Uint8Array([12, 34, 56, 78]));
   }
 
+  const appSnapshot = () => appOwned ? {
+    id: mountId(appPath),
+    bytes: [...FS.readFile(appFile)],
+    allocated: allocatedBytes(),
+  } : null;
+  const appBefore = appSnapshot();
   const previousUnmounts = unmountPaths.length;
   const second = makeBridge();
+  let tokens;
   try {
     check(await load(second) === 1, 'second bridge did not load the model');
-    const tokens = await second.tokenize('hello');
-    return {
-      mountPaths,
-      tokens,
-      unmountPaths: unmountPaths.slice(previousUnmounts),
-      remainingPaths: FS.readdir('/').filter((entry) => entry.startsWith('jsmodels-')),
-      remainingId: mountId(),
-      originalId,
-      allocatedBytes: allocatedBytes(),
-    };
+    tokens = await second.tokenize('hello');
   } finally {
     await second.dispose();
   }
+  return {
+    mountPaths,
+    tokens,
+    unmountPaths: unmountPaths.slice(previousUnmounts),
+    remainingPaths: FS.readdir('/').filter((entry) => entry.startsWith('jsmodels-')),
+    remainingId: mountId(),
+    originalId,
+    allocatedBytes: allocatedBytes(),
+    appBefore,
+    appAfter: appSnapshot(),
+  };
 }
 
-test('shared-core staging survives leftover mount paths', {
+test('shared-core staging survives leftover and application-owned mount paths', {
   skip: process.env.LLAMADART_BROWSER_STAGING_MOUNT_SMOKE !== '1',
   timeout: 120_000,
 }, async (t) => {
@@ -152,15 +175,27 @@ test('shared-core staging survives leftover mount paths', {
           const page = await browser.newPage();
           try {
             await page.goto(url);
-            for (const [issue, replaceMount] of [[236, false], [230, true]]) {
-              await t.test(`#${issue} on ${coreName}`, async () => {
-                const result = await page.evaluate(loadOnSharedCore, { coreName, isolated, replaceMount });
-                assert.deepEqual(result.mountPaths, ['/jsmodels-1', '/jsmodels-2']);
+            const scenarios = [
+              ['#236', 'busy', '/jsmodels-2', ['jsmodels-1']],
+              ['#230', 'replaced', '/jsmodels-2', []],
+              ['application directory', 'application directory', '/jsmodels-3', ['jsmodels-2']],
+              ['application mount', 'application mount', '/jsmodels-3', ['jsmodels-2']],
+            ];
+            for (const [label, scenario, nextPath, remainingPaths] of scenarios) {
+              await t.test(`${label} on ${coreName}`, async () => {
+                const result = await page.evaluate(loadOnSharedCore, { coreName, isolated, scenario });
+                assert.deepEqual(result.mountPaths, ['/jsmodels-1', nextPath]);
                 assert.ok(result.tokens.length > 0);
-                assert.deepEqual(result.unmountPaths, ['/jsmodels-2']);
-                assert.deepEqual(result.remainingPaths, replaceMount ? [] : ['jsmodels-1']);
-                assert.equal(result.remainingId, replaceMount ? 0 : result.originalId);
-                assert.equal(result.allocatedBytes, 0);
+                assert.deepEqual(result.unmountPaths, [nextPath]);
+                assert.deepEqual(result.remainingPaths, remainingPaths);
+                assert.equal(result.remainingId, scenario === 'busy' ? result.originalId : 0);
+                if (result.appBefore) {
+                  assert.deepEqual(result.appBefore.bytes, [12, 34, 56, 78]);
+                  assert.equal(result.appBefore.id > 0, scenario === 'application mount');
+                  assert.equal(result.appBefore.allocated > 0, scenario === 'application mount');
+                }
+                assert.deepEqual(result.appAfter, result.appBefore);
+                assert.equal(result.allocatedBytes, result.appBefore?.allocated ?? 0);
               });
             }
           } finally {
