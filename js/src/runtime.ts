@@ -53,7 +53,7 @@ import {
   isSafariUserAgent,
   safariDefaultMaxGpuLayers,
 } from './internal/environment.ts';
-import { guardCore, isCoreRetired, retireCore, unguardedCore } from './internal/core_guard.ts';
+import { guardCore, isCoreRetired, releaseCore, retireCore, unguardedCore } from './internal/core_guard.ts';
 import { CrossOriginIsolationError, SingleThreadCoreError } from './internal/isolation.ts';
 import { BlobWorkerBlockedError, PTHREAD_WORKER_HOOK, createPthreadWorkerStart } from './internal/worker_start.ts';
 import type { PthreadWorkerStart, WorkerStartMode } from './internal/worker_start.ts';
@@ -228,6 +228,7 @@ const WASMFS_ENOENT = 44;
 export class LlamaWebGpuBridgeRuntime {
   declare _config: LlamaWebGpuBridgeConfig;
   declare _core: LlamaCoreModule | null;
+  declare _ownsCore: boolean;
   declare _backendLabels: string[];
   declare _gpuActive: boolean;
   declare _modelPath: string | null;
@@ -313,6 +314,7 @@ export class LlamaWebGpuBridgeRuntime {
   constructor(config: LlamaWebGpuBridgeConfig = {}) {
     this._config = config;
     this._core = null;
+    this._ownsCore = false;
     this._backendLabels = [];
     this._gpuActive = false;
     this._modelPath = null;
@@ -2453,6 +2455,7 @@ export class LlamaWebGpuBridgeRuntime {
         ]) as LlamaCoreModule, (cause, stats) => this._handleCoreRetired(cause, stats));
         if (pthreadStart?.mode() === 'blob') pthreadStart.checkNotAbandoned();
         this._core = candidateCore;
+        this._ownsCore = candidate.variant !== 'custom';
         this._pthreadStart = pthreadStart?.mode() ?? 'direct';
 
         this._coreVariant = candidate.variant === 'wasm64' ? 'wasm64' : 'wasm32';
@@ -5618,24 +5621,41 @@ export class LlamaWebGpuBridgeRuntime {
       this._activeTransferAbortController = null;
     }
 
-    if (this._core) {
-      for (const mountId of this._activeJsStagingMounts.values()) {
-        this._releaseJsStagingMountChunks(this._core, mountId);
-      }
-      this._clearPendingMedia();
-      const mmprojPath = this._mmProjPath;
-      const mmprojFreeRc = Number(
-        this._core.ccall('llamadart_webgpu_mmproj_free', 'number', [], []),
-      );
-      if (mmprojFreeRc !== 0) {
-        this._emitLogger(
-          'warn',
-          this._coreErrorMessage('Failed to unload multimodal projector during dispose', mmprojFreeRc),
+    const core = this._core;
+    if (core) {
+      let cleanupFailed = false;
+      try {
+        for (const mountId of this._activeJsStagingMounts.values()) {
+          this._releaseJsStagingMountChunks(core, mountId);
+        }
+        this._clearPendingMedia();
+        const mmprojPath = this._mmProjPath;
+        const mmprojFreeRc = Number(
+          core.ccall('llamadart_webgpu_mmproj_free', 'number', [], []),
         );
-      }
-      await this._core.ccall('llamadart_webgpu_shutdown', null, [], [], { async: true });
-      if (!this._mmProjUsesJsStaging) {
-        this._deleteFsFile(mmprojPath);
+        if (mmprojFreeRc !== 0) {
+          this._emitLogger(
+            'warn',
+            this._coreErrorMessage('Failed to unload multimodal projector during dispose', mmprojFreeRc),
+          );
+        }
+        await core.ccall('llamadart_webgpu_shutdown', null, [], [], { async: true });
+        if (!this._mmProjUsesJsStaging) {
+          this._deleteFsFile(mmprojPath);
+        }
+      } catch (error) {
+        cleanupFailed = true;
+        throw error;
+      } finally {
+        // A coreModuleFactory core belongs to the application and may serve another bridge.
+        if (this._ownsCore) {
+          this._core = null;
+          try {
+            releaseCore(core);
+          } catch (error) {
+            if (!cleanupFailed) throw error;
+          }
+        }
       }
     }
     this._modelPath = null;

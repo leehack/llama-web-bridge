@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- End a threaded core's pthread runtime when a direct-mode bridge is disposed or its core retires, so Chromium can collect the core and its memory. A core supplied through `coreModuleFactory` keeps running after `dispose()`. (#262)
+
 - Cache WebKit model downloads and prefetches in 16 MiB parts. Cache hits read one part at a time. If a cached part is missing or damaged, `loadModelFromUrl()` can retry from the network. `loadDraftModel()` rejects that call with an error named `ModelCacheEntryError` in direct mode. The bridge drops the damaged entry for the next call when it can acquire the cache lock. (#257)
 
 - Start cross-origin core pthreads through module blob workers. Report blocked pthread starts as `BlobWorkerBlockedError` and record worker startup routes in the runtime notes. (#223)

@@ -838,6 +838,11 @@ function unguardedCore(core) {
 function isCoreRetired(core) {
   return !!core && typeof core === "object" && guardStates.get(core)?.retired === true;
 }
+function releaseCore(core) {
+  if (core && typeof core === "object") {
+    guardStates.get(core)?.release();
+  }
+}
 function retireCore(core, reason) {
   if (core && typeof core === "object") {
     guardStates.get(core)?.retire(new Error(`Aborted(${String(reason ?? "")})`), false);
@@ -847,6 +852,7 @@ function guardCore(rawModule, onRetired) {
   const wrappers = /* @__PURE__ */ new WeakMap();
   const coreRuntimeError = rawModule.llamadartWasmRuntimeError;
   const isTrap = (error) => isWasmRuntimeError(error, coreRuntimeError);
+  const runRetireHook = () => rawModule.llamadartRetire?.();
   const state = {
     retired: false,
     cause: null,
@@ -861,10 +867,18 @@ function guardCore(rawModule, onRetired) {
       state.cause = cause;
       let stats;
       try {
-        stats = rawModule.llamadartRetire?.();
+        stats = runRetireHook();
       } catch (_) {
       }
       onRetired(cause, stats);
+    },
+    release() {
+      if (state.retired) {
+        return;
+      }
+      state.retired = true;
+      state.cause = new Error("The bridge core was disposed");
+      runRetireHook();
     }
   };
   const observe = (error) => {
@@ -2615,6 +2629,7 @@ var LlamaWebGpuBridgeRuntime = class {
   constructor(config = {}) {
     this._config = config;
     this._core = null;
+    this._ownsCore = false;
     this._backendLabels = [];
     this._gpuActive = false;
     this._modelPath = null;
@@ -4351,6 +4366,7 @@ var LlamaWebGpuBridgeRuntime = class {
         ]), (cause, stats) => this._handleCoreRetired(cause, stats));
         if (pthreadStart?.mode() === "blob") pthreadStart.checkNotAbandoned();
         this._core = candidateCore;
+        this._ownsCore = candidate.variant !== "custom";
         this._pthreadStart = pthreadStart?.mode() ?? "direct";
         this._coreVariant = candidate.variant === "wasm64" ? "wasm64" : "wasm32";
         this._memory64FallbackReason = memory64FallbackReason;
@@ -7057,24 +7073,40 @@ var LlamaWebGpuBridgeRuntime = class {
       }
       this._activeTransferAbortController = null;
     }
-    if (this._core) {
-      for (const mountId of this._activeJsStagingMounts.values()) {
-        this._releaseJsStagingMountChunks(this._core, mountId);
-      }
-      this._clearPendingMedia();
-      const mmprojPath = this._mmProjPath;
-      const mmprojFreeRc = Number(
-        this._core.ccall("llamadart_webgpu_mmproj_free", "number", [], [])
-      );
-      if (mmprojFreeRc !== 0) {
-        this._emitLogger(
-          "warn",
-          this._coreErrorMessage("Failed to unload multimodal projector during dispose", mmprojFreeRc)
+    const core = this._core;
+    if (core) {
+      let cleanupFailed = false;
+      try {
+        for (const mountId of this._activeJsStagingMounts.values()) {
+          this._releaseJsStagingMountChunks(core, mountId);
+        }
+        this._clearPendingMedia();
+        const mmprojPath = this._mmProjPath;
+        const mmprojFreeRc = Number(
+          core.ccall("llamadart_webgpu_mmproj_free", "number", [], [])
         );
-      }
-      await this._core.ccall("llamadart_webgpu_shutdown", null, [], [], { async: true });
-      if (!this._mmProjUsesJsStaging) {
-        this._deleteFsFile(mmprojPath);
+        if (mmprojFreeRc !== 0) {
+          this._emitLogger(
+            "warn",
+            this._coreErrorMessage("Failed to unload multimodal projector during dispose", mmprojFreeRc)
+          );
+        }
+        await core.ccall("llamadart_webgpu_shutdown", null, [], [], { async: true });
+        if (!this._mmProjUsesJsStaging) {
+          this._deleteFsFile(mmprojPath);
+        }
+      } catch (error) {
+        cleanupFailed = true;
+        throw error;
+      } finally {
+        if (this._ownsCore) {
+          this._core = null;
+          try {
+            releaseCore(core);
+          } catch (error) {
+            if (!cleanupFailed) throw error;
+          }
+        }
       }
     }
     this._modelPath = null;

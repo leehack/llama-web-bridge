@@ -214,6 +214,16 @@ The baseline flag enables direct and worker comparisons for the
 control cases. CI passes the built dist as its own baseline. To compare two
 revisions locally, pass a separately built dist as the baseline.
 
+For core disposal or retirement changes, use the same state-smoke model URL,
+SHA-256, and cache directory to check that Chromium can collect the old core
+after disposal or a native abort:
+
+```bash
+node scripts/smoke/core_release.mjs --dist-dir "$OUT_DIR"
+```
+
+Repeat with `--memory-mode wasm64`, `--threading single`, and both flags together.
+
 The shared-core staging regression uses the same pinned model and cache. Run it
 against a dist with all four cores to verify that a new bridge can load after
 an earlier bridge leaves a busy staging mount, when the application occupies
