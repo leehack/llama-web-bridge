@@ -110,9 +110,8 @@ Split models, full offload (the default or a negative
 `nGpuLayers`), more than one effective GPU layer, older or fixed-memory cores, and
 `useMmap: false` use JS chunks. On iOS Safari below 27, pass an explicit
 `nGpuLayers`. Setting it to 0 raises the model-size ceiling by keeping model
-weights on the CPU. On iOS and iPadOS Safari, pass `useCache: false` when
-loading models larger than about 400 MB. WebKit can exceed its WebContent
-memory limit while writing the download to Cache Storage. See the
+weights on the CPU. WebKit writes and reads cached models in 16 MiB parts to
+limit the memory Cache Storage uses during the load. See the
 [iOS measurements](docs/single_thread.md#ios-safari).
 
 Bridges from the same bundle that share a core through `coreModuleFactory`

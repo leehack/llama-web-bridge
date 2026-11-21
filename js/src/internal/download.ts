@@ -26,6 +26,7 @@ export type ProgressCallback = (event: BridgeProgressEvent) => void;
 
 export interface DrainOptions {
   chunkTimeoutMs?: unknown;
+  releaseConsumedChunks?: boolean;
 }
 
 export interface DirectFileChunkWriter {
@@ -376,6 +377,7 @@ export async function drainResponseWithProgress(
       }
 
       loaded += value.length;
+      if (options.releaseConsumedChunks === true) releaseChunkBuffer(value);
       if (typeof progressCallback === 'function') {
         const effectiveTotal = total || loaded;
         const bucket = effectiveTotal > 0
@@ -550,12 +552,15 @@ export function teeResponseForCache(
 const MODEL_CACHE_RECORD_HEADER = 'x-llamadart-cache-record';
 const MODEL_CACHE_SIZE_HEADER = 'x-llamadart-decoded-size';
 
-async function modelCacheMetadataUrl(cacheKey: string): Promise<string> {
+async function modelCacheKeyDigest(cacheKey: string): Promise<string> {
   const key = new URL(cacheKey);
   key.hash = '';
   const hash = await globalThis.crypto.subtle.digest('SHA-256', new TextEncoder().encode(key.href));
-  const digest = Array.from(new Uint8Array(hash), (byte) => byte.toString(16).padStart(2, '0')).join('');
-  return 'https://llamadart-cache.invalid/decoded-size/' + digest;
+  return Array.from(new Uint8Array(hash), (byte) => byte.toString(16).padStart(2, '0')).join('');
+}
+
+async function modelCacheMetadataUrl(cacheKey: string): Promise<string> {
+  return 'https://llamadart-cache.invalid/decoded-size/' + await modelCacheKeyDigest(cacheKey);
 }
 
 function modelCacheRecord(response: Response | undefined): string | null {
@@ -612,6 +617,384 @@ export function startModelCacheStore(cache: Cache, cacheKey: string, response: R
     throw error;
   });
   return { tee, stored };
+}
+
+// WebKit holds a whole Cache Storage body in the page's process, several times
+// over while it commits and again when it is matched. A model is stored there
+// as fixed-size part entries under a manifest that is written last, so only
+// one part is in memory at a time and an interrupted store is never a hit.
+export const MODEL_CACHE_PART_BYTES = 16 * 1024 * 1024;
+const MODEL_CACHE_PART_COUNT_HEADER = 'x-llamadart-part-count';
+const MODEL_CACHE_PART_SIZE_HEADER = 'x-llamadart-part-size';
+const MODEL_CACHE_INTERNAL_HEADERS = [
+  MODEL_CACHE_RECORD_HEADER,
+  MODEL_CACHE_SIZE_HEADER,
+  MODEL_CACHE_PART_COUNT_HEADER,
+  MODEL_CACHE_PART_SIZE_HEADER,
+];
+
+const modelCacheManifestUrl = (digest: string) => 'https://llamadart-cache.invalid/model-parts/' + digest;
+const modelCachePartsUrl = (digest: string) => 'https://llamadart-cache.invalid/model-part/' + digest;
+const modelCachePartUrl = (digest: string, record: string, index: number) =>
+  modelCachePartsUrl(digest) + '?record=' + record + '&part=' + index;
+
+export class ModelCacheEntryError extends Error {
+  declare readonly retryWithoutCache: boolean;
+
+  constructor(message: string, retryWithoutCache: boolean) {
+    super(message);
+    this.name = 'ModelCacheEntryError';
+    this.retryWithoutCache = retryWithoutCache;
+  }
+}
+
+interface ModelCacheManifest {
+  record: string;
+  decodedBytes: number;
+  partCount: number;
+  partBytes: number;
+  headers: Headers;
+}
+
+async function readModelCacheManifest(cache: Cache, digest: string): Promise<ModelCacheManifest | null> {
+  const manifest = await cache.match(modelCacheManifestUrl(digest));
+  const record = modelCacheRecord(manifest);
+  if (!manifest || !record) return null;
+  const decodedBytes = parseByteLength(manifest.headers.get(MODEL_CACHE_SIZE_HEADER));
+  const partCount = parseByteLength(manifest.headers.get(MODEL_CACHE_PART_COUNT_HEADER));
+  const partBytes = parseByteLength(manifest.headers.get(MODEL_CACHE_PART_SIZE_HEADER));
+  if (!decodedBytes || !partCount || !partBytes || partCount !== Math.ceil(decodedBytes / partBytes)) {
+    return null;
+  }
+  return { record, decodedBytes, partCount, partBytes, headers: manifest.headers };
+}
+
+async function deleteModelCachePartEntries(
+  cache: Cache,
+  digest: string,
+  shouldDelete: (record: string | null) => boolean,
+): Promise<void> {
+  const entries = await cache.keys(modelCachePartsUrl(digest), { ignoreSearch: true });
+  const stale = entries.filter((entry) => shouldDelete(new URL(entry.url).searchParams.get('record')));
+  await Promise.all(stale.map((entry) => cache.delete(entry)));
+}
+
+// null means a writer holds the lock and the caller should skip eviction.
+export async function deleteModelCacheParts(cache: Cache, cacheKey: string, lockScope: string): Promise<boolean | null> {
+  if (!getModelCacheLocks()) return false;
+  const digest = await modelCacheKeyDigest(cacheKey);
+  let removed: boolean | null = null;
+  await withModelCacheLock(lockScope, digest, async (lock) => {
+    if (!lock) return;
+    removed = await cache.delete(modelCacheManifestUrl(digest));
+    await deleteModelCachePartEntries(cache, digest, () => true);
+  });
+  return removed;
+}
+
+export interface CachedModelParts {
+  response: Response;
+  decodedBytes: number;
+}
+
+// The part-stored model for a key as one response, or null when there is none.
+// A part that is missing or has the wrong length drops the entry and errors
+// the body with a ModelCacheEntryError.
+export async function openModelCacheParts(
+  cache: Cache,
+  cacheKey: string,
+  lockScope: string,
+): Promise<CachedModelParts | null> {
+  const digest = await modelCacheKeyDigest(cacheKey);
+  const manifest = await readModelCacheManifest(cache, digest);
+  if (!manifest) return null;
+  const { record, decodedBytes, partCount, partBytes } = manifest;
+  let index = 0;
+  const body = new ReadableStream<Uint8Array>(
+    {
+      async pull(controller) {
+        if (index === partCount) {
+          controller.close();
+          return;
+        }
+        const expected = index === partCount - 1 ? decodedBytes - partBytes * index : partBytes;
+        let bytes: Uint8Array | null = null;
+        try {
+          const part = await cache.match(modelCachePartUrl(digest, record, index));
+          // A stream would keep each part alive on WebKit after it is read.
+          bytes = part ? new Uint8Array(await part.arrayBuffer()) : null;
+        } catch (_) {
+          bytes = null;
+        }
+        if (!bytes || bytes.byteLength !== expected) {
+          let retryWithoutCache = true;
+          try {
+            await withModelCacheLock(lockScope, digest, async (lock) => {
+              if (!lock) return;
+              if ((await readModelCacheManifest(cache, digest))?.record === record) {
+                await cache.delete(modelCacheManifestUrl(digest));
+                await deleteModelCachePartEntries(cache, digest, (partRecord) => partRecord === record);
+              }
+              retryWithoutCache = false;
+            });
+          } catch (_) {
+            // An uncached retry can proceed even if the damaged entry could not be removed.
+          }
+          controller.error(new ModelCacheEntryError(
+            'Cached model part ' + index + ' is missing or damaged.',
+            retryWithoutCache,
+          ));
+          return;
+        }
+        index += 1;
+        controller.enqueue(bytes);
+      },
+    },
+    { highWaterMark: 0 },
+  );
+  const headers = new Headers(manifest.headers);
+  for (const name of MODEL_CACHE_INTERNAL_HEADERS) headers.delete(name);
+  // The parts hold decoded bytes.
+  headers.delete('content-encoding');
+  headers.set('content-length', String(decodedBytes));
+  return { response: new Response(body, { status: 200, headers }), decodedBytes };
+}
+
+export async function readCachedModelPartsSize(cache: Cache, cacheKey: string): Promise<number | null> {
+  return (await readModelCacheManifest(cache, await modelCacheKeyDigest(cacheKey)))?.decodedBytes ?? null;
+}
+
+export interface ModelCachePartStore {
+  // The copy the caller reads; it keeps the source's status, headers and url.
+  response: Response;
+  stored: Promise<void>;
+  readonly cancelled: boolean;
+}
+
+type LockManagerLike = {
+  request(name: string, options: { ifAvailable: boolean }, callback: (lock: unknown) => unknown): Promise<unknown>;
+};
+
+function getModelCacheLocks(): LockManagerLike | null {
+  const locks = (globalThis.navigator as { locks?: LockManagerLike } | undefined)?.locks;
+  return typeof locks?.request === 'function' ? locks : null;
+}
+
+async function withModelCacheLock(
+  lockScope: string,
+  digest: string,
+  callback: (lock: unknown) => unknown,
+): Promise<void> {
+  const locks = getModelCacheLocks();
+  if (!locks) {
+    throw new Error('Web Locks are unavailable, so the model cannot be stored in parts.');
+  }
+  await locks.request('llamadart-model-cache:' + lockScope + ':' + digest, { ifAvailable: true }, callback);
+}
+
+/**
+ * Stores a response body as part entries while the caller reads it.
+ *
+ * Each full part is committed before the next chunk is delivered, so the store
+ * holds one part and slows the transfer instead of buffering it. Unlike a tee,
+ * the caller's chunks are not shared with the cache and may be released. A
+ * store failure leaves the transfer intact and rejects `stored`.
+ */
+export function startModelCachePartStore(
+  cache: Cache,
+  cacheKey: string,
+  source: Response,
+  lockScope: string,
+  partBytes: number = MODEL_CACHE_PART_BYTES,
+): ModelCachePartStore {
+  if (source.status === 206) {
+    return {
+      response: source,
+      stored: Promise.reject(new TypeError('A partial response cannot be stored in the model cache.')),
+      cancelled: false,
+    };
+  }
+  const reader = source.body!.getReader();
+  let cancelled = false;
+  let storing = true;
+  let record = '';
+  let digest = '';
+  let part: Uint8Array | null = null;
+  let filled = 0;
+  let partCount = 0;
+  let decodedBytes = 0;
+  let ready: Promise<void> | null = null;
+  let pendingPut: Promise<void> | null = null;
+  let releaseLock: (() => void) | null = null;
+  let resolveStored!: () => void;
+  let rejectStored!: (error: unknown) => void;
+  const stored = new Promise<void>((resolve, reject) => {
+    resolveStored = resolve;
+    rejectStored = reject;
+  });
+
+  const pruneUncommitted = async () => {
+    const current = await readModelCacheManifest(cache, digest);
+    await deleteModelCachePartEntries(cache, digest, (partRecord) => !current || partRecord !== current.record);
+  };
+
+  // Acquire the lock only once the consumer reads, so a failed staging setup
+  // cannot leave a lock held by a response that never gets consumed.
+  const prepare = async () => {
+    if (typeof globalThis.crypto?.randomUUID !== 'function') {
+      throw new Error('A UUID generator is unavailable, so the model cannot be stored in parts.');
+    }
+    record = globalThis.crypto.randomUUID();
+    digest = await modelCacheKeyDigest(cacheKey);
+    const held = await new Promise<boolean>((resolve, reject) => {
+      withModelCacheLock(lockScope, digest, (lock) => {
+        if (!lock) {
+          resolve(false);
+          return undefined;
+        }
+        return new Promise<void>((release) => {
+          releaseLock = release;
+          resolve(true);
+        });
+      }).catch(reject);
+    });
+    if (!held) {
+      throw new Error('Another context is storing this model.');
+    }
+    await pruneUncommitted();
+  };
+
+  const unlock = () => {
+    const release = releaseLock;
+    releaseLock = null;
+    release?.();
+  };
+  const abandon = (error: unknown) => {
+    if (!storing) return;
+    storing = false;
+    part = null;
+    rejectStored(error);
+    void (async () => {
+      // A pending put can still commit after the caller cancels.
+      await Promise.allSettled([ready, pendingPut]);
+      if (releaseLock) {
+        await deleteModelCachePartEntries(cache, digest, (partRecord) => partRecord === record);
+      }
+    })().catch(() => {}).finally(unlock);
+  };
+  const put = async (url: string, response: Response) => {
+    pendingPut = cache.put(url, response);
+    try {
+      await pendingPut;
+    } finally {
+      pendingPut = null;
+    }
+  };
+  const flush = async () => {
+    const body = filled === part!.byteLength ? part! : part!.subarray(0, filled);
+    await put(modelCachePartUrl(digest, record, partCount), new Response(body as BodyInit));
+    partCount += 1;
+    filled = 0;
+  };
+  const append = async (chunk: Uint8Array) => {
+    part ??= new Uint8Array(partBytes);
+    let offset = 0;
+    while (storing && offset < chunk.byteLength) {
+      const length = Math.min(part.byteLength - filled, chunk.byteLength - offset);
+      part.set(chunk.subarray(offset, offset + length), filled);
+      filled += length;
+      offset += length;
+      if (filled === part.byteLength) await flush();
+    }
+  };
+  const commit = async () => {
+    if (filled > 0) await flush();
+    if (!Number.isSafeInteger(decodedBytes) || decodedBytes <= 0) {
+      throw new Error('The model response was empty.');
+    }
+    const expectedBytes = captureResumeIdentity(source, source.url)?.total;
+    if (expectedBytes != null && decodedBytes !== expectedBytes) {
+      throw createModelTransferLengthError('Model response did not match its declared decoded size.');
+    }
+    const headers = new Headers(source.headers);
+    headers.set(MODEL_CACHE_RECORD_HEADER, record);
+    headers.set(MODEL_CACHE_SIZE_HEADER, String(decodedBytes));
+    headers.set(MODEL_CACHE_PART_COUNT_HEADER, String(partCount));
+    headers.set(MODEL_CACHE_PART_SIZE_HEADER, String(partBytes));
+    await put(modelCacheManifestUrl(digest), new Response(null, { headers }));
+    storing = false;
+    part = null;
+    try {
+      await deleteModelCachePartEntries(cache, digest, (partRecord) => partRecord !== record);
+      // A whole-body entry from an earlier version is now a stale duplicate.
+      if (await cache.delete(cacheKey)) await pruneCachedModelSizes(cache, cacheKey);
+    } catch (_) {
+      // Leftovers are pruned by the next store.
+    }
+    unlock();
+    resolveStored();
+  };
+
+  const bodyStream = new ReadableStream<Uint8Array>(
+    {
+      async pull(controller) {
+        let result: ReadableStreamReadResult<Uint8Array>;
+        try {
+          result = await reader.read();
+        } catch (error) {
+          abandon(error);
+          throw error;
+        }
+        if (cancelled) return;
+        if (result.done) {
+          controller.close();
+          if (storing) {
+            try {
+              await (ready ??= prepare());
+              if (storing) await commit();
+            } catch (error) {
+              abandon(error);
+            }
+          }
+          return;
+        }
+        decodedBytes += result.value.byteLength;
+        if (storing) {
+          try {
+            await (ready ??= prepare());
+            if (storing) await append(result.value);
+          } catch (error) {
+            abandon(error);
+          }
+        }
+        if (cancelled) return;
+        controller.enqueue(result.value);
+      },
+      cancel(reason) {
+        cancelled = true;
+        abandon(reason ?? new Error('The response was cancelled before the cache copy completed.'));
+        return reader.cancel(reason);
+      },
+    },
+    { highWaterMark: 0 },
+  );
+
+  const response = new Response(bodyStream, {
+    status: source.status,
+    statusText: source.statusText,
+    headers: source.headers,
+  });
+  Object.defineProperties(response, {
+    url: { value: source.url },
+    type: { value: source.type },
+  });
+  return {
+    response,
+    stored,
+    get cancelled() {
+      return cancelled;
+    },
+  };
 }
 
 // Emscripten's WASMFS FS.analyzePath() reads the whole entry to fill

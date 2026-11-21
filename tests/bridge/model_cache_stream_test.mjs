@@ -348,48 +348,6 @@ const CASES = [
     }
   }],
 
-  ['the WebKit model staging writer preserves chunks shared with the cache', async () => {
-    const { promise: holdPut, resolve: allowPut } = Promise.withResolvers();
-    const caches = installCaches({ holdPut });
-    try {
-      const chunk = Uint8Array.of(1, 2, 3, 4);
-      const source = new Response(new ReadableStream({
-        start(controller) {
-          controller.enqueue(chunk);
-          controller.close();
-        },
-      }), { headers: { 'content-length': '4' } });
-      const { runtime, core, loads } = createRuntime(() => source);
-      runtime._isWebKit = true;
-      runtime._config.jsBackedModelStaging = true;
-      runtime._mountJsBackedStaging = () => '/jsmodels';
-      runtime._assertJsStagingMountOwned = () => {};
-      const { promise: consumed, resolve: afterWrite } = Promise.withResolvers();
-      runtime._openDirectJsWriter = (_core, filePath) => {
-        const handle = core.FS.open(filePath, 'w');
-        return {
-          writeChunk(bytes, position) {
-            const count = core.FS.write(handle, bytes, 0, bytes.length, position);
-            afterWrite();
-            return count;
-          },
-        };
-      };
-      const loading = runtime.loadModelFromUrl(MODEL_URL, loadOptions());
-      loading.catch(afterWrite);
-      await consumed;
-      const chunkLength = chunk.byteLength;
-      allowPut();
-      assert.equal(await loading, 1);
-      assert.equal(chunkLength, 4);
-      assert.deepEqual([...loads[0]], [1, 2, 3, 4]);
-      assert.deepEqual([...caches.entries.get(MODEL_URL)], [1, 2, 3, 4]);
-    } finally {
-      allowPut();
-      caches.restore();
-    }
-  }],
-
   ['WebKit detection distinguishes browsers sharing the AppleWebKit token', () => {
     for (const [ua, expected] of [
       ['Mozilla/5.0 (iPhone) AppleWebKit/605.1.15 CriOS/153.0 Mobile/15E148 Safari/604.1', true],

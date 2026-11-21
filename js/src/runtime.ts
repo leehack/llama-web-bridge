@@ -33,8 +33,13 @@ import {
   inferResponseTotalBytes,
   isRetryableStreamNetworkError,
   sumProgressValues,
+  deleteModelCacheParts,
+  ModelCacheEntryError,
+  openModelCacheParts,
   pruneCachedModelSizes,
+  readCachedModelPartsSize,
   readCachedModelSize,
+  startModelCachePartStore,
   startModelCacheStore,
   unlinkFsFile,
   writeResponseToFsFileWithProgress,
@@ -131,6 +136,8 @@ type ModelCacheStoreOutcome = 'stored' | 'store_failed';
 // Cache stores still being written from a response the caller is reading.
 const cachedModelSizes = new WeakMap<Response, number>();
 const pendingModelCacheStores = new WeakMap<Response, Promise<ModelCacheStoreOutcome>>();
+// Responses whose chunks a cache tee also reads.
+const teedModelResponses = new WeakSet<Response>();
 
 const SAFARI_EMBEDDING_PROBE_MAX_COSINE = 0.999;
 const SAFARI_EMBEDDING_PROBE_MIN_COMPONENT = 0.001;
@@ -1909,6 +1916,20 @@ export class LlamaWebGpuBridgeRuntime {
 
     try {
       const cache = await globalThis.caches.open(this._modelCacheName);
+      const parts = forceRefresh || !this._isWebKit
+        ? null
+        : await openModelCacheParts(cache, cacheKey, this._modelCacheName);
+      if (parts) {
+        this._modelSource = 'cache';
+        this._modelCacheState = 'hit';
+        this._runtimeNotes.push('model_cache_hit');
+        this._runtimeNotes.push('model_cache_parts');
+        if (requireReadableStream) {
+          this._runtimeNotes.push('model_cache_stream');
+        }
+        cachedModelSizes.set(parts.response, parts.decodedBytes);
+        return parts.response;
+      }
       const cached = forceRefresh ? null : await cache.match(cacheKey);
       if (cached) {
         const cacheHasStream = hasReadableResponseStream(cached);
@@ -1992,6 +2013,19 @@ export class LlamaWebGpuBridgeRuntime {
       return response;
     }
 
+    if (this._isWebKit) {
+      const store = startModelCachePartStore(cache, cacheKey, response, this._modelCacheName);
+      pendingModelCacheStores.set(store.response, store.stored.then(
+        (): ModelCacheStoreOutcome => {
+          this._runtimeNotes.push('model_cache_stored');
+          this._runtimeNotes.push('model_cache_parts');
+          return 'stored';
+        },
+        (error: unknown): ModelCacheStoreOutcome => (store.cancelled ? 'store_failed' : recordFailure(error)),
+      ));
+      return store.response;
+    }
+
     const { tee, stored: cacheStore } = startModelCacheStore(cache, cacheKey, response);
     const stored = cacheStore.then(
       (): ModelCacheStoreOutcome => {
@@ -2005,6 +2039,7 @@ export class LlamaWebGpuBridgeRuntime {
       },
     );
     pendingModelCacheStores.set(tee.response, stored);
+    teedModelResponses.add(tee.response);
     return tee.response;
   }
 
@@ -2081,14 +2116,18 @@ export class LlamaWebGpuBridgeRuntime {
         let headerTotal = 0;
 
         if (cache) {
-          const cached = options.force === true ? null : await cache.match(cacheKey);
-          if (cached) {
+          const partsBytes = options.force === true || !this._isWebKit
+            ? null
+            : await readCachedModelPartsSize(cache, cacheKey);
+          const cached = options.force === true || partsBytes !== null ? null : await cache.match(cacheKey);
+          if (cached || partsBytes !== null) {
             this._modelSource = 'cache';
             this._modelCacheState = 'hit';
             this._runtimeNotes.push('model_cache_hit');
+            if (partsBytes !== null) this._runtimeNotes.push('model_cache_parts');
 
-            headerTotal = await readCachedModelSize(cache, cacheKey, cached)
-              ?? (Number(cached.headers.get('content-length')) || 0);
+            headerTotal = partsBytes ?? (cached ? await readCachedModelSize(cache, cacheKey, cached) : null)
+              ?? (Number(cached?.headers.get('content-length')) || 0);
             const resolved = headerTotal > 0 ? headerTotal : 1;
             shardLoaded[shardIndex] = resolved;
             shardTotals[shardIndex] = resolved;
@@ -2113,10 +2152,18 @@ export class LlamaWebGpuBridgeRuntime {
         }
 
         let cacheStore: Promise<void> | null = null;
-        if (cache && hasReadableResponseStream(response)) {
+        let releaseConsumedChunks = this._isWebKit;
+        let storedInParts = false;
+        if (cache && hasReadableResponseStream(response) && this._isWebKit) {
+          const store = startModelCachePartStore(cache, cacheKey, response, this._modelCacheName);
+          response = store.response;
+          cacheStore = store.stored;
+          storedInParts = true;
+        } else if (cache && hasReadableResponseStream(response)) {
           const { tee, stored } = startModelCacheStore(cache, cacheKey, response);
           response = tee.response;
           cacheStore = stored;
+          releaseConsumedChunks = false;
         } else if (cache) {
           cacheStore = cache.put(cacheKey, response.clone());
         }
@@ -2137,7 +2184,7 @@ export class LlamaWebGpuBridgeRuntime {
                   emitAggregateProgress();
                 }
               : null,
-          { chunkTimeoutMs },
+          { chunkTimeoutMs, releaseConsumedChunks },
         );
 
         const finalLoaded = shardLoaded[shardIndex] > 0
@@ -2154,6 +2201,7 @@ export class LlamaWebGpuBridgeRuntime {
           if (putResult.ok) {
             this._modelCacheState = 'stored';
             this._runtimeNotes.push('model_cache_stored');
+            if (storedInParts) this._runtimeNotes.push('model_cache_parts');
           } else {
             const putErrorText = String(putResult.error || '').toLowerCase();
             if (putErrorText.includes('abort') || putErrorText.includes('cancel')) {
@@ -2207,10 +2255,14 @@ export class LlamaWebGpuBridgeRuntime {
       let removedCount = 0;
       for (const modelUrl of modelUrls) {
         const cacheKey = normalizeAbsoluteUrl(modelUrl);
+        const removedParts = await deleteModelCacheParts(cache, cacheKey, this._modelCacheName);
+        if (removedParts === null) continue;
         const removed = await cache.delete(cacheKey);
         if (removed) {
-          removedCount += 1;
           await pruneCachedModelSizes(cache, cacheKey);
+        }
+        if (removed || removedParts) {
+          removedCount += 1;
         }
       }
 
@@ -2726,8 +2778,9 @@ export class LlamaWebGpuBridgeRuntime {
           let minimumShardBytes = 0;
           let heapFileBytes: number | null = null;
           let heapUnavailableReason: string | undefined;
+          let bypassShardCache = false;
 
-          const restartShard = (reason: 'url' | 'range' | 'etag') => {
+          const restartShard = (reason: 'url' | 'range' | 'etag' | 'cache') => {
             this._runtimeNotes.push('model_stream_restart:' + reason);
             if (resumeAttempt >= maxStreamResumeRetries) {
               throw new Error('Model shard changed during download and the retry limit was reached.');
@@ -2753,7 +2806,7 @@ export class LlamaWebGpuBridgeRuntime {
               ...options,
               requireReadableStream: true,
               readDecodedCacheSize: heapResidentStaging,
-              useCache: requestHeaders ? false : options.useCache,
+              useCache: requestHeaders || bypassShardCache ? false : options.useCache,
               force: requestHeaders ? true : options.force,
               requestHeaders,
             });
@@ -2875,7 +2928,7 @@ export class LlamaWebGpuBridgeRuntime {
                   // Detaching frees a chunk at once on WebKit, which otherwise keeps
                   // it past the load; Chromium keeps a detached chunk longer than a
                   // dropped one. A cache tee still reads the chunks.
-                  releaseConsumedChunks: this._isWebKit && !pendingModelCacheStores.has(response),
+                  releaseConsumedChunks: this._isWebKit && !teedModelResponses.has(response),
                   startOffset: resumeOffset,
                   heapFileBytes,
                   preservePartialOnError: true,
@@ -2934,6 +2987,13 @@ export class LlamaWebGpuBridgeRuntime {
                     knownTotalBytes > 0 ? knownTotalBytes : resumeOffset,
                   )
                 : null;
+
+              if (!stagingAllocError && error instanceof ModelCacheEntryError) {
+                this._runtimeNotes.push('model_cache_entry_invalid');
+                bypassShardCache = error.retryWithoutCache;
+                restartShard('cache');
+                continue;
+              }
 
               const retryableNetworkError = isRetryableStreamNetworkError(error);
               if (!stagingAllocError && retryableNetworkError && rangeOverrun) {
