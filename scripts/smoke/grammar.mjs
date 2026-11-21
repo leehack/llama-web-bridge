@@ -29,6 +29,7 @@ import {
   resolvePinnedModel,
   runMain,
   runPlaywright,
+  stageFile,
   withServer,
   withTempDir,
   writeStdout,
@@ -94,6 +95,7 @@ that rejects its own trigger text must each reject, after which the
 unconstrained completion repeats exactly.`;
 
 const MODEL_FILENAME = 'grammar-smoke-model.gguf';
+export const MAX_THREADS = 4;
 // The issue #115 repro prompt. Its ChatML markers are plain text to a model
 // without that template, which is fine: the grammar decides the output.
 const PROMPT = '<|im_start|>user\nIs the sky blue? Answer yes or no.<|im_end|>\n'
@@ -309,6 +311,7 @@ export function renderHarness(nCtx, memoryModes) {
     lazyGrammar: LAZY_GRAMMAR,
     lazyTriggerRuns: LAZY_TRIGGER_RUNS,
     completionCapabilities: COMPLETION_CAPABILITIES,
+    maxThreads: MAX_THREADS,
     nCtx,
     memoryModes,
     runtimeModes: RUNTIME_MODES,
@@ -322,6 +325,11 @@ export function renderHarness(nCtx, memoryModes) {
 <script type="module">
 (async () => {
   const result = document.getElementById('result');
+  const setStage = (stage) => {
+    window.__smokeStage = stage;
+    result.textContent = \`pending: \${stage}\`;
+    console.log(\`GRAMMAR_STAGE \${stage}\`);
+  };
   const finish = (payload) => {
     result.textContent = JSON.stringify(payload);
     window.__smokeResult = payload;
@@ -354,6 +362,7 @@ export function renderHarness(nCtx, memoryModes) {
     if (!window.crossOriginIsolated) {
       throw new Error('test page is not cross-origin isolated');
     }
+    setStage('startup:bridge-import');
     const module = await import('/llama_webgpu_bridge.js');
     const LlamaWebGpuBridge = module.LlamaWebGpuBridge || window.LlamaWebGpuBridge;
     assert(typeof LlamaWebGpuBridge === 'function', 'LlamaWebGpuBridge export was not registered');
@@ -628,6 +637,7 @@ export function renderHarness(nCtx, memoryModes) {
     };
 
     const runMode = async (memoryMode, runtimeMode) => {
+      const startedAt = performance.now();
       const mode = \`\${memoryMode} \${runtimeMode}\`;
       const useMemory64 = memoryMode === 'wasm64';
       const bridge = new LlamaWebGpuBridge({
@@ -636,110 +646,136 @@ export function renderHarness(nCtx, memoryModes) {
         coreModuleUrlMem64: useMemory64 ? '/llama_webgpu_core_mem64.js' : undefined,
         wasmUrlMem64: useMemory64 ? '/llama_webgpu_core_mem64.wasm' : undefined,
       });
-      const cases = [];
-      const samplerRuns = {};
-      const invalidSamplerErrors = [];
-      try {
-        const capabilitiesBeforeLoad = samplerCapabilities(await bridge.getCompletionCapabilities());
-        await bridge.loadModelFromUrl(config.modelUrl, {
-          nCtx: config.nCtx,
-          nThreads: 2,
-          nGpuLayers: 0,
-          useCache: false,
-          forceRemoteFetchBackend: false,
-        });
-        for (const testCase of config.cases) {
-          let text = null;
-          let error = null;
-          try {
-            text = await bridge.createCompletion(config.prompt, {
-              ...testCase.options,
-              grammar: testCase.grammar,
-              tokenEventEncoding: 'text',
-            });
-          } catch (caught) {
-            error = errorText(caught);
-          }
-          cases.push({
-            name: testCase.name,
-            text,
-            error,
-            // A throwing case must carry the parser's message, which proves
-            // the throw reached the bridge's catch.
-            valid: testCase.kind === 'invalid'
-              ? text === null
-                && error !== null
-                && error.includes(config.invalidGrammarError)
-                && error.includes(config.nonThrowingRejection) === !testCase.throws
-              : error === null && typeof text === 'string' && checkText(testCase.kind, text),
-          });
+      const availableThreads = Math.trunc(Number(navigator.hardwareConcurrency) || config.maxThreads);
+      const nThreads = Math.max(1, Math.min(config.maxThreads, availableThreads));
+      const phaseTimingsMs = {};
+      const timePhase = async (key, stage, run) => {
+        setStage(\`\${mode}:\${stage}\`);
+        const phaseStartedAt = performance.now();
+        try {
+          return await run();
+        } finally {
+          phaseTimingsMs[key] = Math.round(performance.now() - phaseStartedAt);
         }
+      };
+      try {
+        const capabilitiesBeforeLoad = await timePhase('loadModelMs', 'load-model', async () => {
+          const capabilities = samplerCapabilities(await bridge.getCompletionCapabilities());
+          await bridge.loadModelFromUrl(config.modelUrl, {
+            nCtx: config.nCtx,
+            nThreads,
+            nGpuLayers: 0,
+            useCache: false,
+            forceRemoteFetchBackend: false,
+          });
+          return capabilities;
+        });
+        const cases = await timePhase('casesMs', 'cases', async () => {
+          const cases = [];
+          for (const testCase of config.cases) {
+            let text = null;
+            let error = null;
+            try {
+              text = await bridge.createCompletion(config.prompt, {
+                ...testCase.options,
+                grammar: testCase.grammar,
+                tokenEventEncoding: 'text',
+              });
+            } catch (caught) {
+              error = errorText(caught);
+            }
+            cases.push({
+              name: testCase.name,
+              text,
+              error,
+              // A throwing case must carry the parser's message, which proves
+              // the throw reached the bridge's catch.
+              valid: testCase.kind === 'invalid'
+                ? text === null
+                  && error !== null
+                  && error.includes(config.invalidGrammarError)
+                  && error.includes(config.nonThrowingRejection) === !testCase.throws
+                : error === null && typeof text === 'string' && checkText(testCase.kind, text),
+            });
+          }
+          return cases;
+        });
 
         // Generation state must be clean after the grammar runs.
-        let plainError = null;
-        try {
-          await bridge.createCompletion(config.prompt, {
-            nPredict: 4,
-            temp: 0,
-            topK: 1,
-            seed: 1,
-            tokenEventEncoding: 'text',
-          });
-        } catch (caught) {
-          plainError = errorText(caught);
-        }
-
-        const capabilitiesAfterLoad = samplerCapabilities(await bridge.getCompletionCapabilities());
-        for (const [name, options] of config.samplerRuns) {
-          samplerRuns[name] = await bridge.createCompletion(config.samplerPrompt, {
-            ...options,
-            tokenEventEncoding: 'text',
-          });
-        }
-        const sampled = Object.fromEntries(config.samplerRuns)['sampled'];
-        for (const options of ${invalidSamplerOptions}) {
+        const plainError = await timePhase('plainCompletionMs', 'plain-completion', async () => {
           try {
-            await bridge.createCompletion(config.samplerPrompt, { ...sampled, ...options });
-            invalidSamplerErrors.push(null);
-          } catch (caught) {
-            invalidSamplerErrors.push(\`\${caught && caught.name}: \${errorText(caught)}\`);
-          }
-        }
-        // Repeats "sampled" after the rejections.
-        const samplerAfterInvalid = await bridge.createCompletion(config.samplerPrompt, {
-          ...sampled,
-          tokenEventEncoding: 'text',
-        });
-
-        const promptPenalty = await probePromptPenalty(bridge);
-
-        const thinkingRuns = {};
-        for (const [name, prompt, options] of config.thinkingRuns) {
-          try {
-            thinkingRuns[name] = await bridge.createCompletion(prompt, {
-              ...options,
+            await bridge.createCompletion(config.prompt, {
+              nPredict: 4,
+              temp: 0,
+              topK: 1,
+              seed: 1,
               tokenEventEncoding: 'text',
             });
+            return null;
           } catch (caught) {
-            if (name !== 'open-budget-rejecting-grammar') throw caught;
-            thinkingRuns[name] = \`ERR \${caught && caught.name}: \${errorText(caught)}\`;
+            return errorText(caught);
           }
-        }
-        let invalidThinkingBudgetError = null;
-        try {
-          await bridge.createCompletion(config.thinkingRuns[0][1], {
-            ...config.thinkingRuns[0][2],
-            thinkingBudget: config.invalidThinkingBudget,
-          });
-        } catch (caught) {
-          invalidThinkingBudgetError = \`\${caught && caught.name}: \${errorText(caught)}\`;
-        }
+        });
 
-        const lazyGrammar = await probeLazyGrammar(bridge);
+        const { capabilitiesAfterLoad, samplerRuns, invalidSamplerErrors, samplerAfterInvalid } =
+          await timePhase('samplerRunsMs', 'sampler-runs', async () => {
+            const capabilitiesAfterLoad = samplerCapabilities(await bridge.getCompletionCapabilities());
+            const samplerRuns = {};
+            const invalidSamplerErrors = [];
+            for (const [name, options] of config.samplerRuns) {
+              samplerRuns[name] = await bridge.createCompletion(config.samplerPrompt, {
+                ...options,
+                tokenEventEncoding: 'text',
+              });
+            }
+            const sampled = Object.fromEntries(config.samplerRuns)['sampled'];
+            for (const options of ${invalidSamplerOptions}) {
+              try {
+                await bridge.createCompletion(config.samplerPrompt, { ...sampled, ...options });
+                invalidSamplerErrors.push(null);
+              } catch (caught) {
+                invalidSamplerErrors.push(\`\${caught && caught.name}: \${errorText(caught)}\`);
+              }
+            }
+            // Repeats "sampled" after the rejections.
+            const samplerAfterInvalid = await bridge.createCompletion(config.samplerPrompt, {
+              ...sampled,
+              tokenEventEncoding: 'text',
+            });
+            return { capabilitiesAfterLoad, samplerRuns, invalidSamplerErrors, samplerAfterInvalid };
+          });
+
+        const promptPenalty = await timePhase('promptPenaltyMs', 'prompt-penalty', () => probePromptPenalty(bridge));
+        const { thinkingRuns, invalidThinkingBudgetError } = await timePhase('thinkingRunsMs', 'thinking-runs', async () => {
+          const thinkingRuns = {};
+          for (const [name, prompt, options] of config.thinkingRuns) {
+            try {
+              thinkingRuns[name] = await bridge.createCompletion(prompt, {
+                ...options,
+                tokenEventEncoding: 'text',
+              });
+            } catch (caught) {
+              if (name !== 'open-budget-rejecting-grammar') throw caught;
+              thinkingRuns[name] = \`ERR \${caught && caught.name}: \${errorText(caught)}\`;
+            }
+          }
+          let invalidThinkingBudgetError = null;
+          try {
+            await bridge.createCompletion(config.thinkingRuns[0][1], {
+              ...config.thinkingRuns[0][2],
+              thinkingBudget: config.invalidThinkingBudget,
+            });
+          } catch (caught) {
+            invalidThinkingBudgetError = \`\${caught && caught.name}: \${errorText(caught)}\`;
+          }
+          return { thinkingRuns, invalidThinkingBudgetError };
+        });
+        const lazyGrammar = await timePhase('lazyGrammarMs', 'lazy-grammar', () => probeLazyGrammar(bridge));
 
         const metadata = bridge.getModelMetadata();
-        const multiEndBudget = metadata['general.architecture'] === 'qwen35'
-          ? await probeMultiEndBudget(bridge, runtimeMode) : null;
+        const multiEndBudget = await timePhase('multiEndBudgetMs', 'multi-end-budget', () => (
+          metadata['general.architecture'] === 'qwen35' ? probeMultiEndBudget(bridge, runtimeMode) : null
+        ));
         return {
           mode,
           cases,
@@ -754,12 +790,16 @@ export function renderHarness(nCtx, memoryModes) {
           invalidThinkingBudgetError,
           lazyGrammar,
           plainCompletionError: plainError,
+          nThreads: Number(metadata['llamadart.webgpu.n_threads']) || null,
+          phaseTimingsMs,
           execution: metadata['llamadart.webgpu.execution'] || null,
           coreVariant: metadata['llamadart.webgpu.core_variant'] || null,
           workerFallbackReason: metadata['llamadart.webgpu.worker_fallback_reason'] || null,
         };
       } finally {
-        await bridge.dispose();
+        await timePhase('disposeMs', 'dispose', () => bridge.dispose());
+        phaseTimingsMs.totalMs = Math.round(performance.now() - startedAt);
+        setStage(\`\${mode}:done\`);
       }
     };
 
@@ -1065,13 +1105,16 @@ export async function main(argv = process.argv.slice(2)) {
   const payload = await withTempDir('llama-web-bridge-grammar-smoke-', async (webRoot) => {
     await copyBridgeArtifacts(distDir, webRoot);
     if (memoryModes.includes('wasm64')) await copyMemory64Artifacts(distDir, webRoot);
-    await fsp.copyFile(modelPath, path.join(webRoot, MODEL_FILENAME));
+    await stageFile(modelPath, path.join(webRoot, MODEL_FILENAME));
     await fsp.writeFile(path.join(webRoot, 'index.html'), renderHarness(args.nCtx, memoryModes), 'utf8');
     if (artifactsDir !== null) {
       await fsp.mkdir(artifactsDir, { recursive: true });
       await fsp.copyFile(path.join(webRoot, 'index.html'), path.join(artifactsDir, 'index.html'));
     }
-    return withServer(webRoot, (url) => runPlaywright(url, args.timeoutMs, artifactsDir, 'grammar-smoke'));
+    return withServer(webRoot, (url) => runPlaywright(url, args.timeoutMs, artifactsDir, 'grammar-smoke', {
+      stageMarker: 'GRAMMAR_STAGE ',
+      stagePrefix: 'grammar-smoke',
+    }));
   });
 
   writeStdout(`${pyJson(payload, { indent: 2, sortKeys: true })}\n`);
