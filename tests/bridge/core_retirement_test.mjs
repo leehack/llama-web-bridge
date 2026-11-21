@@ -164,6 +164,38 @@ test('direct mode: onAbort with no throwing call', async () => {
     next instanceof ModelUnloadedError && counts.total === callsBefore);
   check('the abort note survives the swap',
     bridge._runtime._runtimeNotes.some((note) => note.startsWith('core_abort')));
+  assert.ok(bridge._runtime._runtimeNotes.includes('core_retired_threads_unavailable'));
+  await bridge.dispose();
+});
+
+test('cancelling an active direct operation reaches its replacement runtime', async (t) => {
+  const reply = Promise.withResolvers();
+  let onAbort;
+  const bridge = new LlamaWebGpuBridge({
+    disableWorker: true,
+    coreModuleFactory: async (options) => {
+      onAbort = options.onAbort;
+      return {
+        ccall(name) {
+          return name === 'llamadart_webgpu_tokenize_to_json' ? reply.promise : 0;
+        },
+      };
+    },
+  });
+  const first = bridge._runtime;
+  await first._ensureCore();
+  first._modelBytes = 1;
+  const pending = bridge.tokenize('hi');
+  const rejected = assert.rejects(pending, /Aborted\(pthread abort\)/);
+  onAbort('pthread abort');
+
+  const replacement = bridge._runtime;
+  assert.notEqual(replacement, first);
+  const cancel = t.mock.method(replacement, 'cancel');
+  bridge.cancel();
+  reply.resolve(0);
+  await rejected;
+  assert.equal(cancel.mock.callCount(), 1);
   await bridge.dispose();
 });
 
@@ -685,6 +717,56 @@ test('a core that retires between calls', async () => {
   check('a load after an idle retirement runs on the replacement and is remembered',
     load.ok && second.created.length === 1 && idle.calls.length === 0
     && second.bridge._loadedModelUrl === 'model-b.gguf' && second.bridge._workerModelMissing === false);
+});
+
+test('setLogLevel leaves an already-retired worker to the pending tokenize', async () => {
+  const started = Promise.withResolvers();
+  const reply = Promise.withResolvers();
+  const first = createProxy('first', (method) => {
+    assert.equal(method, 'tokenize');
+    started.resolve();
+    return reply.promise;
+  });
+  const { bridge, created } = createBridge({ proxy: first, overrides: { ...loaded } });
+  let replacementLogLevel;
+  const createWorkerProxy = bridge._createWorkerProxy;
+  bridge._createWorkerProxy = () => {
+    replacementLogLevel = bridge._workerConfig().logLevel;
+    return createWorkerProxy();
+  };
+
+  const pending = bridge.tokenize('hi');
+  const rejected = assert.rejects(pending, /core aborted during tokenize/);
+  await started.promise;
+  first.coreRetired = true;
+  bridge.setLogLevel(1);
+
+  assert.equal(bridge._workerProxy, first);
+  assert.equal(first.disposeCalls, 0);
+  assert.deepEqual(first.calls, ['tokenize']);
+  reply.resolve({ value: [1] });
+  await rejected;
+  assert.equal(created.length, 1);
+  assert.equal(replacementLogLevel, 1);
+  assert.deepEqual(await bridge.tokenize('hi'), [1, 2, 3]);
+  await bridge.dispose();
+});
+
+test('a pending setLogLevel reply cannot replace a worker that just retired', async (t) => {
+  const reply = Promise.withResolvers();
+  const first = createProxy('first', healthyImpl);
+  t.mock.method(first, 'call', () => reply.promise);
+  const { bridge, created } = createBridge({ proxy: first });
+  bridge.setLogLevel(1);
+  assert.equal(first.call.mock.callCount(), 1);
+  first.coreRetired = true;
+  reply.reject(new Error('core aborted'));
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(bridge._workerProxy, first);
+  assert.equal(first.disposeCalls, 0);
+  assert.equal(created.length, 0);
+  await bridge.dispose();
 });
 
 test('a reply that succeeds although the core retired', async () => {
