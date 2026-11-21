@@ -281,7 +281,7 @@ function createRuntime(fetchModel, userAgent) {
     fetches.push(url);
     return fetchModel(url, init);
   };
-  return { runtime, core, loads, fetches, projectorLoads };
+  return { bridge, runtime, core, loads, fetches, projectorLoads };
 }
 
 const loadOptions = (extra = {}) => ({
@@ -569,6 +569,30 @@ const CASES = [
     assert.equal(unread.state.reads, 0);
     assert.equal(locks.held.size, 0);
     assert.equal(caches.urls(MANIFEST).length, 1);
+  })],
+
+  ['a bridge created inside a worker caches relative model and projector URLs', () => withFakes({}, async () => {
+    const location = Object.getOwnPropertyDescriptor(globalThis, 'location');
+    const workerUrl = 'https://models.test/worker/app-worker.js';
+    const model = './legacy.gguf';
+    const projector = './mmproj.gguf';
+    Object.defineProperty(globalThis, 'location', { configurable: true, value: new URL(workerUrl) });
+    try {
+      const { bridge, fetches, projectorLoads } = createRuntime(() => bodyOf(TEN), SAFARI);
+      assert.equal(await bridge.prefetchModelToCache(model, cacheOptions), 1);
+      assert.equal(await bridge.isModelCached(model, cacheOptions), true);
+      assert.equal(await bridge.isModelCached(new URL(model, workerUrl).href, cacheOptions), true);
+      assert.equal(await bridge.loadModelFromUrl(model, loadOptions()), 1);
+
+      assert.equal(await bridge.loadMultimodalProjector(projector, projectorOptions), 1);
+      assert.equal(await bridge.isModelCached(projector, cacheOptions), true);
+      assert.equal(await bridge.loadMultimodalProjector(new URL(projector, workerUrl).href, projectorOptions), 1);
+      assert.deepEqual(fetches, [new URL(model, workerUrl).href, new URL(projector, workerUrl).href]);
+      assert.deepEqual(projectorLoads, [TEN, TEN]);
+    } finally {
+      if (location) Object.defineProperty(globalThis, 'location', location);
+      else delete globalThis.location;
+    }
   })],
 
   ['HTTP(S) is required for model, projector and prefetch cache stores', async () => {

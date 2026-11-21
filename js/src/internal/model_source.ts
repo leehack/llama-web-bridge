@@ -26,19 +26,18 @@ export function hasModelSource(source: unknown): boolean {
     : typeof source === 'string' && source.length > 0;
 }
 
-// The page's base URL, so a `<base href>` applies as it does to a page fetch.
-// A worker has no page: callers resolve URLs on the main thread before posting
-// them, because a worker would resolve them against its own script URL.
-function pageBaseUrl(): string | undefined {
+// Match fetch's base URL in a document or an app-owned worker. The facade
+// resolves URLs before forwarding them to its own worker.
+function sourceBaseUrl(): string | undefined {
   if (typeof document !== 'undefined' && typeof document.baseURI === 'string' && document.baseURI.length > 0) {
     return document.baseURI;
   }
-  return typeof window !== 'undefined' ? window.location.href : undefined;
+  return (typeof window !== 'undefined' ? window.location : globalThis.location)?.href;
 }
 
 export function basenameFromUrl(url: unknown): string {
   try {
-    const parsed = new URL(url as string, pageBaseUrl());
+    const parsed = new URL(url as string, sourceBaseUrl());
     const pathname = parsed.pathname || '';
     const name = pathname.split('/').pop() || 'model.gguf';
     return name.includes('?') ? name.split('?')[0] : name;
@@ -50,13 +49,13 @@ export function basenameFromUrl(url: unknown): string {
 
 export function normalizeAbsoluteUrl(url: unknown): string {
   try {
-    return new URL(url as string, pageBaseUrl()).toString();
+    return new URL(url as string, sourceBaseUrl()).toString();
   } catch (_) {
     return String(url);
   }
 }
 
-// Resolves each URL of a model source against the page, keeping a single URL
+// Resolves each model URL against the calling context, keeping a single URL
 // a string so the loader still expands a split-GGUF name into its shards.
 export function resolveModelSource(source: unknown): ModelSource {
   const cloned = cloneModelSource(source);
@@ -113,7 +112,7 @@ export function expandModelShardUrls(modelUrlOrUrls: unknown): string[] {
   }
 
   try {
-    const parsed = new URL(source, pageBaseUrl());
+    const parsed = new URL(source, sourceBaseUrl());
     const pathname = parsed.pathname || '';
     const slash = pathname.lastIndexOf('/');
     const dirPath = slash >= 0 ? pathname.slice(0, slash + 1) : '';

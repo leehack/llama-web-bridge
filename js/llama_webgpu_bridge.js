@@ -1201,15 +1201,15 @@ function cloneModelSource(source) {
 function hasModelSource(source) {
   return Array.isArray(source) ? source.length > 0 : typeof source === "string" && source.length > 0;
 }
-function pageBaseUrl() {
+function sourceBaseUrl() {
   if (typeof document !== "undefined" && typeof document.baseURI === "string" && document.baseURI.length > 0) {
     return document.baseURI;
   }
-  return typeof window !== "undefined" ? window.location.href : void 0;
+  return (typeof window !== "undefined" ? window.location : globalThis.location)?.href;
 }
 function basenameFromUrl(url) {
   try {
-    const parsed = new URL(url, pageBaseUrl());
+    const parsed = new URL(url, sourceBaseUrl());
     const pathname = parsed.pathname || "";
     const name = pathname.split("/").pop() || "model.gguf";
     return name.includes("?") ? name.split("?")[0] : name;
@@ -1220,7 +1220,7 @@ function basenameFromUrl(url) {
 }
 function normalizeAbsoluteUrl(url) {
   try {
-    return new URL(url, pageBaseUrl()).toString();
+    return new URL(url, sourceBaseUrl()).toString();
   } catch (_) {
     return String(url);
   }
@@ -1265,7 +1265,7 @@ function expandModelShardUrls(modelUrlOrUrls) {
     return [];
   }
   try {
-    const parsed = new URL(source, pageBaseUrl());
+    const parsed = new URL(source, sourceBaseUrl());
     const pathname = parsed.pathname || "";
     const slash = pathname.lastIndexOf("/");
     const dirPath = slash >= 0 ? pathname.slice(0, slash + 1) : "";

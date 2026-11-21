@@ -416,9 +416,10 @@ URL. A WebKit manifest or a whole-body entry counts on WebKit. On other engines,
 only the whole-body entry counts. Pass `options.cacheName` to select a cache.
 The default is the bridge's configured `cacheName`.
 
-An explicit shard array or a split GGUF filename requires every shard. URL
-fragments are ignored. Empty input, missing entries, unavailable Cache Storage,
-and lookup errors resolve `false`.
+An explicit shard array or a split GGUF filename requires every shard. Relative
+URLs resolve against the document base URL or the app-owned worker's script URL.
+URL fragments are ignored. Empty input, missing entries, unavailable Cache
+Storage, and lookup errors resolve `false`.
 
 The query leaves Cache Storage and loaded-model metadata unchanged. It uses no
 Web Lock and consumes no response bodies. It can run during another bridge
