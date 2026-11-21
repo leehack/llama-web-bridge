@@ -1,6 +1,7 @@
 // Worker-side message host that runs a bridge inside a dedicated worker.
 
 import { LlamaWebGpuBridge } from './bridge.ts';
+import { resolveCoreAssets } from './default_assets.ts';
 import { decisionErrorCodeOf } from './internal/decision.ts';
 import { EMBED_BATCH_PROGRESS_OPTION, EmbeddingError } from './internal/embedding.ts';
 import { ModelUnloadedError } from './internal/core_guard.ts';
@@ -33,18 +34,17 @@ import type {
 
 const textDecoder = new TextDecoder();
 
-let bridgeWorkerHostInstalled = false;
+// The standalone and public bundles can both be loaded in the same worker.
+const workerHostInstalled = Symbol.for('llamadart.bridgeWorkerHostInstalled');
 
 export function installBridgeWorkerHost() {
-  if (bridgeWorkerHostInstalled) {
-    return;
-  }
-
   if (typeof self === 'undefined' || typeof self.postMessage !== 'function') {
     throw new Error('Bridge worker host can only run inside a worker context');
   }
 
-  bridgeWorkerHostInstalled = true;
+  const scope = self as typeof self & { [workerHostInstalled]?: true };
+  if (scope[workerHostInstalled]) return;
+  scope[workerHostInstalled] = true;
   let bridge: LlamaWebGpuBridge | null = null;
 
   const postError = (id: unknown, error: unknown) => {
@@ -85,8 +85,10 @@ export function installBridgeWorkerHost() {
 
     try {
       if (type === 'init') {
+        const config = message.config || {};
         bridge = new LlamaWebGpuBridge({
-          ...(message.config || {}),
+          ...config,
+          ...resolveCoreAssets(config, false),
           disableWorker: true,
         });
         // Posted when the core retires, so it reaches the facade before the

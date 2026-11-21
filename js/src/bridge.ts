@@ -29,6 +29,8 @@ import {
   staleLoraAdapterError,
 } from './internal/lora.ts';
 import { cloneModelSource, hasModelSource, normalizeAbsoluteUrl, resolveModelSource, resolvePartUrls } from './internal/model_source.ts';
+import { isBridgeResolvedAsset, resolveCoreAssets, resolveWorkerAsset } from './default_assets.ts';
+import type { BridgeConfig } from './default_assets.ts';
 import { ModelStagingError, jsBackedStagingMode } from './internal/model_staging.ts';
 import { TEXT_TO_SPEECH_CANCELLED } from './internal/text_to_speech.ts';
 import { withoutNul } from './internal/text.ts';
@@ -53,7 +55,6 @@ import type {
   EmbedOptions,
   EmbedInput,
   EmbeddingCapabilities,
-  LlamaWebGpuBridgeConfig,
   LoadModelOptions,
   LoraAdapterCapabilities,
   LoraAdapterInfo,
@@ -203,7 +204,7 @@ const MODEL_OPERATION_KINDS: ReadonlySet<string> = new Set([
 ]);
 
 export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
-  declare _config: LlamaWebGpuBridgeConfig;
+  declare _config: BridgeConfig;
   declare _runtime: LlamaWebGpuBridgeRuntime | null;
   declare _workerProxy: BridgeWorkerProxy | null;
   declare _workerGeneration: number;
@@ -252,7 +253,7 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
   static supportsCompletionUsage = true;
   static supportsModelCacheQuery = true;
 
-  constructor(config: LlamaWebGpuBridgeConfig = {}) {
+  constructor(config: BridgeConfig = {}) {
     this._config = config;
     this._runtime = null;
     this._workerProxy = null;
@@ -1548,20 +1549,13 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
   }
 
   _workerModuleUrl() {
-    const candidate = this._config?.workerUrl;
-    if (typeof candidate === 'string' && candidate.trim().length > 0) {
-      return candidate.trim();
-    }
-
-    try {
-      return new URL('./llama_webgpu_bridge_worker.js', import.meta.url).toString();
-    } catch (_) {
-      return import.meta.url;
-    }
+    return resolveWorkerAsset(this._config).url;
   }
 
   _workerConfig() {
-    const config = this._config || {};
+    const config = this._config;
+    const { _coreAssetSources, ...assets } = resolveCoreAssets(config, resolveWorkerAsset(config).source !== 'explicit');
+    const hasResolvedCore = Object.values(_coreAssetSources).some(isBridgeResolvedAsset);
     return {
       workerRequestTimeoutMs: config.workerRequestTimeoutMs,
       workerInitTimeoutMs: config.workerInitTimeoutMs,
@@ -1570,16 +1564,17 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
       workerCompletionTimeoutMs: config.workerCompletionTimeoutMs,
       workerTextToSpeechTimeoutMs: config.workerTextToSpeechTimeoutMs,
       coreInitTimeoutMs: config.coreInitTimeoutMs,
-      wasmUrl: typeof config.wasmUrl === 'string' ? config.wasmUrl : undefined,
-      wasmUrlMem64: typeof config.wasmUrlMem64 === 'string'
-        ? config.wasmUrlMem64
+      wasmUrl: typeof assets.wasmUrl === 'string' ? assets.wasmUrl : undefined,
+      wasmUrlMem64: typeof assets.wasmUrlMem64 === 'string'
+        ? assets.wasmUrlMem64
         : undefined,
-      coreModuleUrl: typeof config.coreModuleUrl === 'string'
-        ? config.coreModuleUrl
+      coreModuleUrl: typeof assets.coreModuleUrl === 'string'
+        ? assets.coreModuleUrl
         : undefined,
-      coreModuleUrlMem64: typeof config.coreModuleUrlMem64 === 'string'
-        ? config.coreModuleUrlMem64
+      coreModuleUrlMem64: typeof assets.coreModuleUrlMem64 === 'string'
+        ? assets.coreModuleUrlMem64
         : undefined,
+      ...(hasResolvedCore ? { _coreAssetSources } : {}),
       preferMemory64: typeof config.preferMemory64 === 'boolean'
         ? config.preferMemory64
         : undefined,

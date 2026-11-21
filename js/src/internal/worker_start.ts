@@ -137,7 +137,9 @@ export interface PthreadWorkerStart {
   settle(adopted: boolean): void;
 }
 
-export function createPthreadWorkerStart(): PthreadWorkerStart {
+export function createPthreadWorkerStart(
+  { pthreadScriptUrl }: { pthreadScriptUrl?: string } = {},
+): PthreadWorkerStart {
   let mode: WorkerStartMode = 'direct';
   let settled = false;
   let abandoned = false;
@@ -197,7 +199,14 @@ export function createPthreadWorkerStart(): PthreadWorkerStart {
   };
 
   const PthreadWorker = function (url: string | URL, options?: WorkerOptions): Worker {
-    const scriptUrl = String(url);
+    let scriptUrl = String(url);
+    if (pthreadScriptUrl && scriptUrl !== pthreadScriptUrl) {
+      const stockName = /\/llama_webgpu_core(?:_mem64)?\.js$/.exec(scriptUrl)?.[0];
+      if (stockName && scriptUrl === new URL(`.${stockName}`, pthreadScriptUrl).href) {
+        // Emscripten asks for its original sibling filename even after bundling.
+        url = scriptUrl = pthreadScriptUrl;
+      }
+    }
     if (!isCrossOriginScriptUrl(scriptUrl)) {
       return new Worker(url, options);
     }
