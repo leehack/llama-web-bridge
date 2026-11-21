@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 import vm from 'node:vm';
 
 import { LlamaWebGpuBridge, ModelStagingError } from '../../js/src/llama_webgpu_bridge.js';
+import { guardCore, retireCore } from '../../js/src/internal/core_guard.ts';
 import { writeResponseToFsFileWithProgress } from '../../js/src/internal/download.ts';
 import { installBridgeWorkerHost } from '../../js/src/worker_host.ts';
 import {
@@ -95,6 +96,7 @@ function createStagingHarness({
   heapOpenResult = null,
   supportsHeapResident = 1,
   userAgent,
+  guard = false,
 } = {}) {
   const fs = createStubFs({ failWriteWith });
   const ccalls = [];
@@ -251,13 +253,16 @@ function createStagingHarness({
     userAgent,
   });
   runtime = bridge._runtime;
-  runtime._core = core;
+  const runtimeCore = guard
+    ? guardCore(core, (cause, stats) => runtime._handleCoreRetired(cause, stats))
+    : core;
+  runtime._core = runtimeCore;
   runtime._coreVariant = coreVariant;
   runtime._probeBackends = async () => false;
   runtime._ensureCore = async () => {
-    runtime._core = core;
+    runtime._core = runtimeCore;
     runtime._coreVariant = coreVariant;
-    return core;
+    return runtimeCore;
   };
   runtime._coreSupportsPthreads = () => pthreads;
   runtime._syncThreadPoolSizeHintFromCore = () => {};
@@ -287,6 +292,41 @@ function createStagingHarness({
 
 const SAFARI_26 = 'Mozilla/5.0 (iPhone; CPU iPhone OS 26_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.5 Mobile/15E148 Safari/604.1';
 const CHROMIUM = 'Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36';
+
+test('closing a direct staging writer skips ownership checks on a retired core', () => {
+  const { runtime } = createStagingHarness({ guard: true });
+  const core = runtime._core;
+  const mount = runtime._mountJsBackedStaging(core, 'model_staging_js_backed');
+  const mountId = runtime._activeJsStagingMounts.get(mount);
+  const writer = runtime._openDirectJsWriter(core, `${mount}/model.gguf`, 4, false,
+    () => runtime._assertJsStagingMountOwned(core, mount, mountId));
+
+  retireCore(core, 'writer abort');
+  assert.doesNotThrow(() => writer.close());
+});
+
+test('releasing a retired staging mount drops its bookkeeping without checking ownership', (t) => {
+  const { runtime } = createStagingHarness({ guard: true });
+  const core = runtime._core;
+  const mount = runtime._mountJsBackedStaging(core, 'model_staging_js_backed');
+  const ownership = t.mock.method(runtime, '_isJsStagingMountOwned');
+
+  retireCore(core, 'staging abort');
+  runtime._releaseJsModelStaging(core, mount);
+
+  assert.equal(runtime._activeJsStagingMounts.has(mount), false);
+  assert.equal(runtime._jsBackedStagingMounted, false);
+  assert.equal(ownership.mock.callCount(), 0);
+});
+
+test('a trap writing a staged model preserves the original error', async () => {
+  const { runtime, core } = createStagingHarness({ guard: true });
+  const trap = new WebAssembly.RuntimeError('unreachable');
+  core.llamadartJsModelFsWriteDirect = () => { throw trap; };
+
+  await assert.rejects(runtime.loadModelFromUrl('https://models.test/model.gguf'), (error) => error === trap);
+  assert.ok(runtime._runtimeNotes.includes('model_fs_write_failed'));
+});
 
 test('heap model staging selects the writer using the effective layer count and the core ABI', async (t) => {
   const model = 'https://models.test/model.gguf';
@@ -1390,8 +1430,25 @@ test('loadMultimodalProjector uses JS-backed direct staging when jsBackedModelSt
   assert.ok(oomErr instanceof ModelStagingError, String(oomErr));
   assert.equal(oomErr.code, 'MODEL_STAGING_ALLOCATION_FAILED');
   assert.deepEqual(oomHarness.fs.unmountedPaths, ['/jsmodels-1']);
+});
 
-  // Native abort in llamadart_webgpu_mmproj_load resets dead core.
+test('a trap loading a staged projector preserves the original error', async (t) => {
+  const { runtime, core } = createStagingHarness({ guard: true });
+  const trap = new WebAssembly.RuntimeError('unreachable');
+  const ccall = core.ccall;
+  t.mock.method(core, 'ccall', (name, ...args) => {
+    if (name === 'llamadart_webgpu_mmproj_load') throw trap;
+    return ccall(name, ...args);
+  });
+  runtime._modelBytes = 1024;
+  runtime._fetchWithTimeout = async () => new Response(new Uint8Array([1, 2, 3]), {
+    status: 200,
+    headers: { 'content-length': '3', 'content-encoding': 'identity' },
+  });
+
+  await assert.rejects(runtime.loadMultimodalProjector('https://models.test/mmproj-f16.gguf'),
+    (error) => error === trap);
+  assert.equal(runtime._activeJsStagingMounts.size, 0);
 });
 
 test('worker-mode loadMultimodalProjector preserves ModelStagingError without restarting or retrying worker', async () => {
