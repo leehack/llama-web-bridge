@@ -1287,6 +1287,84 @@ function expandModelShardUrls(modelUrlOrUrls) {
   }
 }
 
+// js/src/internal/environment.ts
+function isSafariUserAgent(userAgent) {
+  if (typeof userAgent !== "string" || userAgent.length === 0) {
+    return false;
+  }
+  const hasSafariToken = /Safari\//.test(userAgent);
+  const hasOtherBrowserToken = /(Chrome|Chromium|CriOS|Edg|OPR|Firefox|FxiOS)\//.test(userAgent);
+  return hasSafariToken && !hasOtherBrowserToken;
+}
+function isWebKitUserAgent(userAgent) {
+  return typeof userAgent === "string" && /AppleWebKit\//.test(userAgent) && !/(Chrome|Chromium|Edg|OPR)\//.test(userAgent);
+}
+var SAFARI_UNCAPPED_GPU_MIN_MAJOR = 27;
+var APPLE_SAFARI_PLATFORM = /^Mozilla\/5\.0 \((?:Macintosh; Intel Mac OS X \d+(?:_\d+)*|(?:iPhone|iPad|iPod touch); CPU (?:iPhone )?OS \d+(?:_\d+)* like Mac OS X)\) AppleWebKit\/\d+(?:\.\d+)* \(KHTML, like Gecko\) /;
+var SAFARI_PRODUCTS = /^(?:Version\/(\d+(?:\.\d+)*) )?(?:Mobile\/[A-Za-z0-9]+ )?Safari\/\d+(?:\.\d+)*$/;
+function appleSafariProducts(userAgent) {
+  if (typeof userAgent !== "string") return null;
+  const platform = APPLE_SAFARI_PLATFORM.exec(userAgent);
+  if (!platform) return null;
+  const products = SAFARI_PRODUCTS.exec(userAgent.slice(platform[0].length));
+  if (products?.[1] === "60.5" && userAgent.endsWith("Safari/605.1.15")) return null;
+  return products;
+}
+function isAppleSafariUserAgent(userAgent) {
+  return appleSafariProducts(userAgent) !== null;
+}
+function safariMajorVersion(userAgent) {
+  const version = appleSafariProducts(userAgent)?.[1];
+  const major = Number(version?.split(".")[0]);
+  return Number.isSafeInteger(major) ? major : null;
+}
+function safariDefaultMaxGpuLayers(userAgent) {
+  const major = safariMajorVersion(userAgent);
+  return major !== null && major >= SAFARI_UNCAPPED_GPU_MIN_MAJOR ? Infinity : 1;
+}
+function canPostSharedMemory() {
+  if (typeof MessageChannel !== "function" || typeof WebAssembly === "undefined") {
+    return true;
+  }
+  let channel = null;
+  try {
+    channel = new MessageChannel();
+    channel.port1.postMessage(new WebAssembly.Memory({ initial: 1, maximum: 1, shared: true }));
+    return true;
+  } catch (_) {
+    return false;
+  } finally {
+    channel?.port1.close();
+    channel?.port2.close();
+  }
+}
+function isMemory64Unsupported() {
+  try {
+    return typeof WebAssembly !== "undefined" && WebAssembly.validate(Uint8Array.of(0, 97, 115, 109, 1, 0, 0, 0, 5, 3, 1, 4, 0)) === false;
+  } catch (_) {
+    return false;
+  }
+}
+async function describeWebGpuUnavailable() {
+  const gpu = globalThis.navigator?.gpu;
+  if (!gpu || typeof gpu.requestAdapter !== "function") {
+    return { reason: "no_webgpu", adapter: "" };
+  }
+  let adapter = null;
+  try {
+    adapter = await gpu.requestAdapter();
+  } catch (_) {
+    adapter = null;
+  }
+  if (!adapter) {
+    return { reason: "no_adapter", adapter: "" };
+  }
+  return {
+    reason: adapter.features?.has?.("shader-f16") ? "unknown" : "adapter_missing_shader_f16",
+    adapter: [adapter.info?.vendor, adapter.info?.architecture].filter(Boolean).join("/")
+  };
+}
+
 // js/src/internal/model_staging.ts
 var REQUIRED_JS_MODEL_STAGING_EXPORTS = [
   "_llamadart_webgpu_js_model_fs_api_version",
@@ -1301,6 +1379,20 @@ var REQUIRED_JS_MODEL_STAGING_EXPORTS = [
   "_llamadart_webgpu_js_model_fs_release_mount_chunks",
   "llamadartJsModelFsWriteDirect"
 ];
+var JS_MODEL_STAGING_API_VERSION = 3;
+function jsBackedStagingMode(config) {
+  if (config?.jsBackedModelStaging === true) return "on";
+  if (config?.jsBackedModelStaging === false) return "off";
+  return isWebKitUserAgent(config?.userAgent ?? globalThis.navigator?.userAgent ?? "") ? "auto" : "off";
+}
+function supportsJsBackedStaging(core) {
+  if (!core || missingJsModelStagingExports(core).length > 0) return false;
+  const apiVersion = Number(core.ccall("llamadart_webgpu_js_model_fs_api_version", "number", [], []));
+  return isSupportedJsModelStagingApiVersion(apiVersion);
+}
+function isSupportedJsModelStagingApiVersion(apiVersion) {
+  return Number.isInteger(apiVersion) && apiVersion >= JS_MODEL_STAGING_API_VERSION;
+}
 var HEAP_RESIDENT_STAGING_EXPORTS = [
   "_llamadart_webgpu_js_model_fs_supports_heap_resident",
   "_llamadart_webgpu_js_model_fs_open_direct_heap",
@@ -2395,84 +2487,6 @@ async function writeResponseToFsFileWithProgress(response, fs, filePath, progres
   return finalLoaded;
 }
 
-// js/src/internal/environment.ts
-function isSafariUserAgent(userAgent) {
-  if (typeof userAgent !== "string" || userAgent.length === 0) {
-    return false;
-  }
-  const hasSafariToken = /Safari\//.test(userAgent);
-  const hasOtherBrowserToken = /(Chrome|Chromium|CriOS|Edg|OPR|Firefox|FxiOS)\//.test(userAgent);
-  return hasSafariToken && !hasOtherBrowserToken;
-}
-function isWebKitUserAgent(userAgent) {
-  return typeof userAgent === "string" && /AppleWebKit\//.test(userAgent) && !/(Chrome|Chromium|Edg|OPR)\//.test(userAgent);
-}
-var SAFARI_UNCAPPED_GPU_MIN_MAJOR = 27;
-var APPLE_SAFARI_PLATFORM = /^Mozilla\/5\.0 \((?:Macintosh; Intel Mac OS X \d+(?:_\d+)*|(?:iPhone|iPad|iPod touch); CPU (?:iPhone )?OS \d+(?:_\d+)* like Mac OS X)\) AppleWebKit\/\d+(?:\.\d+)* \(KHTML, like Gecko\) /;
-var SAFARI_PRODUCTS = /^(?:Version\/(\d+(?:\.\d+)*) )?(?:Mobile\/[A-Za-z0-9]+ )?Safari\/\d+(?:\.\d+)*$/;
-function appleSafariProducts(userAgent) {
-  if (typeof userAgent !== "string") return null;
-  const platform = APPLE_SAFARI_PLATFORM.exec(userAgent);
-  if (!platform) return null;
-  const products = SAFARI_PRODUCTS.exec(userAgent.slice(platform[0].length));
-  if (products?.[1] === "60.5" && userAgent.endsWith("Safari/605.1.15")) return null;
-  return products;
-}
-function isAppleSafariUserAgent(userAgent) {
-  return appleSafariProducts(userAgent) !== null;
-}
-function safariMajorVersion(userAgent) {
-  const version = appleSafariProducts(userAgent)?.[1];
-  const major = Number(version?.split(".")[0]);
-  return Number.isSafeInteger(major) ? major : null;
-}
-function safariDefaultMaxGpuLayers(userAgent) {
-  const major = safariMajorVersion(userAgent);
-  return major !== null && major >= SAFARI_UNCAPPED_GPU_MIN_MAJOR ? Infinity : 1;
-}
-function canPostSharedMemory() {
-  if (typeof MessageChannel !== "function" || typeof WebAssembly === "undefined") {
-    return true;
-  }
-  let channel = null;
-  try {
-    channel = new MessageChannel();
-    channel.port1.postMessage(new WebAssembly.Memory({ initial: 1, maximum: 1, shared: true }));
-    return true;
-  } catch (_) {
-    return false;
-  } finally {
-    channel?.port1.close();
-    channel?.port2.close();
-  }
-}
-function isMemory64Unsupported() {
-  try {
-    return typeof WebAssembly !== "undefined" && WebAssembly.validate(Uint8Array.of(0, 97, 115, 109, 1, 0, 0, 0, 5, 3, 1, 4, 0)) === false;
-  } catch (_) {
-    return false;
-  }
-}
-async function describeWebGpuUnavailable() {
-  const gpu = globalThis.navigator?.gpu;
-  if (!gpu || typeof gpu.requestAdapter !== "function") {
-    return { reason: "no_webgpu", adapter: "" };
-  }
-  let adapter = null;
-  try {
-    adapter = await gpu.requestAdapter();
-  } catch (_) {
-    adapter = null;
-  }
-  if (!adapter) {
-    return { reason: "no_adapter", adapter: "" };
-  }
-  return {
-    reason: adapter.features?.has?.("shader-f16") ? "unknown" : "adapter_missing_shader_f16",
-    adapter: [adapter.info?.vendor, adapter.info?.architecture].filter(Boolean).join("/")
-  };
-}
-
 // js/src/internal/image.ts
 async function decodeImageBytesToRgb(bytes, options = {}) {
   const sourceBytes = toUint8Array(bytes);
@@ -3522,6 +3536,13 @@ var LlamaWebGpuBridgeRuntime = class {
     }
     return unlinkFsFile(this._core.FS, path);
   }
+  _usesJsBackedStaging(core) {
+    const mode = jsBackedStagingMode(this._config);
+    if (mode !== "auto") return mode === "on";
+    if (supportsJsBackedStaging(core)) return true;
+    this._pushRuntimeNote("model_staging_js_backed_default_unavailable");
+    return false;
+  }
   _mountJsBackedStaging(core, noteTag) {
     const missingExports = missingJsModelStagingExports(core);
     if (missingExports.length > 0) {
@@ -3534,7 +3555,7 @@ var LlamaWebGpuBridgeRuntime = class {
     const apiVersion = Number(
       core.ccall("llamadart_webgpu_js_model_fs_api_version", "number", [], [])
     );
-    if (!Number.isInteger(apiVersion) || apiVersion < 3) {
+    if (!isSupportedJsModelStagingApiVersion(apiVersion)) {
       this._pushRuntimeNote("model_staging_js_backed_unsupported");
       throw new ModelStagingError(
         "MODEL_STAGING_UNSUPPORTED",
@@ -4545,7 +4566,7 @@ var LlamaWebGpuBridgeRuntime = class {
     let assertMountOwned;
     try {
       if (!loadedViaRemoteFetch) {
-        useJsBackedStaging = this._config.jsBackedModelStaging === true;
+        useJsBackedStaging = this._usesJsBackedStaging(core);
         let modelDir = "/models";
         let stagingMountId = 0;
         if (useJsBackedStaging) {
@@ -5132,7 +5153,7 @@ var LlamaWebGpuBridgeRuntime = class {
       throw new Error("Multimodal projector URL/path is empty.");
     }
     const core = await this._ensureCore();
-    const useJsBackedStaging = this._config.jsBackedModelStaging === true;
+    const useJsBackedStaging = this._usesJsBackedStaging(core);
     const fileName = basenameFromUrl(url);
     const fetchTimeoutMs = this._resolveFetchTimeoutMs({}, 18e4);
     const chunkTimeoutMs = this._resolveStreamChunkTimeoutMs({}, 9e4);
@@ -7271,7 +7292,7 @@ var BridgeWorkerProxy = class {
       this._pending.delete(id);
       if (type === "error") {
         const errorMessage = String(message.message || "Worker request failed");
-        const workerError = message.embeddingErrorCode ? new EmbeddingError(message.embeddingErrorCode, errorMessage) : this._config.jsBackedModelStaging === true && isModelStagingErrorCode(message.modelStagingErrorCode) ? new ModelStagingError(message.modelStagingErrorCode, errorMessage) : message.errorCode === CROSS_ORIGIN_ISOLATION_REQUIRED ? new CrossOriginIsolationError(errorMessage) : message.errorCode === SINGLE_THREAD_CORE_UNSUPPORTED ? new SingleThreadCoreError(errorMessage) : message.errorCode === BLOB_WORKER_BLOCKED ? new BlobWorkerBlockedError(message.blobWorkerBlockReason ?? "script", errorMessage) : message.errorCode === MODEL_UNLOADED_AFTER_CORE_ABORT ? new ModelUnloadedError(errorMessage) : message.errorCode === "MODEL_TRANSFER_LENGTH_ERROR" ? createModelTransferLengthError(errorMessage) : new Error(errorMessage);
+        const workerError = message.embeddingErrorCode ? new EmbeddingError(message.embeddingErrorCode, errorMessage) : jsBackedStagingMode(this._config) !== "off" && isModelStagingErrorCode(message.modelStagingErrorCode) ? new ModelStagingError(message.modelStagingErrorCode, errorMessage) : message.errorCode === CROSS_ORIGIN_ISOLATION_REQUIRED ? new CrossOriginIsolationError(errorMessage) : message.errorCode === SINGLE_THREAD_CORE_UNSUPPORTED ? new SingleThreadCoreError(errorMessage) : message.errorCode === BLOB_WORKER_BLOCKED ? new BlobWorkerBlockedError(message.blobWorkerBlockReason ?? "script", errorMessage) : message.errorCode === MODEL_UNLOADED_AFTER_CORE_ABORT ? new ModelUnloadedError(errorMessage) : message.errorCode === "MODEL_TRANSFER_LENGTH_ERROR" ? createModelTransferLengthError(errorMessage) : new Error(errorMessage);
         if (isDecisionErrorCode(message.decisionErrorCode)) {
           withDecisionErrorCode(workerError, message.decisionErrorCode);
         }
@@ -8127,7 +8148,7 @@ var LlamaWebGpuBridge = class {
     this._workerModelMissing = true;
   }
   _isNonRecoverableStagingError(error) {
-    if (this._config.jsBackedModelStaging !== true || !error || typeof error !== "object") {
+    if (jsBackedStagingMode(this._config) === "off" || !error || typeof error !== "object") {
       return false;
     }
     return error instanceof ModelStagingError || error.name === "ModelStagingError";
@@ -8512,7 +8533,7 @@ var LlamaWebGpuBridge = class {
       coreModuleUrlMem64: typeof config.coreModuleUrlMem64 === "string" ? config.coreModuleUrlMem64 : void 0,
       preferMemory64: typeof config.preferMemory64 === "boolean" ? config.preferMemory64 : void 0,
       allowSingleThreadCore: config.allowSingleThreadCore === true ? true : void 0,
-      ...config.jsBackedModelStaging === true ? { jsBackedModelStaging: true } : {},
+      ...typeof config.jsBackedModelStaging === "boolean" ? { jsBackedModelStaging: config.jsBackedModelStaging } : {},
       threads: Number(config.threads) > 0 ? Number(config.threads) : void 0,
       threadsBatch: Number(config.threadsBatch) > 0 ? Number(config.threadsBatch) : void 0,
       threadPoolSize: Number(config.threadPoolSize) > 0 ? Number(config.threadPoolSize) : void 0,

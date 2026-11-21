@@ -1,4 +1,5 @@
 import type { ModelStagingErrorCode } from '../llama_webgpu_bridge.d.ts';
+import { isWebKitUserAgent } from './environment.ts';
 import type { LlamaCoreModule } from './types.ts';
 
 export const REQUIRED_JS_MODEL_STAGING_EXPORTS = [
@@ -14,6 +15,30 @@ export const REQUIRED_JS_MODEL_STAGING_EXPORTS = [
   '_llamadart_webgpu_js_model_fs_release_mount_chunks',
   'llamadartJsModelFsWriteDirect',
 ] as const;
+
+const JS_MODEL_STAGING_API_VERSION = 3;
+
+export type JsBackedStagingMode = 'on' | 'off' | 'auto';
+
+// WebKit charges staged file copies, the wasm heap and GPU buffers against
+// the WebContent process memory limit.
+export function jsBackedStagingMode(
+  config: { jsBackedModelStaging?: unknown; userAgent?: unknown } | null | undefined,
+): JsBackedStagingMode {
+  if (config?.jsBackedModelStaging === true) return 'on';
+  if (config?.jsBackedModelStaging === false) return 'off';
+  return isWebKitUserAgent(config?.userAgent ?? globalThis.navigator?.userAgent ?? '') ? 'auto' : 'off';
+}
+
+export function supportsJsBackedStaging(core: LlamaCoreModule | null | undefined): boolean {
+  if (!core || missingJsModelStagingExports(core).length > 0) return false;
+  const apiVersion = Number(core.ccall('llamadart_webgpu_js_model_fs_api_version', 'number', [], []));
+  return isSupportedJsModelStagingApiVersion(apiVersion);
+}
+
+export function isSupportedJsModelStagingApiVersion(apiVersion: number): boolean {
+  return Number.isInteger(apiVersion) && apiVersion >= JS_MODEL_STAGING_API_VERSION;
+}
 
 // Optional: a core without these keeps staging on JS chunks.
 const HEAP_RESIDENT_STAGING_EXPORTS = [

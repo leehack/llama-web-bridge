@@ -14,7 +14,7 @@ import {
   SingleThreadCoreError,
 } from './internal/isolation.ts';
 import { MODEL_UNLOADED_AFTER_CORE_ABORT, ModelUnloadedError } from './internal/core_guard.ts';
-import { ModelStagingError, isModelStagingErrorCode } from './internal/model_staging.ts';
+import { ModelStagingError, isModelStagingErrorCode, jsBackedStagingMode } from './internal/model_staging.ts';
 import { TextToSpeechStreamingUnsupportedError } from './internal/text_to_speech.ts';
 import type { LlamaWebGpuBridgeConfig, TextToSpeechOptions } from './llama_webgpu_bridge.d.ts';
 import {
@@ -197,7 +197,7 @@ export class BridgeWorkerProxy {
         const errorMessage = String(message.message || 'Worker request failed');
         const workerError: Error & { state?: unknown } = message.embeddingErrorCode
           ? new EmbeddingError(message.embeddingErrorCode, errorMessage)
-          : (this._config.jsBackedModelStaging === true
+          : (jsBackedStagingMode(this._config) !== 'off'
             && isModelStagingErrorCode(message.modelStagingErrorCode))
             ? new ModelStagingError(message.modelStagingErrorCode, errorMessage)
             : message.errorCode === CROSS_ORIGIN_ISOLATION_REQUIRED

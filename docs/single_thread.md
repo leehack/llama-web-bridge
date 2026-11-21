@@ -25,7 +25,7 @@ load reports `core_single_thread`.
 
 ## wasm32 staging limits
 
-- **Default staging.** Model bytes occupy the same 4 GiB linear-memory address
+- **WASMFS staging.** Model bytes occupy the same 4 GiB linear-memory address
   space as the runtime. Earlier measurements loaded files of 0.80 GB and
   1.04 GB. With Chromium 153 and Apple Metal, the 2.50 GB Qwen3-4B-Q4_K_M
   failed in WASMFS after writing 1 GiB in both direct and worker mode. A
@@ -44,11 +44,11 @@ heap costs on wasm32 and memory64.
 
 ## iOS Safari
 
-On iOS Safari below 27, pass an explicit `nGpuLayers`. With
-`jsBackedModelStaging: true`, set `nGpuLayers: 0` for the highest model-size
-ceiling. A positive request defaults to at most one GPU layer on Safari below
-27, which keeps GPU acceleration with a lower memory ceiling. The default
-full-offload request uses JS chunks.
+WebKit defaults to JS-backed staging with a supported core. On iOS Safari
+below 27, pass an explicit `nGpuLayers`. Set it to `0` for the highest
+model-size ceiling. A positive request defaults to at most one GPU layer on
+Safari below 27, which keeps GPU acceleration with a lower memory ceiling.
+The default full-offload request uses JS chunks.
 
 WebKit can hold several copies of a Cache Storage entry in WebContent.
 On macOS Safari, a whole-model entry peaked at about three times the body
@@ -76,9 +76,12 @@ cache. [Device Run results](https://console.cloud.google.com/storage/browser/lla
 
 The memory estimates below come from Qwen3-0.6B-Q8_0 (767 MiB, `nCtx: 512`)
 and earlier memory-headroom probes on the same device model. The model
-architecture and context and batch settings affect the ceiling.
+architecture and context and batch settings affect the ceiling. Before the
+WebKit default changed, iOS terminated WebContent in all six runs of this Q8
+model with `jsBackedModelStaging` unset, across GPU-layer requests, cache
+settings, and direct and worker modes.
 
-| Effective GPU layers | Q8 result with heap staging | Estimated model-size ceiling |
+| Effective GPU layers | Q8 result with WebKit heap staging | Estimated model-size ceiling |
 | --- | --- | --- |
 | 0 | Loads and generates with 448 MiB of additional JS allocations | About 1.2–1.4 GiB |
 | 1 | Loads and generates; smaller batches leave more memory for weights | About 0.8–1.1 GiB at batch size 64 |

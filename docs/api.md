@@ -184,7 +184,7 @@ it.
 | `workerUrl` | `string` | URL for `llama_webgpu_bridge_worker.js`. Defaults to a sibling of the bridge module when possible. |
 | `disableWorker` | `boolean` | Force direct runtime mode. |
 | `allowSingleThreadCore` | `boolean` | Set to `true` with explicit `_st` core URLs to load on pages without cross-origin isolation. Single-thread cores use one CPU thread and report `core_single_thread`. A core that starts a pthread pool can still hit `Bridge core init timeout` if the page cannot share memory with workers. See [single-thread setup and timeout behavior](single_thread.md). |
-| `jsBackedModelStaging` | `boolean` | Opt-in (`false` by default). Stages model and projector GGUFs in a private per-operation `/jsmodels-<n>` mount. A supported core stages a single model file of known decoded size in one memory-mapped wasm heap block when the effective GPU layer count after the Safari cap is 0 or 1. Other cases use 64 MiB JS `Uint8Array` chunks. |
+| `jsBackedModelStaging` | `boolean` | Unset enables JS-backed staging on WebKit when the core supports it. `false` opts out on any browser. `true` requires JS-backed staging support. JS-backed staging places models and projectors in a private per-operation `/jsmodels-<n>` mount. A supported core stages a single model file of known decoded size in one memory-mapped wasm heap block when the effective GPU layer count after the Safari cap is 0 or 1. Other JS-backed loads use 64 MiB JS `Uint8Array` chunks. |
 | `preferMemory64` | `boolean` | Prefer the wasm64 core when available. Defaults to `true`; the runtime can still fall back to wasm32. |
 | `workerRequestTimeoutMs` | `number` | Default timeout for worker RPC calls, 2 minutes unless a method has its own default. It also sets the `embed`/`embedBatch` budget, which defaults to 10 minutes when an input has image or audio parts. |
 | `workerInitTimeoutMs` | `number` | Timeout for worker initialization. |
@@ -200,8 +200,8 @@ it.
 | `threadPoolSize` | `number` | Hint for the compiled pthread pool size, used before the core can report it. |
 | `nBatch` | `number` | llama.cpp batch size override. |
 | `nUbatch` | `number` | llama.cpp micro-batch size override. |
-| `nGpuLayers` | `number` | Default GPU layer count. `0` forces CPU/WASM execution. The bridge defaults to full offload when the count is omitted or negative. An effective count of `0` or `1` enables heap staging for eligible JS-backed loads. |
-| `userAgent` | `string` | User-agent override for Safari detection and the Safari GPU layer cap's version check. The version check requires an Apple platform and Safari's product tokens. |
+| `nGpuLayers` | `number` | Default GPU layer count. `0` forces CPU/WASM execution. The bridge defaults to full offload when the count is omitted or negative. An effective count of `0` or `1` enables heap staging for eligible JS-backed loads, including the WebKit default. |
+| `userAgent` | `string` | User-agent override for automatic WebKit staging and the Safari GPU layer cap. The Safari version check requires an Apple platform and Safari's product tokens. |
 | `remoteFetchThresholdBytes` | `number` | Size threshold for trying the native remote-fetch backend for large single-file models. |
 | `remoteFetchChunkBytes` | `number` | Chunk size used by remote-fetch streaming paths. |
 | `mediaMaxImagePixels` | `number` | Maximum image pixel count before multimodal image downscaling. |
@@ -331,7 +331,7 @@ Common `options` keys:
 | `signal` | `AbortSignal` used to cancel model transfer. |
 | `nCtx` | Context size. Defaults to the bridge runtime default, initially 4096. |
 | `nThreads`, `nThreadsBatch` | Per-load thread overrides, capped to the active runtime. |
-| `nGpuLayers` | Per-load GPU layer override. Use `0` for CPU/WASM mode. An effective count of `0` or `1` after the Safari cap selects heap staging for eligible JS-backed model loads. With the bridge default, an omitted or negative count requests full offload and uses JS chunks. |
+| `nGpuLayers` | Per-load GPU layer override. Use `0` for CPU/WASM mode. An effective count of `0` or `1` after the Safari cap selects heap staging for eligible JS-backed model loads, including the WebKit default. An omitted or negative count requests full offload, which uses JS chunks when JS-backed staging is enabled. |
 | `useMmap` | Pass `false` to keep eligible JS-backed model loads on JS chunks. |
 | `safariMaxGpuLayers` | Per-load Safari GPU layer cap. Recognized Safari 27 and newer default to no cap. Older or unidentified Safari versions default to one layer. |
 | `safariGpuProbe` | Set to `false` to skip the Safari load-time GPU probe. |
@@ -1283,7 +1283,7 @@ include:
 | `llamadart.webgpu.core_variant` | `wasm32`, `wasm64`, or initialization state. |
 | `llamadart.webgpu.model_source` | Model load source, such as network/cache/remote fetch. |
 | `llamadart.webgpu.model_cache_state` | Cache Storage state for the loaded model. |
-| `llamadart.webgpu.runtime_notes` | Semicolon-separated bridge notes. When a memory64 core attempt fails, `core_mem64_unavailable:<reason>` accompanies `core_mem64_unavailable` and the bridge logs a warning with the same code before trying wasm32. The codes are `unsupported` (the engine rejects a memory64 feature probe after the core factory fails), `timeout` (the bridge's core initialization timer expires), and `init_error` (other failures, including module import). Single-thread cores report `core_single_thread` and `core_pthreads:0`. Automatic fetch-backed loading on a single-thread worker reports `model_fetch_backend_requires_pthreads` and streams into staging. `model_staging_js_backed` identifies JS-backed staging. `model_staging_heap_resident` identifies the final staged model file backed by a wasm heap block. When an eligible load uses JS chunks, `model_staging_heap_resident_unavailable:<reason>` reports `unknown_size` for an unverified decoded size, `unsupported` for an older or fixed-memory core, or the native allocation error code. Model downloads report `model_stream_resume_validated` for verified resumes, `model_stream_resume_unvalidated` for resumes without sufficient validation, and `model_stream_restart:<reason>` when a response requires restarting at zero. `model_cache_parts` identifies a WebKit part entry used or stored by the operation. `model_cache_entry_invalid` reports a missing or damaged part, and `model_stream_restart:cache` marks the shard retry. `gpu_unavailable:<reason>` (`no_webgpu`, `no_adapter`, `adapter_missing_shader_f16`, `unknown`) says why a load with `nGpuLayers > 0` runs on the CPU. The bridge also logs one warning. Chrome hides `shader-f16` on NVIDIA drivers older than 615.71, and ggml-webgpu then registers no device. Safari reports `safari_gpu_layers_capped:<n>` when the cap lowers the requested count, `safari_gpu_probe_embedding` when probing with embeddings, `safari_gpu_probe_passed` or `safari_gpu_probe_failed` for the initial probe, `safari_gpu_probe_skipped_input_too_long` when both embedding prompt pairs exceed the effective microbatch, and `safari_fallback_cpu` when a retry loads on the CPU. |
+| `llamadart.webgpu.runtime_notes` | Semicolon-separated bridge notes. When a memory64 core attempt fails, `core_mem64_unavailable:<reason>` accompanies `core_mem64_unavailable` and the bridge logs a warning with the same code before trying wasm32. The codes are `unsupported` (the engine rejects a memory64 feature probe after the core factory fails), `timeout` (the bridge's core initialization timer expires), and `init_error` (other failures, including module import). Single-thread cores report `core_single_thread` and `core_pthreads:0`. Automatic fetch-backed loading on a single-thread worker reports `model_fetch_backend_requires_pthreads` and streams into staging. `model_staging_js_backed` identifies JS-backed staging. `model_staging_js_backed_default_unavailable` identifies a WebKit load that uses standard WASMFS staging because the core is missing a staging export or lacks a supported JS model filesystem API version. `model_staging_heap_resident` identifies the final staged model file backed by a wasm heap block. When an eligible load uses JS chunks, `model_staging_heap_resident_unavailable:<reason>` reports `unknown_size` for an unverified decoded size, `unsupported` for an older or fixed-memory core, or the native allocation error code. Model downloads report `model_stream_resume_validated` for verified resumes, `model_stream_resume_unvalidated` for resumes without sufficient validation, and `model_stream_restart:<reason>` when a response requires restarting at zero. `model_cache_parts` identifies a WebKit part entry used or stored by the operation. `model_cache_entry_invalid` reports a missing or damaged part, and `model_stream_restart:cache` marks the shard retry. `gpu_unavailable:<reason>` (`no_webgpu`, `no_adapter`, `adapter_missing_shader_f16`, `unknown`) says why a load with `nGpuLayers > 0` runs on the CPU. The bridge also logs one warning. Chrome hides `shader-f16` on NVIDIA drivers older than 615.71, and ggml-webgpu then registers no device. Safari reports `safari_gpu_layers_capped:<n>` when the cap lowers the requested count, `safari_gpu_probe_embedding` when probing with embeddings, `safari_gpu_probe_passed` or `safari_gpu_probe_failed` for the initial probe, `safari_gpu_probe_skipped_input_too_long` when both embedding prompt pairs exceed the effective microbatch, and `safari_fallback_cpu` when a retry loads on the CPU. |
 | `llamadart.webgpu.mmproj_loaded` | `1` when a projector is loaded. |
 | `llamadart.webgpu.supports_vision` | `1` when the active projector supports vision. |
 | `llamadart.webgpu.supports_audio` | `1` when the active projector supports audio. |
@@ -1399,7 +1399,12 @@ this function themselves.
   and wasm files from the same published bridge asset set.
 - Use `dispose()` before dropping references when switching models or tearing
   down a page component.
-- Use `jsBackedModelStaging: true` for models over about 1 GB on `wasm32`, or
+- WebKit uses JS-backed staging by default when the core exposes the staging
+  APIs and reports JS model filesystem API version 3 or later. With an
+  unsupported core, the default uses `/models` (or `/mmproj` for projectors).
+  On WebKit, staging failures can be `ModelStagingError` with the option unset.
+  Set `jsBackedModelStaging: false` to opt out. On other browsers, use
+  `jsBackedModelStaging: true` for models over about 1 GB on `wasm32`, or
   for any large model on `memory64` to cut the peak wasm heap (for example, when
   serving without cross-origin isolation using `WEBGPU_BRIDGE_PTHREADS=0` +
   `allowSingleThreadCore: true`). For single-file models with a known decoded
@@ -1422,8 +1427,8 @@ this function themselves.
   `1,317.7 ms` vs `1,660.5 ms` as direct staging skips wasm memory growth) and
   temporarily holding the full file in the JS heap until loaded and released. A
   JS allocation failure during staging throws `ModelStagingError` with code
-  `'MODEL_STAGING_ALLOCATION_FAILED'`, an unsupported older core missing
-  JS-backed exports throws `'MODEL_STAGING_UNSUPPORTED'`, an existing
+  `'MODEL_STAGING_ALLOCATION_FAILED'`, explicitly enabling staging with an
+  unsupported core throws `'MODEL_STAGING_UNSUPPORTED'`, an existing
   directory or mount at the staging path throws
   `'MODEL_STAGING_MOUNT_FAILED'` (without adopting it), and a single or split GGUF whose tensor
   payload exceeds the wasm32 `4 GiB` (`SIZE_MAX`) limit throws

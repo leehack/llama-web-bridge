@@ -10,7 +10,10 @@ export interface LlamaWebGpuBridgeConfig {
   /** Set for a `coreModuleUrl` core built without pthreads (`WEBGPU_BRIDGE_PTHREADS=0`): it loads on a page that is not cross-origin isolated, capped to one thread, instead of rejecting with `CrossOriginIsolationError`. */
   allowSingleThreadCore?: boolean;
   /**
-   * Stage fetched model files in a private WASMFS mount. A single-file GGUF
+   * Stage fetched model and projector files in a private WASMFS mount.
+   * Defaults to enabled on WebKit when the core supports it, and disabled
+   * elsewhere. Set false to opt out or true to require a staging-capable core.
+   * A single-file model GGUF
    * with a known decoded size and 0 or 1 effective GPU layers is staged once
    * in the wasm heap and memory-mapped on supported cores. Other loads use JS chunks.
    */

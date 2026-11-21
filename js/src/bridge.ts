@@ -29,7 +29,7 @@ import {
   staleLoraAdapterError,
 } from './internal/lora.ts';
 import { cloneModelSource, hasModelSource, normalizeAbsoluteUrl, resolveModelSource, resolvePartUrls } from './internal/model_source.ts';
-import { ModelStagingError } from './internal/model_staging.ts';
+import { ModelStagingError, jsBackedStagingMode } from './internal/model_staging.ts';
 import { TEXT_TO_SPEECH_CANCELLED } from './internal/text_to_speech.ts';
 import { withoutNul } from './internal/text.ts';
 import { bufferSourceBytes, toUint8Array } from './internal/typed_values.ts';
@@ -1046,7 +1046,7 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
   }
 
   _isNonRecoverableStagingError(error: unknown) {
-    if (this._config.jsBackedModelStaging !== true || !error || typeof error !== 'object') {
+    if (jsBackedStagingMode(this._config) === 'off' || !error || typeof error !== 'object') {
       return false;
     }
     return error instanceof ModelStagingError || (error as { name?: unknown }).name === 'ModelStagingError';
@@ -1566,7 +1566,9 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
         ? config.preferMemory64
         : undefined,
       allowSingleThreadCore: config.allowSingleThreadCore === true ? true : undefined,
-      ...(config.jsBackedModelStaging === true ? { jsBackedModelStaging: true } : {}),
+      ...(typeof config.jsBackedModelStaging === 'boolean'
+        ? { jsBackedModelStaging: config.jsBackedModelStaging }
+        : {}),
       threads: Number(config.threads) > 0 ? Number(config.threads) : undefined,
       threadsBatch: Number(config.threadsBatch) > 0
         ? Number(config.threadsBatch)
