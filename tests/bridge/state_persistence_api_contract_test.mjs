@@ -6,6 +6,7 @@ const SRC = readNativeCoreSource();
 const JS = bridgeJsSource();
 const CMAKE = readRepoText('CMakeLists.txt');
 const README = readRepoText('README.md');
+const API_DOCS = readRepoText('docs/api.md').replace(/\s+/g, ' ');
 
 const REQUIRED_NATIVE = [
   'llamadart_webgpu_state_save_file',
@@ -205,15 +206,18 @@ require(
   'worker stateLoadBytes must transfer a copied state buffer into the worker',
 );
 require(
-  README.includes('State persistence') && README.includes('stateSaveBytes') && README.includes('stateLoadBytes'),
-  'README must document state persistence semantics and bytes APIs',
+  README.includes('State persistence')
+    && README.includes('stateSaveBytes')
+    && README.includes('stateLoadBytes')
+    && README.includes('docs/api.md#state-persistence'),
+  'README must summarize the state bytes APIs and link to the API reference',
 );
 require(
-  README.includes('stateSave*` snapshots the current llama.cpp context')
-    && README.includes('The `tokens` argument is stored')
-    && README.includes('whose numeric conversion is greater than zero')
-    && README.includes('all other values fall back'),
-  'README must document snapshot timing, token metadata semantics, and tokenCapacity fallback requirements',
+  API_DOCS.includes('stateSave*` snapshots the current llama.cpp context')
+    && API_DOCS.includes('The `tokens` argument is stored')
+    && API_DOCS.includes('whose numeric conversion is greater than zero')
+    && API_DOCS.includes('All other values fall back'),
+  'The API reference must document snapshot timing, token metadata, and tokenCapacity fallback',
 );
 
 if (errors.length > 0) {
