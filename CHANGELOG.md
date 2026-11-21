@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Apply the one-layer cap to omitted and negative GPU layer counts on Apple Safari before 27. The cap is recomputed for each load, and `safariMaxGpuLayers: Infinity` opts out. (#270)
+
 - Resolve sibling worker and core assets automatically, including hashed bundler filenames and single-thread variants. Set `assetBaseUrl` to serve the assets from a separate directory.
 
 - Reuse one WasmFS fetch worker per threaded core. Each model mount keeps its own URL and chunk size, so the fifth consecutive fetch-backed load no longer stalls. (#301)

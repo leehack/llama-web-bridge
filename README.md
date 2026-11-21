@@ -109,11 +109,12 @@ the Safari cap. Streamed cache entries retain their measured decoded size so
 reloads can use the same path. On WebKit, standalone JS-backed
 model streams use `transfer(0)` to release consumed whole buffers on both heap
 and JS-chunk paths.
-Split models, full offload (the default or a negative
-`nGpuLayers`), more than one effective GPU layer, older or fixed-memory cores, and
-`useMmap: false` use JS chunks. On iOS Safari below 27, pass an explicit
-`nGpuLayers`. Setting it to 0 raises the model-size ceiling by keeping model
-weights on the CPU. WebKit writes and reads cached models in 16 MiB parts to
+Split models, more than one effective GPU layer (including uncapped full
+offload), older or fixed-memory cores, and `useMmap: false` use JS chunks.
+Apple Safari before 27 caps omitted and negative `nGpuLayers` requests to one
+layer by default. Set `nGpuLayers` to 0 to raise the model-size ceiling by
+keeping model weights on the CPU, or pass `safariMaxGpuLayers: Infinity` to opt
+out of the cap for a load. WebKit writes and reads cached models in 16 MiB parts to
 limit the memory Cache Storage uses during the load. See the
 [iOS measurements](docs/single_thread.md#ios-safari).
 Use [the cache query and projector APIs](docs/api.md#ismodelcachedurl-options)
