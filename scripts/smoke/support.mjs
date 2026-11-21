@@ -894,22 +894,50 @@ async function loadChromium() {
   }
 }
 
+async function readSmokeStage(page) {
+  let timer;
+  try {
+    return await Promise.race([
+      page.evaluate(() => window.__smokeStage || null).catch(() => null),
+      new Promise((resolve) => { timer = setTimeout(() => resolve(null), 1_500); }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function reportConsoleArtifactError(error) {
+  process.stderr.write(`browser smoke could not save console log: ${error.message}\n`);
+}
+
 // Load the harness in headless Chromium, wait for window.__smokeResult.ok, and
 // return the result with the last 200 console lines. The console log and the
 // result are written to `artifactsDir`, and a full-page screenshot when the
 // page fails or reports ok !== true.
-export async function runPlaywright(url, timeoutMs, artifactsDir, artifactPrefix = 'state-smoke') {
-  const chromium = await loadChromium();
+export async function runPlaywright(url, timeoutMs, artifactsDir, artifactPrefix = 'state-smoke', {
+  stageMarker = null, stagePrefix = null, launchBrowser = null,
+} = {}) {
   const consoleLines = [];
+  let lastStage = null;
   let payload = null;
-  const browser = await chromium.launch({ args: ['--no-sandbox'] });
+  const browser = launchBrowser ? await launchBrowser() : await (await loadChromium()).launch({ args: ['--no-sandbox'] });
   try {
     const page = await browser.newPage();
-    page.on('console', (message) => consoleLines.push(`${message.type()}: ${message.text()}`));
+    page.on('console', (message) => {
+      const text = message.text();
+      consoleLines.push(`${message.type()}: ${text}`);
+      const markerIndex = stageMarker ? text.indexOf(stageMarker) : -1;
+      if (markerIndex === -1) return;
+      const stage = text.slice(markerIndex + stageMarker.length).trim();
+      if (!stage) return;
+      lastStage = stage;
+      if (stagePrefix !== null) process.stderr.write(`${stagePrefix}: ${stage}\n`);
+    });
     page.on('pageerror', (error) => consoleLines.push(`pageerror: ${error.message}`));
     const screenshot = () => page.screenshot({
       path: path.join(artifactsDir, `${artifactPrefix}-page.png`),
       fullPage: true,
+      timeout: 5_000,
     });
     try {
       await page.goto(url, { waitUntil: 'load', timeout: timeoutMs });
@@ -920,18 +948,24 @@ export async function runPlaywright(url, timeoutMs, artifactsDir, artifactPrefix
         { timeout: timeoutMs },
       );
       payload = await page.evaluate(() => window.__smokeResult);
-      if (isPlainObject(payload) && payload.ok !== true && artifactsDir !== null) await screenshot();
+      if (!isPlainObject(payload)) throw new Error(`unexpected smoke result payload: ${pyRepr(payload)}`);
+      if (payload.ok !== true && artifactsDir !== null) await screenshot().catch(() => {});
     } catch (error) {
+      const stageAtFailure = lastStage;
       if (artifactsDir !== null) {
-        await fsp.mkdir(artifactsDir, { recursive: true });
-        await screenshot();
+        await writeTextArtifact(artifactsDir, `${artifactPrefix}-console.log`, `${consoleLines.join('\n')}\n`)
+          .catch(reportConsoleArtifactError);
+        await screenshot().catch(() => {});
+      }
+      if (error instanceof Error && !error.message.includes('(last stage:')) {
+        const stage = stageAtFailure ?? await readSmokeStage(page);
+        if (stage) error.message += ` (last stage: ${stage})`;
       }
       throw error;
     }
   } finally {
     await browser.close();
   }
-  if (!isPlainObject(payload)) throw new Error(`unexpected smoke result payload: ${pyRepr(payload)}`);
   payload.console = consoleLines.slice(-200);
   await writeTextArtifact(artifactsDir, `${artifactPrefix}-console.log`, `${consoleLines.join('\n')}\n`);
   await writeJsonArtifact(artifactsDir, `${artifactPrefix}-result.json`, payload);
@@ -962,12 +996,11 @@ export function webGpuLaunchArgs(platform = process.platform, { sharedArrayBuffe
 // added and the console log and result are written to `artifactsDir`.
 export async function runPollingPlaywright(url, timeoutMs, artifactsDir, {
   artifactPrefix, stageMarker, stagePrefix = null, transform = async () => {},
-  launchArgs = webGpuLaunchArgs(),
+  launchArgs = webGpuLaunchArgs(), launchBrowser = null,
 }) {
-  const chromium = await loadChromium();
   const consoleLines = [];
   let payload = null;
-  const browser = await chromium.launch({ args: launchArgs });
+  const browser = launchBrowser ? await launchBrowser() : await (await loadChromium()).launch({ args: launchArgs });
   try {
     const page = await browser.newPage();
     page.on('console', (message) => {
@@ -997,8 +1030,11 @@ export async function runPollingPlaywright(url, timeoutMs, artifactsDir, {
       if (!finished) throw new Error(`browser smoke timed out at stage: ${pyStr(previousStage)}`);
     } catch (error) {
       if (artifactsDir !== null) {
-        await fsp.mkdir(artifactsDir, { recursive: true });
-        await page.screenshot({ path: path.join(artifactsDir, `${artifactPrefix}-page.png`), fullPage: true });
+        await writeTextArtifact(artifactsDir, `${artifactPrefix}-console.log`, `${consoleLines.join('\n')}\n`)
+          .catch(reportConsoleArtifactError);
+        await page.screenshot({
+          path: path.join(artifactsDir, `${artifactPrefix}-page.png`), fullPage: true, timeout: 5_000,
+        }).catch(() => {});
       }
       throw error;
     }
@@ -1006,9 +1042,9 @@ export async function runPollingPlaywright(url, timeoutMs, artifactsDir, {
     await browser.close();
   }
   if (!isPlainObject(payload)) throw new Error(`unexpected smoke result payload: ${pyRepr(payload)}`);
+  await writeTextArtifact(artifactsDir, `${artifactPrefix}-console.log`, `${consoleLines.join('\n')}\n`);
   await transform(payload);
   payload.console = consoleLines.slice(-200);
-  await writeTextArtifact(artifactsDir, `${artifactPrefix}-console.log`, `${consoleLines.join('\n')}\n`);
   await writeJsonArtifact(artifactsDir, `${artifactPrefix}-result.json`, payload);
   return payload;
 }

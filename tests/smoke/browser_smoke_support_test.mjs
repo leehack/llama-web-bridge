@@ -11,6 +11,7 @@ import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
+import { test } from 'node:test';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import {
@@ -40,6 +41,8 @@ import {
   resolvePath,
   resolvePinnedFile,
   resolvePinnedModel,
+  runPlaywright,
+  runPollingPlaywright,
   serveIsolated,
   stageFile,
   translatePath,
@@ -649,7 +652,10 @@ assert.deepEqual(webGpuLaunchArgs('linux'), [
 // Runs a harness page's module script in Node against a fake bridge class, so the
 // in-page usage assertions are exercised without a browser. The page imports the
 // bridge from '/llama_webgpu_bridge.js'; that one call is redirected to the fake.
-async function runHarnessPage(page, Bridge, extraDocument = {}, { crossOriginIsolated = true, hideSharedArrayBuffer = false } = {}) {
+async function runHarnessPage(page, Bridge, extraDocument = {}, {
+  crossOriginIsolated = true, hideSharedArrayBuffer = false, hardwareConcurrency,
+  pageConsole = console, capturePage = () => {},
+} = {}) {
   const body = page.slice(page.indexOf('<script type="module">\n') + '<script type="module">\n'.length, page.lastIndexOf('</script>'));
   const importCall = "await import('/llama_webgpu_bridge.js')";
   assert.equal(body.split(importCall).length, 2, 'the harness must import the bridge exactly once');
@@ -657,14 +663,175 @@ async function runHarnessPage(page, Bridge, extraDocument = {}, { crossOriginIso
   const result = { textContent: 'pending' };
   const window = { crossOriginIsolated, __FakeBridge: Bridge, __FakeSingleThreadError: FakeSingleThreadError };
   const document = { getElementById: (id) => (id === 'result' ? result : null), ...extraDocument };
-  if (hideSharedArrayBuffer) {
-    await new Function('window', 'document', 'SharedArrayBuffer', `'use strict'; return ${script}`)(window, document, undefined);
-  } else {
-    await new Function('window', 'document', `'use strict'; return ${script}`)(window, document);
-  }
+  capturePage({ window, result });
+  await new Function('window', 'document', 'SharedArrayBuffer', 'navigator', 'console', `'use strict'; return ${script}`)(
+    window, document, hideSharedArrayBuffer ? undefined : SharedArrayBuffer, { hardwareConcurrency }, pageConsole,
+  );
   assert.equal(result.textContent, JSON.stringify(window.__smokeResult));
   return window.__smokeResult;
 }
+
+const grammarModes = ['wasm32 direct', 'wasm32 worker', 'wasm64 direct', 'wasm64 worker'];
+const grammarPage = grammarSmoke.renderHarness(1024, ['wasm32', 'wasm64']);
+
+class FakeGrammarBridge {
+  async getCompletionCapabilities() { return {}; }
+  async loadModelFromUrl(_url, { nThreads }) { this.nThreads = nThreads; }
+  async createCompletion() { return ''; }
+  async scoreNextToken() {
+    return { top: [{ token: 1, logprob: 0, bytes: new Uint8Array([120]) }] };
+  }
+  async tokenize() { return []; }
+  getModelMetadata() { return { 'llamadart.webgpu.n_threads': String(this.nThreads) }; }
+  async dispose() {}
+}
+
+for (const [hardwareConcurrency, expected] of [[4, 4], [2, 2], [16, 4]]) {
+  test(`grammar requests ${expected} threads with ${hardwareConcurrency} logical CPUs`, async () => {
+    const requested = [];
+    class Bridge extends FakeGrammarBridge {
+      async loadModelFromUrl(url, options) {
+        requested.push(options.nThreads);
+        await super.loadModelFromUrl(url, options);
+      }
+    }
+    const payload = await runHarnessPage(grammarPage, Bridge, {}, {
+      hardwareConcurrency, pageConsole: { log() {} },
+    });
+    assert.equal(payload.ok, true, payload.error);
+    assert.deepEqual(requested, grammarModes.map(() => expected));
+    assert.deepEqual(payload.modeResults.map(({ nThreads }) => nThreads), requested);
+  });
+}
+
+test('grammar reports each phase and cleanup in each mode', async () => {
+  const stages = [];
+  const payload = await runHarnessPage(grammarPage, FakeGrammarBridge, {}, {
+    pageConsole: { log: (line) => stages.push(line) },
+  });
+  assert.equal(payload.ok, true, payload.error);
+  const phases = [
+    'load-model', 'cases', 'plain-completion', 'sampler-runs', 'prompt-penalty',
+    'thinking-runs', 'lazy-grammar', 'multi-end-budget', 'dispose', 'done',
+  ];
+  assert.deepEqual(stages, grammarModes.flatMap((mode) => phases.map((phase) => `GRAMMAR_STAGE ${mode}:${phase}`)));
+  for (const mode of payload.modeResults) {
+    for (const key of [
+      'loadModelMs', 'casesMs', 'plainCompletionMs', 'samplerRunsMs', 'promptPenaltyMs',
+      'thinkingRunsMs', 'lazyGrammarMs', 'multiEndBudgetMs', 'disposeMs', 'totalMs',
+    ]) {
+      const timing = mode.phaseTimingsMs?.[key];
+      assert.ok(Number.isFinite(timing) && timing >= 0, `${mode.mode} did not report ${key}`);
+    }
+  }
+});
+
+test('grammar exposes the pending disposal stage before reporting a disposal error', async () => {
+  let page;
+  let pending;
+  class Bridge extends FakeGrammarBridge {
+    async dispose() {
+      pending = [page.window.__smokeStage, page.result.textContent];
+      throw new Error('disposal failed');
+    }
+  }
+  const payload = await runHarnessPage(grammarPage, Bridge, {}, {
+    pageConsole: { log() {} }, capturePage: (captured) => { page = captured; },
+  });
+  assert.match(firstErrorLine(payload), /disposal failed/);
+  assert.deepEqual(pending, ['wasm32 direct:dispose', 'pending: wasm32 direct:dispose']);
+});
+
+const timeoutMessage = 'page.waitForFunction: Timeout 900000ms exceeded.';
+const reportedStage = 'wasm64 worker:multi-end-budget';
+const fakeSmokeBrowser = ({ evaluate, failScreenshot = false, navigationError = null, timeoutWaiting = true }) => async () => {
+  const handlers = {};
+  return {
+    async newPage() {
+      return {
+        on(event, handler) { handlers[event] = handler; },
+        async goto() {
+          for (const line of ['loading model', `GRAMMAR_STAGE ${reportedStage}`]) {
+            handlers.console({ type: () => 'log', text: () => line });
+          }
+          if (navigationError !== null) throw navigationError;
+        },
+        async waitForFunction() { if (timeoutWaiting) throw new Error(timeoutMessage); },
+        evaluate,
+        async screenshot({ path: filename }) {
+          if (failScreenshot) throw new Error('screenshot failed');
+          fs.writeFileSync(filename, 'fake screenshot');
+        },
+      };
+    },
+    async close() {},
+  };
+};
+
+for (const wedged of [false, true]) {
+  test(`Playwright saves timeout diagnostics${wedged ? ' with a wedged page' : ''}`, { timeout: 5_000 }, async () => {
+    const artifactsDir = path.join(tmp, `grammar-timeout-${wedged}`);
+    const launchBrowser = fakeSmokeBrowser({
+      evaluate: wedged ? () => new Promise(() => {}) : async () => 'stale stage',
+      failScreenshot: wedged,
+    });
+    await assert.rejects(runPlaywright('http://localhost/', 900_000, artifactsDir, 'grammar-smoke', {
+      launchBrowser, stageMarker: 'GRAMMAR_STAGE ',
+    }), { message: `${timeoutMessage} (last stage: ${reportedStage})` });
+    assert.equal(fs.readFileSync(path.join(artifactsDir, 'grammar-smoke-console.log'), 'utf8'),
+      `log: loading model\nlog: GRAMMAR_STAGE ${reportedStage}\n`);
+    if (!wedged) assert.ok(fs.existsSync(path.join(artifactsDir, 'grammar-smoke-page.png')));
+  });
+}
+
+test('Playwright bounds the stage lookup when no console marker is available', { timeout: 5_000 }, async () => {
+  const launchBrowser = fakeSmokeBrowser({ evaluate: () => new Promise(() => {}) });
+  await assert.rejects(runPlaywright('http://localhost/', 900_000, null, 'grammar-smoke', {
+    launchBrowser, stageMarker: 'UNUSED_STAGE ',
+  }), { message: timeoutMessage });
+});
+
+test('Playwright writes a failed harness result when the screenshot fails', async () => {
+  const artifactsDir = path.join(tmp, 'failed-harness');
+  const launchBrowser = fakeSmokeBrowser({
+    evaluate: async () => ({ ok: false, error: 'harness disposal failed' }),
+    failScreenshot: true,
+    timeoutWaiting: false,
+  });
+  const payload = await runPlaywright('http://localhost/', 2_000, artifactsDir, 'grammar-smoke', { launchBrowser });
+  assert.equal(firstErrorLine(payload), 'harness disposal failed');
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(artifactsDir, 'grammar-smoke-result.json'), 'utf8')), payload);
+});
+
+test('a blocked console artifact path preserves browser timeout errors and screenshots', async () => {
+  const artifactsDir = path.join(tmp, 'blocked-console');
+  for (const prefix of ['grammar-smoke', 'polling-smoke']) {
+    fs.mkdirSync(path.join(artifactsDir, `${prefix}-console.log`), { recursive: true });
+  }
+  const navigationTimeout = 'page.goto: Timeout 2000ms exceeded.';
+  const marker = 'GRAMMAR_STAGE ';
+  const launchBrowser = fakeSmokeBrowser({ navigationError: new Error(navigationTimeout) });
+  await assert.rejects(runPollingPlaywright('http://localhost/', 2_000, artifactsDir, {
+    artifactPrefix: 'polling-smoke', stageMarker: 'UNUSED_STAGE ', launchBrowser,
+  }), { message: navigationTimeout });
+  await assert.rejects(runPlaywright('http://localhost/', 2_000, artifactsDir, 'grammar-smoke', {
+    stageMarker: marker, launchBrowser,
+  }), { message: `${navigationTimeout} (last stage: ${reportedStage})` });
+  for (const prefix of ['grammar-smoke', 'polling-smoke']) {
+    assert.ok(fs.existsSync(path.join(artifactsDir, `${prefix}-page.png`)));
+  }
+});
+
+test('polling Playwright saves its console on timeout', { timeout: 5_000 }, async () => {
+  const artifactsDir = path.join(tmp, 'polling-timeout');
+  const evaluated = [null, reportedStage];
+  await assert.rejects(runPollingPlaywright('http://localhost/', 250, artifactsDir, {
+    artifactPrefix: 'polling-smoke', stageMarker: 'UNUSED_STAGE ',
+    launchBrowser: fakeSmokeBrowser({ evaluate: async () => evaluated.shift() }),
+  }), { message: `browser smoke timed out at stage: ${reportedStage}` });
+  assert.equal(fs.readFileSync(path.join(artifactsDir, 'polling-smoke-console.log'), 'utf8'),
+    `log: loading model\nlog: GRAMMAR_STAGE ${reportedStage}\n`);
+});
 
 const firstErrorLine = (payload) => {
   assert.equal(payload.ok, false, JSON.stringify(payload));
