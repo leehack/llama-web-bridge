@@ -328,7 +328,8 @@ export async function copySingleThreadArtifacts(distDir, webRoot, { memory64 = f
 // Stage a large input without copying when the filesystem allows a hard link.
 export async function stageFile(source, target) {
   try {
-    await fsp.link(source, target);
+    // Linux links the symlink itself, which can break relative targets after staging.
+    await fsp.link(await fsp.realpath(source), target);
   } catch {
     await fsp.copyFile(source, target);
   }

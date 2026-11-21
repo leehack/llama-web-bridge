@@ -362,6 +362,7 @@ export function renderHarness(nCtx, memoryModes) {
     if (!window.crossOriginIsolated) {
       throw new Error('test page is not cross-origin isolated');
     }
+    setStage('startup:bridge-import');
     const module = await import('/llama_webgpu_bridge.js');
     const LlamaWebGpuBridge = module.LlamaWebGpuBridge || window.LlamaWebGpuBridge;
     assert(typeof LlamaWebGpuBridge === 'function', 'LlamaWebGpuBridge export was not registered');

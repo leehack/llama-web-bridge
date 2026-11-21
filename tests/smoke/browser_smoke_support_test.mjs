@@ -655,17 +655,18 @@ assert.deepEqual(webGpuLaunchArgs('linux'), [
 async function runHarnessPage(page, Bridge, extraDocument = {}, {
   crossOriginIsolated = true, hideSharedArrayBuffer = false, hardwareConcurrency,
   pageConsole = console, capturePage = () => {},
+  importBridge = () => ({ LlamaWebGpuBridge: Bridge, SingleThreadCoreError: FakeSingleThreadError }),
 } = {}) {
   const body = page.slice(page.indexOf('<script type="module">\n') + '<script type="module">\n'.length, page.lastIndexOf('</script>'));
   const importCall = "await import('/llama_webgpu_bridge.js')";
   assert.equal(body.split(importCall).length, 2, 'the harness must import the bridge exactly once');
-  const script = body.replace(importCall, '({ LlamaWebGpuBridge: window.__FakeBridge, SingleThreadCoreError: window.__FakeSingleThreadError })').trim();
+  const script = body.replace(importCall, 'await importBridge()').trim();
   const result = { textContent: 'pending' };
-  const window = { crossOriginIsolated, __FakeBridge: Bridge, __FakeSingleThreadError: FakeSingleThreadError };
+  const window = { crossOriginIsolated };
   const document = { getElementById: (id) => (id === 'result' ? result : null), ...extraDocument };
   capturePage({ window, result });
-  await new Function('window', 'document', 'SharedArrayBuffer', 'navigator', 'console', `'use strict'; return ${script}`)(
-    window, document, hideSharedArrayBuffer ? undefined : SharedArrayBuffer, { hardwareConcurrency }, pageConsole,
+  await new Function('window', 'document', 'SharedArrayBuffer', 'navigator', 'console', 'importBridge', `'use strict'; return ${script}`)(
+    window, document, hideSharedArrayBuffer ? undefined : SharedArrayBuffer, { hardwareConcurrency }, pageConsole, importBridge,
   );
   assert.equal(result.textContent, JSON.stringify(window.__smokeResult));
   return window.__smokeResult;
@@ -714,7 +715,10 @@ test('grammar reports each phase and cleanup in each mode', async () => {
     'load-model', 'cases', 'plain-completion', 'sampler-runs', 'prompt-penalty',
     'thinking-runs', 'lazy-grammar', 'multi-end-budget', 'dispose', 'done',
   ];
-  assert.deepEqual(stages, grammarModes.flatMap((mode) => phases.map((phase) => `GRAMMAR_STAGE ${mode}:${phase}`)));
+  assert.deepEqual(stages, [
+    'GRAMMAR_STAGE startup:bridge-import',
+    ...grammarModes.flatMap((mode) => phases.map((phase) => `GRAMMAR_STAGE ${mode}:${phase}`)),
+  ]);
   for (const mode of payload.modeResults) {
     for (const key of [
       'loadModelMs', 'casesMs', 'plainCompletionMs', 'samplerRunsMs', 'promptPenaltyMs',
@@ -723,6 +727,32 @@ test('grammar reports each phase and cleanup in each mode', async () => {
       const timing = mode.phaseTimingsMs?.[key];
       assert.ok(Number.isFinite(timing) && timing >= 0, `${mode.mode} did not report ${key}`);
     }
+  }
+});
+
+test('grammar reports its startup stage while the bridge import is pending', { timeout: 5_000 }, async () => {
+  const bridgeModule = Promise.withResolvers();
+  const importStarted = Promise.withResolvers();
+  const stages = [];
+  let page;
+  const smoke = runHarnessPage(grammarPage, FakeGrammarBridge, {}, {
+    capturePage: (captured) => { page = captured; },
+    pageConsole: { log: (line) => stages.push(line) },
+    importBridge: () => {
+      importStarted.resolve();
+      return bridgeModule.promise;
+    },
+  });
+  try {
+    await importStarted.promise;
+    assert.equal(page.window.__smokeStage, 'startup:bridge-import');
+    assert.equal(page.result.textContent, 'pending: startup:bridge-import');
+    assert.equal(page.window.__smokeResult, undefined);
+    assert.deepEqual(stages, ['GRAMMAR_STAGE startup:bridge-import']);
+  } finally {
+    bridgeModule.resolve({ LlamaWebGpuBridge: FakeGrammarBridge });
+    const payload = await smoke;
+    assert.equal(payload.ok, true, payload.error);
   }
 });
 
@@ -1542,8 +1572,7 @@ function parseResponse(buffer) {
     `multimodal browser smoke failed: missing bridge artifact: ${path.join(resolvePath(emptyDist), 'llama_webgpu_bridge.js')}\n`);
 }
 
-// stageFile hard-links when it can, like os.link, and copies otherwise (here
-// because the target exists, as os.link raised FileExistsError).
+// stageFile hard-links when it can and copies when the destination already exists.
 {
   const source = path.join(tmp, 'stage-source.bin');
   fs.writeFileSync(source, 'stage');
@@ -1556,5 +1585,20 @@ function parseResponse(buffer) {
   assert.equal(fs.readFileSync(copied, 'utf8'), 'stage');
   assert.notEqual(fs.statSync(copied).ino, fs.statSync(source).ino);
 }
+
+test('stageFile stages the bytes of a relative model cache symlink', async () => {
+  const cacheDir = fs.mkdtempSync(path.join(tmp, 'symlink-cache-'));
+  const webRoot = fs.mkdtempSync(path.join(tmp, 'symlink-site-'));
+  const modelUrl = 'https://example.invalid/model.gguf';
+  const contents = 'cached model bytes';
+  const modelSha256 = createHash('sha256').update(contents).digest('hex');
+  fs.writeFileSync(path.join(cacheDir, 'payload.gguf'), contents);
+  fs.symlinkSync('payload.gguf', path.join(cacheDir, cachedModelName(modelUrl)));
+  const model = await resolvePinnedModel({ modelPath: null, modelUrl, modelSha256, modelCacheDir: cacheDir });
+  const staged = path.join(webRoot, 'grammar-smoke-model.gguf');
+  await stageFile(model, staged);
+  assert.ok(fs.lstatSync(staged).isFile(), 'the staged model must be independent of the cache symlink');
+  assert.equal(fs.readFileSync(staged, 'utf8'), contents);
+});
 
 console.log('Browser smoke support contract passed');
