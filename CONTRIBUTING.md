@@ -570,10 +570,10 @@ query strings, and fragments before printing the location.
 
 ## Publish Process
 
-Releases are manual: the repository owner dispatches three workflows from
+Releases are manual: the repository owner dispatches four workflows from
 `main`, in order, each after the previous run succeeds. Every stage is
 first-attempt-only, so after a failure dispatch a new run instead of rerunning.
-Use one correlation ID for all three, 1-128 characters of `A-Za-z0-9._:-`
+Use one correlation ID for the first three stages, 1–128 characters of `A-Za-z0-9._:-`
 starting alphanumeric, such as `manual-v0.1.83`. The input keeps its historical
 name `orchestrator_correlation_id` because published manifests and release
 notes record it.
@@ -628,12 +628,24 @@ gh api repos/leehack/llama-web-bridge-assets/immutable-releases  # must be enabl
      -f publish_approved=true
    ```
 
+4. Publish Exact Qualified Bridge to npm, using the immutable assets release
+   from step 3. Complete the one-time setup below before the first dispatch.
+
+   ```bash
+   gh workflow run publish_npm.yml -R leehack/llama-web-bridge --ref main \
+     -f release_tag=v0.1.83 -f publish_approved=true
+   ```
+
 `gh run list -R leehack/llama-web-bridge -w <workflow file> -L 1` shows a run's
 ID. Each stage re-verifies everything it consumes: the candidate resolves the
 upstream and native tags and checks the native `assets.json` digest and
 inventory; qualification proves the candidate run and that its manifest carries
-the same correlation ID; publication re-proves both runs and binds the
-attestation to every input above.
+the same correlation ID; asset publication re-proves both runs and binds the
+attestation to the release inputs. npm publication authenticates the immutable
+release, verifies the candidate and publication runs, and downloads the
+unexpired qualification attestation by artifact ID to confirm it covers the
+exact release files. Dispatch step 4 while the qualification artifacts are
+still available.
 
 The candidate cannot read the assets repository's immutable-release setting, so
 it fails closed unless `assets_immutable_releases_enabled=true` and records the
@@ -704,6 +716,30 @@ a new `-N` tag in the candidate and publish workflows, because npm orders
 `vMAJOR.MINOR.PATCH-N` as a prerelease. Earlier `-N` bridge tags, the native
 forms `vMAJOR.MINOR.PATCH-N`, `bNNNN` and `bNNNN-N`, historical
 `bNNNN-llamadart.N` and prior wrapper forms are read-only compatibility inputs.
+
+### One-time npm setup
+
+1. In the bridge repository's GitHub settings, create the
+   `bridge-npm-publication` environment. Disable administrator bypass, choose
+   **Selected branches and tags**, and add only the branch `main`. Leave the
+   environment without required reviewers or secrets.
+2. Claim `llama-web-bridge` on npm from the maintainer's account. npm requires an
+   existing package before it can bind a Trusted Publisher. For the initial
+   claim, use a minimal `0.0.0-claim.0` package in a scratch directory under the
+   `bootstrap` dist-tag, then deprecate that version. The first qualified
+   release will set `latest`.
+3. In the package's npm access settings, add a GitHub Actions Trusted Publisher
+   with organization or user `leehack`, repository `llama-web-bridge`, workflow
+   filename `publish_npm.yml`, and environment `bridge-npm-publication`. Allow
+   publishing. After the first successful OIDC publish, set the package's
+   publishing access to require two-factor authentication and disallow tokens.
+
+The workflow accepts stable unsuffixed tags with rebuild `0` and rejects
+`v0.0.0` and fixture manifests. It fails if the npm version already exists.
+It verifies the registry tarball, provenance, and `latest` tag after publishing
+and uploads a `bridge-npm-publication-outcome` receipt. If publication succeeds
+and readback fails, check the existing version and its provenance on npm before
+dispatching again.
 
 Never interpolate `${{ inputs.* }}` directly inside a workflow `run` script.
 Transport dispatch inputs through `env` and use quoted shell expansions.
