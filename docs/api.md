@@ -773,9 +773,15 @@ The bridge exposes llama.cpp state/session save and load helpers after a model i
 loaded. State snapshots are tied to the same model, llama.cpp build, and
 compatible load parameters.
 
-The `tokens` argument records the already-evaluated prompt/prefix token list in
-the state file; it does not cause the bridge to evaluate those tokens. Save only
-after the prompt or prefix you want to restore has already been evaluated.
+`stateSave*` snapshots the current llama.cpp context. Save after evaluating the
+prompt or prefix you want to restore and pass its exact token list. The
+`tokens` argument is stored as metadata in the state file and returned by
+`stateLoad*`. Saving neither evaluates the tokens nor checks them against the
+KV cache. A mismatched list can cause incorrect prompt-prefix reuse after
+restoring state. An empty list leaves no prefix metadata to reuse.
+
+State save and load calls share the operation queue with generation. After a
+successful load, reissuing the same prompt can reuse the restored KV state.
 
 ### `stateSaveFile(path, tokens?)`
 
@@ -795,7 +801,7 @@ stateLoadFile(path: string, tokenCapacity = bridge.getContextSize()): Promise<{ 
 ```
 
 Loads a state/session file from the active runtime's WASMFS. A `tokenCapacity`
-whose numeric conversion is greater than zero is truncated and used; all other
+whose numeric conversion is greater than zero is truncated and used. All other
 values fall back to the active context size. The resolved capacity must be at
 least large enough for the stored token list and no larger than the active
 context size. The resolved `{ tokens }` value is the token list stored at save
@@ -1379,16 +1385,36 @@ include:
 | `llamadart.webgpu.core_variant` | `wasm32`, `wasm64`, or initialization state. |
 | `llamadart.webgpu.model_source` | Model load source, such as network/cache/remote fetch. |
 | `llamadart.webgpu.model_cache_state` | Cache Storage state for the loaded model. |
-| `llamadart.webgpu.runtime_notes` | Semicolon-separated bridge notes. When a memory64 core attempt fails, `core_mem64_unavailable:<reason>` accompanies `core_mem64_unavailable` and the bridge logs a warning with the same code before trying wasm32. The codes are `unsupported` (the engine rejects a memory64 feature probe after the core factory fails), `timeout` (the bridge's core initialization timer expires), and `init_error` (other failures, including module import). Single-thread cores report `core_single_thread` and `core_pthreads:0`. Automatic fetch-backed loading on a single-thread worker reports `model_fetch_backend_requires_pthreads` and streams into staging. `model_staging_js_backed` identifies JS-backed staging. `model_staging_js_backed_default_unavailable` identifies a WebKit load that uses standard WASMFS staging because the core is missing a staging export or lacks a supported JS model filesystem API version. `model_staging_heap_resident` identifies the final staged model file backed by a wasm heap block. When an eligible load uses JS chunks, `model_staging_heap_resident_unavailable:<reason>` reports `unknown_size` for an unverified decoded size, `unsupported` for an older or fixed-memory core, or the native allocation error code. Model downloads report `model_stream_resume_validated` for verified resumes, `model_stream_resume_unvalidated` for resumes without sufficient validation, and `model_stream_restart:<reason>` when a response requires restarting at zero. `model_cache_parts` identifies a WebKit part entry used or stored by the operation. `model_cache_entry_invalid` reports a missing or damaged part, and `model_stream_restart:cache` marks the shard retry. `mmproj_cache_entry_invalid` marks a projector retry after a missing or damaged part. `gpu_unavailable:<reason>` (`no_webgpu`, `no_adapter`, `adapter_missing_shader_f16`, `unknown`) says why a load with `nGpuLayers > 0` runs on the CPU. The bridge also logs one warning. Chrome hides `shader-f16` on NVIDIA drivers older than 615.71, and ggml-webgpu then registers no device. Safari reports `safari_gpu_layers_capped:<n>` when the cap lowers the effective offload, including when Apple Safari caps a full-offload request, `safari_gpu_probe_embedding` when probing with embeddings, `safari_gpu_probe_passed` or `safari_gpu_probe_failed` for the initial probe, `safari_gpu_probe_skipped_input_too_long` when both embedding prompt pairs exceed the effective microbatch, and `safari_fallback_cpu` when a retry loads on the CPU. |
+| `llamadart.webgpu.runtime_notes` | Semicolon-separated bridge diagnostics. See [Runtime notes](#runtime-notes). |
 | `llamadart.webgpu.mmproj_loaded` | `1` when a projector is loaded. |
 | `llamadart.webgpu.supports_vision` | `1` when the active projector supports vision. |
 | `llamadart.webgpu.supports_audio` | `1` when the active projector supports audio. |
 | `llamadart.webgpu.worker_fallback_reason` | Present from a fallback from worker mode to direct runtime until `dispose()`, even when a later CPU-mode media request moves the model to a new worker. |
 
-Worker mode reports `worker_start:direct` or `worker_start:blob`.
-Threaded cores report `pthread_start:direct` when the bridge forwards the
-core's worker URL and `pthread_start:blob` when the bridge supplies a module
-blob. A blocked bridge worker blob start can leave a
+#### Runtime notes
+
+| Note | Meaning |
+| --- | --- |
+| `core_mem64_unavailable`, `core_mem64_unavailable:<reason>` | A memory64 attempt failed. The bridge logs the reason before trying wasm32. `unsupported` means the engine failed a memory64 feature probe after the factory failed. `timeout` means initialization timed out. `init_error` covers other failures, including module import. |
+| `core_single_thread`, `core_pthreads:0` | A single-thread core is active. |
+| `worker_start:direct`, `worker_start:blob` | The bridge worker started from its URL or a module blob. |
+| `pthread_start:direct`, `pthread_start:blob` | The bridge forwarded the core's pthread worker URL or supplied a module blob. |
+| `worker_start_blocked:<reason>` | A blocked bridge worker blob start can leave this note on the page-thread runtime. |
+| `model_fetch_backend_requires_pthreads` | Automatic fetch-backed loading on a single-thread worker uses streamed staging. |
+| `model_staging_js_backed` | The load uses JS-backed staging. |
+| `model_staging_js_backed_default_unavailable` | WebKit used standard WASMFS staging because the core lacked a required export or supported staging API version. |
+| `model_staging_heap_resident` | A wasm heap block backs the staged model file. |
+| `model_staging_heap_resident_unavailable:<reason>` | An eligible load used JS chunks. Reasons include `unknown_size` for an unverified decoded size, `unsupported` for an older or fixed-memory core, or a native allocation error code. |
+| `model_stream_resume_validated`, `model_stream_resume_unvalidated` | The model stream resumed with or without sufficient validation. |
+| `model_stream_restart:<reason>` | The shard download restarted at byte zero. `model_stream_restart:cache` identifies a retry after a cache entry error. |
+| `model_cache_parts` | The operation read or stored a WebKit part entry. |
+| `model_cache_entry_invalid`, `mmproj_cache_entry_invalid` | A missing or damaged cache part caused a model or projector retry. |
+| `gpu_unavailable:<reason>` | A load with `nGpuLayers > 0` uses the CPU and logs a warning. Reasons are `no_webgpu`, `no_adapter`, `adapter_missing_shader_f16`, and `unknown`. |
+| `safari_gpu_layers_capped:<n>` | A Safari cap or successful probe retry lowered effective offload to `n` layers. This includes capped full-offload requests on Apple Safari. |
+| `safari_gpu_probe_embedding` | Safari probed the GPU with embeddings. |
+| `safari_gpu_probe_passed`, `safari_gpu_probe_failed` | Result of the initial Safari GPU probe. |
+| `safari_gpu_probe_skipped_input_too_long` | Both embedding prompt pairs exceeded the effective microbatch. |
+| `safari_fallback_cpu` | A probe retry loaded the model on the CPU. |
 `worker_start_blocked:<reason>` note on the page-thread runtime.
 
 ### `getContextSize()`
@@ -1507,56 +1533,50 @@ this function themselves.
   and wasm files from the same published bridge asset set.
 - Use `dispose()` before dropping references when switching models or tearing
   down a page component.
-- WebKit uses JS-backed staging by default when the core exposes the staging
-  APIs and reports JS model filesystem API version 3 or later. With an
-  unsupported core, the default uses `/models` (or `/mmproj` for projectors).
-  On WebKit, staging failures can be `ModelStagingError` with the option unset.
-  Set `jsBackedModelStaging: false` to opt out. On other browsers, use
-  `jsBackedModelStaging: true` for models over about 1 GB on `wasm32`, or
-  for any large model on `memory64` to cut the peak wasm heap (for example, when
-  serving without cross-origin isolation using `WEBGPU_BRIDGE_PTHREADS=0` +
-  `allowSingleThreadCore: true`). For single-file models with a known decoded
-  size and an effective GPU layer count of 0 or 1 after the Safari cap, a
-  supported growable core downloads into one memory-mapped wasm heap block. The block
-  remains resident for the model's lifetime. Split GGUFs, multimodal projectors,
-  `useMmap: false`, `useMlock: true`, and full or higher GPU offload use
-  64 MiB JS `Uint8Array` chunks. Both paths use a private
-  per-operation `/jsmodels-<n>` mount without copying through WASMFS. The path is
-  unique per core instance, including across bridges that share one through
-  `coreModuleFactory` from the same bridge bundle. Later loads use a fresh path
-  even when a mount or its native registration remains after cleanup. The
-  allocator checks individual paths and skips existing entries and native mount
-  collisions. It reports `MODEL_STAGING_MOUNT_FAILED` if all 64 candidates are
-  blocked. Each bridge cleans up its own mounts.
-  Native memory grows by a few bytes per staging mount for the core's lifetime
-  because Emscripten's WasmFS backend table retains created backends. Its
-  cost is slightly slower native chunk reads on small loads (`Qwen3-0.6B-Q8_0`
-  3-run median `nativeLoadMs` `480.9 ms` vs `444.6 ms` off; total load
-  `1,317.7 ms` vs `1,660.5 ms` as direct staging skips wasm memory growth) and
-  temporarily holding the full file in the JS heap until loaded and released. A
-  JS allocation failure during staging throws `ModelStagingError` with code
-  `'MODEL_STAGING_ALLOCATION_FAILED'`, explicitly enabling staging with an
-  unsupported core throws `'MODEL_STAGING_UNSUPPORTED'`, an existing
-  directory or mount at the staging path throws
-  `'MODEL_STAGING_MOUNT_FAILED'` (without adopting it), and a single or split GGUF whose tensor
-  payload exceeds the wasm32 `4 GiB` (`SIZE_MAX`) limit throws
-  `ModelStagingError` with code `'MODEL_TENSOR_SIZE_LIMIT_EXCEEDED'`. Measured
-  on Chrome WebGPU (Apple Metal-3, `nCtx: 2048`, `nGpuLayers: 999`,
-  `crossOriginIsolated === false`, `typeof SharedArrayBuffer === 'undefined'`,
-  `threads_capped_no_coi`) against `llama.cpp` v1.0.0: Qwen3-0.6B-Q8_0
-  (767 MiB) cut `wasm32` peak wasm heap from `2.00 GiB` to `349 MiB` (`373.5` /
-  `123.1` tok/s direct, `377.8` / `115.5` tok/s worker); Qwen3-4B-Q4_K_M
-  (2.33 GiB; `wasm32` baseline failed at `1.37 GiB` during `FS.write`) loaded
-  with `643 MiB` peak wasm heap in direct (`3,274 ms` load, `4.26 GB` peak JS
-  heap before GC, `124.2` / `45.9` tok/s) and worker (`1,475 ms` load, `135.4` /
-  `53.2` tok/s) modes; on `memory64` (`wasm64` no-pthreads), Qwen3-4B-Q4_K_M cut
-  peak wasm heap from `8.01 GiB` (`8.60 GB`, `4,131 ms` load, `127.2` / `43.5`
-  tok/s direct; `4,388 ms` load, `124.9` / `42.0` tok/s worker) to `656 MiB`
-  (`0.69 GB`, `2,049 ms` load, `3.79 GB` peak JS heap dropping to `23.5 MB`,
-  `124.8` / `50.7` tok/s direct; `1,585 ms` load, `128.6` / `50.0` tok/s worker);
-  and `wasm32` Qwen3-8B-Q4_K_M (4.68 GiB) hit the `4 GiB`
-  `gguf_init_from_reader` tensor size-overflow ceiling (`4,288,489,984 +
-  9,437,184` > `4,294,967,295`).
+- See [JS-backed model staging](#js-backed-model-staging) for browser defaults,
+  memory limits, and staging errors.
+
+### JS-backed model staging
+
+WebKit uses JS-backed staging by default when the core exposes the required
+exports and reports JS model filesystem API version 3 or later. Otherwise it
+uses standard WASMFS staging under `/models` or `/mmproj`. Set
+`jsBackedModelStaging: false` to opt out on any browser or `true` to require
+a staging-capable core.
+
+Heap-resident staging requires API version 4 or later and a growable core
+with heap staging support. It needs a single model file of known decoded
+size, an effective GPU layer count of 0 or 1 after any Safari cap, mmap
+enabled, and mlock disabled. The model uses one memory-mapped wasm heap block
+that stays resident for the model's lifetime. Other JS-backed loads, including
+split GGUFs and projectors, stage into 64 MiB JavaScript chunks. These chunks
+can temporarily hold the entire model until the core loads it. On WebKit,
+standalone model streams release consumed whole buffers where supported.
+
+Both paths use a private `/jsmodels-<n>` mount. Bridges from the same bundle
+that share a core through `coreModuleFactory` share a path counter. Each load
+checks up to 64 candidates and skips paths or native mounts that are already
+in use. Each bridge cleans up only its own mounts. The WasmFS backend table
+retains each created backend for the core's lifetime.
+
+A core holds one loaded model. To keep multiple models loaded, give each
+bridge a separate core instance. Loading a replacement through another bridge
+on the same core can keep the previous heap block resident until its owning
+bridge releases it.
+
+A staging failure may be a `ModelStagingError` even when the option is unset
+on WebKit. Use its `code` to distinguish these cases.
+
+| Code | Meaning |
+| --- | --- |
+| `MODEL_STAGING_ALLOCATION_FAILED` | JS memory allocation failed during staging. |
+| `MODEL_STAGING_UNSUPPORTED` | The selected core lacks a required export or supported API version. |
+| `MODEL_STAGING_MOUNT_FAILED` | The bridge could not allocate or verify its private staging mount, or lost ownership during the load. |
+| `MODEL_TENSOR_SIZE_LIMIT_EXCEEDED` | The single-file or split GGUF tensor payload exceeds the wasm32 4 GiB address bound. |
+
+See the [Chromium measurements](single_thread.md#chromium-webgpu-measurements)
+and [iOS Safari results](single_thread.md#ios-safari) for observed limits and
+heap costs.
 
 ### `BlobWorkerBlockedError`
 

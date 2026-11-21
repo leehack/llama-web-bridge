@@ -1,9 +1,9 @@
 # GGUF on pages without cross-origin isolation
 
-Set `allowSingleThreadCore: true` and use the explicit `_st` core URLs. These
-cores run with one CPU thread. WebGPU can still offload model layers, and the
-cores support vision, speech recognition and speech synthesis. Use the wasm32
-core in Safari, where memory64 is unavailable. The bridge can load
+Set `allowSingleThreadCore: true` to select the single-thread defaults. If you
+supply core URLs, point them at the `_st` variants. These cores run with one
+CPU thread and support WebGPU offload, vision, speech recognition, and speech
+synthesis. The iOS Safari measurements below use wasm32. The bridge can load
 single-thread cores from a CDN on non-isolated pages. With
 `disableWorker: true`, the single-thread core starts no workers.
 
@@ -25,22 +25,45 @@ load reports `core_single_thread`.
 
 ## wasm32 staging limits
 
-- **WASMFS staging.** Model bytes occupy the same 4 GiB linear-memory address
-  space as the runtime. Earlier measurements loaded files of 0.80 GB and
-  1.04 GB. With Chromium 153 and Apple Metal, the 2.50 GB Qwen3-4B-Q4_K_M
-  failed in WASMFS after writing 1 GiB in both direct and worker mode. A
-  previous run reached 1.37 GiB. The available staging capacity varies with
-  allocations and filesystem growth.
-- **JS-backed staging.** With `jsBackedModelStaging: true`, the 2.50 GB
-  Qwen3-4B-Q4_K_M generated on WebGPU in both modes and used 643 MiB peak wasm
-  heap. This full-offload case uses JS chunks during staging. The browser's JS
-  heap and device memory still limit model size. Qwen3-8B-Q4_K_M (4.68 GiB)
-  returned `MODEL_TENSOR_SIZE_LIMIT_EXCEEDED` after staging because its
-  tensor payload exceeds the wasm32 4 GiB bound.
+With standard WASMFS staging, model bytes share the 4 GiB linear-memory
+address space with the runtime. Earlier runs loaded files of 0.80 GB and
+1.04 GB. The 2.50 GB Qwen3-4B-Q4_K_M failed in WASMFS after writing 1 GiB
+in both direct and worker modes on Chromium 153 with Apple Metal. An earlier
+run reached 1.37 GiB. Allocations and filesystem growth affect that limit.
 
-Use JS-backed staging for models over about 1 GB. The
-[API measurements](api.md#browser-and-asset-requirements) include staging and
-heap costs on wasm32 and memory64.
+JS-backed staging avoids storing a second full copy in the wasm heap. The
+browser's JS heap, device memory, and wasm32 tensor address limit still
+constrain the largest model. See the
+[staging API](api.md#js-backed-model-staging) for browser defaults and errors.
+
+### Chromium WebGPU measurements
+
+The runs below used Chromium WebGPU on Apple Metal-3 with the llama.cpp
+v1.0.0 pin, `nCtx: 2048`, and `nGpuLayers: 999`. The page was non-isolated
+and `SharedArrayBuffer` was unavailable. The cores used one CPU thread.
+
+| Model (size) | Staging / Mode | Load time | Peak wasm heap | Peak JS heap | Prefill / Decode | Outcome |
+| --- | --- | --- | --- | --- | --- | --- |
+| Qwen3-0.6B-Q8_0 (767 MiB) | `wasm32` Off (`/models`), direct | 1,660.5 ms (3-run median) | 2.00 GiB | 300 MB | 359.6 / 119.4 tok/s | Pass |
+| Qwen3-0.6B-Q8_0 (767 MiB) | `wasm32` JS-backed (`/jsmodels`), direct | 1,317.7 ms (3-run median) | 349 MiB | 1.18 GB | 373.5 / 123.1 tok/s | Pass |
+| Qwen3-0.6B-Q8_0 (767 MiB) | `wasm32` JS-backed (`/jsmodels`), worker | 731.8 ms | 349 MiB | — | 377.8 / 115.5 tok/s | Pass |
+| Qwen3-4B-Q4_K_M (2.33 GiB) | `wasm32` Off (`/models`), direct | — | 2.75 GiB | 863 MB | — | Fail in `FS.write` at 1.37 GiB |
+| Qwen3-4B-Q4_K_M (2.33 GiB) | `wasm32` JS-backed (`/jsmodels`), direct | 3,274 ms | 643 MiB | 4.26 GB (before GC) | 124.2 / 45.9 tok/s | Pass (`37/37` GPU layers) |
+| Qwen3-4B-Q4_K_M (2.33 GiB) | `wasm32` JS-backed (`/jsmodels`), worker | 1,475 ms | 643 MiB | — | 135.4 / 53.2 tok/s | Pass (`37/37` GPU layers) |
+| Qwen3-4B-Q4_K_M (2.33 GiB) | `memory64` Off (`/models`), direct | 4,131 ms | 8.01 GiB (8.60 GB) | 1.06 GB (drops to 8.1 MB) | 127.2 / 43.5 tok/s | Pass |
+| Qwen3-4B-Q4_K_M (2.33 GiB) | `memory64` Off (`/models`), worker | 4,388 ms | 8.01 GiB (8.60 GB) | — | 124.9 / 42.0 tok/s | Pass |
+| Qwen3-4B-Q4_K_M (2.33 GiB) | `memory64` JS-backed (`/jsmodels`), direct | 2,049 ms | 656 MiB (0.69 GB) | 3.79 GB (drops to 23.5 MB) | 124.8 / 50.7 tok/s | Pass |
+| Qwen3-4B-Q4_K_M (2.33 GiB) | `memory64` JS-backed (`/jsmodels`), worker | 1,585 ms | 656 MiB (0.69 GB) | — | 128.6 / 50.0 tok/s | Pass |
+| Qwen3-8B-Q4_K_M (4.68 GiB) | `wasm32` JS-backed (`/jsmodels`), direct | — | — | — | — | Fail: wasm32 4 GiB `gguf_init_from_reader` tensor overflow |
+
+For the 767 MiB model, median native load time rose from 444.6 ms to 480.9 ms
+with JS-backed staging. Total median load time fell from 1,660.5 ms to
+1,317.7 ms as direct staging avoided wasm memory growth.
+
+On the 4B run Chrome approached its roughly 4.4 GB V8 JS heap limit
+before staging chunks were released. The 8B model exceeded the separate
+wasm32 tensor payload limit of 4 GiB and reported
+`MODEL_TENSOR_SIZE_LIMIT_EXCEEDED`.
 
 ## iOS Safari
 
