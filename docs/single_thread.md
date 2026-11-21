@@ -44,11 +44,12 @@ heap costs on wasm32 and memory64.
 
 ## iOS Safari
 
-WebKit defaults to JS-backed staging with a supported core. On iOS Safari
-below 27, pass an explicit `nGpuLayers`. Set it to `0` for the highest
-model-size ceiling. A positive request defaults to at most one GPU layer on
-Safari below 27, which keeps GPU acceleration with a lower memory ceiling.
-The default full-offload request uses JS chunks.
+WebKit defaults to JS-backed staging with a supported core. On Apple Safari
+before 27, the bridge caps full-offload requests, including the default and
+negative `nGpuLayers`, to one GPU layer. This keeps GPU acceleration and
+allows eligible models to use heap staging. Set `nGpuLayers` to `0` for the
+highest model-size ceiling. Use `safariMaxGpuLayers: Infinity` to opt out for
+a load. Uncapped full offload uses JS chunks.
 
 WebKit can hold several copies of a Cache Storage entry in WebContent.
 On macOS Safari, a whole-model entry peaked at about three times the body
@@ -78,6 +79,16 @@ default caching at `nGpuLayers: 0`. Cold loads and cache-hit reloads worked in
 direct and worker modes, and direct loads also worked with 448 MiB of extra JS
 allocations. Prefetch wrote 48 parts and a manifest, and the next load hit the
 cache. [Device Run results](https://console.cloud.google.com/storage/browser/llamadart-cuda-qa-20260916-devicerun/automation/sessions/session-8319c979-b975-4560-ba07-35ea7bdb6954/).
+
+On the same device model and OS version, the wasm32 single-thread core
+loaded Qwen3-0.6B-Q8_0 with default caching and heap-resident staging. The
+omitted-count direct and worker cases and the direct `nGpuLayers: -1` case
+loaded one GPU layer and passed the Safari GPU probe. The direct
+`nGpuLayers: 0` control loaded zero GPU layers. All four cases generated
+“Paris” with `nCtx: 512`. Device Run session
+`session-e7d6dfa1-27eb-4cdd-90bd-e4bd37a5d736` recorded the results for
+[#300](https://github.com/leehack/llama-web-bridge/pull/300). The temporary
+public objects were deleted and returned HTTP 403 by HEAD and GET.
 
 The memory estimates below come from Qwen3-0.6B-Q8_0 (767 MiB, `nCtx: 512`)
 and earlier memory-headroom probes on the same device model. The model
