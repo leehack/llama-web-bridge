@@ -336,7 +336,7 @@ Common `options` keys:
 | `safariMaxGpuLayers` | Per-load Safari GPU layer cap. Recognized Safari 27 and newer default to no cap. Older or unidentified Safari versions default to one layer. |
 | `safariGpuProbe` | Set to `false` to skip the Safari load-time GPU probe. |
 | `nBatch`, `nUbatch` | Per-load batch and micro-batch overrides. |
-| `useCache`, `force` | Cache Storage controls for model responses. A cache miss writes the model to Cache Storage during the download. If the cache write fails, the download can still finish and load the model. Cancellation during transfer discards the incomplete entry. WebKit uses 16 MiB parts and a manifest under synthetic `https://llamadart-cache.invalid/` keys. A Web Lock allows one context to store a given model in a given cache at a time. A competing context or one without Web Locks or `crypto.randomUUID()` loads without storing. Other engines store one whole-body entry under the model URL. |
+| `useCache`, `force` | Cache Storage controls for model responses. A cache miss writes the model to Cache Storage during the download. If the cache write fails, the download can still finish and load the model. Cancellation during transfer discards the incomplete entry. WebKit uses 16 MiB parts and a manifest under synthetic `https://llamadart-cache.invalid/` keys. A Web Lock allows one context to store a given model in a given cache at a time. When a load needs to download a model and the lock is busy, Web Locks are unavailable, or `crypto.randomUUID()` is unavailable, the load proceeds uncached. Other engines store one whole-body entry under the model URL. |
 | `streamResumeRetries` | Maximum retry count per shard for resuming or restarting a streamed model download. |
 | `remoteFetchThresholdBytes`, `remoteFetchChunkBytes` | Per-load remote-fetch tuning. |
 | `forceRemoteFetchBackend` | Force the native fetch backend for a single-file model in a worker. On a single-thread worker, the load rejects with `SingleThreadCoreError` (`code: 'SINGLE_THREAD_CORE_UNSUPPORTED'`, `feature: 'remote_fetch_backend'`). Page-thread loads use streamed staging. |
@@ -382,6 +382,10 @@ worker-backed. Use it to warm the browser cache before calling
 manifest keys as loading. Applications accessing Cache Storage directly cannot
 retrieve these entries with `caches.match(modelUrl)`.
 
+If a WebKit prefetch needs to download a model and cannot acquire its cache
+lock or generate a UUID, it downloads the body and then rejects with the
+message `Failed to store prefetched model in browser cache.`
+
 ### `evictModelFromCache(url, options?)`
 
 ```ts
@@ -390,8 +394,10 @@ evictModelFromCache(url: string | string[], options?: Record<string, unknown>): 
 
 Removes one model URL, explicit shard array, or expanded split-model URL set from
 Cache Storage, including both whole-body entries and WebKit part entries.
-Eviction skips a model while another context holds its cache lock. Removing part
-entries requires Web Locks. Returns whether any requested model or shard was removed.
+Eviction skips a model while an active store or cache cleanup holds its lock.
+This includes cleanup in the same context immediately after cancellation.
+Removing part entries requires Web Locks. Returns whether any requested model
+or shard was removed.
 
 ## Text generation
 
@@ -610,6 +616,12 @@ The draft is staged in the WASM heap before it loads. When the server reports
 the draft's size and it would not fit in the memory left, the call rejects
 before reading the body; on the wasm32 core, whose heap is limited to 4 GiB, the
 message says a memory64 core is required.
+
+When a cached WebKit part is missing or damaged, the draft load rejects. In
+direct mode the error's `name` is `ModelCacheEntryError`. In worker mode the
+call rejects with an `Error` carrying the same message. The bridge removes the
+damaged entry for the next call when it acquires the cache lock and the entry
+is still current.
 
 ### `unloadDraftModel()`
 

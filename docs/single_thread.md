@@ -57,11 +57,16 @@ models in 16 MiB parts, commits a manifest after the last part, and reads one
 part at a time. The manifest records the decoded size for heap staging on a
 cache hit.
 
-| Engine | Cache Storage format for model loads and prefetches |
+| Engine | Model cache behavior |
 | --- | --- |
 | WebKit with Web Locks and `crypto.randomUUID()` | 16 MiB parts and a manifest |
-| WebKit missing one or both APIs | Existing entries can be read. Downloads skip the cache write. |
+| WebKit missing one or both APIs | Existing cache entries are readable. |
 | Chromium and Firefox | Whole model response under its URL |
+
+When WebKit needs to download a model and the cache lock is busy, or either
+Web Locks or `crypto.randomUUID()` is unavailable, a load proceeds uncached.
+In those cases `prefetchModelToCache()` downloads the body and then rejects
+with the message `Failed to store prefetched model in browser cache.`
 
 On an iPhone 17 Pro running iOS 26.5.1, the 805 MB Q8 model loaded with
 default caching at `nGpuLayers: 0`. Cold loads and cache-hit reloads worked in
