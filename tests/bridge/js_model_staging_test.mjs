@@ -12,6 +12,7 @@ import {
   isRetryableStreamNetworkError,
   writeResponseToFsFileWithProgress,
 } from '../../js/src/internal/download.ts';
+import { jsBackedStagingMode, supportsJsBackedStaging } from '../../js/src/internal/model_staging.ts';
 import { installBridgeWorkerHost } from '../../js/src/worker_host.ts';
 import {
   createRealWorkerBridge,
@@ -250,7 +251,7 @@ function createStagingHarness({
     disableWorker: true,
     allowSingleThreadCore: true,
     preferMemory64: coreVariant === 'wasm64',
-    jsBackedModelStaging,
+    ...(jsBackedModelStaging === null ? {} : { jsBackedModelStaging }),
     userAgent,
   });
   runtime = bridge._runtime;
@@ -2449,4 +2450,183 @@ test('staging off cleanup matches main unchanged (retry-unlink, 404/503 unlink, 
     /503/,
   );
   assert.equal(harness.fs.files.has('/mmproj/err503.gguf'), false);
+});
+
+const IPHONE_CHROME = 'Mozilla/5.0 (iPhone; CPU iPhone OS 26_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) CriOS/153.0.7000.10 Mobile/15E148 Safari/604.1';
+const IPAD_DESKTOP = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.5 Safari/605.1.15';
+const MAC_SAFARI_27 = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/27.0 Safari/605.1.15';
+const FIREFOX = 'Mozilla/5.0 (X11; Linux x86_64; rv:150.0) Gecko/20100101 Firefox/150.0';
+
+test('an unset jsBackedModelStaging stages on WebKit and stays off elsewhere', () => {
+  for (const [config, expected] of [
+    [{ userAgent: SAFARI_26 }, 'auto'],
+    [{ userAgent: IPHONE_CHROME }, 'auto'],
+    [{ userAgent: IPAD_DESKTOP }, 'auto'],
+    [{ userAgent: MAC_SAFARI_27 }, 'auto'],
+    [{ userAgent: SAFARI_26, jsBackedModelStaging: undefined }, 'auto'],
+    [{ userAgent: SAFARI_26, jsBackedModelStaging: false }, 'off'],
+    [{ userAgent: SAFARI_26, jsBackedModelStaging: true }, 'on'],
+    [{ userAgent: CHROMIUM }, 'off'],
+    [{ userAgent: FIREFOX }, 'off'],
+    [{ userAgent: CHROMIUM, jsBackedModelStaging: true }, 'on'],
+    [{ userAgent: CHROMIUM, jsBackedModelStaging: false }, 'off'],
+    [{}, 'off'],
+    [undefined, 'off'],
+  ]) {
+    assert.equal(jsBackedStagingMode(config), expected, JSON.stringify(config));
+  }
+});
+
+test('the default staging mode reads the page user agent when the config has none', () => {
+  const descriptor = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
+  try {
+    Object.defineProperty(globalThis, 'navigator', { configurable: true, value: { userAgent: SAFARI_26 } });
+    assert.equal(jsBackedStagingMode({}), 'auto');
+    assert.equal(jsBackedStagingMode({ userAgent: CHROMIUM }), 'off');
+    assert.equal(jsBackedStagingMode({ jsBackedModelStaging: false }), 'off');
+  } finally {
+    Object.defineProperty(globalThis, 'navigator', descriptor);
+  }
+});
+
+test('default WebKit staging requires every staging export and FS API version 3', () => {
+  assert.equal(supportsJsBackedStaging(createStagingHarness({ apiVersion: 3 }).core), true);
+  assert.equal(supportsJsBackedStaging(createStagingHarness({ apiVersion: 4 }).core), true);
+  assert.equal(supportsJsBackedStaging(createStagingHarness({ apiVersion: 2 }).core), false);
+  assert.equal(supportsJsBackedStaging(createStagingHarness({ apiVersion: 3.5 }).core), false);
+  assert.equal(supportsJsBackedStaging(createStagingHarness({ apiVersion: Infinity }).core), false);
+  assert.equal(supportsJsBackedStaging(createStagingHarness({ includeJsModelFsExports: false }).core), false);
+  const partial = createStagingHarness({ apiVersion: 4 }).core;
+  delete partial._llamadart_webgpu_js_model_fs_release_mount_chunks;
+  assert.equal(supportsJsBackedStaging(partial), false);
+  assert.equal(supportsJsBackedStaging(null), false);
+});
+
+test('model loads follow the default staging mode', async (t) => {
+  const cases = [
+    { name: 'iPhone Safari, zero layers', harness: { userAgent: SAFARI_26 }, options: { nGpuLayers: 0 }, staged: true, heap: true },
+    { name: 'iPhone Safari, capped layers', harness: { userAgent: SAFARI_26 }, options: { nGpuLayers: 99 }, staged: true, heap: true },
+    { name: 'iPhone Safari, omitted layers', harness: { userAgent: SAFARI_26 }, options: {}, staged: true },
+    { name: 'iPhone Chrome', harness: { userAgent: IPHONE_CHROME }, options: { nGpuLayers: 0 }, staged: true, heap: true },
+    { name: 'iPad desktop user agent', harness: { userAgent: IPAD_DESKTOP }, options: { nGpuLayers: 0 }, staged: true, heap: true },
+    { name: 'macOS Safari 27, full offload', harness: { userAgent: MAC_SAFARI_27 }, options: { nGpuLayers: 99 }, staged: true },
+    { name: 'explicit false on iPhone Safari', harness: { userAgent: SAFARI_26, jsBackedModelStaging: false }, options: { nGpuLayers: 0 } },
+    { name: 'Chromium', harness: { userAgent: CHROMIUM }, options: { nGpuLayers: 0 } },
+    { name: 'Firefox', harness: { userAgent: FIREFOX }, options: { nGpuLayers: 0 } },
+    { name: 'no user agent', harness: {}, options: { nGpuLayers: 0 } },
+    { name: 'older core on iPhone Safari', harness: { userAgent: SAFARI_26, includeJsModelFsExports: false }, options: { nGpuLayers: 0 }, unavailable: true },
+    { name: 'FS API version 2 on iPhone Safari', harness: { userAgent: SAFARI_26, apiVersion: 2 }, options: { nGpuLayers: 0 }, unavailable: true },
+    { name: 'fractional FS API version on iPhone Safari', harness: { userAgent: SAFARI_26, apiVersion: 3.5 }, options: { nGpuLayers: 0 }, unavailable: true },
+    { name: 'infinite FS API version on iPhone Safari', harness: { userAgent: SAFARI_26, apiVersion: Infinity }, options: { nGpuLayers: 0 }, unavailable: true },
+  ];
+  for (const entry of cases) {
+    await t.test(entry.name, async () => {
+      const { runtime, fs, ccalls } = createStagingHarness({ apiVersion: 4, jsBackedModelStaging: null, ...entry.harness });
+      runtime._gpuActive = true;
+      await runtime.loadModelFromUrl('https://models.test/model.gguf', {
+        ...entry.options, nCtx: 128, useCache: false, forceRemoteFetchBackend: false, safariGpuProbe: false,
+      });
+
+      const notes = runtime._runtimeNotes;
+      const mounts = ccalls.filter(([name]) => name === 'llamadart_webgpu_mount_js_model_fs');
+      const nativeLoad = ccalls.find(([name]) => name === 'llamadart_webgpu_load_model');
+      assert.equal(mounts.length, entry.staged ? 1 : 0);
+      assert.equal(notes.includes('model_staging_js_backed'), entry.staged === true);
+      assert.equal(notes.includes('model_staging_heap_resident'), entry.heap === true);
+      assert.equal(notes.includes('model_staging_js_backed_default_unavailable'), entry.unavailable === true);
+      assert.equal(notes.includes('model_staging_js_backed_unsupported'), false);
+      assert.equal(fs.dirs.has('/models'), !entry.staged);
+      assert.equal(nativeLoad[1].startsWith(entry.staged ? '/jsmodels-1/' : '/models/'), true, nativeLoad[1]);
+    });
+  }
+});
+
+test('an explicit jsBackedModelStaging still rejects an unsupported core on WebKit', async () => {
+  for (const unsupported of [
+    { includeJsModelFsExports: false },
+    { apiVersion: 3.5 },
+    { apiVersion: Infinity },
+  ]) {
+    const { runtime } = createStagingHarness({
+      jsBackedModelStaging: true, userAgent: SAFARI_26, ...unsupported,
+    });
+    await assert.rejects(
+      runtime.loadModelFromUrl('https://models.test/model.gguf', {
+        nCtx: 128, nGpuLayers: 0, useCache: false, forceRemoteFetchBackend: false,
+      }),
+      (error) => error instanceof ModelStagingError && error.code === 'MODEL_STAGING_UNSUPPORTED',
+    );
+    assert.equal(runtime._runtimeNotes.includes('model_staging_js_backed_default_unavailable'), false);
+  }
+});
+
+test('multimodal projector loads follow the default staging mode', async () => {
+  for (const [harnessOptions, expectedPath] of [
+    [{ userAgent: SAFARI_26 }, '/jsmodels-1/mmproj.gguf'],
+    [{ userAgent: SAFARI_26, jsBackedModelStaging: false }, '/mmproj/mmproj.gguf'],
+    [{ userAgent: SAFARI_26, includeJsModelFsExports: false }, '/mmproj/mmproj.gguf'],
+    [{ userAgent: CHROMIUM }, '/mmproj/mmproj.gguf'],
+  ]) {
+    const harness = createStagingHarness({ jsBackedModelStaging: null, ...harnessOptions });
+    harness.runtime._modelBytes = 1024;
+    harness.runtime._fetchWithTimeout = async () => new Response(new Uint8Array([5, 6, 7]), {
+      status: 200,
+      headers: { 'content-length': '3', 'content-encoding': 'identity' },
+    });
+    await harness.runtime.loadMultimodalProjector('https://models.test/mmproj.gguf');
+    const load = harness.ccalls.find(([name]) => name === 'llamadart_webgpu_mmproj_load');
+    assert.equal(load[1], expectedPath, JSON.stringify(harnessOptions));
+    assert.equal(
+      harness.runtime._runtimeNotes.includes('mmproj_staging_js_backed'),
+      expectedPath.startsWith('/jsmodels-'),
+    );
+  }
+});
+
+test('the worker receives an explicit jsBackedModelStaging and resolves an unset one itself', async () => {
+  for (const [config, forwarded, workerMode] of [
+    [{ userAgent: SAFARI_26 }, undefined, 'auto'],
+    [{ userAgent: SAFARI_26, jsBackedModelStaging: false }, false, 'off'],
+    [{ userAgent: SAFARI_26, jsBackedModelStaging: true }, true, 'on'],
+    [{ userAgent: CHROMIUM }, undefined, 'off'],
+    [{ userAgent: CHROMIUM, jsBackedModelStaging: false }, false, 'off'],
+  ]) {
+    const bridge = new LlamaWebGpuBridge({ disableWorker: true, ...config });
+    const workerConfig = bridge._workerConfig();
+    assert.equal(workerConfig.jsBackedModelStaging, forwarded, JSON.stringify(config));
+    assert.equal(Object.hasOwn(workerConfig, 'jsBackedModelStaging'), forwarded !== undefined);
+    assert.equal(jsBackedStagingMode(workerConfig), workerMode, JSON.stringify(config));
+    await bridge.dispose();
+  }
+});
+
+test('staging errors keep their type whenever staging can be active', async () => {
+  const stagingError = new ModelStagingError('MODEL_STAGING_ALLOCATION_FAILED', 'out of memory');
+  for (const [config, typed] of [
+    [{ userAgent: SAFARI_26 }, true],
+    [{ userAgent: SAFARI_26, jsBackedModelStaging: false }, false],
+    [{ userAgent: CHROMIUM }, false],
+    [{ userAgent: CHROMIUM, jsBackedModelStaging: true }, true],
+  ]) {
+    await withStubWorkerEnvironment(async ({ workers }) => {
+      const bridge = createRealWorkerBridge(config);
+      assert.equal(bridge._isNonRecoverableStagingError(stagingError), typed, JSON.stringify(config));
+      const proxy = bridge._workerProxy;
+      const driver = workerDriver(proxy, workers[0]);
+      driver.ready();
+      const pendingLoad = bridge.loadModelFromUrl('https://models.test/x.gguf', { nCtx: 128, nGpuLayers: 0 });
+      await driver.settle();
+      proxy._worker.onmessage({
+        data: {
+          id: driver.calls('loadModelFromUrl')[0].id,
+          type: 'error',
+          modelStagingErrorCode: 'MODEL_STAGING_ALLOCATION_FAILED',
+          message: 'out of memory',
+        },
+      });
+      const error = await pendingLoad.then(() => assert.fail('must reject'), (e) => e);
+      assert.equal(error instanceof ModelStagingError, typed, JSON.stringify(config));
+      await bridge.dispose();
+    });
+  }
 });
