@@ -23,7 +23,6 @@
 #include <emscripten/emscripten.h>
 #include <emscripten/heap.h>
 #include <emscripten/threading.h>
-#include <emscripten/wasmfs.h>
 
 #include "ggml-backend.h"
 #include "llama-cpp.h"
@@ -40,6 +39,7 @@
 #include "llama_webgpu_decision.h"
 #include "llama_webgpu_embedding_json.h"
 #include "llama_webgpu_embedding.h"
+#include "llama_webgpu_fetch_fs.h"
 #include "llama_webgpu_grammar.h"
 #include "llama_webgpu_lora.h"
 #include "llama_webgpu_mtmd_compat.h"

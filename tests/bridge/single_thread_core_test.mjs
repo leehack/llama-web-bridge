@@ -177,7 +177,7 @@ test('single-thread error round-trips through the host and worker proxy', async 
 test('the native URL loader rejects no-pthreads builds before creating a fetch backend', () => {
   const source = readNativeCoreSource();
   const loader = source.slice(source.indexOf('EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_load_model_from_url('));
-  const backend = loader.indexOf('wasmfs_create_fetch_backend(');
+  const backend = loader.indexOf('create_shared_fetch_file(');
   assert.ok(backend > 0, 'missing native fetch backend');
   assert.match(
     loader.slice(0, backend),
