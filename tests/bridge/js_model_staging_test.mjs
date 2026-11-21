@@ -1646,6 +1646,44 @@ test('failed Safari GPU probe fallback unmounts and releases JS-backed staged mo
   assert.equal(harness.openDirectHandles.size, 0);
 });
 
+test('a Safari wasm64 probe decode failure retries the original staged download', async () => {
+  const harness = createStagingHarness({
+    coreVariant: 'wasm64', userAgent: SAFARI_26, jsBackedModelStaging: null, apiVersion: 4,
+  });
+  const { bridge, runtime, core, ccalls } = harness;
+  const fetchModel = runtime._getCachedModelResponse.bind(runtime);
+  let fetches = 0;
+  runtime._getCachedModelResponse = async (...args) => {
+    if (++fetches > 1) throw new Error('model source went offline after download');
+    return fetchModel(...args);
+  };
+  const ccall = core.ccall.bind(core);
+  core.ccall = (name, ...args) => {
+    if (name === 'llamadart_webgpu_next_token') {
+      harness.setLastError('failed to decode');
+      return -1;
+    }
+    return ccall(name, ...args);
+  };
+
+  try {
+    await bridge.loadModelFromUrl('https://models.test/model.gguf', {
+      useCache: false, forceRemoteFetchBackend: false,
+    });
+    const loads = ccalls.filter(([name]) => name === 'llamadart_webgpu_load_model');
+    assert.deepEqual(loads.map((load) => load[7]), [1, 0]);
+    assert.match(loads[0][1], /^\/jsmodels-/);
+    assert.equal(loads[1][1], loads[0][1]);
+    assert.equal(fetches, 1);
+    assert.ok(runtime._runtimeNotes.includes('model_staging_heap_resident'));
+    assert.ok(runtime._runtimeNotes.includes('safari_gpu_probe_failed'));
+    assert.ok(runtime._runtimeNotes.includes('safari_fallback_cpu'));
+    assert.equal(bridge.getModelMetadata()['llamadart.webgpu.n_gpu_layers'], '0');
+  } finally {
+    await bridge.dispose();
+  }
+});
+
 test('staging off preserves main cancellation error on replacement worker projector retry and parity behaviors', async () => {
   // 1) Cancellation during replacement-worker projector retry wraps as plain Error when staging is off.
   let projectorAttempt = 0;

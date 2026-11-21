@@ -294,6 +294,31 @@ test('worker replay and main-thread fallback keep CPU after generation recovery'
   }
 });
 
+test('completion recovers to CPU again after replay of an omitted Safari count', async (t) => {
+  for (const execution of ['worker', 'main-thread']) {
+    await t.test(execution, () => withSafariBridge({
+      userAgent: safari('26.2'), preferMemory64: true,
+    }, async ({ bridge, trace, workers }) => {
+      await loadModel(bridge, withoutProbe);
+      assert.equal(await bridge.createCompletion(PROMPT, { nPredict: 5 }), COMPLETION);
+      assert.deepEqual(trace, [1, 0]);
+      assert.equal(metadata(bridge, 'n_gpu_layers'), '0');
+      if (execution === 'worker') {
+        await restartWorker(bridge, workers);
+      } else {
+        workers[0].crashOnResult = true;
+        await bridge.getCompletionCapabilities();
+      }
+      assert.equal(metadata(bridge, 'execution'), execution);
+      assert.deepEqual(trace, [1, 0, 1]);
+      assert.equal(await bridge.createCompletion(PROMPT, { nPredict: 5 }), COMPLETION);
+      assert.deepEqual(trace, [1, 0, 1, 0]);
+      assert.equal(metadata(bridge, 'n_gpu_layers'), '0');
+      assert.match(metadata(bridge, 'runtime_notes'), /generation_recovery_cpu_applied/);
+    }, { failGpuDecode: true }));
+  }
+});
+
 test('an omitted Safari count enables wasm64 CPU recovery and subsequent omitted loads inherit CPU', () => withSafariBridge({
   userAgent: safari('26.2'), disableWorker: true, preferMemory64: true,
 }, async ({ bridge, trace }) => {
@@ -463,6 +488,22 @@ test('safariMaxGpuLayers overrides the default in both directions', async () => 
   const raised = await load({ userAgent: safari('26.2'), options: { safariMaxGpuLayers: 99 } });
   assert.deepEqual(raised.loadedLayers, [99]);
   assert.deepEqual(raised.notes, ['safari_gpu_probe_passed']);
+});
+
+test('a failed Safari probe tries one layer after capping full offload to four', async () => {
+  let firstProbe = true;
+  const result = await load({
+    userAgent: safari('26.2'),
+    options: { nGpuLayers: -5, safariMaxGpuLayers: 4 },
+    completion: async () => {
+      if (!firstProbe) return COMPLETION;
+      firstProbe = false;
+      return PADS;
+    },
+  });
+  assert.deepEqual(result.loadedLayers, [4, 1]);
+  assert.equal(result.layers, '1');
+  assert.deepEqual(result.notes, ['safari_gpu_layers_capped:4', 'safari_gpu_probe_failed', 'safari_gpu_layers_capped:1']);
 });
 
 test('another browser is neither capped nor probed', async () => {

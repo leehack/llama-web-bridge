@@ -3279,6 +3279,8 @@ export class LlamaWebGpuBridgeRuntime {
               topP: 1,
               penalty: 1,
               seed: index + seedOffset,
+              // The probe retries with the current staging mount. Generation recovery would release it.
+              _llamadartGenerationRecoveryAttempted: true,
             });
             if (looksLikeCorruptedGeneration(probeOutput)) return 'failed';
           }
