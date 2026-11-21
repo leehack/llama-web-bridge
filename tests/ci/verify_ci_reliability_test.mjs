@@ -639,6 +639,15 @@ assertRejected(validatePublicationPatContract('jobs: [unterminated', EXPECTED_ST
     [CI_PATH, '        run: node scripts/smoke/cross_origin_assets.mjs\n',
       '        if: false\n        run: node scripts/smoke/cross_origin_assets.mjs\n',
       'job build-webgpu-bridge must run "node scripts/smoke/cross_origin_assets.mjs" unconditionally without continue-on-error'],
+    [CI_PATH, '        run: node scripts/smoke/bundler_packaging.mjs\n',
+      '        if: false\n        run: node scripts/smoke/bundler_packaging.mjs\n',
+      'job build-webgpu-bridge must run "node scripts/smoke/bundler_packaging.mjs" unconditionally without continue-on-error'],
+    [CI_PATH, '        run: npm ci --ignore-scripts --prefix scripts/smoke/bundler_deps\n',
+      '        run: npm install --prefix scripts/smoke/bundler_deps\n',
+      'job build-webgpu-bridge must run "npm ci --ignore-scripts --prefix scripts/smoke/bundler_deps" unconditionally without continue-on-error'],
+    [CI_PATH, '      - run: npm ci --ignore-scripts\n',
+      '      - run: npm ci --ignore-scripts --prefix scripts/smoke/bundler_deps\n',
+      'bundler smoke dependencies and execution must stay in build-webgpu-bridge'],
     ...['', ' --threading single'].map((flags) => {
       const command = `node scripts/smoke/core_abort_recovery.mjs${flags}`;
       return [CI_PATH, `        run: ${command}\n`, `        if: false\n        run: ${command}\n`,

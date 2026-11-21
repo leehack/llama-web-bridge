@@ -1,0 +1,10 @@
+{
+  "name": "llama-web-bridge-bundler-smoke",
+  "version": "0.0.0",
+  "private": true,
+  "devDependencies": {
+    "vite": "8.2.4",
+    "webpack": "5.113.0",
+    "webpack-cli": "7.3.1"
+  }
+}
