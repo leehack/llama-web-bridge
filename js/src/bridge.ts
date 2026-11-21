@@ -2836,9 +2836,7 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
           }
         },
         transferList,
-        streamAudio
-          ? () => this._throwIfOperationCancelled(undefined, TEXT_TO_SPEECH_CANCELLED, operation)
-          : undefined,
+        () => this._throwIfOperationCancelled(undefined, TEXT_TO_SPEECH_CANCELLED, operation),
       );
     } catch (error) {
       if (progressFailure) {

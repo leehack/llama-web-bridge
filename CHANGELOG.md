@@ -4,6 +4,8 @@
 
 - WebKit now uses JS-backed staging for models and projectors by default on supported cores. Set `jsBackedModelStaging: false` to opt out in either direct or worker mode. Staging failures can raise `ModelStagingError` with the option unset. With heap staging active, an iPhone 17 Pro loaded the 805 MB Q8 model at 0 or 1 GPU layer. (#263)
 
+- Skip worker dispatch and reject with `AbortError` when one-shot `synthesizeSpeech()` is cancelled while awaiting worker readiness. (#268)
+
 - Resume interrupted model downloads when Safari reports `TypeError: Load failed`. (#278)
 
 - Cache WebKit model downloads and prefetches in 16 MiB parts. Cache hits read one part at a time. If a cached part is missing or damaged, `loadModelFromUrl()` can retry from the network. `loadDraftModel()` rejects that call with an error named `ModelCacheEntryError` in direct mode. The bridge drops the damaged entry for the next call when it can acquire the cache lock. (#257)

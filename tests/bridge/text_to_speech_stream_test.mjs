@@ -223,20 +223,23 @@ for (const [label, cancel] of [
   ['bridge.cancel()', (bridge) => bridge.cancel()],
   ['AbortController.abort()', (_bridge, controller) => controller.abort()],
 ]) {
-  test(`streamed worker dispatch is skipped after ${label} during readiness`, async () => {
-    const controller = new AbortController();
-    const result = await runWorkerSpeech({
-      text: 'Hello.',
-      streamAudio: true,
-      signal: controller.signal,
-      onProgress() {},
-    }, {
-      afterStart(bridge) { queueMicrotask(() => cancel(bridge, controller)); },
+  for (const streamAudio of [true, false]) {
+    const mode = streamAudio ? 'streamed' : 'one-shot';
+    test(`${mode} worker dispatch is skipped after ${label} during readiness`, async () => {
+      const controller = new AbortController();
+      const result = await runWorkerSpeech({
+        text: 'Hello.',
+        streamAudio,
+        signal: controller.signal,
+        onProgress() {},
+      }, {
+        afterStart(bridge) { queueMicrotask(() => cancel(bridge, controller)); },
+      });
+      assert.equal(result.calls.length, 0, 'no synthesis message was posted');
+      assert.ok(result.error instanceof DOMException);
+      assert.equal(result.error.name, 'AbortError');
     });
-    assert.ok(result.error instanceof DOMException);
-    assert.equal(result.error.name, 'AbortError');
-    assert.equal(result.calls.length, 0, 'no synthesis message was posted');
-  });
+  }
 }
 
 test('a queued one-shot request keeps its admitted mode in direct synthesis', async () => {

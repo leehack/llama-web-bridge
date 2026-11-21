@@ -9584,7 +9584,7 @@ var LlamaWebGpuBridge = class {
           }
         },
         transferList,
-        streamAudio ? () => this._throwIfOperationCancelled(void 0, TEXT_TO_SPEECH_CANCELLED, operation) : void 0
+        () => this._throwIfOperationCancelled(void 0, TEXT_TO_SPEECH_CANCELLED, operation)
       );
     } catch (error) {
       if (progressFailure) {
