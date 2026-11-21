@@ -9,7 +9,10 @@ import vm from 'node:vm';
 
 import { LlamaWebGpuBridge, ModelStagingError } from '../../js/src/llama_webgpu_bridge.js';
 import { guardCore, retireCore } from '../../js/src/internal/core_guard.ts';
-import { writeResponseToFsFileWithProgress } from '../../js/src/internal/download.ts';
+import {
+  isRetryableStreamNetworkError,
+  writeResponseToFsFileWithProgress,
+} from '../../js/src/internal/download.ts';
 import { installBridgeWorkerHost } from '../../js/src/worker_host.ts';
 import {
   createRealWorkerBridge,
@@ -1234,7 +1237,7 @@ test('direct JS-backed writer completes positive short writes without gaps and c
   assert.equal(stalledProgress.at(-1).loaded, 4);
 });
 
-test('resumed HTTP 206 with jsBackedModelStaging opens append handle and writes at resumeOffset', async () => {
+test('Safari Load failed resumes JS-backed staging with an HTTP 206 append', async () => {
   const fullPayload = Uint8Array.from({ length: 10 }, (_, i) => 10 + i);
   const makeCutResponse = () => {
     let chunkSent = false;
@@ -1245,7 +1248,7 @@ test('resumed HTTP 206 with jsBackedModelStaging opens append handle and writes 
           controller.enqueue(fullPayload.subarray(0, 4));
           return;
         }
-        controller.error(new Error('network error'));
+        controller.error(new TypeError('Load failed'));
       },
     }), {
       status: 200,
@@ -1300,6 +1303,13 @@ test('resumed HTTP 206 with jsBackedModelStaging opens append handle and writes 
     ],
   );
   assert.deepEqual(staged, fullPayload);
+});
+
+test('the Safari load failure match requires the exact TypeError message', () => {
+  assert.equal(isRetryableStreamNetworkError(new TypeError('Load failed')), true);
+  assert.equal(isRetryableStreamNetworkError(new TypeError('Model load failed')), false);
+  assert.equal(isRetryableStreamNetworkError(new Error('Load failed')), false);
+  assert.equal(isRetryableStreamNetworkError(new DOMException('Load failed', 'AbortError')), false);
 });
 
 test('heap-file overrun preserves range restart and reports a false full length as a transfer error', async (t) => {

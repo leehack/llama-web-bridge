@@ -304,7 +304,8 @@ export function classifyResumeResponse(
 
 export function isRetryableStreamNetworkError(error: unknown): boolean {
   const text = String(error || '').toLowerCase();
-  return text.includes('network error')
+  return (error instanceof TypeError && error.message === 'Load failed')
+    || text.includes('network error')
     || text.includes('failed to fetch')
     || text.includes('networkerror')
     || text.includes('err_network_io_suspended')
