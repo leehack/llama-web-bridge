@@ -5,6 +5,7 @@ import { LlamaWebGpuBridge } from '../../js/src/llama_webgpu_bridge.js';
 export const UNQUEUED_ASYNC_METHODS = new Map([
   ['prefetchModelToCache', 'Cache Storage and network only; never enters the wasm core'],
   ['evictModelFromCache', 'Cache Storage only; never enters the wasm core'],
+  ['isModelCached', 'Cache Storage only; never enters the wasm core'],
 ]);
 
 // dispose() marks synchronously, rejects queued/new work, and drains after the active owner.

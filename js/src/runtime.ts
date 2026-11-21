@@ -34,6 +34,7 @@ import {
   isRetryableStreamNetworkError,
   sumProgressValues,
   deleteModelCacheParts,
+  hasCommittedModelCacheManifest,
   ModelCacheEntryError,
   openModelCacheParts,
   pruneCachedModelSizes,
@@ -126,6 +127,8 @@ import type {
   LoraAdapterCapabilities,
   LoraAdapterInfo,
   LoraAdapterLoadOptions,
+  ModelCacheQueryOptions,
+  MultimodalProjectorLoadOptions,
   NextTokenScoreOptions,
   TextToSpeechOptions,
   TextToSpeechProgress,
@@ -135,6 +138,10 @@ import type {
 type BridgeLogger = Partial<Record<LogMethod, (message: unknown) => void>>;
 
 type ModelCacheStoreOutcome = 'stored' | 'store_failed';
+
+function isModelCacheUrl(url: string): boolean {
+  return /^https?:\/\//i.test(url);
+}
 
 // Cache stores still being written from a response the caller is reading.
 const cachedModelSizes = new WeakMap<Response, number>();
@@ -300,6 +307,7 @@ export class LlamaWebGpuBridgeRuntime {
   declare _modelCacheName: string;
   declare _loadedModelUrl: ModelSource | null;
   declare _mmProjSourceUrl: string | null;
+  declare _mmProjSourceOptions: MultimodalProjectorLoadOptions | undefined;
   declare _draftModel: { url: string; options: DraftModelLoadOptions; info: DraftModelInfo } | null;
   declare _speculativeFileCounter: number;
   declare _suppressedWarmupWarningCount: number;
@@ -405,6 +413,7 @@ export class LlamaWebGpuBridgeRuntime {
     this._modelCacheName = defaultModelCacheName;
     this._loadedModelUrl = null;
     this._mmProjSourceUrl = null;
+    this._mmProjSourceOptions = undefined;
     this._draftModel = null;
     this._speculativeFileCounter = 0;
     this._suppressedWarmupWarningCount = 0;
@@ -703,6 +712,7 @@ export class LlamaWebGpuBridgeRuntime {
 
     const previousPreferMemory64 = this._preferMemory64;
     const previousMMProjSourceUrl = this._mmProjSourceUrl;
+    const previousMMProjSourceOptions = this._mmProjSourceOptions;
     const previousDraftModel = this._draftModel;
     const resolvedLoadState = this._resolvedLoadState();
 
@@ -721,7 +731,7 @@ export class LlamaWebGpuBridgeRuntime {
 
       if (typeof previousMMProjSourceUrl === 'string' && previousMMProjSourceUrl.length > 0) {
         try {
-          await this.loadMultimodalProjector(previousMMProjSourceUrl);
+          await this.loadMultimodalProjector(previousMMProjSourceUrl, previousMMProjSourceOptions);
         } catch (_) {
           this._runtimeNotes.push('generation_recovery_mmproj_reload_failed');
         }
@@ -1874,8 +1884,10 @@ export class LlamaWebGpuBridgeRuntime {
     return true;
   }
 
-  async _getCachedModelResponse(url: string, options: CachedModelResponseOptions = {}) {
-    let useCache = options.useCache !== false;
+  async _getCachedModelResponse(url: string, options: CachedModelResponseOptions = {}, recordCacheMetadata = true) {
+    const cacheKey = normalizeAbsoluteUrl(url);
+    const cacheName = this._resolveCacheName(options);
+    let useCache = options.useCache !== false && isModelCacheUrl(cacheKey);
     const forceRefresh = options.force === true;
     const requireReadableStream = options.requireReadableStream === true;
     const requestHeaders =
@@ -1892,16 +1904,20 @@ export class LlamaWebGpuBridgeRuntime {
       ...(requestHeaders ? { headers: requestHeaders } : {}),
     };
     const fetchTimeoutMs = this._resolveFetchTimeoutMs(options, 180000);
-    this._modelSource = 'network';
-    this._modelCacheState = useCache ? 'unavailable' : 'disabled';
-    this._modelCacheName = this._resolveCacheName(options);
+    const recordCacheState = (state: string, source?: string) => {
+      if (!recordCacheMetadata) return;
+      this._modelCacheState = state;
+      if (source !== undefined) this._modelSource = source;
+    };
+    recordCacheState(useCache ? 'unavailable' : 'disabled', 'network');
+    if (recordCacheMetadata) this._modelCacheName = cacheName;
 
     if (!useCache) {
       const response = await this._fetchWithTimeout(url, {
         cache: 'no-store',
         ...fetchOptions,
       }, fetchTimeoutMs);
-      this._modelCacheState = 'disabled';
+      recordCacheState('disabled');
       if (requireReadableStream) {
         this._runtimeNotes.push(
           hasReadableResponseStream(response)
@@ -1913,7 +1929,7 @@ export class LlamaWebGpuBridgeRuntime {
     }
 
     if (!globalThis.caches || typeof globalThis.caches.open !== 'function') {
-      this._modelCacheState = 'unavailable';
+      recordCacheState('unavailable');
       const response = await this._fetchWithTimeout(url, fetchOptions, fetchTimeoutMs);
       if (requireReadableStream) {
         this._runtimeNotes.push(
@@ -1925,16 +1941,13 @@ export class LlamaWebGpuBridgeRuntime {
       return response;
     }
 
-    const cacheKey = normalizeAbsoluteUrl(url);
-
     try {
-      const cache = await globalThis.caches.open(this._modelCacheName);
+      const cache = await globalThis.caches.open(cacheName);
       const parts = forceRefresh || !this._isWebKit
         ? null
-        : await openModelCacheParts(cache, cacheKey, this._modelCacheName);
+        : await openModelCacheParts(cache, cacheKey, cacheName);
       if (parts) {
-        this._modelSource = 'cache';
-        this._modelCacheState = 'hit';
+        recordCacheState('hit', 'cache');
         this._runtimeNotes.push('model_cache_hit');
         this._runtimeNotes.push('model_cache_parts');
         if (requireReadableStream) {
@@ -1947,8 +1960,7 @@ export class LlamaWebGpuBridgeRuntime {
       if (cached) {
         const cacheHasStream = hasReadableResponseStream(cached);
         if (!requireReadableStream || cacheHasStream) {
-          this._modelSource = 'cache';
-          this._modelCacheState = 'hit';
+          recordCacheState('hit', 'cache');
           this._runtimeNotes.push('model_cache_hit');
           if (requireReadableStream) {
             this._runtimeNotes.push('model_cache_stream');
@@ -1961,8 +1973,7 @@ export class LlamaWebGpuBridgeRuntime {
         }
 
         this._runtimeNotes.push('model_cache_hit_no_stream');
-        this._modelSource = 'network';
-        this._modelCacheState = 'refresh';
+        recordCacheState('refresh', 'network');
         const refreshed = await this._fetchWithTimeout(url, {
           cache: 'no-store',
           ...fetchOptions,
@@ -1973,10 +1984,12 @@ export class LlamaWebGpuBridgeRuntime {
             ? 'model_network_stream'
             : 'model_network_no_stream',
         );
-        return refreshed.ok ? await this._storeModelResponse(cache, cacheKey, refreshed) : refreshed;
+        return refreshed.ok
+          ? await this._storeModelResponse(cache, cacheName, cacheKey, refreshed, recordCacheState)
+          : refreshed;
       }
 
-      this._modelCacheState = forceRefresh ? 'refresh' : 'miss';
+      recordCacheState(forceRefresh ? 'refresh' : 'miss');
       const response = await this._fetchWithTimeout(url, fetchOptions, fetchTimeoutMs);
 
       if (requireReadableStream) {
@@ -1987,9 +2000,11 @@ export class LlamaWebGpuBridgeRuntime {
         );
       }
 
-      return response.ok ? await this._storeModelResponse(cache, cacheKey, response) : response;
+      return response.ok
+        ? await this._storeModelResponse(cache, cacheName, cacheKey, response, recordCacheState)
+        : response;
     } catch (_) {
-      this._modelCacheState = 'error';
+      recordCacheState('error');
       this._runtimeNotes.push('model_cache_error');
       const response = await this._fetchWithTimeout(url, fetchOptions, fetchTimeoutMs);
       if (requireReadableStream) {
@@ -2009,25 +2024,32 @@ export class LlamaWebGpuBridgeRuntime {
    * progress follows the download; `_settleModelCacheStore` then waits for the
    * store. Without a stream, the store completes before this returns.
    */
-  async _storeModelResponse(cache: Cache, cacheKey: string, response: Response): Promise<Response> {
+  async _storeModelResponse(
+    cache: Cache,
+    cacheName: string,
+    cacheKey: string,
+    response: Response,
+    recordCacheState: (state: string) => void,
+  ): Promise<Response> {
     const recordFailure = (error: unknown): ModelCacheStoreOutcome => {
       this._runtimeNotes.push('model_cache_store_failed');
       this._emitLogger('warn', `Model was not cached: ${error instanceof Error ? error.message : String(error)}`);
       return 'store_failed';
     };
     if (!hasReadableResponseStream(response)) {
+      if (response.body === null) return response;
       try {
         await cache.put(cacheKey, response.clone());
-        this._modelCacheState = 'stored';
+        recordCacheState('stored');
         this._runtimeNotes.push('model_cache_stored');
       } catch (error) {
-        this._modelCacheState = recordFailure(error);
+        recordCacheState(recordFailure(error));
       }
       return response;
     }
 
     if (this._isWebKit) {
-      const store = startModelCachePartStore(cache, cacheKey, response, this._modelCacheName);
+      const store = startModelCachePartStore(cache, cacheKey, response, cacheName);
       pendingModelCacheStores.set(store.response, store.stored.then(
         (): ModelCacheStoreOutcome => {
           this._runtimeNotes.push('model_cache_stored');
@@ -2071,16 +2093,17 @@ export class LlamaWebGpuBridgeRuntime {
   }
 
   async prefetchModelToCache(url: string | string[], options: LoadModelOptions = {}) {
-    const useCache = options.useCache !== false;
+    const modelUrls = expandModelShardUrls(url);
+    const useCache = options.useCache !== false && modelUrls.some(isModelCacheUrl);
+    const cacheName = this._resolveCacheName(options);
     this._modelSource = 'network';
     this._modelCacheState = useCache ? 'unavailable' : 'disabled';
-    this._modelCacheName = this._resolveCacheName(options);
+    this._modelCacheName = cacheName;
 
     const progressCallback = typeof options.progressCallback === 'function'
       ? options.progressCallback
       : null;
 
-    const modelUrls = expandModelShardUrls(url);
     if (modelUrls.length === 0) {
       throw new Error('Model URL is empty.');
     }
@@ -2114,17 +2137,18 @@ export class LlamaWebGpuBridgeRuntime {
       const fetchTimeoutMs = this._resolveFetchTimeoutMs(options, 180000);
       const chunkTimeoutMs = this._resolveStreamChunkTimeoutMs(options, 90000);
 
-      const cache = (useCache && globalThis.caches && typeof globalThis.caches.open === 'function')
-        ? await globalThis.caches.open(this._modelCacheName)
+      const storageCache = (useCache && globalThis.caches && typeof globalThis.caches.open === 'function')
+        ? await globalThis.caches.open(cacheName)
         : null;
 
-      if (!useCache || !cache) {
+      if (!storageCache) {
         this._modelCacheState = useCache ? 'unavailable' : 'disabled';
       }
 
       for (let shardIndex = 0; shardIndex < modelUrls.length; shardIndex += 1) {
         const shardUrl = modelUrls[shardIndex];
         const cacheKey = normalizeAbsoluteUrl(shardUrl);
+        const cache = isModelCacheUrl(cacheKey) ? storageCache : null;
         let response;
         let headerTotal = 0;
 
@@ -2168,7 +2192,7 @@ export class LlamaWebGpuBridgeRuntime {
         let releaseConsumedChunks = this._isWebKit;
         let storedInParts = false;
         if (cache && hasReadableResponseStream(response) && this._isWebKit) {
-          const store = startModelCachePartStore(cache, cacheKey, response, this._modelCacheName);
+          const store = startModelCachePartStore(cache, cacheKey, response, cacheName);
           response = store.response;
           cacheStore = store.stored;
           storedInParts = true;
@@ -2251,7 +2275,8 @@ export class LlamaWebGpuBridgeRuntime {
   }
 
   async evictModelFromCache(url: string | string[], options: Record<string, unknown> = {}) {
-    this._modelCacheName = this._resolveCacheName(options);
+    const cacheName = this._resolveCacheName(options);
+    this._modelCacheName = cacheName;
 
     const modelUrls = expandModelShardUrls(url);
     if (modelUrls.length === 0) {
@@ -2264,11 +2289,11 @@ export class LlamaWebGpuBridgeRuntime {
     }
 
     try {
-      const cache = await globalThis.caches.open(this._modelCacheName);
+      const cache = await globalThis.caches.open(cacheName);
       let removedCount = 0;
       for (const modelUrl of modelUrls) {
         const cacheKey = normalizeAbsoluteUrl(modelUrl);
-        const removedParts = await deleteModelCacheParts(cache, cacheKey, this._modelCacheName);
+        const removedParts = await deleteModelCacheParts(cache, cacheKey, cacheName);
         if (removedParts === null) continue;
         const removed = await cache.delete(cacheKey);
         if (removed) {
@@ -2291,6 +2316,28 @@ export class LlamaWebGpuBridgeRuntime {
     } catch (_) {
       this._modelCacheState = 'error';
       this._runtimeNotes.push('model_cache_error');
+      return false;
+    }
+  }
+
+  async isModelCached(url: string | string[], options: ModelCacheQueryOptions = {}): Promise<boolean> {
+    try {
+      const modelUrls = expandModelShardUrls(url);
+      const cache = globalThis.caches;
+      if (modelUrls.length === 0 || typeof cache?.match !== 'function') return false;
+
+      const cacheName = this._resolveCacheName(options);
+      for (const modelUrl of modelUrls) {
+        const cacheKey = normalizeAbsoluteUrl(modelUrl);
+        if (!isModelCacheUrl(cacheKey)) return false;
+        if (this._isWebKit && await hasCommittedModelCacheManifest(cache, cacheKey, cacheName)) continue;
+
+        const response = await cache.match(cacheKey, { cacheName });
+        if (!response) return false;
+        void response.body?.cancel().catch(() => {});
+      }
+      return true;
+    } catch (_) {
       return false;
     }
   }
@@ -2570,6 +2617,7 @@ export class LlamaWebGpuBridgeRuntime {
     // leaves the current model and its configuration intact.
     await this._releaseLoadedModel(core);
     this._mmProjSourceUrl = null;
+    this._mmProjSourceOptions = undefined;
 
     const configuredPoolHint = Number(this._threadPoolSizeHint);
     this._syncThreadPoolSizeHintFromCore();
@@ -3384,7 +3432,7 @@ export class LlamaWebGpuBridgeRuntime {
     return 1;
   }
 
-  async loadMultimodalProjector(url: string) {
+  async loadMultimodalProjector(url: string, options: MultimodalProjectorLoadOptions = {}) {
     if (!this._core || this._modelBytes <= 0) {
       throw new Error('No model loaded. Call loadModelFromUrl first.');
     }
@@ -3402,14 +3450,17 @@ export class LlamaWebGpuBridgeRuntime {
       ensureFsDirectory(core.FS, '/mmproj');
     }
     let lastError = null;
+    let bypassCache = false;
 
     for (let attempt = 0; attempt < 2; attempt += 1) {
+      const useCache = options.useCache === true && !bypassCache;
       let stagingMountPath: string | null = null;
       let stagingMountId = 0;
       let mmprojPath = `/mmproj/${fileName}`;
       let createdMmprojPath: string | null = null;
       let assertMountOwned: (() => void) | undefined;
       let projectorLoaded = false;
+      let response: Response | null = null;
       try {
         if (useJsBackedStaging) {
           const mountPath = this._mountJsBackedStaging(core, 'mmproj_staging_js_backed');
@@ -3419,11 +3470,16 @@ export class LlamaWebGpuBridgeRuntime {
           mmprojPath = `${mountPath}/${fileName}`;
         }
 
-        const response = await this._fetchWithTimeout(
-          url,
-          { cache: 'no-store' },
-          fetchTimeoutMs,
-        );
+        if (useCache) {
+          response = await this._getCachedModelResponse(url, {
+            useCache: true,
+            cacheName: options.cacheName,
+            requireReadableStream: true,
+            readDecodedCacheSize: true,
+          }, false);
+        } else {
+          response = await this._fetchWithTimeout(url, { cache: 'no-store' }, fetchTimeoutMs);
+        }
         if (!response.ok) {
           throw new Error(
             `Failed to fetch multimodal projector: ${response.status} ${response.statusText}`,
@@ -3442,10 +3498,11 @@ export class LlamaWebGpuBridgeRuntime {
           this._ownedMmProjPath = null;
           this._ownedMmProjMount = null;
         }
-        let knownTotalBytes = 0;
+        const knownTotalBytes = useCache || assertMountOwned
+          ? (cachedModelSizes.get(response) ?? inferResponseTotalBytes(response, 0))
+          : 0;
         let directWriter: DirectFileChunkWriter | null = null;
         if (assertMountOwned) {
-          knownTotalBytes = inferResponseTotalBytes(response, 0);
           directWriter = this._openDirectJsWriter(core, this._mmProjPath, knownTotalBytes, false, assertMountOwned);
         }
         await writeResponseToFsFileWithProgress(
@@ -3457,10 +3514,12 @@ export class LlamaWebGpuBridgeRuntime {
             useBigIntPosition: this._coreVariant === 'wasm64',
             skipMemoryReservation: useJsBackedStaging,
             directWriter,
-            ...(useJsBackedStaging ? { totalBytes: knownTotalBytes } : {}),
+            ...(useJsBackedStaging || useCache ? { totalBytes: knownTotalBytes } : {}),
+            releaseConsumedChunks: useCache && this._isWebKit && !teedModelResponses.has(response),
             chunkTimeoutMs,
           },
         );
+        if (useCache) await this._settleModelCacheStore(response, false);
 
         assertMountOwned?.();
         const rc = Number(
@@ -3484,6 +3543,9 @@ export class LlamaWebGpuBridgeRuntime {
           core.ccall('llamadart_webgpu_mmproj_supports_audio', 'number', [], []),
         ) === 1;
         this._mmProjSourceUrl = url;
+        this._mmProjSourceOptions = options.useCache === true
+          ? { useCache: true, cacheName: options.cacheName }
+          : undefined;
         // mtmd has copied the tensors into its own buffers. A resident GGUF
         // copy leaves wasm32 too little heap to re-reserve the context's
         // compute buffer, which every embedding call does.
@@ -3522,6 +3584,7 @@ export class LlamaWebGpuBridgeRuntime {
               // Preserve the staging failure if native cleanup also fails.
             }
             this._mmProjSourceUrl = null;
+            this._mmProjSourceOptions = undefined;
           }
           throw ownershipError;
         }
@@ -3536,6 +3599,12 @@ export class LlamaWebGpuBridgeRuntime {
           throw error;
         }
 
+        if (error instanceof ModelCacheEntryError && attempt === 0) {
+          this._runtimeNotes.push('mmproj_cache_entry_invalid');
+          bypassCache = error.retryWithoutCache;
+          continue;
+        }
+
         const retryable = isRetryableStreamNetworkError(error);
         if (!retryable || attempt >= 1) {
           throw error;
@@ -3543,6 +3612,9 @@ export class LlamaWebGpuBridgeRuntime {
 
         this._runtimeNotes.push(`mmproj_load_retry:${attempt + 1}`);
       } finally {
+        if (options.useCache === true && response?.body && !response.body.locked) {
+          void response.body.cancel().catch(() => {});
+        }
         this._releaseJsModelStaging(core, stagingMountPath);
       }
     }
@@ -3563,6 +3635,7 @@ export class LlamaWebGpuBridgeRuntime {
       this._mmSupportsVision = false;
       this._mmSupportsAudio = false;
       this._mmProjSourceUrl = null;
+      this._mmProjSourceOptions = undefined;
       return;
     }
 
@@ -3594,6 +3667,7 @@ export class LlamaWebGpuBridgeRuntime {
     this._mmSupportsVision = false;
     this._mmSupportsAudio = false;
     this._mmProjSourceUrl = null;
+    this._mmProjSourceOptions = undefined;
   }
 
   // Bytes the core heap can still allocate, or null for a core without the
@@ -5677,6 +5751,7 @@ export class LlamaWebGpuBridgeRuntime {
     this._loadedModelUrl = null;
     this._mmProjPath = null;
     this._mmProjSourceUrl = null;
+    this._mmProjSourceOptions = undefined;
     this._mmSupportsVision = false;
     this._mmSupportsAudio = false;
     this._loraAdaptersLoaded = false;

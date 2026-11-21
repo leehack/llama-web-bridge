@@ -89,6 +89,22 @@ function fixture() {
   await assert.rejects(partial.bridge.createCompletion('hello'), /failed to decode/);
   assert.equal(partial.loads.length, 1, 'partial generation must never trigger a recovery reload');
 
+  {
+    const { bridge, runtime, core } = fixture();
+    const ccall = core.ccall;
+    core.ccall = (name, ...args) => name.startsWith('llamadart_webgpu_mmproj_') ? 0 : ccall(name, ...args);
+    runtime._fetchWithTimeout = async () => new Response(new Uint8Array([1, 2, 3]));
+    await bridge.loadModelFromUrl('https://models.test/model.gguf', { nGpuLayers: 99, forceRemoteFetchBackend: false });
+    const projector = 'https://models.test/projector.gguf';
+    const options = { useCache: true, cacheName: 'projector-cache' };
+    await bridge.loadMultimodalProjector(projector, options);
+    const original = runtime.loadMultimodalProjector.bind(runtime);
+    const replays = [];
+    runtime.loadMultimodalProjector = (...args) => { replays.push(args); return original(...args); };
+    assert.equal(await bridge.createCompletion('hello', { nPredict: 2 }), 'OK');
+    assert.deepEqual(replays, [[projector, options]]);
+  }
+
   // Real worker-host message dispatch constructs its own facade and runtime.
   // Reuse only the same core/network/environment doubles, with no recovery
   // helper or load parser replaced on this route either.
@@ -96,6 +112,8 @@ function fixture() {
   const prototype = LlamaWebGpuBridgeRuntime.prototype;
   const methods = ['_probeBackends', '_ensureCore', '_coreSupportsPthreads', '_syncThreadPoolSizeHintFromCore', '_getCachedModelResponse', '_emitLogger'];
   const originals = new Map(methods.map((method) => [method, prototype[method]]));
+  const originalProjectorLoad = prototype.loadMultimodalProjector;
+  const projectorCalls = [];
   const oldSelf = globalThis.self;
   const replies = [];
   globalThis.self = { postMessage: (message) => replies.push(message) };
@@ -106,6 +124,7 @@ function fixture() {
       this._coreVariant = 'wasm64';
       return worker.core;
     };
+    prototype.loadMultimodalProjector = async (...args) => { projectorCalls.push(args); return 1; };
     installBridgeWorkerHost();
     await self.onmessage({ data: { type: 'init', config: {} } });
     await self.onmessage({ data: { type: 'call', id: 1, method: 'loadModelFromUrl', args: [
@@ -119,7 +138,12 @@ function fixture() {
     const expected = [...worker.loads[0]];
     expected[6] = 0;
     assert.deepEqual(worker.loads[1], expected, 'worker-host recovery preserves native settings');
+    const projector = 'https://models.test/projector.gguf';
+    const options = { useCache: true, cacheName: 'worker-projector-cache' };
+    await self.onmessage({ data: { type: 'call', id: 3, method: 'loadMultimodalProjector', args: [projector, options] } });
+    assert.deepEqual(projectorCalls, [[projector, options]]);
   } finally {
+    prototype.loadMultimodalProjector = originalProjectorLoad;
     for (const [method, original] of originals) prototype[method] = original;
     if (oldSelf === undefined) delete globalThis.self;
     else globalThis.self = oldSelf;

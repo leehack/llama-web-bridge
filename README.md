@@ -116,6 +116,8 @@ Split models, full offload (the default or a negative
 weights on the CPU. WebKit writes and reads cached models in 16 MiB parts to
 limit the memory Cache Storage uses during the load. See the
 [iOS measurements](docs/single_thread.md#ios-safari).
+Use [the cache query and projector APIs](docs/api.md#ismodelcachedurl-options)
+to check cache presence and opt projectors into the same storage.
 
 Bridges from the same bundle that share a core through `coreModuleFactory`
 use a shared sequence of staging paths. Later loads skip occupied paths and

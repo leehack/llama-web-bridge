@@ -58,7 +58,9 @@ import type {
   LoraAdapterCapabilities,
   LoraAdapterInfo,
   LoraAdapterLoadOptions,
+  ModelCacheQueryOptions,
   ModelMetadata,
+  MultimodalProjectorLoadOptions,
   NextTokenScoreOptions,
   NextTokenScores,
   LlamaWebGpuBridge as PublicLlamaWebGpuBridge,
@@ -219,6 +221,7 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
   declare _loadedModelUrl: ModelSource | null;
   declare _loadedModelOptions: LoadModelOptions | null;
   declare _loadedMmProjUrl: string | null;
+  declare _loadedMmProjOptions: MultimodalProjectorLoadOptions | undefined;
   declare _loadedDraftModel: RememberedDraftModel | null;
   declare _multimodalWorkerCpuMode: boolean;
   declare _workerModelMissing: boolean;
@@ -247,6 +250,7 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
     LlamaWebGpuBridgeRuntime.supportsSafariAdaptiveGpu === true;
 
   static supportsCompletionUsage = true;
+  static supportsModelCacheQuery = true;
 
   constructor(config: LlamaWebGpuBridgeConfig = {}) {
     this._config = config;
@@ -268,6 +272,7 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
     this._loadedModelUrl = null;
     this._loadedModelOptions = null;
     this._loadedMmProjUrl = null;
+    this._loadedMmProjOptions = undefined;
     this._loadedDraftModel = null;
     this._multimodalWorkerCpuMode = false;
     // True while the current worker is a replacement that has not yet loaded
@@ -931,6 +936,7 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
     this._loadedModelUrl = normalizedUrl;
     this._loadedModelOptions = this._sanitizeModelLoadOptions(options);
     this._loadedMmProjUrl = null;
+    this._loadedMmProjOptions = undefined;
     this._forgetLoraAdapters();
     this._loadedDraftModel = null;
     this._multimodalWorkerCpuMode = this._workerProxy != null;
@@ -947,6 +953,7 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
     this._loadedModelUrl = null;
     this._loadedModelOptions = null;
     this._loadedMmProjUrl = null;
+    this._loadedMmProjOptions = undefined;
     this._forgetLoraAdapters();
     this._loadedDraftModel = null;
     this._multimodalWorkerCpuMode = false;
@@ -986,13 +993,14 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
     }
   }
 
-  _rememberLoadedMmProj(url: string) {
+  _rememberLoadedMmProj(url: string, options?: MultimodalProjectorLoadOptions) {
     const normalizedUrl = String(url || '').trim();
     if (normalizedUrl.length === 0) {
       return;
     }
 
     this._loadedMmProjUrl = normalizedUrl;
+    this._loadedMmProjOptions = options;
     if (this._activeOperation) {
       this._activeOperation.projectorSource = normalizedUrl;
     }
@@ -1168,7 +1176,9 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
     await this._callWorker('loadModelFromUrl', [this._loadedModelUrl, selectedOptions]);
     this._throwIfDisposed();
     if (typeof this._loadedMmProjUrl === 'string' && this._loadedMmProjUrl.length > 0) {
-      await this._callWorker('loadMultimodalProjector', [this._loadedMmProjUrl]);
+      const url = this._loadedMmProjUrl;
+      const options = this._loadedMmProjOptions;
+      await this._callWorker('loadMultimodalProjector', options ? [url, options] : [url]);
     }
     const draft = this._loadedDraftModel;
     if (draft) {
@@ -1387,7 +1397,7 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
 
           if (!runtimeSupportsMedia) {
             this._throwIfDisposed();
-            await this._runtime.loadMultimodalProjector(this._loadedMmProjUrl!);
+            await this._runtime.loadMultimodalProjector(this._loadedMmProjUrl!, this._loadedMmProjOptions);
             this._throwIfDisposed();
             if (Array.isArray(this._runtime._runtimeNotes)) {
               this._runtime._runtimeNotes.push('worker_fallback_reload_mmproj');
@@ -1455,7 +1465,7 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
 
       if (shouldEnsureMultimodalInRuntime) {
         this._throwIfDisposed();
-        await this._runtime.loadMultimodalProjector(this._loadedMmProjUrl!);
+        await this._runtime.loadMultimodalProjector(this._loadedMmProjUrl!, this._loadedMmProjOptions);
         this._throwIfDisposed();
       }
       await this._restoreLoraAdapters();
@@ -1496,6 +1506,7 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
       this._loadedModelUrl = null;
       this._loadedModelOptions = null;
       this._loadedMmProjUrl = null;
+      this._loadedMmProjOptions = undefined;
       this._forgetLoraAdapters();
       this._loadedDraftModel = null;
       if (!this._disposed && this._lifecycleState === 'open' && !this._workerProxy) {
@@ -2127,6 +2138,14 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
     }
   }
 
+  async isModelCached(url: string | string[], options: ModelCacheQueryOptions = {}): Promise<boolean> {
+    this._throwIfDisposed();
+    if (!this._runtime) {
+      this._runtime = this._createRuntime();
+    }
+    return this._runtime.isModelCached(url, options);
+  }
+
   async createCompletion(prompt: string, options: CompletionOptions = {}) {
     resolveCompletionSamplingOptions(options);
     const onUsage = options?.onUsage;
@@ -2456,16 +2475,20 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
     }
   }
 
-  async loadMultimodalProjector(url: string) {
+  async loadMultimodalProjector(url: string, options?: MultimodalProjectorLoadOptions) {
     return this._runExclusive(
-      () => this._loadMultimodalProjectorUnlocked(url),
+      () => this._loadMultimodalProjectorUnlocked(url, options),
       { kind: 'projector-load' },
     );
   }
 
-  async _loadMultimodalProjectorUnlocked(source: string) {
+  async _loadMultimodalProjectorUnlocked(source: string, options?: MultimodalProjectorLoadOptions) {
     // The worker resolves relative URLs against its own script URL.
     const url = typeof source === 'string' && source.length > 0 ? normalizeAbsoluteUrl(source) : source;
+    const cacheOptions = options?.useCache === true
+      ? { useCache: true, ...(typeof options.cacheName === 'string' ? { cacheName: options.cacheName } : {}) }
+      : undefined;
+    const workerArgs = cacheOptions ? [url, cacheOptions] : [url];
     const startedWithWorker = this._workerProxy != null;
     const invokeRuntimeLoad = async () => {
       if (!this._runtime) {
@@ -2473,8 +2496,8 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
       }
 
       await this._ensureRuntimeReadyAfterWorkerFallback({}, null);
-      const result = await this._runtime.loadMultimodalProjector(url);
-      this._rememberLoadedMmProj(url);
+      const result = await this._runtime.loadMultimodalProjector(url, cacheOptions);
+      this._rememberLoadedMmProj(url, cacheOptions);
       this._supportsVision = this._runtime.supportsVision();
       this._supportsAudio = this._runtime.supportsAudio();
       return result;
@@ -2486,8 +2509,8 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
       }
 
       await this._ensureWorkerMultimodalCpuMode();
-      const result = await this._callWorker('loadMultimodalProjector', [url]);
-      this._rememberLoadedMmProj(url);
+      const result = await this._callWorker('loadMultimodalProjector', workerArgs);
+      this._rememberLoadedMmProj(url, cacheOptions);
       return result;
     } catch (error) {
       this._throwIfOperationCancelled(error, 'Projector operation was cancelled.');
@@ -2504,8 +2527,8 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
         try {
           await this._replaceWorkerProxyForMultimodalCpuMode();
           await this._ensureWorkerMultimodalCpuMode();
-          const retryResult = await this._callWorker('loadMultimodalProjector', [url]);
-          this._rememberLoadedMmProj(url);
+          const retryResult = await this._callWorker('loadMultimodalProjector', workerArgs);
+          this._rememberLoadedMmProj(url, cacheOptions);
           this._emitBridgeWarn(
             'llamadart: CPU multimodal worker setup recovered after worker restart.',
           );
@@ -2539,6 +2562,7 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
     if (!this._workerProxy) {
       const result = await this._runtime!.unloadMultimodalProjector();
       this._loadedMmProjUrl = null;
+      this._loadedMmProjOptions = undefined;
       this._supportsVision = this._runtime!.supportsVision();
       this._supportsAudio = this._runtime!.supportsAudio();
       return result;
@@ -2547,6 +2571,7 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
     try {
       const result = await this._callWorker('unloadMultimodalProjector', []);
       this._loadedMmProjUrl = null;
+      this._loadedMmProjOptions = undefined;
       return result;
     } catch (error) {
       this._throwIfOperationCancelled(error, 'Projector operation was cancelled.');
@@ -2555,6 +2580,7 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
       await this._waitForWorkerDisposal();
       const result = await this._runtime!.unloadMultimodalProjector();
       this._loadedMmProjUrl = null;
+      this._loadedMmProjOptions = undefined;
       this._supportsVision = this._runtime!.supportsVision();
       this._supportsAudio = this._runtime!.supportsAudio();
       return result;
@@ -3677,7 +3703,7 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
     if (!this._loadedMmProjUrl || !this._runtime?._modelBytes || this._runtime._mmProjPath) return;
     this._throwIfDisposed();
     try {
-      await this._runtime.loadMultimodalProjector(this._loadedMmProjUrl);
+      await this._runtime.loadMultimodalProjector(this._loadedMmProjUrl, this._loadedMmProjOptions);
     } catch (error) {
       this._throwIfOperationCancelled(error, 'Embedding projector restore was cancelled.');
       // Preserve the healthy model and remembered source. The runtime probe
@@ -3922,6 +3948,7 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
       this._loadedModelUrl = null;
       this._loadedModelOptions = null;
       this._loadedMmProjUrl = null;
+      this._loadedMmProjOptions = undefined;
       this._loadedDraftModel = null;
       this._workerFallbackReason = null;
       this._multimodalWorkerCpuMode = false;

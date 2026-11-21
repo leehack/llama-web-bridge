@@ -68,6 +68,11 @@ Web Locks or `crypto.randomUUID()` is unavailable, a load proceeds uncached.
 In those cases `prefetchModelToCache()` downloads the body and then rejects
 with the message `Failed to store prefetched model in browser cache.`
 
+Use [the bridge cache query](api.md#ismodelcachedurl-options) for a cached model
+or projector. Pass `{ useCache: true }` to
+[`loadMultimodalProjector`](api.md#loadmultimodalprojectorurl-options) to use the
+same cache for the projector load.
+
 On an iPhone 17 Pro running iOS 26.5.1, the 805 MB Q8 model loaded with
 default caching at `nGpuLayers: 0`. Cold loads and cache-hit reloads worked in
 direct and worker modes, and direct loads also worked with 448 MiB of extra JS

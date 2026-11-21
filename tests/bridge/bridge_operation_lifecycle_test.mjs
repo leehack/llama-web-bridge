@@ -818,6 +818,7 @@ const CASES = [
       _loadedModelUrl: ['shard-00001.gguf', 'shard-00002.gguf'],
       _loadedModelOptions: { nGpuLayers: 8 },
       _loadedMmProjUrl: 'projector.gguf',
+      _loadedMmProjOptions: { useCache: true, cacheName: 'projector-cache' },
     });
 
     assert.equal(await bridge._ensureWorkerMultimodalCpuMode(), true);
@@ -830,6 +831,7 @@ const CASES = [
       replayed.map(({ method }) => method),
       ['loadModelFromUrl', 'loadMultimodalProjector'],
     );
+    assert.deepEqual(replayed[1].args, ['projector.gguf', { useCache: true, cacheName: 'projector-cache' }]);
   }],
 
   ['a bare cancel before the first multimodal token resolves empty without a retry', async () => {
