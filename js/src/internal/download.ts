@@ -33,6 +33,7 @@ export interface DirectFileChunkWriter {
   close?: () => void;
   assertMountOwned?: () => void;
   heapResident?: boolean;
+  heapUnavailableReason?: string;
 }
 
 export interface WriteResponseOptions {
@@ -44,6 +45,7 @@ export interface WriteResponseOptions {
   // else reads: a cache tee shares these buffers.
   releaseConsumedChunks?: boolean;
   startOffset?: unknown;
+  heapFileBytes?: number | null;
   preservePartialOnError?: boolean;
   chunkTimeoutMs?: unknown;
   signal?: AbortSignal | null;
@@ -358,35 +360,40 @@ export async function drainResponseWithProgress(
   let loaded = 0;
   let lastBucket = -1;
 
-  while (true) {
-    const { done, value } = await readStreamChunkWithTimeout(
-      reader,
-      chunkTimeoutMs,
-      'response drain read',
-    );
-    if (done) {
-      break;
-    }
+  try {
+    while (true) {
+      const { done, value } = await readStreamChunkWithTimeout(
+        reader,
+        chunkTimeoutMs,
+        'response drain read',
+      );
+      if (done) {
+        break;
+      }
 
-    if (!value || value.length === 0) {
-      continue;
-    }
+      if (!value || value.length === 0) {
+        continue;
+      }
 
-    loaded += value.length;
-    if (typeof progressCallback === 'function') {
-      const effectiveTotal = total || loaded;
-      const bucket = effectiveTotal > 0
-        ? Math.floor((loaded / effectiveTotal) * 100)
-        : -1;
-      if (bucket > lastBucket) {
-        lastBucket = bucket;
-        progressCallback({ loaded, total: effectiveTotal });
+      loaded += value.length;
+      if (typeof progressCallback === 'function') {
+        const effectiveTotal = total || loaded;
+        const bucket = effectiveTotal > 0
+          ? Math.floor((loaded / effectiveTotal) * 100)
+          : -1;
+        if (bucket > lastBucket) {
+          lastBucket = bucket;
+          progressCallback({ loaded, total: effectiveTotal });
+        }
       }
     }
-  }
 
-  if (typeof progressCallback === 'function') {
-    progressCallback({ loaded, total: total || loaded });
+    if (typeof progressCallback === 'function') {
+      progressCallback({ loaded, total: total || loaded });
+    }
+  } catch (error) {
+    void reader.cancel(error).catch(() => {});
+    throw error;
   }
 
   return loaded;
@@ -403,6 +410,7 @@ export interface CacheTee {
   detachCache(reason: unknown): void;
   // Whether the caller cancelled its copy before the body ended.
   readonly cancelled: boolean;
+  readonly decodedBytes: number;
 }
 
 /**
@@ -418,12 +426,14 @@ export interface CacheTee {
 export function teeResponseForCache(
   source: Response,
   maxCacheLagBytes: number = DEFAULT_CACHE_TEE_LAG_BYTES,
+  recordId?: string,
 ): CacheTee {
   const reader = source.body!.getReader();
   let cacheController: ReadableStreamDefaultController<Uint8Array> | null = null;
   let wakeReader: (() => void) | null = null;
   let finished = false;
   let cancelled = false;
+  let decodedBytes = 0;
 
   const wake = () => {
     const resolve = wakeReader;
@@ -496,6 +506,7 @@ export function teeResponseForCache(
           cacheController = null;
           return;
         }
+        decodedBytes += result.value.byteLength;
         controller.enqueue(result.value);
         try {
           cacheController?.enqueue(result.value);
@@ -520,14 +531,87 @@ export function teeResponseForCache(
     url: { value: source.url },
     type: { value: source.type },
   });
+  const cacheHeaders = new Headers(source.headers);
+  cacheHeaders.delete(MODEL_CACHE_RECORD_HEADER);
+  if (recordId) cacheHeaders.set(MODEL_CACHE_RECORD_HEADER, recordId);
   return {
     response,
-    cacheResponse: new Response(cacheStream, init),
+    cacheResponse: new Response(cacheStream, { ...init, headers: cacheHeaders }),
     detachCache,
     get cancelled() {
       return cancelled;
     },
+    get decodedBytes() {
+      return decodedBytes;
+    },
   };
+}
+
+const MODEL_CACHE_RECORD_HEADER = 'x-llamadart-cache-record';
+const MODEL_CACHE_SIZE_HEADER = 'x-llamadart-decoded-size';
+
+async function modelCacheMetadataUrl(cacheKey: string): Promise<string> {
+  const key = new URL(cacheKey);
+  key.hash = '';
+  const hash = await globalThis.crypto.subtle.digest('SHA-256', new TextEncoder().encode(key.href));
+  const digest = Array.from(new Uint8Array(hash), (byte) => byte.toString(16).padStart(2, '0')).join('');
+  return 'https://llamadart-cache.invalid/decoded-size/' + digest;
+}
+
+function modelCacheRecord(response: Response | undefined): string | null {
+  const record = response?.headers.get(MODEL_CACHE_RECORD_HEADER) ?? '';
+  return /^[0-9a-f-]{36}$/.test(record) ? record : null;
+}
+
+export async function readCachedModelSize(cache: Cache, cacheKey: string, response: Response): Promise<number | null> {
+  const record = modelCacheRecord(response);
+  if (!record) return null;
+  try {
+    const metadata = await cache.match((await modelCacheMetadataUrl(cacheKey)) + '?record=' + record);
+    const bytes = parseByteLength(metadata?.headers.get(MODEL_CACHE_SIZE_HEADER) ?? null);
+    return bytes !== null && bytes > 0 ? bytes : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+export async function pruneCachedModelSizes(cache: Cache, cacheKey: string): Promise<void> {
+  try {
+    const url = await modelCacheMetadataUrl(cacheKey);
+    const entries = await cache.keys(url, { ignoreSearch: true });
+    if (entries.length === 0) return;
+    // Metadata is written after its body commits. Only prune records listed
+    // before checking which body is current, so a concurrent store is safe.
+    const cached = await cache.match(cacheKey);
+    const record = modelCacheRecord(cached);
+    // A clone-backed body may wait for its other branch on cancellation.
+    void cached?.body?.cancel().catch(() => {});
+    const keep = url + '?record=' + record;
+    await Promise.all(entries.filter((entry) => entry.url !== keep).map((entry) => cache.delete(entry)));
+  } catch (_) {
+    // A metadata cleanup failure does not affect the model body.
+  }
+}
+
+export function startModelCacheStore(cache: Cache, cacheKey: string, response: Response) {
+  const record = globalThis.crypto?.randomUUID?.();
+  const tee = teeResponseForCache(response, DEFAULT_CACHE_TEE_LAG_BYTES, record);
+  const stored = cache.put(cacheKey, tee.cacheResponse).then(async () => {
+    if (!record || !Number.isSafeInteger(tee.decodedBytes) || tee.decodedBytes <= 0) return;
+    try {
+      const url = (await modelCacheMetadataUrl(cacheKey)) + '?record=' + record;
+      await cache.put(url, new Response(null, {
+        headers: { [MODEL_CACHE_SIZE_HEADER]: String(tee.decodedBytes) },
+      }));
+      await pruneCachedModelSizes(cache, cacheKey);
+    } catch (_) {
+      // The model remains usable as a legacy cache entry.
+    }
+  }, (error: unknown) => {
+    tee.detachCache(error);
+    throw error;
+  });
+  return { tee, stored };
 }
 
 // Emscripten's WASMFS FS.analyzePath() reads the whole entry to fill
@@ -613,6 +697,7 @@ export async function writeResponseToFsFileWithProgress(
   const directWriter = writeOptions.directWriter || null;
   const releaseConsumedChunks = directWriter != null && writeOptions.releaseConsumedChunks === true;
   const startOffset = parsePositiveInteger(writeOptions.startOffset);
+  const heapFileBytes = writeOptions.heapFileBytes ?? null;
   const preservePartialOnError = writeOptions.preservePartialOnError === true;
   const appendMode = startOffset > 0;
   const chunkTimeoutMs = parsePositiveInteger(writeOptions.chunkTimeoutMs);
@@ -639,6 +724,9 @@ export async function writeResponseToFsFileWithProgress(
             ? 'Model response ended before its declared byte length.'
             : 'Model response exceeded its declared byte length.',
         );
+      }
+      if (heapFileBytes !== null && startOffset + bytes.byteLength > heapFileBytes) {
+        throw createModelTransferLengthError('Model response exceeded its declared byte length.');
       }
       let directLoaded = 0;
       if (directWriter) {
@@ -730,6 +818,9 @@ export async function writeResponseToFsFileWithProgress(
       );
       if (done) {
         throwIfAborted(signal, abortMessage);
+        if (heapFileBytes !== null && startOffset + loaded > heapFileBytes) {
+          throw createModelTransferLengthError('Model response exceeded its declared byte length.');
+        }
         if (exactLength > 0 && loaded !== exactLength) {
           throw createModelTransferLengthError('Model response ended before its declared byte length.');
         }
@@ -742,6 +833,18 @@ export async function writeResponseToFsFileWithProgress(
 
       if (exactLength > 0 && value.length > exactLength - loaded) {
         throw createModelTransferLengthError('Model response exceeded its declared byte length.');
+      }
+
+      if (heapFileBytes !== null && startOffset + loaded + value.length > heapFileBytes) {
+        if (response.status !== 206) {
+          throw createModelTransferLengthError('Model response exceeded its declared byte length.');
+        }
+        // Count the invalid range tail so a later transport error still
+        // triggers a restart, without writing outside the fixed heap block.
+        loaded += value.length;
+        emitProgressIfNeeded();
+        if (releaseConsumedChunks) releaseChunkBuffer(value);
+        continue;
       }
 
       if (directWriter) {

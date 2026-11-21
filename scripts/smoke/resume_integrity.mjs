@@ -69,7 +69,7 @@ function makeRevisions(revA) {
   };
 }
 
-export function renderHarness({ threading, jsBackedModelStaging, noMmap }, { modelUrl, worker, recover }) {
+export function renderHarness({ threading, jsBackedModelStaging, noMmap }, { modelUrl, worker, recover, cacheReload = false }) {
   const single = threading === 'single';
   const config = {
     disableWorker: !worker,
@@ -93,7 +93,7 @@ channel.onmessage = ({ data }) => {
 };
 const bridge = new LlamaWebGpuBridge(${JSON.stringify(config)});
 const progress = [];
-const options = { nCtx: 128, nThreads: 1, nGpuLayers: 0, useCache: false${noMmap ? ', useMmap: false' : ''} };
+const options = { nCtx: 128, nThreads: 1, nGpuLayers: 0, useCache: ${cacheReload}${noMmap ? ', useMmap: false' : ''} };
 const result = { crossOriginIsolated, sharedArrayBuffer: typeof SharedArrayBuffer, progress, staged };
 try {
   let originalCore;
@@ -103,7 +103,12 @@ try {
       ...options,
       progressCallback: (event) => progress.push(event),
     });
+    if (${cacheReload}) {
+      result.initialCache = bridge.getModelMetadata()['llamadart.webgpu.model_cache_state'];
+      await bridge.loadModelFromUrl(${JSON.stringify(modelUrl)}, options);
+    }
     const metadata = bridge.getModelMetadata();
+    result.cache = metadata['llamadart.webgpu.model_cache_state'];
     result.name = metadata['general.name'];
     result.notes = (metadata['llamadart.webgpu.runtime_notes'] || '').split(';');
     result.execution = metadata['llamadart.webgpu.execution'];
@@ -206,6 +211,11 @@ const CASES = {
   'always-cut-full-get': { cut: true, alwaysCut: true, expected: 'A', requests: RESUME, note: UNVALIDATED },
   'strong-etag-changed': { cut: true, initialTag: '"a"', laterTag: '"b"', newRevision: true,
     expected: 'B', requests: RESTART, note: 'model_stream_restart:etag' },
+  'etag-restart-without-size': { cut: true, initialTag: '"a"', laterTag: '"b"', newRevision: true,
+    chunkedReplacement: true, expected: 'B', requests: RESTART, note: 'model_stream_restart:etag' },
+  'interrupted-range-overrun': { cut: true, initialTag: '"a"', laterTag: '"a"', overlongTail: true,
+    expected: 'A', requests: RESTART, note: 'model_stream_restart:range' },
+  'decoded-cache-reload': { cacheReload: true, expected: 'A', requests: FULL },
   'weak-etag-changed': { cut: true, initialTag: 'W/"a"', laterTag: 'W/"b"', newRevision: true,
     expected: 'hybrid', requests: RESUME, note: UNVALIDATED },
   'strong-etag-unchanged': { cut: true, initialTag: '"same"', laterTag: '"same"',
@@ -287,7 +297,15 @@ function serveModel(req, res, requestPath, index, scenario, { revA, revB }) {
     const total = scenario.wildcardTotal ? '*' : revision.length;
     headers['Content-Range'] = `${unit} ${start}-${revision.length - 1}/${total}`;
   }
-  if (!shortTail || scenario.declareTailLength) headers['Content-Length'] = body.length;
+  const chunkedReplacement = scenario.chunkedReplacement && !range && index > 0;
+  if ((!shortTail || scenario.declareTailLength) && !chunkedReplacement && !(range && scenario.overlongTail)) {
+    headers['Content-Length'] = body.length;
+  }
+  if (scenario.cacheReload) {
+    const encoded = gzipSync(body);
+    res.writeHead(200, { ...headers, 'Content-Encoding': 'gzip', 'Content-Length': encoded.length }).end(encoded);
+    return;
+  }
   if (scenario.wrongReplacementSize && !range && index > 0) headers['X-Linked-Size'] = revision.length - 1;
   if (scenario.gzip) {
     headers.Vary = 'Accept-Encoding';
@@ -301,7 +319,9 @@ function serveModel(req, res, requestPath, index, scenario, { revA, revB }) {
     }
   }
   res.writeHead(range ? 206 : 200, headers);
-  if (!range && scenario.cut && (index === 0 || scenario.alwaysCut)) {
+  if (range && scenario.overlongTail) {
+    res.write(Buffer.concat([body, Buffer.alloc(CUT)]), () => setTimeout(() => res.destroy(), 150));
+  } else if (!range && scenario.cut && (index === 0 || scenario.alwaysCut)) {
     res.write(revision.subarray(0, CUT), () => setTimeout(() => res.destroy(), 150));
   } else {
     res.end(body);
@@ -353,7 +373,7 @@ async function runCase(browser, args, revisions, name, { worker = false, parity 
     }
     if (req.url === '/index.html') {
       res.writeHead(200, { ...isolationHeaders, 'Content-Type': 'text/html' });
-      res.end(renderHarness(args, { modelUrl: modelOrigin + MODEL, worker, recover: scenario.recover ?? false }));
+      res.end(renderHarness(args, { modelUrl: modelOrigin + MODEL, worker, recover: scenario.recover ?? false, cacheReload: scenario.cacheReload }));
       return;
     }
     if (req.url === '/instrumented-core.js') {
@@ -399,9 +419,14 @@ function verifyCase(args, revisions, name, result, worker = false) {
   scenario.requests.map(([path, range]) => ['GET', path, range, null]));
   const notes = result.notes.filter((note) => note === VALIDATED || note === UNVALIDATED
     || note.startsWith('model_stream_restart:'));
-  assert.deepEqual(notes, scenario.note ? [scenario.note] : []);
+  const expectedNotes = scenario.overlongTail ? [VALIDATED, scenario.note] : scenario.note ? [scenario.note] : [];
+  assert.deepEqual(notes, expectedNotes);
   const rewinds = result.progress.filter(({ loaded }, index) => index > 0 && loaded < result.progress[index - 1].loaded);
   assert.deepEqual(rewinds.map(({ loaded }) => loaded), scenario.note?.startsWith('model_stream_restart:') ? [0] : []);
+  if (scenario.chunkedReplacement && args.jsBackedModelStaging && !args.noMmap) {
+    assert.ok(!result.notes.includes('model_staging_heap_resident'), 'the discarded heap file leaked its staging note');
+    assert.ok(result.notes.includes('model_staging_heap_resident_unavailable:unknown_size'));
+  }
   if (scenario.recover) {
     assert.equal(result.ok, false);
     assert.equal(result.error?.name, 'ModelTransferLengthError');
@@ -412,7 +437,13 @@ function verifyCase(args, revisions, name, result, worker = false) {
     assert.equal(result.execution, worker ? 'worker' : 'main-thread');
     assert.equal(result.notes.includes('model_staging_js_backed'), args.jsBackedModelStaging);
     const expected = revisions.expected[scenario.expected];
-    assert.deepEqual(result.staged, [{ sha256: expected.sha256, bytes: revisions.revA.length }]);
+    const staged = { sha256: expected.sha256, bytes: revisions.revA.length };
+    assert.deepEqual(result.staged, scenario.cacheReload ? [staged, staged] : [staged]);
+    if (scenario.cacheReload) {
+      assert.equal(result.initialCache, 'stored');
+      assert.equal(result.cache, 'hit');
+      assert.equal(result.notes.includes('model_staging_heap_resident'), args.jsBackedModelStaging && !args.noMmap);
+    }
     assert.equal(result.name, expected.name);
     assert.deepEqual(result.tokens, [29871, expected.token]);
   }

@@ -78,15 +78,25 @@ async function readAll(response) {
 
 // Like the Cache API, put() reads the whole body and commits an entry only when
 // the body completes; a body that errors rejects put() and leaves no entry.
-function installCaches({ putError = null, holdPut = null, commitDelayMs = 0 } = {}) {
+function installCaches({
+  putError = null, holdPut = null, holdCancellation = null, commitDelayMs = 0,
+} = {}) {
   const entries = new Map();
+  const storedHeaders = new Map();
+  const canonical = (url) => url.split('#')[0];
   const original = Object.getOwnPropertyDescriptor(globalThis, 'caches');
   const cache = {
-    async match(key) {
-      const stored = entries.get(key);
-      return stored
-        ? new Response(stored, { headers: { 'content-length': String(stored.length) } })
-        : undefined;
+    async match(key, { ignoreSearch } = {}) {
+      const url = ignoreSearch
+        ? [...entries.keys()].find((candidate) => candidate.split('?')[0] === key.split('?')[0])
+        : canonical(key);
+      const stored = entries.get(url);
+      if (!stored) return undefined;
+      const body = holdCancellation && url === MODEL_URL ? new ReadableStream({
+        start(controller) { controller.enqueue(stored); },
+        cancel() { return holdCancellation; },
+      }) : stored;
+      return new Response(body, { headers: storedHeaders.get(url) });
     },
     async put(key, response) {
       if (putError) {
@@ -95,7 +105,18 @@ function installCaches({ putError = null, holdPut = null, commitDelayMs = 0 } = 
       await holdPut;
       const bytes = await readAll(response);
       await delay(commitDelayMs);
-      entries.set(key, bytes);
+      const url = canonical(key);
+      entries.set(url, bytes);
+      storedHeaders.set(url, new Headers(response.headers));
+    },
+    async keys(key, { ignoreSearch } = {}) {
+      const match = (url) => ignoreSearch ? url.split('?')[0] : url;
+      return [...entries.keys()].filter((url) => !key || match(url) === match(key)).map((url) => new Request(url));
+    },
+    async delete(key) {
+      const url = canonical(typeof key === 'string' ? key : key.url);
+      storedHeaders.delete(url);
+      return entries.delete(url);
     },
   };
   Object.defineProperty(globalThis, 'caches', {
@@ -104,6 +125,7 @@ function installCaches({ putError = null, holdPut = null, commitDelayMs = 0 } = 
   });
   return {
     entries,
+    storedHeaders,
     restore() {
       if (original) {
         Object.defineProperty(globalThis, 'caches', original);
@@ -408,6 +430,91 @@ const CASES = [
       assert.ok(runtime._runtimeNotes.includes('model_cache_hit'));
       assert.deepEqual([...loads[1]], [1, 2, 3, 4, 5, 6]);
     } finally {
+      caches.restore();
+    }
+  }],
+
+  ['cache reload uses the counted decoded size and validates the cache record identity', async () => {
+    const caches = installCaches();
+    try {
+      const bytes = Uint8Array.of(1, 2, 3, 4, 5, 6);
+      const { runtime, core, loads, fetches } = createRuntime(() => new Response(bytes, {
+        headers: { 'content-length': '2', 'content-encoding': 'gzip' },
+      }));
+      runtime._config.jsBackedModelStaging = true;
+      runtime._mountJsBackedStaging = () => '/jsmodels';
+      runtime._assertJsStagingMountOwned = () => {};
+      const heapSizes = [];
+      runtime._openDirectJsWriter = (_core, filePath, _total, _append, _assertOwned, heapBytes) => {
+        const handle = core.FS.open(filePath, 'w');
+        heapSizes.push(heapBytes ?? 0);
+        return {
+          heapResident: heapBytes > 0,
+          writeChunk(chunk, position) {
+            return core.FS.write(handle, chunk, 0, chunk.length, position);
+          },
+        };
+      };
+
+      await runtime.loadModelFromUrl(MODEL_URL, loadOptions());
+      assert.equal(runtime._modelCacheState, 'stored');
+      await runtime.loadModelFromUrl(MODEL_URL, loadOptions());
+      assert.equal(runtime._modelCacheState, 'hit');
+      assert.deepEqual(heapSizes, [0, bytes.length]);
+      assert.ok(runtime._runtimeNotes.includes('model_staging_heap_resident'));
+      assert.equal(fetches.length, 1);
+      assert.deepEqual(loads, [bytes, bytes]);
+
+      const modelHeaders = caches.storedHeaders.get(MODEL_URL);
+      modelHeaders.set('x-llamadart-cache-record', '00000000-0000-4000-8000-000000000000');
+      await runtime.loadModelFromUrl(MODEL_URL, loadOptions());
+      assert.deepEqual(heapSizes, [0, bytes.length, 0]);
+      assert.ok(runtime._runtimeNotes.includes('model_staging_heap_resident_unavailable:unknown_size'));
+      assert.ok(!runtime._runtimeNotes.includes('model_staging_heap_resident'));
+      assert.equal(fetches.length, 1);
+    } finally {
+      caches.restore();
+    }
+  }],
+
+  ['prefetch and eviction use the same decoded size across URL fragments', async () => {
+    const caches = installCaches();
+    try {
+      const bytes = Uint8Array.of(1, 2, 3, 4, 5, 6);
+      const { runtime, fetches } = createRuntime(() => new Response(bytes, {
+        headers: { 'content-length': '2', 'content-encoding': 'gzip' },
+      }));
+      const options = { cacheName: CACHE_NAME };
+      assert.equal(await runtime.prefetchModelToCache(MODEL_URL + '#one', options), 1);
+      assert.deepEqual([...caches.entries.get(MODEL_URL)], [...bytes]);
+      assert.equal(caches.entries.size, 2);
+      const progress = [];
+      assert.equal(await runtime.prefetchModelToCache(MODEL_URL + '#two', {
+        ...options, progressCallback: (event) => progress.push(event),
+      }), 1);
+      assert.deepEqual(progress.at(-1), { loaded: bytes.length, total: bytes.length });
+      assert.equal(fetches.length, 1);
+
+      assert.equal(await runtime.prefetchModelToCache(MODEL_URL + '#two', { ...options, force: true }), 1);
+      assert.equal(caches.entries.size, 2, 'only the latest model body and its metadata remain');
+      assert.equal(await runtime.evictModelFromCache(MODEL_URL + '#three', options), true);
+      assert.equal(caches.entries.size, 0);
+    } finally {
+      caches.restore();
+    }
+  }],
+
+  ['metadata pruning does not wait for a cloned cache body to cancel', async () => {
+    const { promise: holdCancellation, resolve: release } = Promise.withResolvers();
+    const caches = installCaches({ holdCancellation });
+    try {
+      const { runtime } = createRuntime(() => new Response(Uint8Array.of(1, 2, 3, 4)));
+      const prefetch = runtime.prefetchModelToCache(MODEL_URL, { cacheName: CACHE_NAME });
+      const result = await Promise.race([prefetch, delay(500).then(() => 'timed out')]);
+      assert.equal(result, 1);
+      assert.equal(caches.entries.size, 2);
+    } finally {
+      release();
       caches.restore();
     }
   }],

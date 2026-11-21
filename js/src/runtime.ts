@@ -33,7 +33,9 @@ import {
   inferResponseTotalBytes,
   isRetryableStreamNetworkError,
   sumProgressValues,
-  teeResponseForCache,
+  pruneCachedModelSizes,
+  readCachedModelSize,
+  startModelCacheStore,
   unlinkFsFile,
   writeResponseToFsFileWithProgress,
 } from './internal/download.ts';
@@ -125,6 +127,7 @@ type BridgeLogger = Partial<Record<LogMethod, (message: unknown) => void>>;
 type ModelCacheStoreOutcome = 'stored' | 'store_failed';
 
 // Cache stores still being written from a response the caller is reading.
+const cachedModelSizes = new WeakMap<Response, number>();
 const pendingModelCacheStores = new WeakMap<Response, Promise<ModelCacheStoreOutcome>>();
 
 const SAFARI_EMBEDDING_PROBE_MAX_COSINE = 0.999;
@@ -163,6 +166,7 @@ interface TransferOptions {
 // A model shard request: the load options plus the resume/stream controls
 // the loader adds per attempt.
 interface CachedModelResponseOptions extends RuntimeLoadModelOptions {
+  readDecodedCacheSize?: boolean;
   requireReadableStream?: boolean;
   requestHeaders?: Record<string, string> | null;
 }
@@ -1555,6 +1559,7 @@ export class LlamaWebGpuBridgeRuntime {
     // The native open unlinks or truncates the destination synchronously.
     assertMountOwned();
     let heapResident = false;
+    let heapUnavailableReason: string | undefined;
     let directHandle = 0;
     if (heapBytes > 0 && !append) {
       if (supportsHeapResidentStaging(core, this._jsModelStagingApiVersion)) {
@@ -1569,10 +1574,10 @@ export class LlamaWebGpuBridgeRuntime {
         heapResident = Number.isInteger(directHandle) && directHandle > 0;
         if (!heapResident) {
           // The heap cannot hold the block; JS chunks still can.
-          this._pushRuntimeNote(`model_staging_heap_resident_unavailable:${directHandle}`);
+          heapUnavailableReason = String(directHandle);
         }
       } else {
-        this._pushRuntimeNote('model_staging_heap_resident_unavailable:unsupported');
+        heapUnavailableReason = 'unsupported';
       }
     }
     if (!heapResident) {
@@ -1635,6 +1640,7 @@ export class LlamaWebGpuBridgeRuntime {
       close,
       assertMountOwned,
       heapResident,
+      heapUnavailableReason,
     };
   }
 
@@ -1902,6 +1908,10 @@ export class LlamaWebGpuBridgeRuntime {
           if (requireReadableStream) {
             this._runtimeNotes.push('model_cache_stream');
           }
+          if (options.readDecodedCacheSize) {
+            const decodedSize = await readCachedModelSize(cache, cacheKey, cached);
+            if (decodedSize !== null) cachedModelSizes.set(cached, decodedSize);
+          }
           return cached;
         }
 
@@ -1971,14 +1981,13 @@ export class LlamaWebGpuBridgeRuntime {
       return response;
     }
 
-    const tee = teeResponseForCache(response);
-    const stored = cache.put(cacheKey, tee.cacheResponse).then(
+    const { tee, stored: cacheStore } = startModelCacheStore(cache, cacheKey, response);
+    const stored = cacheStore.then(
       (): ModelCacheStoreOutcome => {
         this._runtimeNotes.push('model_cache_stored');
         return 'stored';
       },
       (error: unknown): ModelCacheStoreOutcome => {
-        tee.detachCache(error);
         // A load that gave up on the body has already failed; its rejected
         // store may settle during the next load, so record nothing.
         return tee.cancelled ? 'store_failed' : recordFailure(error);
@@ -2067,7 +2076,8 @@ export class LlamaWebGpuBridgeRuntime {
             this._modelCacheState = 'hit';
             this._runtimeNotes.push('model_cache_hit');
 
-            headerTotal = Number(cached.headers.get('content-length')) || 0;
+            headerTotal = await readCachedModelSize(cache, cacheKey, cached)
+              ?? (Number(cached.headers.get('content-length')) || 0);
             const resolved = headerTotal > 0 ? headerTotal : 1;
             shardLoaded[shardIndex] = resolved;
             shardTotals[shardIndex] = resolved;
@@ -2091,11 +2101,17 @@ export class LlamaWebGpuBridgeRuntime {
           shardTotals[shardIndex] = headerTotal;
         }
 
-        const putPromise = cache
-          ? cache.put(cacheKey, response.clone())
-            .then(() => ({ ok: true, error: null }))
-            .catch((error) => ({ ok: false, error }))
-          : null;
+        let cacheStore: Promise<void> | null = null;
+        if (cache && hasReadableResponseStream(response)) {
+          const { tee, stored } = startModelCacheStore(cache, cacheKey, response);
+          response = tee.response;
+          cacheStore = stored;
+        } else if (cache) {
+          cacheStore = cache.put(cacheKey, response.clone());
+        }
+        const putPromise = cacheStore
+          ?.then(() => ({ ok: true, error: null }))
+          .catch((error) => ({ ok: false, error }));
 
         await drainResponseWithProgress(
           response,
@@ -2183,6 +2199,7 @@ export class LlamaWebGpuBridgeRuntime {
         const removed = await cache.delete(cacheKey);
         if (removed) {
           removedCount += 1;
+          await pruneCachedModelSizes(cache, cacheKey);
         }
       }
 
@@ -2672,6 +2689,8 @@ export class LlamaWebGpuBridgeRuntime {
           let knownTotalBytes = 0;
           let resumeIdentity: ResumeIdentity | null = null;
           let minimumShardBytes = 0;
+          let heapFileBytes: number | null = null;
+          let heapUnavailableReason: string | undefined;
 
           const restartShard = (reason: 'url' | 'range' | 'etag') => {
             this._runtimeNotes.push('model_stream_restart:' + reason);
@@ -2698,6 +2717,7 @@ export class LlamaWebGpuBridgeRuntime {
             const response = await this._getCachedModelResponse(activeShardUrl, {
               ...options,
               requireReadableStream: true,
+              readDecodedCacheSize: heapResidentStaging,
               useCache: requestHeaders ? false : options.useCache,
               force: requestHeaders ? true : options.force,
               requestHeaders,
@@ -2754,7 +2774,8 @@ export class LlamaWebGpuBridgeRuntime {
             }
             this._runtimeNotes.push('model_response_stream');
 
-            const responseTotal = inferResponseTotalBytes(response, knownTotalBytes);
+            const decodedCacheSize = cachedModelSizes.get(response);
+            const responseTotal = decodedCacheSize ?? inferResponseTotalBytes(response, knownTotalBytes);
             let fullGetSpanBytes: number | null = null;
             if (resumeOffset === 0) {
               resumeIdentity = captureResumeIdentity(response, responseUrl);
@@ -2762,6 +2783,7 @@ export class LlamaWebGpuBridgeRuntime {
                 await response.body?.cancel().catch(() => {});
                 throw createModelTransferLengthError('Model response reported conflicting Content-Range and X-Linked-Size totals.');
               }
+              resumeIdentity.total ??= decodedCacheSize ?? null;
               expectedShardBytes = resumeIdentity.total;
               fullGetSpanBytes = resumeIdentity.initialSpanBytes;
             }
@@ -2790,8 +2812,11 @@ export class LlamaWebGpuBridgeRuntime {
                       : 0,
                   )
                 : null;
-              if (directWriter?.heapResident) {
-                this._pushRuntimeNote('model_staging_heap_resident');
+              if (resumeOffset === 0) {
+                heapFileBytes = directWriter?.heapResident ? expectedShardBytes : null;
+                heapUnavailableReason = heapResidentStaging && expectedShardBytes === null
+                  ? 'unknown_size'
+                  : directWriter?.heapUnavailableReason;
               }
               shardBytes = await writeResponseToFsFileWithProgress(
                 response,
@@ -2817,6 +2842,7 @@ export class LlamaWebGpuBridgeRuntime {
                   // dropped one. A cache tee still reads the chunks.
                   releaseConsumedChunks: this._isWebKit && !pendingModelCacheStores.has(response),
                   startOffset: resumeOffset,
+                  heapFileBytes,
                   preservePartialOnError: true,
                   totalBytes: knownTotalBytes,
                   chunkTimeoutMs: streamChunkTimeoutMs,
@@ -2838,6 +2864,11 @@ export class LlamaWebGpuBridgeRuntime {
                 );
               }
               await this._settleModelCacheStore(response);
+              if (heapFileBytes !== null) {
+                this._pushRuntimeNote('model_staging_heap_resident');
+              } else if (heapUnavailableReason) {
+                this._pushRuntimeNote(`model_staging_heap_resident_unavailable:${heapUnavailableReason}`);
+              }
               break;
             } catch (error) {
               if (assertMountOwned && !isCoreRetired(core)) {

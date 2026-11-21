@@ -102,7 +102,11 @@ tensor-limit failures into typed `ModelStagingError` errors.
 
 For a single-file GGUF with a known decoded size, JS-backed staging uses one
 memory-mapped wasm heap block when the effective `nGpuLayers` is 0 or 1 after
-the Safari cap. Split models, full offload (the default or a negative
+the Safari cap. Streamed cache entries retain their measured decoded size so
+reloads can use the same path. On WebKit, standalone JS-backed
+model streams use `transfer(0)` to release consumed whole buffers on both heap
+and JS-chunk paths.
+Split models, full offload (the default or a negative
 `nGpuLayers`), more than one effective GPU layer, older or fixed-memory cores, and
 `useMmap: false` use JS chunks. On iOS Safari below 27, pass an explicit
 `nGpuLayers`. Setting it to 0 raises the model-size ceiling by keeping model
@@ -112,7 +116,8 @@ Bridges from the same bundle that share a core through `coreModuleFactory`
 use a shared sequence of staging paths. Later loads skip occupied paths and
 avoid reusing paths left behind by an earlier bridge. Each core holds one
 loaded model. Use separate core instances to hold models in multiple bridges
-at the same time.
+at the same time. Replacing a model through a different bridge on the same
+core can keep the previous heap block resident until the previous bridge releases it.
 
 Tradeoffs: small models see slightly slower native reads from JS chunks
 (`Qwen3-0.6B-Q8_0` 767 MiB 3-run median native load `480.9 ms` vs `444.6 ms`

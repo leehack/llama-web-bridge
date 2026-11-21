@@ -1450,40 +1450,47 @@ async function drainResponseWithProgress(response, progressCallback, options = {
   const reader = response.body.getReader();
   let loaded = 0;
   let lastBucket = -1;
-  while (true) {
-    const { done, value } = await readStreamChunkWithTimeout(
-      reader,
-      chunkTimeoutMs,
-      "response drain read"
-    );
-    if (done) {
-      break;
-    }
-    if (!value || value.length === 0) {
-      continue;
-    }
-    loaded += value.length;
-    if (typeof progressCallback === "function") {
-      const effectiveTotal = total || loaded;
-      const bucket = effectiveTotal > 0 ? Math.floor(loaded / effectiveTotal * 100) : -1;
-      if (bucket > lastBucket) {
-        lastBucket = bucket;
-        progressCallback({ loaded, total: effectiveTotal });
+  try {
+    while (true) {
+      const { done, value } = await readStreamChunkWithTimeout(
+        reader,
+        chunkTimeoutMs,
+        "response drain read"
+      );
+      if (done) {
+        break;
+      }
+      if (!value || value.length === 0) {
+        continue;
+      }
+      loaded += value.length;
+      if (typeof progressCallback === "function") {
+        const effectiveTotal = total || loaded;
+        const bucket = effectiveTotal > 0 ? Math.floor(loaded / effectiveTotal * 100) : -1;
+        if (bucket > lastBucket) {
+          lastBucket = bucket;
+          progressCallback({ loaded, total: effectiveTotal });
+        }
       }
     }
-  }
-  if (typeof progressCallback === "function") {
-    progressCallback({ loaded, total: total || loaded });
+    if (typeof progressCallback === "function") {
+      progressCallback({ loaded, total: total || loaded });
+    }
+  } catch (error) {
+    void reader.cancel(error).catch(() => {
+    });
+    throw error;
   }
   return loaded;
 }
 var DEFAULT_CACHE_TEE_LAG_BYTES = 8 * 1024 * 1024;
-function teeResponseForCache(source, maxCacheLagBytes = DEFAULT_CACHE_TEE_LAG_BYTES) {
+function teeResponseForCache(source, maxCacheLagBytes = DEFAULT_CACHE_TEE_LAG_BYTES, recordId) {
   const reader = source.body.getReader();
   let cacheController = null;
   let wakeReader = null;
   let finished = false;
   let cancelled = false;
+  let decodedBytes = 0;
   const wake = () => {
     const resolve = wakeReader;
     wakeReader = null;
@@ -1551,6 +1558,7 @@ function teeResponseForCache(source, maxCacheLagBytes = DEFAULT_CACHE_TEE_LAG_BY
           cacheController = null;
           return;
         }
+        decodedBytes += result.value.byteLength;
         controller.enqueue(result.value);
         try {
           cacheController?.enqueue(result.value);
@@ -1573,14 +1581,77 @@ function teeResponseForCache(source, maxCacheLagBytes = DEFAULT_CACHE_TEE_LAG_BY
     url: { value: source.url },
     type: { value: source.type }
   });
+  const cacheHeaders = new Headers(source.headers);
+  cacheHeaders.delete(MODEL_CACHE_RECORD_HEADER);
+  if (recordId) cacheHeaders.set(MODEL_CACHE_RECORD_HEADER, recordId);
   return {
     response,
-    cacheResponse: new Response(cacheStream, init),
+    cacheResponse: new Response(cacheStream, { ...init, headers: cacheHeaders }),
     detachCache,
     get cancelled() {
       return cancelled;
+    },
+    get decodedBytes() {
+      return decodedBytes;
     }
   };
+}
+var MODEL_CACHE_RECORD_HEADER = "x-llamadart-cache-record";
+var MODEL_CACHE_SIZE_HEADER = "x-llamadart-decoded-size";
+async function modelCacheMetadataUrl(cacheKey) {
+  const key = new URL(cacheKey);
+  key.hash = "";
+  const hash = await globalThis.crypto.subtle.digest("SHA-256", new TextEncoder().encode(key.href));
+  const digest = Array.from(new Uint8Array(hash), (byte) => byte.toString(16).padStart(2, "0")).join("");
+  return "https://llamadart-cache.invalid/decoded-size/" + digest;
+}
+function modelCacheRecord(response) {
+  const record = response?.headers.get(MODEL_CACHE_RECORD_HEADER) ?? "";
+  return /^[0-9a-f-]{36}$/.test(record) ? record : null;
+}
+async function readCachedModelSize(cache, cacheKey, response) {
+  const record = modelCacheRecord(response);
+  if (!record) return null;
+  try {
+    const metadata = await cache.match(await modelCacheMetadataUrl(cacheKey) + "?record=" + record);
+    const bytes = parseByteLength(metadata?.headers.get(MODEL_CACHE_SIZE_HEADER) ?? null);
+    return bytes !== null && bytes > 0 ? bytes : null;
+  } catch (_) {
+    return null;
+  }
+}
+async function pruneCachedModelSizes(cache, cacheKey) {
+  try {
+    const url = await modelCacheMetadataUrl(cacheKey);
+    const entries = await cache.keys(url, { ignoreSearch: true });
+    if (entries.length === 0) return;
+    const cached = await cache.match(cacheKey);
+    const record = modelCacheRecord(cached);
+    void cached?.body?.cancel().catch(() => {
+    });
+    const keep = url + "?record=" + record;
+    await Promise.all(entries.filter((entry) => entry.url !== keep).map((entry) => cache.delete(entry)));
+  } catch (_) {
+  }
+}
+function startModelCacheStore(cache, cacheKey, response) {
+  const record = globalThis.crypto?.randomUUID?.();
+  const tee = teeResponseForCache(response, DEFAULT_CACHE_TEE_LAG_BYTES, record);
+  const stored = cache.put(cacheKey, tee.cacheResponse).then(async () => {
+    if (!record || !Number.isSafeInteger(tee.decodedBytes) || tee.decodedBytes <= 0) return;
+    try {
+      const url = await modelCacheMetadataUrl(cacheKey) + "?record=" + record;
+      await cache.put(url, new Response(null, {
+        headers: { [MODEL_CACHE_SIZE_HEADER]: String(tee.decodedBytes) }
+      }));
+      await pruneCachedModelSizes(cache, cacheKey);
+    } catch (_) {
+    }
+  }, (error) => {
+    tee.detachCache(error);
+    throw error;
+  });
+  return { tee, stored };
 }
 function ensureFsDirectory(fs, dirPath) {
   const slash = dirPath.lastIndexOf("/");
@@ -1642,6 +1713,7 @@ async function writeResponseToFsFileWithProgress(response, fs, filePath, progres
   const directWriter = writeOptions.directWriter || null;
   const releaseConsumedChunks = directWriter != null && writeOptions.releaseConsumedChunks === true;
   const startOffset = parsePositiveInteger(writeOptions.startOffset);
+  const heapFileBytes = writeOptions.heapFileBytes ?? null;
   const preservePartialOnError = writeOptions.preservePartialOnError === true;
   const appendMode = startOffset > 0;
   const chunkTimeoutMs = parsePositiveInteger(writeOptions.chunkTimeoutMs);
@@ -1662,6 +1734,9 @@ async function writeResponseToFsFileWithProgress(response, fs, filePath, progres
         throw createModelTransferLengthError(
           bytes.byteLength < exactLength2 ? "Model response ended before its declared byte length." : "Model response exceeded its declared byte length."
         );
+      }
+      if (heapFileBytes !== null && startOffset + bytes.byteLength > heapFileBytes) {
+        throw createModelTransferLengthError("Model response exceeded its declared byte length.");
       }
       let directLoaded = 0;
       if (directWriter) {
@@ -1740,6 +1815,9 @@ async function writeResponseToFsFileWithProgress(response, fs, filePath, progres
       );
       if (done) {
         throwIfAborted(signal, abortMessage);
+        if (heapFileBytes !== null && startOffset + loaded > heapFileBytes) {
+          throw createModelTransferLengthError("Model response exceeded its declared byte length.");
+        }
         if (exactLength > 0 && loaded !== exactLength) {
           throw createModelTransferLengthError("Model response ended before its declared byte length.");
         }
@@ -1750,6 +1828,15 @@ async function writeResponseToFsFileWithProgress(response, fs, filePath, progres
       }
       if (exactLength > 0 && value.length > exactLength - loaded) {
         throw createModelTransferLengthError("Model response exceeded its declared byte length.");
+      }
+      if (heapFileBytes !== null && startOffset + loaded + value.length > heapFileBytes) {
+        if (response.status !== 206) {
+          throw createModelTransferLengthError("Model response exceeded its declared byte length.");
+        }
+        loaded += value.length;
+        emitProgressIfNeeded();
+        if (releaseConsumedChunks) releaseChunkBuffer(value);
+        continue;
       }
       if (directWriter) {
         throwIfAborted(signal, abortMessage);
@@ -2029,6 +2116,7 @@ function scoredTokensFrom(entries) {
 }
 
 // js/src/runtime.ts
+var cachedModelSizes = /* @__PURE__ */ new WeakMap();
 var pendingModelCacheStores = /* @__PURE__ */ new WeakMap();
 var SAFARI_EMBEDDING_PROBE_MAX_COSINE = 0.999;
 var SAFARI_EMBEDDING_PROBE_MIN_COMPONENT = 1e-3;
@@ -3038,6 +3126,7 @@ var LlamaWebGpuBridgeRuntime = class {
   _openDirectJsWriter(core, filePath, preallocBytes, append, assertMountOwned, heapBytes = 0) {
     assertMountOwned();
     let heapResident = false;
+    let heapUnavailableReason;
     let directHandle = 0;
     if (heapBytes > 0 && !append) {
       if (supportsHeapResidentStaging(core, this._jsModelStagingApiVersion)) {
@@ -3051,10 +3140,10 @@ var LlamaWebGpuBridgeRuntime = class {
         );
         heapResident = Number.isInteger(directHandle) && directHandle > 0;
         if (!heapResident) {
-          this._pushRuntimeNote(`model_staging_heap_resident_unavailable:${directHandle}`);
+          heapUnavailableReason = String(directHandle);
         }
       } else {
-        this._pushRuntimeNote("model_staging_heap_resident_unavailable:unsupported");
+        heapUnavailableReason = "unsupported";
       }
     }
     if (!heapResident) {
@@ -3115,7 +3204,8 @@ var LlamaWebGpuBridgeRuntime = class {
       },
       close,
       assertMountOwned,
-      heapResident
+      heapResident,
+      heapUnavailableReason
     };
   }
   _assertJsStagingMountOwned(core, mountPath, mountId) {
@@ -3330,6 +3420,10 @@ var LlamaWebGpuBridgeRuntime = class {
           if (requireReadableStream) {
             this._runtimeNotes.push("model_cache_stream");
           }
+          if (options.readDecodedCacheSize) {
+            const decodedSize = await readCachedModelSize(cache, cacheKey, cached);
+            if (decodedSize !== null) cachedModelSizes.set(cached, decodedSize);
+          }
           return cached;
         }
         this._runtimeNotes.push("model_cache_hit_no_stream");
@@ -3386,14 +3480,13 @@ var LlamaWebGpuBridgeRuntime = class {
       }
       return response;
     }
-    const tee = teeResponseForCache(response);
-    const stored = cache.put(cacheKey, tee.cacheResponse).then(
+    const { tee, stored: cacheStore } = startModelCacheStore(cache, cacheKey, response);
+    const stored = cacheStore.then(
       () => {
         this._runtimeNotes.push("model_cache_stored");
         return "stored";
       },
       (error) => {
-        tee.detachCache(error);
         return tee.cancelled ? "store_failed" : recordFailure(error);
       }
     );
@@ -3462,7 +3555,7 @@ var LlamaWebGpuBridgeRuntime = class {
             this._modelSource = "cache";
             this._modelCacheState = "hit";
             this._runtimeNotes.push("model_cache_hit");
-            headerTotal = Number(cached.headers.get("content-length")) || 0;
+            headerTotal = await readCachedModelSize(cache, cacheKey, cached) ?? (Number(cached.headers.get("content-length")) || 0);
             const resolved = headerTotal > 0 ? headerTotal : 1;
             shardLoaded[shardIndex] = resolved;
             shardTotals[shardIndex] = resolved;
@@ -3482,7 +3575,15 @@ var LlamaWebGpuBridgeRuntime = class {
         if (headerTotal > 0) {
           shardTotals[shardIndex] = headerTotal;
         }
-        const putPromise = cache ? cache.put(cacheKey, response.clone()).then(() => ({ ok: true, error: null })).catch((error) => ({ ok: false, error })) : null;
+        let cacheStore = null;
+        if (cache && hasReadableResponseStream(response)) {
+          const { tee, stored } = startModelCacheStore(cache, cacheKey, response);
+          response = tee.response;
+          cacheStore = stored;
+        } else if (cache) {
+          cacheStore = cache.put(cacheKey, response.clone());
+        }
+        const putPromise = cacheStore?.then(() => ({ ok: true, error: null })).catch((error) => ({ ok: false, error }));
         await drainResponseWithProgress(
           response,
           progressCallback ? (progress) => {
@@ -3555,6 +3656,7 @@ var LlamaWebGpuBridgeRuntime = class {
         const removed = await cache.delete(cacheKey);
         if (removed) {
           removedCount += 1;
+          await pruneCachedModelSizes(cache, cacheKey);
         }
       }
       const removedAny = removedCount > 0;
@@ -3952,6 +4054,8 @@ var LlamaWebGpuBridgeRuntime = class {
             let knownTotalBytes = 0;
             let resumeIdentity = null;
             let minimumShardBytes = 0;
+            let heapFileBytes = null;
+            let heapUnavailableReason;
             const restartShard = (reason) => {
               this._runtimeNotes.push("model_stream_restart:" + reason);
               if (resumeAttempt >= maxStreamResumeRetries) {
@@ -3973,6 +4077,7 @@ var LlamaWebGpuBridgeRuntime = class {
               const response = await this._getCachedModelResponse(activeShardUrl, {
                 ...options,
                 requireReadableStream: true,
+                readDecodedCacheSize: heapResidentStaging,
                 useCache: requestHeaders ? false : options.useCache,
                 force: requestHeaders ? true : options.force,
                 requestHeaders
@@ -4026,7 +4131,8 @@ var LlamaWebGpuBridgeRuntime = class {
                 );
               }
               this._runtimeNotes.push("model_response_stream");
-              const responseTotal = inferResponseTotalBytes(response, knownTotalBytes);
+              const decodedCacheSize = cachedModelSizes.get(response);
+              const responseTotal = decodedCacheSize ?? inferResponseTotalBytes(response, knownTotalBytes);
               let fullGetSpanBytes = null;
               if (resumeOffset === 0) {
                 resumeIdentity = captureResumeIdentity(response, responseUrl);
@@ -4035,6 +4141,7 @@ var LlamaWebGpuBridgeRuntime = class {
                   });
                   throw createModelTransferLengthError("Model response reported conflicting Content-Range and X-Linked-Size totals.");
                 }
+                resumeIdentity.total ??= decodedCacheSize ?? null;
                 expectedShardBytes = resumeIdentity.total;
                 fullGetSpanBytes = resumeIdentity.initialSpanBytes;
               }
@@ -4057,8 +4164,9 @@ var LlamaWebGpuBridgeRuntime = class {
                   // The block cannot grow, so it needs the exact decoded size.
                   heapResidentStaging && resumeOffset === 0 && expectedShardBytes !== null ? expectedShardBytes : 0
                 ) : null;
-                if (directWriter?.heapResident) {
-                  this._pushRuntimeNote("model_staging_heap_resident");
+                if (resumeOffset === 0) {
+                  heapFileBytes = directWriter?.heapResident ? expectedShardBytes : null;
+                  heapUnavailableReason = heapResidentStaging && expectedShardBytes === null ? "unknown_size" : directWriter?.heapUnavailableReason;
                 }
                 shardBytes = await writeResponseToFsFileWithProgress(
                   response,
@@ -4082,6 +4190,7 @@ var LlamaWebGpuBridgeRuntime = class {
                     // dropped one. A cache tee still reads the chunks.
                     releaseConsumedChunks: this._isWebKit && !pendingModelCacheStores.has(response),
                     startOffset: resumeOffset,
+                    heapFileBytes,
                     preservePartialOnError: true,
                     totalBytes: knownTotalBytes,
                     chunkTimeoutMs: streamChunkTimeoutMs,
@@ -4101,6 +4210,11 @@ var LlamaWebGpuBridgeRuntime = class {
                   );
                 }
                 await this._settleModelCacheStore(response);
+                if (heapFileBytes !== null) {
+                  this._pushRuntimeNote("model_staging_heap_resident");
+                } else if (heapUnavailableReason) {
+                  this._pushRuntimeNote(`model_staging_heap_resident_unavailable:${heapUnavailableReason}`);
+                }
                 break;
               } catch (error) {
                 if (assertMountOwned && !isCoreRetired(core)) {

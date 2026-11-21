@@ -1262,6 +1262,88 @@ test('resumed HTTP 206 with jsBackedModelStaging opens append handle and writes 
   assert.deepEqual(staged, fullPayload);
 });
 
+test('heap-file overrun preserves range restart and reports a false full length as a transfer error', async (t) => {
+  await t.test('the stream rejects an oversized range that reaches EOF', async () => {
+    const writes = [];
+    const response = new Response(Uint8Array.of(3, 4, 5, 6, 7, 8), { status: 206 });
+    await assert.rejects(writeResponseToFsFileWithProgress(response, {}, '/model.gguf', null, {
+      directWriter: {
+        writeChunk(chunk) { writes.push(chunk); return chunk.length; },
+      },
+      startOffset: 2,
+      heapFileBytes: 6,
+    }), { name: 'ModelTransferLengthError' });
+    assert.deepEqual(writes, []);
+  });
+  for (const scenario of ['range overrun', 'closed overrun', 'valid append', 'ETag restart', 'false full length']) {
+    await t.test(scenario, async () => {
+      let request = 0;
+      const { runtime, ccalls } = createStagingHarness({
+        apiVersion: 4,
+        failWriteWith: ({ position, length }) => (
+          request <= 2 && position + length > 6 ? { errno: 22 } : null
+        ),
+      });
+      const requests = [];
+      const brokenResponse = (status, bytes, headers) => {
+        let sent = false;
+        return new Response(new ReadableStream({
+          pull(controller) {
+            if (sent) {
+              controller.error(new TypeError('network error'));
+            } else {
+              sent = true;
+              controller.enqueue(Uint8Array.from(bytes));
+            }
+          },
+        }, { highWaterMark: 0 }), { status, headers });
+      };
+      runtime._getCachedModelResponse = async (_url, { requestHeaders }) => {
+        requests.push(requestHeaders?.Range ?? null);
+        request++;
+        if (scenario === 'false full length') {
+          return new Response(new Uint8Array(8), { headers: { 'x-linked-size': '6' } });
+        }
+        if (request === 1) {
+          return brokenResponse(200, [1, 2], { 'content-length': '6', 'content-encoding': 'identity', etag: '"a"' });
+        }
+        if (request === 2) {
+          const headers = {
+            'content-range': 'bytes 2-5/6', 'content-encoding': 'identity',
+            etag: scenario === 'ETag restart' ? '"b"' : '"a"',
+          };
+          if (scenario === 'closed overrun' || scenario === 'valid append') {
+            const suffix = scenario === 'valid append' ? [3, 4, 5, 6] : [3, 4, 5, 6, 7, 8];
+            return new Response(Uint8Array.from(suffix), { status: 206, headers });
+          }
+          return brokenResponse(206, [3, 4, 5, 6, 7, 8], headers);
+        }
+        return new Response(new Uint8Array(6));
+      };
+      const load = runtime.loadModelFromUrl('https://models.test/overrun.gguf', {
+        nGpuLayers: 0, useCache: false, forceRemoteFetchBackend: false,
+      });
+      if (scenario === 'false full length' || scenario === 'closed overrun') {
+        await assert.rejects(load, { name: 'ModelTransferLengthError' });
+        assert.deepEqual(requests, scenario === 'closed overrun' ? [null, 'bytes=2-'] : [null]);
+        assert.ok(!ccalls.some(([name]) => name === 'llamadart_webgpu_load_model'));
+        return;
+      }
+      assert.equal(await load, 1);
+      if (scenario === 'valid append') {
+        assert.deepEqual(requests, [null, 'bytes=2-']);
+        assert.ok(runtime._runtimeNotes.includes('model_staging_heap_resident'));
+        return;
+      }
+      assert.deepEqual(requests, [null, 'bytes=2-', null]);
+      const reason = scenario === 'ETag restart' ? 'etag' : 'range';
+      assert.ok(runtime._runtimeNotes.includes(`model_stream_restart:${reason}`));
+      assert.ok(!runtime._runtimeNotes.includes('model_staging_heap_resident'));
+      assert.ok(runtime._runtimeNotes.includes('model_staging_heap_resident_unavailable:unknown_size'));
+    });
+  }
+});
+
 test('loadMultimodalProjector uses JS-backed direct staging when jsBackedModelStaging is enabled', async () => {
   for (const coreVariant of ['wasm32', 'wasm64']) {
     const harness = createStagingHarness({ jsBackedModelStaging: true, coreVariant });
