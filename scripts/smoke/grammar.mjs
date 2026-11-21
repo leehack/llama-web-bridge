@@ -29,6 +29,7 @@ import {
   resolvePinnedModel,
   runMain,
   runPlaywright,
+  stageFile,
   withServer,
   withTempDir,
   writeStdout,
@@ -56,12 +57,12 @@ original bug (the end-tag-rejecting grammar finishing the block without its end
 tag); the tiny-model run passes with or without the fix, so CI must keep the
 Qwen3.5 run.
 
-It then checks \`\`minP\`\` and \`\`presencePenalty\`\` with a fixed seed. Every
-compared completion reuses the same cached prompt, so each run starts from the
-same logits. \`\`minP: 1\`\` keeps only the most probable token and so matches
-greedy decoding, which plain sampling does not; explicit zeros match the
-defaults; a presence penalty changes greedy output; an invalid value rejects,
-and the same seeded sample repeats exactly afterwards.
+It then checks \`\`minP\`\` and \`\`presencePenalty\`\` with a fixed seed and a shared
+prompt. The comparisons start with eight tokens and expand to 20 if the
+controls need more tokens to diverge. \`\`minP: 1\`\` keeps only the most probable
+token and matches greedy decoding. Plain sampling produces different text,
+explicit zeros match the defaults, and a presence penalty changes the greedy
+output. After invalid values are rejected, the seeded sample repeats exactly.
 \`\`getCompletionCapabilities\`\` reports no option before a model load and
 every option after it.
 
@@ -94,6 +95,7 @@ that rejects its own trigger text must each reject, after which the
 unconstrained completion repeats exactly.`;
 
 const MODEL_FILENAME = 'grammar-smoke-model.gguf';
+export const MAX_THREADS = 4;
 // The issue #115 repro prompt. Its ChatML markers are plain text to a model
 // without that template, which is fine: the grammar decides the output.
 const PROMPT = '<|im_start|>user\nIs the sky blue? Answer yes or no.<|im_end|>\n'
@@ -162,6 +164,7 @@ export const CASES = Object.freeze([
   },
 ]);
 const SAMPLER_PROMPT = 'Here is a long list of animals, colors, and cities:';
+export const SAMPLER_SHORT_PREDICT = 8;
 const SAMPLED = { nPredict: 20, temp: 1, topK: 0, topP: 1, penalty: 1, seed: 11 };
 const GREEDY = { nPredict: 20, temp: 0, topK: 1, penalty: 1, seed: 11 };
 // Each run's options; "first" warms the prompt cache and is not compared.
@@ -302,6 +305,7 @@ export function renderHarness(nCtx, memoryModes) {
     nonThrowingRejection: NON_THROWING_REJECTION,
     samplerPrompt: SAMPLER_PROMPT,
     samplerRuns: SAMPLER_RUNS,
+    samplerShortPredict: SAMPLER_SHORT_PREDICT,
     thinkingRuns: THINKING_RUNS,
     promptPenalty: PROMPT_PENALTY,
     invalidThinkingBudget: INVALID_THINKING_BUDGET,
@@ -309,6 +313,7 @@ export function renderHarness(nCtx, memoryModes) {
     lazyGrammar: LAZY_GRAMMAR,
     lazyTriggerRuns: LAZY_TRIGGER_RUNS,
     completionCapabilities: COMPLETION_CAPABILITIES,
+    maxThreads: MAX_THREADS,
     nCtx,
     memoryModes,
     runtimeModes: RUNTIME_MODES,
@@ -322,6 +327,11 @@ export function renderHarness(nCtx, memoryModes) {
 <script type="module">
 (async () => {
   const result = document.getElementById('result');
+  const setStage = (stage) => {
+    window.__smokeStage = stage;
+    result.textContent = \`pending: \${stage}\`;
+    console.log(\`GRAMMAR_STAGE \${stage}\`);
+  };
   const finish = (payload) => {
     result.textContent = JSON.stringify(payload);
     window.__smokeResult = payload;
@@ -354,6 +364,7 @@ export function renderHarness(nCtx, memoryModes) {
     if (!window.crossOriginIsolated) {
       throw new Error('test page is not cross-origin isolated');
     }
+    setStage('startup:bridge-import');
     const module = await import('/llama_webgpu_bridge.js');
     const LlamaWebGpuBridge = module.LlamaWebGpuBridge || window.LlamaWebGpuBridge;
     assert(typeof LlamaWebGpuBridge === 'function', 'LlamaWebGpuBridge export was not registered');
@@ -363,55 +374,142 @@ export function renderHarness(nCtx, memoryModes) {
     );
     const modeResults = [];
 
+    const createPrefixSnapshotHelper = (bridge) => {
+      const snapshotPath = '/tmp/grammar-smoke-prefix.bin';
+      const stats = { enabled: false, saves: 0, restores: 0, saveMs: 0, restoreMs: 0, cachedPromptTokens: 0, restoresByPhase: {} };
+      let active = null;
+      let phase;
+      const startsWithTokens = (tokens, prefix) => prefix.every((token, i) => tokens[i] === token);
+      const invalidate = () => { active = null; };
+      const detect = async () => {
+        if (typeof bridge.stateSaveFile !== 'function' || typeof bridge.stateLoadFile !== 'function'
+            || typeof bridge.detokenize !== 'function') return;
+        let usage;
+        for (let i = 0; i < 2; i++) {
+          usage = undefined;
+          await bridge.createCompletion('a b', {
+            nPredict: 1, temp: 0, topK: 1, seed: 1, onUsage: (value) => { usage = value; },
+          });
+        }
+        stats.enabled = usage?.promptTokens > 1 && usage.cachedPromptTokens === 0;
+      };
+      const saveCurrentContextAs = async (prompt, tokens) => {
+        const startedAt = performance.now();
+        await bridge.stateSaveFile(snapshotPath, tokens);
+        stats.saveMs += performance.now() - startedAt;
+        stats.saves += 1;
+        active = { prompt, tokens };
+      };
+      const load = async (run) => {
+        const startedAt = performance.now();
+        await bridge.stateLoadFile(snapshotPath);
+        const elapsed = performance.now() - startedAt;
+        stats.restoreMs += elapsed;
+        stats.restores += 1;
+        (stats.restoresByPhase[phase] ??= []).push({ run, restoreMs: Math.round(elapsed * 1_000) / 1_000 });
+      };
+      const prepare = async (prompt, run) => {
+        if (!stats.enabled) return false;
+        if (active?.prompt === prompt) return true;
+        // Leaving the final token to decode lets recurrent memory keep the snapshot and still produce logits.
+        const prefix = (await bridge.tokenize(prompt, true)).slice(0, -1);
+        if (prefix.length === 0) {
+          invalidate();
+          return false;
+        }
+        if (active?.tokens.length === prefix.length && startsWithTokens(prefix, active.tokens)) {
+          active.prompt = prompt;
+          return true;
+        }
+        const prefixText = await bridge.detokenize(prefix, true);
+        const roundTrip = await bridge.tokenize(prefixText, true);
+        if (roundTrip.length !== prefix.length || !startsWithTokens(roundTrip, prefix)) {
+          invalidate();
+          return false;
+        }
+        if (active && active.tokens.length < prefix.length && startsWithTokens(prefix, active.tokens)) {
+          await load(run + ':extend-prefix');
+        }
+        await bridge.scoreNextToken(prefixText, { topK: 1 });
+        await saveCurrentContextAs(prompt, prefix);
+        return true;
+      };
+      const restore = async (prompt, run) => {
+        if (!stats.enabled || active?.prompt !== prompt) return false;
+        await load(run);
+        return true;
+      };
+      const complete = async (prompt, options, run) => {
+        if (!await restore(prompt, run)) return bridge.createCompletion(prompt, options);
+        return bridge.createCompletion(prompt, {
+          ...options,
+          onUsage: (usage) => {
+            stats.cachedPromptTokens += usage.cachedPromptTokens ?? 0;
+            options.onUsage?.(usage);
+          },
+        });
+      };
+      return { detect, prepare, restore, complete, invalidate, saveCurrentContextAs, stats, setPhase: (key) => { phase = key; } };
+    };
+
     // Appends the most probable next token's text, a greedy continuation,
     // until that token is among the prompt's last tokens, then runs the
     // greedy token under a large presence penalty with and without a grammar.
     // A step whose picks are near ties, or whose penalized pick ends
     // generation and so returns no text, is skipped.
-    const probePromptPenalty = async (bridge) => {
+    const probePromptPenalty = async (bridge, snap) => {
       const probe = config.promptPenalty;
       const text = (bytes) => new TextDecoder().decode(bytes);
       const usable = (piece) => piece.length > 0 && !piece.includes('\uFFFD');
       const clear = ([first, second]) => second === undefined || first.logprob - second.logprob > probe.minGap;
       let prompt = config.samplerPrompt;
+      const rolling = await snap.prepare(prompt, 'score-0');
+      if (rolling) await snap.restore(prompt, 'score-0');
       for (let step = 0; step < probe.maxSteps; step++) {
         const { top } = await bridge.scoreNextToken(prompt, { topK: probe.topK });
-        const window = (await bridge.tokenize(prompt, true)).slice(-probe.window);
+        const fullTokens = await bridge.tokenize(prompt, true);
+        const window = fullTokens.slice(-probe.window);
+        let contextMatchesPrompt = true;
         const outside = top.filter((entry) => !window.includes(entry.token));
         const best = text(top[0].bytes);
         const unpenalized = outside.length > 0 ? text(outside[0].bytes) : '';
         if (window.includes(top[0].token) && clear(top) && clear(outside)
             && usable(best) && usable(unpenalized) && best !== unpenalized) {
-          const run = (options) => bridge.createCompletion(prompt, {
+          const completionOptions = (options) => ({
             ...probe.options,
             ...options,
             tokenEventEncoding: 'text',
           });
-          const penalized = await run({ presencePenalty: probe.presencePenalty });
+          contextMatchesPrompt = false;
+          const penalized = await bridge.createCompletion(prompt, completionOptions({ presencePenalty: probe.presencePenalty }));
           if (penalized !== '') {
+            await snap.prepare(prompt, 'penalty-comparisons');
+            const run = (name, options) => snap.complete(prompt, completionOptions(options), name);
             return {
               steps: step,
               best,
               unpenalized,
-              neutral: await run({}),
+              neutral: await run('neutral', {}),
               penalized,
-              grammar: await run({ presencePenalty: probe.presencePenalty, grammar: probe.grammar }),
-              emptyGrammar: await run({ presencePenalty: probe.presencePenalty, grammar: '' }),
-              grammarOptIn: await run({ presencePenalty: probe.presencePenalty, grammar: probe.grammar, penaltyPromptTokensWithGrammar: true }),
-              emptyGrammarOptIn: await run({ presencePenalty: probe.presencePenalty, grammar: '', penaltyPromptTokensWithGrammar: true }),
+              grammar: await run('grammar', { presencePenalty: probe.presencePenalty, grammar: probe.grammar }),
+              emptyGrammar: await run('empty-grammar', { presencePenalty: probe.presencePenalty, grammar: '' }),
+              grammarOptIn: await run('grammar-opt-in', { presencePenalty: probe.presencePenalty, grammar: probe.grammar, penaltyPromptTokensWithGrammar: true }),
+              emptyGrammarOptIn: await run('empty-grammar-opt-in', { presencePenalty: probe.presencePenalty, grammar: '', penaltyPromptTokensWithGrammar: true }),
               // The trigger appears in the prompt, and its grammar allows only
               // a different suffix after it. Seeding must not fire it.
-              promptTriggerOptIn: await run({
+              promptTriggerOptIn: await run('prompt-trigger-opt-in', {
                 presencePenalty: probe.presencePenalty,
                 grammar: 'root ::= ' + gbnfLiteral(prompt) + ' "__prompt_trigger_fired__"',
                 grammarLazy: true,
                 grammarTriggers: [{ type: 'word', value: prompt }],
                 penaltyPromptTokensWithGrammar: true,
               }),
-              optOut: await run({ presencePenalty: probe.presencePenalty, penaltyPromptTokens: false }),
+              optOut: await run('opt-out', { presencePenalty: probe.presencePenalty, penaltyPromptTokens: false }),
             };
           }
+          snap.invalidate();
         }
+        if (rolling && contextMatchesPrompt) await snap.saveCurrentContextAs(null, fullTokens);
         prompt += best;
       }
       return { steps: probe.maxSteps, best: null };
@@ -433,27 +531,30 @@ export function renderHarness(nCtx, memoryModes) {
 
     // Runs lazy grammars triggered by text the unconstrained greedy
     // completion produces, and the rejections that must leave the core usable.
-    const probeLazyGrammar = async (bridge) => {
+    const probeLazyGrammar = async (bridge, snap) => {
       const lazy = config.lazyGrammar;
       // Room for the trigger window, an answer and the end of generation.
       let answeredTokens = 0;
-      const run = (options, nPredict = answeredTokens) => bridge.createCompletion(lazy.prompt, {
+      const completionOptions = (options, nPredict = answeredTokens) => ({
         ...lazy.options,
         nPredict,
         ...options,
         tokenEventEncoding: 'text',
       });
+      const raw = (options, nPredict) => bridge.createCompletion(lazy.prompt, completionOptions(options, nPredict));
+      const run = (name, options, nPredict) => snap.complete(lazy.prompt, completionOptions(options, nPredict), name);
       const usableWindow = (before, through) => {
         const word = through.startsWith(before) ? through.slice(before.length) : '';
         return word.length > 0 && through.indexOf(word) === before.length && !through.includes('\uFFFD');
       };
       let beforeTokens = lazy.minBeforeTokens;
-      let before = await run({}, beforeTokens);
-      let through = await run({}, beforeTokens + lazy.triggerTokens);
+      let before = await raw({}, beforeTokens);
+      await snap.prepare(lazy.prompt, 'through');
+      let through = await run('through', {}, beforeTokens + lazy.triggerTokens);
       while (!usableWindow(before, through) && beforeTokens < lazy.maxBeforeTokens) {
         beforeTokens += 1;
-        before = await run({}, beforeTokens);
-        through = await run({}, beforeTokens + lazy.triggerTokens);
+        before = await run('before', {}, beforeTokens);
+        through = await run('through', {}, beforeTokens + lazy.triggerTokens);
       }
       const throughTokens = beforeTokens + lazy.triggerTokens;
       answeredTokens = throughTokens + lazy.answerTokens;
@@ -465,7 +566,7 @@ export function renderHarness(nCtx, memoryModes) {
       const word = result.word;
       const answers = lazy.answers.map(gbnfLiteral).join(' | ');
       const grammar = \`root ::= \${gbnfLiteral(word)} (\${answers})\`;
-      const lazyRun = (trigger) => run({ grammar, grammarLazy: true, grammarTriggers: [trigger] });
+      const triggerOptions = (trigger) => ({ grammar, grammarLazy: true, grammarTriggers: [trigger] });
       const triggers = {
         word: { type: 'word', value: word },
         pattern: { type: 'pattern', value: regexLiteral(word) },
@@ -473,38 +574,39 @@ export function renderHarness(nCtx, memoryModes) {
       };
       result.triggered = {};
       for (const name of config.lazyTriggerRuns) {
-        result.triggered[name] = await lazyRun(triggers[name]);
+        result.triggered[name] = await run(name, triggerOptions(triggers[name]));
       }
-      result.triggeredWithPromptPenalties = await run({
+      result.triggeredWithPromptPenalties = await run('triggered-with-prompt-penalties', {
         grammar, grammarLazy: true, grammarTriggers: [triggers.word],
         penaltyPromptTokensWithGrammar: true,
       });
-      result.strict = await run({ grammar });
+      result.strict = await run('strict', { grammar });
 
+      await snap.restore(lazy.prompt, 'score');
       const { top } = await bridge.scoreNextToken(lazy.prompt, { topK: 2 });
       const piece = new TextDecoder().decode(top[0].bytes);
       if (top[0].logprob - top[1].logprob > lazy.minGap && piece.length > 0 && !piece.includes('\uFFFD')) {
-        const tokenRun = (token, nPredict) => run({
+        const tokenRun = (name, token, nPredict) => run(name, {
           grammar: \`root ::= \${gbnfLiteral(piece)} (\${answers})\`,
           grammarLazy: true,
           grammarTriggers: [{ type: 'token', token }],
         }, nPredict);
         result.tokenPiece = piece;
-        result.tokenTriggered = await tokenRun(top[0].token);
-        result.tokenNotSampled = await tokenRun(top[1].token, throughTokens);
+        result.tokenTriggered = await tokenRun('token-triggered', top[0].token);
+        result.tokenNotSampled = await tokenRun('token-not-sampled', top[1].token, throughTokens);
       }
-      result.root = await run({ grammar: lazy.rootGrammar, grammarRoot: 'answer' });
+      result.root = await run('root', { grammar: lazy.rootGrammar, grammarRoot: 'answer' });
       result.errors = {
-        invalidPattern: await errorOf(lazyRun({ type: 'pattern', value: '(' })),
-        outOfVocabulary: await errorOf(lazyRun({ type: 'token', token: 2147483647 })),
-        missingRoot: await errorOf(run({ grammar, grammarRoot: 'missing' })),
-        rejectedTrigger: await errorOf(run({
+        invalidPattern: await errorOf(raw(triggerOptions({ type: 'pattern', value: '(' }))),
+        outOfVocabulary: await errorOf(raw(triggerOptions({ type: 'token', token: 2147483647 }))),
+        missingRoot: await errorOf(raw({ grammar, grammarRoot: 'missing' })),
+        rejectedTrigger: await errorOf(raw({
           grammar: 'root ::= ' + answers,
           grammarLazy: true,
           grammarTriggers: [triggers.word],
         })),
       };
-      result.afterErrors = await run({}, throughTokens);
+      result.afterErrors = await raw({}, throughTokens);
       return result;
     };
 
@@ -531,7 +633,7 @@ export function renderHarness(nCtx, memoryModes) {
       return rejected;
     };
 
-    const probeMultiEndBudget = async (bridge, runtimeMode) => {
+    const probeMultiEndBudget = async (bridge, runtimeMode, snap) => {
       const prompt = '<|im_start|>user\\nCall get_weather for Seoul.<|im_end|>\\n<|im_start|>assistant\\n<think>\\n';
       const opener = '<tool_call>';
       const endTag = '</think>';
@@ -542,39 +644,39 @@ export function renderHarness(nCtx, memoryModes) {
       const naturalEndTags = ['\\n' + endTag, endTag, opener];
       const multi = { ...budget, naturalEndTags, grammarReplayEndIndex: 2 };
       const neverReplayGrammar = 'root ::= "yes"';
-      const run = (thinkingBudget, overrides = {}, input = prompt) =>
+      const raw = (thinkingBudget, overrides = {}, input = prompt) =>
         bridge.createCompletion(input, { ...options, ...overrides, thinkingBudget });
+      const run = (name, thinkingBudget, overrides = {}, input = prompt) =>
+        snap.complete(input, { ...options, ...overrides, thinkingBudget }, name);
       const tokens = await bridge.tokenize(forcedClose, false);
       assert(tokens.join(',') === '248058,198,248069', 'Qwen3.5 forced close tokenization changed');
 
       const invalidNativeMultiEnds = runtimeMode === 'direct'
         ? await probeNativeMultiEndValidation(bridge, prompt) : null;
       const forced = { forcedMessage: opener + '\\n' };
-      const legacy = await run({ ...budget, ...forced }, { nPredict: tokens.length });
-      const full = await run({ ...multi, ...forced }, { grammar: neverReplayGrammar });
+      const legacy = await raw({ ...budget, ...forced }, { nPredict: tokens.length });
+      await snap.prepare(prompt, 'full');
+      const full = await run('full', { ...multi, ...forced }, { grammar: neverReplayGrammar });
       assert(legacy === forcedClose, 'legacy singleton changed the forced close: ' + JSON.stringify(legacy));
       assert(full === forcedClose + 'yes', 'multi-end did not emit the full close then resume grammar: ' + JSON.stringify(full));
       const embedded = await run(
+        'embedded',
         { ...multi, forcedMessage: embeddedClose.slice(0, -endTag.length) },
         { grammar: neverReplayGrammar },
       );
       assert(embedded === embeddedClose + 'yes', 'embedded delimiters truncated forcing: ' + JSON.stringify(embedded));
 
-      const prefilled = prompt + opener + '\\n<function=get_weather>\\n';
-      const prefilledControl = await run(null, { nPredict: 6 }, prefilled);
-      const prefilledBudgeted = await run({ ...multi, forcedMessage: 'BUDGET1949' }, { nPredict: 6 }, prefilled);
-      assert(prefilledBudgeted === prefilledControl && !prefilledBudgeted.includes('BUDGET1949'),
-        'the prefilled opener did not close the budget: ' + JSON.stringify(prefilledBudgeted));
-
       const activeGrammar = 'root ::= <[248058]> "weather"';
-      const activeControl = await run(null, { grammar: activeGrammar });
+      const activeControl = await run('active-control', null, { grammar: activeGrammar });
       const active = await run(
+        'active',
         { ...multi, maxTokens: 1, forcedMessage: 'BUDGET1949', pauseGrammar: false },
         { grammar: activeGrammar },
       );
       assert(activeControl === opener + 'weather' && active === activeControl,
         'a generated XML opener at the final allowed token changed the active grammar: ' + JSON.stringify(active));
 
+      await snap.restore(prompt, 'score');
       const { top } = await bridge.scoreNextToken(prompt, { topK: 1 });
       const greedyToken = top[0].token;
       const greedyText = await bridge.detokenize([greedyToken], true);
@@ -582,26 +684,35 @@ export function renderHarness(nCtx, memoryModes) {
         'the greedy marker did not round-trip to the same token');
       const closing = { ...multi, maxTokens: 1, naturalEndTags: [endTag, greedyText], grammarReplayEndIndex: 1 };
       const greedyGrammar = 'root ::= <[' + greedyToken + ']> "weather"';
-      const eager = await run(closing, { grammar: greedyGrammar });
-      const lazy = await run(closing, {
+      const eager = await run('eager', closing, { grammar: greedyGrammar });
+      const lazy = await run('lazy', closing, {
         grammar: greedyGrammar,
         grammarLazy: true,
         grammarTriggers: [{ type: 'token', token: greedyToken }],
       });
-      const unrelated = await run({ ...closing, grammarReplayEndIndex: -1 }, { grammar: 'root ::= "weather"' });
+      const unrelated = await run('unrelated', { ...closing, grammarReplayEndIndex: -1 }, { grammar: 'root ::= "weather"' });
       const nonSelected = await run(
+        'non-selected',
         { ...closing, naturalEndTags: [endTag, greedyText, opener], grammarReplayEndIndex: 2 },
         { grammar: 'root ::= "weather"' },
       );
       assert([eager, lazy, unrelated, nonSelected].every((text) => text === greedyText + 'weather'),
         'natural replay routed the marker to the wrong grammar: ' + JSON.stringify({ eager, lazy, unrelated, nonSelected }));
 
-      const noGrammar = await run(closing, { nPredict: 1 });
+      const noGrammar = await run('no-grammar', closing, { nPredict: 1 });
       assert(noGrammar === greedyText, 'a natural end tried to replay without a grammar: ' + JSON.stringify(noGrammar));
+
+      const prefilled = prompt + opener + '\\n<function=get_weather>\\n';
+      const prefilledControl = await raw(null, { nPredict: 6 }, prefilled);
+      await snap.prepare(prefilled, 'prefilled-budgeted');
+      const prefilledBudgeted = await run('prefilled-budgeted', { ...multi, forcedMessage: 'BUDGET1949' },
+        { nPredict: 6 }, prefilled);
+      assert(prefilledBudgeted === prefilledControl && !prefilledBudgeted.includes('BUDGET1949'),
+        'the prefilled opener did not close the budget: ' + JSON.stringify(prefilledBudgeted));
 
       let rejected = false;
       try {
-        await run(closing, { grammar: neverReplayGrammar });
+        await raw(closing, { grammar: neverReplayGrammar });
       } catch (error) {
         rejected = errorText(error).includes("paused grammar rejected the thinking budget's natural end");
       }
@@ -609,7 +720,7 @@ export function renderHarness(nCtx, memoryModes) {
 
       const abort = new AbortController();
       try {
-        await run({ ...multi, ...forced }, {
+        await raw({ ...multi, ...forced }, {
           signal: abort.signal,
           tokenEventEncoding: 'text',
           onToken: () => abort.abort(),
@@ -618,7 +729,7 @@ export function renderHarness(nCtx, memoryModes) {
         if (error.name !== 'AbortError') throw error;
       }
       assert(abort.signal.aborted, 'multi-end generation was not cancelled during forcing');
-      const singletonAfterCancel = await run({ ...budget, forcedMessage: 'BUDGET1949' }, { nPredict: 8 }, prefilled);
+      const singletonAfterCancel = await raw({ ...budget, forcedMessage: 'BUDGET1949' }, { nPredict: 8 }, prefilled);
       assert(singletonAfterCancel.startsWith('BUDGET1949' + endTag),
         'multi-end state leaked into the next singleton request: ' + JSON.stringify(singletonAfterCancel));
       return {
@@ -628,6 +739,7 @@ export function renderHarness(nCtx, memoryModes) {
     };
 
     const runMode = async (memoryMode, runtimeMode) => {
+      const startedAt = performance.now();
       const mode = \`\${memoryMode} \${runtimeMode}\`;
       const useMemory64 = memoryMode === 'wasm64';
       const bridge = new LlamaWebGpuBridge({
@@ -636,116 +748,166 @@ export function renderHarness(nCtx, memoryModes) {
         coreModuleUrlMem64: useMemory64 ? '/llama_webgpu_core_mem64.js' : undefined,
         wasmUrlMem64: useMemory64 ? '/llama_webgpu_core_mem64.wasm' : undefined,
       });
-      const cases = [];
-      const samplerRuns = {};
-      const invalidSamplerErrors = [];
-      try {
-        const capabilitiesBeforeLoad = samplerCapabilities(await bridge.getCompletionCapabilities());
-        await bridge.loadModelFromUrl(config.modelUrl, {
-          nCtx: config.nCtx,
-          nThreads: 2,
-          nGpuLayers: 0,
-          useCache: false,
-          forceRemoteFetchBackend: false,
-        });
-        for (const testCase of config.cases) {
-          let text = null;
-          let error = null;
-          try {
-            text = await bridge.createCompletion(config.prompt, {
-              ...testCase.options,
-              grammar: testCase.grammar,
-              tokenEventEncoding: 'text',
-            });
-          } catch (caught) {
-            error = errorText(caught);
-          }
-          cases.push({
-            name: testCase.name,
-            text,
-            error,
-            // A throwing case must carry the parser's message, which proves
-            // the throw reached the bridge's catch.
-            valid: testCase.kind === 'invalid'
-              ? text === null
-                && error !== null
-                && error.includes(config.invalidGrammarError)
-                && error.includes(config.nonThrowingRejection) === !testCase.throws
-              : error === null && typeof text === 'string' && checkText(testCase.kind, text),
-          });
+      const availableThreads = Math.trunc(Number(navigator.hardwareConcurrency) || config.maxThreads);
+      const nThreads = Math.max(1, Math.min(config.maxThreads, availableThreads));
+      const phaseTimingsMs = {};
+      const snap = createPrefixSnapshotHelper(bridge);
+      const timePhase = async (key, stage, run) => {
+        setStage(\`\${mode}:\${stage}\`);
+        snap.setPhase(key);
+        const phaseStartedAt = performance.now();
+        try {
+          return await run();
+        } finally {
+          phaseTimingsMs[key] = Math.round(performance.now() - phaseStartedAt);
         }
+      };
+      try {
+        const capabilitiesBeforeLoad = await timePhase('loadModelMs', 'load-model', async () => {
+          const capabilities = samplerCapabilities(await bridge.getCompletionCapabilities());
+          await bridge.loadModelFromUrl(config.modelUrl, {
+            nCtx: config.nCtx,
+            nThreads,
+            nGpuLayers: 0,
+            useCache: false,
+            forceRemoteFetchBackend: false,
+          });
+          return capabilities;
+        });
+        const cases = await timePhase('casesMs', 'cases', async () => {
+          const cases = [];
+          for (const testCase of config.cases) {
+            const useSnapshot = testCase.kind !== 'invalid' && testCase.name !== 'yes-no-greedy';
+            if (useSnapshot) await snap.prepare(config.prompt, testCase.name);
+            let text = null;
+            let error = null;
+            try {
+              const options = {
+                ...testCase.options,
+                grammar: testCase.grammar,
+                tokenEventEncoding: 'text',
+              };
+              text = useSnapshot ? await snap.complete(config.prompt, options, testCase.name)
+                : await bridge.createCompletion(config.prompt, options);
+            } catch (caught) {
+              error = errorText(caught);
+            }
+            cases.push({
+              name: testCase.name,
+              text,
+              error,
+              // A throwing case must carry the parser's message, which proves
+              // the throw reached the bridge's catch.
+              valid: testCase.kind === 'invalid'
+                ? text === null
+                  && error !== null
+                  && error.includes(config.invalidGrammarError)
+                  && error.includes(config.nonThrowingRejection) === !testCase.throws
+                : error === null && typeof text === 'string' && checkText(testCase.kind, text),
+            });
+            if (testCase.name === 'yes-no-greedy') await snap.detect();
+          }
+          return cases;
+        });
 
         // Generation state must be clean after the grammar runs.
-        let plainError = null;
-        try {
-          await bridge.createCompletion(config.prompt, {
-            nPredict: 4,
-            temp: 0,
-            topK: 1,
-            seed: 1,
-            tokenEventEncoding: 'text',
-          });
-        } catch (caught) {
-          plainError = errorText(caught);
-        }
-
-        const capabilitiesAfterLoad = samplerCapabilities(await bridge.getCompletionCapabilities());
-        for (const [name, options] of config.samplerRuns) {
-          samplerRuns[name] = await bridge.createCompletion(config.samplerPrompt, {
-            ...options,
-            tokenEventEncoding: 'text',
-          });
-        }
-        const sampled = Object.fromEntries(config.samplerRuns)['sampled'];
-        for (const options of ${invalidSamplerOptions}) {
+        const plainError = await timePhase('plainCompletionMs', 'plain-completion', async () => {
           try {
-            await bridge.createCompletion(config.samplerPrompt, { ...sampled, ...options });
-            invalidSamplerErrors.push(null);
-          } catch (caught) {
-            invalidSamplerErrors.push(\`\${caught && caught.name}: \${errorText(caught)}\`);
-          }
-        }
-        // Repeats "sampled" after the rejections.
-        const samplerAfterInvalid = await bridge.createCompletion(config.samplerPrompt, {
-          ...sampled,
-          tokenEventEncoding: 'text',
-        });
-
-        const promptPenalty = await probePromptPenalty(bridge);
-
-        const thinkingRuns = {};
-        for (const [name, prompt, options] of config.thinkingRuns) {
-          try {
-            thinkingRuns[name] = await bridge.createCompletion(prompt, {
-              ...options,
+            await bridge.createCompletion(config.prompt, {
+              nPredict: 4,
+              temp: 0,
+              topK: 1,
+              seed: 1,
               tokenEventEncoding: 'text',
             });
+            return null;
           } catch (caught) {
-            if (name !== 'open-budget-rejecting-grammar') throw caught;
-            thinkingRuns[name] = \`ERR \${caught && caught.name}: \${errorText(caught)}\`;
+            return errorText(caught);
           }
-        }
-        let invalidThinkingBudgetError = null;
-        try {
-          await bridge.createCompletion(config.thinkingRuns[0][1], {
-            ...config.thinkingRuns[0][2],
-            thinkingBudget: config.invalidThinkingBudget,
-          });
-        } catch (caught) {
-          invalidThinkingBudgetError = \`\${caught && caught.name}: \${errorText(caught)}\`;
-        }
+        });
 
-        const lazyGrammar = await probeLazyGrammar(bridge);
+        const { capabilitiesAfterLoad, samplerRuns, samplerPredictLimit, invalidSamplerErrors, samplerAfterInvalid } =
+          await timePhase('samplerRunsMs', 'sampler-runs', async () => {
+            const capabilitiesAfterLoad = samplerCapabilities(await bridge.getCompletionCapabilities());
+            const prompt = config.samplerPrompt;
+            const invalidSamplerErrors = [];
+            const runSamplerBatch = async (limit) => {
+              const runs = {};
+              for (const [name, options] of config.samplerRuns) {
+                const completionOptions = { ...options, nPredict: Math.min(options.nPredict, limit), tokenEventEncoding: 'text' };
+                if (name === 'first') {
+                  runs[name] = await bridge.createCompletion(prompt, completionOptions);
+                } else {
+                  const run = name + '-' + limit;
+                  await snap.prepare(prompt, run);
+                  runs[name] = await snap.complete(prompt, completionOptions, run);
+                }
+              }
+              return runs;
+            };
+            const sampledOptions = Object.fromEntries(config.samplerRuns).sampled;
+            let samplerPredictLimit = config.samplerShortPredict;
+            let samplerRuns = await runSamplerBatch(samplerPredictLimit);
+            if (samplerRuns.sampled === samplerRuns.greedy || samplerRuns['greedy-presence'] === samplerRuns.greedy) {
+              samplerPredictLimit = sampledOptions.nPredict;
+              samplerRuns = await runSamplerBatch(samplerPredictLimit);
+            }
+            const sampled = { ...sampledOptions, nPredict: samplerPredictLimit };
+            for (const options of ${invalidSamplerOptions}) {
+              try {
+                await bridge.createCompletion(config.samplerPrompt, { ...sampled, ...options });
+                invalidSamplerErrors.push(null);
+              } catch (caught) {
+                invalidSamplerErrors.push(\`\${caught && caught.name}: \${errorText(caught)}\`);
+              }
+            }
+            // Repeats "sampled" after the rejections.
+            const samplerAfterInvalid = await bridge.createCompletion(config.samplerPrompt, {
+              ...sampled,
+              tokenEventEncoding: 'text',
+            });
+            return { capabilitiesAfterLoad, samplerRuns, samplerPredictLimit, invalidSamplerErrors, samplerAfterInvalid };
+          });
+
+        const promptPenalty = await timePhase('promptPenaltyMs', 'prompt-penalty', () => probePromptPenalty(bridge, snap));
+        const { thinkingRuns, invalidThinkingBudgetError } = await timePhase('thinkingRunsMs', 'thinking-runs', async () => {
+          const thinkingRuns = {};
+          for (const [name, prompt, options] of config.thinkingRuns) {
+            const raw = name.endsWith('-first') || name === 'open-budget-rejecting-grammar' || name === 'open-budget-after-rejecting';
+            if (!raw) await snap.prepare(prompt, name);
+            try {
+              const completionOptions = { ...options, tokenEventEncoding: 'text' };
+              thinkingRuns[name] = raw ? await bridge.createCompletion(prompt, completionOptions)
+                : await snap.complete(prompt, completionOptions, name);
+            } catch (caught) {
+              if (name !== 'open-budget-rejecting-grammar') throw caught;
+              thinkingRuns[name] = \`ERR \${caught && caught.name}: \${errorText(caught)}\`;
+            }
+          }
+          let invalidThinkingBudgetError = null;
+          try {
+            await bridge.createCompletion(config.thinkingRuns[0][1], {
+              ...config.thinkingRuns[0][2],
+              thinkingBudget: config.invalidThinkingBudget,
+            });
+          } catch (caught) {
+            invalidThinkingBudgetError = \`\${caught && caught.name}: \${errorText(caught)}\`;
+          }
+          return { thinkingRuns, invalidThinkingBudgetError };
+        });
+        const lazyGrammar = await timePhase('lazyGrammarMs', 'lazy-grammar', () => probeLazyGrammar(bridge, snap));
 
         const metadata = bridge.getModelMetadata();
-        const multiEndBudget = metadata['general.architecture'] === 'qwen35'
-          ? await probeMultiEndBudget(bridge, runtimeMode) : null;
+        const multiEndBudget = await timePhase('multiEndBudgetMs', 'multi-end-budget', () => (
+          metadata['general.architecture'] === 'qwen35' ? probeMultiEndBudget(bridge, runtimeMode, snap) : null
+        ));
         return {
           mode,
           cases,
           capabilitiesBeforeLoad,
           capabilitiesAfterLoad,
           samplerRuns,
+          samplerPredictLimit,
           invalidSamplerErrors,
           samplerAfterInvalid,
           promptPenalty,
@@ -754,12 +916,17 @@ export function renderHarness(nCtx, memoryModes) {
           invalidThinkingBudgetError,
           lazyGrammar,
           plainCompletionError: plainError,
+          nThreads: Number(metadata['llamadart.webgpu.n_threads']) || null,
+          phaseTimingsMs,
+          prefixSnapshotReuse: snap.stats,
           execution: metadata['llamadart.webgpu.execution'] || null,
           coreVariant: metadata['llamadart.webgpu.core_variant'] || null,
           workerFallbackReason: metadata['llamadart.webgpu.worker_fallback_reason'] || null,
         };
       } finally {
-        await bridge.dispose();
+        await timePhase('disposeMs', 'dispose', () => bridge.dispose());
+        phaseTimingsMs.totalMs = Math.round(performance.now() - startedAt);
+        setStage(\`\${mode}:done\`);
       }
     };
 
@@ -1065,13 +1232,16 @@ export async function main(argv = process.argv.slice(2)) {
   const payload = await withTempDir('llama-web-bridge-grammar-smoke-', async (webRoot) => {
     await copyBridgeArtifacts(distDir, webRoot);
     if (memoryModes.includes('wasm64')) await copyMemory64Artifacts(distDir, webRoot);
-    await fsp.copyFile(modelPath, path.join(webRoot, MODEL_FILENAME));
+    await stageFile(modelPath, path.join(webRoot, MODEL_FILENAME));
     await fsp.writeFile(path.join(webRoot, 'index.html'), renderHarness(args.nCtx, memoryModes), 'utf8');
     if (artifactsDir !== null) {
       await fsp.mkdir(artifactsDir, { recursive: true });
       await fsp.copyFile(path.join(webRoot, 'index.html'), path.join(artifactsDir, 'index.html'));
     }
-    return withServer(webRoot, (url) => runPlaywright(url, args.timeoutMs, artifactsDir, 'grammar-smoke'));
+    return withServer(webRoot, (url) => runPlaywright(url, args.timeoutMs, artifactsDir, 'grammar-smoke', {
+      stageMarker: 'GRAMMAR_STAGE ',
+      stagePrefix: 'grammar-smoke',
+    }));
   });
 
   writeStdout(`${pyJson(payload, { indent: 2, sortKeys: true })}\n`);

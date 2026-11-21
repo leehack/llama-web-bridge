@@ -11,6 +11,7 @@ import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
+import { test } from 'node:test';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import {
@@ -40,6 +41,8 @@ import {
   resolvePath,
   resolvePinnedFile,
   resolvePinnedModel,
+  runPlaywright,
+  runPollingPlaywright,
   serveIsolated,
   stageFile,
   translatePath,
@@ -649,22 +652,404 @@ assert.deepEqual(webGpuLaunchArgs('linux'), [
 // Runs a harness page's module script in Node against a fake bridge class, so the
 // in-page usage assertions are exercised without a browser. The page imports the
 // bridge from '/llama_webgpu_bridge.js'; that one call is redirected to the fake.
-async function runHarnessPage(page, Bridge, extraDocument = {}, { crossOriginIsolated = true, hideSharedArrayBuffer = false } = {}) {
+async function runHarnessPage(page, Bridge, extraDocument = {}, {
+  crossOriginIsolated = true, hideSharedArrayBuffer = false, hardwareConcurrency,
+  pageConsole = console, capturePage = () => {},
+  importBridge = () => ({ LlamaWebGpuBridge: Bridge, SingleThreadCoreError: FakeSingleThreadError }),
+} = {}) {
   const body = page.slice(page.indexOf('<script type="module">\n') + '<script type="module">\n'.length, page.lastIndexOf('</script>'));
   const importCall = "await import('/llama_webgpu_bridge.js')";
   assert.equal(body.split(importCall).length, 2, 'the harness must import the bridge exactly once');
-  const script = body.replace(importCall, '({ LlamaWebGpuBridge: window.__FakeBridge, SingleThreadCoreError: window.__FakeSingleThreadError })').trim();
+  const script = body.replace(importCall, 'await importBridge()').trim();
   const result = { textContent: 'pending' };
-  const window = { crossOriginIsolated, __FakeBridge: Bridge, __FakeSingleThreadError: FakeSingleThreadError };
+  const window = { crossOriginIsolated };
   const document = { getElementById: (id) => (id === 'result' ? result : null), ...extraDocument };
-  if (hideSharedArrayBuffer) {
-    await new Function('window', 'document', 'SharedArrayBuffer', `'use strict'; return ${script}`)(window, document, undefined);
-  } else {
-    await new Function('window', 'document', `'use strict'; return ${script}`)(window, document);
-  }
+  capturePage({ window, result });
+  await new Function('window', 'document', 'SharedArrayBuffer', 'navigator', 'console', 'importBridge', `'use strict'; return ${script}`)(
+    window, document, hideSharedArrayBuffer ? undefined : SharedArrayBuffer, { hardwareConcurrency }, pageConsole, importBridge,
+  );
   assert.equal(result.textContent, JSON.stringify(window.__smokeResult));
   return window.__smokeResult;
 }
+
+const grammarModes = ['wasm32 direct', 'wasm32 worker', 'wasm64 direct', 'wasm64 worker'];
+const grammarPage = grammarSmoke.renderHarness(1024, ['wasm32', 'wasm64']);
+
+class FakeGrammarBridge {
+  async getCompletionCapabilities() { return {}; }
+  async loadModelFromUrl(_url, { nThreads }) { this.nThreads = nThreads; }
+  async createCompletion() { return ''; }
+  async scoreNextToken() {
+    return { top: [{ token: 1, logprob: 0, bytes: new Uint8Array([120]) }] };
+  }
+  async tokenize() { return []; }
+  getModelMetadata() { return { 'llamadart.webgpu.n_threads': String(this.nThreads) }; }
+  async dispose() {}
+}
+
+const snapshotPath = '/tmp/grammar-smoke-prefix.bin';
+const samplerPrompt = grammarSmoke.LAZY_GRAMMAR.prompt;
+
+async function runSnapshotGrammar({ nativeReuse = 0, roundTrip = true, dirtySkip = false,
+  samplerDivergesAt = 8, qwen = false, nCtx = 1024 } = {}) {
+  const modes = [];
+  const tokensFor = (prompt) => prompt === '<tool_call>\n</think>'
+    ? [248058, 198, 248069] : Array.from(prompt, (char) => char.codePointAt(0));
+  class Bridge extends FakeGrammarBridge {
+    constructor() {
+      super();
+      this.calls = [];
+      modes.push(this.calls);
+      this._runtime = { _core: { ccall: (name, _type, _types, args) => {
+        if (name === 'llamadart_webgpu_last_error') return this.nativeError;
+        this.nativeError = grammarSmoke.INVALID_NATIVE_MULTI_ENDS.find(
+          ({ json, index }) => json === args.at(-2) && index === args.at(-1),
+        ).error;
+        return -2;
+      } } };
+    }
+
+    async getCompletionCapabilities() {
+      return Object.fromEntries(grammarSmoke.COMPLETION_CAPABILITIES.map((name) => [name, this.nThreads != null]));
+    }
+
+    getModelMetadata() {
+      return { ...super.getModelMetadata(), 'general.architecture': qwen ? 'qwen35' : 'llama' };
+    }
+
+    async tokenize(prompt) { return tokensFor(prompt); }
+
+    async detokenize(tokens) {
+      return (roundTrip ? '' : '!') + String.fromCodePoint(...tokens);
+    }
+
+    async stateSaveFile(file, tokens) {
+      this.calls.push({ op: 'save', file, tokens, scored: this.scored });
+      this.snapshot = tokens;
+    }
+
+    async stateLoadFile(file, capacity = 256) {
+      assert.ok(this.snapshot.length <= capacity, 'saved prefix exceeds the restore capacity');
+      this.calls.push({ op: 'load', file });
+      this.restored = this.snapshot;
+    }
+
+    async scoreNextToken(prompt, { topK }) {
+      this.calls.push({ op: 'score', prompt, restored: this.restored });
+      this.restored = undefined;
+      this.scored = tokensFor(prompt);
+      const char = topK === grammarSmoke.PROMPT_PENALTY.topK ? 'a' : 'g';
+      return { top: [char, '~'].map((piece, i) => ({
+        token: piece.charCodeAt(0), logprob: -i, bytes: new TextEncoder().encode(piece),
+      })) };
+    }
+
+    async createCompletion(prompt, options) {
+      const restored = this.restored;
+      const { seed, nPredict, temp, minP, presencePenalty, grammar, thinkingBudget } = options;
+      this.calls.push({ op: 'complete', prompt, options, restored });
+      this.restored = undefined;
+      this.scored = undefined;
+      options.onUsage?.({ promptTokens: tokensFor(prompt).length, cachedPromptTokens: restored?.length ?? nativeReuse });
+      if (prompt === 'a b') return 'detection';
+      if (minP < 0 || minP > 1 || presencePenalty === Infinity) throw new RangeError('CompletionOptions.');
+      if (thinkingBudget?.maxTokens < 0) throw new RangeError('CompletionOptions.thinkingBudget');
+      if (prompt.includes('Call get_weather for Seoul.')) {
+        const forced = thinkingBudget?.forcedMessage;
+        if (options.signal) {
+          options.onToken();
+          return '';
+        }
+        if (forced === 'BUDGET1949' && !thinkingBudget.naturalEndTags) return 'BUDGET1949</think>';
+        if (prompt.includes('<function=get_weather>')) return 'prefilled';
+        if (grammar?.includes('<[248058]>')) return '<tool_call>weather';
+        if (forced != null) return forced + '</think>' + (grammar ? 'yes' : '');
+        if (grammar === 'root ::= "yes"') throw new Error("paused grammar rejected the thinking budget's natural end");
+        return grammar ? 'gweather' : 'g';
+      }
+      if (seed === 5) return 'abcdefghijklmnopqrst'.slice(0, nPredict);
+      if (presencePenalty === grammarSmoke.PROMPT_PENALTY.presencePenalty) {
+        return dirtySkip && prompt === samplerPrompt ? '' : '~';
+      }
+      if (seed === 11) {
+        if (presencePenalty === 20 && nPredict >= samplerDivergesAt) return 'presence';
+        return temp === 0 || minP === 1 ? 'greedy' : 'sampled';
+      }
+      return 'yes';
+    }
+  }
+  const page = grammarSmoke.renderHarness(nCtx, ['wasm32', 'wasm64']);
+  const payload = await runHarnessPage(page, Bridge, {}, { pageConsole: { log() {} } });
+  assert.equal(payload.ok, true, payload.error);
+  return { modes, results: payload.modeResults };
+}
+
+test('grammar reuses hybrid snapshots while keeping raw completion and recovery coverage', async () => {
+  const { modes, results } = await runSnapshotGrammar({ qwen: true, nCtx: 1 });
+  for (const [i, calls] of modes.entries()) {
+    const stats = results[i].prefixSnapshotReuse;
+    assert.ok(stats?.saves > 0 && stats.restores > 0 && stats.cachedPromptTokens > 0,
+      'hybrid completions must save, restore and reuse prompt tokens');
+    assert.equal(stats?.enabled, true);
+    assert.equal(Object.values(stats.restoresByPhase).flat().length, stats.restores);
+    assert.ok(stats.restoresByPhase.casesMs.some(({ run }) => run === 'yes-no-sampled'));
+    for (const call of calls.filter(({ op }) => op === 'save' || op === 'load')) {
+      assert.equal(call.file, snapshotPath);
+      if (call.op === 'save') assert.deepEqual(call.tokens, call.scored);
+    }
+    const completions = calls.filter(({ op }) => op === 'complete');
+    for (const { prompt, restored } of completions.filter(({ restored }) => restored)) {
+      assert.deepEqual(restored, Array.from(prompt.slice(0, -1), (char) => char.codePointAt(0)));
+    }
+    for (const prompt of new Set(completions.map(({ prompt }) => prompt))) {
+      assert.ok(completions.some((call) => call.prompt === prompt && !call.restored), 'raw completion missing for ' + prompt);
+    }
+    const sampler = completions.filter(({ prompt, options }) => prompt === samplerPrompt && options.seed === 11 && options.nPredict > 1);
+    assert.equal(sampler.at(-1).restored, undefined, 'samplerAfterInvalid');
+    const thinking = completions.filter(({ options }) => options.seed === 3);
+    for (const index of [0, 6, 7, 8, 11]) assert.equal(thinking[index].restored, undefined);
+    const lazy = completions.filter(({ options }) => options.seed === 5);
+    assert.ok(lazy.slice(-5).every(({ restored }) => !restored), 'lazy errors and recovery');
+    assert.ok(completions.slice(-3).every(({ restored }) => !restored), 'multi-end rejection, cancel and recovery');
+    const closedPrefix = grammarSmoke.THINKING_RUNS.find(([name]) => name === 'closed-first')[1].slice(0, -1);
+    for (const score of calls.filter(({ op, prompt }) => op === 'score'
+      && (prompt === closedPrefix || prompt.includes('<function=get_weather>')))) {
+      assert.ok(score.restored?.length > 0, 'prefix extension must restore the shared state');
+    }
+    assert.equal(calls.filter(({ op, prompt }) => op === 'score'
+      && (prompt === closedPrefix || prompt.includes('<function=get_weather>'))).length, 2);
+  }
+});
+
+for (const [name, options, enabled] of [
+  ['native reuse', { nativeReuse: 1 }, false],
+  ['a prefix that does not round-trip', { roundTrip: false }, true],
+]) {
+  test(`grammar stays snapshot-free with ${name}`, async () => {
+    const { modes, results } = await runSnapshotGrammar(options);
+    for (const [i, calls] of modes.entries()) {
+      const stats = results[i].prefixSnapshotReuse;
+      assert.equal(stats?.enabled, enabled);
+      assert.equal(stats.saves, 0);
+      assert.equal(stats.restores, 0);
+      assert.ok(!calls.some(({ op }) => op === 'save' || op === 'load'));
+    }
+  });
+}
+
+test('grammar never saves dirty context when the prompt-penalty probe skips an empty output', async () => {
+  const { modes, results } = await runSnapshotGrammar({ dirtySkip: true });
+  for (const [i, calls] of modes.entries()) {
+    assert.equal(results[i].promptPenalty.steps, 1);
+    assert.ok(results[i].prefixSnapshotReuse?.saves > 0);
+    const skip = calls.findIndex(({ op, prompt, options }) => op === 'complete' && prompt === samplerPrompt
+      && options.presencePenalty === grammarSmoke.PROMPT_PENALTY.presencePenalty);
+    assert.ok(skip !== -1);
+    assert.deepEqual(calls[skip + 1], { op: 'score', prompt: samplerPrompt + 'a', restored: undefined });
+    assert.deepEqual(calls[skip + 3], { op: 'score', prompt: samplerPrompt, restored: undefined });
+  }
+});
+
+for (const [label, samplerDivergesAt, expectedLimits] of [
+  ['early divergence', 8, [8]], ['late divergence', 20, [8, 20]], ['a broken penalty', Infinity, [8, 20]],
+]) {
+  test(`grammar uses the expected sampler budgets for ${label}`, async () => {
+    const { modes, results } = await runSnapshotGrammar({ samplerDivergesAt });
+    for (const [i, calls] of modes.entries()) {
+      const penalty = calls.filter(({ op, options }) => op === 'complete' && options.presencePenalty === 20);
+      assert.deepEqual(penalty.map(({ options }) => options.nPredict), expectedLimits);
+      assert.equal(results[i].samplerPredictLimit, expectedLimits.at(-1));
+      const result = results[i];
+      const otherFailures = new Set([
+        ...grammarSmoke.validatePromptPenalty(result), ...grammarSmoke.validateThinkingBudget(result),
+        ...grammarSmoke.validateLazyGrammar(result),
+      ]);
+      const failures = grammarSmoke.validateSampler(result).filter((failure) => !otherFailures.has(failure));
+      if (samplerDivergesAt === Infinity) {
+        assert.deepEqual(failures.slice(0, -1), ['presencePenalty did not change greedy output']);
+        assert.match(failures.at(-1), /^sampler outputs:/);
+      } else {
+        assert.deepEqual(failures, []);
+      }
+    }
+  });
+}
+
+for (const [hardwareConcurrency, expected] of [[4, 4], [2, 2], [16, 4]]) {
+  test(`grammar requests ${expected} threads with ${hardwareConcurrency} logical CPUs`, async () => {
+    const requested = [];
+    class Bridge extends FakeGrammarBridge {
+      async loadModelFromUrl(url, options) {
+        requested.push(options.nThreads);
+        await super.loadModelFromUrl(url, options);
+      }
+    }
+    const payload = await runHarnessPage(grammarPage, Bridge, {}, {
+      hardwareConcurrency, pageConsole: { log() {} },
+    });
+    assert.equal(payload.ok, true, payload.error);
+    assert.deepEqual(requested, grammarModes.map(() => expected));
+    assert.deepEqual(payload.modeResults.map(({ nThreads }) => nThreads), requested);
+  });
+}
+
+test('grammar reports each phase and cleanup in each mode', async () => {
+  const stages = [];
+  const payload = await runHarnessPage(grammarPage, FakeGrammarBridge, {}, {
+    pageConsole: { log: (line) => stages.push(line) },
+  });
+  assert.equal(payload.ok, true, payload.error);
+  const phases = [
+    'load-model', 'cases', 'plain-completion', 'sampler-runs', 'prompt-penalty',
+    'thinking-runs', 'lazy-grammar', 'multi-end-budget', 'dispose', 'done',
+  ];
+  assert.deepEqual(stages, [
+    'GRAMMAR_STAGE startup:bridge-import',
+    ...grammarModes.flatMap((mode) => phases.map((phase) => `GRAMMAR_STAGE ${mode}:${phase}`)),
+  ]);
+  for (const mode of payload.modeResults) {
+    for (const key of [
+      'loadModelMs', 'casesMs', 'plainCompletionMs', 'samplerRunsMs', 'promptPenaltyMs',
+      'thinkingRunsMs', 'lazyGrammarMs', 'multiEndBudgetMs', 'disposeMs', 'totalMs',
+    ]) {
+      const timing = mode.phaseTimingsMs?.[key];
+      assert.ok(Number.isFinite(timing) && timing >= 0, `${mode.mode} did not report ${key}`);
+    }
+  }
+});
+
+test('grammar reports its startup stage while the bridge import is pending', { timeout: 5_000 }, async () => {
+  const bridgeModule = Promise.withResolvers();
+  const importStarted = Promise.withResolvers();
+  const stages = [];
+  let page;
+  const smoke = runHarnessPage(grammarPage, FakeGrammarBridge, {}, {
+    capturePage: (captured) => { page = captured; },
+    pageConsole: { log: (line) => stages.push(line) },
+    importBridge: () => {
+      importStarted.resolve();
+      return bridgeModule.promise;
+    },
+  });
+  try {
+    await importStarted.promise;
+    assert.equal(page.window.__smokeStage, 'startup:bridge-import');
+    assert.equal(page.result.textContent, 'pending: startup:bridge-import');
+    assert.equal(page.window.__smokeResult, undefined);
+    assert.deepEqual(stages, ['GRAMMAR_STAGE startup:bridge-import']);
+  } finally {
+    bridgeModule.resolve({ LlamaWebGpuBridge: FakeGrammarBridge });
+    const payload = await smoke;
+    assert.equal(payload.ok, true, payload.error);
+  }
+});
+
+test('grammar exposes the pending disposal stage before reporting a disposal error', async () => {
+  let page;
+  let pending;
+  class Bridge extends FakeGrammarBridge {
+    async dispose() {
+      pending = [page.window.__smokeStage, page.result.textContent];
+      throw new Error('disposal failed');
+    }
+  }
+  const payload = await runHarnessPage(grammarPage, Bridge, {}, {
+    pageConsole: { log() {} }, capturePage: (captured) => { page = captured; },
+  });
+  assert.match(firstErrorLine(payload), /disposal failed/);
+  assert.deepEqual(pending, ['wasm32 direct:dispose', 'pending: wasm32 direct:dispose']);
+});
+
+const timeoutMessage = 'page.waitForFunction: Timeout 900000ms exceeded.';
+const reportedStage = 'wasm64 worker:multi-end-budget';
+const fakeSmokeBrowser = ({ evaluate, failScreenshot = false, navigationError = null, timeoutWaiting = true }) => async () => {
+  const handlers = {};
+  return {
+    async newPage() {
+      return {
+        on(event, handler) { handlers[event] = handler; },
+        async goto() {
+          for (const line of ['loading model', `GRAMMAR_STAGE ${reportedStage}`]) {
+            handlers.console({ type: () => 'log', text: () => line });
+          }
+          if (navigationError !== null) throw navigationError;
+        },
+        async waitForFunction() { if (timeoutWaiting) throw new Error(timeoutMessage); },
+        evaluate,
+        async screenshot({ path: filename }) {
+          if (failScreenshot) throw new Error('screenshot failed');
+          fs.writeFileSync(filename, 'fake screenshot');
+        },
+      };
+    },
+    async close() {},
+  };
+};
+
+for (const wedged of [false, true]) {
+  test(`Playwright saves timeout diagnostics${wedged ? ' with a wedged page' : ''}`, { timeout: 5_000 }, async () => {
+    const artifactsDir = path.join(tmp, `grammar-timeout-${wedged}`);
+    const launchBrowser = fakeSmokeBrowser({
+      evaluate: wedged ? () => new Promise(() => {}) : async () => 'stale stage',
+      failScreenshot: wedged,
+    });
+    await assert.rejects(runPlaywright('http://localhost/', 900_000, artifactsDir, 'grammar-smoke', {
+      launchBrowser, stageMarker: 'GRAMMAR_STAGE ',
+    }), { message: `${timeoutMessage} (last stage: ${reportedStage})` });
+    assert.equal(fs.readFileSync(path.join(artifactsDir, 'grammar-smoke-console.log'), 'utf8'),
+      `log: loading model\nlog: GRAMMAR_STAGE ${reportedStage}\n`);
+    if (!wedged) assert.ok(fs.existsSync(path.join(artifactsDir, 'grammar-smoke-page.png')));
+  });
+}
+
+test('Playwright bounds the stage lookup when no console marker is available', { timeout: 5_000 }, async () => {
+  const launchBrowser = fakeSmokeBrowser({ evaluate: () => new Promise(() => {}) });
+  await assert.rejects(runPlaywright('http://localhost/', 900_000, null, 'grammar-smoke', {
+    launchBrowser, stageMarker: 'UNUSED_STAGE ',
+  }), { message: timeoutMessage });
+});
+
+test('Playwright writes a failed harness result when the screenshot fails', async () => {
+  const artifactsDir = path.join(tmp, 'failed-harness');
+  const launchBrowser = fakeSmokeBrowser({
+    evaluate: async () => ({ ok: false, error: 'harness disposal failed' }),
+    failScreenshot: true,
+    timeoutWaiting: false,
+  });
+  const payload = await runPlaywright('http://localhost/', 2_000, artifactsDir, 'grammar-smoke', { launchBrowser });
+  assert.equal(firstErrorLine(payload), 'harness disposal failed');
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(artifactsDir, 'grammar-smoke-result.json'), 'utf8')), payload);
+});
+
+test('a blocked console artifact path preserves browser timeout errors and screenshots', async () => {
+  const artifactsDir = path.join(tmp, 'blocked-console');
+  for (const prefix of ['grammar-smoke', 'polling-smoke']) {
+    fs.mkdirSync(path.join(artifactsDir, `${prefix}-console.log`), { recursive: true });
+  }
+  const navigationTimeout = 'page.goto: Timeout 2000ms exceeded.';
+  const marker = 'GRAMMAR_STAGE ';
+  const launchBrowser = fakeSmokeBrowser({ navigationError: new Error(navigationTimeout) });
+  await assert.rejects(runPollingPlaywright('http://localhost/', 2_000, artifactsDir, {
+    artifactPrefix: 'polling-smoke', stageMarker: 'UNUSED_STAGE ', launchBrowser,
+  }), { message: navigationTimeout });
+  await assert.rejects(runPlaywright('http://localhost/', 2_000, artifactsDir, 'grammar-smoke', {
+    stageMarker: marker, launchBrowser,
+  }), { message: `${navigationTimeout} (last stage: ${reportedStage})` });
+  for (const prefix of ['grammar-smoke', 'polling-smoke']) {
+    assert.ok(fs.existsSync(path.join(artifactsDir, `${prefix}-page.png`)));
+  }
+});
+
+test('polling Playwright saves its console on timeout', { timeout: 5_000 }, async () => {
+  const artifactsDir = path.join(tmp, 'polling-timeout');
+  const evaluated = [null, reportedStage];
+  await assert.rejects(runPollingPlaywright('http://localhost/', 250, artifactsDir, {
+    artifactPrefix: 'polling-smoke', stageMarker: 'UNUSED_STAGE ',
+    launchBrowser: fakeSmokeBrowser({ evaluate: async () => evaluated.shift() }),
+  }), { message: `browser smoke timed out at stage: ${reportedStage}` });
+  assert.equal(fs.readFileSync(path.join(artifactsDir, 'polling-smoke-console.log'), 'utf8'),
+    `log: loading model\nlog: GRAMMAR_STAGE ${reportedStage}\n`);
+});
 
 const firstErrorLine = (payload) => {
   assert.equal(payload.ok, false, JSON.stringify(payload));
@@ -1375,8 +1760,7 @@ function parseResponse(buffer) {
     `multimodal browser smoke failed: missing bridge artifact: ${path.join(resolvePath(emptyDist), 'llama_webgpu_bridge.js')}\n`);
 }
 
-// stageFile hard-links when it can, like os.link, and copies otherwise (here
-// because the target exists, as os.link raised FileExistsError).
+// stageFile hard-links when it can and copies when the destination already exists.
 {
   const source = path.join(tmp, 'stage-source.bin');
   fs.writeFileSync(source, 'stage');
@@ -1389,5 +1773,20 @@ function parseResponse(buffer) {
   assert.equal(fs.readFileSync(copied, 'utf8'), 'stage');
   assert.notEqual(fs.statSync(copied).ino, fs.statSync(source).ino);
 }
+
+test('stageFile stages the bytes of a relative model cache symlink', async () => {
+  const cacheDir = fs.mkdtempSync(path.join(tmp, 'symlink-cache-'));
+  const webRoot = fs.mkdtempSync(path.join(tmp, 'symlink-site-'));
+  const modelUrl = 'https://example.invalid/model.gguf';
+  const contents = 'cached model bytes';
+  const modelSha256 = createHash('sha256').update(contents).digest('hex');
+  fs.writeFileSync(path.join(cacheDir, 'payload.gguf'), contents);
+  fs.symlinkSync('payload.gguf', path.join(cacheDir, cachedModelName(modelUrl)));
+  const model = await resolvePinnedModel({ modelPath: null, modelUrl, modelSha256, modelCacheDir: cacheDir });
+  const staged = path.join(webRoot, 'grammar-smoke-model.gguf');
+  await stageFile(model, staged);
+  assert.ok(fs.lstatSync(staged).isFile(), 'the staged model must be independent of the cache symlink');
+  assert.equal(fs.readFileSync(staged, 'utf8'), contents);
+});
 
 console.log('Browser smoke support contract passed');
