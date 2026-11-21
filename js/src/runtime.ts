@@ -80,6 +80,7 @@ import {
 } from './internal/model_source.ts';
 import {
   ModelStagingError,
+  effectiveOffloadedGpuLayers,
   isJsAllocationError,
   isSupportedJsModelStagingApiVersion,
   isWasm32TensorLimitText,
@@ -277,6 +278,7 @@ export class LlamaWebGpuBridgeRuntime {
   declare _threadsBatch: number;
   declare _nBatch: number;
   declare _nUbatch: number;
+  declare _requestedGpuLayers: number;
   declare _nGpuLayers: number;
   declare _nSeqMax: number;
   declare _useMmap: boolean;
@@ -380,9 +382,10 @@ export class LlamaWebGpuBridgeRuntime {
     this._nUbatch = Number(config.nUbatch) > 0
       ? Math.max(32, Math.trunc(Number(config.nUbatch)))
       : 0;
-    this._nGpuLayers = Number.isFinite(config.nGpuLayers)
+    this._requestedGpuLayers = Number.isFinite(config.nGpuLayers)
       ? Number(config.nGpuLayers)
       : -1;
+    this._nGpuLayers = this._requestedGpuLayers;
     this._nSeqMax = 0;
     this._useMmap = false;
     this._useMlock = false;
@@ -2657,7 +2660,10 @@ export class LlamaWebGpuBridgeRuntime {
 
     const requestedGpuLayers = Number(options.nGpuLayers);
     if (Number.isFinite(requestedGpuLayers)) {
-      this._nGpuLayers = Math.trunc(requestedGpuLayers);
+      this._requestedGpuLayers = Math.trunc(requestedGpuLayers);
+      this._nGpuLayers = this._requestedGpuLayers;
+    } else if (this._isAppleSafari) {
+      this._nGpuLayers = this._requestedGpuLayers;
     }
 
     if (this._nGpuLayers > 0 && !this._gpuActive) {
@@ -2726,13 +2732,17 @@ export class LlamaWebGpuBridgeRuntime {
       this._runtimeNotes.push('cpu_batch_tuned_default');
     }
 
-    if (this._isSafari && this._nGpuLayers > 0) {
+    const capCandidateLayers = this._isAppleSafari
+      ? effectiveOffloadedGpuLayers(this._nGpuLayers)
+      : this._nGpuLayers;
+    if (this._isSafari && capCandidateLayers > 0) {
       const requestedSafariMaxLayers = Number(options.safariMaxGpuLayers);
       const safariMaxGpuLayers = Number.isFinite(requestedSafariMaxLayers)
+        || (this._isAppleSafari && requestedSafariMaxLayers === Infinity)
         ? Math.max(1, Math.trunc(requestedSafariMaxLayers))
         : this._safariDefaultMaxGpuLayers;
 
-      if (this._nGpuLayers > safariMaxGpuLayers) {
+      if (capCandidateLayers > safariMaxGpuLayers) {
         this._nGpuLayers = safariMaxGpuLayers;
         this._runtimeNotes.push(`safari_gpu_layers_capped:${safariMaxGpuLayers}`);
       }

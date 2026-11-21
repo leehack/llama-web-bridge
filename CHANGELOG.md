@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Apply the Apple Safari below 27 one-layer cap to full-offload requests so eligible loads use heap-resident staging. Set `safariMaxGpuLayers: Infinity` to opt out. (#270)
+
 - Use the full GGUF URL, including its query string, for forced and automatic WasmFS fetch-backed model loads. Mount the model at a short local path so long signed URLs can load. (#288)
 
 - End a threaded core's pthread runtime when a direct-mode bridge is disposed or its core retires, so Chromium can collect the core and its memory. A core supplied through `coreModuleFactory` keeps running after `dispose()`. (#262)

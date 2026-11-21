@@ -13,6 +13,8 @@ import type { BlobWorkerBlockReason } from './internal/worker_start.ts';
 // Model state a worker reports so the facade can answer synchronous getters.
 export interface BridgeStateSnapshot {
   metadata: ModelMetadata | null;
+  // The owning Apple Safari runtime's request before the per-load cap.
+  requestedGpuLayers?: number;
   contextSize: number;
   gpuActive: boolean;
   backendName: string;
