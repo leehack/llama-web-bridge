@@ -1600,7 +1600,7 @@ function classifyResumeResponse(identity, response, finalUrl, offset, minimumByt
 }
 function isRetryableStreamNetworkError(error) {
   const text = String(error || "").toLowerCase();
-  return text.includes("network error") || text.includes("failed to fetch") || text.includes("networkerror") || text.includes("err_network_io_suspended") || text.includes("the network connection was lost") || text.includes("connection reset") || text.includes("timeout") || text.includes("timed out");
+  return error instanceof TypeError && error.message === "Load failed" || text.includes("network error") || text.includes("failed to fetch") || text.includes("networkerror") || text.includes("err_network_io_suspended") || text.includes("the network connection was lost") || text.includes("connection reset") || text.includes("timeout") || text.includes("timed out");
 }
 async function readStreamChunkWithTimeout(reader, timeoutMs, label = "stream read") {
   const resolvedTimeout = Number(timeoutMs);
