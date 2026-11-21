@@ -47,6 +47,8 @@ import {
 } from './internal/environment.ts';
 import { guardCore, isCoreRetired, retireCore, unguardedCore } from './internal/core_guard.ts';
 import { CrossOriginIsolationError, SingleThreadCoreError } from './internal/isolation.ts';
+import { BlobWorkerBlockedError, PTHREAD_WORKER_HOOK, createPthreadWorkerStart } from './internal/worker_start.ts';
+import type { PthreadWorkerStart, WorkerStartMode } from './internal/worker_start.ts';
 import { decodeImageBytesToRgb } from './internal/image.ts';
 import {
   EmbeddingError, EMPTY_EMBEDDING_CAPABILITIES, EMBEDDING_MEDIA_MARKER,
@@ -241,6 +243,10 @@ export class LlamaWebGpuBridgeRuntime {
   declare _textToSpeechDone: Promise<void> | null;
   declare _resolveTextToSpeechDone: (() => void) | null;
   declare _runtimeNotes: string[];
+  declare _startNotes: string[];
+  declare _pthreadStart: WorkerStartMode;
+  declare _pendingPthreadStarts: Set<PthreadWorkerStart>;
+  declare _pthreadStartGeneration: number;
   declare _threadPoolSizeHint: number | null;
   declare _threads: number;
   declare _threadsBatch: number;
@@ -319,6 +325,11 @@ export class LlamaWebGpuBridgeRuntime {
     this._textToSpeechDone = null;
     this._resolveTextToSpeechDone = null;
     this._runtimeNotes = [];
+    const workerStart = (config as { workerStart?: unknown }).workerStart;
+    this._startNotes = workerStart === 'direct' || workerStart === 'blob' ? [`worker_start:${workerStart}`] : [];
+    this._pthreadStart = 'direct';
+    this._pendingPthreadStarts = new Set();
+    this._pthreadStartGeneration = 0;
     this._threadPoolSizeHint = Number(config.threadPoolSize) > 0
       ? Math.max(1, Math.trunc(Number(config.threadPoolSize)))
       : null;
@@ -2218,6 +2229,7 @@ export class LlamaWebGpuBridgeRuntime {
       });
     }
 
+    const pthreadStartGeneration = this._pthreadStartGeneration;
     let lastError = null;
     let memory64FallbackReason: string | null = null;
     for (const candidate of candidates) {
@@ -2231,12 +2243,21 @@ export class LlamaWebGpuBridgeRuntime {
       // discarded keeps its callbacks, which must not reach the adopted core.
       let candidateCore: LlamaCoreModule | null = null;
       let initTimer: ReturnType<typeof globalThis.setTimeout> | undefined;
+      const pthreadStart = candidate.variant === 'custom' ? null : createPthreadWorkerStart();
+      if (pthreadStart) {
+        if (pthreadStartGeneration === this._pthreadStartGeneration) {
+          this._pendingPthreadStarts.add(pthreadStart);
+        } else {
+          pthreadStart.settle(false);
+        }
+      }
       try {
         const moduleFactory = await candidate.factoryPromise;
         factoryLoaded = true;
         const initTimeoutMs = this._resolveCoreInitTimeoutMs();
         candidateCore = guardCore(await Promise.race([
           moduleFactory({
+          ...(pthreadStart ? { [PTHREAD_WORKER_HOOK]: pthreadStart.Worker } : {}),
           locateFile: (path: string, prefix: string) => {
             if (path.endsWith('.wasm') && candidate.wasmUrl) {
               return candidate.wasmUrl;
@@ -2321,8 +2342,11 @@ export class LlamaWebGpuBridgeRuntime {
               reject(initTimeoutError);
             }, initTimeoutMs);
           }),
+          ...(pthreadStart ? [pthreadStart.failed] : []),
         ]) as LlamaCoreModule, (cause, stats) => this._handleCoreRetired(cause, stats));
+        if (pthreadStart?.mode() === 'blob') pthreadStart.checkNotAbandoned();
         this._core = candidateCore;
+        this._pthreadStart = pthreadStart?.mode() ?? 'direct';
 
         this._coreVariant = candidate.variant === 'wasm64' ? 'wasm64' : 'wasm32';
         this._memory64FallbackReason = memory64FallbackReason;
@@ -2333,7 +2357,8 @@ export class LlamaWebGpuBridgeRuntime {
         }
 
         break;
-      } catch (error) {
+      } catch (caught) {
+        const error = pthreadStart && caught !== initTimeoutError ? pthreadStart.failure(caught) : caught;
         lastError = error;
         if (candidate.variant === 'wasm64') {
           const reason = initTimeoutError && error === initTimeoutError
@@ -2349,6 +2374,10 @@ export class LlamaWebGpuBridgeRuntime {
       } finally {
         // The pending timer would keep the core reachable after disposal or retirement.
         if (initTimer !== undefined) globalThis.clearTimeout(initTimer);
+        if (pthreadStart) {
+          pthreadStart.settle(candidateCore !== null && this._core === candidateCore);
+          this._pendingPthreadStarts.delete(pthreadStart);
+        }
       }
     }
 
@@ -2380,9 +2409,10 @@ export class LlamaWebGpuBridgeRuntime {
         ? parsed.map((v) => String(v))
         : [];
       this._gpuActive = probeResult === 1;
-    } catch (_err) {
+    } catch (error) {
       this._backendLabels = [];
       this._gpuActive = false;
+      if (error instanceof BlobWorkerBlockedError) throw error;
     }
 
     return this._gpuActive;
@@ -2397,9 +2427,12 @@ export class LlamaWebGpuBridgeRuntime {
     const abortMessage = 'Model load was cancelled.';
     throwIfAborted(operationSignal, abortMessage);
     this._abortRequested = false;
-    this._runtimeNotes = this._core && this._memory64FallbackReason
-      ? ['core_mem64_unavailable', `core_mem64_unavailable:${this._memory64FallbackReason}`]
-      : [];
+    this._runtimeNotes = [
+      ...this._startNotes,
+      ...(this._core && this._memory64FallbackReason
+        ? ['core_mem64_unavailable', `core_mem64_unavailable:${this._memory64FallbackReason}`]
+        : []),
+    ];
     this._suppressedWarmupWarningCount = 0;
     this._didReportWarmupWarningSuppression = false;
     await this._probeBackends();
@@ -2421,7 +2454,9 @@ export class LlamaWebGpuBridgeRuntime {
     this._syncThreadPoolSizeHintFromCore();
     const coreSupportsPthreads = this._coreSupportsPthreads();
     this._pushRuntimeNote(`core_pthreads:${coreSupportsPthreads ? 1 : 0}`);
-    if (!coreSupportsPthreads) {
+    if (coreSupportsPthreads) {
+      this._pushRuntimeNote(`pthread_start:${this._pthreadStart}`);
+    } else {
       this._pushRuntimeNote('core_single_thread');
     }
     if (
@@ -5418,6 +5453,10 @@ export class LlamaWebGpuBridgeRuntime {
   }
 
   async dispose() {
+    this._pthreadStartGeneration += 1;
+    for (const start of this._pendingPthreadStarts) start.settle(false);
+    this._pendingPthreadStarts.clear();
+
     if (this._textToSpeechActive && this._textToSpeechDone) {
       this.cancel();
       await this._textToSpeechDone;

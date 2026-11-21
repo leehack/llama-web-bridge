@@ -7,6 +7,7 @@ import { ModelUnloadedError } from './internal/core_guard.ts';
 import { CrossOriginIsolationError, SingleThreadCoreError } from './internal/isolation.ts';
 import { ModelStagingError } from './internal/model_staging.ts';
 import { textToSpeechProgressTransfers } from './internal/text_to_speech.ts';
+import { BlobWorkerBlockedError } from './internal/worker_start.ts';
 import type { EmbedBatchProgressHook } from './internal/embedding.ts';
 import { toUint8Array } from './internal/typed_values.ts';
 import {
@@ -65,6 +66,7 @@ export function installBridgeWorkerHost() {
       ...(error instanceof Error && error.name === 'ModelTransferLengthError'
         ? { errorCode: 'MODEL_TRANSFER_LENGTH_ERROR' } : {}),
       ...(error instanceof ModelStagingError ? { modelStagingErrorCode: error.code } : {}),
+      ...(error instanceof BlobWorkerBlockedError ? { errorCode: error.code, blobWorkerBlockReason: error.reason } : {}),
       ...(decisionErrorCode ? { decisionErrorCode } : {}),
       state,
     });

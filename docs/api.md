@@ -229,6 +229,8 @@ warning at the `warn` log level and sets `llamadart.webgpu.execution` to
 `main-thread` and `llamadart.webgpu.worker_fallback_reason` in
 `getModelMetadata()`. A result returned after a fallback did not run in the
 worker.
+Firefox falls back to the page thread when a CDN bridge worker fails to start.
+With cross-origin isolation, a supported CDN pthread core can still run there.
 
 ### Custom core factory
 
@@ -242,6 +244,12 @@ genuine `WebAssembly.RuntimeError` constructor as
 bridge trusts the supplied constructor. Built cores expose it. An older
 cross-realm core without this export still retires through `onAbort` and
 rethrows a bare trap with the core left in use.
+
+Wrappers loaded through `coreModuleUrl` or `coreModuleUrlMem64` can use
+cross-origin pthread startup by forwarding the factory options, including the
+symbol-keyed hook, to a core built with support for it. Older cores, supplied
+`coreModuleFactory` factories, and wrappers that drop the hook use the
+core's original worker startup.
 
 ### Static properties
 
@@ -1264,6 +1272,12 @@ include:
 | `llamadart.webgpu.supports_audio` | `1` when the active projector supports audio. |
 | `llamadart.webgpu.worker_fallback_reason` | Present from a fallback from worker mode to direct runtime until `dispose()`, even when a later CPU-mode media request moves the model to a new worker. |
 
+Worker mode reports `worker_start:direct` or `worker_start:blob`.
+Threaded cores report `pthread_start:direct` when the bridge forwards the
+core's worker URL and `pthread_start:blob` when the bridge supplies a module
+blob. A blocked bridge worker blob start can leave a
+`worker_start_blocked:<reason>` note on the page-thread runtime.
+
 ### `getContextSize()`
 
 ```ts
@@ -1356,8 +1370,14 @@ this function themselves.
   `wasmUrl` and `wasmUrlMem64` if the binaries are served separately.
   Single-thread cores support vision, speech recognition and speech synthesis.
   See the [size measurements and limits](single_thread.md).
-- Serve `llama_webgpu_core.js` and `llama_webgpu_core.wasm` from URLs reachable
-  by both the page and worker. If using wasm64, also serve the `_mem64` files.
+- Serve both the core JS and Wasm from URLs reachable by the page and worker.
+  For a threaded core on another origin, matching bridge and core assets start
+  the core's pthread workers from a same-origin module `blob:` that imports
+  the core. The page must be cross-origin isolated and the CDN must serve
+  assets with CORS and a compatible `Cross-Origin-Resource-Policy`.
+- With CSP, allow `worker-src blob: <asset-origin>`,
+  `script-src <asset-origin> 'wasm-unsafe-eval'`, and `connect-src` for the
+  asset and model hosts alongside the application's existing sources.
 - Keep `llama_webgpu_bridge.js`, `llama_webgpu_bridge_worker.js`, the core JS,
   and wasm files from the same published bridge asset set.
 - Use `dispose()` before dropping references when switching models or tearing
@@ -1403,3 +1423,20 @@ this function themselves.
   and `wasm32` Qwen3-8B-Q4_K_M (4.68 GiB) hit the `4 GiB`
   `gguf_init_from_reader` tensor size-overflow ceiling (`4,288,489,984 +
   9,437,184` > `4,294,967,295`).
+
+### `BlobWorkerBlockedError`
+
+When cross-origin pthread startup fails and the bridge can classify the
+failure before initialization ends, it rejects with
+`BlobWorkerBlockedError` (`code: 'BLOB_WORKER_BLOCKED'`, `target: 'pthread'`).
+The error propagates to the caller from either execution mode. If the
+core factory fails first or its deadline expires first, the caller receives
+the original error.
+
+The `reason` is best-effort. The bridge reports `csp` when it observes an
+enforced blob-worker policy violation, `unavailable` when it cannot start or
+confirm a module blob worker, and `script` when the module blob starts but
+cannot import its core script. Firefox reports `unavailable` when a policy on
+the bridge worker's response blocks its pthreads and Firefox does not deliver
+the violation event to that worker. A blocked pthread start can report up to
+one CSP violation per pool worker, four with the default pool size.

@@ -996,6 +996,7 @@ function checkCiRunsContracts({ ci, candidate, publish }, testFiles, errors) {
     'node scripts/smoke/resume_integrity.mjs --baseline-dist-dir "$BRIDGE_DIST_DIR" --threading single',
     'node scripts/smoke/resume_integrity.mjs --baseline-dist-dir "$BRIDGE_DIST_DIR" --js-backed-model-staging',
     'node scripts/smoke/resume_integrity.mjs --baseline-dist-dir "$BRIDGE_DIST_DIR" --threading single --js-backed-model-staging',
+    'node scripts/smoke/cross_origin_assets.mjs',
     'node scripts/smoke/core_abort_recovery.mjs',
     'node scripts/smoke/core_abort_recovery.mjs --threading single',
   ]) {

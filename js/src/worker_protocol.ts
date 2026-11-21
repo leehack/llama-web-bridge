@@ -8,6 +8,7 @@ import type {
   ModelMetadata,
   ModelStagingErrorCode,
 } from './llama_webgpu_bridge.d.ts';
+import type { BlobWorkerBlockReason } from './internal/worker_start.ts';
 
 // Model state a worker reports so the facade can answer synchronous getters.
 export interface BridgeStateSnapshot {
@@ -31,7 +32,8 @@ export interface WorkerResponse {
   decisionErrorCode?: DecisionErrorCode;
   modelStagingErrorCode?: ModelStagingErrorCode;
   errorCode?: 'CROSS_ORIGIN_ISOLATION_REQUIRED' | 'SINGLE_THREAD_CORE_UNSUPPORTED' | 'MODEL_TRANSFER_LENGTH_ERROR'
-    | 'MODEL_UNLOADED_AFTER_CORE_ABORT';
+    | 'MODEL_UNLOADED_AFTER_CORE_ABORT' | 'BLOB_WORKER_BLOCKED';
+  blobWorkerBlockReason?: BlobWorkerBlockReason;
   event?: string;
   payload?: unknown;
 }

@@ -3,7 +3,9 @@
 Set `allowSingleThreadCore: true` and use the explicit `_st` core URLs. These
 cores run with one CPU thread. WebGPU can still offload model layers, and the
 cores support vision, speech recognition and speech synthesis. Use the wasm32
-core in Safari, where memory64 is unavailable.
+core in Safari, where memory64 is unavailable. The bridge can load
+single-thread cores from a CDN on non-isolated pages. With
+`disableWorker: true`, the single-thread core starts no workers.
 
 The default pthread cores require cross-origin isolation. Serve the page with
 `Cross-Origin-Opener-Policy: same-origin` and
