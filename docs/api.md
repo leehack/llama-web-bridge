@@ -328,7 +328,7 @@ Common `options` keys:
 | `safariMaxGpuLayers` | Per-load Safari GPU layer cap. Recognized Safari 27 and newer default to no cap. Older or unidentified Safari versions default to one layer. |
 | `safariGpuProbe` | Set to `false` to skip the Safari load-time GPU probe. |
 | `nBatch`, `nUbatch` | Per-load batch and micro-batch overrides. |
-| `useCache`, `force` | Cache Storage controls for model responses. A cache miss writes the model to Cache Storage while it downloads, so progress follows the download; a failed cache write leaves the model loaded but uncached, and a cancelled load stores nothing. |
+| `useCache`, `force` | Cache Storage controls for model responses. A cache miss writes the model to Cache Storage while it downloads, so progress follows the download; a failed cache write leaves the model loaded but uncached, and a cancelled load stores nothing. On iOS and iPadOS Safari, pass `useCache: false` for models larger than about 400 MB to avoid the [WebContent memory limit](single_thread.md#ios-safari). |
 | `streamResumeRetries` | Maximum retry count per shard for resuming or restarting a streamed model download. |
 | `remoteFetchThresholdBytes`, `remoteFetchChunkBytes` | Per-load remote-fetch tuning. |
 | `forceRemoteFetchBackend` | Force the native fetch backend for a single-file model in a worker. On a single-thread worker, the load rejects with `SingleThreadCoreError` (`code: 'SINGLE_THREAD_CORE_UNSUPPORTED'`, `feature: 'remote_fetch_backend'`). Page-thread loads use streamed staging. |

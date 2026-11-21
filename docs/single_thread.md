@@ -48,8 +48,20 @@ ceiling. A positive request defaults to at most one GPU layer on Safari below
 27, which keeps GPU acceleration with a lower memory ceiling. The default
 full-offload request uses JS chunks.
 
+On iOS and iPadOS Safari, pass `useCache: false` for models larger than about
+400 MB until the Cache Storage write is fixed. During a cold load with default
+caching, WebKit's `Cache.put` of the teed download stream can push WebContent
+past its memory limit. On an iPhone 17 Pro running iOS 26.5, the 805 MB Q8 model
+finished downloading with 767.5 MiB in the heap staging block and zero JS
+file-staging bytes. iOS killed WebContent at its 2 GiB limit while the cache
+write was still pending, before native model loading started.
+On the same device, the 397 MB Q4 model loaded with default caching and
+reloaded from Cache Storage using heap staging.
+[Q8 cold load](https://console.cloud.google.com/storage/browser/llamadart-cuda-qa-20260916-devicerun/automation/sessions/session-15958212-a0a7-455a-8ed1-5d1ed482250c/) ·
+[Q4 cold load and reload](https://console.cloud.google.com/storage/browser/llamadart-cuda-qa-20260916-devicerun/automation/sessions/session-d6f7a701-106b-42ac-97d5-2a29797374aa/)
+
 The memory estimates below come from Qwen3-0.6B-Q8_0 (767 MiB, `nCtx: 512`)
-and memory-headroom probes on an iPhone 17 Pro running iOS 26.5. The model
+and memory-headroom probes with `useCache: false` on the same device. The model
 architecture and context and batch settings affect the ceiling.
 
 | Effective GPU layers | Q8 result with heap staging | Estimated model-size ceiling |
