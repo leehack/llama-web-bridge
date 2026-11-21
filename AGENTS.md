@@ -1,20 +1,20 @@
 # AGENTS.md
 
-Guidance for coding agents working in `llama-web-bridge`. `README.md` owns the
-integration surface, CI/qualification/publication narrative, and CDN list;
-`CONTRIBUTING.md` owns the runnable build recipes, smoke invocations and their
-pins, workflow guardrails, and publish process. This file keeps only what
-neither states.
+Guidance for coding agents working in `llama-web-bridge`.
+
+- [README.md](README.md) covers the bridge, installation, and CDN assets.
+- [API reference](docs/api.md) defines the public JavaScript API.
+- [Single-thread guide](docs/single_thread.md) records browser staging limits and measurements.
+- [CONTRIBUTING.md](CONTRIBUTING.md) owns build recipes, smoke commands and pins,
+  workflow guardrails, and publication.
 
 ## Scope and Ownership
 
-- This repository owns WebGPU bridge source/runtime build for llama.cpp web.
-- It publishes versioned assets to `llama-web-bridge-assets` via workflow.
-- `llamadart` consumes those published assets.
+- This repository owns the WebGPU bridge source and runtime build for llama.cpp.
+- `llama-web-bridge-assets` holds versioned artifacts published by workflow.
+- `llamadart` consumes those artifacts.
 
-## Related Repositories
-
-Common maintainer sibling layout:
+### Related repositories
 
 ```text
 ../llamadart
@@ -29,144 +29,82 @@ Common maintainer sibling layout:
 ./scripts/build/build_bridge.sh
 ```
 
-`./scripts/build/build_bridge.sh --help` lists every environment variable the build
-reads, with defaults. CI clones the `llama_cpp.version` tag into the script's
-default `third_party/llama_cpp` and installs the exact `emsdk.version`
-compiler; a local Emscripten SDK must match that release.
+Match the llama.cpp checkout to `llama_cpp.version` and Emscripten to
+`emsdk.version`. See [Local Build](CONTRIBUTING.md#local-build).
 
 ## Agent PR Workflow
 
-For non-trivial runtime, workflow, or API changes, keep the PR path explicit:
+For non-trivial runtime, workflow, or API changes:
 
 1. Start from a clean topic branch and inspect `git status` before editing.
-2. Add or update a regression/contract check before changing behavior when
-   practical. Static contract scripts are acceptable for workflow invariants.
+2. Add or update a regression or contract check before changing behavior when
+   practical. Static checks can cover workflow invariants.
 3. Keep Emscripten build directories, ccache, model caches, and Playwright
-   artifacts outside the repository unless they are intentionally versioned.
-4. Run the targeted checks below and the full browser smoke when the change
-   touches `js/`, `src/`, `scripts/`, or GitHub workflows.
-5. Use an independent review before committing PR-bound changes. Fix blocking
-   findings, rerun the targeted checks, then commit locally; do not push or open
-   a PR unless the maintainer asks.
+   artifacts outside the checkout unless intentionally versioned.
+4. Run the targeted checks below and the full browser smoke when changes touch
+   `js/`, `src/`, `scripts/`, or GitHub workflows.
+5. Get an independent review before committing PR-bound changes. Fix blockers,
+   rerun the targeted checks, then commit locally. Push or open a PR only when
+   the maintainer asks.
 
-### Local Verification Notes
+## Verification and Regression Guidance
 
-The external-path build recipe (`CCACHE_DIR`, `EM_CACHE`, `BUILD_DIR`,
-`MEM64_BUILD_DIR`, `OUT_DIR`), the lightweight contract list starting with
-`npm run check:js`, and every browser smoke invocation live in
-[CONTRIBUTING.md](CONTRIBUTING.md#validate-outputs) under Local Build and
-Validate Outputs. Run them from there; do not copy them here. Which smoke
-applies:
+The [external-path build recipe](CONTRIBUTING.md#local-build) sets `CCACHE_DIR`,
+`EM_CACHE`, `BUILD_DIR`, `MEM64_BUILD_DIR`, `SINGLE_THREAD_BUILD_DIR`,
+`SINGLE_THREAD_MEM64_BUILD_DIR`, and `OUT_DIR`, with
+`WEBGPU_BRIDGE_BUILD_MEM64` and `WEBGPU_BRIDGE_BUILD_SINGLE_THREAD` enabled.
+Run the lightweight contracts, starting with `npm run check:js`, and use the
+[smoke commands](CONTRIBUTING.md#validate-outputs) with their pinned inputs.
+The scripts below live in `scripts/smoke/` unless a different path is shown.
 
-- core disposal, retirement, or core `--pre-js`/`--post-js` changes:
-  `scripts/smoke/core_release.mjs` (default, `--memory-mode wasm64`,
-  `--threading single`, and both flags);
-- state-persistence or workflow changes:
-  `scripts/smoke/state_persistence.mjs` (both default pthreads and
-  `--threading single` for wasm32 and wasm64) against a built `OUT_DIR`;
-- llama.cpp pin or multimodal changes: `scripts/smoke/multimodal.mjs`
-  through both direct and worker runtimes;
-- sampler or grammar changes: `scripts/smoke/grammar.mjs` with the
-  state-persistence model and the multimodal model;
-- next-token scoring or prompt-evaluation changes:
-  `scripts/smoke/next_token_scores.mjs` with the state-persistence model;
-- speech changes: `scripts/smoke/speech_to_text.mjs` and
-  `scripts/smoke/text_to_speech.mjs` individually. The combined
-  `scripts/release/qualification.mjs qualify` command is workflow-only because it
-  requires GitHub Actions and `github-hosted` runner identity;
-- decision-head changes: `scripts/smoke/decision.mjs` with a Laya
-  encoder GGUF, head and reference fixture;
-- LoRA adapter changes: `scripts/smoke/lora_adapter.mjs` with its
-  default base model and adapter.
+| Change | Smoke |
+| --- | --- |
+| Core disposal, retirement, or core pre/post JS | `core_release.mjs` on both memory modes and threading modes |
+| Native abort or trap recovery | `core_abort_recovery.mjs` with default and single threading |
+| State persistence or workflows | `state_persistence.mjs` on wasm32 and wasm64, threaded and single-threaded |
+| Worker startup or core URLs | `cross_origin_assets.mjs` |
+| Streaming downloads and retry integrity | `resume_integrity.mjs` |
+| WasmFS fetch backend | `remote_fetch_backend.mjs` on both threaded memory modes |
+| JS-backed staging mounts and shared cores | `tests/bridge/js_model_staging_shared_core_browser_test.mjs` |
+| Single-thread behavior | Non-isolated `state_persistence.mjs` and local `single_thread.mjs` WebGPU acceptance |
+| Asset resolution or npm packaging | `bundler_packaging.mjs` |
+| llama.cpp pin or multimodal completion | `multimodal.mjs` through direct and worker runtimes |
+| Multimodal embeddings | `multimodal_embeddings.mjs` with the pinned BF16 fixtures |
+| Samplers or grammars | `grammar.mjs` with both the state-persistence and multimodal models |
+| Next-token scoring or prompt evaluation | `next_token_scores.mjs` with the state-persistence model |
+| Speculative decoding | `speculative.mjs` with the affected strategies |
+| Speech recognition or synthesis | `speech_to_text.mjs` and `text_to_speech.mjs` individually |
+| Decision heads | `decision.mjs` with a Laya encoder, head, and reference fixture |
+| LoRA adapters | `lora_adapter.mjs` with its default base model and adapter |
 
-Keep the tiny model in a user cache or `/private/tmp`; do not commit downloaded
-GGUFs or smoke artifacts.
+- For pthread changes, test a BERT-class encoder in isolated Chromium on a host
+  whose `navigator.hardwareConcurrency` exceeds the compiled pool. Run
+  `loadModelFromUrl`, `tokenize`, `embed`, and `embedBatch` through both
+  direct (`disableWorker: true`) and worker runtimes. Both must cap
+  `n_threads` to the pool size.
+- Worker and direct WASMFS are separate. Keep worker-owned state operations in
+  the worker. Use the byte APIs for durable application storage.
+- Keep downloaded GGUFs in a user cache or temporary directory and keep smoke
+  artifacts outside the checkout. Redact userinfo, query values, and fragments
+  from model URLs in errors and artifacts.
+- Every llama.cpp pin change needs checksum-pinned real multimodal inference
+  in both runtimes.
+- Speech-capable releases require the hosted memory/runtime qualification
+  matrix. Keep the heavy gates outside ordinary CI. The combined
+  `qualification.mjs qualify` command requires a GitHub-hosted Actions runner.
 
-## CI / Release
+## CI and Release
 
-- CI build gate: `.github/workflows/ci.yml`
-  - Builds all four cores (threaded and single-thread `_st` wasm32/memory64)
-    against the `llama_cpp.version` pin (`v1.0.0`,
-    asserting resolved commit `b1b770d90d94cad9e9ea5b993bdbc383a522fb28`)
-    with default identities (`Build WebGPU Bridge (WASM)`, `webgpu-bridge-dist`).
-    The former separate `v1.0.0` candidate lane is now the default; see
-    [the qualification notes](docs/v100_qualification.md) for the release gates.
-    Builds against llama.cpp v0.4.0 are no longer tested in CI; the
-    `src/llama_webgpu_mtmd_compat.h` shim and its static contract remain.
-  - Verifies the active `emcc` identity against `emsdk.version` and
-    contract-tests all five required wasm64 WASMFS patches.
-  - `scripts/ci/ci_scope.mjs` lets `README.md`, `CONTRIBUTING.md`, `LICENSE`, and
-    `docs/*.md` changes skip the build lane; `AGENTS.md` is not in that
-    allowlist, so editing it still runs it.
-- Candidate build: `.github/workflows/bridge_candidate.yml`
-  - The only workflow that builds publishable assets. It uploads the bundle as
-    `exact-webgpu-bridge-dist`, which qualification and publication download by
-    immutable artifact ID. It refuses `github.run_attempt != 1`; dispatch a new
-    candidate after failure rather than rerunning it.
-  - Holds no credential that can read another repository's administration
-    settings, so it fails closed on the dispatcher's
-    `assets_immutable_releases_enabled` assertion and records it in
-    `bridge-candidate-prequalification`. Confirm the assertion first with
-    `gh api repos/leehack/llama-web-bridge-assets/immutable-releases`.
-- Automated qualification: `.github/workflows/bridge_qualification.yml`
-  - Owner-dispatched with the exact candidate run ID and the candidate's
-    correlation ID; no maintainer-supplied attestation input exists. It uploads
-    one `qualification-attestation` artifact using repository access and no
-    PAT.
-- Releases are manual: the owner dispatches candidate, qualification, then
-  publish, with the inputs in
-  [CONTRIBUTING.md](CONTRIBUTING.md#publish-process). No workflow dispatches
-  another, so each stage must verify every input it consumes on its own.
-- CI reliability contract: `scripts/ci/verify_ci_reliability.mjs`
-  - Checks publication-safety invariants, not wording: it parses the workflows
-    with `yaml` and reads commands from resolved `run` scripts. It covers
-    read-only workflow and job permissions, no `continue-on-error` outside the
-    publication ref mutation, the environment gates, `WEBGPU_BRIDGE_ASSETS_PAT` as the only
-    secret with its fail-closed, never-printed guard, immutable-release
-    governance and readback, owner-only first-attempt runs, artifact download
-    by immutable ID, the toolchain pins, and that CI, candidate, and publish run
-    the contract tests (`check:js` must run `npm test`, which globs every
-    `tests/**/*_test.mjs`, and every other file under `tests/` must be a helper
-    a test imports). It asserts the 7-pin set in `CONTRIBUTING.md` and both
-    build workflows, and that `README.md` and `AGENTS.md` hold no pins. It
-    checks no documentation prose. `tests/ci/verify_ci_reliability_test.mjs`
-    tests its test-registration, pin and PAT checks.
-- Publish workflow: `.github/workflows/publish_assets.yml`
-  - Never builds. It downloads the exact candidate artifact and attestation by
-    immutable artifact ID and verifies the candidate manifest's
-    `emscripten_version` against the `emsdk.version` pin at the exact bridge
-    source SHA.
-  - Requires `publish_approved=true`. Publication remains blocked until an
-    administrator externally creates `bridge-assets-publication`, disables
-    administrator bypass, restricts custom deployment branches to `main`, and
-    stores `WEBGPU_BRIDGE_ASSETS_PAT` as an environment-scoped secret. The
-    solo-maintainer publication contract does not require a reviewer rule. Do
-    not describe that environment as protected without current live evidence.
-    Use the default job token to validate the environment identity,
-    administrator-bypass setting, and exact `main` branch policy before approval
-    and again after approval, with the trusted workflow commit's validator.
-    Immediately before any network use of the environment-scoped publication
-    PAT, fail closed unless the injected credential is non-empty,
-    without printing its value.
-  - Proves immutable-release governance on the assets repository through
-    `GET /repos/{owner}/{repo}/immutable-releases` before any ref or release
-    mutation, reads every complete release back by tag and by release ID with
-    explicit boolean `immutable: true`, and requires
-    `gh release verify <tag> --repo <assets repo> --format json` to prove the
-    `https://in-toto.io/attestation/release/v0.2` attestation over the exact
-    published bytes. A mismatch is a non-retryable
-    `immutable-publication-unverified` outcome; publication never deletes,
-    retags, overwrites, or otherwise repairs the release.
-
-### Immutable Release Baseline
-
-The historical `v0.1.38` release is not repaired or reused. The verified
-immutable baseline is:
-
-- `release_tag`: `v0.1.39`
-- `release_rebuild`: `0`
-- `orchestrator_correlation_id`: `kanban:t_7f112b91:web-v0.1.39`
-- `assets_immutable_releases_enabled`: `true`
+- `AGENTS.md` is outside the docs allowlist in `scripts/ci/ci_scope.mjs`.
+  Editing it runs the full WASM build and browser smoke lane.
+- See the [current pin qualification](docs/v100_qualification.md).
+  Keep `src/llama_webgpu_mtmd_compat.h` and its static contract. CI no longer
+  builds llama.cpp v0.4.0.
+- Follow the [workflow guardrails](CONTRIBUTING.md#agent-workflow-guardrails)
+  and the [four-stage publish process](CONTRIBUTING.md#publish-process).
+  Keep SHA-256 pins in the files named by the verifier.
+- Verify live settings before describing `bridge-assets-publication` or
+  `bridge-npm-publication` as protected.
 
 ## Change Boundaries
 
@@ -222,32 +160,3 @@ After publishing assets tag:
 1. Update/fetch pinned bridge assets in `llamadart`:
    `WEBGPU_BRIDGE_ASSETS_TAG=<tag> ./scripts/fetch_webgpu_bridge_assets.sh`
 2. Update docs/changelog in `llamadart` if behavior changed.
-
-## Regression Smoke Guidance
-
-- For worker startup or core URL changes, run the [cross-origin assets smoke](CONTRIBUTING.md#validate-outputs).
-- For pthread/runtime changes, test a BERT-class embedding model in Chromium
-  with cross-origin isolation enabled. The regression shape is:
-  `loadModelFromUrl`, `tokenize`, `embed`, and `embedBatch` on a host where
-  `navigator.hardwareConcurrency` is greater than the bridge pthread pool size.
-- Run the smoke through both direct runtime (`disableWorker: true`) and the
-  bridge worker path; both should report `n_threads` capped to the pool size.
-- For state persistence, exercise both direct and worker runtimes with a real
-  tiny model. The smoke should evaluate a prompt, save bytes, mutate state,
-  reload bytes, and verify generation still works after restore.
-- For single-thread runtime changes, run the non-isolated state smoke and the
-  [local WebGPU acceptance smoke](CONTRIBUTING.md#validate-outputs). The state
-  smoke checks the public worker error and automatic staging fallback. The
-  local worker run also checks the native URL loader directly.
-- Worker and direct runtime filesystems are separate. Do not silently fall back
-  from worker-owned state APIs to direct runtime state; byte APIs are the durable
-  app-storage path for IndexedDB/OPFS/Cache API integrations.
-- If the smoke downloads a model, never expose raw signed/authenticated locations in
-  thrown errors or artifacts. Redact userinfo, query, and fragment values.
-- Every llama.cpp pin update must pass checksum-pinned real multimodal inference
-  in both direct and worker runtimes; a successful WASM build alone is not
-  sufficient.
-- Speech-capable asset releases must pass the hosted automated qualification
-  workflow's exact required memory/runtime matrix before publication. Keep
-  these heavy gates outside ordinary CI; reproduce locally with the individual
-  smoke scripts, not the workflow-only combined qualifier.
