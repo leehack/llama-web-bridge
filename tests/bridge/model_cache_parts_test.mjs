@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { setTimeout as delay } from 'node:timers/promises';
+import { setImmediate as nextTurn } from 'node:timers/promises';
 
 import * as download from '../../js/src/internal/download.ts';
 import { createDirectBridge } from './bridge_operation_queue_fixtures.mjs';
@@ -83,16 +83,21 @@ function installCaches() {
 // navigator.locks with the one mode the store uses: an exclusive ifAvailable request.
 function installLocks({ available = true, present = true } = {}) {
   const held = new Set();
+  const pendingReleases = new Set();
   const requests = [];
   const locks = {
     async request(name, options, callback) {
       requests.push({ name, options });
       if (!available || held.has(name)) return callback(null);
+      const released = Promise.withResolvers();
       held.add(name);
+      pendingReleases.add(released.promise);
       try {
         return await callback({ name });
       } finally {
         held.delete(name);
+        pendingReleases.delete(released.promise);
+        released.resolve();
       }
     },
   };
@@ -104,6 +109,7 @@ function installLocks({ available = true, present = true } = {}) {
   return {
     held,
     requests,
+    whenIdle: () => Promise.all(pendingReleases),
     restore() {
       if (original) Object.defineProperty(globalThis, 'navigator', original);
       else delete globalThis.navigator;
@@ -186,9 +192,21 @@ async function withFakes(options, run) {
   try {
     await run(caches, locks);
   } finally {
+    await locks.whenIdle();
     if (options.uuid === false) Object.defineProperty(globalThis, 'crypto', originalCrypto);
     locks.restore();
     caches.restore();
+  }
+}
+
+async function withStoreReader(store, run) {
+  const reader = store.response.body.getReader();
+  const settled = store.stored.catch(() => {});
+  try {
+    await run(reader);
+  } finally {
+    await reader.cancel().catch(() => {});
+    await settled;
   }
 }
 
@@ -256,17 +274,20 @@ const CASES = [
     assert.equal(store.response.url, MODEL_URL);
     assert.equal(store.response.status, 200);
     assert.equal(store.response.headers.get('etag'), '"v1"');
-    const body = readAll(store.response);
-    source.push([1, 2, 3]);
-    source.push([4, 5, 6]);
-    await delay(5);
-    assert.equal(caches.urls(PART).length, 1, 'the first full part is committed while the body is still open');
-    assert.equal(caches.manifest(), null, 'no manifest before the body completes');
-    source.push([7, 8, 9]);
-    source.push([10]);
-    source.close();
-    assert.deepEqual(await body, TEN);
-    await store.stored;
+    await withStoreReader(store, async (reader) => {
+      source.push([1, 2, 3]);
+      source.push([4, 5, 6]);
+      const received = [...(await reader.read()).value, ...(await reader.read()).value];
+      assert.equal(caches.urls(PART).length, 1, 'the first full part is committed while the body is still open');
+      assert.equal(caches.manifest(), null, 'no manifest before the body completes');
+      source.push([7, 8, 9]);
+      source.push([10]);
+      source.close();
+      received.push(...(await reader.read()).value, ...(await reader.read()).value);
+      assert.equal((await reader.read()).done, true);
+      assert.deepEqual(received, TEN);
+      await store.stored;
+    });
 
     const manifest = caches.manifest();
     const record = manifest.get('x-llamadart-cache-record');
@@ -278,7 +299,7 @@ const CASES = [
     assert.deepEqual(caches.partBytes(record), [[1, 2, 3, 4], [5, 6, 7, 8], [9, 10]]);
     assert.equal(caches.entries.has(MODEL_URL), false, 'no whole-body entry');
     assert.equal(caches.calls.put.at(-1).startsWith(MANIFEST), true, 'the manifest is the last write');
-    await delay(0);
+    await locks.whenIdle();
     assert.equal(locks.held.size, 0, 'the lock is released after the commit');
     assert.deepEqual(locks.requests[0].options, { ifAvailable: true });
     assert.ok(locks.requests[0].name.includes(CACHE_NAME));
@@ -286,22 +307,37 @@ const CASES = [
 
   ['a part still being written holds the transfer back', () => withFakes({}, async (caches) => {
     const { promise: hold, resolve: allow } = Promise.withResolvers();
-    caches.hooks.beforePut = (url) => (url.startsWith(PART) ? hold : undefined);
+    const putStarted = Promise.withResolvers();
+    caches.hooks.beforePut = (url) => {
+      if (!url.startsWith(PART)) return;
+      putStarted.resolve();
+      return hold;
+    };
     const source = controlledResponse();
     const store = startModelCachePartStore(caches.cache, MODEL_URL, source.response, CACHE_NAME, 4);
-    const reader = store.response.body.getReader();
-    const first = reader.read();
-    source.push([1, 2, 3, 4]);
-    await delay(20);
-    assert.equal(source.state.reads, 1, 'the source is not read past a part that has not committed');
-    allow();
-    assert.deepEqual([...(await first).value], [1, 2, 3, 4]);
-    const second = reader.read();
-    source.push([5]);
-    assert.deepEqual([...(await second).value], [5]);
-    source.close();
-    assert.equal((await reader.read()).done, true);
-    await store.stored;
+    await withStoreReader(store, async (reader) => {
+      let delivered = false;
+      const first = reader.read().then((result) => {
+        delivered = true;
+        return result;
+      });
+      const second = reader.read();
+      source.push([1, 2, 3, 4]);
+      source.push([5]);
+      try {
+        await Promise.race([putStarted.promise, first]);
+        await nextTurn();
+        assert.equal(delivered, false, 'the first chunk is held until the put commits');
+        assert.equal(source.state.reads, 1, 'the source is not read past a part that has not committed');
+      } finally {
+        allow();
+      }
+      assert.deepEqual([...(await first).value], [1, 2, 3, 4]);
+      assert.deepEqual([...(await second).value], [5]);
+      source.close();
+      assert.equal((await reader.read()).done, true);
+      await store.stored;
+    });
   })],
 
   ['the caller may release its chunks without changing the cached parts', () => withFakes({}, async (caches) => {
@@ -333,7 +369,7 @@ const CASES = [
     await assert.rejects(store.stored, /load cancelled/);
     assert.equal(store.cancelled, true);
     assert.equal(cancelled.state.cancelled, true);
-    await delay(5);
+    await locks.whenIdle();
     assert.equal(caches.entries.size, 0);
     assert.equal(locks.held.size, 0);
 
@@ -347,13 +383,14 @@ const CASES = [
     await assert.rejects(reader.read(), /network error/);
     await assert.rejects(store.stored, /network error/);
     assert.equal(store.cancelled, false);
-    await delay(5);
+    await locks.whenIdle();
     assert.equal(caches.entries.size, 0);
     assert.equal(locks.held.size, 0);
 
     store = startModelCachePartStore(caches.cache, MODEL_URL, bodyOf([]), CACHE_NAME, 4);
     assert.deepEqual(await readAll(store.response), []);
     await assert.rejects(store.stored, /empty/);
+    await locks.whenIdle();
     assert.equal(caches.entries.size, 0);
   })],
 
@@ -370,11 +407,11 @@ const CASES = [
     await putStarted.promise;
     const rejection = assert.rejects(store.stored, /load cancelled/);
     const cancel = reader.cancel(new Error('load cancelled'));
-    await delay(5);
+    await nextTurn();
     const lockedDuringPut = locks.held.size === 1;
     finishPut.resolve();
     await Promise.all([cancel, read, rejection]);
-    await delay(5);
+    await locks.whenIdle();
     assert.equal(lockedDuringPut, true);
     assert.equal(locks.held.size, 0);
     assert.equal(caches.calls.put.length, 1);
@@ -391,7 +428,7 @@ const CASES = [
     const store = startModelCachePartStore(caches.cache, MODEL_URL, bodyOf(TEN), CACHE_NAME, 4);
     assert.deepEqual(await readAll(store.response), TEN);
     await assert.rejects(store.stored, { name: 'QuotaExceededError' });
-    await delay(5);
+    await locks.whenIdle();
     assert.equal(puts, 2, 'no part is written after the failure');
     assert.equal(caches.entries.size, 0);
     assert.equal(locks.held.size, 0);
@@ -440,15 +477,16 @@ const CASES = [
 
     const source = controlledResponse();
     const store = startModelCachePartStore(caches.cache, MODEL_URL, source.response, CACHE_NAME, 4);
-    const body = readAll(store.response);
-    source.push([21, 22, 23, 24, 25]);
-    await delay(5);
-    assert.equal(caches.partBytes('11111111-1111-4111-8111-111111111111').length, 0, 'uncommitted parts are pruned first');
-    assert.equal(caches.manifest().get('x-llamadart-cache-record'), first);
-    assert.deepEqual(await readAll((await openModelCacheParts(caches.cache, MODEL_URL, CACHE_NAME)).response), TEN);
-    source.close();
-    assert.deepEqual(await body, [21, 22, 23, 24, 25]);
-    await store.stored;
+    await withStoreReader(store, async (reader) => {
+      source.push([21, 22, 23, 24, 25]);
+      assert.deepEqual([...(await reader.read()).value], [21, 22, 23, 24, 25]);
+      assert.equal(caches.partBytes('11111111-1111-4111-8111-111111111111').length, 0, 'uncommitted parts are pruned first');
+      assert.equal(caches.manifest().get('x-llamadart-cache-record'), first);
+      assert.deepEqual(await readAll((await openModelCacheParts(caches.cache, MODEL_URL, CACHE_NAME)).response), TEN);
+      source.close();
+      assert.equal((await reader.read()).done, true);
+      await store.stored;
+    });
 
     const second = caches.manifest().get('x-llamadart-cache-record');
     assert.notEqual(second, first);
@@ -626,12 +664,13 @@ const CASES = [
     const open = core.FS.open;
     core.FS.open = () => { throw new Error('FS open failed'); };
     await assert.rejects(runtime.loadModelFromUrl(MODEL_URL, loadOptions()), /FS open failed/);
-    await delay(5);
+    await nextTurn();
     assert.equal(locks.requests.length, 0);
     core.FS.open = open;
     assert.equal(await runtime.loadModelFromUrl(MODEL_URL, loadOptions()), 1);
     assert.equal(fetches.length, 2);
     assert.equal(runtime._modelCacheState, 'stored');
+    assert.equal(locks.requests.length, 1, 'only the healthy retry takes a lock');
     assert.equal(caches.entries.size, 2);
   })],
 
@@ -655,7 +694,7 @@ const CASES = [
 
   ['a model with a trustworthy length mismatch never commits a manifest', async () => {
     for (const length of ['2', '10']) {
-      await withFakes({}, async (caches) => {
+      await withFakes({}, async (caches, locks) => {
         const { runtime, loads, fetches } = createRuntime(() => bodyOf([1, 2, 3, 4], 3, {
           'content-length': length, 'content-encoding': 'identity',
         }), SAFARI);
@@ -666,7 +705,7 @@ const CASES = [
         for (let attempt = 0; attempt < 2; attempt++) {
           await assert.rejects(runtime.loadModelFromUrl(MODEL_URL, loadOptions()), { name: 'ModelTransferLengthError' });
         }
-        await delay(5);
+        await locks.whenIdle();
         assert.equal(caches.entries.size, 0);
         assert.deepEqual(loads, []);
         assert.equal(fetches.length, 3);
