@@ -8,10 +8,6 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const sourceDir = resolve(root, 'js/src');
 const outputDir = resolve(root, 'js');
 
-const mainSource = resolve(sourceDir, 'llama_webgpu_bridge.js');
-const mainOutput = resolve(outputDir, 'llama_webgpu_bridge.js');
-const workerSource = resolve(sourceDir, 'llama_webgpu_bridge_worker.js');
-const workerOutput = resolve(outputDir, 'llama_webgpu_bridge_worker.js');
 const declarationSource = resolve(sourceDir, 'llama_webgpu_bridge.d.ts');
 const declarationOutput = resolve(outputDir, 'llama_webgpu_bridge.d.ts');
 
@@ -22,9 +18,9 @@ const generatedBanner = (sourcePath) => (
 
 await mkdir(outputDir, { recursive: true });
 
-await build({
-  entryPoints: [mainSource],
-  outfile: mainOutput,
+await Promise.all(['llama_webgpu_bridge.js', 'llama_webgpu_bridge_worker.js'].map((entry) => build({
+  entryPoints: [resolve(sourceDir, entry)],
+  outfile: resolve(outputDir, entry),
   bundle: true,
   format: 'esm',
   platform: 'browser',
@@ -34,16 +30,9 @@ await build({
   legalComments: 'none',
   // Match tsconfig and Node's type stripping: keep every value import as written.
   tsconfigRaw: { compilerOptions: { verbatimModuleSyntax: true } },
-  banner: { js: generatedBanner('js/src/llama_webgpu_bridge.js').trimEnd() },
+  banner: { js: generatedBanner(`js/src/${entry}`).trimEnd() },
   logLevel: 'info',
-});
-
-const workerSourceText = await readFile(workerSource, 'utf8');
-await writeFile(
-  workerOutput,
-  `${generatedBanner('js/src/llama_webgpu_bridge_worker.js')}${workerSourceText}`,
-  'utf8',
-);
+})));
 const declarationSourceText = await readFile(declarationSource, 'utf8');
 await writeFile(
   declarationOutput,

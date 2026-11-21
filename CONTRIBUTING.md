@@ -51,15 +51,15 @@ and memory64 contract for `scripts/build/patch_wasm64_runtime.mjs`, and the CI
 change selector.
 Run one test file directly with `node tests/<area>/<name>_test.mjs`.
 
-`js/src/llama_webgpu_bridge.js` is the public entry. It re-exports the API and
-owns the only load-time side effects (worker host auto-boot and the
-`window.LlamaWebGpuBridge` global); every other module is side-effect free.
+`js/src/llama_webgpu_bridge.js` is the public entry. It re-exports the API,
+supports worker host auto-boot, and sets the `window.LlamaWebGpuBridge` global.
+`js/src/llama_webgpu_bridge_worker.js` installs the worker host when loaded.
 `bridge.ts` is the facade, `runtime.ts` the direct runtime, `worker_proxy.ts`,
 `worker_host.ts`, and `worker_protocol.ts` the worker path, and `internal/`
 holds shared helpers, with internal-only types in `internal/types.ts`.
 
 Every module except the two entries (`llama_webgpu_bridge.js` and
-`llama_webgpu_bridge_worker.js`, which is copied unbundled) is TypeScript,
+`llama_webgpu_bridge_worker.js`, which are bundled separately) is TypeScript,
 type-checked with `strict` (`tsconfig.strict.json`). The entries keep the
 lenient `checkJs` pass (`tsconfig.bridge.json`), and `npm run typecheck:js` runs
 both. `LlamaWebGpuBridge` implements the published `llama_webgpu_bridge.d.ts`
@@ -75,8 +75,8 @@ strip the types without changing the code, so the tests run the `.ts` sources
 directly. A type change must not change behaviour: with comments and whitespace
 stripped, the bundle stays byte-identical. Import modules by their `.ts` path.
 
-Keep `bridge.ts` beside `llama_webgpu_bridge_worker.js`: it resolves the worker
-entry relative to `import.meta.url`.
+Keep `default_assets.ts` beside the entry modules so its static asset paths
+resolve relative to each generated bundle.
 
 The native core is one translation unit. `src/llama_webgpu_core.cpp` holds the
 headers, the anonymous namespace, the `extern "C"` block with

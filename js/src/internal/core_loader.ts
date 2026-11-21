@@ -26,6 +26,6 @@ function normalizeFactory(moduleExport: CoreModuleExport): LlamaCoreModuleFactor
 }
 
 export async function importCoreFactory(moduleUrl: string): Promise<LlamaCoreModuleFactory> {
-  const exportedModule = await import(moduleUrl);
+  const exportedModule = await import(/* @vite-ignore */ /* webpackIgnore: true */ moduleUrl);
   return normalizeFactory(exportedModule);
 }
