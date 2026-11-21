@@ -1115,6 +1115,7 @@ export const EXTRACT_ARTIFACT_COMMAND = `${RELEASE_QUALIFICATION_COMMAND} extrac
 export const QUALIFY_COMMAND = 'node candidate-source/scripts/release/qualification.mjs qualify';
 const NODE_COMMAND = /(?:^|[\s;&|(`$])node\s/;
 const PACKAGE_COMMAND = /\b(?:npm|pnpm|yarn|npx|pip3?|corepack)\b/;
+const hasFullActionSha = (uses) => /^[\w./-]+@[0-9a-f]{40}$/.test(uses);
 
 /**
  * A job that runs a node command must set up Node.js 24 with
@@ -1123,19 +1124,21 @@ const PACKAGE_COMMAND = /\b(?:npm|pnpm|yarn|npx|pip3?|corepack)\b/;
  * cache and never install or run packages, since the release modules it runs
  * are zero-dependency.
  */
-export function nodeSetupErrors(workflow, jobName, { privileged = false } = {}) {
+export function nodeSetupErrors(workflow, jobName, { privileged = false, pinned = false } = {}) {
   const steps = workflow.jobSteps(jobName);
   const errors = [];
   const firstNode = steps.find((step) => NODE_COMMAND.test(step.run));
   if (firstNode !== undefined) {
     const setups = steps.filter((step) => /^actions\/setup-node@/.test(step.uses));
     const uncached = (step) => !has(step.with, 'cache') && !has(step.with, 'cache-dependency-path');
+    const validSetup = (step) => pinned ? hasFullActionSha(step.uses) : step.uses === 'actions/setup-node@v4';
     if (!(setups.length > 0
       && setups[0].index < firstNode.index
-      && setups.every((step) => step.uses === 'actions/setup-node@v4' && String(step.with['node-version']) === '24'
+      && setups.every((step) => validSetup(step) && String(step.with['node-version']) === '24'
         && (!privileged || uncached(step))))) {
+      const reference = pinned ? 'actions/setup-node pinned to a full commit SHA' : 'actions/setup-node@v4';
       errors.push(
-        `${workflow.path} job ${jobName} must set up Node.js 24 with actions/setup-node@v4 before its first node command`
+        `${workflow.path} job ${jobName} must set up Node.js 24 with ${reference} before its first node command`
           + (privileged ? ', without a package cache' : ''),
       );
     }
@@ -1473,7 +1476,10 @@ function checkNpmPublication(workflow, errors) {
   require(!/\b(?:NPM_TOKEN|NODE_AUTH_TOKEN|NPM_AUTH_TOKEN|NPM_CONFIG__AUTH(?:TOKEN)?)\b|:_authToken\b/i.test(workflow.text),
     `${label} must not configure an npm token`);
   excludes(label, workflow.runText, ['--allow-test-fixture'], 'never allow test fixtures');
-  const uses = workflow.steps.map((step) => step.uses);
+  const uses = workflow.steps.map((step) => step.uses).filter(Boolean);
+  for (const ref of uses) {
+    require(hasFullActionSha(ref), `${label} must pin ${ref.split('@')[0]} to a full commit SHA`);
+  }
   excludes(label, `${workflow.runText}\n${uses.join('\n')}`, ['build_bridge.sh', 'setup-emsdk'], 'never build release assets');
 
   const request = commandsFor(requestJob);
@@ -1490,10 +1496,10 @@ function checkNpmPublication(workflow, errors) {
 
   for (const job of [environmentJob, stageJob, publishJob]) {
     const checkout = workflow.jobSteps(job)[0];
-    require(checkout?.uses === 'actions/checkout@v4' && checkout.with.ref === '${{ github.sha }}'
+    require(checkout?.uses.startsWith('actions/checkout@') && checkout.with.ref === '${{ github.sha }}'
       && checkout.with['persist-credentials'] === false && !has(checkout.with, 'repository'),
     `${label} job ${job} must check out the trusted workflow commit without persisting credentials`);
-    errors.push(...nodeSetupErrors(workflow, job));
+    errors.push(...nodeSetupErrors(workflow, job, { pinned: true }));
   }
 
   const publish = commandsFor(publishJob);
@@ -1523,8 +1529,8 @@ function checkNpmPublication(workflow, errors) {
     'node scripts/release/npm_package.mjs stage', '--release-rebuild 0',
     'npm pack "${RUNNER_TEMP}/staged" --ignore-scripts', 'node scripts/release/npm_package.mjs verify-tarball',
   ], 'stage, pack and verify the exact release');
-  const upload = workflow.jobSteps(stageJob).find((step) => step.uses === 'actions/upload-artifact@v4');
-  const download = workflow.jobSteps(publishJob).find((step) => step.uses === 'actions/download-artifact@v4');
+  const upload = workflow.jobSteps(stageJob).find((step) => step.uses.startsWith('actions/upload-artifact@'));
+  const download = workflow.jobSteps(publishJob).find((step) => step.uses.startsWith('actions/download-artifact@'));
   require(upload?.id === 'package' && upload.with['if-no-files-found'] === 'error'
     && workflow.job(stageJob).outputs?.artifact_id === '${{ steps.package.outputs.artifact-id }}'
     && download?.with['artifact-ids'] === '${{ needs.stage-and-verify-package.outputs.artifact_id }}'
@@ -1557,6 +1563,10 @@ function checkNpmPublication(workflow, errors) {
     '.subject == [{name: $subject, digest: {sha512: $sha}}]', '.signature.certificate.runInvocationURI == $run',
     '.predicate.runDetails.metadata.invocationId == $run', 'bridge-npm-publication-outcome.json',
   ], 'read back exact registry bytes and provenance');
+  const provenanceCommand = publish.split('\n').find((line) => line.trimStart().startsWith('gh attestation verify ')) ?? '';
+  includes(label, ` ${provenanceCommand} `, [
+    ' --source-ref refs/heads/main ', ' --source-digest "${GITHUB_SHA}" ', ' --deny-self-hosted-runners ',
+  ], 'bind npm provenance to main, the workflow commit and a GitHub-hosted runner');
   const publishIndex = workflow.stepIndex(publishJob, (step) => step.run.includes('npm publish '));
   const envIndex = workflow.stepIndex(publishJob, (step) => step.run.includes('validate-environment'));
   const verifyIndex = workflow.stepIndex(publishJob, (step) => step.run.includes('verify-tarball'));

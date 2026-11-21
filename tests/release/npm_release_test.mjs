@@ -1,13 +1,18 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { test } from 'node:test';
 
-import { verifyReleaseRuns } from '../../scripts/release/npm_release.mjs';
-import { ATTESTATION_ARTIFACT_NAME, QUALIFICATION_WORKFLOW_PATH } from '../../scripts/release/qualification.mjs';
+import { fetchRelease, verifyReleaseRuns } from '../../scripts/release/npm_release.mjs';
+import { PUBLICATION_FILES } from '../../scripts/release/publication_state.mjs';
+import { ATTESTATION_ARTIFACT_NAME, QUALIFICATION_WORKFLOW_PATH, canonicalJson } from '../../scripts/release/qualification.mjs';
+import { ASSETS_REPO, TAG_COMMIT, releaseAttestation } from './contract_fixtures.mjs';
 import {
   BRIDGE_SHA, CANDIDATE_RUN_ID, CORRELATION_ID, QUALIFICATION_RUN_ID,
   setUp, workflowRun, writeCandidate,
 } from './qualification_fixtures.mjs';
+import { buildZip } from './zip_fixture.mjs';
 
 const repo = 'leehack/llama-web-bridge';
 const publicationRunId = '32919087000';
@@ -22,8 +27,8 @@ const makeArtifact = (id, name, runId) => ({
   workflow_run: { id: Number(runId) },
 });
 
-function fixture(t) {
-  const { attestation, candidate, manifest, fingerprint, tmp, cleanup } = setUp();
+function fixture(t, candidateOptions) {
+  const { attestation, candidate, manifest, fingerprint, tmp, cleanup } = setUp(candidateOptions);
   t.after(cleanup);
   const { release_tag: tag, release_rebuild: rebuild } = manifest;
   const releaseNotes = [
@@ -90,6 +95,70 @@ function fixture(t) {
     publicationInventory, attestation, publishedAttestation, outcome, fingerprint, tmp,
   };
 }
+
+test('release staging evidence rejects bytes that disagree with the signed release statement', (t) => {
+  const releaseTag = 'v0.2.0';
+  const { options, tmp, fingerprint, attestation, qualificationArtifact, publicationInventory } = fixture(t, {
+    manifestOverrides: { releaseTag, releaseRebuild: 0 },
+  });
+  Object.assign(publicationInventory, { total_count: 0, artifacts: [] });
+  const releases = `repos/${ASSETS_REPO}/releases`;
+  const digest = (bytes) => createHash('sha256').update(bytes).digest('hex');
+  const downloads = new Map();
+  const assets = PUBLICATION_FILES.map((name, index) => {
+    const bytes = readFileSync(path.join(options.dist, name));
+    const id = 100 + index;
+    downloads.set(`${releases}/assets/${id}`, bytes);
+    return { id, name, size: bytes.length, digest: `sha256:${digest(bytes)}`, state: 'uploaded' };
+  });
+  const qualificationZip = buildZip([{ name: 'qualification-attestation.json', data: canonicalJson(attestation) }]);
+  downloads.set(`repos/${repo}/actions/artifacts/${qualificationArtifactId}/zip`, qualificationZip);
+  qualificationArtifact.digest = `sha256:${digest(qualificationZip)}`;
+  const release = {
+    id: 3,
+    tag_name: releaseTag,
+    target_commitish: TAG_COMMIT,
+    draft: false,
+    prerelease: false,
+    immutable: true,
+    published_at: '2026-08-20T22:15:59Z',
+    body: options.releaseNotes,
+    assets,
+  };
+  const metadata = new Map([
+    [`${releases}/tags/${releaseTag}`, release],
+    [`${releases}/${release.id}`, structuredClone(release)],
+    [`repos/${ASSETS_REPO}/git/ref/tags/${releaseTag}`, {
+      ref: `refs/tags/${releaseTag}`, object: { type: 'commit', sha: TAG_COMMIT },
+    }],
+  ]);
+  let queriedRuns = false;
+  const api = (endpoint, { binary } = {}) => {
+    if (downloads.has(endpoint)) {
+      assert.equal(binary, true, endpoint);
+      return downloads.get(endpoint);
+    }
+    if (metadata.has(endpoint)) return metadata.get(endpoint);
+    queriedRuns = true;
+    return options.api(endpoint);
+  };
+  const signedDigests = Object.fromEntries(assets.map(({ name, digest }) => [name, digest.slice('sha256:'.length)]));
+  const fetch = (name, signedAssets) => {
+    const outDir = path.join(tmp, name);
+    mkdirSync(outDir);
+    const signedReport = releaseAttestation({ releaseTag, releaseId: release.id, assets: signedAssets });
+    const reportPath = path.join(outDir, 'release-attestation.json');
+    writeFileSync(reportPath, JSON.stringify(signedReport));
+    return fetchRelease({ releaseTag, releaseAttestation: reportPath, outDir, api });
+  };
+
+  assert.equal(fetch('matching-statement', signedDigests).candidate_fingerprint, fingerprint);
+  assert.equal(queriedRuns, true);
+  queriedRuns = false;
+  assert.throws(() => fetch('mismatched-statement', { ...signedDigests, 'manifest.json': '0'.repeat(64) }),
+    /release attestation asset digests do not match the published candidate/);
+  assert.equal(queriedRuns, false);
+});
 
 test('release run discovery binds exact qualification and publication evidence', (t) => {
   const { options, fingerprint, publicationInventory } = fixture(t);

@@ -846,6 +846,10 @@ console.log('CI reliability verifier tests passed');
     ['.dist.integrity == $integrity', 'true', 'must read back exact registry bytes and provenance'],
     ['gh attestation verify "${RUNNER_TEMP}/registry.tgz"', 'echo "${RUNNER_TEMP}/registry.tgz"',
       'must read back exact registry bytes and provenance'],
+    ['--source-ref refs/heads/main', '', 'missing: " --source-ref refs/heads/main "'],
+    ['--source-digest "${GITHUB_SHA}"', '', 'must bind npm provenance to main, the workflow commit and a GitHub-hosted runner'],
+    ['--deny-self-hosted-runners', '', 'missing: " --deny-self-hosted-runners "'],
+    ['--deny-self-hosted-runners', '--deny-self-hosted-runners=false', 'missing: " --deny-self-hosted-runners "'],
     ['"${STATUS}" != "404"', '"${STATUS}" != "200"', 'must refuse to publish an existing or unconfirmed version'],
     ['--environment-name bridge-npm-publication', '--environment-name bridge-assets-publication',
       'must validate bridge-npm-publication with the trusted contract'],
@@ -853,6 +857,16 @@ console.log('CI reliability verifier tests passed');
   for (const [original, mutation, expected] of mutations) {
     assert.ok(workflow.includes(original), `missing npm publication mutation anchor: ${original}`);
     assertRejected(collectRepositoryErrors({ [npmPath]: workflow.replace(original, () => mutation) }), expected);
+  }
+
+  const actions = [...workflow.matchAll(/^[ \t]*(?:- )?uses: ([^@\s]+)@\S+[^\n]*$/gm)];
+  assert.ok(actions.length > 0, 'expected npm publication actions');
+  for (const match of actions) {
+    const [line, action] = match;
+    assert.match(line, /@[0-9a-f]{40} # v\d+\.\d+\.\d+$/);
+    const tagged = line.replace(/@[0-9a-f]{40}/, '@v4');
+    const changed = workflow.slice(0, match.index) + tagged + workflow.slice(match.index + line.length);
+    assertRejected(collectRepositoryErrors({ [npmPath]: changed }), `must pin ${action} to a full commit SHA`);
   }
 
   const assetWorkflow = read('.github/workflows/publish_assets.yml');

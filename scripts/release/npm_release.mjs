@@ -150,17 +150,17 @@ function releaseAssets(release) {
   return inventory;
 }
 
-function fetchRelease({ releaseTag, releaseAttestation, outDir }) {
+export function fetchRelease({ releaseTag, releaseAttestation, outDir, api = ghApi }) {
   const { version, distTag } = resolveVersion(releaseTag, 0);
   requireThat(releaseTag !== FIXTURE_RELEASE_TAG, 'npm publication refuses fixture version 0.0.0');
 
-  const releaseByTag = ghApi(`${ASSETS_RELEASES}/tags/${releaseTag}`);
-  const ref = ghApi(`repos/${ASSETS_REPOSITORY}/git/ref/tags/${releaseTag}`);
+  const releaseByTag = api(`${ASSETS_RELEASES}/tags/${releaseTag}`);
+  const ref = api(`repos/${ASSETS_REPOSITORY}/git/ref/tags/${releaseTag}`);
   requireThat(ref.ref === `refs/tags/${releaseTag}` && ref.object?.type === 'commit',
     'assets tag must point directly to a commit');
   const tagCommit = ref.object.sha;
   const releaseId = validateReleaseImmutability(releaseByTag, { releaseTag, tagCommit });
-  const releaseById = ghApi(`${ASSETS_RELEASES}/${releaseId}`);
+  const releaseById = api(`${ASSETS_RELEASES}/${releaseId}`);
   validateReleaseImmutability(releaseById, { releaseTag, tagCommit, releaseId });
 
   const assets = releaseAssets(releaseByTag);
@@ -171,7 +171,7 @@ function fetchRelease({ releaseTag, releaseAttestation, outDir }) {
     const readback = readbackAssets.get(name);
     requireThat(readback.id === id && readback.size === size && readback.digest === digest,
       `GitHub Release asset inventory changed between the tag and ID readbacks: ${name}`);
-    const bytes = ghApi(`${ASSETS_RELEASES}/assets/${id}`, {
+    const bytes = api(`${ASSETS_RELEASES}/assets/${id}`, {
       binary: true, accept: 'application/octet-stream', maxBuffer: MAX_RELEASE_ASSET_BYTES,
     });
     requireThat(bytes.length === size && sha256(bytes) === digest, `GitHub Release asset digest mismatch: ${name}`);
@@ -197,9 +197,9 @@ function fetchRelease({ releaseTag, releaseAttestation, outDir }) {
     manifest,
     releaseNotes: releaseById.body,
     dist,
-    api: ghApi,
+    api,
     readArtifact({ id, name, digest }) {
-      const bytes = ghApi(`repos/${BRIDGE_REPOSITORY}/actions/artifacts/${id}/zip`, { binary: true });
+      const bytes = api(`repos/${BRIDGE_REPOSITORY}/actions/artifacts/${id}/zip`, { binary: true });
       requireThat(sha256(bytes) === digest, `run artifact ZIP digest mismatch: ${name} (${id})`);
       const archive = path.join(outDir, `${id}.zip`);
       writeFileSync(archive, bytes, { flag: 'wx' });
