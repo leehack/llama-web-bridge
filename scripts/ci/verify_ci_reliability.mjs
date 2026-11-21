@@ -23,6 +23,7 @@ const WORKFLOWS = {
   candidate: '.github/workflows/bridge_candidate.yml',
   qualification: '.github/workflows/bridge_qualification.yml',
   publish: '.github/workflows/publish_assets.yml',
+  publishNpm: '.github/workflows/publish_npm.yml',
 };
 
 // ---------------------------------------------------------------------------
@@ -876,6 +877,14 @@ function checkPermissions(workflows, errors) {
       errors.push(`${workflow.path} must declare read-only top-level permissions`);
     }
     for (const name of Object.keys(workflow.jobs)) {
+      if (workflow.path === WORKFLOWS.publishNpm && name === 'publish-npm') {
+        const permissions = mapping(workflow.job(name).permissions);
+        if (Object.keys(permissions).length !== 3 || permissions.actions !== 'read'
+          || permissions.contents !== 'read' || permissions['id-token'] !== 'write') {
+          errors.push(`${workflow.path} job ${name} must grant exactly actions: read, contents: read and id-token: write`);
+        }
+        continue;
+      }
       if (!readOnlyPermissions(workflow.job(name).permissions)) {
         errors.push(`${workflow.path} job ${name} must not grant write permissions`);
       }
@@ -911,6 +920,8 @@ export const RELEASE_CONTRACT_SUITES = Object.freeze([
   'tests/release/archive_test.mjs',
   'tests/release/contract_test.mjs',
   'tests/release/manifest_test.mjs',
+  'tests/release/npm_package_test.mjs',
+  'tests/release/npm_release_test.mjs',
   'tests/release/publication_state_test.mjs',
   'tests/release/qualification_attestation_test.mjs',
   'tests/release/qualification_harness_test.mjs',
@@ -948,7 +959,7 @@ export function checkNoPython(workflows, errors) {
   }
 }
 
-function checkCiRunsContracts({ ci, candidate, publish }, testFiles, errors) {
+function checkCiRunsContracts({ ci, candidate, qualification, publish }, testFiles, errors) {
   const check = checker(errors);
   // Row 41: CI, candidate and publish run the JS contract tests without npm
   // lifecycle scripts and prove the tracked generated bridge matches its source.
@@ -997,16 +1008,27 @@ function checkCiRunsContracts({ ci, candidate, publish }, testFiles, errors) {
     'node scripts/smoke/resume_integrity.mjs --baseline-dist-dir "$BRIDGE_DIST_DIR" --js-backed-model-staging',
     'node scripts/smoke/resume_integrity.mjs --baseline-dist-dir "$BRIDGE_DIST_DIR" --threading single --js-backed-model-staging',
     'node scripts/smoke/cross_origin_assets.mjs',
+    'npm ci --ignore-scripts --prefix scripts/smoke/bundler_deps',
+    'node scripts/smoke/bundler_packaging.mjs',
     'node scripts/smoke/core_abort_recovery.mjs',
     'node scripts/smoke/core_abort_recovery.mjs --threading single',
     'node scripts/smoke/core_release.mjs',
     'node scripts/smoke/core_release.mjs --memory-mode wasm64',
     'node scripts/smoke/core_release.mjs --threading single',
+    'node scripts/smoke/remote_fetch_backend.mjs',
+    'node scripts/smoke/remote_fetch_backend.mjs --memory-mode wasm64',
   ]) {
     check.require(
       ciBuildSteps.some((step) => step.run.trim() === command
         && step.raw.if === undefined && step.raw['continue-on-error'] === undefined),
       `${ci.path} job build-webgpu-bridge must run "${command}" unconditionally without continue-on-error`,
+    );
+  }
+  for (const workflow of [ci, candidate, qualification, publish]) {
+    check.require(
+      workflow.steps.every((step) => (workflow === ci && step.job === 'build-webgpu-bridge')
+        || !/scripts\/smoke\/(?:bundler_deps|bundler_packaging\.mjs)/.test(step.run)),
+      `${workflow.path} bundler smoke dependencies and execution must stay in build-webgpu-bridge`,
     );
   }
   // Row 57: CI builds the llama.cpp pin.
@@ -1093,6 +1115,7 @@ export const EXTRACT_ARTIFACT_COMMAND = `${RELEASE_QUALIFICATION_COMMAND} extrac
 export const QUALIFY_COMMAND = 'node candidate-source/scripts/release/qualification.mjs qualify';
 const NODE_COMMAND = /(?:^|[\s;&|(`$])node\s/;
 const PACKAGE_COMMAND = /\b(?:npm|pnpm|yarn|npx|pip3?|corepack)\b/;
+const hasFullActionSha = (uses) => /^[\w./-]+@[0-9a-f]{40}$/.test(uses);
 
 /**
  * A job that runs a node command must set up Node.js 24 with
@@ -1101,19 +1124,21 @@ const PACKAGE_COMMAND = /\b(?:npm|pnpm|yarn|npx|pip3?|corepack)\b/;
  * cache and never install or run packages, since the release modules it runs
  * are zero-dependency.
  */
-export function nodeSetupErrors(workflow, jobName, { privileged = false } = {}) {
+export function nodeSetupErrors(workflow, jobName, { privileged = false, pinned = false } = {}) {
   const steps = workflow.jobSteps(jobName);
   const errors = [];
   const firstNode = steps.find((step) => NODE_COMMAND.test(step.run));
   if (firstNode !== undefined) {
     const setups = steps.filter((step) => /^actions\/setup-node@/.test(step.uses));
     const uncached = (step) => !has(step.with, 'cache') && !has(step.with, 'cache-dependency-path');
+    const validSetup = (step) => pinned ? hasFullActionSha(step.uses) : step.uses === 'actions/setup-node@v4';
     if (!(setups.length > 0
       && setups[0].index < firstNode.index
-      && setups.every((step) => step.uses === 'actions/setup-node@v4' && String(step.with['node-version']) === '24'
+      && setups.every((step) => validSetup(step) && String(step.with['node-version']) === '24'
         && (!privileged || uncached(step))))) {
+      const reference = pinned ? 'actions/setup-node pinned to a full commit SHA' : 'actions/setup-node@v4';
       errors.push(
-        `${workflow.path} job ${jobName} must set up Node.js 24 with actions/setup-node@v4 before its first node command`
+        `${workflow.path} job ${jobName} must set up Node.js 24 with ${reference} before its first node command`
           + (privileged ? ', without a package cache' : ''),
       );
     }
@@ -1409,6 +1434,145 @@ function checkPublication({ publish, candidate }, errors) {
     'gh release delete', 'gh release edit', 'gh release upload', 'upload-release-assets',
     'git push --delete', '--force-with-lease', 'push --force', '-X DELETE',
   ], 'never delete, retag, overwrite or repair a release');
+}
+
+function checkNpmPublication(workflow, errors) {
+  const { require, includes, excludes } = checker(errors);
+  const label = workflow.path;
+  const requestJob = 'validate-request';
+  const environmentJob = 'verify-npm-environment';
+  const stageJob = 'stage-and-verify-package';
+  const publishJob = 'publish-npm';
+  const expectedJobs = [requestJob, environmentJob, stageJob, publishJob];
+  const environment = 'bridge-npm-publication';
+  const commandsFor = (job) => shellCommands(workflow.jobRunText(job));
+  const triggers = mapping(workflow.data.on);
+  const inputs = mapping(mapping(triggers.workflow_dispatch).inputs);
+  require(Object.keys(triggers).length === 1 && has(triggers, 'workflow_dispatch')
+    && Object.keys(inputs).length === 2
+    && inputs.release_tag?.type === 'string' && inputs.release_tag.required === true
+    && inputs.publish_approved?.type === 'boolean' && inputs.publish_approved.required === true
+    && inputs.publish_approved.default === false,
+  `${label} must only dispatch with release_tag and explicit boolean publish_approved inputs`);
+  require(deepEqual(workflow.data.permissions, { contents: 'read' }),
+    `${label} must grant only contents: read at the workflow level`);
+  require(workflow.data.concurrency?.group === 'publish-bridge-npm-llama-web-bridge'
+    && workflow.data.concurrency['cancel-in-progress'] === false,
+  `${label} must serialize npm publication without canceling an in-progress run`);
+  require(deepEqual(Object.keys(workflow.jobs).sort(), [...expectedJobs].sort())
+    && deepEqual(workflow.needs(environmentJob), [requestJob])
+    && deepEqual(workflow.needs(stageJob), [environmentJob])
+    && deepEqual(workflow.needs(publishJob).sort(), [environmentJob, stageJob].sort())
+    && workflow.job(publishJob).environment?.name === '${{ needs.verify-npm-environment.outputs.environment_name }}',
+  `${label} must depend on the verified environment and staged artifact`);
+  require(expectedJobs.every((job) => workflow.job(job).if === undefined
+    && workflow.job(job)['runs-on'] === 'ubuntu-latest'
+    && workflow.jobSteps(job).every((step) => step.raw.if === undefined)),
+  `${label} must run its gates unconditionally on GitHub-hosted Linux`);
+  require(workflow.data.env?.BRIDGE_REPO === 'leehack/llama-web-bridge'
+    && workflow.data.env?.ASSETS_REPO === 'leehack/llama-web-bridge-assets'
+    && workflow.data.env?.RELEASE_TAG === '${{ inputs.release_tag }}',
+  `${label} must use the fixed bridge and assets repositories and requested tag`);
+  require(!/\b(?:NPM_TOKEN|NODE_AUTH_TOKEN|NPM_AUTH_TOKEN|NPM_CONFIG__AUTH(?:TOKEN)?)\b|:_authToken\b/i.test(workflow.text),
+    `${label} must not configure an npm token`);
+  excludes(label, workflow.runText, ['--allow-test-fixture'], 'never allow test fixtures');
+  const uses = workflow.steps.map((step) => step.uses).filter(Boolean);
+  for (const ref of uses) {
+    require(hasFullActionSha(ref), `${label} must pin ${ref.split('@')[0]} to a full commit SHA`);
+  }
+  excludes(label, `${workflow.runText}\n${uses.join('\n')}`, ['build_bridge.sh', 'setup-emsdk'], 'never build release assets');
+
+  const request = commandsFor(requestJob);
+  const requestEnv = workflow.jobSteps(requestJob)[0]?.env;
+  require(requestEnv?.PUBLISH_APPROVED === '${{ inputs.publish_approved }}'
+    && requestEnv?.DISPATCHING_ACTOR === '${{ github.triggering_actor }}'
+    && /if \[\[ "\$\{PUBLISH_APPROVED\}" != "true" \]\]; then\n[^\n]+\n exit 1\nfi/.test(request),
+  `${label} must require explicit publication approval`);
+  includes(label, request, [
+    '"${GITHUB_REPOSITORY}" != "${BRIDGE_REPO}"', '"${GITHUB_REF}" != "refs/heads/main"',
+    '"${GITHUB_ACTOR}" != "leehack"', '"${DISPATCHING_ACTOR}" != "leehack"', '"${GITHUB_RUN_ATTEMPT}" != "1"',
+  ], 'restrict publication to the owner’s first attempt on main');
+  includes(label, request, ['"${RELEASE_TAG}" == "v0.0.0" ]]; then'], 'reject fixture version v0.0.0');
+
+  for (const job of [environmentJob, stageJob, publishJob]) {
+    const checkout = workflow.jobSteps(job)[0];
+    require(checkout?.uses.startsWith('actions/checkout@') && checkout.with.ref === '${{ github.sha }}'
+      && checkout.with['persist-credentials'] === false && !has(checkout.with, 'repository'),
+    `${label} job ${job} must check out the trusted workflow commit without persisting credentials`);
+    errors.push(...nodeSetupErrors(workflow, job, { pinned: true }));
+  }
+
+  const publish = commandsFor(publishJob);
+  for (const job of [environmentJob, publishJob]) {
+    const validation = workflow.jobSteps(job).find((step) => step.run.includes('validate-environment'));
+    require(validation?.env.GH_TOKEN === '${{ github.token }}',
+      `${label} job ${job} must validate the environment with the default job token`);
+    includes(`${label} job ${job}`, shellCommands(validation?.run ?? ''), [
+      'gh api "repos/${BRIDGE_REPO}/environments/bridge-npm-publication"',
+      'gh api "repos/${BRIDGE_REPO}/environments/bridge-npm-publication/deployment-branch-policies"',
+      `${RELEASE_CONTRACT_COMMAND} validate-environment --environment-name ${environment}`,
+      '--branch-policies-json',
+    ], `validate ${environment} with the trusted contract`);
+  }
+  require(workflow.job(environmentJob).outputs?.environment_name === '${{ steps.environment.outputs.environment_name }}'
+    && commandsFor(environmentJob).includes('echo "environment_name=bridge-npm-publication" >> "${GITHUB_OUTPUT}"'),
+  `${label} must pass the verified environment identity to the publish job`);
+
+  const stage = commandsFor(stageJob);
+  includes(label, stage, [
+    'npm ci --ignore-scripts', 'npm run check:js', 'node scripts/ci/verify_ci_reliability.mjs',
+    'gh release verify "${RELEASE_TAG}" --repo "${ASSETS_REPO}" --format json',
+    'node scripts/release/npm_release.mjs --release-tag "${RELEASE_TAG}"', 'sha256sum --check sha256sums.txt',
+    'git merge-base --is-ancestor "${SOURCE}" "${GITHUB_SHA}"',
+  ], 'authenticate the immutable release, qualification and checksums before staging');
+  includes(label, stage, [
+    'node scripts/release/npm_package.mjs stage', '--release-rebuild 0',
+    'npm pack "${RUNNER_TEMP}/staged" --ignore-scripts', 'node scripts/release/npm_package.mjs verify-tarball',
+  ], 'stage, pack and verify the exact release');
+  const upload = workflow.jobSteps(stageJob).find((step) => step.uses.startsWith('actions/upload-artifact@'));
+  const download = workflow.jobSteps(publishJob).find((step) => step.uses.startsWith('actions/download-artifact@'));
+  require(upload?.id === 'package' && upload.with['if-no-files-found'] === 'error'
+    && workflow.job(stageJob).outputs?.artifact_id === '${{ steps.package.outputs.artifact-id }}'
+    && download?.with['artifact-ids'] === '${{ needs.stage-and-verify-package.outputs.artifact_id }}'
+    && download.with['merge-multiple'] === true,
+  `${label} must transfer the verified package by immutable artifact ID`);
+
+  includes(label, publish, ['if [[ "${VERSION}" == "0.0.0" || "v${VERSION}" != "${RELEASE_TAG}" ]]; then'],
+    'reject fixture version 0.0.0');
+  includes(label, publish, [
+    'node scripts/release/npm_package.mjs verify-tarball', 'npm --version', 'npm >= 11.5.1',
+    '.tarball_sha256 == $sha and .tarball_sha256 == $checked[0].tarball_sha256',
+  ], 're-verify the tarball and minimum npm CLI before publishing');
+  require(!/(?:^|[\n;&|(`])\s*(?:npm\s+(?!--version\b|publish\b)|npx\s|pnpm\s|yarn\s|corepack\s)/.test(publish)
+    && workflow.jobSteps(publishJob).every((step) => !has(step.with, 'cache') && !has(step.with, 'registry-url')),
+  `${label} must never install or run other npm packages in the OIDC job`);
+  require(workflow.jobSteps(publishJob).filter((step) => /npm (?:publish |--version)/.test(step.run)).every((step) =>
+    step.env.NPM_CONFIG_GLOBALCONFIG === '/dev/null'
+    && step.env.NPM_CONFIG_USERCONFIG === '${{ runner.temp }}/npm-oidc-user.npmrc'),
+  `${label} must isolate npm user and global configuration with distinct paths`);
+  includes(label, publish, ['if [[ "${STATUS}" != "404" ]]; then', 'https://registry.npmjs.org/llama-web-bridge/${VERSION}'],
+    'refuse to publish an existing or unconfirmed version');
+  includes(label, publish, ['npm publish "./llama-web-bridge-${VERSION}.tgz" --provenance --access public --tag latest --registry https://registry.npmjs.org --ignore-scripts'],
+    'publish the exact tarball with OIDC');
+  require(occurrences(workflow.runText, 'npm publish ') === 1,
+    `${label} must publish only from the OIDC job`);
+  includes(label, publish, [
+    '.dist.integrity == $integrity', 'sha256sum --check', '.dist.attestations.provenance.predicateType == $predicate',
+    '.latest == $version', 'gh attestation verify "${RUNNER_TEMP}/registry.tgz"',
+    '--signer-workflow "${BRIDGE_REPO}/.github/workflows/publish_npm.yml"',
+    '.subject == [{name: $subject, digest: {sha512: $sha}}]', '.signature.certificate.runInvocationURI == $run',
+    '.predicate.runDetails.metadata.invocationId == $run', 'bridge-npm-publication-outcome.json',
+  ], 'read back exact registry bytes and provenance');
+  const provenanceCommand = publish.split('\n').find((line) => line.trimStart().startsWith('gh attestation verify ')) ?? '';
+  includes(label, ` ${provenanceCommand} `, [
+    ' --source-ref refs/heads/main ', ' --source-digest "${GITHUB_SHA}" ', ' --deny-self-hosted-runners ',
+  ], 'bind npm provenance to main, the workflow commit and a GitHub-hosted runner');
+  const publishIndex = workflow.stepIndex(publishJob, (step) => step.run.includes('npm publish '));
+  const envIndex = workflow.stepIndex(publishJob, (step) => step.run.includes('validate-environment'));
+  const verifyIndex = workflow.stepIndex(publishJob, (step) => step.run.includes('verify-tarball'));
+  const readbackIndex = workflow.stepIndex(publishJob, (step) => step.run.includes('.dist.integrity'));
+  require(verifyIndex > download?.index && envIndex > verifyIndex && publishIndex > envIndex && readbackIndex > publishIndex,
+    `${label} must verify the artifact and live environment before publishing, then read back the registry`);
 }
 
 function checkCandidateAndQualification({ candidate, qualification, publish }, errors) {
@@ -1715,6 +1879,7 @@ export function collectErrors(overrides = {}) {
   checkNodeSetup(workflows, errors);
   checkToolchainPins(workflows, files, errors);
   checkPublication(workflows, errors);
+  checkNpmPublication(workflows.publishNpm, errors);
   checkCandidateAndQualification(workflows, errors);
   checkModelPins(files, workflows, errors);
   return errors;

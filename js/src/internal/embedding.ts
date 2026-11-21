@@ -31,9 +31,10 @@ export function hasEmbeddingMediaParts(input: unknown): boolean {
 // Versioned CDN paths identify the loaded assets. Never include URL credentials,
 // query strings, fragments or arbitrary path text in public diagnostics.
 export function embeddingAssetVersion(...sources: (string | undefined)[]): string {
-  for (const source of [...sources, import.meta.url]) {
+  const moduleUrl = import.meta.url;
+  for (const source of [...sources, moduleUrl]) {
     try {
-      const version = new URL(source || '', import.meta.url).pathname.match(/(?:^|[/@])(v?\d+\.\d+\.\d+(?:-\d+)?)(?:[/]|$)/)?.[1];
+      const version = new URL(source || '', moduleUrl).pathname.match(/(?:^|[/@])(v?\d+\.\d+\.\d+(?:-\d+)?)(?:[/]|$)/)?.[1];
       if (version) return version;
     } catch (_) { /* Local or unversioned assets. */ }
   }

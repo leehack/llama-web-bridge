@@ -1,0 +1,95 @@
+{
+  "name": "llama-web-bridge",
+  "version": "0.0.0-placeholder",
+  "description": "WebGPU and WebAssembly browser bridge runtime for llama.cpp",
+  "license": "MIT",
+  "type": "module",
+  "main": "./dist/llama_webgpu_bridge.js",
+  "types": "./dist/llama_webgpu_bridge.d.ts",
+  "sideEffects": [
+    "./dist/llama_webgpu_bridge.js",
+    "./dist/llama_webgpu_bridge_worker.js",
+    "./dist/llama_webgpu_core.js",
+    "./dist/llama_webgpu_core_mem64.js"
+  ],
+  "files": [
+    "dist/llama_webgpu_bridge.js",
+    "dist/llama_webgpu_bridge_worker.js",
+    "dist/llama_webgpu_bridge.d.ts",
+    "dist/llama_webgpu_core.js",
+    "dist/llama_webgpu_core.wasm",
+    "dist/llama_webgpu_core_mem64.js",
+    "dist/llama_webgpu_core_mem64.wasm",
+    "dist/llama_webgpu_core_st.js",
+    "dist/llama_webgpu_core_st.wasm",
+    "dist/llama_webgpu_core_mem64_st.js",
+    "dist/llama_webgpu_core_mem64_st.wasm",
+    "dist/manifest.json",
+    "dist/sha256sums.txt",
+    "types/core.d.ts",
+    "types/worker.d.ts",
+    "LICENSE",
+    "README.md"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/llama_webgpu_bridge.d.ts",
+      "import": "./dist/llama_webgpu_bridge.js",
+      "default": "./dist/llama_webgpu_bridge.js"
+    },
+    "./worker": {
+      "types": "./types/worker.d.ts",
+      "import": "./dist/llama_webgpu_bridge_worker.js",
+      "default": "./dist/llama_webgpu_bridge_worker.js"
+    },
+    "./core": {
+      "types": "./types/core.d.ts",
+      "import": "./dist/llama_webgpu_core.js",
+      "default": "./dist/llama_webgpu_core.js"
+    },
+    "./core.wasm": "./dist/llama_webgpu_core.wasm",
+    "./core-mem64": {
+      "types": "./types/core.d.ts",
+      "import": "./dist/llama_webgpu_core_mem64.js",
+      "default": "./dist/llama_webgpu_core_mem64.js"
+    },
+    "./core-mem64.wasm": "./dist/llama_webgpu_core_mem64.wasm",
+    "./core-st": {
+      "types": "./types/core.d.ts",
+      "import": "./dist/llama_webgpu_core_st.js",
+      "default": "./dist/llama_webgpu_core_st.js"
+    },
+    "./core-st.wasm": "./dist/llama_webgpu_core_st.wasm",
+    "./core-mem64-st": {
+      "types": "./types/core.d.ts",
+      "import": "./dist/llama_webgpu_core_mem64_st.js",
+      "default": "./dist/llama_webgpu_core_mem64_st.js"
+    },
+    "./core-mem64-st.wasm": "./dist/llama_webgpu_core_mem64_st.wasm",
+    "./manifest.json": "./dist/manifest.json",
+    "./sha256sums.txt": "./dist/sha256sums.txt",
+    "./package.json": "./package.json"
+  },
+  "keywords": [
+    "llama.cpp",
+    "webgpu",
+    "wasm",
+    "webassembly",
+    "llm",
+    "browser",
+    "ai",
+    "inference"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/leehack/llama-web-bridge.git"
+  },
+  "homepage": "https://github.com/leehack/llama-web-bridge#readme",
+  "bugs": {
+    "url": "https://github.com/leehack/llama-web-bridge/issues"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org"
+  }
+}

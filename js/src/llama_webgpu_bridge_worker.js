@@ -1,3 +1,3 @@
-import { enableBridgeWorkerHost } from './llama_webgpu_bridge.js';
+import { enableBridgeWorkerHost } from './worker_host.ts';
 
 enableBridgeWorkerHost();

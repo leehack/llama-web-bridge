@@ -639,6 +639,15 @@ assertRejected(validatePublicationPatContract('jobs: [unterminated', EXPECTED_ST
     [CI_PATH, '        run: node scripts/smoke/cross_origin_assets.mjs\n',
       '        if: false\n        run: node scripts/smoke/cross_origin_assets.mjs\n',
       'job build-webgpu-bridge must run "node scripts/smoke/cross_origin_assets.mjs" unconditionally without continue-on-error'],
+    [CI_PATH, '        run: node scripts/smoke/bundler_packaging.mjs\n',
+      '        if: false\n        run: node scripts/smoke/bundler_packaging.mjs\n',
+      'job build-webgpu-bridge must run "node scripts/smoke/bundler_packaging.mjs" unconditionally without continue-on-error'],
+    [CI_PATH, '        run: npm ci --ignore-scripts --prefix scripts/smoke/bundler_deps\n',
+      '        run: npm install --prefix scripts/smoke/bundler_deps\n',
+      'job build-webgpu-bridge must run "npm ci --ignore-scripts --prefix scripts/smoke/bundler_deps" unconditionally without continue-on-error'],
+    [CI_PATH, '      - run: npm ci --ignore-scripts\n',
+      '      - run: npm ci --ignore-scripts --prefix scripts/smoke/bundler_deps\n',
+      'bundler smoke dependencies and execution must stay in build-webgpu-bridge'],
     ...['', ' --threading single'].map((flags) => {
       const command = `node scripts/smoke/core_abort_recovery.mjs${flags}`;
       return [CI_PATH, `        run: ${command}\n`, `        if: false\n        run: ${command}\n`,
@@ -646,6 +655,11 @@ assertRejected(validatePublicationPatContract('jobs: [unterminated', EXPECTED_ST
     }),
     ...['', ' --memory-mode wasm64', ' --threading single'].map((flags) => {
       const command = `node scripts/smoke/core_release.mjs${flags}`;
+      return [CI_PATH, `        run: ${command}\n`, `        if: false\n        run: ${command}\n`,
+        `job build-webgpu-bridge must run "${command}" unconditionally without continue-on-error`];
+    }),
+    ...['', ' --memory-mode wasm64'].map((flags) => {
+      const command = `node scripts/smoke/remote_fetch_backend.mjs${flags}`;
       return [CI_PATH, `        run: ${command}\n`, `        if: false\n        run: ${command}\n`,
         `job build-webgpu-bridge must run "${command}" unconditionally without continue-on-error`];
     }),
@@ -800,3 +814,63 @@ assertRejected(validatePublicationPatContract('jobs: [unterminated', EXPECTED_ST
 }
 
 console.log('CI reliability verifier tests passed');
+
+{
+  const npmPath = '.github/workflows/publish_npm.yml';
+  const workflow = read(npmPath);
+  const mutations = [
+    ['      actions: read\n      contents: read', '      id-token: write\n      actions: read\n      contents: read',
+      'job verify-npm-environment must not grant write permissions'],
+    ['  GH_HOST: github.com', '  GH_HOST: github.com\n  NPM_TOKEN: example',
+      'must not configure an npm token'],
+    ['      actions: read\n      contents: read\n      id-token: write', '      actions: read\n      contents: read',
+      'must grant exactly actions: read, contents: read and id-token: write'],
+    ['name: ${{ needs.verify-npm-environment.outputs.environment_name }}', 'name: another-environment',
+      'must depend on the verified environment and staged artifact'],
+    ['merge-multiple: true', 'merge-multiple: false', 'must transfer the verified package by immutable artifact ID'],
+    ['NPM_CONFIG_USERCONFIG: ${{ runner.temp }}/npm-oidc-user.npmrc', 'NPM_CONFIG_USERCONFIG: /dev/null',
+      'must isolate npm user and global configuration with distinct paths'],
+    ['--provenance --access public', '--access public', 'must publish the exact tarball with OIDC'],
+    ['--tag latest --registry', '--tag next --registry', 'must publish the exact tarball with OIDC'],
+    ['--registry https://registry.npmjs.org --ignore-scripts', '--registry https://registry.npmjs.org',
+      'must publish the exact tarball with OIDC'],
+    ['npm_package.mjs stage --dist-dir', 'npm_package.mjs stage --allow-test-fixture --dist-dir',
+      'must never allow test fixtures'],
+    ['"${RELEASE_TAG}" == "v0.0.0"', '"${RELEASE_TAG}" == "v0.0.1"', 'must reject fixture version v0.0.0'],
+    ['"${VERSION}" == "0.0.0"', '"${VERSION}" == "0.0.1"', 'must reject fixture version 0.0.0'],
+    ['"${PUBLISH_APPROVED}" != "true"', '"${PUBLISH_APPROVED}" == "true"', 'must require explicit publication approval'],
+    ['gh release verify "${RELEASE_TAG}"', 'gh release view "${RELEASE_TAG}"', 'must authenticate the immutable release'],
+    ['npm publish "./llama-web-bridge-${VERSION}.tgz"',
+      'npm ci --ignore-scripts\n          npm publish "./llama-web-bridge-${VERSION}.tgz"',
+      'must never install or run other npm packages'],
+    ['.dist.integrity == $integrity', 'true', 'must read back exact registry bytes and provenance'],
+    ['gh attestation verify "${RUNNER_TEMP}/registry.tgz"', 'echo "${RUNNER_TEMP}/registry.tgz"',
+      'must read back exact registry bytes and provenance'],
+    ['--source-ref refs/heads/main', '', 'missing: " --source-ref refs/heads/main "'],
+    ['--source-digest "${GITHUB_SHA}"', '', 'must bind npm provenance to main, the workflow commit and a GitHub-hosted runner'],
+    ['--deny-self-hosted-runners', '', 'missing: " --deny-self-hosted-runners "'],
+    ['--deny-self-hosted-runners', '--deny-self-hosted-runners=false', 'missing: " --deny-self-hosted-runners "'],
+    ['"${STATUS}" != "404"', '"${STATUS}" != "200"', 'must refuse to publish an existing or unconfirmed version'],
+    ['--environment-name bridge-npm-publication', '--environment-name bridge-assets-publication',
+      'must validate bridge-npm-publication with the trusted contract'],
+  ];
+  for (const [original, mutation, expected] of mutations) {
+    assert.ok(workflow.includes(original), `missing npm publication mutation anchor: ${original}`);
+    assertRejected(collectRepositoryErrors({ [npmPath]: workflow.replace(original, () => mutation) }), expected);
+  }
+
+  const actions = [...workflow.matchAll(/^[ \t]*(?:- )?uses: ([^@\s]+)@\S+[^\n]*$/gm)];
+  assert.ok(actions.length > 0, 'expected npm publication actions');
+  for (const match of actions) {
+    const [line, action] = match;
+    assert.match(line, /@[0-9a-f]{40} # v\d+\.\d+\.\d+$/);
+    const tagged = line.replace(/@[0-9a-f]{40}/, '@v4');
+    const changed = workflow.slice(0, match.index) + tagged + workflow.slice(match.index + line.length);
+    assertRejected(collectRepositoryErrors({ [npmPath]: changed }), `must pin ${action} to a full commit SHA`);
+  }
+
+  const assetWorkflow = read('.github/workflows/publish_assets.yml');
+  assertRejected(collectRepositoryErrors({
+    '.github/workflows/publish_assets.yml': assetWorkflow.replace('  actions: read', '  id-token: write\n  actions: read'),
+  }), 'publish_assets.yml must declare read-only top-level permissions');
+}

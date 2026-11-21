@@ -3,13 +3,15 @@
 export type LlamaCoreModuleFactory = (options?: Record<string, unknown>) => unknown | Promise<unknown>;
 
 export interface LlamaWebGpuBridgeConfig {
+  /** Directory URL for omitted bridge worker and core assets. Relative URLs use the calling document or worker URL. Explicit per-file URLs take precedence. */
+  assetBaseUrl?: string;
   coreModuleUrl?: string;
   coreModuleUrlMem64?: string;
   wasmUrl?: string;
   wasmUrlMem64?: string;
   /** A custom factory skips the cross-origin isolation check, so a custom pthread core on a page that is not isolated still waits for `coreInitTimeoutMs`. */
   coreModuleFactory?: LlamaCoreModuleFactory | Promise<LlamaCoreModuleFactory>;
-  /** Set for a `coreModuleUrl` core built without pthreads (`WEBGPU_BRIDGE_PTHREADS=0`): it loads on a page that is not cross-origin isolated, capped to one thread, instead of rejecting with `CrossOriginIsolationError`. */
+  /** Select single-thread default cores or allow an explicitly selected core built without pthreads to load on a page without cross-origin isolation. */
   allowSingleThreadCore?: boolean;
   /**
    * Stage fetched model and projector files in a private WASMFS mount.
@@ -65,7 +67,7 @@ export interface LoadModelOptions {
   remoteFetchChunkBytes?: number;
   /** Pass false to keep JS-chunk staging when jsBackedModelStaging is enabled. */
   useMmap?: boolean;
-  /** Overrides the Safari GPU layer cap. Recognized Safari 27+ is uncapped by default. */
+  /** Overrides the Safari GPU layer cap for this load. Apple Safari applies it to full-offload requests and treats values above 2147483647, including Infinity, as uncapped. Safari 27+ is uncapped by default. */
   safariMaxGpuLayers?: number;
   /** Set to false to skip the Safari load-time GPU probe. */
   safariGpuProbe?: boolean;

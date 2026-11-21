@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Apply the one-layer cap to omitted and negative GPU layer counts on Apple Safari before 27. The cap is recomputed for each load, and `safariMaxGpuLayers: Infinity` opts out. (#270)
+
+- Resolve sibling worker and core assets automatically, including hashed bundler filenames and single-thread variants. Set `assetBaseUrl` to serve the assets from a separate directory.
+
+- Reuse one WasmFS fetch worker per threaded core. Each model mount keeps its own URL and chunk size, so the fifth consecutive fetch-backed load no longer stalls. (#301)
+
+- Use the full GGUF URL, including its query string, for forced and automatic WasmFS fetch-backed model loads. Mount the model at a short local path so long signed URLs can load. (#288)
+
 - End a threaded core's pthread runtime when a direct-mode bridge is disposed or its core retires, so Chromium can collect the core and its memory. A core supplied through `coreModuleFactory` keeps running after `dispose()`. (#262)
 
 - Keep `setLogLevel()` updates in the bridge configuration when the worker core retires. Queued operations own worker replacement and apply the saved level to the new worker. (#261)
