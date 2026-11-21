@@ -15,8 +15,6 @@ This repository provides:
 
 ## Install via npm
 
-The package has not been published to npm yet.
-
 ```bash
 npm install llama-web-bridge
 ```
