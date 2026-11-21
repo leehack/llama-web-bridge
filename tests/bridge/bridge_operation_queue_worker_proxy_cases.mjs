@@ -400,6 +400,11 @@ export const WORKER_PROXY_CASES = [
         this._runtimeNotes.push('model_cache_evicted');
         return true;
       },
+      async isModelCached(url, options) {
+        assert.equal(url, 'model.gguf');
+        assert.deepEqual(options, { cacheName: 'prefetch-cache' });
+        return true;
+      },
     };
     const bridge = createWorkerBridge({
       _runtime: cacheRuntime,
@@ -445,8 +450,28 @@ export const WORKER_PROXY_CASES = [
     assert.equal(metadata['llamadart.webgpu.runtime_notes'], 'worker_threads;worker_fallback');
     assert.equal(metadata['llamadart.webgpu.execution'], 'worker');
 
+    assert.equal(await bridge.isModelCached('model.gguf', { cacheName: 'prefetch-cache' }), true);
     assert.equal(coreCalls, 0, 'cache helpers must never call into the core');
     assert.equal(workerDispatches, 0, 'cache helpers must never dispatch to the worker');
+  }],
+
+  [41, 'projector worker requests carry only supported cache options', async () => {
+    const calls = [];
+    const bridge = createWorkerBridge({
+      _ensureWorkerMultimodalCpuMode: async () => {},
+      _callWorker: async (method, args) => { calls.push([method, args]); return 1; },
+    });
+    const url = 'https://models.test/mmproj.gguf';
+    await bridge.loadMultimodalProjector(url);
+    await bridge.loadMultimodalProjector(url, { useCache: false, cacheName: 'ignored' });
+    const options = { useCache: true, cacheName: 'projector-cache', extra: () => {} };
+    await bridge.loadMultimodalProjector(url, options);
+    options.cacheName = 'changed';
+    assert.deepEqual(calls, [
+      ['loadMultimodalProjector', [url]],
+      ['loadMultimodalProjector', [url]],
+      ['loadMultimodalProjector', [url, { useCache: true, cacheName: 'projector-cache' }]],
+    ]);
   }],
 
   [32, 'a state-bearing owner applies its state before applyChatTemplate can fall back', async () => {

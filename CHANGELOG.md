@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Add `isModelCached()` and `supportsModelCacheQuery` so applications can query the bridge cache on every engine. `loadMultimodalProjector()` accepts opt-in `useCache` and `cacheName` options. (#290)
+- Restrict model and projector caching to HTTP(S) URLs. This prevents the orphaned WebKit cache parts that `blob:` and `data:` loads could leave after #281. Deleting the affected Cache Storage cache removes any existing orphaned parts.
+
 - Skip worker dispatch and reject with `AbortError` when one-shot `synthesizeSpeech()` is cancelled while awaiting worker readiness. (#268)
 
 - Resume interrupted model downloads when Safari reports `TypeError: Load failed`. (#278)

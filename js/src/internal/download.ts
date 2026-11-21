@@ -657,8 +657,12 @@ interface ModelCacheManifest {
   headers: Headers;
 }
 
-async function readModelCacheManifest(cache: Cache, digest: string): Promise<ModelCacheManifest | null> {
-  const manifest = await cache.match(modelCacheManifestUrl(digest));
+async function readModelCacheManifest(
+  cache: Pick<CacheStorage, 'match'>,
+  digest: string,
+  options?: MultiCacheQueryOptions,
+): Promise<ModelCacheManifest | null> {
+  const manifest = await cache.match(modelCacheManifestUrl(digest), options);
   const record = modelCacheRecord(manifest);
   if (!manifest || !record) return null;
   const decodedBytes = parseByteLength(manifest.headers.get(MODEL_CACHE_SIZE_HEADER));
@@ -763,6 +767,11 @@ export async function openModelCacheParts(
 
 export async function readCachedModelPartsSize(cache: Cache, cacheKey: string): Promise<number | null> {
   return (await readModelCacheManifest(cache, await modelCacheKeyDigest(cacheKey)))?.decodedBytes ?? null;
+}
+
+export async function hasCommittedModelCacheManifest(cache: CacheStorage, cacheKey: string, cacheName: string) {
+  const digest = await modelCacheKeyDigest(cacheKey);
+  return (await readModelCacheManifest(cache, digest, { cacheName })) !== null;
 }
 
 export interface ModelCachePartStore {
@@ -1160,7 +1169,7 @@ export async function writeResponseToFsFileWithProgress(
     : (reservedLength > 0 && (response.type === 'basic' || encoding === 'identity') ? reservedLength : 0);
   const reader = response.body.getReader();
   const openMode = appendMode ? 'r+' : 'w';
-  const stream = directWriter ? null : fs.open(filePath, openMode);
+  let stream: ReturnType<EmscriptenFs['open']> | null = null;
   let loaded = 0;
   let lastBucket = -1;
   let writePosition = startOffset;
@@ -1181,6 +1190,7 @@ export async function writeResponseToFsFileWithProgress(
   };
 
   try {
+    if (!directWriter) stream = fs.open(filePath, openMode);
     if (reservedLength > 0 && stream != null) {
       try {
         const written = fs.write(stream, new Uint8Array(1), 0, 1, reservedLength - 1);

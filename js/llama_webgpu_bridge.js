@@ -1861,8 +1861,8 @@ var ModelCacheEntryError = class extends Error {
     this.retryWithoutCache = retryWithoutCache;
   }
 };
-async function readModelCacheManifest(cache, digest) {
-  const manifest = await cache.match(modelCacheManifestUrl(digest));
+async function readModelCacheManifest(cache, digest, options) {
+  const manifest = await cache.match(modelCacheManifestUrl(digest), options);
   const record = modelCacheRecord(manifest);
   if (!manifest || !record) return null;
   const decodedBytes = parseByteLength(manifest.headers.get(MODEL_CACHE_SIZE_HEADER));
@@ -1943,6 +1943,10 @@ async function openModelCacheParts(cache, cacheKey, lockScope) {
 }
 async function readCachedModelPartsSize(cache, cacheKey) {
   return (await readModelCacheManifest(cache, await modelCacheKeyDigest(cacheKey)))?.decodedBytes ?? null;
+}
+async function hasCommittedModelCacheManifest(cache, cacheKey, cacheName) {
+  const digest = await modelCacheKeyDigest(cacheKey);
+  return await readModelCacheManifest(cache, digest, { cacheName }) !== null;
 }
 function getModelCacheLocks() {
   const locks = globalThis.navigator?.locks;
@@ -2261,7 +2265,7 @@ async function writeResponseToFsFileWithProgress(response, fs, filePath, progres
   const exactLength = skipReservation ? exactExpectedTransferLength(response, startOffset) : reservedLength > 0 && (response.type === "basic" || encoding === "identity") ? reservedLength : 0;
   const reader = response.body.getReader();
   const openMode = appendMode ? "r+" : "w";
-  const stream = directWriter ? null : fs.open(filePath, openMode);
+  let stream = null;
   let loaded = 0;
   let lastBucket = -1;
   let writePosition = startOffset;
@@ -2279,6 +2283,7 @@ async function writeResponseToFsFileWithProgress(response, fs, filePath, progres
     }
   };
   try {
+    if (!directWriter) stream = fs.open(filePath, openMode);
     if (reservedLength > 0 && stream != null) {
       try {
         const written = fs.write(stream, new Uint8Array(1), 0, 1, reservedLength - 1);
@@ -2599,6 +2604,9 @@ function scoredTokensFrom(entries) {
 }
 
 // js/src/runtime.ts
+function isModelCacheUrl(url) {
+  return /^https?:\/\//i.test(url);
+}
 var cachedModelSizes = /* @__PURE__ */ new WeakMap();
 var pendingModelCacheStores = /* @__PURE__ */ new WeakMap();
 var teedModelResponses = /* @__PURE__ */ new WeakSet();
@@ -2690,6 +2698,7 @@ var LlamaWebGpuBridgeRuntime = class {
     this._modelCacheName = defaultModelCacheName;
     this._loadedModelUrl = null;
     this._mmProjSourceUrl = null;
+    this._mmProjSourceOptions = void 0;
     this._draftModel = null;
     this._speculativeFileCounter = 0;
     this._suppressedWarmupWarningCount = 0;
@@ -2906,6 +2915,7 @@ var LlamaWebGpuBridgeRuntime = class {
     );
     const previousPreferMemory64 = this._preferMemory64;
     const previousMMProjSourceUrl = this._mmProjSourceUrl;
+    const previousMMProjSourceOptions = this._mmProjSourceOptions;
     const previousDraftModel = this._draftModel;
     const resolvedLoadState = this._resolvedLoadState();
     try {
@@ -2922,7 +2932,7 @@ var LlamaWebGpuBridgeRuntime = class {
       }, resolvedLoadState);
       if (typeof previousMMProjSourceUrl === "string" && previousMMProjSourceUrl.length > 0) {
         try {
-          await this.loadMultimodalProjector(previousMMProjSourceUrl);
+          await this.loadMultimodalProjector(previousMMProjSourceUrl, previousMMProjSourceOptions);
         } catch (_) {
           this._runtimeNotes.push("generation_recovery_mmproj_reload_failed");
         }
@@ -3857,8 +3867,10 @@ var LlamaWebGpuBridgeRuntime = class {
     this._runtimeNotes.push("previous_model_released");
     return true;
   }
-  async _getCachedModelResponse(url, options = {}) {
-    let useCache = options.useCache !== false;
+  async _getCachedModelResponse(url, options = {}, recordCacheMetadata = true) {
+    const cacheKey = normalizeAbsoluteUrl(url);
+    const cacheName = this._resolveCacheName(options);
+    let useCache = options.useCache !== false && isModelCacheUrl(cacheKey);
     const forceRefresh = options.force === true;
     const requireReadableStream = options.requireReadableStream === true;
     const requestHeaders = options.requestHeaders && typeof options.requestHeaders === "object" ? options.requestHeaders : null;
@@ -3870,15 +3882,19 @@ var LlamaWebGpuBridgeRuntime = class {
       ...requestHeaders ? { headers: requestHeaders } : {}
     };
     const fetchTimeoutMs = this._resolveFetchTimeoutMs(options, 18e4);
-    this._modelSource = "network";
-    this._modelCacheState = useCache ? "unavailable" : "disabled";
-    this._modelCacheName = this._resolveCacheName(options);
+    const recordCacheState = (state, source) => {
+      if (!recordCacheMetadata) return;
+      this._modelCacheState = state;
+      if (source !== void 0) this._modelSource = source;
+    };
+    recordCacheState(useCache ? "unavailable" : "disabled", "network");
+    if (recordCacheMetadata) this._modelCacheName = cacheName;
     if (!useCache) {
       const response = await this._fetchWithTimeout(url, {
         cache: "no-store",
         ...fetchOptions
       }, fetchTimeoutMs);
-      this._modelCacheState = "disabled";
+      recordCacheState("disabled");
       if (requireReadableStream) {
         this._runtimeNotes.push(
           hasReadableResponseStream(response) ? "model_network_stream" : "model_network_no_stream"
@@ -3887,7 +3903,7 @@ var LlamaWebGpuBridgeRuntime = class {
       return response;
     }
     if (!globalThis.caches || typeof globalThis.caches.open !== "function") {
-      this._modelCacheState = "unavailable";
+      recordCacheState("unavailable");
       const response = await this._fetchWithTimeout(url, fetchOptions, fetchTimeoutMs);
       if (requireReadableStream) {
         this._runtimeNotes.push(
@@ -3896,13 +3912,11 @@ var LlamaWebGpuBridgeRuntime = class {
       }
       return response;
     }
-    const cacheKey = normalizeAbsoluteUrl(url);
     try {
-      const cache = await globalThis.caches.open(this._modelCacheName);
-      const parts = forceRefresh || !this._isWebKit ? null : await openModelCacheParts(cache, cacheKey, this._modelCacheName);
+      const cache = await globalThis.caches.open(cacheName);
+      const parts = forceRefresh || !this._isWebKit ? null : await openModelCacheParts(cache, cacheKey, cacheName);
       if (parts) {
-        this._modelSource = "cache";
-        this._modelCacheState = "hit";
+        recordCacheState("hit", "cache");
         this._runtimeNotes.push("model_cache_hit");
         this._runtimeNotes.push("model_cache_parts");
         if (requireReadableStream) {
@@ -3915,8 +3929,7 @@ var LlamaWebGpuBridgeRuntime = class {
       if (cached) {
         const cacheHasStream = hasReadableResponseStream(cached);
         if (!requireReadableStream || cacheHasStream) {
-          this._modelSource = "cache";
-          this._modelCacheState = "hit";
+          recordCacheState("hit", "cache");
           this._runtimeNotes.push("model_cache_hit");
           if (requireReadableStream) {
             this._runtimeNotes.push("model_cache_stream");
@@ -3928,8 +3941,7 @@ var LlamaWebGpuBridgeRuntime = class {
           return cached;
         }
         this._runtimeNotes.push("model_cache_hit_no_stream");
-        this._modelSource = "network";
-        this._modelCacheState = "refresh";
+        recordCacheState("refresh", "network");
         const refreshed = await this._fetchWithTimeout(url, {
           cache: "no-store",
           ...fetchOptions
@@ -3937,18 +3949,18 @@ var LlamaWebGpuBridgeRuntime = class {
         this._runtimeNotes.push(
           hasReadableResponseStream(refreshed) ? "model_network_stream" : "model_network_no_stream"
         );
-        return refreshed.ok ? await this._storeModelResponse(cache, cacheKey, refreshed) : refreshed;
+        return refreshed.ok ? await this._storeModelResponse(cache, cacheName, cacheKey, refreshed, recordCacheState) : refreshed;
       }
-      this._modelCacheState = forceRefresh ? "refresh" : "miss";
+      recordCacheState(forceRefresh ? "refresh" : "miss");
       const response = await this._fetchWithTimeout(url, fetchOptions, fetchTimeoutMs);
       if (requireReadableStream) {
         this._runtimeNotes.push(
           hasReadableResponseStream(response) ? "model_network_stream" : "model_network_no_stream"
         );
       }
-      return response.ok ? await this._storeModelResponse(cache, cacheKey, response) : response;
+      return response.ok ? await this._storeModelResponse(cache, cacheName, cacheKey, response, recordCacheState) : response;
     } catch (_) {
-      this._modelCacheState = "error";
+      recordCacheState("error");
       this._runtimeNotes.push("model_cache_error");
       const response = await this._fetchWithTimeout(url, fetchOptions, fetchTimeoutMs);
       if (requireReadableStream) {
@@ -3965,24 +3977,25 @@ var LlamaWebGpuBridgeRuntime = class {
    * progress follows the download; `_settleModelCacheStore` then waits for the
    * store. Without a stream, the store completes before this returns.
    */
-  async _storeModelResponse(cache, cacheKey, response) {
+  async _storeModelResponse(cache, cacheName, cacheKey, response, recordCacheState) {
     const recordFailure = (error) => {
       this._runtimeNotes.push("model_cache_store_failed");
       this._emitLogger("warn", `Model was not cached: ${error instanceof Error ? error.message : String(error)}`);
       return "store_failed";
     };
     if (!hasReadableResponseStream(response)) {
+      if (response.body === null) return response;
       try {
         await cache.put(cacheKey, response.clone());
-        this._modelCacheState = "stored";
+        recordCacheState("stored");
         this._runtimeNotes.push("model_cache_stored");
       } catch (error) {
-        this._modelCacheState = recordFailure(error);
+        recordCacheState(recordFailure(error));
       }
       return response;
     }
     if (this._isWebKit) {
-      const store = startModelCachePartStore(cache, cacheKey, response, this._modelCacheName);
+      const store = startModelCachePartStore(cache, cacheKey, response, cacheName);
       pendingModelCacheStores.set(store.response, store.stored.then(
         () => {
           this._runtimeNotes.push("model_cache_stored");
@@ -4021,12 +4034,13 @@ var LlamaWebGpuBridgeRuntime = class {
     }
   }
   async prefetchModelToCache(url, options = {}) {
-    const useCache = options.useCache !== false;
+    const modelUrls = expandModelShardUrls(url);
+    const useCache = options.useCache !== false && modelUrls.some(isModelCacheUrl);
+    const cacheName = this._resolveCacheName(options);
     this._modelSource = "network";
     this._modelCacheState = useCache ? "unavailable" : "disabled";
-    this._modelCacheName = this._resolveCacheName(options);
+    this._modelCacheName = cacheName;
     const progressCallback = typeof options.progressCallback === "function" ? options.progressCallback : null;
-    const modelUrls = expandModelShardUrls(url);
     if (modelUrls.length === 0) {
       throw new Error("Model URL is empty.");
     }
@@ -4054,13 +4068,14 @@ var LlamaWebGpuBridgeRuntime = class {
       };
       const fetchTimeoutMs = this._resolveFetchTimeoutMs(options, 18e4);
       const chunkTimeoutMs = this._resolveStreamChunkTimeoutMs(options, 9e4);
-      const cache = useCache && globalThis.caches && typeof globalThis.caches.open === "function" ? await globalThis.caches.open(this._modelCacheName) : null;
-      if (!useCache || !cache) {
+      const storageCache = useCache && globalThis.caches && typeof globalThis.caches.open === "function" ? await globalThis.caches.open(cacheName) : null;
+      if (!storageCache) {
         this._modelCacheState = useCache ? "unavailable" : "disabled";
       }
       for (let shardIndex = 0; shardIndex < modelUrls.length; shardIndex += 1) {
         const shardUrl = modelUrls[shardIndex];
         const cacheKey = normalizeAbsoluteUrl(shardUrl);
+        const cache = isModelCacheUrl(cacheKey) ? storageCache : null;
         let response;
         let headerTotal = 0;
         if (cache) {
@@ -4095,7 +4110,7 @@ var LlamaWebGpuBridgeRuntime = class {
         let releaseConsumedChunks = this._isWebKit;
         let storedInParts = false;
         if (cache && hasReadableResponseStream(response) && this._isWebKit) {
-          const store = startModelCachePartStore(cache, cacheKey, response, this._modelCacheName);
+          const store = startModelCachePartStore(cache, cacheKey, response, cacheName);
           response = store.response;
           cacheStore = store.stored;
           storedInParts = true;
@@ -4164,7 +4179,8 @@ var LlamaWebGpuBridgeRuntime = class {
     }
   }
   async evictModelFromCache(url, options = {}) {
-    this._modelCacheName = this._resolveCacheName(options);
+    const cacheName = this._resolveCacheName(options);
+    this._modelCacheName = cacheName;
     const modelUrls = expandModelShardUrls(url);
     if (modelUrls.length === 0) {
       return false;
@@ -4174,11 +4190,11 @@ var LlamaWebGpuBridgeRuntime = class {
       return false;
     }
     try {
-      const cache = await globalThis.caches.open(this._modelCacheName);
+      const cache = await globalThis.caches.open(cacheName);
       let removedCount = 0;
       for (const modelUrl of modelUrls) {
         const cacheKey = normalizeAbsoluteUrl(modelUrl);
-        const removedParts = await deleteModelCacheParts(cache, cacheKey, this._modelCacheName);
+        const removedParts = await deleteModelCacheParts(cache, cacheKey, cacheName);
         if (removedParts === null) continue;
         const removed = await cache.delete(cacheKey);
         if (removed) {
@@ -4200,6 +4216,26 @@ var LlamaWebGpuBridgeRuntime = class {
     } catch (_) {
       this._modelCacheState = "error";
       this._runtimeNotes.push("model_cache_error");
+      return false;
+    }
+  }
+  async isModelCached(url, options = {}) {
+    try {
+      const modelUrls = expandModelShardUrls(url);
+      const cache = globalThis.caches;
+      if (modelUrls.length === 0 || typeof cache?.match !== "function") return false;
+      const cacheName = this._resolveCacheName(options);
+      for (const modelUrl of modelUrls) {
+        const cacheKey = normalizeAbsoluteUrl(modelUrl);
+        if (!isModelCacheUrl(cacheKey)) return false;
+        if (this._isWebKit && await hasCommittedModelCacheManifest(cache, cacheKey, cacheName)) continue;
+        const response = await cache.match(cacheKey, { cacheName });
+        if (!response) return false;
+        void response.body?.cancel().catch(() => {
+        });
+      }
+      return true;
+    } catch (_) {
       return false;
     }
   }
@@ -4429,6 +4465,7 @@ var LlamaWebGpuBridgeRuntime = class {
     }
     await this._releaseLoadedModel(core);
     this._mmProjSourceUrl = null;
+    this._mmProjSourceOptions = void 0;
     const configuredPoolHint = Number(this._threadPoolSizeHint);
     this._syncThreadPoolSizeHintFromCore();
     const coreSupportsPthreads = this._coreSupportsPthreads();
@@ -5124,7 +5161,7 @@ var LlamaWebGpuBridgeRuntime = class {
     this._emitSuppressedWarmupWarningSummaryIfNeeded();
     return 1;
   }
-  async loadMultimodalProjector(url) {
+  async loadMultimodalProjector(url, options = {}) {
     if (!this._core || this._modelBytes <= 0) {
       throw new Error("No model loaded. Call loadModelFromUrl first.");
     }
@@ -5140,13 +5177,16 @@ var LlamaWebGpuBridgeRuntime = class {
       ensureFsDirectory(core.FS, "/mmproj");
     }
     let lastError = null;
+    let bypassCache = false;
     for (let attempt = 0; attempt < 2; attempt += 1) {
+      const useCache = options.useCache === true && !bypassCache;
       let stagingMountPath = null;
       let stagingMountId = 0;
       let mmprojPath = `/mmproj/${fileName}`;
       let createdMmprojPath = null;
       let assertMountOwned;
       let projectorLoaded = false;
+      let response = null;
       try {
         if (useJsBackedStaging) {
           const mountPath = this._mountJsBackedStaging(core, "mmproj_staging_js_backed");
@@ -5155,11 +5195,16 @@ var LlamaWebGpuBridgeRuntime = class {
           assertMountOwned = () => this._assertJsStagingMountOwned(core, mountPath, stagingMountId);
           mmprojPath = `${mountPath}/${fileName}`;
         }
-        const response = await this._fetchWithTimeout(
-          url,
-          { cache: "no-store" },
-          fetchTimeoutMs
-        );
+        if (useCache) {
+          response = await this._getCachedModelResponse(url, {
+            useCache: true,
+            cacheName: options.cacheName,
+            requireReadableStream: true,
+            readDecodedCacheSize: true
+          }, false);
+        } else {
+          response = await this._fetchWithTimeout(url, { cache: "no-store" }, fetchTimeoutMs);
+        }
         if (!response.ok) {
           throw new Error(
             `Failed to fetch multimodal projector: ${response.status} ${response.statusText}`
@@ -5175,10 +5220,9 @@ var LlamaWebGpuBridgeRuntime = class {
           this._ownedMmProjPath = null;
           this._ownedMmProjMount = null;
         }
-        let knownTotalBytes = 0;
+        const knownTotalBytes = useCache || assertMountOwned ? cachedModelSizes.get(response) ?? inferResponseTotalBytes(response, 0) : 0;
         let directWriter = null;
         if (assertMountOwned) {
-          knownTotalBytes = inferResponseTotalBytes(response, 0);
           directWriter = this._openDirectJsWriter(core, this._mmProjPath, knownTotalBytes, false, assertMountOwned);
         }
         await writeResponseToFsFileWithProgress(
@@ -5190,10 +5234,12 @@ var LlamaWebGpuBridgeRuntime = class {
             useBigIntPosition: this._coreVariant === "wasm64",
             skipMemoryReservation: useJsBackedStaging,
             directWriter,
-            ...useJsBackedStaging ? { totalBytes: knownTotalBytes } : {},
+            ...useJsBackedStaging || useCache ? { totalBytes: knownTotalBytes } : {},
+            releaseConsumedChunks: useCache && this._isWebKit && !teedModelResponses.has(response),
             chunkTimeoutMs
           }
         );
+        if (useCache) await this._settleModelCacheStore(response, false);
         assertMountOwned?.();
         const rc = Number(
           await core.ccall(
@@ -5215,6 +5261,7 @@ var LlamaWebGpuBridgeRuntime = class {
           core.ccall("llamadart_webgpu_mmproj_supports_audio", "number", [], [])
         ) === 1;
         this._mmProjSourceUrl = url;
+        this._mmProjSourceOptions = options.useCache === true ? { useCache: true, cacheName: options.cacheName } : void 0;
         assertMountOwned?.();
         if (this._deleteFsFile(mmprojPath)) {
           this._runtimeNotes.push("mmproj_file_released");
@@ -5246,6 +5293,7 @@ var LlamaWebGpuBridgeRuntime = class {
             } catch (_) {
             }
             this._mmProjSourceUrl = null;
+            this._mmProjSourceOptions = void 0;
           }
           throw ownershipError;
         }
@@ -5256,12 +5304,21 @@ var LlamaWebGpuBridgeRuntime = class {
         if (useJsBackedStaging && error instanceof ModelStagingError) {
           throw error;
         }
+        if (error instanceof ModelCacheEntryError && attempt === 0) {
+          this._runtimeNotes.push("mmproj_cache_entry_invalid");
+          bypassCache = error.retryWithoutCache;
+          continue;
+        }
         const retryable = isRetryableStreamNetworkError(error);
         if (!retryable || attempt >= 1) {
           throw error;
         }
         this._runtimeNotes.push(`mmproj_load_retry:${attempt + 1}`);
       } finally {
+        if (options.useCache === true && response?.body && !response.body.locked) {
+          void response.body.cancel().catch(() => {
+          });
+        }
         this._releaseJsModelStaging(core, stagingMountPath);
       }
     }
@@ -5279,6 +5336,7 @@ var LlamaWebGpuBridgeRuntime = class {
       this._mmSupportsVision = false;
       this._mmSupportsAudio = false;
       this._mmProjSourceUrl = null;
+      this._mmProjSourceOptions = void 0;
       return;
     }
     const mmprojPath = this._mmProjPath;
@@ -5302,6 +5360,7 @@ var LlamaWebGpuBridgeRuntime = class {
     this._mmSupportsVision = false;
     this._mmSupportsAudio = false;
     this._mmProjSourceUrl = null;
+    this._mmProjSourceOptions = void 0;
   }
   // Bytes the core heap can still allocate, or null for a core without the
   // probe.
@@ -7085,6 +7144,7 @@ var LlamaWebGpuBridgeRuntime = class {
     this._loadedModelUrl = null;
     this._mmProjPath = null;
     this._mmProjSourceUrl = null;
+    this._mmProjSourceOptions = void 0;
     this._mmSupportsVision = false;
     this._mmSupportsAudio = false;
     this._loraAdaptersLoaded = false;
@@ -7472,6 +7532,7 @@ var MODEL_OPERATION_KINDS = /* @__PURE__ */ new Set([
 var LlamaWebGpuBridge = class {
   static supportsSafariAdaptiveGpu = LlamaWebGpuBridgeRuntime.supportsSafariAdaptiveGpu === true;
   static supportsCompletionUsage = true;
+  static supportsModelCacheQuery = true;
   constructor(config = {}) {
     this._config = config;
     this._runtime = null;
@@ -7491,6 +7552,7 @@ var LlamaWebGpuBridge = class {
     this._loadedModelUrl = null;
     this._loadedModelOptions = null;
     this._loadedMmProjUrl = null;
+    this._loadedMmProjOptions = void 0;
     this._loadedDraftModel = null;
     this._multimodalWorkerCpuMode = false;
     this._workerModelMissing = false;
@@ -8032,6 +8094,7 @@ var LlamaWebGpuBridge = class {
     this._loadedModelUrl = normalizedUrl;
     this._loadedModelOptions = this._sanitizeModelLoadOptions(options);
     this._loadedMmProjUrl = null;
+    this._loadedMmProjOptions = void 0;
     this._forgetLoraAdapters();
     this._loadedDraftModel = null;
     this._multimodalWorkerCpuMode = this._workerProxy != null;
@@ -8047,6 +8110,7 @@ var LlamaWebGpuBridge = class {
     this._loadedModelUrl = null;
     this._loadedModelOptions = null;
     this._loadedMmProjUrl = null;
+    this._loadedMmProjOptions = void 0;
     this._forgetLoraAdapters();
     this._loadedDraftModel = null;
     this._multimodalWorkerCpuMode = false;
@@ -8081,12 +8145,13 @@ var LlamaWebGpuBridge = class {
       this._forgetLoadedModel();
     }
   }
-  _rememberLoadedMmProj(url) {
+  _rememberLoadedMmProj(url, options) {
     const normalizedUrl = String(url || "").trim();
     if (normalizedUrl.length === 0) {
       return;
     }
     this._loadedMmProjUrl = normalizedUrl;
+    this._loadedMmProjOptions = options;
     if (this._activeOperation) {
       this._activeOperation.projectorSource = normalizedUrl;
     }
@@ -8217,7 +8282,9 @@ var LlamaWebGpuBridge = class {
     await this._callWorker("loadModelFromUrl", [this._loadedModelUrl, selectedOptions]);
     this._throwIfDisposed();
     if (typeof this._loadedMmProjUrl === "string" && this._loadedMmProjUrl.length > 0) {
-      await this._callWorker("loadMultimodalProjector", [this._loadedMmProjUrl]);
+      const url = this._loadedMmProjUrl;
+      const options = this._loadedMmProjOptions;
+      await this._callWorker("loadMultimodalProjector", options ? [url, options] : [url]);
     }
     const draft = this._loadedDraftModel;
     if (draft) {
@@ -8367,7 +8434,7 @@ var LlamaWebGpuBridge = class {
           const runtimeSupportsMedia = typeof this._runtime.supportsVision === "function" && this._runtime.supportsVision() || typeof this._runtime.supportsAudio === "function" && this._runtime.supportsAudio();
           if (!runtimeSupportsMedia) {
             this._throwIfDisposed();
-            await this._runtime.loadMultimodalProjector(this._loadedMmProjUrl);
+            await this._runtime.loadMultimodalProjector(this._loadedMmProjUrl, this._loadedMmProjOptions);
             this._throwIfDisposed();
             if (Array.isArray(this._runtime._runtimeNotes)) {
               this._runtime._runtimeNotes.push("worker_fallback_reload_mmproj");
@@ -8427,7 +8494,7 @@ var LlamaWebGpuBridge = class {
       }
       if (shouldEnsureMultimodalInRuntime) {
         this._throwIfDisposed();
-        await this._runtime.loadMultimodalProjector(this._loadedMmProjUrl);
+        await this._runtime.loadMultimodalProjector(this._loadedMmProjUrl, this._loadedMmProjOptions);
         this._throwIfDisposed();
       }
       await this._restoreLoraAdapters();
@@ -8454,6 +8521,7 @@ var LlamaWebGpuBridge = class {
       this._loadedModelUrl = null;
       this._loadedModelOptions = null;
       this._loadedMmProjUrl = null;
+      this._loadedMmProjOptions = void 0;
       this._forgetLoraAdapters();
       this._loadedDraftModel = null;
       if (!this._disposed && this._lifecycleState === "open" && !this._workerProxy) {
@@ -8935,6 +9003,13 @@ var LlamaWebGpuBridge = class {
       this._refreshCacheMetadataSnapshot();
     }
   }
+  async isModelCached(url, options = {}) {
+    this._throwIfDisposed();
+    if (!this._runtime) {
+      this._runtime = this._createRuntime();
+    }
+    return this._runtime.isModelCached(url, options);
+  }
   async createCompletion(prompt, options = {}) {
     resolveCompletionSamplingOptions(options);
     const onUsage = options?.onUsage;
@@ -9206,22 +9281,24 @@ var LlamaWebGpuBridge = class {
       return this._runtime.createCompletion(prompt, options);
     }
   }
-  async loadMultimodalProjector(url) {
+  async loadMultimodalProjector(url, options) {
     return this._runExclusive(
-      () => this._loadMultimodalProjectorUnlocked(url),
+      () => this._loadMultimodalProjectorUnlocked(url, options),
       { kind: "projector-load" }
     );
   }
-  async _loadMultimodalProjectorUnlocked(source) {
+  async _loadMultimodalProjectorUnlocked(source, options) {
     const url = typeof source === "string" && source.length > 0 ? normalizeAbsoluteUrl(source) : source;
+    const cacheOptions = options?.useCache === true ? { useCache: true, ...typeof options.cacheName === "string" ? { cacheName: options.cacheName } : {} } : void 0;
+    const workerArgs = cacheOptions ? [url, cacheOptions] : [url];
     const startedWithWorker = this._workerProxy != null;
     const invokeRuntimeLoad = async () => {
       if (!this._runtime) {
         this._runtime = this._createRuntime();
       }
       await this._ensureRuntimeReadyAfterWorkerFallback({}, null);
-      const result = await this._runtime.loadMultimodalProjector(url);
-      this._rememberLoadedMmProj(url);
+      const result = await this._runtime.loadMultimodalProjector(url, cacheOptions);
+      this._rememberLoadedMmProj(url, cacheOptions);
       this._supportsVision = this._runtime.supportsVision();
       this._supportsAudio = this._runtime.supportsAudio();
       return result;
@@ -9231,8 +9308,8 @@ var LlamaWebGpuBridge = class {
         return await invokeRuntimeLoad();
       }
       await this._ensureWorkerMultimodalCpuMode();
-      const result = await this._callWorker("loadMultimodalProjector", [url]);
-      this._rememberLoadedMmProj(url);
+      const result = await this._callWorker("loadMultimodalProjector", workerArgs);
+      this._rememberLoadedMmProj(url, cacheOptions);
       return result;
     } catch (error) {
       this._throwIfOperationCancelled(error, "Projector operation was cancelled.");
@@ -9248,8 +9325,8 @@ var LlamaWebGpuBridge = class {
         try {
           await this._replaceWorkerProxyForMultimodalCpuMode();
           await this._ensureWorkerMultimodalCpuMode();
-          const retryResult = await this._callWorker("loadMultimodalProjector", [url]);
-          this._rememberLoadedMmProj(url);
+          const retryResult = await this._callWorker("loadMultimodalProjector", workerArgs);
+          this._rememberLoadedMmProj(url, cacheOptions);
           this._emitBridgeWarn(
             "llamadart: CPU multimodal worker setup recovered after worker restart."
           );
@@ -9279,6 +9356,7 @@ var LlamaWebGpuBridge = class {
     if (!this._workerProxy) {
       const result = await this._runtime.unloadMultimodalProjector();
       this._loadedMmProjUrl = null;
+      this._loadedMmProjOptions = void 0;
       this._supportsVision = this._runtime.supportsVision();
       this._supportsAudio = this._runtime.supportsAudio();
       return result;
@@ -9286,6 +9364,7 @@ var LlamaWebGpuBridge = class {
     try {
       const result = await this._callWorker("unloadMultimodalProjector", []);
       this._loadedMmProjUrl = null;
+      this._loadedMmProjOptions = void 0;
       return result;
     } catch (error) {
       this._throwIfOperationCancelled(error, "Projector operation was cancelled.");
@@ -9294,6 +9373,7 @@ var LlamaWebGpuBridge = class {
       await this._waitForWorkerDisposal();
       const result = await this._runtime.unloadMultimodalProjector();
       this._loadedMmProjUrl = null;
+      this._loadedMmProjOptions = void 0;
       this._supportsVision = this._runtime.supportsVision();
       this._supportsAudio = this._runtime.supportsAudio();
       return result;
@@ -10262,7 +10342,7 @@ var LlamaWebGpuBridge = class {
     if (!this._loadedMmProjUrl || !this._runtime?._modelBytes || this._runtime._mmProjPath) return;
     this._throwIfDisposed();
     try {
-      await this._runtime.loadMultimodalProjector(this._loadedMmProjUrl);
+      await this._runtime.loadMultimodalProjector(this._loadedMmProjUrl, this._loadedMmProjOptions);
     } catch (error) {
       this._throwIfOperationCancelled(error, "Embedding projector restore was cancelled.");
       this._emitBridgeWarn("llamadart: embedding projector restore failed; keeping the loaded model.");
@@ -10451,6 +10531,7 @@ var LlamaWebGpuBridge = class {
       this._loadedModelUrl = null;
       this._loadedModelOptions = null;
       this._loadedMmProjUrl = null;
+      this._loadedMmProjOptions = void 0;
       this._loadedDraftModel = null;
       this._workerFallbackReason = null;
       this._multimodalWorkerCpuMode = false;
@@ -10733,7 +10814,10 @@ function installBridgeWorkerHost() {
         return;
       }
       if (method === "loadMultimodalProjector") {
-        const value2 = await bridge.loadMultimodalProjector(args[0]);
+        const value2 = await bridge.loadMultimodalProjector(
+          args[0],
+          args[1]
+        );
         self.postMessage({ type: "result", id, value: value2, state: snapshotBridgeState(bridge) });
         return;
       }

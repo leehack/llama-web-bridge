@@ -8,6 +8,7 @@ import { createDirectBridge } from './bridge_operation_queue_fixtures.mjs';
 const { openModelCacheParts, startModelCachePartStore } = download;
 
 const MODEL_URL = 'https://models.test/model.gguf';
+const PROJECTOR_URL = 'https://models.test/mmproj.gguf';
 const CACHE_NAME = 'model-cache-parts-test';
 const MANIFEST = 'https://llamadart-cache.invalid/model-parts/';
 const PART = 'https://llamadart-cache.invalid/model-part/';
@@ -17,10 +18,10 @@ const SAFARI = 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebK
 function installCaches() {
   const entries = new Map();
   const headers = new Map();
-  const calls = { put: [], match: [], keys: 0, delete: [] };
+  const calls = { put: [], match: [], keys: 0, delete: [], open: [] };
   const hooks = { afterMatch: null, beforePut: null };
   const urlOf = (key) => (typeof key === 'string' ? key : key.url).split('#')[0];
-  const cache = {
+  const createCache = (entries, headers) => ({
     async match(key) {
       const url = urlOf(key);
       calls.match.push(url);
@@ -50,14 +51,35 @@ function installCaches() {
       headers.delete(url);
       return entries.delete(url);
     },
+  });
+  const cache = createCache(entries, headers);
+  const names = new Map([[CACHE_NAME, cache]]);
+  const storage = {
+    async open(name) {
+      calls.open.push(name);
+      if (!names.has(name)) names.set(name, createCache(new Map(), new Map()));
+      return names.get(name);
+    },
+    async match(key, { cacheName } = {}) {
+      if (cacheName !== undefined) return names.get(cacheName)?.match(key);
+      for (const namedCache of names.values()) {
+        const response = await namedCache.match(key);
+        if (response) return response;
+      }
+      return undefined;
+    },
+    async keys() {
+      return [...names.keys()];
+    },
   };
   const original = Object.getOwnPropertyDescriptor(globalThis, 'caches');
   Object.defineProperty(globalThis, 'caches', {
     configurable: true,
-    value: { open: async (name) => (name === CACHE_NAME ? cache : assert.fail('unexpected cache ' + name)) },
+    value: storage,
   });
   return {
     cache,
+    storage,
     entries,
     headers,
     calls,
@@ -118,7 +140,7 @@ function installLocks({ available = true, present = true } = {}) {
 }
 
 // A response whose body the test feeds; `reads` counts the consumer's reads.
-function controlledResponse(headers = {}) {
+function controlledResponse(headers = {}, status = 200) {
   const queue = [];
   const state = { cancelled: false, closed: false, reads: 0, error: null };
   let wake = null;
@@ -146,7 +168,7 @@ function controlledResponse(headers = {}) {
       notify();
     },
   }, { highWaterMark: 0 });
-  const response = new Response(stream, { status: 200, statusText: 'OK', headers });
+  const response = new Response(stream, { status, headers });
   Object.defineProperty(response, 'url', { value: MODEL_URL });
   return {
     response,
@@ -231,11 +253,17 @@ function createRuntime(fetchModel, userAgent) {
   };
   const ccall = core.ccall.bind(core);
   const loads = [];
+  const projectorLoads = [];
   core.ccall = (name, type, types, args = []) => {
     if (name === 'llamadart_webgpu_load_model') {
       loads.push(written.get(args[0]).flatMap((chunk) => [...chunk]));
       return 0;
     }
+    if (name === 'llamadart_webgpu_mmproj_load') {
+      projectorLoads.push(written.get(args[0]).flatMap((chunk) => [...chunk]));
+      return 0;
+    }
+    if (name.startsWith('llamadart_webgpu_mmproj_supports_')) return 1;
     if (name === 'llamadart_webgpu_free_model') return 0;
     if (name === 'llamadart_webgpu_get_context_size') return 128;
     return ccall(name, type, types, args);
@@ -253,7 +281,7 @@ function createRuntime(fetchModel, userAgent) {
     fetches.push(url);
     return fetchModel(url, init);
   };
-  return { runtime, core, loads, fetches };
+  return { runtime, core, loads, fetches, projectorLoads };
 }
 
 const loadOptions = (extra = {}) => ({
@@ -265,9 +293,300 @@ const loadOptions = (extra = {}) => ({
   ...extra,
 });
 
+const cacheOptions = { cacheName: CACHE_NAME };
+const projectorOptions = { useCache: true, cacheName: CACHE_NAME };
+const targetCacheFields = (runtime) => [runtime._modelSource, runtime._modelCacheState, runtime._modelCacheName];
+
+function createProjectorRuntime(fetchModel, userAgent) {
+  const fixture = createRuntime(fetchModel, userAgent);
+  fixture.runtime._modelBytes = 1;
+  fixture.runtime._core = fixture.core;
+  return fixture;
+}
+
 // 40 bytes in 16-byte parts would need a 16 MiB buffer; the runtime cases use
 // the production part size and a body smaller than one part.
 const CASES = [
+  ['isModelCached reports a WebKit prefetch and eviction without mutating state', () => withFakes({}, async (caches, locks) => {
+    const { runtime, fetches } = createRuntime(() => bodyOf(TEN), SAFARI);
+    await runtime.prefetchModelToCache(MODEL_URL, cacheOptions);
+    assert.equal(caches.entries.has(MODEL_URL), false);
+    runtime._modelCacheName = 'loaded-model-cache';
+    const metadata = [...targetCacheFields(runtime), [...runtime._runtimeNotes]];
+    const activity = () => [caches.calls.open.length, caches.calls.put.length, caches.calls.delete.length, caches.calls.keys, locks.requests.length];
+    const before = activity();
+    assert.equal(await runtime.isModelCached(MODEL_URL + '#x', cacheOptions), true);
+    assert.deepEqual(activity(), before);
+    assert.deepEqual([...targetCacheFields(runtime), runtime._runtimeNotes], metadata);
+    assert.deepEqual(fetches, [MODEL_URL]);
+    assert.equal(await runtime.evictModelFromCache(MODEL_URL, cacheOptions), true);
+    assert.equal(await runtime.isModelCached(MODEL_URL, cacheOptions), false);
+  })],
+
+  ['isModelCached follows the committed manifest during a WebKit store', () => withFakes({}, async (caches) => {
+    const { runtime } = createRuntime(() => assert.fail('unexpected fetch'), SAFARI);
+    for (const hadPrevious of [false, true]) {
+      const source = controlledResponse();
+      const store = startModelCachePartStore(caches.cache, MODEL_URL, source.response, CACHE_NAME, 4);
+      await withStoreReader(store, async (reader) => {
+        source.push(TEN.slice(0, 5));
+        assert.equal((await reader.read()).done, false);
+        assert.ok(caches.urls(PART).length > 0);
+        assert.equal(await runtime.isModelCached(MODEL_URL, cacheOptions), hadPrevious);
+        source.close();
+        assert.equal((await reader.read()).done, true);
+        await store.stored;
+        assert.equal(await runtime.isModelCached(MODEL_URL, cacheOptions), true);
+      });
+    }
+  })],
+
+  ['isModelCached validates the WebKit manifest without looking up parts', () => withFakes({}, async (caches) => {
+    await storeParts(caches);
+    const [manifest] = caches.urls(MANIFEST);
+    await caches.cache.delete(caches.urls(PART)[0]);
+    const lookups = caches.calls.match.length;
+    const keyScans = caches.calls.keys;
+    const { runtime } = createRuntime(() => assert.fail('unexpected fetch'), SAFARI);
+    assert.equal(await runtime.isModelCached(MODEL_URL, cacheOptions), true);
+    assert.deepEqual(caches.calls.match.slice(lookups), [manifest]);
+    assert.equal(caches.calls.keys, keyScans);
+    caches.manifest().set('x-llamadart-part-count', '999');
+    assert.equal(await runtime.isModelCached(MODEL_URL, cacheOptions), false);
+  })],
+
+  ['isModelCached on other engines follows only the whole-body entry', () => withFakes({}, async (caches) => {
+    const { runtime } = createRuntime(() => bodyOf(TEN), 'Chrome');
+    await runtime.loadModelFromUrl(MODEL_URL, loadOptions({ recordCacheMetadata: false }));
+    assert.equal(runtime._modelCacheName, CACHE_NAME);
+    assert.equal(runtime._modelCacheState, 'stored');
+    assert.equal(await runtime.isModelCached(MODEL_URL, cacheOptions), true);
+    await runtime.evictModelFromCache(MODEL_URL, cacheOptions);
+    assert.equal(await runtime.isModelCached(MODEL_URL, cacheOptions), false);
+    await storeParts(caches);
+    const lookups = caches.calls.match.length;
+    const keyScans = caches.calls.keys;
+    assert.equal(await runtime.isModelCached(MODEL_URL, cacheOptions), false);
+    assert.deepEqual(caches.calls.match.slice(lookups), [MODEL_URL]);
+    assert.equal(caches.calls.keys, keyScans);
+  })],
+
+  ['isModelCached recognizes legacy WebKit whole-body entries', () => withFakes({}, async (caches) => {
+    const { runtime } = createRuntime(() => assert.fail('unexpected fetch'), SAFARI);
+    const legacyBody = controlledResponse();
+    const match = caches.storage.match;
+    caches.storage.match = async (url, options) => (
+      url === MODEL_URL ? legacyBody.response : match(url, options)
+    );
+    assert.equal(await runtime.isModelCached(MODEL_URL, cacheOptions), true);
+    assert.equal(legacyBody.state.reads, 0);
+    assert.equal(legacyBody.state.cancelled, true);
+  })],
+
+  ['isModelCached requires every explicitly listed or implicit split shard', () => withFakes({}, async (caches) => {
+    const { runtime } = createRuntime(() => assert.fail('unexpected fetch'), 'Chrome');
+    const first = 'https://models.test/m-00001-of-00002.gguf';
+    const second = 'https://models.test/m-00002-of-00002.gguf';
+    await caches.cache.put(first, bodyOf(TEN));
+    assert.equal(await runtime.isModelCached([first, second], cacheOptions), false);
+    assert.equal(await runtime.isModelCached(first, cacheOptions), false);
+    await caches.cache.put(second, bodyOf(TEN));
+    assert.equal(await runtime.isModelCached([first, second], cacheOptions), true);
+    assert.equal(await runtime.isModelCached(first, cacheOptions), true);
+  })],
+
+  ['isModelCached returns false for an empty input or unavailable Cache Storage', () => withFakes({}, async (caches) => {
+    const { runtime } = createRuntime(() => assert.fail('unexpected fetch'), SAFARI);
+    assert.equal(await runtime.isModelCached([], cacheOptions), false);
+    assert.equal(await runtime.isModelCached('', cacheOptions), false);
+    assert.deepEqual(caches.calls.match, []);
+    caches.storage.match = async () => { throw new Error('Cache Storage access denied'); };
+    assert.equal(await runtime.isModelCached(MODEL_URL, cacheOptions), false);
+    delete globalThis.caches;
+    assert.equal(await runtime.isModelCached(MODEL_URL, cacheOptions), false);
+  })],
+
+  ['isModelCached does not create a missing named cache or search another cache', () => withFakes({}, async (caches) => {
+    const { runtime } = createRuntime(() => assert.fail('unexpected fetch'), SAFARI);
+    await storeParts(caches);
+    await caches.cache.put(MODEL_URL, bodyOf(TEN));
+    const names = await caches.storage.keys();
+    assert.equal(await runtime.isModelCached(MODEL_URL, { cacheName: 'missing' }), false);
+    assert.deepEqual(await caches.storage.keys(), names);
+  })],
+
+  ...[SAFARI, 'Chrome'].map((agent) => [
+    `a prefetched projector is staged without a request (${agent === SAFARI ? 'WebKit' : 'Chromium'})`,
+    () => withFakes({}, async () => {
+      const { runtime, fetches, projectorLoads } = createProjectorRuntime(() => bodyOf(TEN), agent);
+      await runtime.prefetchModelToCache(PROJECTOR_URL, cacheOptions);
+      runtime._modelSource = 'network';
+      runtime._modelCacheState = 'disabled';
+      runtime._modelCacheName = 'loaded-model-cache';
+      const target = targetCacheFields(runtime);
+      assert.equal(await runtime.loadMultimodalProjector(PROJECTOR_URL, projectorOptions), 1);
+      assert.deepEqual(fetches, [PROJECTOR_URL]);
+      assert.deepEqual(projectorLoads, [TEN]);
+      assert.deepEqual(targetCacheFields(runtime), target);
+    }),
+  ]),
+
+  ['a projector without cache opt-in fetches no-store even after prefetch', () => withFakes({}, async (caches) => {
+    const inits = [];
+    const { runtime } = createProjectorRuntime((url, init) => { inits.push(init); return bodyOf(TEN); }, SAFARI);
+    await runtime.prefetchModelToCache(PROJECTOR_URL, cacheOptions);
+    const snapshots = [caches.calls.put.length, caches.calls.match.length, caches.entries.size];
+    await runtime.loadMultimodalProjector(PROJECTOR_URL);
+    assert.equal(inits.length, 2);
+    assert.deepEqual(inits[1], { cache: 'no-store' });
+    assert.deepEqual([caches.calls.put.length, caches.calls.match.length, caches.entries.size], snapshots);
+  })],
+
+  ['a projector cache miss commits before the native load on both engines', async () => {
+    for (const agent of [SAFARI, 'Chrome']) {
+      await withFakes({}, async (caches, locks) => {
+        const { runtime, core, fetches, projectorLoads } = createProjectorRuntime(() => bodyOf(TEN), agent);
+        const ccall = core.ccall;
+        core.ccall = (name, ...args) => {
+          if (name === 'llamadart_webgpu_mmproj_load') {
+            assert.equal(locks.held.size, 0);
+            assert.equal(caches.entries.has(PROJECTOR_URL), agent === 'Chrome');
+            assert.equal(caches.urls(MANIFEST).length, agent === SAFARI ? 1 : 0);
+          }
+          return ccall(name, ...args);
+        };
+        assert.equal(await runtime.loadMultimodalProjector(PROJECTOR_URL, projectorOptions), 1);
+        assert.equal(await runtime.isModelCached(PROJECTOR_URL, cacheOptions), true);
+        assert.deepEqual(fetches, [PROJECTOR_URL]);
+        assert.deepEqual(projectorLoads, [TEN]);
+      });
+    }
+  }],
+
+  ['a concurrent prefetch cannot change the projector cache lock or metadata', () => withFakes({}, async (caches, locks) => {
+    const source = controlledResponse();
+    const store = startModelCachePartStore(caches.cache, PROJECTOR_URL, source.response, CACHE_NAME, 4);
+    await withStoreReader(store, async (reader) => {
+      source.push(TEN.slice(0, 5));
+      assert.equal((await reader.read()).done, false);
+      const projectorLock = locks.requests[0].name;
+      const requested = Promise.withResolvers();
+      const delayedResponse = Promise.withResolvers();
+      const { runtime, projectorLoads } = createProjectorRuntime((url) => {
+        if (url !== PROJECTOR_URL) return bodyOf(TEN);
+        requested.resolve();
+        return delayedResponse.promise;
+      }, SAFARI);
+      const originalTarget = targetCacheFields(runtime);
+      const projector = runtime.loadMultimodalProjector(PROJECTOR_URL, projectorOptions);
+      try {
+        await requested.promise;
+        assert.deepEqual(targetCacheFields(runtime), originalTarget);
+        await runtime.prefetchModelToCache(MODEL_URL, { cacheName: 'other-cache' });
+        const prefetchTarget = targetCacheFields(runtime);
+        delayedResponse.resolve(bodyOf([31, 32, 33]));
+        assert.equal(await projector, 1);
+        assert.deepEqual(projectorLoads, [[31, 32, 33]]);
+        assert.equal(locks.requests.at(-1).name, projectorLock);
+        assert.deepEqual(targetCacheFields(runtime), prefetchTarget);
+        assert.equal(await runtime.isModelCached(PROJECTOR_URL, cacheOptions), false);
+
+        source.push(TEN.slice(5));
+        source.close();
+        assert.equal((await reader.read()).done, false);
+        assert.equal((await reader.read()).done, true);
+        await store.stored;
+        const opened = await openModelCacheParts(caches.cache, PROJECTOR_URL, CACHE_NAME);
+        assert.deepEqual(await readAll(opened.response), TEN);
+      } finally {
+        delayedResponse.resolve(bodyOf(TEN));
+        await projector.catch(() => {});
+      }
+    });
+  })],
+
+  ['a bodyless WebKit projector response creates no URL-keyed cache entry', () => withFakes({}, async (caches) => {
+    const { runtime, core } = createProjectorRuntime(() => new Response(null, { status: 204 }), SAFARI);
+    const ccall = core.ccall;
+    core.ccall = (name, ...args) => name === 'llamadart_webgpu_mmproj_load' ? 2 : ccall(name, ...args);
+    await assert.rejects(runtime.loadMultimodalProjector(PROJECTOR_URL, projectorOptions), /Failed to load multimodal projector/);
+    assert.equal(caches.entries.size, 0);
+    assert.equal(await runtime.isModelCached(PROJECTOR_URL, cacheOptions), false);
+  })],
+
+  ['a damaged projector part retries once and bypasses a locked cache', async () => {
+    for (const locked of [false, true]) {
+      await withFakes({}, async (caches, locks) => {
+        const inits = [];
+        const { runtime, fetches, projectorLoads } = createProjectorRuntime((url, init) => {
+          inits.push(init);
+          return bodyOf(TEN);
+        }, SAFARI);
+        await runtime.prefetchModelToCache(PROJECTOR_URL, cacheOptions);
+        const record = caches.manifest().get('x-llamadart-cache-record');
+        await caches.cache.delete(caches.urls(PART)[0]);
+        const lock = locks.requests[0].name;
+        const requests = locks.requests.length;
+        if (locked) locks.held.add(lock);
+        try {
+          assert.equal(await runtime.loadMultimodalProjector(PROJECTOR_URL, projectorOptions), 1);
+          assert.deepEqual(fetches, [PROJECTOR_URL, PROJECTOR_URL]);
+          assert.deepEqual(projectorLoads, [TEN]);
+          assert.ok(runtime._runtimeNotes.includes('mmproj_cache_entry_invalid'));
+          if (locked) {
+            assert.deepEqual(inits[1], { cache: 'no-store' });
+            assert.equal(locks.requests.length, requests + 1);
+            assert.equal(caches.manifest().get('x-llamadart-cache-record'), record);
+          } else {
+            assert.notEqual(caches.manifest().get('x-llamadart-cache-record'), record);
+            assert.deepEqual(caches.partBytes(record), []);
+          }
+        } finally {
+          locks.held.delete(lock);
+        }
+      });
+    }
+  }],
+
+  ['projector failure releases the part lock and cancels an unread body', () => withFakes({}, async (caches, locks) => {
+    const { runtime, core } = createProjectorRuntime(() => bodyOf(TEN), SAFARI);
+    const ccall = core.ccall;
+    core.ccall = (name, ...args) => name === 'llamadart_webgpu_mmproj_load' ? 2 : ccall(name, ...args);
+    await assert.rejects(runtime.loadMultimodalProjector(PROJECTOR_URL, projectorOptions), /Failed to load multimodal projector/);
+    assert.equal(locks.held.size, 0);
+
+    const rejected = controlledResponse({}, 503);
+    runtime._fetchWithTimeout = async () => rejected.response;
+    await assert.rejects(runtime.loadMultimodalProjector(MODEL_URL, projectorOptions), /Failed to fetch multimodal projector: 503/);
+    assert.equal(rejected.state.cancelled, true);
+    assert.equal(rejected.state.reads, 0);
+
+    const unread = controlledResponse();
+    runtime._fetchWithTimeout = async () => unread.response;
+    core.FS.open = () => { throw new Error('FS open failed'); };
+    await assert.rejects(runtime.loadMultimodalProjector(MODEL_URL, projectorOptions), /FS open failed/);
+    assert.equal(unread.state.cancelled, true);
+    assert.equal(unread.state.reads, 0);
+    assert.equal(locks.held.size, 0);
+    assert.equal(caches.urls(MANIFEST).length, 1);
+  })],
+
+  ['HTTP(S) is required for model, projector and prefetch cache stores', async () => {
+    for (const url of ['blob:https://models.test/asset', 'data:application/octet-stream,model']) {
+      await withFakes({}, async (caches, locks) => {
+        const { runtime, fetches } = createRuntime(() => bodyOf(TEN), SAFARI);
+        assert.equal(await runtime.loadModelFromUrl(url, loadOptions()), 1);
+        assert.equal(runtime._modelCacheState, 'disabled');
+        assert.equal(await runtime.loadMultimodalProjector(url, projectorOptions), 1);
+        assert.equal(await runtime.prefetchModelToCache(url, cacheOptions), 1);
+        assert.equal(runtime._modelCacheState, 'disabled');
+        assert.deepEqual(fetches, [url, url, url]);
+        assert.equal(caches.entries.size, 0);
+        assert.deepEqual(caches.calls.open, []);
+        assert.deepEqual(locks.requests, []);
+      });
+    }
+  }],
   ['a stored body becomes fixed-size parts under a manifest written last', () => withFakes({}, async (caches, locks) => {
     const source = controlledResponse({ etag: '"v1"', 'content-length': '10' });
     const store = startModelCachePartStore(caches.cache, MODEL_URL, source.response, CACHE_NAME, 4);

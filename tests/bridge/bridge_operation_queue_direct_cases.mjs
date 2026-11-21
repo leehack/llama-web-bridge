@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { LlamaWebGpuBridge } from '../../js/src/llama_webgpu_bridge.js';
 
 import {
   createDirectBridge,
@@ -351,6 +352,28 @@ export const DIRECT_CASES = [
     assert.equal(core.beginRejections, 1);
   }],
 
+  [40, 'model cache queries bypass direct operations and preserve metadata', async () => {
+    const { bridge } = createDirectBridge();
+    const { promise, resolve } = Promise.withResolvers();
+    const owner = bridge._runExclusive(() => promise, { kind: 'projector-load' });
+    await Promise.resolve();
+    const options = { cacheName: 'prefetch-cache' };
+    const metadata = bridge._metadata;
+    const calls = [];
+    bridge._runtime.isModelCached = async (...args) => { calls.push(args); return true; };
+    try {
+      assert.equal(LlamaWebGpuBridge.supportsModelCacheQuery, true);
+      const query = settleQuietly(bridge.isModelCached('model.gguf', options));
+      await Promise.resolve();
+      assert.deepEqual(calls, [['model.gguf', options]]);
+      assert.equal(await query, true);
+      assert.equal(bridge._metadata, metadata);
+    } finally {
+      resolve();
+      await owner;
+    }
+  }],
+
   [23, 'unqueued helpers reject after dispose without resurrecting the runtime (direct)', async () => {
     const { bridge } = createDirectBridge();
     let runtimesCreated = 0;
@@ -364,6 +387,7 @@ export const DIRECT_CASES = [
 
     await assert.rejects(bridge.prefetchModelToCache('model.gguf'), /Bridge has been disposed/);
     await assert.rejects(bridge.evictModelFromCache('model.gguf'), /Bridge has been disposed/);
+    await assert.rejects(bridge.isModelCached('model.gguf'), /Bridge has been disposed/);
     await assert.rejects(
       bridge.applyChatTemplate([{ role: 'user', content: 'hi' }], true),
       /Bridge has been disposed/,

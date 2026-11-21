@@ -27,6 +27,7 @@ import type {
   EmbedOptions,
   LoadModelOptions,
   LoraAdapterLoadOptions,
+  MultimodalProjectorLoadOptions,
   TextToSpeechOptions,
 } from './llama_webgpu_bridge.d.ts';
 
@@ -343,7 +344,10 @@ export function installBridgeWorkerHost() {
       }
 
       if (method === 'loadMultimodalProjector') {
-        const value = await bridge.loadMultimodalProjector(args[0] as string);
+        const value = await bridge.loadMultimodalProjector(
+          args[0] as string,
+          args[1] as MultimodalProjectorLoadOptions | undefined,
+        );
         self.postMessage({ type: 'result', id, value, state: snapshotBridgeState(bridge) });
         return;
       }

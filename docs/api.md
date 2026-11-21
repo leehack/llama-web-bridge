@@ -128,7 +128,7 @@ These methods are deliberately **not** queued:
 | --- | --- |
 | `cancel()` | Out-of-band control signal that reaches the running operation immediately, scoped to the worker generation and runtime that operation captured. |
 | `setLogLevel(level)` | Synchronous, best-effort control signal; delivery failures are absorbed without switching execution modes. |
-| `prefetchModelToCache()`, `evictModelFromCache()` | Cache and network operations that do not enter the model runtime. |
+| `prefetchModelToCache()`, `evictModelFromCache()`, `isModelCached()` | Cache and network operations that do not enter the model runtime. |
 | `getModelMetadata()`, `getContextSize()`, `isGpuActive()`, `getBackendName()`, `supportsVision()`, `supportsAudio()` | Synchronous accessors served from the current bridge snapshot. |
 
 ### Cancellation while queued
@@ -265,6 +265,11 @@ and unidentified Safari versions default to a one-layer cap.
 the flag; through v0.1.52 their worker mode rejects a function option with a
 `DataCloneError`. Check it before passing `onUsage`.
 
+#### `LlamaWebGpuBridge.supportsModelCacheQuery`
+
+`true` when the bridge exposes `isModelCached()` and accepts `useCache` in
+`loadMultimodalProjector()`. Earlier bridges lack the flag.
+
 ## Model loading and cache helpers
 
 When text generation on wasm64/WebGPU qualifies for CPU recovery, the reload
@@ -336,7 +341,7 @@ Common `options` keys:
 | `safariMaxGpuLayers` | Per-load Safari GPU layer cap. Recognized Safari 27 and newer default to no cap. Older or unidentified Safari versions default to one layer. |
 | `safariGpuProbe` | Set to `false` to skip the Safari load-time GPU probe. |
 | `nBatch`, `nUbatch` | Per-load batch and micro-batch overrides. |
-| `useCache`, `force` | Cache Storage controls for model responses. A cache miss writes the model to Cache Storage during the download. If the cache write fails, the download can still finish and load the model. Cancellation during transfer discards the incomplete entry. WebKit uses 16 MiB parts and a manifest under synthetic `https://llamadart-cache.invalid/` keys. A Web Lock allows one context to store a given model in a given cache at a time. When a load needs to download a model and the lock is busy, Web Locks are unavailable, or `crypto.randomUUID()` is unavailable, the load proceeds uncached. Other engines store one whole-body entry under the model URL. |
+| `useCache`, `force` | Cache Storage controls for HTTP(S) model responses. A cache miss writes the model to Cache Storage during the download. If the cache write fails, the download can still finish and load the model. Cancellation during transfer discards the incomplete entry. WebKit stores 16 MiB parts and a manifest. A Web Lock allows one context to store a given model in a given cache at a time. When a load needs to download a model and the lock is busy, Web Locks are unavailable, or `crypto.randomUUID()` is unavailable, the load proceeds uncached. The cache layout is private on every engine. Use `isModelCached()` to check for a cached model. |
 | `streamResumeRetries` | Maximum retry count per shard for resuming or restarting a streamed model download. |
 | `remoteFetchThresholdBytes`, `remoteFetchChunkBytes` | Per-load remote-fetch tuning. |
 | `forceRemoteFetchBackend` | Force the native fetch backend for a single-file model in a worker. On a single-thread worker, the load rejects with `SingleThreadCoreError` (`code: 'SINGLE_THREAD_CORE_UNSUPPORTED'`, `feature: 'remote_fetch_backend'`). Page-thread loads use streamed staging. |
@@ -378,9 +383,9 @@ prefetchModelToCache(url: string | string[], options?: LoadModelOptions): Promis
 Fetches model URL(s) into Cache Storage without loading them into llama.cpp.
 This uses a direct runtime helper even when the main bridge instance is currently
 worker-backed. Use it to warm the browser cache before calling
-`loadModelFromUrl()`. On WebKit, prefetch uses the same synthetic part and
-manifest keys as loading. Applications accessing Cache Storage directly cannot
-retrieve these entries with `caches.match(modelUrl)`.
+`loadModelFromUrl()`. After a successful cache-enabled HTTP(S) prefetch with
+Cache Storage available, [`isModelCached()`](#ismodelcachedurl-options) reports
+the committed record in the same cache. Other URL schemes load uncached.
 
 If a WebKit prefetch needs to download a model and cannot acquire its cache
 lock or generate a UUID, it downloads the body and then rejects with the
@@ -397,7 +402,31 @@ Cache Storage, including both whole-body entries and WebKit part entries.
 Eviction skips a model while an active store or cache cleanup holds its lock.
 This includes cleanup in the same context immediately after cancellation.
 Removing part entries requires Web Locks. Returns whether any requested model
-or shard was removed.
+or shard was removed. After successful eviction of an individual URL,
+`isModelCached()` for that URL returns `false` unless another writer commits it.
+
+### `isModelCached(url, options?)`
+
+```ts
+isModelCached(url: string | string[], options?: ModelCacheQueryOptions): Promise<boolean>
+```
+
+Resolves `true` when the bridge cache holds a committed record for every HTTP(S)
+URL. A WebKit manifest or a whole-body entry counts on WebKit. On other engines,
+only the whole-body entry counts. Pass `options.cacheName` to select a cache.
+The default is the bridge's configured `cacheName`.
+
+An explicit shard array or a split GGUF filename requires every shard. URL
+fragments are ignored. Empty input, missing entries, unavailable Cache Storage,
+and lookup errors resolve `false`.
+
+The query leaves Cache Storage and loaded-model metadata unchanged. It uses no
+Web Lock and consumes no response bodies. It can run during another bridge
+operation, including when the bridge is worker-backed. An in-progress part store
+becomes visible after its manifest commits. An older committed manifest stays
+visible during a refresh. The query does not verify individual parts. A later
+cache-enabled model load that finds a missing or damaged part can recover from
+the network.
 
 ## Text generation
 
@@ -918,10 +947,10 @@ affect later calls.
 
 ## Multimodal projector APIs
 
-### `loadMultimodalProjector(url)`
+### `loadMultimodalProjector(url, options?)`
 
 ```ts
-loadMultimodalProjector(url: string): Promise<unknown>
+loadMultimodalProjector(url: string, options?: MultimodalProjectorLoadOptions): Promise<unknown>
 ```
 
 Loads a multimodal projector (`mmproj`) file and updates the vision/audio
@@ -930,6 +959,17 @@ for `loadModelFromUrl()`. Once loaded, the downloaded file is freed from the
 core filesystem, so it does not occupy the WASM heap. Multimodal generation uses `createCompletion(prompt,
 { parts })` after this succeeds. The bridge may restart or switch worker/direct
 execution modes to satisfy projector constraints.
+
+| Option | Behavior |
+| --- | --- |
+| `useCache` | Set to `true` to use the bridge cache for HTTP(S) projectors. The default is `false`, which preserves the `no-store` request for existing callers, including callers with credential-bearing URLs. |
+| `cacheName` | Cache Storage cache name when `useCache` is enabled. Defaults to the bridge's configured `cacheName`. |
+
+With caching enabled, this loads a prefetched projector from Cache Storage or
+stores it while downloading. Use the same URL and cache name for prefetch and
+load. If a WebKit part is missing or damaged, the bridge records
+`mmproj_cache_entry_invalid` and retries from the network. Other URL schemes,
+including `blob:` and `data:`, load uncached.
 
 ### `unloadMultimodalProjector()`
 
@@ -1283,7 +1323,7 @@ include:
 | `llamadart.webgpu.core_variant` | `wasm32`, `wasm64`, or initialization state. |
 | `llamadart.webgpu.model_source` | Model load source, such as network/cache/remote fetch. |
 | `llamadart.webgpu.model_cache_state` | Cache Storage state for the loaded model. |
-| `llamadart.webgpu.runtime_notes` | Semicolon-separated bridge notes. When a memory64 core attempt fails, `core_mem64_unavailable:<reason>` accompanies `core_mem64_unavailable` and the bridge logs a warning with the same code before trying wasm32. The codes are `unsupported` (the engine rejects a memory64 feature probe after the core factory fails), `timeout` (the bridge's core initialization timer expires), and `init_error` (other failures, including module import). Single-thread cores report `core_single_thread` and `core_pthreads:0`. Automatic fetch-backed loading on a single-thread worker reports `model_fetch_backend_requires_pthreads` and streams into staging. `model_staging_js_backed` identifies JS-backed staging. `model_staging_heap_resident` identifies the final staged model file backed by a wasm heap block. When an eligible load uses JS chunks, `model_staging_heap_resident_unavailable:<reason>` reports `unknown_size` for an unverified decoded size, `unsupported` for an older or fixed-memory core, or the native allocation error code. Model downloads report `model_stream_resume_validated` for verified resumes, `model_stream_resume_unvalidated` for resumes without sufficient validation, and `model_stream_restart:<reason>` when a response requires restarting at zero. `model_cache_parts` identifies a WebKit part entry used or stored by the operation. `model_cache_entry_invalid` reports a missing or damaged part, and `model_stream_restart:cache` marks the shard retry. `gpu_unavailable:<reason>` (`no_webgpu`, `no_adapter`, `adapter_missing_shader_f16`, `unknown`) says why a load with `nGpuLayers > 0` runs on the CPU. The bridge also logs one warning. Chrome hides `shader-f16` on NVIDIA drivers older than 615.71, and ggml-webgpu then registers no device. Safari reports `safari_gpu_layers_capped:<n>` when the cap lowers the requested count, `safari_gpu_probe_embedding` when probing with embeddings, `safari_gpu_probe_passed` or `safari_gpu_probe_failed` for the initial probe, `safari_gpu_probe_skipped_input_too_long` when both embedding prompt pairs exceed the effective microbatch, and `safari_fallback_cpu` when a retry loads on the CPU. |
+| `llamadart.webgpu.runtime_notes` | Semicolon-separated bridge notes. When a memory64 core attempt fails, `core_mem64_unavailable:<reason>` accompanies `core_mem64_unavailable` and the bridge logs a warning with the same code before trying wasm32. The codes are `unsupported` (the engine rejects a memory64 feature probe after the core factory fails), `timeout` (the bridge's core initialization timer expires), and `init_error` (other failures, including module import). Single-thread cores report `core_single_thread` and `core_pthreads:0`. Automatic fetch-backed loading on a single-thread worker reports `model_fetch_backend_requires_pthreads` and streams into staging. `model_staging_js_backed` identifies JS-backed staging. `model_staging_heap_resident` identifies the final staged model file backed by a wasm heap block. When an eligible load uses JS chunks, `model_staging_heap_resident_unavailable:<reason>` reports `unknown_size` for an unverified decoded size, `unsupported` for an older or fixed-memory core, or the native allocation error code. Model downloads report `model_stream_resume_validated` for verified resumes, `model_stream_resume_unvalidated` for resumes without sufficient validation, and `model_stream_restart:<reason>` when a response requires restarting at zero. `model_cache_parts` identifies a WebKit part entry used or stored by the operation. `model_cache_entry_invalid` reports a missing or damaged part, and `model_stream_restart:cache` marks the shard retry. `mmproj_cache_entry_invalid` marks a projector retry after a missing or damaged part. `gpu_unavailable:<reason>` (`no_webgpu`, `no_adapter`, `adapter_missing_shader_f16`, `unknown`) says why a load with `nGpuLayers > 0` runs on the CPU. The bridge also logs one warning. Chrome hides `shader-f16` on NVIDIA drivers older than 615.71, and ggml-webgpu then registers no device. Safari reports `safari_gpu_layers_capped:<n>` when the cap lowers the requested count, `safari_gpu_probe_embedding` when probing with embeddings, `safari_gpu_probe_passed` or `safari_gpu_probe_failed` for the initial probe, `safari_gpu_probe_skipped_input_too_long` when both embedding prompt pairs exceed the effective microbatch, and `safari_fallback_cpu` when a retry loads on the CPU. |
 | `llamadart.webgpu.mmproj_loaded` | `1` when a projector is loaded. |
 | `llamadart.webgpu.supports_vision` | `1` when the active projector supports vision. |
 | `llamadart.webgpu.supports_audio` | `1` when the active projector supports audio. |
