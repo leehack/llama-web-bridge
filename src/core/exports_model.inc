@@ -132,23 +132,15 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_load_model_from_url(
       ? static_cast<uint32_t>(chunk_size)
       : static_cast<uint32_t>(16 * 1024 * 1024);
 
-  // A single-file WasmFS mount fetches the backend URL verbatim.
-  backend_t fetch_backend =
-      wasmfs_create_fetch_backend(model_url, effective_chunk_size);
-  if (fetch_backend == nullptr) {
-    set_error("Failed to initialize fetch-backed model loader");
-    return -5;
-  }
-
-  // Keep signed URLs out of the local filename and reuse the backend's proxy
-  // worker if an application file already occupies a generated path.
+  // Keep signed URLs out of the local filename and preserve occupied paths.
   static uint64_t fetch_file_counter = 0;
   std::string fetch_file_path;
   int fd;
   do {
     fetch_file_path =
         "/remote_model_" + std::to_string(++fetch_file_counter) + ".gguf";
-    fd = wasmfs_create_file(fetch_file_path.c_str(), 0444, fetch_backend);
+    fd = llamadart_webgpu::create_shared_fetch_file(
+        fetch_file_path.c_str(), model_url, effective_chunk_size);
   } while (fd == -EEXIST);
   if (fd < 0) {
     set_error(

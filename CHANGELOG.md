@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Reuse one WasmFS fetch worker per threaded core. Each model mount keeps its own URL and chunk size, so the fifth consecutive fetch-backed load no longer stalls. (#301)
+
 - Use the full GGUF URL, including its query string, for forced and automatic WasmFS fetch-backed model loads. Mount the model at a short local path so long signed URLs can load. (#288)
 
 - End a threaded core's pthread runtime when a direct-mode bridge is disposed or its core retires, so Chromium can collect the core and its memory. A core supplied through `coreModuleFactory` keeps running after `dispose()`. (#262)
