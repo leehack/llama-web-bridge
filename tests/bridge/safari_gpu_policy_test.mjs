@@ -7,11 +7,14 @@ import test, { after } from 'node:test';
 import { fileURLToPath } from 'node:url';
 
 import * as environment from '../../js/src/internal/environment.ts';
-import { createDirectBridge } from './bridge_operation_queue_fixtures.mjs';
+import { LlamaWebGpuBridge } from '../../js/src/llama_webgpu_bridge.js';
+import { createStubCore } from './bridge_operation_queue_fixtures.mjs';
 import { readNativeCoreSource } from './native_core_source.mjs';
 
 const MAC = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko)';
 const safari = (version) => `${MAC} Version/${version} Safari/605.1.15`;
+const IPHONE_26 = 'Mozilla/5.0 (iPhone; CPU iPhone OS 26_5 like Mac OS X) AppleWebKit/605.1.15 '
+  + '(KHTML, like Gecko) Version/26.5 Mobile/15E148 Safari/604.1';
 const IPHONE_27 = 'Mozilla/5.0 (iPhone; CPU iPhone OS 27_0 like Mac OS X) AppleWebKit/605.1.15 '
   + '(KHTML, like Gecko) Version/27.0 Mobile/15E148 Safari/604.1';
 const IPAD_27 = IPHONE_27.replace('iPhone; CPU iPhone OS', 'iPad; CPU OS');
@@ -88,6 +91,7 @@ int main(int argc, char **argv) {
 
 async function load({
   userAgent,
+  config = { nGpuLayers: 99 },
   options = {},
   embeddingModel = false,
   legacyCore = false,
@@ -100,8 +104,10 @@ async function load({
   const oldNavigator = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
   Object.defineProperty(globalThis, 'navigator', { configurable: true, value: { userAgent } });
   try {
-    const { bridge, core } = createDirectBridge();
+    const bridge = new LlamaWebGpuBridge({ ...config, disableWorker: true });
+    const core = createStubCore();
     const runtime = bridge._runtime;
+    runtime._core = core;
     const ccall = core.ccall.bind(core);
     const loadedLayers = [];
     const nativeEmbedCalls = [];
@@ -155,7 +161,7 @@ async function load({
     };
 
     await bridge.loadModelFromUrl('https://models.test/model.gguf', {
-      nCtx: 128, nThreads: 1, nGpuLayers: 99, forceRemoteFetchBackend: false, useCache: false, ...options,
+      nCtx: 128, nThreads: 1, forceRemoteFetchBackend: false, useCache: false, ...options,
     });
     const metadata = bridge.getModelMetadata();
     return {
@@ -163,6 +169,7 @@ async function load({
       nativeEmbedCalls,
       lastEmbeddingJson,
       loadedLayers,
+      gpuActive: bridge.isGpuActive(),
       layers: metadata['llamadart.webgpu.n_gpu_layers'],
       notes: metadata['llamadart.webgpu.runtime_notes'].split(';').filter((note) => note.startsWith('safari_')),
     };
@@ -181,11 +188,31 @@ test('Safari 27 offloads every requested layer by default', async () => {
   }
 });
 
-test('an older or unknown Safari keeps the one-layer cap', async () => {
-  for (const userAgent of [safari('26.2'), `${MAC} Safari/605.1.15`]) {
-    const result = await load({ userAgent });
-    assert.deepEqual(result.loadedLayers, [1]);
-    assert.deepEqual(result.notes, ['safari_gpu_layers_capped:1', 'safari_gpu_probe_passed']);
+test('Safari below 27 applies its layer cap before loading and probing', async (t) => {
+  const requests = [
+    { name: 'macOS Safari, omitted', userAgent: safari('26.2'), config: {}, capped: true },
+    { name: 'iPhone Safari, omitted', config: {}, capped: true },
+    { name: 'unknown Safari, omitted', userAgent: `${MAC} Safari/605.1.15`, config: {}, capped: true },
+    { name: 'configured -2', config: { nGpuLayers: -2 }, capped: true },
+    ...[-1, -5, 0, 1, 99].map((nGpuLayers) => ({
+      name: `requested ${nGpuLayers}`,
+      options: { nGpuLayers },
+      layers: nGpuLayers === 0 ? 0 : 1,
+      capped: nGpuLayers !== 0 && nGpuLayers !== 1,
+    })),
+  ];
+  for (const { name, userAgent = IPHONE_26, config, options, layers = 1, capped } of requests) {
+    await t.test(name, async () => {
+      const result = await load({ userAgent, config, options });
+      assert.deepEqual(result.loadedLayers, [layers]);
+      assert.equal(result.layers, String(layers));
+      assert.equal(result.gpuActive, layers > 0);
+      assert.deepEqual(result.notes, [
+        ...(capped ? ['safari_gpu_layers_capped:1'] : []),
+        ...(layers > 0 ? ['safari_gpu_probe_passed'] : []),
+      ]);
+      assert.deepEqual(result.calls, { completion: layers > 0 ? 2 : 0, embed: 0 });
+    });
   }
 });
 
@@ -197,6 +224,38 @@ test('safariMaxGpuLayers overrides the default in both directions', async () => 
   const raised = await load({ userAgent: safari('26.2'), options: { safariMaxGpuLayers: 99 } });
   assert.deepEqual(raised.loadedLayers, [99]);
   assert.deepEqual(raised.notes, ['safari_gpu_probe_passed']);
+});
+
+test('Safari applies explicit caps to full-offload requests', async (t) => {
+  for (const [cap, layers] of [[4.5, 4], [0, 1], [-1, 1], [-Infinity, 1], [NaN, 1]]) {
+    await t.test(`cap ${cap}`, async () => {
+      const result = await load({ userAgent: IPHONE_26, config: {}, options: { safariMaxGpuLayers: cap } });
+      assert.deepEqual(result.loadedLayers, [layers]);
+      assert.deepEqual(result.notes, [`safari_gpu_layers_capped:${layers}`, 'safari_gpu_probe_passed']);
+    });
+  }
+  const result = await load({ userAgent: safari('27.0'), options: { nGpuLayers: -5, safariMaxGpuLayers: 4 } });
+  assert.deepEqual(result.loadedLayers, [4]);
+  assert.deepEqual(result.notes, ['safari_gpu_layers_capped:4', 'safari_gpu_probe_passed']);
+});
+
+test('Safari below 27 accepts Infinity to skip the GPU layer cap', async (t) => {
+  for (const [options, layers] of [[{}, -1], [{ nGpuLayers: -5 }, -5], [{ nGpuLayers: 99 }, 99]]) {
+    await t.test(`native count ${layers}`, async () => {
+      const result = await load({ userAgent: IPHONE_26, config: {}, options: { ...options, safariMaxGpuLayers: Infinity } });
+      assert.deepEqual(result.loadedLayers, [layers]);
+      assert.equal(result.notes.some((note) => note.startsWith('safari_gpu_layers_capped:')), false);
+    });
+  }
+});
+
+test('Safari 27 and non-WebKit browsers pass through uncapped counts', async () => {
+  for (const userAgent of [safari('27.0'), IPHONE_27, IPAD_27, CHROME]) {
+    for (const [options, layers] of [[{}, -1], [{ nGpuLayers: -5 }, -5], [{ nGpuLayers: 99 }, 99]]) {
+      const result = await load({ userAgent, config: {}, options });
+      assert.deepEqual(result.loadedLayers, [layers], userAgent);
+    }
+  }
 });
 
 test('another browser is neither capped nor probed', async () => {

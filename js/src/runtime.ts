@@ -80,6 +80,7 @@ import {
 } from './internal/model_source.ts';
 import {
   ModelStagingError,
+  effectiveOffloadedGpuLayers,
   isJsAllocationError,
   isSupportedJsModelStagingApiVersion,
   isWasm32TensorLimitText,
@@ -2726,13 +2727,14 @@ export class LlamaWebGpuBridgeRuntime {
       this._runtimeNotes.push('cpu_batch_tuned_default');
     }
 
-    if (this._isSafari && this._nGpuLayers > 0) {
+    const effectiveGpuLayers = effectiveOffloadedGpuLayers(this._nGpuLayers);
+    if (this._isSafari && effectiveGpuLayers > 0) {
       const requestedSafariMaxLayers = Number(options.safariMaxGpuLayers);
-      const safariMaxGpuLayers = Number.isFinite(requestedSafariMaxLayers)
+      const safariMaxGpuLayers = requestedSafariMaxLayers === Infinity || Number.isFinite(requestedSafariMaxLayers)
         ? Math.max(1, Math.trunc(requestedSafariMaxLayers))
         : this._safariDefaultMaxGpuLayers;
 
-      if (this._nGpuLayers > safariMaxGpuLayers) {
+      if (effectiveGpuLayers > safariMaxGpuLayers) {
         this._nGpuLayers = safariMaxGpuLayers;
         this._runtimeNotes.push(`safari_gpu_layers_capped:${safariMaxGpuLayers}`);
       }

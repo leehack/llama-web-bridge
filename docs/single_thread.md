@@ -45,10 +45,10 @@ heap costs on wasm32 and memory64.
 ## iOS Safari
 
 WebKit defaults to JS-backed staging with a supported core. On iOS Safari
-below 27, pass an explicit `nGpuLayers`. Set it to `0` for the highest
-model-size ceiling. A positive request defaults to at most one GPU layer on
-Safari below 27, which keeps GPU acceleration with a lower memory ceiling.
-The default full-offload request uses JS chunks.
+below 27, GPU offload defaults to at most one layer for omitted, negative, and
+positive `nGpuLayers` requests. Eligible one-layer loads use heap-resident
+staging. Set `nGpuLayers: 0` for the highest model-size ceiling on the CPU, or
+`safariMaxGpuLayers: Infinity` to lift the cap.
 
 WebKit can hold several copies of a Cache Storage entry in WebContent.
 On macOS Safari, a whole-model entry peaked at about three times the body
@@ -78,6 +78,12 @@ default caching at `nGpuLayers: 0`. Cold loads and cache-hit reloads worked in
 direct and worker modes, and direct loads also worked with 448 MiB of extra JS
 allocations. Prefetch wrote 48 parts and a manifest, and the next load hit the
 cache. [Device Run results](https://console.cloud.google.com/storage/browser/llamadart-cuda-qa-20260916-devicerun/automation/sessions/session-8319c979-b975-4560-ba07-35ea7bdb6954/).
+
+On the same iPhone model and iOS version, omitting `nGpuLayers` in direct and
+worker modes and passing `nGpuLayers: -1` in direct mode used one GPU layer.
+All three runs and a direct `nGpuLayers: 0` control generated text with the
+805 MB Q8 model, default caching, and heap-resident staging. WebContent had no
+jetsams. [Device Run results](https://console.cloud.google.com/storage/browser/llamadart-cuda-qa-20260916-devicerun/automation/sessions/session-e7d6dfa1-27eb-4cdd-90bd-e4bd37a5d736/).
 
 The memory estimates below come from Qwen3-0.6B-Q8_0 (767 MiB, `nCtx: 512`)
 and earlier memory-headroom probes on the same device model. The model

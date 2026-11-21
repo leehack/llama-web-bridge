@@ -295,6 +295,7 @@ function createStagingHarness({
 }
 
 const SAFARI_26 = 'Mozilla/5.0 (iPhone; CPU iPhone OS 26_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.5 Mobile/15E148 Safari/604.1';
+const MAC_SAFARI_27 = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/27.0 Safari/605.1.15';
 const CHROMIUM = 'Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36';
 
 test('closing a direct staging writer skips ownership checks on a retired core', () => {
@@ -343,7 +344,10 @@ test('heap model staging selects the writer using the effective layer count and 
     { name: 'mmap disabled', options: { nGpuLayers: 0, useMmap: false }, layers: 0 },
     { name: 'mlock', options: { nGpuLayers: 0, useMlock: true }, layers: 0 },
     { name: 'Safari capped', harness: { userAgent: SAFARI_26 }, options: { nGpuLayers: 99 }, layers: 1, heap: true },
-    { name: 'Safari omitted', harness: { userAgent: SAFARI_26 }, options: {}, layers: -1 },
+    { name: 'Safari omitted', harness: { userAgent: SAFARI_26 }, options: {}, layers: 1, heap: true },
+    { name: 'Safari negative', harness: { userAgent: SAFARI_26 }, options: { nGpuLayers: -5 }, layers: 1, heap: true },
+    { name: 'Safari uncapped override', harness: { userAgent: SAFARI_26 }, options: { safariMaxGpuLayers: Infinity }, layers: -1 },
+    { name: 'Safari 27 omitted', harness: { userAgent: MAC_SAFARI_27 }, options: {}, layers: -1 },
     { name: 'API v3', harness: { apiVersion: 3 }, options: { nGpuLayers: 0 }, layers: 0 },
     { name: 'missing heap export', missingExport: true, options: { nGpuLayers: 0 }, layers: 0 },
     { name: 'fixed heap', harness: { supportsHeapResident: 0 }, options: { nGpuLayers: 0 }, layers: 0 },
@@ -2511,7 +2515,6 @@ test('staging off cleanup matches main unchanged (retry-unlink, 404/503 unlink, 
 
 const IPHONE_CHROME = 'Mozilla/5.0 (iPhone; CPU iPhone OS 26_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) CriOS/153.0.7000.10 Mobile/15E148 Safari/604.1';
 const IPAD_DESKTOP = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.5 Safari/605.1.15';
-const MAC_SAFARI_27 = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/27.0 Safari/605.1.15';
 const FIREFOX = 'Mozilla/5.0 (X11; Linux x86_64; rv:150.0) Gecko/20100101 Firefox/150.0';
 
 test('an unset jsBackedModelStaging stages on WebKit and stays off elsewhere', () => {
@@ -2563,10 +2566,13 @@ test('model loads follow the default staging mode', async (t) => {
   const cases = [
     { name: 'iPhone Safari, zero layers', harness: { userAgent: SAFARI_26 }, options: { nGpuLayers: 0 }, staged: true, heap: true },
     { name: 'iPhone Safari, capped layers', harness: { userAgent: SAFARI_26 }, options: { nGpuLayers: 99 }, staged: true, heap: true },
-    { name: 'iPhone Safari, omitted layers', harness: { userAgent: SAFARI_26 }, options: {}, staged: true },
+    { name: 'iPhone Safari, omitted layers', harness: { userAgent: SAFARI_26 }, options: {}, staged: true, heap: true },
+    { name: 'iPhone Safari, negative layers', harness: { userAgent: SAFARI_26 }, options: { nGpuLayers: -1 }, staged: true, heap: true },
+    { name: 'iPhone Safari, uncapped override', harness: { userAgent: SAFARI_26 }, options: { safariMaxGpuLayers: Infinity }, staged: true },
     { name: 'iPhone Chrome', harness: { userAgent: IPHONE_CHROME }, options: { nGpuLayers: 0 }, staged: true, heap: true },
     { name: 'iPad desktop user agent', harness: { userAgent: IPAD_DESKTOP }, options: { nGpuLayers: 0 }, staged: true, heap: true },
     { name: 'macOS Safari 27, full offload', harness: { userAgent: MAC_SAFARI_27 }, options: { nGpuLayers: 99 }, staged: true },
+    { name: 'macOS Safari 27, omitted layers', harness: { userAgent: MAC_SAFARI_27 }, options: {}, staged: true },
     { name: 'explicit false on iPhone Safari', harness: { userAgent: SAFARI_26, jsBackedModelStaging: false }, options: { nGpuLayers: 0 } },
     { name: 'Chromium', harness: { userAgent: CHROMIUM }, options: { nGpuLayers: 0 } },
     { name: 'Firefox', harness: { userAgent: FIREFOX }, options: { nGpuLayers: 0 } },
