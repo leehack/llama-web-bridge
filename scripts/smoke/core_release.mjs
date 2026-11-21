@@ -11,8 +11,11 @@ import {
 } from './support.mjs';
 
 const CASES = ['dispose', 'abort'];
+const DECISION_CASE = 'decision-abort';
 const MODEL = 'release-smoke.gguf';
 const TRUNCATED = 'release-smoke-truncated.gguf';
+const DECISION_MODEL = 'decision-encoder.gguf';
+const DECISION_HEAD = 'decision-head.safetensors';
 
 export function parseArgs(argv) {
   return parseSmokeArgs(argv, {
@@ -22,11 +25,13 @@ export function parseArgs(argv) {
       { flag: '--dist-dir', type: 'path', default: () => env.path('BRIDGE_DIST_DIR', 'dist') },
       { flag: '--threading', type: 'string', choices: ['default', 'single'], default: () => 'default' },
       { flag: '--memory-mode', type: 'string', choices: ['wasm32', 'wasm64'], default: () => 'wasm32' },
-      { flag: '--case', type: 'string', choices: CASES },
+      { flag: '--case', type: 'string', choices: [...CASES, DECISION_CASE] },
       { flag: '--model-path', type: 'path', default: () => env.optionalPath('LLAMA_WEBGPU_SMOKE_MODEL_PATH') },
       { flag: '--model-url', type: 'string', default: () => env.string('LLAMA_WEBGPU_SMOKE_MODEL_URL') },
       { flag: '--model-sha256', type: 'string', default: () => env.string('LLAMA_WEBGPU_SMOKE_MODEL_SHA256') },
       { flag: '--model-cache-dir', type: 'path', default: () => env.path('LLAMA_WEBGPU_SMOKE_MODEL_CACHE', DEFAULT_MODEL_CACHE) },
+      { flag: '--decision-model-path', type: 'path' },
+      { flag: '--decision-head-path', type: 'path' },
       { flag: '--artifacts-dir', type: 'path' },
       { flag: '--timeout-ms', type: 'int', default: () => 90000 },
     ],
@@ -48,7 +53,7 @@ export default async (options) => {
 
 async function runBrowserCase(settings) {
   const { LlamaWebGpuBridge } = await import('/llama_webgpu_bridge.js');
-  const { scenario, modelUrl, truncatedUrl, single, memory64, coreName } = settings;
+  const { scenario, modelUrl, truncatedUrl, decisionModelUrl, decisionHeadUrl, single, memory64, coreName } = settings;
   const assert = (condition, message) => {
     if (!condition) throw new Error(message);
   };
@@ -85,8 +90,16 @@ async function runBrowserCase(settings) {
 
     window.__smokeStage = scenario + ':first-core';
     bridge = new LlamaWebGpuBridge(config);
-    await load();
-    assert((await complete()).length > 0, 'The first core generated nothing');
+    let decisionHandle;
+    if (decisionModelUrl) {
+      await bridge.loadModelFromUrl(decisionModelUrl, { ...options, nCtx: 512, nBatch: 512, nUbatch: 512 });
+      const head = await bridge.loadDecisionHead(decisionHeadUrl);
+      decisionHandle = head.handle;
+      assert(Number.isInteger(decisionHandle) && decisionHandle > 0, 'The first core did not load a decision head');
+    } else {
+      await load();
+      assert((await complete()).length > 0, 'The first core generated nothing');
+    }
     assert(cores().length === 1, `Expected one core, found ${cores().length}`);
     assert(bridge.getModelMetadata()['llamadart.webgpu.core_variant'] === (memory64 ? 'wasm64' : 'wasm32'),
       'The selected Wasm core did not match the requested memory mode');
@@ -110,6 +123,11 @@ async function runBrowserCase(settings) {
     assert(!result.liveCoreCollected, 'The core in use was collected, so the probe proves nothing');
     assert(result.firstCoreCollected,
       `The ${scenario === 'dispose' ? 'disposed' : 'retired'} core is still reachable after garbage collection`);
+    if (decisionHandle !== undefined) {
+      const stale = await bridge.runDecision(decisionHandle, [{ tokens: [1] }]).then(() => null, (error) => error);
+      assert(stale?.code === 'head-lost', `Expected head-lost for the stale decision handle: ${stale}`);
+      assert(await bridge.freeDecisionHead(decisionHandle) === undefined, 'Freeing a stale decision handle must be a no-op');
+    }
     assert((await complete()).length > 0, 'The replacement core generated nothing');
     result.ok = true;
   } catch (error) {
@@ -143,6 +161,12 @@ export function launchArgs(platform = process.platform, { single = false } = {})
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
+  const decision = args.case === DECISION_CASE;
+  if (decision) {
+    assert(args.decisionModelPath && args.decisionHeadPath,
+      '--case decision-abort requires --decision-model-path and --decision-head-path');
+  }
+  const scenarios = args.case === null ? CASES : [args.case];
   const modelPath = await resolvePinnedModel(args);
   const single = args.threading === 'single';
   const memory64 = args.memoryMode === 'wasm64';
@@ -152,15 +176,21 @@ async function main() {
     if (single) await copySingleThreadArtifacts(args.distDir, webRoot, { memory64 });
     else if (memory64) await copyMemory64Artifacts(args.distDir, webRoot);
     await stageFile(modelPath, path.join(webRoot, MODEL));
+    if (decision) {
+      await stageFile(args.decisionModelPath, path.join(webRoot, DECISION_MODEL));
+      await stageFile(args.decisionHeadPath, path.join(webRoot, DECISION_HEAD));
+    }
     const model = await fsp.readFile(modelPath);
     await fsp.writeFile(path.join(webRoot, TRUNCATED), model.subarray(0, 1_000_000));
     await fsp.writeFile(path.join(webRoot, 'tracked-core.js'), renderTrackedCore(coreName));
     return withServer(webRoot, async (url) => {
       const collected = {};
-      for (const scenario of CASES.filter((name) => args.case == null || args.case === name)) {
+      for (const scenario of scenarios) {
         const key = [args.threading, args.memoryMode, scenario].join('-');
         await fsp.writeFile(path.join(webRoot, 'index.html'), renderHarness({
           scenario, single, memory64, coreName, modelUrl: '/' + MODEL, truncatedUrl: '/' + TRUNCATED,
+          decisionModelUrl: decision ? '/' + DECISION_MODEL : null,
+          decisionHeadUrl: decision ? '/' + DECISION_HEAD : null,
         }));
         const payload = await runPollingPlaywright(url, args.timeoutMs, args.artifactsDir, {
           artifactPrefix: key,

@@ -73,6 +73,7 @@ test('direct mode end to end (fake core through coreModuleFactory)', async () =>
     && counts.retireHook === 1);
   check('notes carried to the new runtime', bridge._runtime._runtimeNotes.includes('core_retired'));
   check('metadata snapshot shows no model', !(Number(bridge.getModelMetadata()['llamadart.webgpu.model_bytes']) > 0));
+  assert.equal(bridge._decisionHeads.size, 0, 'the facade must release the retired head owner before stale-handle calls');
 
   const next = await bridge.tokenize('hi').catch((error) => error);
   check('next call rejects with ModelUnloadedError', next instanceof ModelUnloadedError
@@ -81,6 +82,7 @@ test('direct mode end to end (fake core through coreModuleFactory)', async () =>
   check('LoRA handle is gone', lora instanceof ModelUnloadedError);
   const head = await bridge.runDecision(1, [{ tokens: [1] }]).catch((error) => error);
   check('decision head rejects head-lost', head?.code === 'head-lost', String(head?.code));
+  assert.equal(await bridge.freeDecisionHead(1), undefined);
   // The retired runtime stays unusable through any stale reference.
   const stale = await first.tokenize('hi').catch((error) => error);
   check('stale runtime reference rethrows the abort, no native call', stale === trapError
@@ -89,6 +91,48 @@ test('direct mode end to end (fake core through coreModuleFactory)', async () =>
   await bridge.dispose();
   check('dispose after an abort makes no native call into the retired core', counts.total === callsAtAbort,
     `${counts.total - callsAtAbort} extra calls`);
+});
+
+test('direct runtime retirement keeps handles belonging to a live worker', () => {
+  const bridge = new LlamaWebGpuBridge({ disableWorker: true });
+  const runtime = bridge._runtime;
+  const worker = createProxy('live', healthyImpl);
+  const { handle: retiredHead } = bridge._registerDecisionHead(runtime, { handle: 7 });
+  bridge._workerProxy = worker;
+  const { handle: liveHead } = bridge._registerDecisionHead(worker, { handle: 8 });
+  bridge._loraAdapters.set(1, { owner: runtime, handle: 4, source: 'adapter.gguf', cacheOptions: {} });
+  bridge._loraAdapters.set(2, { owner: worker, handle: 5, source: 'worker-adapter.gguf', cacheOptions: {} });
+
+  runtime._handleCoreRetired(wasmTrap());
+
+  assert.equal(bridge._decisionHeads.has(retiredHead), false);
+  assert.equal(bridge._decisionHeads.get(liveHead)?.owner, worker);
+  assert.equal(bridge._loraAdapters.get(1)?.owner, null);
+  assert.equal(bridge._loraAdapters.get(2)?.owner, worker);
+});
+
+test('handle loads that finish after direct runtime retirement do not retain it', async () => {
+  const bridge = new LlamaWebGpuBridge({ disableWorker: true });
+  const first = bridge._runtime;
+  first.loadDecisionHead = async () => {
+    first._handleCoreRetired(wasmTrap());
+    return { handle: 7 };
+  };
+  const head = await bridge.loadDecisionHead(new Uint8Array([1]));
+  assert.equal(bridge._decisionHeads.has(head.handle), false);
+  assert.equal((await outcome(bridge.runDecision(head.handle, [{ tokens: [1] }]))).code, 'head-lost');
+  assert.equal(await bridge.freeDecisionHead(head.handle), undefined);
+
+  const second = bridge._runtime;
+  second.loadModelFromUrl = async function load() { this._modelBytes = 1; };
+  await bridge.loadModelFromUrl('model.gguf');
+  second.loadLoraAdapter = async () => {
+    second._handleCoreRetired(wasmTrap());
+    return { handle: 8 };
+  };
+  const lora = await bridge.loadLoraAdapter(new Uint8Array([1]));
+  assert.equal(bridge._loraAdapters.has(lora.handle), false);
+  await bridge.dispose();
 });
 
 test('direct mode: onAbort with no throwing call', async () => {

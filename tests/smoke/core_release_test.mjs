@@ -19,6 +19,14 @@ test('core release smoke accepts single-thread, wasm64 and case selections', () 
   assert.throws(() => parseArgs(['--case', 'invalid']), /invalid choice/);
 });
 
+test('core release smoke accepts a local decision encoder and head', () => {
+  const args = parseArgs(['--case', 'decision-abort', '--decision-model-path', 'encoder.gguf',
+    '--decision-head-path', 'head.safetensors']);
+  assert.equal(args.case, 'decision-abort');
+  assert.equal(args.decisionModelPath, 'encoder.gguf');
+  assert.equal(args.decisionHeadPath, 'head.safetensors');
+});
+
 test('the tracked core holds each core only through a WeakRef', () => {
   const source = renderTrackedCore('llama_webgpu_core_mem64');
   assert.match(source, /import createCore from '\/llama_webgpu_core_mem64\.js'/);

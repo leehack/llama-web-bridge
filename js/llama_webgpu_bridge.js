@@ -7577,6 +7577,7 @@ var LlamaWebGpuBridge = class {
     if (this._runtime !== runtime) {
       return;
     }
+    this._dropDecisionHeadsOf(runtime);
     this._coreRetirements = (this._coreRetirements || 0) + 1;
     const replacement = this._lifecycleState === "disposed" ? null : this._createRuntime();
     if (replacement) {
@@ -7591,6 +7592,8 @@ var LlamaWebGpuBridge = class {
     if (!this._workerProxy) {
       this._forgetLoadedModel();
       this._modelUnloadedAfterCoreAbort = true;
+    } else {
+      this._dropLoraAdaptersOf(runtime);
     }
     this._onCoreRetired?.();
   }
@@ -8473,7 +8476,11 @@ var LlamaWebGpuBridge = class {
         throw error;
       }
       try {
-        await this._runtime?.dispose?.();
+        const runtime = this._runtime;
+        if (runtime) {
+          this._dropDecisionHeadsOf(runtime);
+          await runtime.dispose?.();
+        }
       } catch (_) {
       }
       this._runtime = null;
@@ -9669,8 +9676,16 @@ var LlamaWebGpuBridge = class {
   _registerDecisionHead(owner, info) {
     const heads = this._decisionHeadMap();
     const handle = this._nextDecisionHandle++;
-    heads.set(handle, { owner, handle: Number(info?.handle) });
+    if (owner === this._decisionOwner()) {
+      heads.set(handle, { owner, handle: Number(info?.handle) });
+    }
     return { ...info, handle };
+  }
+  _dropDecisionHeadsOf(owner) {
+    const heads = this._decisionHeadMap();
+    for (const [handle, entry] of heads) {
+      if (entry.owner === owner) heads.delete(handle);
+    }
   }
   _decisionOwner() {
     return this._workerProxy || this._runtime || null;
@@ -10070,6 +10085,9 @@ var LlamaWebGpuBridge = class {
       source: retained,
       cacheOptions: { useCache: options.useCache, cacheName: options.cacheName }
     });
+    if (loaded.owner instanceof LlamaWebGpuBridgeRuntime && loaded.owner._coreRetired) {
+      this._dropLoraAdaptersOf(loaded.owner);
+    }
     return { handle };
   }
   async setLoraAdapter(handle, scale = 1) {
@@ -10471,6 +10489,7 @@ var LlamaWebGpuBridge = class {
       if (this._runtime) {
         const runtime = this._runtime;
         this._runtime = null;
+        this._dropDecisionHeadsOf(runtime);
         await runtime.dispose();
       }
     } finally {

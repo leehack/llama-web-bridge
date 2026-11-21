@@ -224,6 +224,15 @@ node scripts/smoke/core_release.mjs --dist-dir "$OUT_DIR"
 
 Repeat with `--memory-mode wasm64`, `--threading single`, and both flags together.
 
+To check collection while a stale decision handle is still live, pass a local
+Laya encoder and a head with embedded `laya.config` metadata:
+
+```bash
+node scripts/smoke/core_release.mjs --dist-dir "$OUT_DIR" --case decision-abort \
+  --decision-model-path /path/to/laya-Q8_0.gguf \
+  --decision-head-path /path/to/laya-head.safetensors
+```
+
 The shared-core staging regression uses the same pinned model and cache. Run it
 against a dist with all four cores to verify that a new bridge can load after
 an earlier bridge leaves a busy staging mount, when the application occupies
