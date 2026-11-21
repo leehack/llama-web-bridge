@@ -58,6 +58,9 @@ The external-path build recipe (`CCACHE_DIR`, `EM_CACHE`, `BUILD_DIR`,
 Validate Outputs. Run them from there; do not copy them here. Which smoke
 applies:
 
+- core disposal, retirement, or core `--pre-js`/`--post-js` changes:
+  `scripts/smoke/core_release.mjs` (default, `--memory-mode wasm64`,
+  `--threading single`, and both flags);
 - state-persistence or workflow changes:
   `scripts/smoke/state_persistence.mjs` (both default pthreads and
   `--threading single` for wasm32 and wasm64) against a built `OUT_DIR`;

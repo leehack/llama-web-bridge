@@ -32,7 +32,14 @@ Module['llamadartRetire'] = () => {
   let threads = -1;
   if (typeof PThread !== 'undefined') {
     threads = Object.keys(PThread.pthreads).length + PThread.unusedWorkers.length;
-    PThread.terminateAllThreads();
+    // Besides the pool, this wakes the calling thread's mailbox
+    // Atomics.waitAsync. The browser keeps a pending wait alive, and with it
+    // this module and its memory.
+    try {
+      PThread.terminateRuntime();
+    } catch (_) {
+      PThread.terminateAllThreads();
+    }
   }
   let stagedBytes = 0;
   const files = llamadartJsModelFsFiles();

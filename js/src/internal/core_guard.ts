@@ -39,6 +39,7 @@ interface CoreGuardState {
   retired: boolean;
   cause: unknown;
   retire: (cause: unknown, fromThrow: boolean) => void;
+  release: () => void;
 }
 
 interface CoreRetirementStats {
@@ -56,6 +57,13 @@ export function unguardedCore<T extends object>(core: T): T {
 
 export function isCoreRetired(core: unknown): boolean {
   return !!core && typeof core === 'object' && guardStates.get(core)?.retired === true;
+}
+
+// Disposal uses the retirement hook without triggering abort recovery.
+export function releaseCore(core: unknown): void {
+  if (core && typeof core === 'object') {
+    guardStates.get(core)?.release();
+  }
 }
 
 // Retires a guarded core for an abort no guarded call observed (onAbort).
@@ -77,6 +85,8 @@ export function guardCore<T extends object>(
   const wrappers = new WeakMap<object, unknown>();
   const coreRuntimeError = (rawModule as { llamadartWasmRuntimeError?: unknown }).llamadartWasmRuntimeError;
   const isTrap = (error: unknown) => isWasmRuntimeError(error, coreRuntimeError);
+  const runRetireHook = () =>
+    (rawModule as { llamadartRetire?: () => CoreRetirementStats }).llamadartRetire?.();
   const state: CoreGuardState = {
     retired: false,
     cause: null,
@@ -92,11 +102,19 @@ export function guardCore<T extends object>(
       state.cause = cause;
       let stats: CoreRetirementStats | undefined;
       try {
-        stats = (rawModule as { llamadartRetire?: () => CoreRetirementStats }).llamadartRetire?.();
+        stats = runRetireHook();
       } catch (_) {
-        // The hook is plain JS; a failure must not hide the abort.
+        // A release failure must not hide the abort.
       }
       onRetired(cause, stats);
+    },
+    release() {
+      if (state.retired) {
+        return;
+      }
+      state.retired = true;
+      state.cause = new Error('The bridge core was disposed');
+      runRetireHook();
     },
   };
 

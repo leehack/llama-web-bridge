@@ -179,7 +179,7 @@ require(
   new RegExp(
     String.raw`const mmprojPath = this\._mmProjPath;.*?`
       + String.raw`const mmprojFreeRc = Number\(\s*`
-      + String.raw`this\._core\.ccall\('llamadart_webgpu_mmproj_free', 'number'.*?`
+      + String.raw`core\.ccall\('llamadart_webgpu_mmproj_free', 'number'.*?`
       + String.raw`if \(mmprojFreeRc !== 0\).*?`
       + String.raw`llamadart_webgpu_shutdown'.*?this\._deleteFsFile\(mmprojPath\);`,
     's',

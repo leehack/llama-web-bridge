@@ -999,6 +999,9 @@ function checkCiRunsContracts({ ci, candidate, publish }, testFiles, errors) {
     'node scripts/smoke/cross_origin_assets.mjs',
     'node scripts/smoke/core_abort_recovery.mjs',
     'node scripts/smoke/core_abort_recovery.mjs --threading single',
+    'node scripts/smoke/core_release.mjs',
+    'node scripts/smoke/core_release.mjs --memory-mode wasm64',
+    'node scripts/smoke/core_release.mjs --threading single',
   ]) {
     check.require(
       ciBuildSteps.some((step) => step.run.trim() === command

@@ -81,8 +81,8 @@ Most methods require a model loaded by `loadModelFromUrl()` and reject with
 ### Native core aborts
 
 The bridge retires a core after its native abort callback or a
-`WebAssembly.RuntimeError`. It stops calling that core, terminates its
-pthread pool when available, and releases its JS-backed staging data.
+`WebAssembly.RuntimeError`. It stops calling that core, ends its pthread
+runtime when available, and releases its JS-backed staging data.
 
 - In direct mode, the call fails with the original error and the model is
   unloaded. Calls that need a model reject with `ModelUnloadedError` (code
@@ -1358,6 +1358,11 @@ dispose(): Promise<void>
 Terminates the worker proxy, shuts down the direct runtime if it exists, unloads
 model/projector state, and clears cached metadata. Call this when an application
 is done with a bridge instance.
+
+With updated bridge and core assets, direct-mode disposal also ends the pthread
+runtime of a core loaded through `coreModuleUrl` or `coreModuleUrlMem64`, so
+the browser can reclaim its memory. A core supplied through `coreModuleFactory`
+belongs to the application and keeps running after disposal.
 
 ## Worker host entrypoint
 
