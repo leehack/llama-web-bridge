@@ -233,9 +233,11 @@ node scripts/smoke/core_release.mjs --dist-dir "$OUT_DIR" --case decision-abort 
   --decision-head-path /path/to/laya-head.safetensors
 ```
 
-The WasmFS remote-fetch smoke uses the same pinned model to check range requests
-from application-owned and bridge-owned workers. With the state-smoke model
-environment variables set, run both threaded memory modes.
+The WasmFS remote-fetch smoke uses the same pinned model to check six consecutive
+fetch-backed loads on one core, varying the URLs and chunk sizes with
+`nThreads: 4`. It verifies inference and recovery after a native abort in both
+application-owned and bridge-owned workers. With the state-smoke model environment
+variables set, run both threaded memory modes.
 
 ```bash
 node scripts/smoke/remote_fetch_backend.mjs --dist-dir "$OUT_DIR"
