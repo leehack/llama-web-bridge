@@ -222,6 +222,7 @@ After publishing assets tag:
 
 ## Regression Smoke Guidance
 
+- For worker startup or core URL changes, run the [cross-origin assets smoke](CONTRIBUTING.md#validate-outputs).
 - For pthread/runtime changes, test a BERT-class embedding model in Chromium
   with cross-origin isolation enabled. The regression shape is:
   `loadModelFromUrl`, `tokenize`, `embed`, and `embedBatch` on a host where

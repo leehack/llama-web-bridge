@@ -317,6 +317,14 @@ export class EmbeddingError extends Error {
   constructor(code: EmbeddingErrorCode, message: string);
 }
 
+/** A threaded core on another origin could not start its pthread workers from a module blob. */
+export class BlobWorkerBlockedError extends Error {
+  readonly code: 'BLOB_WORKER_BLOCKED';
+  readonly reason: 'csp' | 'unavailable' | 'script';
+  readonly target: 'pthread';
+  constructor(reason: 'csp' | 'unavailable' | 'script', message?: string);
+}
+
 export type CrossOriginIsolationErrorCode = 'CROSS_ORIGIN_ISOLATION_REQUIRED';
 /** Thrown by a load or core init on a page that cannot share memory with workers, before the core starts. */
 export class CrossOriginIsolationError extends Error {
