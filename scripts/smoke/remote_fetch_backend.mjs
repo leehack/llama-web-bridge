@@ -114,14 +114,29 @@ async function runBrowserCase(settings, disableWorker) {
   try {
     if (!crossOriginIsolated) throw new Error('Expected cross-origin isolation');
     const { LlamaWebGpuBridge } = await import('/llama_webgpu_bridge.js');
-    bridge = new LlamaWebGpuBridge({
+    const config = {
       disableWorker,
       preferMemory64: settings.memoryMode === 'wasm64',
       coreModuleUrl: '/llama_webgpu_core.js',
       wasmUrl: '/llama_webgpu_core.wasm',
       coreModuleUrlMem64: '/llama_webgpu_core_mem64.js',
       wasmUrlMem64: '/llama_webgpu_core_mem64.wasm',
-    });
+    };
+    const { occupiedPaths } = settings;
+    let appCore;
+    if (occupiedPaths) {
+      const moduleUrl = config.preferMemory64 ? config.coreModuleUrlMem64 : config.coreModuleUrl;
+      if (config.preferMemory64) config.wasmUrl = config.wasmUrlMem64;
+      config.coreModuleFactory = async (options) => {
+        const { default: createCore } = await import(moduleUrl);
+        appCore = await createCore(options);
+        for (const [index, file] of occupiedPaths.entries()) {
+          appCore.FS.writeFile(file, Uint8Array.of(index + 1));
+        }
+        return appCore;
+      };
+    }
+    bridge = new LlamaWebGpuBridge(config);
     await bridge.loadModelFromUrl(location.origin + settings.modelPath, {
       nCtx: 64, nThreads: 1, nGpuLayers: 0, useCache: false,
       forceRemoteFetchBackend: true, remoteFetchChunkBytes: settings.chunkSize,
@@ -132,6 +147,10 @@ async function runBrowserCase(settings, disableWorker) {
     result.source = metadata['llamadart.webgpu.model_source'];
     result.notes = (metadata['llamadart.webgpu.runtime_notes'] || '').split(';');
     result.tokens = Array.from(await bridge.tokenize('Hello', true));
+    if (appCore) {
+      result.occupiedContents = occupiedPaths.map((file) => Array.from(appCore.FS.readFile(file)));
+      result.remoteModelFiles = appCore.FS.readdir('/').filter((file) => file.startsWith('remote_model_')).sort();
+    }
     if (disableWorker) {
       result.completion = await bridge.createCompletion('Hello', { nPredict: 1, temp: 0, seed: 1 });
     }
@@ -156,7 +175,9 @@ self.onmessage = async ({ data: settings }) => self.postMessage(await runBrowser
 }
 
 export function renderHarness(settings) {
-  const run = settings.scenario === 'app-worker' ? `
+  const run = settings.scenario === 'bridge-worker' ? `
+const runBrowserCase = ${runBrowserCase.toString()};
+window.__smokeResult = await runBrowserCase(settings, false);` : `
 const worker = new Worker('/app_worker.mjs', { type: 'module' });
 try {
   window.__smokeResult = await new Promise((resolve) => {
@@ -166,9 +187,7 @@ try {
   });
 } finally {
   worker.terminate();
-}` : `
-const runBrowserCase = ${runBrowserCase.toString()};
-window.__smokeResult = await runBrowserCase(settings, false);`;
+}`;
   return `<!doctype html>
 <meta charset="utf-8">
 <title>Remote fetch backend</title>
@@ -184,15 +203,21 @@ async function main() {
   const args = parseArgs(process.argv.slice(2));
   const model = await fsp.readFile(await resolvePinnedModel(args));
   assert.ok(model.length > 2 * CHUNK_SIZE, 'Use a model larger than two chunks to trigger WasmFS range fetches');
+  const scenarios = [
+    { scenario: 'app-worker', modelPath: MODEL_PATH },
+    { scenario: 'bridge-worker', modelPath: SIGNED_MODEL_PATH },
+    { scenario: 'app-worker-collision', modelPath: MODEL_PATH, occupiedPaths: ['/remote_model_1.gguf', '/remote_model_2.gguf'] },
+  ];
   const results = await withTempDir('remote-fetch-backend-', async (webRoot) => {
     await copyBridgeArtifacts(args.distDir, webRoot);
     if (args.memoryMode === 'wasm64') await copyMemory64Artifacts(args.distDir, webRoot);
     await fsp.writeFile(path.join(webRoot, 'app_worker.mjs'), renderAppWorker());
     return withModelRangeServer(webRoot, model, async (url, requests) => {
       const cases = {};
-      for (const [scenario, modelPath] of [['app-worker', MODEL_PATH], ['bridge-worker', SIGNED_MODEL_PATH]]) {
+      for (const entry of scenarios) {
         requests.length = 0;
-        const settings = { scenario, modelPath, memoryMode: args.memoryMode, chunkSize: CHUNK_SIZE };
+        const { scenario } = entry;
+        const settings = { ...entry, memoryMode: args.memoryMode, chunkSize: CHUNK_SIZE };
         await fsp.writeFile(path.join(webRoot, 'index.html'), renderHarness(settings));
         const result = await runPollingPlaywright(url, args.timeoutMs, args.artifactsDir, {
           artifactPrefix: `remote-fetch-${args.memoryMode}-${scenario}`,
@@ -206,18 +231,23 @@ async function main() {
   });
 
   const failures = [];
-  for (const [scenario, result] of Object.entries(results)) {
-    const modelPath = scenario === 'app-worker' ? MODEL_PATH : SIGNED_MODEL_PATH;
+  for (const { scenario, modelPath, occupiedPaths } of scenarios) {
+    const result = results[scenario];
     try {
       assert.equal(result.ok, true, [result.error, result.disposeError].filter(Boolean).join('\n'));
       assert.equal(result.crossOriginIsolated, true);
-      assert.equal(result.variant, args.memoryMode);
+      // The custom factory selects its core directly, outside variant detection.
+      if (!occupiedPaths) assert.equal(result.variant, args.memoryMode);
       if (scenario === 'bridge-worker') assert.equal(result.execution, 'worker');
       assert.equal(result.source, 'network-fetch');
       assert.ok(result.notes.includes('model_source_fetch_backend'));
       assert.ok(!result.notes.some((note) => note.startsWith('model_fetch_backend_failed')));
       assert.ok(result.tokens.length > 0, 'tokenize returned no tokens');
-      if (scenario === 'app-worker') assert.equal(typeof result.completion, 'string');
+      if (scenario !== 'bridge-worker') assert.equal(typeof result.completion, 'string');
+      if (occupiedPaths) {
+        assert.deepEqual(result.occupiedContents, occupiedPaths.map((_, index) => [index + 1]));
+        assert.deepEqual(result.remoteModelFiles, occupiedPaths.map((file) => path.basename(file)));
+      }
       assertModelRequests(result.requests, modelPath);
     } catch (error) {
       failures.push(`${scenario}: ${error.message}\nRequests: ${JSON.stringify(result.requests)}`);
@@ -225,6 +255,7 @@ async function main() {
   }
   assert.equal(failures.length, 0, failures.join('\n'));
   assert.deepEqual(results['bridge-worker'].tokens, results['app-worker'].tokens);
+  assert.deepEqual(results['app-worker-collision'].tokens, results['app-worker'].tokens);
   console.log(JSON.stringify({ ok: true, memoryMode: args.memoryMode, scenarios: Object.keys(results) }));
 }
 

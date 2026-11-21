@@ -58,8 +58,13 @@ test('native WasmFS fetch uses the complete model URL and a synthetic local moun
   assert.ok(loader, 'missing native model URL loader');
   assert.match(loader, /wasmfs_create_fetch_backend\(model_url,\s*effective_chunk_size\)/);
   assert.doesNotMatch(loader, /\.(?:rfind|substr)\(/);
-  assert.match(loader, /fetch_file_path\s*=\s*"\/remote_model_"\s*\+\s*std::to_string\(\+\+\w+\)\s*\+\s*"\.gguf"/);
-  assert.match(loader, /wasmfs_create_file\(\s*fetch_file_path\.c_str\(\),\s*0444,\s*fetch_backend\)/);
+  const retry = loader.match(/\bdo\s*\{([^}]*)\}\s*while\s*\(fd\s*==\s*-EEXIST\)/);
+  assert.ok(retry, 'the synthetic mount must retry on EEXIST');
+  const backends = [...loader.matchAll(/wasmfs_create_fetch_backend\(/g)];
+  assert.equal(backends.length, 1);
+  assert.ok(backends[0].index < retry.index, 'retries must reuse the existing backend');
+  assert.match(retry[1], /fetch_file_path\s*=\s*"\/remote_model_"\s*\+\s*std::to_string\(\+\+\w+\)\s*\+\s*"\.gguf"/);
+  assert.match(retry[1], /fd\s*=\s*wasmfs_create_file\(\s*fetch_file_path\.c_str\(\),\s*0444,\s*fetch_backend\)/);
 });
 
 test('the app-owned worker passes plain and signed model URLs intact to native fetch', async (t) => {
