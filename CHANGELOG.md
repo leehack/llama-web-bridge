@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Skip worker dispatch and reject with `AbortError` when one-shot `synthesizeSpeech()` is cancelled while awaiting worker readiness. (#268)
+
 - Resume interrupted model downloads when Safari reports `TypeError: Load failed`. (#278)
 
 - Cache WebKit model downloads and prefetches in 16 MiB parts. Cache hits read one part at a time. If a cached part is missing or damaged, `loadModelFromUrl()` can retry from the network. `loadDraftModel()` rejects that call with an error named `ModelCacheEntryError` in direct mode. The bridge drops the damaged entry for the next call when it can acquire the cache lock. (#257)
