@@ -1002,6 +1002,8 @@ function checkCiRunsContracts({ ci, candidate, publish }, testFiles, errors) {
     'node scripts/smoke/core_release.mjs',
     'node scripts/smoke/core_release.mjs --memory-mode wasm64',
     'node scripts/smoke/core_release.mjs --threading single',
+    'node scripts/smoke/remote_fetch_backend.mjs',
+    'node scripts/smoke/remote_fetch_backend.mjs --memory-mode wasm64',
   ]) {
     check.require(
       ciBuildSteps.some((step) => step.run.trim() === command

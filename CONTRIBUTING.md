@@ -233,6 +233,15 @@ node scripts/smoke/core_release.mjs --dist-dir "$OUT_DIR" --case decision-abort 
   --decision-head-path /path/to/laya-head.safetensors
 ```
 
+The WasmFS remote-fetch smoke uses the same pinned model to check range requests
+from application-owned and bridge-owned workers. With the state-smoke model
+environment variables set, run both threaded memory modes.
+
+```bash
+node scripts/smoke/remote_fetch_backend.mjs --dist-dir "$OUT_DIR"
+node scripts/smoke/remote_fetch_backend.mjs --dist-dir "$OUT_DIR" --memory-mode wasm64
+```
+
 The shared-core staging regression uses the same pinned model and cache. Run it
 against a dist with all four cores to verify that a new bridge can load after
 an earlier bridge leaves a busy staging mount, when the application occupies
