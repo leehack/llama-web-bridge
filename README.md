@@ -99,11 +99,9 @@ rules apply.
 
 ### 0.x compatibility
 
-npm versions mirror unsuffixed stable bridge asset tags (for example, `v0.1.X`
-becomes `0.1.X`). During `0.x`, patch releases keep the JavaScript API compatible while
-shipping fixes, additive features, and llama.cpp updates. Breaking JavaScript
-API changes advance the minor version. Strict SemVer guarantees begin at
-`1.0.0`.
+npm versions mirror unsuffixed stable bridge asset tags (`v0.1.X` becomes
+`0.1.X`). During `0.x`, any release may change the JavaScript API. See
+[CHANGELOG.md](CHANGELOG.md) for changes. Strict SemVer starts at `1.0.0`.
 
 ## Public API
 
