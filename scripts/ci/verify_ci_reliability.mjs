@@ -911,6 +911,7 @@ export const RELEASE_CONTRACT_SUITES = Object.freeze([
   'tests/release/archive_test.mjs',
   'tests/release/contract_test.mjs',
   'tests/release/manifest_test.mjs',
+  'tests/release/npm_package_test.mjs',
   'tests/release/publication_state_test.mjs',
   'tests/release/qualification_attestation_test.mjs',
   'tests/release/qualification_harness_test.mjs',
@@ -948,7 +949,7 @@ export function checkNoPython(workflows, errors) {
   }
 }
 
-function checkCiRunsContracts({ ci, candidate, publish }, testFiles, errors) {
+function checkCiRunsContracts({ ci, candidate, qualification, publish }, testFiles, errors) {
   const check = checker(errors);
   // Row 41: CI, candidate and publish run the JS contract tests without npm
   // lifecycle scripts and prove the tracked generated bridge matches its source.
@@ -997,6 +998,8 @@ function checkCiRunsContracts({ ci, candidate, publish }, testFiles, errors) {
     'node scripts/smoke/resume_integrity.mjs --baseline-dist-dir "$BRIDGE_DIST_DIR" --js-backed-model-staging',
     'node scripts/smoke/resume_integrity.mjs --baseline-dist-dir "$BRIDGE_DIST_DIR" --threading single --js-backed-model-staging',
     'node scripts/smoke/cross_origin_assets.mjs',
+    'npm ci --ignore-scripts --prefix scripts/smoke/bundler_deps',
+    'node scripts/smoke/bundler_packaging.mjs',
     'node scripts/smoke/core_abort_recovery.mjs',
     'node scripts/smoke/core_abort_recovery.mjs --threading single',
     'node scripts/smoke/core_release.mjs',
@@ -1009,6 +1012,13 @@ function checkCiRunsContracts({ ci, candidate, publish }, testFiles, errors) {
       ciBuildSteps.some((step) => step.run.trim() === command
         && step.raw.if === undefined && step.raw['continue-on-error'] === undefined),
       `${ci.path} job build-webgpu-bridge must run "${command}" unconditionally without continue-on-error`,
+    );
+  }
+  for (const workflow of [ci, candidate, qualification, publish]) {
+    check.require(
+      workflow.steps.every((step) => (workflow === ci && step.job === 'build-webgpu-bridge')
+        || !/scripts\/smoke\/(?:bundler_deps|bundler_packaging\.mjs)/.test(step.run)),
+      `${workflow.path} bundler smoke dependencies and execution must stay in build-webgpu-bridge`,
     );
   }
   // Row 57: CI builds the llama.cpp pin.

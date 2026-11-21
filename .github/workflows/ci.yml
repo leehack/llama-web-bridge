@@ -219,6 +219,14 @@ jobs:
       - name: Install Playwright Chromium
         run: npx --no-install playwright install --only-shell chromium
 
+      - name: Install bundler smoke dependencies
+        run: npm ci --ignore-scripts --prefix scripts/smoke/bundler_deps
+
+      - name: Run npm bundler packaging browser smoke
+        env:
+          BRIDGE_DIST_DIR: ${{ runner.temp }}/webgpu_bridge_dist
+        run: node scripts/smoke/bundler_packaging.mjs
+
       - name: Run state persistence browser smoke
         env:
           BRIDGE_DIST_DIR: ${{ runner.temp }}/webgpu_bridge_dist
