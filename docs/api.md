@@ -9,6 +9,28 @@ The TypeScript declaration shipped with the browser asset is
 `llama_webgpu_bridge.d.ts`; this page explains the runtime behavior behind those
 signatures.
 
+## Contents
+
+- [Importing the bridge](#importing-the-bridge)
+- [Minimal usage](#minimal-usage)
+- [Runtime model](#runtime-model)
+- [Operation serialization](#operation-serialization)
+- [Constructor](#constructor)
+- [Model loading and cache helpers](#model-loading-and-cache-helpers)
+- [Text generation](#text-generation)
+- [Draft models](#draft-models)
+- [Tokenization and chat templates](#tokenization-and-chat-templates)
+- [State persistence](#state-persistence)
+- [Embeddings](#embeddings)
+- [Next-token scoring](#next-token-scoring)
+- [Multimodal projector APIs](#multimodal-projector-apis)
+- [Text-to-speech](#text-to-speech)
+- [Decision heads](#decision-heads)
+- [LoRA adapters](#lora-adapters)
+- [Runtime metadata and diagnostics](#runtime-metadata-and-diagnostics)
+- [Worker host entrypoint](#worker-host-entrypoint)
+- [Browser and asset requirements](#browser-and-asset-requirements)
+
 ## Importing the bridge
 
 ```js
@@ -22,6 +44,18 @@ A browser page that imports the bridge also receives `window.LlamaWebGpuBridge`
 when the global is not already defined. Worker bootstrap code can either import
 `llama_webgpu_bridge_worker.js` or import `llama_webgpu_bridge.js` and call
 `enableBridgeWorkerHost()`.
+
+The same module exports these error classes for callers to import:
+
+| Export | Reference |
+| --- | --- |
+| `ModelUnloadedError` | [Native core aborts](#native-core-aborts) |
+| `EmbeddingError` | [Embeddings](#embeddings) |
+| `CrossOriginIsolationError` | [Browser and asset requirements](#browser-and-asset-requirements) |
+| `SingleThreadCoreError` | [Model loading options](#loadmodelfromurlurl-options) |
+| `ModelStagingError` | [Browser and asset requirements](#browser-and-asset-requirements) |
+| `TextToSpeechStreamingUnsupportedError` | [Streamed audio](#streamed-audio) |
+| `BlobWorkerBlockedError` | [Blocked blob workers](#blobworkerblockederror) |
 
 ## Minimal usage
 
@@ -116,7 +150,8 @@ both worker and direct runtime modes:
 `loadLoraAdapter`, `setLoraAdapter`, `removeLoraAdapter`, `clearLoraAdapters`,
 `createCompletion`, `getCompletionCapabilities`, `tokenize`, `detokenize`,
 `stateSaveFile`, `stateLoadFile`, `stateSaveBytes`,
-`stateLoadBytes`, `embed`, `embedBatch`, `scoreNextToken`, `applyChatTemplate`.
+`stateLoadBytes`, `getEmbeddingCapabilities`, `embed`, `embedBatch`,
+`scoreNextToken`, `applyChatTemplate`.
 
 Overlapping calls wait their turn and run in call order. A failing operation
 releases the queue for the calls behind it, and separate bridge instances never
@@ -127,18 +162,17 @@ These methods are deliberately **not** queued:
 | Method | Observable guarantee |
 | --- | --- |
 | `cancel()` | Out-of-band control signal that reaches the running operation immediately, scoped to the worker generation and runtime that operation captured. |
-| `setLogLevel(level)` | Synchronous, best-effort control signal; delivery failures are absorbed without switching execution modes. |
+| `setLogLevel(level)` | Synchronous, best-effort control signal. Finite numeric values are truncated and clamped to `0..4`. Delivery failures are absorbed without switching execution modes. After disposal, it throws `Bridge has been disposed.` |
 | `prefetchModelToCache()`, `evictModelFromCache()`, `isModelCached()` | Cache and network operations that do not enter the model runtime. |
 | `getModelMetadata()`, `getContextSize()`, `isGpuActive()`, `getBackendName()`, `supportsVision()`, `supportsAudio()` | Synchronous accessors served from the current bridge snapshot. |
 
 ### Cancellation while queued
 
-`createCompletion()`, `synthesizeSpeech()` and `loadModelFromUrl()` accept a
-`signal`. A call whose signal is **already aborted, or that aborts while it is
-still waiting in the queue**, rejects with an `AbortError` `DOMException`, never
-dispatches to the worker and never enters the core; its slot is skipped when its
-turn arrives, and `cancel()` is *not* invoked, so the unrelated operation that
-currently owns the runtime is unaffected.
+`loadModelFromUrl()`, `loadDraftModel()`, `loadLoraAdapter()`,
+`createCompletion()`, and `synthesizeSpeech()` accept a `signal`. An already
+aborted signal or an abort while the call waits in the queue rejects the call
+with an `AbortError` `DOMException`. The bridge skips the call's slot when its
+turn arrives, leaving the active operation unaffected.
 
 Once an operation has started, cancellation is scoped to that operation.
 Aborting its `signal`, or calling `cancel()` while it owns the runtime, reaches
@@ -189,13 +223,13 @@ it.
 | `preferMemory64` | `boolean` | Prefer the wasm64 core when available. Defaults to `true`; the runtime can still fall back to wasm32. |
 | `workerRequestTimeoutMs` | `number` | Default timeout for worker RPC calls, 2 minutes unless a method has its own default. It also sets the `embed`/`embedBatch` budget, which defaults to 10 minutes when an input has image or audio parts. |
 | `workerInitTimeoutMs` | `number` | Timeout for worker initialization. |
-| `workerModelLoadTimeoutMs` | `number` | Timeout for model load requests sent to a worker. |
-| `workerMmprojLoadTimeoutMs` | `number` | Timeout for multimodal projector load requests sent to a worker. |
-| `workerCompletionTimeoutMs` | `number` | Timeout for worker `createCompletion` RPC requests. |
+| `workerModelLoadTimeoutMs` | `number` | Worker `loadModelFromUrl()` and `loadDraftModel()` request timeout. Defaults to 3 minutes. |
+| `workerMmprojLoadTimeoutMs` | `number` | Worker `loadMultimodalProjector()` request timeout. Defaults to 8 minutes. |
+| `workerCompletionTimeoutMs` | `number` | Worker `createCompletion()` request timeout. Defaults to 6 minutes. |
 | `workerTextToSpeechTimeoutMs` | `number` | Timeout for a worker text-to-speech request. Defaults to 20 minutes and is refreshed by progress events. |
-| `workerGenerationStallTimeoutMs` | `number` | Stall timeout for worker generation after no token events arrive; clamped by the bridge. |
+| `workerGenerationStallTimeoutMs` | `number` | Worker generation timeout without token events. Explicit positive values are clamped to 5 seconds–5 minutes. Without an override, the timeout is 90 seconds for text, 180 seconds for GPU media, and disabled for CPU media. |
 | `coreInitTimeoutMs` | `number` | Timeout while initializing the Emscripten core module. |
-| `cacheName` | `string` | Cache Storage name used by model prefetch/load helpers. |
+| `cacheName` | `string` | Cache Storage name used by model prefetch/load helpers. Defaults to `llamadart-webgpu-model-cache-v1`. |
 | `threads` | `number` | Requested llama.cpp thread count. The bridge caps this to the compiled pthread pool, and to one thread for a single-thread core on a page that is not isolated. |
 | `threadsBatch` | `number` | Requested batch thread count; defaults to `threads`. |
 | `threadPoolSize` | `number` | Hint for the compiled pthread pool size, used before the core can report it. |
@@ -459,7 +493,7 @@ Common `options` keys:
 | `grammarLazy` | `true` applies `grammar` only after a `grammarTriggers` entry fires, as llama.cpp's lazy grammar (`llama-server`'s `grammar_lazy`) does; see [Lazy grammars](#lazy-grammars). Needs a non-empty `grammar` and at least one trigger. Omitted or `null` means `false`. |
 | `grammarTriggers` | Array of `{ type: 'word' \| 'pattern' \| 'pattern-full', value }` or `{ type: 'token', token }` that fire a lazy grammar. Always validated; applied only when `grammarLazy` is `true`. |
 | `seed` | Integer seed; random when omitted. |
-| `thinkingBudget` | `{ maxTokens, startTag, endTag, forcedMessage?, pauseGrammar? }`: llama.cpp's reasoning budget. After `maxTokens` tokens inside a block opened by `startTag`, plus any that finish a UTF-8 character, the sampler forces `forcedMessage` (default empty) and `endTag`. A block the prompt leaves open counts from the start of generation, so `maxTokens: 0` forces the end at once. Each new `startTag` gets a fresh budget. A grammar constrains `startTag` like any other text, then pauses until `endTag` completes, unless `pauseGrammar` is `false`: that keeps the grammar applied inside the block, for one that takes the block and `endTag` itself (such as one written for a prompt that ends inside the block; paused, it resumes at its start and takes the reply as reasoning) and so accepts `forcedMessage` and `endTag` wherever the budget can run out; a kept grammar that rejects the forced end tag fails the generation with `Grammar rejected every candidate token`. Omitted, `null` or `true` pauses it; `false` needs the `thinkingBudgetPauseGrammar` capability. `maxTokens` is an integer from `0` to `2147483647`; the tags must be non-empty. Each tag is tokenized on its own, as native llamadart does: with a vocabulary that adds a leading space to text, such as Llama 2's SentencePiece, a tag in the prompt matches only after a space, and the forced end tag starts with one. Text-only prompts: with `parts` it rejects. |
+| `thinkingBudget` | `{ maxTokens, startTag, endTag, forcedMessage?, pauseGrammar? }`: llama.cpp's reasoning budget. After `maxTokens` tokens inside a block opened by `startTag`, plus any that finish a UTF-8 character, the sampler forces `forcedMessage` (default empty) and `endTag`. A block the prompt leaves open counts from the start of generation, so `maxTokens: 0` forces the end at once. Each new `startTag` gets a fresh budget. A grammar constrains `startTag` like any other text, then pauses until a natural end or the forced close completes, unless `pauseGrammar` is `false`: that keeps the grammar applied inside the block, for one that takes the block and `endTag` itself (such as one written for a prompt that ends inside the block; paused, it resumes at its start and takes the reply as reasoning) and so accepts `forcedMessage` and `endTag` wherever the budget can run out; a kept grammar that rejects the forced end tag fails the generation with `Grammar rejected every candidate token`. Omitted, `null` or `true` pauses it; `false` needs the `thinkingBudgetPauseGrammar` capability. `maxTokens` is an integer from `0` to `2147483647`; the tags must be non-empty. Each tag is tokenized on its own, as native llamadart does: with a vocabulary that adds a leading space to text, such as Llama 2's SentencePiece, a tag in the prompt matches only after a space, and the forced end tag starts with one. Text-only prompts: with `parts` it rejects. |
 | `onUsage(usage)` | Called at most once, with the `CompletionUsage` of the last attempt whose generation returned, before the promise resolves or rejects with an `AbortError`. Not called when no generation returned: other rejections, a skipped multimodal warmup, or a worker failure after a cancel. |
 | `onToken(piece, currentText)` | Token callback. By default `piece` is a `Uint8Array` containing complete UTF-8 characters; see [Streamed text](#streamed-text). `currentText` is the text streamed so far. Direct runtime mode provides it by default; worker mode provides `''` unless `emitCurrentTextOnToken: true` is set. |
 | `signal` | `AbortSignal`; aborting cancels this operation and rejects with `AbortError`. |
@@ -471,6 +505,14 @@ Common `options` keys:
 | `parts` | Optional multimodal parts after a projector is loaded. Image parts require `{ type: 'image', bytes }` or `{ type: 'image', url }`; audio parts require `{ type: 'audio', samples }`, `{ type: 'audio', bytes }`, or `{ type: 'audio', url }`. `bytes` and `samples` accept an `ArrayBuffer`, any `ArrayBuffer` view, or a number array. Image `width` and `height` identify raw RGB bytes when their dimensions match the byte length. |
 | `mediaMaxPredict` | Cap for multimodal generation token count. |
 | `speculativeDecoding` | `{ strategies, ... }`: llama.cpp speculative decoding; see [Speculative decoding](#speculative-decoding). |
+
+`thinkingBudget.naturalEndTags` is the complete ordered list of natural ends,
+including any normal close. Supply a non-empty array to use this option, which
+requires `thinkingBudgetMultiEnd`. By default only `endTag` closes the block.
+The forced close still uses `forcedMessage` followed by `endTag`.
+`thinkingBudget.grammarReplayEndIndex` selects the natural end that a paused
+tool grammar must accept when the reasoning block closes. Supply an index in
+`naturalEndTags`. Omit the index or set it to `-1` to disable replay.
 
 Call `cancel()` or abort the supplied signal to request a best-effort stop.
 
@@ -498,9 +540,11 @@ An invalid `minP`, a `presencePenalty` that is not finite as a 32-bit float,
 an invalid `thinkingBudget`, or a malformed `grammarLazy`, `grammarTriggers` or
 `grammarRoot` rejects with a `RangeError` or `TypeError` before generation
 starts, and `grammarLazy: true` or another `grammarRoot` without a non-empty
-`grammar`, or a lazy grammar without triggers, with an `Error`. A nonzero `minP` or `presencePenalty`, any `thinkingBudget`, `thinkingBudget.pauseGrammar: false`, and
-`grammarLazy: true` or a `grammarRoot` other than `root` reject when the loaded
-core does not apply that option.
+`grammar`, or a lazy grammar without triggers, with an `Error`. A nonzero
+`minP` or `presencePenalty`, any `thinkingBudget`,
+`thinkingBudget.pauseGrammar: false`, `thinkingBudget.naturalEndTags`,
+`grammarLazy: true`, and a `grammarRoot` other than `root` each reject when the
+loaded core lacks the corresponding capability.
 
 #### Lazy grammars
 
@@ -563,8 +607,11 @@ cancelled generation once it returns.
 getCompletionCapabilities(): Promise<CompletionCapabilities>
 ```
 
-Returns `{ presencePenalty, minP, thinkingBudget, thinkingBudgetPauseGrammar, penaltyPromptTokens, penaltyPromptTokensWithGrammar, lazyGrammar, speculativeDecoding }`:
-whether the loaded core applies each `createCompletion` option. `lazyGrammar`
+Returns `{ presencePenalty, minP, thinkingBudget, thinkingBudgetPauseGrammar,
+thinkingBudgetMultiEnd, penaltyPromptTokens, penaltyPromptTokensWithGrammar,
+lazyGrammar, speculativeDecoding }`. The flags indicate whether the loaded core
+applies each `createCompletion` option. `thinkingBudgetMultiEnd` covers ordered
+natural ends and the complete forced close. `lazyGrammar`
 covers `grammarLazy`, `grammarTriggers` and `grammarRoot`.
 `penaltyPromptTokensWithGrammar` separately permits the explicit grammar opt-in;
 interface presence and an asset tag do not prove it.
@@ -682,9 +729,10 @@ and `createCompletion` prompts keep the text after U+0000: the bridge passes the
 core UTF-8 bytes and their length, not a C string. A lone surrogate becomes
 U+FFFD.
 
-- A `grammar`, `thinkingBudget` tag or `forcedMessage`, or `synthesizeSpeech`
-  `text` or `language`, holding U+0000 rejects with a `TypeError` before the
-  core runs, because the core reads them as C strings.
+- `grammar`, `grammarRoot`, string values in `grammarTriggers`, the tags in
+  `thinkingBudget` (including `naturalEndTags`), `thinkingBudget.forcedMessage`,
+  and `synthesizeSpeech` options `text` and `language` reject U+0000 with a
+  `TypeError` before the core runs.
 - Decision head load errors name a URL head whose file name holds U+0000 with
   `%00` in its place, as a parsed URL path does.
 - Cores built before this behavior lack `llamadart_webgpu_tokenize_bytes_to_json`
@@ -801,8 +849,10 @@ the active runtime. An unloaded model returns all false. Probe again after
 projector load/unload; completion vision/audio support alone does not enable
 media embeddings. Pooled embedding models support text; mixed media requires
 a noncausal decoder with MEAN pooling and the extended batch API. Audio also
-requires a 16 kHz projector. The production source pin lacks this mixed API;
-it reports image/audio false. There is no minimum published assets tag yet.
+requires a 16 kHz projector. The v1.0.0 source pin exposes the mixed-batch API.
+Use this probe to check the loaded assets and models. The local BF16 CPU
+results use v0.7.0. [Qualification record](multimodal_embeddings.md)
+
 An absent, malformed or unknown capability protocol throws a typed
 `EmbeddingError` with `code: 'EMBEDDING_CAPABILITY_UNAVAILABLE'`; legacy string
 embeddings remain available through their existing route.
@@ -1147,8 +1197,9 @@ URL heads are fetched into the runtime's in-memory WASMFS and deleted after
 loading, so peak memory includes the whole file: the official checkpoint is
 about 800 MB. `onProgress` reports the download of a URL head. Worker mode
 resolves a relative URL against the page and sends the worker a copy of byte
-sources, so caller buffers are not detached. A worker head load fails after 10
-minutes without download progress.
+sources, so caller buffers are not detached. By default, a worker head load
+times out after 10 minutes without download progress. Use
+`workerRequestTimeoutMs` to override the budget.
 
 ### `runDecision(handle, sequences)`
 
@@ -1167,10 +1218,12 @@ checks every sequence before its first encoder pass: 1 to `max_len` tokens, ids
 inside the vocabulary, 1 to token-count markers, markers inside the sequence,
 and a question type from 0 to 2. One invalid sequence rejects the whole call.
 
-A run cannot be cancelled: `cancel()` does not stop it, and later operations
-wait for it in the queue. A worker run fails after 10 minutes plus 1 minute per
-sequence; the bridge then falls back to the main-thread runtime as described
-below.
+`cancel()` does not interrupt a native decision run. Later operations wait for
+it to finish. In worker mode, if a decision RPC fails after a cancel request,
+the bridge reports an `AbortError` with code `cancelled`. A worker run defaults
+to a timeout of 10 minutes plus 1 minute per sequence. `workerRequestTimeoutMs`
+overrides that budget. On timeout, the bridge falls back to the main-thread
+runtime as described below.
 
 ### `freeDecisionHead(handle)`
 
@@ -1258,7 +1311,8 @@ does not apply it; `setLoraAdapter()` does.
 The adapter is staged in the runtime's in-memory WASMFS and deleted after
 loading. Worker mode resolves a relative URL against the page and sends the
 worker a copy of byte sources, so caller buffers are not detached. A worker
-adapter load fails after 10 minutes without download progress.
+adapter load times out after 10 minutes without download progress by default.
+Use `workerRequestTimeoutMs` to override the budget.
 
 The load rejects, and the runtime stays usable, for a file llama.cpp rejects,
 including an adapter made for another base model (for example `tensor
@@ -1370,9 +1424,10 @@ Returns a user-facing backend label such as `WebGPU (Prototype bridge)`,
 setLogLevel(level: string | number): void
 ```
 
-Updates the bridge/core logging level. Numeric values are clamped by the bridge;
-string values are accepted for compatibility with callers but may be interpreted
-by current or future bridge internals.
+Updates the bridge/core logging level. Finite numeric values are truncated and
+clamped to `0..4`. String values are accepted for compatibility with callers
+and may be interpreted by current or future bridge internals. After `dispose()`,
+this method throws `Bridge has been disposed.`
 
 ### `cancel()`
 
@@ -1380,16 +1435,18 @@ by current or future bridge internals.
 cancel(): void
 ```
 
-Best-effort cancellation for active model transfer, token generation, or
-text-to-speech synthesis. It aborts the transfer controller of the operation
-that currently owns the runtime and asks that operation's captured worker
-generation and runtime to stop, so an internal worker restart or main-thread
-fallback cannot redirect the cancel to an unrelated replacement. It never
-cancels a queued operation, and it stays out-of-band: it does not wait behind
-the operation it controls. In worker mode the cancel names its operation, and
-the worker applies it only while that operation's call runs there, so a cancel
-that arrives after the call returned never affects a later call. After disposal
-it is a no-op and never resurrects torn-down state.
+Requests best-effort cancellation for active model, draft, and LoRA transfers
+(`loadModelFromUrl()`, `loadDraftModel()`, `loadLoraAdapter()`), token generation,
+text-to-speech synthesis, and `embed()` and `embedBatch()` calls. It aborts the
+active operation's transfer controller and asks that operation's captured worker
+generation and runtime to stop. The signal bypasses the queue and stays scoped to
+that operation through a worker restart or main-thread fallback. The worker
+applies the signal only while that operation's call runs there. After disposal,
+`cancel()` is a no-op.
+
+Decision operations continue to run after `cancel()`. See
+[runDecision](#rundecisionhandle-sequences) for the worker failure and queue
+behavior.
 
 ### `dispose()`
 
