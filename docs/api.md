@@ -176,6 +176,7 @@ it.
 
 | Option | Type | Description |
 | --- | --- | --- |
+| `assetBaseUrl` | `string` | Directory for omitted bridge worker, core JS and Wasm URLs. Relative values resolve against the document base or the calling worker's URL. The trailing slash is optional. Explicit per-file URLs take precedence. |
 | `coreModuleUrl` | `string` | URL for the wasm32 Emscripten JS loader, usually `llama_webgpu_core.js`. |
 | `coreModuleUrlMem64` | `string` | URL for the optional wasm64 Emscripten JS loader. |
 | `wasmUrl` | `string` | URL for the wasm32 `llama_webgpu_core.wasm` binary. |
@@ -183,7 +184,7 @@ it.
 | `coreModuleFactory` | `LlamaCoreModuleFactory \| Promise<LlamaCoreModuleFactory>` | Preloaded Emscripten factory. Supplying this disables worker mode because factories cannot be transferred to the worker. It also skips the default isolation check. A core that starts a pthread pool can hit `coreInitTimeoutMs` if the page cannot share memory with workers. See [the custom core contract](#custom-core-factory). A core instance holds one loaded model. Bridges that share the same core instance must not hold models at the same time. A load on either bridge releases the model in that core. Return a separate core instance for each bridge that needs an independent model. |
 | `workerUrl` | `string` | URL for `llama_webgpu_bridge_worker.js`. Defaults to a sibling of the bridge module when possible. |
 | `disableWorker` | `boolean` | Force direct runtime mode. |
-| `allowSingleThreadCore` | `boolean` | Set to `true` with explicit `_st` core URLs to load on pages without cross-origin isolation. Single-thread cores use one CPU thread and report `core_single_thread`. A core that starts a pthread pool can still hit `Bridge core init timeout` if the page cannot share memory with workers. See [single-thread setup and timeout behavior](single_thread.md). |
+| `allowSingleThreadCore` | `boolean` | Set to `true` to select the single-thread defaults on pages without cross-origin isolation. When supplying core URLs, point them at single-thread cores for those pages. Single-thread cores use one CPU thread and report `core_single_thread`. A core that starts a pthread pool can still hit `Bridge core init timeout` if the page cannot share memory with workers. See [single-thread setup and timeout behavior](single_thread.md). |
 | `jsBackedModelStaging` | `boolean` | Unset enables JS-backed staging on WebKit when the core supports it. `false` opts out on any browser. `true` requires JS-backed staging support. JS-backed staging places models and projectors in a private per-operation `/jsmodels-<n>` mount. A supported core stages a single model file of known decoded size in one memory-mapped wasm heap block when the effective GPU layer count after the Safari cap is 0 or 1. Other JS-backed loads use 64 MiB JS `Uint8Array` chunks. |
 | `preferMemory64` | `boolean` | Prefer the wasm64 core when available. Defaults to `true`; the runtime can still fall back to wasm32. |
 | `workerRequestTimeoutMs` | `number` | Default timeout for worker RPC calls, 2 minutes unless a method has its own default. It also sets the `embed`/`embedBatch` budget, which defaults to 10 minutes when an input has image or audio parts. |
@@ -1427,10 +1428,12 @@ this function themselves.
   available. `credentialless` does not isolate Safari. On a page that cannot
   share memory with workers, loading the default core configuration rejects
   with `CrossOriginIsolationError` (`code: 'CROSS_ORIGIN_ISOLATION_REQUIRED'`).
-- On pages without isolation, set `allowSingleThreadCore: true` and
-  `coreModuleUrl: '/llama_webgpu_core_st.js'`. To opt into memory64, also set
-  `coreModuleUrlMem64: '/llama_webgpu_core_mem64_st.js'`. Supply matching
-  `wasmUrl` and `wasmUrlMem64` if the binaries are served separately.
+- The bridge can load the worker and cores from assets beside its module, or
+  from an `assetBaseUrl` such as `'/webgpu_bridge/'`. Bundlers that process
+  static `new URL(..., import.meta.url)` references can emit these assets with
+  hashed names. On pages without isolation, set `allowSingleThreadCore: true`
+  to select the `_st` variants. When passing explicit core URLs, use the
+  single-thread loaders and supply matching Wasm URLs if served separately.
   Single-thread cores support vision, speech recognition and speech synthesis.
   See the [size measurements and limits](single_thread.md).
 - Serve both the core JS and Wasm from URLs reachable by the page and worker.

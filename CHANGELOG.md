@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Resolve sibling worker and core assets automatically, including hashed bundler filenames and single-thread variants. Set `assetBaseUrl` to serve the assets from a separate directory.
+
 - Use the full GGUF URL, including its query string, for forced and automatic WasmFS fetch-backed model loads. Mount the model at a short local path so long signed URLs can load. (#288)
 
 - End a threaded core's pthread runtime when a direct-mode bridge is disposed or its core retires, so Chromium can collect the core and its memory. A core supplied through `coreModuleFactory` keeps running after `dispose()`. (#262)
