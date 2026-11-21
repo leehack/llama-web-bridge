@@ -1,0 +1,290 @@
+name: Publish Exact Qualified Bridge to npm
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Published stable bridge-assets tag (vMAJOR.MINOR.PATCH)
+        required: true
+        type: string
+      publish_approved:
+        description: Approve publishing this release to npm
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-bridge-npm-llama-web-bridge
+  cancel-in-progress: false
+
+env:
+  BRIDGE_REPO: leehack/llama-web-bridge
+  ASSETS_REPO: leehack/llama-web-bridge-assets
+  RELEASE_TAG: ${{ inputs.release_tag }}
+  GH_HOST: github.com
+
+jobs:
+  validate-request:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate publication request
+        env:
+          PUBLISH_APPROVED: ${{ inputs.publish_approved }}
+          DISPATCHING_ACTOR: ${{ github.triggering_actor }}
+        run: |
+          set -euo pipefail
+          if [[ "${PUBLISH_APPROVED}" != "true" ]]; then
+            echo "error: publish_approved=true is required" >&2
+            exit 1
+          fi
+          if [[ "${GITHUB_REPOSITORY}" != "${BRIDGE_REPO}" || "${GITHUB_REF}" != "refs/heads/main" ||
+                "${GITHUB_ACTOR}" != "leehack" || "${DISPATCHING_ACTOR}" != "leehack" ||
+                "${GITHUB_RUN_ATTEMPT}" != "1" ]]; then
+            echo "error: npm publication requires the repository owner, main, and a first-attempt dispatch" >&2
+            exit 1
+          fi
+          if [[ ! "${RELEASE_TAG}" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ||
+                "${RELEASE_TAG}" == "v0.0.0" ]]; then
+            echo "error: expected an unsuffixed stable release tag above v0.0.0" >&2
+            exit 1
+          fi
+
+  verify-npm-environment:
+    needs: validate-request
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      environment_name: ${{ steps.environment.outputs.environment_name }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24
+      - name: Verify npm publication environment
+        id: environment
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api "repos/${BRIDGE_REPO}/environments/bridge-npm-publication" > "${RUNNER_TEMP}/environment.json"
+          gh api "repos/${BRIDGE_REPO}/environments/bridge-npm-publication/deployment-branch-policies" > "${RUNNER_TEMP}/policies.json"
+          node scripts/release/contract.mjs validate-environment --environment-name bridge-npm-publication \
+            --environment-json "${RUNNER_TEMP}/environment.json" --branch-policies-json "${RUNNER_TEMP}/policies.json"
+          echo "environment_name=bridge-npm-publication" >> "${GITHUB_OUTPUT}"
+
+  stage-and-verify-package:
+    needs: verify-npm-environment
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      artifact_id: ${{ steps.package.outputs.artifact-id }}
+      version: ${{ steps.evidence.outputs.version }}
+      tarball_sha256: ${{ steps.stage.outputs.tarball_sha256 }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24
+      - name: Run release contracts
+        run: |
+          npm ci --ignore-scripts
+          npm run check:js
+          node scripts/ci/verify_ci_reliability.mjs
+      - name: Authenticate exact release and qualification
+        id: evidence
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release verify "${RELEASE_TAG}" --repo "${ASSETS_REPO}" --format json > "${RUNNER_TEMP}/release-attestation.json"
+          mkdir "${RUNNER_TEMP}/verified"
+          node scripts/release/npm_release.mjs --release-tag "${RELEASE_TAG}" \
+            --release-attestation "${RUNNER_TEMP}/release-attestation.json" --out-dir "${RUNNER_TEMP}/verified" \
+            > "${RUNNER_TEMP}/release-evidence.json"
+          (cd "${RUNNER_TEMP}/verified/dist" && sha256sum --check sha256sums.txt)
+          SOURCE="$(jq -er '.source_commit' "${RUNNER_TEMP}/release-evidence.json")"
+          if ! git merge-base --is-ancestor "${SOURCE}" "${GITHUB_SHA}"; then
+            echo "error: signed bridge source is outside the trusted main history" >&2
+            exit 1
+          fi
+          git show "${SOURCE}:LICENSE" > "${RUNNER_TEMP}/LICENSE"
+          git show "${SOURCE}:README.md" > "${RUNNER_TEMP}/README.md"
+          VERSION="$(jq -er '.npm_version' "${RUNNER_TEMP}/release-evidence.json")"
+          echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
+      - name: Stage, pack and verify exact package
+        id: stage
+        env:
+          VERSION: ${{ steps.evidence.outputs.version }}
+        run: |
+          set -euo pipefail
+          PACKAGE="${RUNNER_TEMP}/verified"
+          node scripts/release/npm_package.mjs stage --dist-dir "${PACKAGE}/dist" \
+            --release-tag "${RELEASE_TAG}" --release-rebuild 0 --out-dir "${RUNNER_TEMP}/staged" \
+            --license "${RUNNER_TEMP}/LICENSE" --readme "${RUNNER_TEMP}/README.md"
+          npm pack "${RUNNER_TEMP}/staged" --ignore-scripts --pack-destination "${PACKAGE}"
+          TARBALL="${PACKAGE}/llama-web-bridge-${VERSION}.tgz"
+          node scripts/release/npm_package.mjs verify-tarball --tarball "${TARBALL}" \
+            --dist-dir "${PACKAGE}/dist" --expected-version "${VERSION}" > "${RUNNER_TEMP}/tarball-evidence.json"
+          jq -s add "${RUNNER_TEMP}/release-evidence.json" "${RUNNER_TEMP}/tarball-evidence.json" \
+            > "${PACKAGE}/npm-package-verification.json"
+          SHA="$(jq -er '.tarball_sha256' "${PACKAGE}/npm-package-verification.json")"
+          echo "tarball_sha256=${SHA}" >> "${GITHUB_OUTPUT}"
+      - name: Upload the verified tarball and exact assets
+        id: package
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: verified-npm-package
+          path: |
+            ${{ runner.temp }}/verified/dist/
+            ${{ runner.temp }}/verified/llama-web-bridge-${{ steps.evidence.outputs.version }}.tgz
+            ${{ runner.temp }}/verified/npm-package-verification.json
+          if-no-files-found: error
+
+  publish-npm:
+    needs: [verify-npm-environment, stage-and-verify-package]
+    runs-on: ubuntu-latest
+    environment:
+      name: ${{ needs.verify-npm-environment.outputs.environment_name }}
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+    env:
+      VERSION: ${{ needs.stage-and-verify-package.outputs.version }}
+      EXPECTED_TARBALL_SHA256: ${{ needs.stage-and-verify-package.outputs.tarball_sha256 }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24
+      - name: Download verified package by artifact ID
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          artifact-ids: ${{ needs.stage-and-verify-package.outputs.artifact_id }}
+          path: ${{ runner.temp }}/verified
+          merge-multiple: true
+      - name: Re-verify the tarball and npm CLI
+        id: tarball
+        env:
+          NPM_CONFIG_USERCONFIG: ${{ runner.temp }}/npm-oidc-user.npmrc
+          NPM_CONFIG_GLOBALCONFIG: /dev/null
+        run: |
+          set -euo pipefail
+          if [[ "${VERSION}" == "0.0.0" || "v${VERSION}" != "${RELEASE_TAG}" ]]; then
+            echo "error: invalid package version" >&2
+            exit 1
+          fi
+          NPM_VERSION="$(npm --version)"
+          if [[ ! "${NPM_VERSION}" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]] ||
+              ! (( BASH_REMATCH[1] > 11 ||
+                (BASH_REMATCH[1] == 11 && (BASH_REMATCH[2] > 5 ||
+                  (BASH_REMATCH[2] == 5 && BASH_REMATCH[3] >= 1))) )); then
+            echo "error: npm >= 11.5.1 is required for Trusted Publishing" >&2
+            exit 1
+          fi
+          PACKAGE="${RUNNER_TEMP}/verified"
+          node scripts/release/npm_package.mjs verify-tarball \
+            --tarball "${PACKAGE}/llama-web-bridge-${VERSION}.tgz" --dist-dir "${PACKAGE}/dist" \
+            --expected-version "${VERSION}" > "${RUNNER_TEMP}/tarball-recheck.json"
+          jq -e --arg sha "${EXPECTED_TARBALL_SHA256}" --arg version "${VERSION}" \
+            --slurpfile checked "${RUNNER_TEMP}/tarball-recheck.json" \
+            '.npm_version == $version and .npm_dist_tag == "latest" and
+              .tarball_sha256 == $sha and .tarball_sha256 == $checked[0].tarball_sha256 and
+              .tarball_integrity == $checked[0].tarball_integrity' "${PACKAGE}/npm-package-verification.json"
+          INTEGRITY="$(jq -er '.tarball_integrity' "${RUNNER_TEMP}/tarball-recheck.json")"
+          echo "integrity=${INTEGRITY}" >> "${GITHUB_OUTPUT}"
+      - name: Re-verify npm publication environment
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api "repos/${BRIDGE_REPO}/environments/bridge-npm-publication" > "${RUNNER_TEMP}/environment.json"
+          gh api "repos/${BRIDGE_REPO}/environments/bridge-npm-publication/deployment-branch-policies" > "${RUNNER_TEMP}/policies.json"
+          node scripts/release/contract.mjs validate-environment --environment-name bridge-npm-publication \
+            --environment-json "${RUNNER_TEMP}/environment.json" --branch-policies-json "${RUNNER_TEMP}/policies.json"
+      - name: Publish the previously verified tarball with OIDC
+        working-directory: ${{ runner.temp }}/verified
+        env:
+          NPM_CONFIG_USERCONFIG: ${{ runner.temp }}/npm-oidc-user.npmrc
+          NPM_CONFIG_GLOBALCONFIG: /dev/null
+        run: |
+          set -euo pipefail
+          STATUS="$(curl --silent --show-error --max-time 30 --output /dev/null --write-out '%{http_code}' \
+            "https://registry.npmjs.org/llama-web-bridge/${VERSION}")"
+          if [[ "${STATUS}" != "404" ]]; then
+            echo "error: npm version ${VERSION} is not confirmed absent (HTTP ${STATUS})" >&2
+            exit 1
+          fi
+          npm publish "./llama-web-bridge-${VERSION}.tgz" \
+            --provenance --access public --tag latest --registry https://registry.npmjs.org --ignore-scripts
+      - name: Read back exact registry bytes and provenance
+        env:
+          EXPECTED_INTEGRITY: ${{ steps.tarball.outputs.integrity }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          REGISTRY="https://registry.npmjs.org"
+          PREDICATE="https://slsa.dev/provenance/v1"
+          ATTESTATION_URL="${REGISTRY}/-/npm/v1/attestations/llama-web-bridge@${VERSION}"
+          TARBALL_URL="${REGISTRY}/llama-web-bridge/-/llama-web-bridge-${VERSION}.tgz"
+          PACKAGE_URL="${REGISTRY}/llama-web-bridge/${VERSION}"
+          RUN_URL="https://github.com/${BRIDGE_REPO}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}"
+          for attempt in {1..6}; do
+            if curl -fsS --max-time 30 "${PACKAGE_URL}" > "${RUNNER_TEMP}/npm-version.json" &&
+               jq -e --arg version "${VERSION}" --arg integrity "${EXPECTED_INTEGRITY}" \
+                 --arg attestation "${ATTESTATION_URL}" --arg tarball "${TARBALL_URL}" --arg predicate "${PREDICATE}" \
+                 '.name == "llama-web-bridge" and .version == $version and .dist.integrity == $integrity and
+                   .dist.tarball == $tarball and .dist.attestations.url == $attestation and
+                   .dist.attestations.provenance.predicateType == $predicate' "${RUNNER_TEMP}/npm-version.json" &&
+               curl -fsS --max-time 30 "${REGISTRY}/-/package/llama-web-bridge/dist-tags" |
+                 jq -e --arg version "${VERSION}" '.latest == $version' &&
+               curl -fsS --max-time 30 "${ATTESTATION_URL}" > "${RUNNER_TEMP}/npm-attestations.json"; then
+              break
+            fi
+            if [[ "${attempt}" == 6 ]]; then
+              echo "error: npm publication could not be verified from registry metadata" >&2
+              exit 1
+            fi
+            sleep 10
+          done
+          curl -fsS --max-time 120 "${TARBALL_URL}" > "${RUNNER_TEMP}/registry.tgz"
+          echo "${EXPECTED_TARBALL_SHA256}  ${RUNNER_TEMP}/registry.tgz" | sha256sum --check
+          SHA512="$(sha512sum "${RUNNER_TEMP}/registry.tgz" | cut -d ' ' -f 1)"
+          jq -er --arg predicate "${PREDICATE}" \
+            '[.attestations[] | select(.predicateType == $predicate)] |
+              select(length == 1) | .[0].bundle' "${RUNNER_TEMP}/npm-attestations.json" > "${RUNNER_TEMP}/npm-provenance.json"
+          gh attestation verify "${RUNNER_TEMP}/registry.tgz" --bundle "${RUNNER_TEMP}/npm-provenance.json" \
+            --repo "${BRIDGE_REPO}" --signer-workflow "${BRIDGE_REPO}/.github/workflows/publish_npm.yml" \
+            --source-ref refs/heads/main --source-digest "${GITHUB_SHA}" --deny-self-hosted-runners \
+            --digest-alg sha512 --predicate-type "${PREDICATE}" --format json |
+            jq -e --arg sha "${SHA512}" --arg run "${RUN_URL}" --arg subject "pkg:npm/llama-web-bridge@${VERSION}" \
+              'length == 1 and (.[0].verificationResult |
+                .signature.certificate.runInvocationURI == $run and
+                .statement.subject == [{name: $subject, digest: {sha512: $sha}}] and
+                .statement.predicate.runDetails.metadata.invocationId == $run)'
+          jq --arg registry_run "${RUN_URL}" --arg predicate "${PREDICATE}" \
+            '. + {registry_verified: true, provenance_predicate: $predicate, npm_publication_run: $registry_run}' \
+            "${RUNNER_TEMP}/verified/npm-package-verification.json" > "${RUNNER_TEMP}/bridge-npm-publication-outcome.json"
+      - name: Upload npm publication receipt
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: bridge-npm-publication-outcome
+          path: ${{ runner.temp }}/bridge-npm-publication-outcome.json
+          if-no-files-found: error

@@ -139,10 +139,10 @@ export function manifestArgs(directory, overrides = {}) {
   };
 }
 
-export function writeCandidate(directory, { marker = 'candidate' } = {}) {
+export function writeCandidate(directory, { marker = 'candidate', manifestOverrides = {} } = {}) {
   fs.mkdirSync(directory, { recursive: true });
   ARTIFACTS.forEach((name, index) => fs.writeFileSync(path.join(directory, name), artifactBytes(name, `${marker}-${index}-${name}`)));
-  generate(manifestArgs(directory));
+  generate(manifestArgs(directory, manifestOverrides));
 }
 
 export function speechPhase() {
@@ -259,10 +259,10 @@ export function camel(name) {
 // setUp(): a written candidate, its manifest and fingerprint, the harness
 // digest of scripts/, and the attestation that binds them. verify() is
 // QualificationTest.verify. Call cleanup() when done.
-export function setUp() {
+export function setUp(candidateOptions) {
   const tmp = makeTempDir();
   const candidate = path.join(tmp, 'candidate');
-  writeCandidate(candidate);
+  writeCandidate(candidate, candidateOptions);
   const [manifest, fingerprint] = loadCandidate(candidate);
   const harnessDigest = harnessSourceSha256(SCRIPTS_DIR);
   const attestation = buildAttestation({

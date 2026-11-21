@@ -720,9 +720,13 @@ export function validateNativeRelease(
   return identity;
 }
 
+const ASSETS_PUBLICATION_ENVIRONMENT = 'bridge-assets-publication';
+
 // Require the exact fail-closed solo-maintainer publication policy.
-export function validatePublicationEnvironment(environment, branchPolicies) {
-  if (pyGet(environment, 'name') !== 'bridge-assets-publication') {
+export function validatePublicationEnvironment(environment, branchPolicies, {
+  expectedName = ASSETS_PUBLICATION_ENVIRONMENT,
+} = {}) {
+  if (typeof expectedName !== 'string' || !expectedName || pyGet(environment, 'name') !== expectedName) {
     throw new ContractError('publication environment identity is missing or incorrect');
   }
   if (pyGet(environment, 'can_admins_bypass') !== false) {
@@ -1186,7 +1190,11 @@ export const COMMANDS = Object.freeze({
     ],
   },
   'validate-environment': {
-    options: [required('--environment-json', 'path'), required('--branch-policies-json', 'path')],
+    options: [
+      required('--environment-json', 'path'),
+      required('--branch-policies-json', 'path'),
+      { flag: '--environment-name', required: false, type: 'str' },
+    ],
   },
   // The workflows' input checks: silent on success, `error: <message>` and
   // exit status 1 otherwise.
@@ -1283,8 +1291,9 @@ function runCommand(command, args, write) {
     const branchPoliciesPayload = pyJsonLoads(pyReadText(args.branchPoliciesJson));
     if (!isDict(environmentPayload)) throw new ContractError('publication environment root must be an object');
     if (!isDict(branchPoliciesPayload)) throw new ContractError('publication branch policies root must be an object');
-    validatePublicationEnvironment(environmentPayload, branchPoliciesPayload);
-    write(dumps({ environment: 'bridge-assets-publication' }));
+    const expectedName = args.environmentName ?? ASSETS_PUBLICATION_ENVIRONMENT;
+    validatePublicationEnvironment(environmentPayload, branchPoliciesPayload, { expectedName });
+    write(dumps({ environment: expectedName }));
   }
 }
 

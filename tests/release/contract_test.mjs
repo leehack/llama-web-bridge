@@ -230,19 +230,29 @@ test('test_validate_environment_cli_reports_only_environment_identity', () => {
     deployment_branch_policy: { protected_branches: false, custom_branch_policies: true },
   };
   const branchPolicies = { total_count: 1, branch_policies: [{ name: 'main', type: 'branch' }] };
-  const result = withTemporaryDirectory((directory) => {
+  const validate = (name, ...options) => withTemporaryDirectory((directory) => {
     const environmentPath = path.join(directory, 'environment.json');
     const branchPoliciesPath = path.join(directory, 'branch-policies.json');
-    writeFileSync(environmentPath, dumps(configured), 'utf8');
+    writeFileSync(environmentPath, dumps({ ...configured, name }), 'utf8');
     writeFileSync(branchPoliciesPath, dumps(branchPolicies), 'utf8');
     return runCli([
       'validate-environment',
       '--environment-json', environmentPath,
       '--branch-policies-json', branchPoliciesPath,
+      ...options,
     ]);
   });
+  const result = validate(configured.name);
   assert.equal(result.returncode, 0, result.stderr);
   assert.deepEqual(JSON.parse(result.stdout), { environment: 'bridge-assets-publication' });
+
+  const npmEnvironment = 'bridge-npm-publication';
+  const npmResult = validate(npmEnvironment, '--environment-name', npmEnvironment);
+  assert.equal(npmResult.returncode, 0, npmResult.stderr);
+  assert.deepEqual(JSON.parse(npmResult.stdout), { environment: npmEnvironment });
+  const mismatch = validate(configured.name, '--environment-name', npmEnvironment);
+  assert.equal(mismatch.returncode, 1);
+  assert.match(mismatch.stderr, /publication environment identity is missing or incorrect/);
 });
 
 test('test_legacy_wrappers_are_consumption_only', () => {
