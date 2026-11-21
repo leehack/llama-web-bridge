@@ -19,6 +19,7 @@ export function isWebKitUserAgent(userAgent: unknown): boolean {
 
 // Safari 27 is the first version validated for full GPU offload.
 const SAFARI_UNCAPPED_GPU_MIN_MAJOR = 27;
+const MAX_NATIVE_GPU_LAYERS = 0x7fffffff;
 
 // The legacy detector also matches other WebKit browsers. Require Apple's
 // platform and Safari's product sequence before enabling the new policy.
@@ -49,6 +50,33 @@ export function safariMajorVersion(userAgent: unknown): number | null {
 export function safariDefaultMaxGpuLayers(userAgent: unknown): number {
   const major = safariMajorVersion(userAgent);
   return major !== null && major >= SAFARI_UNCAPPED_GPU_MIN_MAJOR ? Infinity : 1;
+}
+
+export interface SafariGpuLayerCapResult {
+  effective: number;
+  capped: boolean;
+}
+
+export function capSafariGpuLayers(
+  requestedGpuLayers: number,
+  defaultMaxGpuLayers: number,
+  safariMaxGpuLayersOption?: unknown,
+): SafariGpuLayerCapResult {
+  if (requestedGpuLayers === 0) {
+    return { effective: 0, capped: false };
+  }
+  const requestedMax = Number(safariMaxGpuLayersOption);
+  let maxGpuLayers = defaultMaxGpuLayers;
+  if (requestedMax > MAX_NATIVE_GPU_LAYERS) {
+    maxGpuLayers = Infinity;
+  } else if (Number.isFinite(requestedMax)) {
+    maxGpuLayers = Math.max(1, Math.trunc(requestedMax));
+  }
+  const offloadedLayers = requestedGpuLayers < 0 ? Infinity : requestedGpuLayers;
+  if (offloadedLayers > maxGpuLayers) {
+    return { effective: maxGpuLayers, capped: true };
+  }
+  return { effective: requestedGpuLayers, capped: false };
 }
 
 // A pthread core preallocates workers and posts its shared memory to them.

@@ -47,6 +47,7 @@ import {
 } from './internal/download.ts';
 import {
   canPostSharedMemory,
+  capSafariGpuLayers,
   describeWebGpuUnavailable,
   isAppleSafariUserAgent,
   isWebKitUserAgent,
@@ -278,6 +279,7 @@ export class LlamaWebGpuBridgeRuntime {
   declare _nBatch: number;
   declare _nUbatch: number;
   declare _nGpuLayers: number;
+  declare _effectiveGpuLayers: number;
   declare _nSeqMax: number;
   declare _useMmap: boolean;
   declare _useMlock: boolean;
@@ -383,6 +385,7 @@ export class LlamaWebGpuBridgeRuntime {
     this._nGpuLayers = Number.isFinite(config.nGpuLayers)
       ? Number(config.nGpuLayers)
       : -1;
+    this._effectiveGpuLayers = this._nGpuLayers;
     this._nSeqMax = 0;
     this._useMmap = false;
     this._useMlock = false;
@@ -638,7 +641,7 @@ export class LlamaWebGpuBridgeRuntime {
       return false;
     }
 
-    if (this._nGpuLayers <= 0) {
+    if (this._effectiveGpuLayers <= 0) {
       return false;
     }
 
@@ -1207,7 +1210,7 @@ export class LlamaWebGpuBridgeRuntime {
             this._threadsBatch,
             this._nBatch,
             this._nUbatch,
-            this._nGpuLayers,
+            this._effectiveGpuLayers,
             chunkBytes,
             ...this._nativeLoadOptionValues(),
           ],
@@ -2659,6 +2662,7 @@ export class LlamaWebGpuBridgeRuntime {
     if (Number.isFinite(requestedGpuLayers)) {
       this._nGpuLayers = Math.trunc(requestedGpuLayers);
     }
+    this._effectiveGpuLayers = this._nGpuLayers;
 
     if (this._nGpuLayers > 0 && !this._gpuActive) {
       const unavailable = await describeWebGpuUnavailable();
@@ -2726,7 +2730,14 @@ export class LlamaWebGpuBridgeRuntime {
       this._runtimeNotes.push('cpu_batch_tuned_default');
     }
 
-    if (this._isSafari && this._nGpuLayers > 0) {
+    this._effectiveGpuLayers = this._nGpuLayers;
+    if (this._isAppleSafari) {
+      const capped = capSafariGpuLayers(this._nGpuLayers, this._safariDefaultMaxGpuLayers, options.safariMaxGpuLayers);
+      this._effectiveGpuLayers = capped.effective;
+      if (capped.capped) {
+        this._runtimeNotes.push(`safari_gpu_layers_capped:${capped.effective}`);
+      }
+    } else if (this._isSafari && this._nGpuLayers > 0) {
       const requestedSafariMaxLayers = Number(options.safariMaxGpuLayers);
       const safariMaxGpuLayers = Number.isFinite(requestedSafariMaxLayers)
         ? Math.max(1, Math.trunc(requestedSafariMaxLayers))
@@ -2734,6 +2745,7 @@ export class LlamaWebGpuBridgeRuntime {
 
       if (this._nGpuLayers > safariMaxGpuLayers) {
         this._nGpuLayers = safariMaxGpuLayers;
+        this._effectiveGpuLayers = safariMaxGpuLayers;
         this._runtimeNotes.push(`safari_gpu_layers_capped:${safariMaxGpuLayers}`);
       }
     }
@@ -2779,7 +2791,7 @@ export class LlamaWebGpuBridgeRuntime {
       }
       const heapResidentStaging = shouldUseHeapResidentStaging({
         jsBackedStaging: useJsBackedStaging,
-        nativeGpuLayers: this._nGpuLayers,
+        nativeGpuLayers: this._effectiveGpuLayers,
         useMmapDisabled: this._useMmapDisabled,
         useMlock: this._useMlock,
         shardCount: modelUrls.length,
@@ -3135,7 +3147,7 @@ export class LlamaWebGpuBridgeRuntime {
                 this._threadsBatch,
                 this._nBatch,
                 this._nUbatch,
-                this._nGpuLayers,
+                this._effectiveGpuLayers,
                 ...this._nativeLoadOptionValues(),
               ],
               { async: true },
@@ -3214,7 +3226,7 @@ export class LlamaWebGpuBridgeRuntime {
 
     assertMountOwned?.();
     const shouldProbeSafariGpu = this._isSafari
-      && this._nGpuLayers > 0
+      && this._effectiveGpuLayers > 0
       && options.safariGpuProbe !== false;
 
     if (shouldProbeSafariGpu) {
@@ -3281,7 +3293,7 @@ export class LlamaWebGpuBridgeRuntime {
         this._runtimeNotes.push('safari_gpu_probe_failed');
 
         const retryCandidates = [];
-        if (this._nGpuLayers > 1) {
+        if (this._effectiveGpuLayers > 1) {
           retryCandidates.push(1);
         }
         retryCandidates.push(0);
@@ -3367,6 +3379,7 @@ export class LlamaWebGpuBridgeRuntime {
           }
 
           this._nGpuLayers = candidateLayers;
+          this._effectiveGpuLayers = candidateLayers;
           if (candidateLayers === 0) {
             this._runtimeNotes.push('safari_fallback_cpu');
             stabilized = true;
@@ -3405,7 +3418,7 @@ export class LlamaWebGpuBridgeRuntime {
     this._mediaFileCounter = 0;
     this._stateFileCounter = 0;
     this._stagedMediaPaths = [];
-    this._gpuActive = this._gpuActive && this._nGpuLayers > 0;
+    this._gpuActive = this._gpuActive && this._effectiveGpuLayers > 0;
 
       if (this._releaseModelFiles(stagingMountPath, assertMountOwned) > 0) {
         this._runtimeNotes.push('model_file_released');
@@ -3746,7 +3759,7 @@ export class LlamaWebGpuBridgeRuntime {
       if (totalBytes > 0) {
         this._requireHeapHeadroom(
           core,
-          this._nGpuLayers === 0 ? totalBytes * 2 : totalBytes,
+          this._effectiveGpuLayers === 0 ? totalBytes * 2 : totalBytes,
           'The draft model',
         );
       }
@@ -5619,7 +5632,7 @@ export class LlamaWebGpuBridgeRuntime {
         Number.isFinite(this._threadPoolSizeHint) && this._threadPoolSizeHint! > 0
           ? String(this._threadPoolSizeHint)
           : '',
-      'llamadart.webgpu.n_gpu_layers': String(this._nGpuLayers),
+      'llamadart.webgpu.n_gpu_layers': String(this._effectiveGpuLayers),
       'llamadart.webgpu.core_variant': this._coreVariant,
       'llamadart.webgpu.model_source': this._modelSource,
       'llamadart.webgpu.model_cache_state': this._modelCacheState,
@@ -5649,7 +5662,7 @@ export class LlamaWebGpuBridgeRuntime {
   }
 
   getBackendName() {
-    if (this._nGpuLayers === 0) {
+    if (this._effectiveGpuLayers === 0) {
       return 'WASM (Prototype bridge)';
     }
 

@@ -50,7 +50,7 @@ const leadingValueTokens = {
   n_threads_batch: ['this._threadsBatch'],
   n_batch: ['this._nBatch'],
   n_ubatch: ['this._nUbatch'],
-  n_gpu_layers: ['this._nGpuLayers', 'candidateLayers'],
+  n_gpu_layers: ['this._effectiveGpuLayers', 'candidateLayers'],
   chunk_size: ['chunkBytes', 'remoteFetchReloadChunkBytes'],
 };
 
