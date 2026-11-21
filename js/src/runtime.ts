@@ -81,10 +81,13 @@ import {
 import {
   ModelStagingError,
   isJsAllocationError,
+  isSupportedJsModelStagingApiVersion,
   isWasm32TensorLimitText,
+  jsBackedStagingMode,
   missingJsModelStagingExports,
   shouldUseHeapResidentStaging,
   supportsHeapResidentStaging,
+  supportsJsBackedStaging,
 } from './internal/model_staging.ts';
 import { nextTokenCandidateIds, scoredTokensFrom } from './internal/next_token_scores.ts';
 import {
@@ -1475,6 +1478,14 @@ export class LlamaWebGpuBridgeRuntime {
     return unlinkFsFile(this._core.FS, path);
   }
 
+  _usesJsBackedStaging(core: LlamaCoreModule): boolean {
+    const mode = jsBackedStagingMode(this._config);
+    if (mode !== 'auto') return mode === 'on';
+    if (supportsJsBackedStaging(core)) return true;
+    this._pushRuntimeNote('model_staging_js_backed_default_unavailable');
+    return false;
+  }
+
   _mountJsBackedStaging(core: LlamaCoreModule, noteTag: string): string {
     const missingExports = missingJsModelStagingExports(core);
     if (missingExports.length > 0) {
@@ -1487,7 +1498,7 @@ export class LlamaWebGpuBridgeRuntime {
     const apiVersion = Number(
       core.ccall('llamadart_webgpu_js_model_fs_api_version', 'number', [], []),
     );
-    if (!Number.isInteger(apiVersion) || apiVersion < 3) {
+    if (!isSupportedJsModelStagingApiVersion(apiVersion)) {
       this._pushRuntimeNote('model_staging_js_backed_unsupported');
       throw new ModelStagingError(
         'MODEL_STAGING_UNSUPPORTED',
@@ -2751,7 +2762,7 @@ export class LlamaWebGpuBridgeRuntime {
     let assertMountOwned: (() => void) | undefined;
     try {
       if (!loadedViaRemoteFetch) {
-      useJsBackedStaging = this._config.jsBackedModelStaging === true;
+      useJsBackedStaging = this._usesJsBackedStaging(core);
       let modelDir = '/models';
       let stagingMountId = 0;
       if (useJsBackedStaging) {
@@ -3428,7 +3439,7 @@ export class LlamaWebGpuBridgeRuntime {
     }
 
     const core = await this._ensureCore();
-    const useJsBackedStaging = this._config.jsBackedModelStaging === true;
+    const useJsBackedStaging = this._usesJsBackedStaging(core);
     const fileName = basenameFromUrl(url);
     const fetchTimeoutMs = this._resolveFetchTimeoutMs({}, 180000);
     const chunkTimeoutMs = this._resolveStreamChunkTimeoutMs({}, 90000);

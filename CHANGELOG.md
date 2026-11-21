@@ -12,6 +12,8 @@
 - Add `isModelCached()` and `supportsModelCacheQuery` so applications can query the bridge cache on every engine. `loadMultimodalProjector()` accepts opt-in `useCache` and `cacheName` options. (#290)
 - Restrict model and projector caching to HTTP(S) URLs. This prevents the orphaned WebKit cache parts that `blob:` and `data:` loads could leave after #281. Deleting the affected Cache Storage cache removes any existing orphaned parts.
 
+- WebKit now uses JS-backed staging for models and projectors by default on supported cores. Set `jsBackedModelStaging: false` to opt out in either direct or worker mode. Staging failures can raise `ModelStagingError` with the option unset. With heap staging active, an iPhone 17 Pro loaded the 805 MB Q8 model at 0 or 1 GPU layer. (#263)
+
 - Start cross-origin core pthreads through module blob workers. Report blocked pthread starts as `BlobWorkerBlockedError` and record worker startup routes in the runtime notes. (#223)
 
 - Clear the core initialization timer when initialization settles so it cannot keep a disposed or retired core in memory.
