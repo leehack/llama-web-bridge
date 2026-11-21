@@ -1895,7 +1895,7 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
       }
       return response?.value as T;
     } catch (error) {
-      if (proxy.coreRetired === true) {
+      if (method !== 'setLogLevel' && proxy.coreRetired === true) {
         throw await this._workerCoreRetiredError(proxy, error);
       }
       if (error && typeof error === 'object' && (error as WorkerRequestError).state) {
@@ -3788,12 +3788,11 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
     }
 
     if (this._workerProxy) {
-      // Log-level delivery is best effort and runs outside the queue, so a
-      // failure must not replace worker topology here: doing so could strand a
-      // state-bearing response from the operation that currently owns the queue.
-      // The next real queued operation performs the normal fallback under
-      // queue ownership.
-      this._callWorker('setLogLevel', [level]).catch(() => {});
+      // Log-level delivery runs outside the queue. Leave retirement to queued
+      // operations, and use the stored level when they create a worker.
+      if (this._workerProxy.coreRetired !== true) {
+        this._callWorker('setLogLevel', [level]).catch(() => {});
+      }
       if (this._runtime) {
         this._runtime.setLogLevel(level);
       }

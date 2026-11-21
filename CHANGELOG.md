@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Keep `setLogLevel()` updates in the bridge configuration when the worker core retires. Queued operations own worker replacement and apply the saved level to the new worker. (#261)
+
 - Skip worker dispatch and reject with `AbortError` when one-shot `synthesizeSpeech()` is cancelled while awaiting worker readiness. (#268)
 
 - Resume interrupted model downloads when Safari reports `TypeError: Load failed`. (#278)
