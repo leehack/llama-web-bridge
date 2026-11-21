@@ -1650,6 +1650,7 @@ async function drainResponseWithProgress(response, progressCallback, options = {
         continue;
       }
       loaded += value.length;
+      if (options.releaseConsumedChunks === true) releaseChunkBuffer(value);
       if (typeof progressCallback === "function") {
         const effectiveTotal = total || loaded;
         const bucket = effectiveTotal > 0 ? Math.floor(loaded / effectiveTotal * 100) : -1;
@@ -1784,12 +1785,14 @@ function teeResponseForCache(source, maxCacheLagBytes = DEFAULT_CACHE_TEE_LAG_BY
 }
 var MODEL_CACHE_RECORD_HEADER = "x-llamadart-cache-record";
 var MODEL_CACHE_SIZE_HEADER = "x-llamadart-decoded-size";
-async function modelCacheMetadataUrl(cacheKey) {
+async function modelCacheKeyDigest(cacheKey) {
   const key = new URL(cacheKey);
   key.hash = "";
   const hash = await globalThis.crypto.subtle.digest("SHA-256", new TextEncoder().encode(key.href));
-  const digest = Array.from(new Uint8Array(hash), (byte) => byte.toString(16).padStart(2, "0")).join("");
-  return "https://llamadart-cache.invalid/decoded-size/" + digest;
+  return Array.from(new Uint8Array(hash), (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+async function modelCacheMetadataUrl(cacheKey) {
+  return "https://llamadart-cache.invalid/decoded-size/" + await modelCacheKeyDigest(cacheKey);
 }
 function modelCacheRecord(response) {
   const record = response?.headers.get(MODEL_CACHE_RECORD_HEADER) ?? "";
@@ -1838,6 +1841,300 @@ function startModelCacheStore(cache, cacheKey, response) {
     throw error;
   });
   return { tee, stored };
+}
+var MODEL_CACHE_PART_BYTES = 16 * 1024 * 1024;
+var MODEL_CACHE_PART_COUNT_HEADER = "x-llamadart-part-count";
+var MODEL_CACHE_PART_SIZE_HEADER = "x-llamadart-part-size";
+var MODEL_CACHE_INTERNAL_HEADERS = [
+  MODEL_CACHE_RECORD_HEADER,
+  MODEL_CACHE_SIZE_HEADER,
+  MODEL_CACHE_PART_COUNT_HEADER,
+  MODEL_CACHE_PART_SIZE_HEADER
+];
+var modelCacheManifestUrl = (digest) => "https://llamadart-cache.invalid/model-parts/" + digest;
+var modelCachePartsUrl = (digest) => "https://llamadart-cache.invalid/model-part/" + digest;
+var modelCachePartUrl = (digest, record, index) => modelCachePartsUrl(digest) + "?record=" + record + "&part=" + index;
+var ModelCacheEntryError = class extends Error {
+  constructor(message, retryWithoutCache) {
+    super(message);
+    this.name = "ModelCacheEntryError";
+    this.retryWithoutCache = retryWithoutCache;
+  }
+};
+async function readModelCacheManifest(cache, digest) {
+  const manifest = await cache.match(modelCacheManifestUrl(digest));
+  const record = modelCacheRecord(manifest);
+  if (!manifest || !record) return null;
+  const decodedBytes = parseByteLength(manifest.headers.get(MODEL_CACHE_SIZE_HEADER));
+  const partCount = parseByteLength(manifest.headers.get(MODEL_CACHE_PART_COUNT_HEADER));
+  const partBytes = parseByteLength(manifest.headers.get(MODEL_CACHE_PART_SIZE_HEADER));
+  if (!decodedBytes || !partCount || !partBytes || partCount !== Math.ceil(decodedBytes / partBytes)) {
+    return null;
+  }
+  return { record, decodedBytes, partCount, partBytes, headers: manifest.headers };
+}
+async function deleteModelCachePartEntries(cache, digest, shouldDelete) {
+  const entries = await cache.keys(modelCachePartsUrl(digest), { ignoreSearch: true });
+  const stale = entries.filter((entry) => shouldDelete(new URL(entry.url).searchParams.get("record")));
+  await Promise.all(stale.map((entry) => cache.delete(entry)));
+}
+async function deleteModelCacheParts(cache, cacheKey, lockScope) {
+  if (!getModelCacheLocks()) return false;
+  const digest = await modelCacheKeyDigest(cacheKey);
+  let removed = null;
+  await withModelCacheLock(lockScope, digest, async (lock) => {
+    if (!lock) return;
+    removed = await cache.delete(modelCacheManifestUrl(digest));
+    await deleteModelCachePartEntries(cache, digest, () => true);
+  });
+  return removed;
+}
+async function openModelCacheParts(cache, cacheKey, lockScope) {
+  const digest = await modelCacheKeyDigest(cacheKey);
+  const manifest = await readModelCacheManifest(cache, digest);
+  if (!manifest) return null;
+  const { record, decodedBytes, partCount, partBytes } = manifest;
+  let index = 0;
+  const body = new ReadableStream(
+    {
+      async pull(controller) {
+        if (index === partCount) {
+          controller.close();
+          return;
+        }
+        const expected = index === partCount - 1 ? decodedBytes - partBytes * index : partBytes;
+        let bytes = null;
+        try {
+          const part = await cache.match(modelCachePartUrl(digest, record, index));
+          bytes = part ? new Uint8Array(await part.arrayBuffer()) : null;
+        } catch (_) {
+          bytes = null;
+        }
+        if (!bytes || bytes.byteLength !== expected) {
+          let retryWithoutCache = true;
+          try {
+            await withModelCacheLock(lockScope, digest, async (lock) => {
+              if (!lock) return;
+              if ((await readModelCacheManifest(cache, digest))?.record === record) {
+                await cache.delete(modelCacheManifestUrl(digest));
+                await deleteModelCachePartEntries(cache, digest, (partRecord) => partRecord === record);
+              }
+              retryWithoutCache = false;
+            });
+          } catch (_) {
+          }
+          controller.error(new ModelCacheEntryError(
+            "Cached model part " + index + " is missing or damaged.",
+            retryWithoutCache
+          ));
+          return;
+        }
+        index += 1;
+        controller.enqueue(bytes);
+      }
+    },
+    { highWaterMark: 0 }
+  );
+  const headers = new Headers(manifest.headers);
+  for (const name of MODEL_CACHE_INTERNAL_HEADERS) headers.delete(name);
+  headers.delete("content-encoding");
+  headers.set("content-length", String(decodedBytes));
+  return { response: new Response(body, { status: 200, headers }), decodedBytes };
+}
+async function readCachedModelPartsSize(cache, cacheKey) {
+  return (await readModelCacheManifest(cache, await modelCacheKeyDigest(cacheKey)))?.decodedBytes ?? null;
+}
+function getModelCacheLocks() {
+  const locks = globalThis.navigator?.locks;
+  return typeof locks?.request === "function" ? locks : null;
+}
+async function withModelCacheLock(lockScope, digest, callback) {
+  const locks = getModelCacheLocks();
+  if (!locks) {
+    throw new Error("Web Locks are unavailable, so the model cannot be stored in parts.");
+  }
+  await locks.request("llamadart-model-cache:" + lockScope + ":" + digest, { ifAvailable: true }, callback);
+}
+function startModelCachePartStore(cache, cacheKey, source, lockScope, partBytes = MODEL_CACHE_PART_BYTES) {
+  if (source.status === 206) {
+    return {
+      response: source,
+      stored: Promise.reject(new TypeError("A partial response cannot be stored in the model cache.")),
+      cancelled: false
+    };
+  }
+  const reader = source.body.getReader();
+  let cancelled = false;
+  let storing = true;
+  let record = "";
+  let digest = "";
+  let part = null;
+  let filled = 0;
+  let partCount = 0;
+  let decodedBytes = 0;
+  let ready = null;
+  let pendingPut = null;
+  let releaseLock = null;
+  let resolveStored;
+  let rejectStored;
+  const stored = new Promise((resolve, reject) => {
+    resolveStored = resolve;
+    rejectStored = reject;
+  });
+  const pruneUncommitted = async () => {
+    const current = await readModelCacheManifest(cache, digest);
+    await deleteModelCachePartEntries(cache, digest, (partRecord) => !current || partRecord !== current.record);
+  };
+  const prepare = async () => {
+    if (typeof globalThis.crypto?.randomUUID !== "function") {
+      throw new Error("A UUID generator is unavailable, so the model cannot be stored in parts.");
+    }
+    record = globalThis.crypto.randomUUID();
+    digest = await modelCacheKeyDigest(cacheKey);
+    const held = await new Promise((resolve, reject) => {
+      withModelCacheLock(lockScope, digest, (lock) => {
+        if (!lock) {
+          resolve(false);
+          return void 0;
+        }
+        return new Promise((release) => {
+          releaseLock = release;
+          resolve(true);
+        });
+      }).catch(reject);
+    });
+    if (!held) {
+      throw new Error("Another context is storing this model.");
+    }
+    await pruneUncommitted();
+  };
+  const unlock = () => {
+    const release = releaseLock;
+    releaseLock = null;
+    release?.();
+  };
+  const abandon = (error) => {
+    if (!storing) return;
+    storing = false;
+    part = null;
+    rejectStored(error);
+    void (async () => {
+      await Promise.allSettled([ready, pendingPut]);
+      if (releaseLock) {
+        await deleteModelCachePartEntries(cache, digest, (partRecord) => partRecord === record);
+      }
+    })().catch(() => {
+    }).finally(unlock);
+  };
+  const put = async (url, response2) => {
+    pendingPut = cache.put(url, response2);
+    try {
+      await pendingPut;
+    } finally {
+      pendingPut = null;
+    }
+  };
+  const flush = async () => {
+    const body = filled === part.byteLength ? part : part.subarray(0, filled);
+    await put(modelCachePartUrl(digest, record, partCount), new Response(body));
+    partCount += 1;
+    filled = 0;
+  };
+  const append = async (chunk) => {
+    part ??= new Uint8Array(partBytes);
+    let offset = 0;
+    while (storing && offset < chunk.byteLength) {
+      const length = Math.min(part.byteLength - filled, chunk.byteLength - offset);
+      part.set(chunk.subarray(offset, offset + length), filled);
+      filled += length;
+      offset += length;
+      if (filled === part.byteLength) await flush();
+    }
+  };
+  const commit = async () => {
+    if (filled > 0) await flush();
+    if (!Number.isSafeInteger(decodedBytes) || decodedBytes <= 0) {
+      throw new Error("The model response was empty.");
+    }
+    const expectedBytes = captureResumeIdentity(source, source.url)?.total;
+    if (expectedBytes != null && decodedBytes !== expectedBytes) {
+      throw createModelTransferLengthError("Model response did not match its declared decoded size.");
+    }
+    const headers = new Headers(source.headers);
+    headers.set(MODEL_CACHE_RECORD_HEADER, record);
+    headers.set(MODEL_CACHE_SIZE_HEADER, String(decodedBytes));
+    headers.set(MODEL_CACHE_PART_COUNT_HEADER, String(partCount));
+    headers.set(MODEL_CACHE_PART_SIZE_HEADER, String(partBytes));
+    await put(modelCacheManifestUrl(digest), new Response(null, { headers }));
+    storing = false;
+    part = null;
+    try {
+      await deleteModelCachePartEntries(cache, digest, (partRecord) => partRecord !== record);
+      if (await cache.delete(cacheKey)) await pruneCachedModelSizes(cache, cacheKey);
+    } catch (_) {
+    }
+    unlock();
+    resolveStored();
+  };
+  const bodyStream = new ReadableStream(
+    {
+      async pull(controller) {
+        let result;
+        try {
+          result = await reader.read();
+        } catch (error) {
+          abandon(error);
+          throw error;
+        }
+        if (cancelled) return;
+        if (result.done) {
+          controller.close();
+          if (storing) {
+            try {
+              await (ready ??= prepare());
+              if (storing) await commit();
+            } catch (error) {
+              abandon(error);
+            }
+          }
+          return;
+        }
+        decodedBytes += result.value.byteLength;
+        if (storing) {
+          try {
+            await (ready ??= prepare());
+            if (storing) await append(result.value);
+          } catch (error) {
+            abandon(error);
+          }
+        }
+        if (cancelled) return;
+        controller.enqueue(result.value);
+      },
+      cancel(reason) {
+        cancelled = true;
+        abandon(reason ?? new Error("The response was cancelled before the cache copy completed."));
+        return reader.cancel(reason);
+      }
+    },
+    { highWaterMark: 0 }
+  );
+  const response = new Response(bodyStream, {
+    status: source.status,
+    statusText: source.statusText,
+    headers: source.headers
+  });
+  Object.defineProperties(response, {
+    url: { value: source.url },
+    type: { value: source.type }
+  });
+  return {
+    response,
+    stored,
+    get cancelled() {
+      return cancelled;
+    }
+  };
 }
 function ensureFsDirectory(fs, dirPath) {
   const slash = dirPath.lastIndexOf("/");
@@ -2304,6 +2601,7 @@ function scoredTokensFrom(entries) {
 // js/src/runtime.ts
 var cachedModelSizes = /* @__PURE__ */ new WeakMap();
 var pendingModelCacheStores = /* @__PURE__ */ new WeakMap();
+var teedModelResponses = /* @__PURE__ */ new WeakSet();
 var SAFARI_EMBEDDING_PROBE_MAX_COSINE = 0.999;
 var SAFARI_EMBEDDING_PROBE_MIN_COMPONENT = 1e-3;
 var EmbeddingInputTooLongError = class extends Error {
@@ -3601,6 +3899,18 @@ var LlamaWebGpuBridgeRuntime = class {
     const cacheKey = normalizeAbsoluteUrl(url);
     try {
       const cache = await globalThis.caches.open(this._modelCacheName);
+      const parts = forceRefresh || !this._isWebKit ? null : await openModelCacheParts(cache, cacheKey, this._modelCacheName);
+      if (parts) {
+        this._modelSource = "cache";
+        this._modelCacheState = "hit";
+        this._runtimeNotes.push("model_cache_hit");
+        this._runtimeNotes.push("model_cache_parts");
+        if (requireReadableStream) {
+          this._runtimeNotes.push("model_cache_stream");
+        }
+        cachedModelSizes.set(parts.response, parts.decodedBytes);
+        return parts.response;
+      }
       const cached = forceRefresh ? null : await cache.match(cacheKey);
       if (cached) {
         const cacheHasStream = hasReadableResponseStream(cached);
@@ -3671,6 +3981,18 @@ var LlamaWebGpuBridgeRuntime = class {
       }
       return response;
     }
+    if (this._isWebKit) {
+      const store = startModelCachePartStore(cache, cacheKey, response, this._modelCacheName);
+      pendingModelCacheStores.set(store.response, store.stored.then(
+        () => {
+          this._runtimeNotes.push("model_cache_stored");
+          this._runtimeNotes.push("model_cache_parts");
+          return "stored";
+        },
+        (error) => store.cancelled ? "store_failed" : recordFailure(error)
+      ));
+      return store.response;
+    }
     const { tee, stored: cacheStore } = startModelCacheStore(cache, cacheKey, response);
     const stored = cacheStore.then(
       () => {
@@ -3682,6 +4004,7 @@ var LlamaWebGpuBridgeRuntime = class {
       }
     );
     pendingModelCacheStores.set(tee.response, stored);
+    teedModelResponses.add(tee.response);
     return tee.response;
   }
   // Waits for the cache store a model response feeds, once the caller has read
@@ -3741,12 +4064,14 @@ var LlamaWebGpuBridgeRuntime = class {
         let response;
         let headerTotal = 0;
         if (cache) {
-          const cached = options.force === true ? null : await cache.match(cacheKey);
-          if (cached) {
+          const partsBytes = options.force === true || !this._isWebKit ? null : await readCachedModelPartsSize(cache, cacheKey);
+          const cached = options.force === true || partsBytes !== null ? null : await cache.match(cacheKey);
+          if (cached || partsBytes !== null) {
             this._modelSource = "cache";
             this._modelCacheState = "hit";
             this._runtimeNotes.push("model_cache_hit");
-            headerTotal = await readCachedModelSize(cache, cacheKey, cached) ?? (Number(cached.headers.get("content-length")) || 0);
+            if (partsBytes !== null) this._runtimeNotes.push("model_cache_parts");
+            headerTotal = partsBytes ?? (cached ? await readCachedModelSize(cache, cacheKey, cached) : null) ?? (Number(cached?.headers.get("content-length")) || 0);
             const resolved = headerTotal > 0 ? headerTotal : 1;
             shardLoaded[shardIndex] = resolved;
             shardTotals[shardIndex] = resolved;
@@ -3767,10 +4092,18 @@ var LlamaWebGpuBridgeRuntime = class {
           shardTotals[shardIndex] = headerTotal;
         }
         let cacheStore = null;
-        if (cache && hasReadableResponseStream(response)) {
+        let releaseConsumedChunks = this._isWebKit;
+        let storedInParts = false;
+        if (cache && hasReadableResponseStream(response) && this._isWebKit) {
+          const store = startModelCachePartStore(cache, cacheKey, response, this._modelCacheName);
+          response = store.response;
+          cacheStore = store.stored;
+          storedInParts = true;
+        } else if (cache && hasReadableResponseStream(response)) {
           const { tee, stored } = startModelCacheStore(cache, cacheKey, response);
           response = tee.response;
           cacheStore = stored;
+          releaseConsumedChunks = false;
         } else if (cache) {
           cacheStore = cache.put(cacheKey, response.clone());
         }
@@ -3786,7 +4119,7 @@ var LlamaWebGpuBridgeRuntime = class {
             }
             emitAggregateProgress();
           } : null,
-          { chunkTimeoutMs }
+          { chunkTimeoutMs, releaseConsumedChunks }
         );
         const finalLoaded = shardLoaded[shardIndex] > 0 ? shardLoaded[shardIndex] : shardTotals[shardIndex] > 0 ? shardTotals[shardIndex] : headerTotal;
         shardLoaded[shardIndex] = finalLoaded;
@@ -3799,6 +4132,7 @@ var LlamaWebGpuBridgeRuntime = class {
           if (putResult.ok) {
             this._modelCacheState = "stored";
             this._runtimeNotes.push("model_cache_stored");
+            if (storedInParts) this._runtimeNotes.push("model_cache_parts");
           } else {
             const putErrorText = String(putResult.error || "").toLowerCase();
             if (putErrorText.includes("abort") || putErrorText.includes("cancel")) {
@@ -3844,10 +4178,14 @@ var LlamaWebGpuBridgeRuntime = class {
       let removedCount = 0;
       for (const modelUrl of modelUrls) {
         const cacheKey = normalizeAbsoluteUrl(modelUrl);
+        const removedParts = await deleteModelCacheParts(cache, cacheKey, this._modelCacheName);
+        if (removedParts === null) continue;
         const removed = await cache.delete(cacheKey);
         if (removed) {
-          removedCount += 1;
           await pruneCachedModelSizes(cache, cacheKey);
+        }
+        if (removed || removedParts) {
+          removedCount += 1;
         }
       }
       const removedAny = removedCount > 0;
@@ -4271,6 +4609,7 @@ var LlamaWebGpuBridgeRuntime = class {
             let minimumShardBytes = 0;
             let heapFileBytes = null;
             let heapUnavailableReason;
+            let bypassShardCache = false;
             const restartShard = (reason) => {
               this._runtimeNotes.push("model_stream_restart:" + reason);
               if (resumeAttempt >= maxStreamResumeRetries) {
@@ -4293,7 +4632,7 @@ var LlamaWebGpuBridgeRuntime = class {
                 ...options,
                 requireReadableStream: true,
                 readDecodedCacheSize: heapResidentStaging,
-                useCache: requestHeaders ? false : options.useCache,
+                useCache: requestHeaders || bypassShardCache ? false : options.useCache,
                 force: requestHeaders ? true : options.force,
                 requestHeaders
               });
@@ -4403,7 +4742,7 @@ var LlamaWebGpuBridgeRuntime = class {
                     // Detaching frees a chunk at once on WebKit, which otherwise keeps
                     // it past the load; Chromium keeps a detached chunk longer than a
                     // dropped one. A cache tee still reads the chunks.
-                    releaseConsumedChunks: this._isWebKit && !pendingModelCacheStores.has(response),
+                    releaseConsumedChunks: this._isWebKit && !teedModelResponses.has(response),
                     startOffset: resumeOffset,
                     heapFileBytes,
                     preservePartialOnError: true,
@@ -4457,6 +4796,12 @@ var LlamaWebGpuBridgeRuntime = class {
                   error,
                   knownTotalBytes > 0 ? knownTotalBytes : resumeOffset
                 ) : null;
+                if (!stagingAllocError && error instanceof ModelCacheEntryError) {
+                  this._runtimeNotes.push("model_cache_entry_invalid");
+                  bypassShardCache = error.retryWithoutCache;
+                  restartShard("cache");
+                  continue;
+                }
                 const retryableNetworkError = isRetryableStreamNetworkError(error);
                 if (!stagingAllocError && retryableNetworkError && rangeOverrun) {
                   restartShard("range");
