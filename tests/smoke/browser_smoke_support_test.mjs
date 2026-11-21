@@ -687,6 +687,194 @@ class FakeGrammarBridge {
   async dispose() {}
 }
 
+const snapshotPath = '/tmp/grammar-smoke-prefix.bin';
+const samplerPrompt = grammarSmoke.LAZY_GRAMMAR.prompt;
+
+async function runSnapshotGrammar({ nativeReuse = 0, roundTrip = true, dirtySkip = false,
+  samplerDivergesAt = 8, qwen = false, nCtx = 1024 } = {}) {
+  const modes = [];
+  const tokensFor = (prompt) => prompt === '<tool_call>\n</think>'
+    ? [248058, 198, 248069] : Array.from(prompt, (char) => char.codePointAt(0));
+  class Bridge extends FakeGrammarBridge {
+    constructor() {
+      super();
+      this.calls = [];
+      modes.push(this.calls);
+      this._runtime = { _core: { ccall: (name, _type, _types, args) => {
+        if (name === 'llamadart_webgpu_last_error') return this.nativeError;
+        this.nativeError = grammarSmoke.INVALID_NATIVE_MULTI_ENDS.find(
+          ({ json, index }) => json === args.at(-2) && index === args.at(-1),
+        ).error;
+        return -2;
+      } } };
+    }
+
+    async getCompletionCapabilities() {
+      return Object.fromEntries(grammarSmoke.COMPLETION_CAPABILITIES.map((name) => [name, this.nThreads != null]));
+    }
+
+    getModelMetadata() {
+      return { ...super.getModelMetadata(), 'general.architecture': qwen ? 'qwen35' : 'llama' };
+    }
+
+    async tokenize(prompt) { return tokensFor(prompt); }
+
+    async detokenize(tokens) {
+      return (roundTrip ? '' : '!') + String.fromCodePoint(...tokens);
+    }
+
+    async stateSaveFile(file, tokens) {
+      this.calls.push({ op: 'save', file, tokens, scored: this.scored });
+      this.snapshot = tokens;
+    }
+
+    async stateLoadFile(file, capacity = 256) {
+      assert.ok(this.snapshot.length <= capacity, 'saved prefix exceeds the restore capacity');
+      this.calls.push({ op: 'load', file });
+      this.restored = this.snapshot;
+    }
+
+    async scoreNextToken(prompt, { topK }) {
+      this.calls.push({ op: 'score', prompt, restored: this.restored });
+      this.restored = undefined;
+      this.scored = tokensFor(prompt);
+      const char = topK === grammarSmoke.PROMPT_PENALTY.topK ? 'a' : 'g';
+      return { top: [char, '~'].map((piece, i) => ({
+        token: piece.charCodeAt(0), logprob: -i, bytes: new TextEncoder().encode(piece),
+      })) };
+    }
+
+    async createCompletion(prompt, options) {
+      const restored = this.restored;
+      const { seed, nPredict, temp, minP, presencePenalty, grammar, thinkingBudget } = options;
+      this.calls.push({ op: 'complete', prompt, options, restored });
+      this.restored = undefined;
+      this.scored = undefined;
+      options.onUsage?.({ promptTokens: tokensFor(prompt).length, cachedPromptTokens: restored?.length ?? nativeReuse });
+      if (prompt === 'a b') return 'detection';
+      if (minP < 0 || minP > 1 || presencePenalty === Infinity) throw new RangeError('CompletionOptions.');
+      if (thinkingBudget?.maxTokens < 0) throw new RangeError('CompletionOptions.thinkingBudget');
+      if (prompt.includes('Call get_weather for Seoul.')) {
+        const forced = thinkingBudget?.forcedMessage;
+        if (options.signal) {
+          options.onToken();
+          return '';
+        }
+        if (forced === 'BUDGET1949' && !thinkingBudget.naturalEndTags) return 'BUDGET1949</think>';
+        if (prompt.includes('<function=get_weather>')) return 'prefilled';
+        if (grammar?.includes('<[248058]>')) return '<tool_call>weather';
+        if (forced != null) return forced + '</think>' + (grammar ? 'yes' : '');
+        if (grammar === 'root ::= "yes"') throw new Error("paused grammar rejected the thinking budget's natural end");
+        return grammar ? 'gweather' : 'g';
+      }
+      if (seed === 5) return 'abcdefghijklmnopqrst'.slice(0, nPredict);
+      if (presencePenalty === grammarSmoke.PROMPT_PENALTY.presencePenalty) {
+        return dirtySkip && prompt === samplerPrompt ? '' : '~';
+      }
+      if (seed === 11) {
+        if (presencePenalty === 20 && nPredict >= samplerDivergesAt) return 'presence';
+        return temp === 0 || minP === 1 ? 'greedy' : 'sampled';
+      }
+      return 'yes';
+    }
+  }
+  const page = grammarSmoke.renderHarness(nCtx, ['wasm32', 'wasm64']);
+  const payload = await runHarnessPage(page, Bridge, {}, { pageConsole: { log() {} } });
+  assert.equal(payload.ok, true, payload.error);
+  return { modes, results: payload.modeResults };
+}
+
+test('grammar reuses hybrid snapshots while keeping raw completion and recovery coverage', async () => {
+  const { modes, results } = await runSnapshotGrammar({ qwen: true, nCtx: 1 });
+  for (const [i, calls] of modes.entries()) {
+    const stats = results[i].prefixSnapshotReuse;
+    assert.ok(stats?.saves > 0 && stats.restores > 0 && stats.cachedPromptTokens > 0,
+      'hybrid completions must save, restore and reuse prompt tokens');
+    assert.equal(stats?.enabled, true);
+    assert.equal(Object.values(stats.restoresByPhase).flat().length, stats.restores);
+    assert.ok(stats.restoresByPhase.casesMs.some(({ run }) => run === 'yes-no-sampled'));
+    for (const call of calls.filter(({ op }) => op === 'save' || op === 'load')) {
+      assert.equal(call.file, snapshotPath);
+      if (call.op === 'save') assert.deepEqual(call.tokens, call.scored);
+    }
+    const completions = calls.filter(({ op }) => op === 'complete');
+    for (const { prompt, restored } of completions.filter(({ restored }) => restored)) {
+      assert.deepEqual(restored, Array.from(prompt.slice(0, -1), (char) => char.codePointAt(0)));
+    }
+    for (const prompt of new Set(completions.map(({ prompt }) => prompt))) {
+      assert.ok(completions.some((call) => call.prompt === prompt && !call.restored), 'raw completion missing for ' + prompt);
+    }
+    const sampler = completions.filter(({ prompt, options }) => prompt === samplerPrompt && options.seed === 11 && options.nPredict > 1);
+    assert.equal(sampler.at(-1).restored, undefined, 'samplerAfterInvalid');
+    const thinking = completions.filter(({ options }) => options.seed === 3);
+    for (const index of [0, 6, 7, 8, 11]) assert.equal(thinking[index].restored, undefined);
+    const lazy = completions.filter(({ options }) => options.seed === 5);
+    assert.ok(lazy.slice(-5).every(({ restored }) => !restored), 'lazy errors and recovery');
+    assert.ok(completions.slice(-3).every(({ restored }) => !restored), 'multi-end rejection, cancel and recovery');
+    const closedPrefix = grammarSmoke.THINKING_RUNS.find(([name]) => name === 'closed-first')[1].slice(0, -1);
+    for (const score of calls.filter(({ op, prompt }) => op === 'score'
+      && (prompt === closedPrefix || prompt.includes('<function=get_weather>')))) {
+      assert.ok(score.restored?.length > 0, 'prefix extension must restore the shared state');
+    }
+    assert.equal(calls.filter(({ op, prompt }) => op === 'score'
+      && (prompt === closedPrefix || prompt.includes('<function=get_weather>'))).length, 2);
+  }
+});
+
+for (const [name, options, enabled] of [
+  ['native reuse', { nativeReuse: 1 }, false],
+  ['a prefix that does not round-trip', { roundTrip: false }, true],
+]) {
+  test(`grammar stays snapshot-free with ${name}`, async () => {
+    const { modes, results } = await runSnapshotGrammar(options);
+    for (const [i, calls] of modes.entries()) {
+      const stats = results[i].prefixSnapshotReuse;
+      assert.equal(stats?.enabled, enabled);
+      assert.equal(stats.saves, 0);
+      assert.equal(stats.restores, 0);
+      assert.ok(!calls.some(({ op }) => op === 'save' || op === 'load'));
+    }
+  });
+}
+
+test('grammar never saves dirty context when the prompt-penalty probe skips an empty output', async () => {
+  const { modes, results } = await runSnapshotGrammar({ dirtySkip: true });
+  for (const [i, calls] of modes.entries()) {
+    assert.equal(results[i].promptPenalty.steps, 1);
+    assert.ok(results[i].prefixSnapshotReuse?.saves > 0);
+    const skip = calls.findIndex(({ op, prompt, options }) => op === 'complete' && prompt === samplerPrompt
+      && options.presencePenalty === grammarSmoke.PROMPT_PENALTY.presencePenalty);
+    assert.ok(skip !== -1);
+    assert.deepEqual(calls[skip + 1], { op: 'score', prompt: samplerPrompt + 'a', restored: undefined });
+    assert.deepEqual(calls[skip + 3], { op: 'score', prompt: samplerPrompt, restored: undefined });
+  }
+});
+
+for (const [label, samplerDivergesAt, expectedLimits] of [
+  ['early divergence', 8, [8]], ['late divergence', 20, [8, 20]], ['a broken penalty', Infinity, [8, 20]],
+]) {
+  test(`grammar uses the expected sampler budgets for ${label}`, async () => {
+    const { modes, results } = await runSnapshotGrammar({ samplerDivergesAt });
+    for (const [i, calls] of modes.entries()) {
+      const penalty = calls.filter(({ op, options }) => op === 'complete' && options.presencePenalty === 20);
+      assert.deepEqual(penalty.map(({ options }) => options.nPredict), expectedLimits);
+      assert.equal(results[i].samplerPredictLimit, expectedLimits.at(-1));
+      const result = results[i];
+      const otherFailures = new Set([
+        ...grammarSmoke.validatePromptPenalty(result), ...grammarSmoke.validateThinkingBudget(result),
+        ...grammarSmoke.validateLazyGrammar(result),
+      ]);
+      const failures = grammarSmoke.validateSampler(result).filter((failure) => !otherFailures.has(failure));
+      if (samplerDivergesAt === Infinity) {
+        assert.deepEqual(failures.slice(0, -1), ['presencePenalty did not change greedy output']);
+        assert.match(failures.at(-1), /^sampler outputs:/);
+      } else {
+        assert.deepEqual(failures, []);
+      }
+    }
+  });
+}
+
 for (const [hardwareConcurrency, expected] of [[4, 4], [2, 2], [16, 4]]) {
   test(`grammar requests ${expected} threads with ${hardwareConcurrency} logical CPUs`, async () => {
     const requested = [];
