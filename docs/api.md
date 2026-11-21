@@ -200,7 +200,7 @@ it.
 | `threadPoolSize` | `number` | Hint for the compiled pthread pool size, used before the core can report it. |
 | `nBatch` | `number` | llama.cpp batch size override. |
 | `nUbatch` | `number` | llama.cpp micro-batch size override. |
-| `nGpuLayers` | `number` | Default GPU layer count. `0` forces CPU/WASM execution. An omitted or negative count requests full offload, subject to the Safari cap. Older or unidentified Safari defaults to one GPU layer. An effective count of `0` or `1` enables heap staging for eligible JS-backed loads, including the WebKit default. |
+| `nGpuLayers` | `number` | Initial GPU layer request. `0` forces CPU/WASM execution. An omitted or negative count requests full offload. Apple Safari with a version below 27 or an unknown version defaults to a cap of one GPU layer. An effective count of `0` or `1` enables heap staging for eligible JS-backed loads, including the WebKit default. |
 | `userAgent` | `string` | User-agent override for automatic WebKit staging and the Safari GPU layer cap. The Safari version check requires an Apple platform and Safari's product tokens. |
 | `remoteFetchThresholdBytes` | `number` | Size threshold for trying the native remote-fetch backend for large single-file models. |
 | `remoteFetchChunkBytes` | `number` | Chunk size used by remote-fetch streaming paths. |
@@ -336,9 +336,9 @@ Common `options` keys:
 | `signal` | `AbortSignal` used to cancel model transfer. |
 | `nCtx` | Context size. Defaults to the bridge runtime default, initially 4096. |
 | `nThreads`, `nThreadsBatch` | Per-load thread overrides, capped to the active runtime. |
-| `nGpuLayers` | Per-load GPU layer override. Use `0` for CPU/WASM mode. A negative count requests full offload, as does omitting the count when no default is configured. The Safari cap applies to these requests. An effective count of `0` or `1` after the cap selects heap staging for eligible JS-backed model loads, including the WebKit default. |
+| `nGpuLayers` | GPU layer request. Omit this option to reuse the last request on the active runtime, initially the bridge's configured default. Use `0` for CPU/WASM mode. A negative count requests full offload, subject to the cap on Apple Safari. An effective count of `0` or `1` after the cap selects heap staging for eligible JS-backed model loads, including the WebKit default. |
 | `useMmap` | Pass `false` to keep eligible JS-backed model loads on JS chunks. |
-| `safariMaxGpuLayers` | Per-load GPU layer cap for user agents detected as Safari, including for full-offload requests. Older or unidentified Safari defaults to one layer. Pass `Infinity` to lift the cap. Recognized Safari 27 and newer default to no cap. Use `nGpuLayers: 0` to request CPU-only execution. |
+| `safariMaxGpuLayers` | Per-load Safari GPU layer cap. Apple Safari also applies it to full-offload requests. Safari 27 and newer default to no cap. Older or unversioned Safari defaults to one layer. Pass `Infinity` to lift the cap or `nGpuLayers: 0` for CPU-only execution. |
 | `safariGpuProbe` | Set to `false` to skip the Safari load-time GPU probe. |
 | `nBatch`, `nUbatch` | Per-load batch and micro-batch overrides. |
 | `useCache`, `force` | Cache Storage controls for HTTP(S) model responses. A cache miss writes the model to Cache Storage during the download. If the cache write fails, the download can still finish and load the model. Cancellation during transfer discards the incomplete entry. WebKit stores 16 MiB parts and a manifest. A Web Lock allows one context to store a given model in a given cache at a time. When a load needs to download a model and the lock is busy, Web Locks are unavailable, or `crypto.randomUUID()` is unavailable, the load proceeds uncached. The cache layout is private on every engine. Use `isModelCached()` to check for a cached model. |

@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- Apply the Safari below 27 one-layer cap when `nGpuLayers` is omitted or negative so eligible loads use heap-resident staging. Set `safariMaxGpuLayers: Infinity` to opt out. (#270)
+- Apply the Apple Safari below 27 one-layer cap to full-offload requests so eligible loads use heap-resident staging. Set `safariMaxGpuLayers: Infinity` to opt out. (#270)
 
 - End a threaded core's pthread runtime when a direct-mode bridge is disposed or its core retires, so Chromium can collect the core and its memory. A core supplied through `coreModuleFactory` keeps running after `dispose()`. (#262)
 

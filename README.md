@@ -111,7 +111,7 @@ model streams use `transfer(0)` to release consumed whole buffers on both heap
 and JS-chunk paths.
 Split models, requests that still offload more than one GPU layer after the
 Safari cap, older or fixed-memory cores, and `useMmap: false` use JS chunks.
-Safari below 27 caps GPU offload at one layer by default, including when
+Apple Safari below 27 caps GPU offload at one layer by default, including when
 `nGpuLayers` is omitted or negative. Set `nGpuLayers: 0` for a higher model-size
 ceiling on the CPU, or `safariMaxGpuLayers: Infinity` to lift the cap.
 WebKit writes and reads cached models in 16 MiB parts to

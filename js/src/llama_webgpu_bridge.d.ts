@@ -63,7 +63,7 @@ export interface LoadModelOptions {
   remoteFetchChunkBytes?: number;
   /** Pass false to keep JS-chunk staging when jsBackedModelStaging is enabled. */
   useMmap?: boolean;
-  /** Overrides the Safari GPU layer cap, including for full-offload requests. Older Safari defaults to one layer. Pass Infinity to opt out. Recognized Safari 27+ is uncapped by default. */
+  /** Overrides the Safari GPU layer cap. Apple Safari also applies it to full-offload requests. Older Safari defaults to one layer. Pass Infinity to opt out. Recognized Safari 27+ is uncapped by default. */
   safariMaxGpuLayers?: number;
   /** Set to false to skip the Safari load-time GPU probe. */
   safariGpuProbe?: boolean;

@@ -2696,7 +2696,8 @@ var LlamaWebGpuBridgeRuntime = class {
     );
     this._nBatch = Number(config.nBatch) > 0 ? Math.max(32, Math.trunc(Number(config.nBatch))) : 0;
     this._nUbatch = Number(config.nUbatch) > 0 ? Math.max(32, Math.trunc(Number(config.nUbatch))) : 0;
-    this._nGpuLayers = Number.isFinite(config.nGpuLayers) ? Number(config.nGpuLayers) : -1;
+    this._requestedGpuLayers = Number.isFinite(config.nGpuLayers) ? Number(config.nGpuLayers) : -1;
+    this._nGpuLayers = this._requestedGpuLayers;
     this._nSeqMax = 0;
     this._useMmap = false;
     this._useMlock = false;
@@ -4533,8 +4534,9 @@ var LlamaWebGpuBridgeRuntime = class {
     }
     const requestedGpuLayers = Number(options.nGpuLayers);
     if (Number.isFinite(requestedGpuLayers)) {
-      this._nGpuLayers = Math.trunc(requestedGpuLayers);
+      this._requestedGpuLayers = Math.trunc(requestedGpuLayers);
     }
+    this._nGpuLayers = this._requestedGpuLayers;
     if (this._nGpuLayers > 0 && !this._gpuActive) {
       const unavailable = await describeWebGpuUnavailable();
       throwIfAborted(operationSignal, abortMessage);
@@ -4587,7 +4589,7 @@ var LlamaWebGpuBridgeRuntime = class {
       this._runtimeNotes.push("cpu_batch_tuned_default");
     }
     const effectiveGpuLayers = effectiveOffloadedGpuLayers(this._nGpuLayers);
-    if (this._isSafari && effectiveGpuLayers > 0) {
+    if (this._isSafari && effectiveGpuLayers > 0 && (this._isAppleSafari || this._nGpuLayers > 0)) {
       const requestedSafariMaxLayers = Number(options.safariMaxGpuLayers);
       const safariMaxGpuLayers = requestedSafariMaxLayers === Infinity || Number.isFinite(requestedSafariMaxLayers) ? Math.max(1, Math.trunc(requestedSafariMaxLayers)) : this._safariDefaultMaxGpuLayers;
       if (effectiveGpuLayers > safariMaxGpuLayers) {

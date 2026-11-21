@@ -8,12 +8,14 @@ import { fileURLToPath } from 'node:url';
 
 import * as environment from '../../js/src/internal/environment.ts';
 import { LlamaWebGpuBridge } from '../../js/src/llama_webgpu_bridge.js';
+import { LlamaWebGpuBridgeRuntime } from '../../js/src/runtime.ts';
+import { installBridgeWorkerHost } from '../../js/src/worker_host.ts';
 import { createStubCore } from './bridge_operation_queue_fixtures.mjs';
 import { readNativeCoreSource } from './native_core_source.mjs';
 
 const MAC = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko)';
 const safari = (version) => `${MAC} Version/${version} Safari/605.1.15`;
-const IPHONE_26 = 'Mozilla/5.0 (iPhone; CPU iPhone OS 26_5 like Mac OS X) AppleWebKit/605.1.15 '
+const IPHONE_26 = 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/605.1.15 '
   + '(KHTML, like Gecko) Version/26.5 Mobile/15E148 Safari/604.1';
 const IPHONE_27 = 'Mozilla/5.0 (iPhone; CPU iPhone OS 27_0 like Mac OS X) AppleWebKit/605.1.15 '
   + '(KHTML, like Gecko) Version/27.0 Mobile/15E148 Safari/604.1';
@@ -93,6 +95,7 @@ async function load({
   userAgent,
   config = { nGpuLayers: 99 },
   options = {},
+  reloadOptions = [],
   embeddingModel = false,
   legacyCore = false,
   completion = async () => 'Hello there.',
@@ -160,15 +163,14 @@ async function load({
       return completion(...args);
     };
 
-    await bridge.loadModelFromUrl('https://models.test/model.gguf', {
-      nCtx: 128, nThreads: 1, forceRemoteFetchBackend: false, useCache: false, ...options,
-    });
+    const metadataLayers = await loadModels(bridge, [options, ...reloadOptions]);
     const metadata = bridge.getModelMetadata();
     return {
       calls: { completion: completionCalls, embed: nativeEmbedCalls.length },
       nativeEmbedCalls,
       lastEmbeddingJson,
       loadedLayers,
+      metadataLayers,
       gpuActive: bridge.isGpuActive(),
       layers: metadata['llamadart.webgpu.n_gpu_layers'],
       notes: metadata['llamadart.webgpu.runtime_notes'].split(';').filter((note) => note.startsWith('safari_')),
@@ -177,6 +179,90 @@ async function load({
     Object.defineProperty(globalThis, 'navigator', oldNavigator);
   }
 }
+
+async function loadModels(bridge, options) {
+  const metadataLayers = [];
+  for (const [index, loadOptions] of options.entries()) {
+    await bridge.loadModelFromUrl(`https://models.test/model-${index}.gguf`, {
+      nCtx: 128, nThreads: 1, forceRemoteFetchBackend: false, useCache: false, ...loadOptions,
+    });
+    metadataLayers.push(bridge.getModelMetadata()['llamadart.webgpu.n_gpu_layers']);
+  }
+  return metadataLayers;
+}
+
+const RELOAD_OPTIONS = [
+  {},
+  { safariMaxGpuLayers: Infinity },
+  {},
+  { nGpuLayers: -7 },
+  { safariMaxGpuLayers: Infinity },
+  { nGpuLayers: 0 },
+  { safariMaxGpuLayers: Infinity },
+];
+
+test('direct Safari applies each cap to the requested count across model loads', async (t) => {
+  for (const [config, originalLayers] of [[{}, -1], [{ nGpuLayers: -5 }, -5], [{ nGpuLayers: 42 }, 42]]) {
+    await t.test(`original request ${originalLayers}`, async () => {
+      const result = await load({ userAgent: IPHONE_26, config, reloadOptions: RELOAD_OPTIONS.slice(1) });
+      const expectedLayers = [1, originalLayers, 1, 1, -7, 0, 0];
+      assert.deepEqual(result.loadedLayers, expectedLayers);
+      assert.deepEqual(result.metadataLayers, expectedLayers.map(String));
+    });
+  }
+});
+
+test('the Safari worker applies each cap to the requested count across model loads', async (t) => {
+  const core = createStubCore();
+  const loadedLayers = [];
+  const ccall = core.ccall.bind(core);
+  t.mock.method(core, 'ccall', (name, type, types, args = []) => {
+    if (name === 'llamadart_webgpu_probe') return 1;
+    if (name === 'llamadart_webgpu_load_model') {
+      loadedLayers.push(args[6]);
+      return 0;
+    }
+    if (name === 'llamadart_webgpu_free_model') return 0;
+    return ccall(name, type, types, args);
+  });
+  const prototype = LlamaWebGpuBridgeRuntime.prototype;
+  t.mock.method(prototype, '_ensureCore', async function () {
+    this._core = core;
+    return core;
+  });
+  t.mock.method(prototype, '_getCachedModelResponse', async () => new Response(Uint8Array.of(1, 2, 3)));
+  t.mock.method(prototype, 'createCompletion', async () => 'Hello there.');
+
+  const { port1, port2 } = new MessageChannel();
+  const oldSelf = globalThis.self;
+  const oldWorker = globalThis.Worker;
+  const host = { postMessage: (message) => port2.postMessage(message) };
+  let bridge;
+  try {
+    globalThis.self = host;
+    installBridgeWorkerHost();
+    port2.onmessage = (event) => host.onmessage(event);
+    globalThis.Worker = class {
+      constructor() { port1.onmessage = (event) => this.onmessage(event); }
+      postMessage(message, transfers) { port1.postMessage(message, transfers); }
+      terminate() { port1.close(); port2.close(); }
+    };
+    bridge = new LlamaWebGpuBridge({ userAgent: IPHONE_26, nGpuLayers: -5 });
+    const metadataLayers = await loadModels(bridge, RELOAD_OPTIONS);
+    assert.equal(bridge.getModelMetadata()['llamadart.webgpu.execution'], 'worker');
+    assert.deepEqual(loadedLayers, [1, -5, 1, 1, -7, 0, 0]);
+    assert.deepEqual(metadataLayers, loadedLayers.map(String));
+  } finally {
+    try {
+      await bridge?.dispose();
+    } finally {
+      port1.close();
+      port2.close();
+      globalThis.self = oldSelf;
+      globalThis.Worker = oldWorker;
+    }
+  }
+});
 
 test('Safari 27 offloads every requested layer by default', async () => {
   for (const userAgent of [safari('27.0'), IPHONE_27, IPAD_27]) {
@@ -271,6 +357,15 @@ for (const [browser, userAgent] of Object.entries(SAFARI_LIKE_UAS)) {
     assert.deepEqual(result.loadedLayers, [1]);
     assert.deepEqual(result.notes, ['safari_gpu_layers_capped:1', 'safari_gpu_probe_passed']);
     assert.deepEqual(result.calls, { completion: 2, embed: 0 });
+  });
+
+  test(`${browser} passes through full-offload requests`, async () => {
+    for (const [options, layers] of [[{}, -1], [{ nGpuLayers: -5 }, -5]]) {
+      const result = await load({ userAgent, config: {}, options });
+      assert.deepEqual(result.loadedLayers, [layers]);
+      assert.deepEqual(result.notes, []);
+      assert.deepEqual(result.calls, { completion: 0, embed: 0 });
+    }
   });
 }
 
