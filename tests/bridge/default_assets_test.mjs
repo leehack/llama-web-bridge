@@ -1,10 +1,11 @@
 import assert from 'node:assert/strict';
-import { copyFile, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { copyFile, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { registerHooks } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
-import { pathToFileURL } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import ts from 'typescript';
 import { LlamaWebGpuBridge } from '../../js/src/bridge.ts';
 import { createPthreadWorkerStart, PTHREAD_WORKER_HOOK } from '../../js/src/internal/worker_start.ts';
 import { LlamaWebGpuBridgeRuntime } from '../../js/src/runtime.ts';
@@ -55,6 +56,21 @@ test('a relative assetBaseUrl resolves against the calling document and keeps pe
   assert.deepEqual(bridge._workerConfig()._coreAssetSources, { wasm32: 'explicit', wasm64: 'base' });
 });
 
+test('a relative assetBaseUrl resolves against the calling worker', (t) => {
+  const location = Object.getOwnPropertyDescriptor(globalThis, 'location');
+  Object.defineProperty(globalThis, 'location', {
+    configurable: true, value: { href: 'https://app.test/workers/custom.js' },
+  });
+  t.after(() => {
+    if (location) Object.defineProperty(globalThis, 'location', location);
+    else delete globalThis.location;
+  });
+
+  const bridge = new LlamaWebGpuBridge({ disableWorker: true, assetBaseUrl: '../runtime' });
+  assert.equal(bridge._workerModuleUrl(), 'https://app.test/runtime/llama_webgpu_bridge_worker.js');
+  assert.equal(bridge._workerConfig().wasmUrl, 'https://app.test/runtime/llama_webgpu_core.wasm');
+});
+
 test('an app-owned worker gets base URLs only when the caller requests them', async (t) => {
   const scratch = await mkdtemp(join(tmpdir(), 'lane-npm1-app-worker-test-'));
   t.after(() => rm(scratch, { recursive: true, force: true }));
@@ -62,6 +78,8 @@ test('an app-owned worker gets base URLs only when the caller requests them', as
   await copyFile(bundle, workerBundle);
   await writeFile(join(scratch, 'llama_webgpu_core.js'),
     "export default async () => { throw new Error('worker-local core selected'); };");
+  await writeFile(join(scratch, 'llama_webgpu_core_st.js'),
+    "export default async () => { throw new Error('bridge default selected'); };");
   const replies = [];
   const previousSelf = Object.getOwnPropertyDescriptor(globalThis, 'self');
   Object.defineProperty(globalThis, 'self', { configurable: true, value: {
@@ -75,7 +93,9 @@ test('an app-owned worker gets base URLs only when the caller requests them', as
   const { enableBridgeWorkerHost } = await import(workerBundle);
   enableBridgeWorkerHost();
   const config = { disableWorker: true, workerUrl: 'https://app.test/custom.mjs' };
-  const bridge = new LlamaWebGpuBridge({ ...config, logLevel: 0 });
+  const bridge = new LlamaWebGpuBridge({
+    ...config, logLevel: 0, allowSingleThreadCore: true, preferMemory64: false,
+  });
   assert.equal(bridge._workerModuleUrl(), config.workerUrl);
   const wire = bridge._workerConfig();
   assert.deepEqual(Object.values(urls(wire)), [undefined, undefined, undefined, undefined]);
@@ -256,17 +276,54 @@ test('direct runtime resolves the core and wasm and enables the rewrite only for
   assert.deepEqual(calls, [requested.href, hashed, requested.href]);
 });
 
-test('a custom factory retains its options and disables bridge-owned worker startup', async () => {
+test('a custom factory retains its options and disables bridge-owned worker startup', async (t) => {
+  let workerStarts = 0;
+  const previousWorker = Object.getOwnPropertyDescriptor(globalThis, 'Worker');
+  Object.defineProperty(globalThis, 'Worker', { configurable: true, value: class {
+    constructor() {
+      workerStarts++;
+      throw new Error('a custom factory must not start a worker');
+    }
+  } });
+  t.after(() => {
+    if (previousWorker) Object.defineProperty(globalThis, 'Worker', previousWorker);
+    else delete globalThis.Worker;
+  });
   let options;
   const bridge = new LlamaWebGpuBridge({
     assetBaseUrl: 'https://cdn.test/runtime/',
     wasmUrl: './explicit.wasm',
     coreModuleFactory: async (arg) => { options = arg; return { ccall: () => 0 }; },
   });
+  assert.equal(workerStarts, 0);
   assert.equal(bridge._shouldUseWorker(), false);
   await bridge._runtime._ensureCore();
   assert.deepEqual(Reflect.ownKeys(options), ['locateFile', 'print', 'printErr', 'onAbort']);
   assert.equal(options.locateFile('core.wasm', '/'), './explicit.wasm');
+});
+
+test('runtime URL constructors use string literals with import.meta.url', async () => {
+  const entries = await readdir(new URL('../../js/src/', import.meta.url), {
+    recursive: true, withFileTypes: true,
+  });
+  const files = entries.filter((entry) => entry.isFile() && /\.[jt]s$/.test(entry.name))
+    .map((entry) => join(entry.parentPath, entry.name));
+  files.push(fileURLToPath(bundle), fileURLToPath(new URL('./llama_webgpu_bridge_worker.js', bundle)));
+
+  for (const file of files) {
+    const source = ts.createSourceFile(file, await readFile(file, 'utf8'), ts.ScriptTarget.Latest);
+    function visit(node) {
+      if (ts.isNewExpression(node) && node.expression.getText(source) === 'URL' && node.arguments?.length === 2) {
+        const [path, base] = node.arguments.map((argument) => ts.skipOuterExpressions(argument));
+        if (ts.isPropertyAccessExpression(base) && base.name.text === 'url' &&
+            ts.isMetaProperty(base.expression) && base.expression.keywordToken === ts.SyntaxKind.ImportKeyword) {
+          assert.ok(ts.isStringLiteral(path), `${file}: webpack requires a literal path in ${node.getText(source)}`);
+        }
+      }
+      ts.forEachChild(node, visit);
+    }
+    visit(source);
+  }
 });
 
 test('the generated bridge exposes literal assets and the worker has no relative import', async () => {

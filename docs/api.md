@@ -1436,6 +1436,8 @@ this function themselves.
   single-thread loaders and supply matching Wasm URLs if served separately.
   Single-thread cores support vision, speech recognition and speech synthesis.
   See the [size measurements and limits](single_thread.md).
+- On the Vite 7 dev server, use `optimizeDeps: { exclude: ['llama-web-bridge'] }`
+  with the installed package name so its worker and core files stay beside the module.
 - Serve both the core JS and Wasm from URLs reachable by the page and worker.
   For a threaded core on another origin, matching bridge and core assets start
   the core's pthread workers from a same-origin module `blob:` that imports

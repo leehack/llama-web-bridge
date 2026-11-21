@@ -37,9 +37,10 @@ function hasEmbeddingMediaParts(input) {
   return Array.isArray(input) && input.some((part) => part?.type !== "text");
 }
 function embeddingAssetVersion(...sources) {
-  for (const source of [...sources, import.meta.url]) {
+  const moduleUrl = import.meta.url;
+  for (const source of [...sources, moduleUrl]) {
     try {
-      const version = new URL(source || "", import.meta.url).pathname.match(/(?:^|[/@])(v?\d+\.\d+\.\d+(?:-\d+)?)(?:[/]|$)/)?.[1];
+      const version = new URL(source || "", moduleUrl).pathname.match(/(?:^|[/@])(v?\d+\.\d+\.\d+(?:-\d+)?)(?:[/]|$)/)?.[1];
       if (version) return version;
     } catch (_) {
     }
@@ -1324,7 +1325,8 @@ var singleThreadAssets = [
 function assetBase(config) {
   const value = config.assetBaseUrl?.trim();
   if (!value) return void 0;
-  const url = new URL(normalizeAbsoluteUrl(value), import.meta.url);
+  const moduleUrl = import.meta.url;
+  const url = new URL(normalizeAbsoluteUrl(value), moduleUrl);
   if (!url.pathname.endsWith("/")) url.pathname += "/";
   return url;
 }

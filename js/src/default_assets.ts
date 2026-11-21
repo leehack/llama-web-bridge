@@ -27,7 +27,9 @@ const singleThreadAssets = [
 function assetBase(config: LlamaWebGpuBridgeConfig): URL | undefined {
   const value = config.assetBaseUrl?.trim();
   if (!value) return undefined;
-  const url = new URL(normalizeAbsoluteUrl(value), import.meta.url);
+  // Bundlers treat a direct import.meta.url argument as an asset reference.
+  const moduleUrl = import.meta.url;
+  const url = new URL(normalizeAbsoluteUrl(value), moduleUrl);
   if (!url.pathname.endsWith('/')) url.pathname += '/';
   return url;
 }
