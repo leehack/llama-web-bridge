@@ -4535,8 +4535,10 @@ var LlamaWebGpuBridgeRuntime = class {
     const requestedGpuLayers = Number(options.nGpuLayers);
     if (Number.isFinite(requestedGpuLayers)) {
       this._requestedGpuLayers = Math.trunc(requestedGpuLayers);
+      this._nGpuLayers = this._requestedGpuLayers;
+    } else if (this._isAppleSafari) {
+      this._nGpuLayers = this._requestedGpuLayers;
     }
-    this._nGpuLayers = this._requestedGpuLayers;
     if (this._nGpuLayers > 0 && !this._gpuActive) {
       const unavailable = await describeWebGpuUnavailable();
       throwIfAborted(operationSignal, abortMessage);
@@ -4588,11 +4590,11 @@ var LlamaWebGpuBridgeRuntime = class {
     if (!resolvedLoadState && isCpuModelMode && !Number.isFinite(requestedBatch) && !Number.isFinite(requestedUbatch)) {
       this._runtimeNotes.push("cpu_batch_tuned_default");
     }
-    const effectiveGpuLayers = effectiveOffloadedGpuLayers(this._nGpuLayers);
-    if (this._isSafari && effectiveGpuLayers > 0 && (this._isAppleSafari || this._nGpuLayers > 0)) {
+    const capCandidateLayers = this._isAppleSafari ? effectiveOffloadedGpuLayers(this._nGpuLayers) : this._nGpuLayers;
+    if (this._isSafari && capCandidateLayers > 0) {
       const requestedSafariMaxLayers = Number(options.safariMaxGpuLayers);
-      const safariMaxGpuLayers = requestedSafariMaxLayers === Infinity || Number.isFinite(requestedSafariMaxLayers) ? Math.max(1, Math.trunc(requestedSafariMaxLayers)) : this._safariDefaultMaxGpuLayers;
-      if (effectiveGpuLayers > safariMaxGpuLayers) {
+      const safariMaxGpuLayers = Number.isFinite(requestedSafariMaxLayers) || this._isAppleSafari && requestedSafariMaxLayers === Infinity ? Math.max(1, Math.trunc(requestedSafariMaxLayers)) : this._safariDefaultMaxGpuLayers;
+      if (capCandidateLayers > safariMaxGpuLayers) {
         this._nGpuLayers = safariMaxGpuLayers;
         this._runtimeNotes.push(`safari_gpu_layers_capped:${safariMaxGpuLayers}`);
       }
@@ -7385,6 +7387,9 @@ var BridgeWorkerProxy = class {
         return;
       }
       this._pending.delete(id);
+      if (typeof message.state?.requestedGpuLayers === "number") {
+        this.requestedGpuLayers = message.state.requestedGpuLayers;
+      }
       if (type === "error") {
         const errorMessage = String(message.message || "Worker request failed");
         const workerError = message.embeddingErrorCode ? new EmbeddingError(message.embeddingErrorCode, errorMessage) : jsBackedStagingMode(this._config) !== "off" && isModelStagingErrorCode(message.modelStagingErrorCode) ? new ModelStagingError(message.modelStagingErrorCode, errorMessage) : message.errorCode === CROSS_ORIGIN_ISOLATION_REQUIRED ? new CrossOriginIsolationError(errorMessage) : message.errorCode === SINGLE_THREAD_CORE_UNSUPPORTED ? new SingleThreadCoreError(errorMessage) : message.errorCode === BLOB_WORKER_BLOCKED ? new BlobWorkerBlockedError(message.blobWorkerBlockReason ?? "script", errorMessage) : message.errorCode === MODEL_UNLOADED_AFTER_CORE_ABORT ? new ModelUnloadedError(errorMessage) : message.errorCode === "MODEL_TRANSFER_LENGTH_ERROR" ? createModelTransferLengthError(errorMessage) : new Error(errorMessage);
@@ -7566,6 +7571,9 @@ var BridgeWorkerProxy = class {
 };
 
 // js/src/bridge.ts
+function withInheritedGpuLayerRequest(options, nGpuLayers) {
+  return Number.isInteger(nGpuLayers) && !Number.isFinite(Number(options.nGpuLayers)) ? { ...options, nGpuLayers } : options;
+}
 var MODEL_OPERATION_KINDS = /* @__PURE__ */ new Set([
   "generation",
   "projector-load",
@@ -8152,6 +8160,7 @@ var LlamaWebGpuBridge = class {
     }
     this._loadedModelUrl = normalizedUrl;
     this._loadedModelOptions = this._sanitizeModelLoadOptions(options);
+    this._loadedModelReplayGpuLayers = this._workerProxy ? this._workerProxy.requestedGpuLayers : this._runtime?._isAppleSafari ? this._runtime._requestedGpuLayers : void 0;
     this._loadedMmProjUrl = null;
     this._loadedMmProjOptions = void 0;
     this._forgetLoraAdapters();
@@ -8168,6 +8177,7 @@ var LlamaWebGpuBridge = class {
   _forgetLoadedModel() {
     this._loadedModelUrl = null;
     this._loadedModelOptions = null;
+    this._loadedModelReplayGpuLayers = void 0;
     this._loadedMmProjUrl = null;
     this._loadedMmProjOptions = void 0;
     this._forgetLoraAdapters();
@@ -8338,7 +8348,10 @@ var LlamaWebGpuBridge = class {
   async _loadRememberedModelIntoWorker(selectedOptions) {
     this._throwIfDisposed();
     this._dropLoraAdaptersOf(this._workerProxy);
-    await this._callWorker("loadModelFromUrl", [this._loadedModelUrl, selectedOptions]);
+    await this._callWorker("loadModelFromUrl", [
+      this._loadedModelUrl,
+      withInheritedGpuLayerRequest(selectedOptions, this._loadedModelReplayGpuLayers)
+    ]);
     this._throwIfDisposed();
     if (typeof this._loadedMmProjUrl === "string" && this._loadedMmProjUrl.length > 0) {
       const url = this._loadedMmProjUrl;
@@ -8534,7 +8547,10 @@ var LlamaWebGpuBridge = class {
       }
       this._throwIfDisposed();
       this._dropLoraAdaptersOf(this._runtime);
-      await this._runtime.loadModelFromUrl(this._loadedModelUrl, loadOptions);
+      await this._runtime.loadModelFromUrl(
+        this._loadedModelUrl,
+        withInheritedGpuLayerRequest(loadOptions, this._loadedModelReplayGpuLayers)
+      );
       this._throwIfDisposed();
       if (Array.isArray(this._runtime._runtimeNotes)) {
         this._runtime._runtimeNotes.push("worker_fallback_reload_model");
@@ -8978,7 +8994,7 @@ var LlamaWebGpuBridge = class {
       this._rememberLoadedModel(url, options);
       return result;
     }
-    const invokeWorkerLoad = async () => {
+    const invokeWorkerLoad = async (inheritedGpuLayers) => {
       const workerOptions = { ...options };
       delete workerOptions.progressCallback;
       delete workerOptions.signal;
@@ -8990,7 +9006,7 @@ var LlamaWebGpuBridge = class {
       try {
         result = await this._callWorker(
           "loadModelFromUrl",
-          [url, workerOptions],
+          [url, withInheritedGpuLayerRequest(workerOptions, inheritedGpuLayers)],
           (event) => {
             if (event.event !== "progress") {
               return;
@@ -9014,6 +9030,7 @@ var LlamaWebGpuBridge = class {
       return await invokeWorkerLoad();
     } catch (error) {
       this._throwIfOperationCancelled(error, "Model load was cancelled.");
+      const inheritedGpuLayers = attempt.state?.requestedGpuLayers ?? (attempt.proxy === this._workerProxy ? attempt.proxy?.requestedGpuLayers : void 0);
       if (this._isRecoverableWorkerFsError(error) && !this._isWorkerRequestTimeoutError(error)) {
         this._emitBridgeWarn(
           `llamadart: worker model-load FS error detected; restarting worker (${serializeWorkerError(error)}).`
@@ -9022,7 +9039,7 @@ var LlamaWebGpuBridge = class {
           await this._replaceWorkerProxyForMultimodalCpuMode();
           this._forgetLoadedModel();
           this._applyShadowState(emptyBridgeState());
-          return await invokeWorkerLoad();
+          return await invokeWorkerLoad(inheritedGpuLayers);
         } catch (retryError) {
           this._emitBridgeWarn(
             `llamadart: worker model-load retry failed (${serializeWorkerError(retryError)}).`
@@ -9037,7 +9054,7 @@ var LlamaWebGpuBridge = class {
       await this._waitForWorkerDisposal();
       this._throwIfDisposed();
       const result = await this._runtime.loadModelFromUrl(url, {
-        ...options,
+        ...withInheritedGpuLayerRequest(options, inheritedGpuLayers),
         signal: this._operationSignal() || options.signal || null
       });
       this._rememberLoadedModel(url, options);
@@ -10654,10 +10671,17 @@ function installBridgeWorkerHost() {
   }
   bridgeWorkerHostInstalled = true;
   let bridge = null;
+  const workerState = (target) => {
+    const state = snapshotBridgeState(target);
+    if (target._runtime?._isAppleSafari) {
+      state.requestedGpuLayers = target._runtime._requestedGpuLayers;
+    }
+    return state;
+  };
   const postError = (id, error) => {
     let state;
     try {
-      state = bridge ? snapshotBridgeState(bridge) : void 0;
+      if (bridge) state = workerState(bridge);
     } catch (_) {
       state = void 0;
     }
@@ -10712,7 +10736,7 @@ function installBridgeWorkerHost() {
           self.postMessage({ type: "event", id, event: "progress", payload: progress || {} });
         };
         const value2 = await bridge.loadModelFromUrl(url, options);
-        self.postMessage({ type: "result", id, value: value2, state: snapshotBridgeState(bridge) });
+        self.postMessage({ type: "result", id, value: value2, state: workerState(bridge) });
         return;
       }
       if (method === "loadDraftModel") {
@@ -10887,7 +10911,7 @@ function installBridgeWorkerHost() {
         if (usage != null) {
           self.postMessage({ type: "event", id, event: "usage", payload: usage });
         }
-        self.postMessage({ type: "result", id, value: value2, state: snapshotBridgeState(bridge) });
+        self.postMessage({ type: "result", id, value: value2, state: workerState(bridge) });
         return;
       }
       if (method === "loadMultimodalProjector") {
@@ -10895,7 +10919,7 @@ function installBridgeWorkerHost() {
           args[0],
           args[1]
         );
-        self.postMessage({ type: "result", id, value: value2, state: snapshotBridgeState(bridge) });
+        self.postMessage({ type: "result", id, value: value2, state: workerState(bridge) });
         return;
       }
       if (method === "synthesizeSpeech") {
@@ -10913,7 +10937,7 @@ function installBridgeWorkerHost() {
         const value2 = await bridge.synthesizeSpeech(options);
         const transfers = value2?.pcm?.buffer instanceof ArrayBuffer ? [value2.pcm.buffer] : [];
         self.postMessage(
-          { type: "result", id, value: value2, state: snapshotBridgeState(bridge) },
+          { type: "result", id, value: value2, state: workerState(bridge) },
           transfers
         );
         return;
@@ -10963,7 +10987,7 @@ function installBridgeWorkerHost() {
       }
       if (method === "unloadMultimodalProjector") {
         const value2 = await bridge.unloadMultimodalProjector();
-        self.postMessage({ type: "result", id, value: value2, state: snapshotBridgeState(bridge) });
+        self.postMessage({ type: "result", id, value: value2, state: workerState(bridge) });
         return;
       }
       if (method === "stateSaveBytes") {

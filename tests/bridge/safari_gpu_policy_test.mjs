@@ -8,10 +8,9 @@ import { fileURLToPath } from 'node:url';
 
 import * as environment from '../../js/src/internal/environment.ts';
 import { LlamaWebGpuBridge } from '../../js/src/llama_webgpu_bridge.js';
-import { LlamaWebGpuBridgeRuntime } from '../../js/src/runtime.ts';
-import { installBridgeWorkerHost } from '../../js/src/worker_host.ts';
 import { createStubCore } from './bridge_operation_queue_fixtures.mjs';
 import { readNativeCoreSource } from './native_core_source.mjs';
+import { safariPolicyCore, safariPolicyWorker } from './safari_gpu_policy_worker_fixture.mjs';
 
 const MAC = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko)';
 const safari = (version) => `${MAC} Version/${version} Safari/605.1.15`;
@@ -212,55 +211,83 @@ test('direct Safari applies each cap to the requested count across model loads',
   }
 });
 
-test('the Safari worker applies each cap to the requested count across model loads', async (t) => {
-  const core = createStubCore();
+function createSafariWorkerBridge(t, nGpuLayers, failReplacementCore = false) {
   const loadedLayers = [];
-  const ccall = core.ccall.bind(core);
-  t.mock.method(core, 'ccall', (name, type, types, args = []) => {
-    if (name === 'llamadart_webgpu_probe') return 1;
-    if (name === 'llamadart_webgpu_load_model') {
-      loadedLayers.push(args[6]);
-      return 0;
-    }
-    if (name === 'llamadart_webgpu_free_model') return 0;
-    return ccall(name, type, types, args);
+  const workers = [];
+  const previousWorker = globalThis.Worker;
+  globalThis.Worker = safariPolicyWorker(loadedLayers, workers, failReplacementCore);
+  const bridge = new LlamaWebGpuBridge({
+    userAgent: IPHONE_26, nGpuLayers, logLevel: 0,
+    workerRequestTimeoutMs: 3000,
   });
-  const prototype = LlamaWebGpuBridgeRuntime.prototype;
-  t.mock.method(prototype, '_ensureCore', async function () {
-    this._core = core;
-    return core;
-  });
-  t.mock.method(prototype, '_getCachedModelResponse', async () => new Response(Uint8Array.of(1, 2, 3)));
-  t.mock.method(prototype, 'createCompletion', async () => 'Hello there.');
-
-  const { port1, port2 } = new MessageChannel();
-  const oldSelf = globalThis.self;
-  const oldWorker = globalThis.Worker;
-  const host = { postMessage: (message) => port2.postMessage(message) };
-  let bridge;
-  try {
-    globalThis.self = host;
-    installBridgeWorkerHost();
-    port2.onmessage = (event) => host.onmessage(event);
-    globalThis.Worker = class {
-      constructor() { port1.onmessage = (event) => this.onmessage(event); }
-      postMessage(message, transfers) { port1.postMessage(message, transfers); }
-      terminate() { port1.close(); port2.close(); }
-    };
-    bridge = new LlamaWebGpuBridge({ userAgent: IPHONE_26, nGpuLayers: -5 });
-    const metadataLayers = await loadModels(bridge, RELOAD_OPTIONS);
-    assert.equal(bridge.getModelMetadata()['llamadart.webgpu.execution'], 'worker');
-    assert.deepEqual(loadedLayers, [1, -5, 1, 1, -7, 0, 0]);
-    assert.deepEqual(metadataLayers, loadedLayers.map(String));
-  } finally {
+  t.after(async () => {
     try {
-      await bridge?.dispose();
+      await bridge.dispose();
     } finally {
-      port1.close();
-      port2.close();
-      globalThis.self = oldSelf;
-      globalThis.Worker = oldWorker;
+      globalThis.Worker = previousWorker;
+      await Promise.all(workers.map((worker) => worker.terminate()));
     }
+  });
+  return { bridge, loadedLayers, workers };
+}
+
+test('the Safari worker applies each cap to the requested count across model loads', async (t) => {
+  const { bridge, loadedLayers } = createSafariWorkerBridge(t, -5);
+  const metadataLayers = await loadModels(bridge, RELOAD_OPTIONS);
+  assert.equal(bridge.getModelMetadata()['llamadart.webgpu.execution'], 'worker');
+  assert.deepEqual(loadedLayers, [1, -5, 1, 1, -7, 0, 0]);
+  assert.deepEqual(metadataLayers, loadedLayers.map(String));
+});
+
+test('restarting a Safari worker replays the layer request inherited by its last load', async (t) => {
+  for (const [cap, count] of [[Infinity, 7], [4, 4]]) {
+    await t.test(`replay with cap ${cap}`, async (t) => {
+      const { bridge, loadedLayers, workers } = createSafariWorkerBridge(t, 42);
+      assert.deepEqual(await loadModels(bridge, [
+        { nGpuLayers: 7 },
+        { safariMaxGpuLayers: cap },
+      ]), ['1', String(count)]);
+      workers[0].postMessage({ type: 'trap-on-tokenize' });
+      await assert.rejects(bridge.tokenize('hi'), /unreachable/);
+      assert.ok((await bridge.tokenize('hi')).length > 0);
+      assert.equal(workers.length, 2);
+      assert.equal(bridge.getModelMetadata()['llamadart.webgpu.execution'], 'worker');
+      assert.equal(bridge.getModelMetadata()['llamadart.webgpu.n_gpu_layers'], String(count));
+      assert.deepEqual(await loadModels(bridge, [{ safariMaxGpuLayers: Infinity }]), ['7']);
+      assert.deepEqual(loadedLayers, [1, count, count, 7]);
+    });
+  }
+});
+
+test('retrying a failed Safari load on a replacement worker keeps its layer request', async (t) => {
+  const { bridge, loadedLayers, workers } = createSafariWorkerBridge(t, 42);
+  assert.deepEqual(await loadModels(bridge, [{ nGpuLayers: 7 }]), ['1']);
+  workers[0].postMessage({ type: 'fail-next-model-load' });
+  assert.deepEqual(await loadModels(bridge, [{ safariMaxGpuLayers: Infinity }]), ['7']);
+  assert.equal(workers.length, 2);
+  assert.equal(bridge.getModelMetadata()['llamadart.webgpu.execution'], 'worker');
+  assert.deepEqual(loadedLayers, [1, 7, 7]);
+});
+
+test('Safari main-thread fallback keeps the original worker layer request', async (t) => {
+  for (const failReplacementCore of [false, true]) {
+    await t.test(failReplacementCore ? 'replacement startup failed' : 'original worker reply lost', async (t) => {
+      const { bridge, loadedLayers, workers } = createSafariWorkerBridge(t, 42, failReplacementCore);
+      const createRuntime = bridge._createRuntime.bind(bridge);
+      t.mock.method(bridge, '_createRuntime', () => {
+        const runtime = createRuntime();
+        runtime._config.coreModuleFactory = async () => safariPolicyCore((layers) => loadedLayers.push(layers));
+        return runtime;
+      });
+      t.mock.method(globalThis, 'fetch', async () => new Response(Uint8Array.of(1, 2, 3)));
+      assert.deepEqual(await loadModels(bridge, [{ nGpuLayers: 7 }]), ['1']);
+      if (failReplacementCore) workers[0].postMessage({ type: 'fail-next-model-load' });
+      else workers[0].dropNextResult = true;
+      assert.deepEqual(await loadModels(bridge, [{ safariMaxGpuLayers: Infinity }]), ['7']);
+      assert.equal(workers.length, failReplacementCore ? 2 : 1);
+      assert.equal(bridge.getModelMetadata()['llamadart.webgpu.execution'], 'main-thread');
+      assert.deepEqual(loadedLayers, [1, 7, 7]);
+    });
   }
 });
 
@@ -357,6 +384,19 @@ for (const [browser, userAgent] of Object.entries(SAFARI_LIKE_UAS)) {
     assert.deepEqual(result.loadedLayers, [1]);
     assert.deepEqual(result.notes, ['safari_gpu_layers_capped:1', 'safari_gpu_probe_passed']);
     assert.deepEqual(result.calls, { completion: 2, embed: 0 });
+  });
+
+  test(`${browser} retains the legacy positive count across capped loads`, async () => {
+    const result = await load({
+      userAgent,
+      config: { nGpuLayers: 7 },
+      reloadOptions: [
+        { safariMaxGpuLayers: 4 },
+        { nGpuLayers: 7, safariMaxGpuLayers: Infinity },
+        { nGpuLayers: 7, safariMaxGpuLayers: 4 },
+      ],
+    });
+    assert.deepEqual(result.loadedLayers, [1, 1, 1, 4]);
   });
 
   test(`${browser} passes through full-offload requests`, async () => {

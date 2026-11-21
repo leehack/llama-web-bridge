@@ -92,6 +92,7 @@ export class BridgeWorkerProxy {
   declare _readyReject: (reason?: unknown) => void;
   declare _readyTimeoutHandle: ReturnType<typeof setTimeout> | null;
   declare _supportsIncrementalAudio: boolean;
+  declare requestedGpuLayers?: number;
   // Set once the worker reports that its core aborted. It never clears: the
   // facade replaces this worker.
   declare coreRetired: boolean;
@@ -193,6 +194,9 @@ export class BridgeWorkerProxy {
       }
 
       this._pending.delete(id);
+      if (typeof message.state?.requestedGpuLayers === 'number') {
+        this.requestedGpuLayers = message.state.requestedGpuLayers;
+      }
       if (type === 'error') {
         const errorMessage = String(message.message || 'Worker request failed');
         const workerError: Error & { state?: unknown } = message.embeddingErrorCode

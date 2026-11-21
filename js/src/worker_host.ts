@@ -47,10 +47,18 @@ export function installBridgeWorkerHost() {
   bridgeWorkerHostInstalled = true;
   let bridge: LlamaWebGpuBridge | null = null;
 
+  const workerState = (target: LlamaWebGpuBridge) => {
+    const state = snapshotBridgeState(target);
+    if (target._runtime?._isAppleSafari) {
+      state.requestedGpuLayers = target._runtime._requestedGpuLayers;
+    }
+    return state;
+  };
+
   const postError = (id: unknown, error: unknown) => {
     let state;
     try {
-      state = bridge ? snapshotBridgeState(bridge) : undefined;
+      if (bridge) state = workerState(bridge);
     } catch (_) {
       state = undefined;
     }
@@ -127,7 +135,7 @@ export function installBridgeWorkerHost() {
         };
 
         const value = await bridge.loadModelFromUrl(url, options);
-        self.postMessage({ type: 'result', id, value, state: snapshotBridgeState(bridge) });
+        self.postMessage({ type: 'result', id, value, state: workerState(bridge) });
         return;
       }
 
@@ -339,7 +347,7 @@ export function installBridgeWorkerHost() {
         if (usage != null) {
           self.postMessage({ type: 'event', id, event: 'usage', payload: usage });
         }
-        self.postMessage({ type: 'result', id, value, state: snapshotBridgeState(bridge) });
+        self.postMessage({ type: 'result', id, value, state: workerState(bridge) });
         return;
       }
 
@@ -348,7 +356,7 @@ export function installBridgeWorkerHost() {
           args[0] as string,
           args[1] as MultimodalProjectorLoadOptions | undefined,
         );
-        self.postMessage({ type: 'result', id, value, state: snapshotBridgeState(bridge) });
+        self.postMessage({ type: 'result', id, value, state: workerState(bridge) });
         return;
       }
 
@@ -369,7 +377,7 @@ export function installBridgeWorkerHost() {
           ? [value.pcm.buffer]
           : [];
         self.postMessage(
-          { type: 'result', id, value, state: snapshotBridgeState(bridge) },
+          { type: 'result', id, value, state: workerState(bridge) },
           transfers,
         );
         return;
@@ -424,7 +432,7 @@ export function installBridgeWorkerHost() {
 
       if (method === 'unloadMultimodalProjector') {
         const value = await bridge.unloadMultimodalProjector();
-        self.postMessage({ type: 'result', id, value, state: snapshotBridgeState(bridge) });
+        self.postMessage({ type: 'result', id, value, state: workerState(bridge) });
         return;
       }
 

@@ -130,11 +130,19 @@ interface ExclusiveRunOptions {
   cancelSignalWhileActiveOnly?: boolean;
 }
 
-// The last worker model load's proxy and reply, read after a failed load.
+// The last worker model load's proxy and reply.
 interface WorkerLoadAttempt {
   proxy: BridgeWorkerProxy | null;
   state: BridgeStateSnapshot | null;
   loaded: boolean;
+}
+
+function withInheritedGpuLayerRequest(options: LoadModelOptions, nGpuLayers?: number): LoadModelOptions {
+  // Fractional configured counts come from config on replay. Passing one
+  // as a load option would truncate it.
+  return Number.isInteger(nGpuLayers) && !Number.isFinite(Number(options.nGpuLayers))
+    ? { ...options, nGpuLayers }
+    : options;
 }
 
 // Completion options plus the recursion guard the empty-response retry sets.
@@ -220,6 +228,7 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
   declare _supportsAudio: boolean;
   declare _loadedModelUrl: ModelSource | null;
   declare _loadedModelOptions: LoadModelOptions | null;
+  declare private _loadedModelReplayGpuLayers?: number;
   declare _loadedMmProjUrl: string | null;
   declare _loadedMmProjOptions: MultimodalProjectorLoadOptions | undefined;
   declare _loadedDraftModel: RememberedDraftModel | null;
@@ -935,6 +944,9 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
 
     this._loadedModelUrl = normalizedUrl;
     this._loadedModelOptions = this._sanitizeModelLoadOptions(options);
+    this._loadedModelReplayGpuLayers = this._workerProxy
+      ? this._workerProxy.requestedGpuLayers
+      : this._runtime?._isAppleSafari ? this._runtime._requestedGpuLayers : undefined;
     this._loadedMmProjUrl = null;
     this._loadedMmProjOptions = undefined;
     this._forgetLoraAdapters();
@@ -952,6 +964,7 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
   _forgetLoadedModel() {
     this._loadedModelUrl = null;
     this._loadedModelOptions = null;
+    this._loadedModelReplayGpuLayers = undefined;
     this._loadedMmProjUrl = null;
     this._loadedMmProjOptions = undefined;
     this._forgetLoraAdapters();
@@ -1173,7 +1186,9 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
   async _loadRememberedModelIntoWorker(selectedOptions: LoadModelOptions) {
     this._throwIfDisposed();
     this._dropLoraAdaptersOf(this._workerProxy);
-    await this._callWorker('loadModelFromUrl', [this._loadedModelUrl, selectedOptions]);
+    await this._callWorker('loadModelFromUrl', [
+      this._loadedModelUrl, withInheritedGpuLayerRequest(selectedOptions, this._loadedModelReplayGpuLayers),
+    ]);
     this._throwIfDisposed();
     if (typeof this._loadedMmProjUrl === 'string' && this._loadedMmProjUrl.length > 0) {
       const url = this._loadedMmProjUrl;
@@ -1445,7 +1460,9 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
 
       this._throwIfDisposed();
       this._dropLoraAdaptersOf(this._runtime);
-      await this._runtime.loadModelFromUrl(this._loadedModelUrl!, loadOptions);
+      await this._runtime.loadModelFromUrl(
+        this._loadedModelUrl!, withInheritedGpuLayerRequest(loadOptions, this._loadedModelReplayGpuLayers),
+      );
       this._throwIfDisposed();
       if (Array.isArray(this._runtime._runtimeNotes)) {
         this._runtime._runtimeNotes.push('worker_fallback_reload_model');
@@ -2038,7 +2055,7 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
       return result;
     }
 
-    const invokeWorkerLoad = async () => {
+    const invokeWorkerLoad = async (inheritedGpuLayers?: number) => {
       const workerOptions = { ...options };
       delete workerOptions.progressCallback;
       delete workerOptions.signal;
@@ -2051,7 +2068,7 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
       try {
         result = await this._callWorker(
           'loadModelFromUrl',
-          [url, workerOptions],
+          [url, withInheritedGpuLayerRequest(workerOptions, inheritedGpuLayers)],
           (event) => {
             if (event.event !== 'progress') {
               return;
@@ -2078,6 +2095,8 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
       return await invokeWorkerLoad();
     } catch (error) {
       this._throwIfOperationCancelled(error, 'Model load was cancelled.');
+      const inheritedGpuLayers = attempt.state?.requestedGpuLayers
+        ?? (attempt.proxy === this._workerProxy ? attempt.proxy?.requestedGpuLayers : undefined);
       if (this._isRecoverableWorkerFsError(error) && !this._isWorkerRequestTimeoutError(error)) {
         this._emitBridgeWarn(
           `llamadart: worker model-load FS error detected; restarting worker (${serializeWorkerError(error)}).`,
@@ -2089,7 +2108,7 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
           // until the retry succeeds.
           this._forgetLoadedModel();
           this._applyShadowState(emptyBridgeState());
-          return await invokeWorkerLoad();
+          return await invokeWorkerLoad(inheritedGpuLayers);
         } catch (retryError) {
           this._emitBridgeWarn(
             `llamadart: worker model-load retry failed (${serializeWorkerError(retryError)}).`,
@@ -2106,7 +2125,7 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
       await this._waitForWorkerDisposal();
       this._throwIfDisposed();
       const result = await this._runtime!.loadModelFromUrl(url, {
-        ...options,
+        ...withInheritedGpuLayerRequest(options, inheritedGpuLayers),
         signal: this._operationSignal() || options.signal || null,
       });
       this._rememberLoadedModel(url, options);
