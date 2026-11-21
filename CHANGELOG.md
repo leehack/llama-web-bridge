@@ -2,14 +2,15 @@
 
 ## Unreleased
 
-- Add `isModelCached()` and `supportsModelCacheQuery` so applications can query the bridge cache on every engine. `loadMultimodalProjector()` accepts opt-in `useCache` and `cacheName` options. (#290)
-- Restrict model and projector caching to HTTP(S) URLs. This prevents the orphaned WebKit cache parts that `blob:` and `data:` loads could leave after #281. Deleting the affected Cache Storage cache removes any existing orphaned parts.
+- Keep `setLogLevel()` updates in the bridge configuration when the worker core retires. Queued operations own worker replacement and apply the saved level to the new worker. (#261)
 
 - Skip worker dispatch and reject with `AbortError` when one-shot `synthesizeSpeech()` is cancelled while awaiting worker readiness. (#268)
 
 - Resume interrupted model downloads when Safari reports `TypeError: Load failed`. (#278)
 
 - Cache WebKit model downloads and prefetches in 16 MiB parts. Cache hits read one part at a time. If a cached part is missing or damaged, `loadModelFromUrl()` can retry from the network. `loadDraftModel()` rejects that call with an error named `ModelCacheEntryError` in direct mode. The bridge drops the damaged entry for the next call when it can acquire the cache lock. (#257)
+- Add `isModelCached()` and `supportsModelCacheQuery` so applications can query the bridge cache on every engine. `loadMultimodalProjector()` accepts opt-in `useCache` and `cacheName` options. (#290)
+- Restrict model and projector caching to HTTP(S) URLs. This prevents the orphaned WebKit cache parts that `blob:` and `data:` loads could leave after #281. Deleting the affected Cache Storage cache removes any existing orphaned parts.
 
 - Start cross-origin core pthreads through module blob workers. Report blocked pthread starts as `BlobWorkerBlockedError` and record worker startup routes in the runtime notes. (#223)
 
