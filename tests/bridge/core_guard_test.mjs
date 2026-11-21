@@ -263,6 +263,20 @@ test('guard: signals', async () => {
   }
 });
 
+test('guarded methods preserve raw module, filesystem, and explicit receivers', () => {
+  const core = {
+    ccall() { return this; },
+    FS: { unlink() { return this; } },
+  };
+  const guarded = guardCore(core, () => assert.fail('receiver lookup must not retire the core'));
+  assert.equal(guarded.ccall() === core, true, 'module receiver');
+  assert.equal(guarded.FS.unlink() === core.FS, true, 'filesystem receiver');
+  const receiver = {};
+  assert.equal(guarded.ccall.call(receiver), receiver);
+  const { ccall } = guarded;
+  assert.equal(ccall(), undefined);
+});
+
 test('a custom core with a locked ccall property is outside the factory contract', () => {
   const core = Object.freeze({ ccall: () => 7 });
   const guarded = guardCore(core, () => assert.fail('a proxy invariant is not a native abort'));

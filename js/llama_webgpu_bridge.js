@@ -8768,7 +8768,7 @@ var LlamaWebGpuBridge = class {
       }
       return response?.value;
     } catch (error) {
-      if (proxy.coreRetired === true) {
+      if (method !== "setLogLevel" && proxy.coreRetired === true) {
         throw await this._workerCoreRetiredError(proxy, error);
       }
       if (error && typeof error === "object" && error.state) {
@@ -10387,8 +10387,10 @@ var LlamaWebGpuBridge = class {
       this._config.logLevel = Math.max(0, Math.min(4, Math.trunc(level)));
     }
     if (this._workerProxy) {
-      this._callWorker("setLogLevel", [level]).catch(() => {
-      });
+      if (this._workerProxy.coreRetired !== true) {
+        this._callWorker("setLogLevel", [level]).catch(() => {
+        });
+      }
       if (this._runtime) {
         this._runtime.setLogLevel(level);
       }
