@@ -636,6 +636,9 @@ assertRejected(validatePublicationPatContract('jobs: [unterminated', EXPECTED_ST
         return [CI_PATH, `        run: ${command}\n`, `        if: false\n        run: ${command}\n`,
           `job build-webgpu-bridge must run "${command}" unconditionally without continue-on-error`];
       }),
+    [CI_PATH, '        run: node scripts/smoke/cross_origin_assets.mjs\n',
+      '        if: false\n        run: node scripts/smoke/cross_origin_assets.mjs\n',
+      'job build-webgpu-bridge must run "node scripts/smoke/cross_origin_assets.mjs" unconditionally without continue-on-error'],
     ...['', ' --threading single'].map((flags) => {
       const command = `node scripts/smoke/core_abort_recovery.mjs${flags}`;
       return [CI_PATH, `        run: ${command}\n`, `        if: false\n        run: ${command}\n`,

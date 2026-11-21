@@ -25,3 +25,4 @@ export { EmbeddingError } from './internal/embedding.ts';
 export { CrossOriginIsolationError, SingleThreadCoreError } from './internal/isolation.ts';
 export { ModelStagingError } from './internal/model_staging.ts';
 export { TextToSpeechStreamingUnsupportedError } from './internal/text_to_speech.ts';
+export { BlobWorkerBlockedError } from './internal/worker_start.ts';

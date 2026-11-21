@@ -179,6 +179,18 @@ Run the same single-thread smoke with `--memory-mode wasm64` as well. Both
 non-isolated runs check that the worker rejects a forced fetch-backend load,
 and that auto mode stages the model. CI and candidate qualification require both runs.
 
+For worker startup or core URL changes, use the same checksum-pinned model:
+
+```bash
+node scripts/smoke/cross_origin_assets.mjs \
+  --dist-dir "$OUT_DIR" \
+  --model-url "$LLAMA_WEBGPU_SMOKE_MODEL_URL" \
+  --model-sha256 "$LLAMA_WEBGPU_SMOKE_MODEL_SHA256"
+```
+
+Rerun with `--memory-mode wasm64` for memory64 and `--browser firefox`
+with Playwright Firefox installed.
+
 The resume integrity smoke uses the model already downloaded by state
 persistence. Set the model URL, SHA-256 and cache directory to the same values
 as the state smoke and run:

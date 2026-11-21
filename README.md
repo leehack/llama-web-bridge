@@ -568,6 +568,14 @@ forms (`vMAJOR.MINOR.PATCH-N`, `bNNNN`, `bNNNN-N`) stay readable. Historical
 `bNNNN-llamadart.N` and earlier wrapper forms are accepted only when reading
 existing manifests and are never emitted.
 
+With cross-origin isolation, matching bridge and core assets can start
+CDN-hosted pthreads from a same-origin module `blob:` that imports the core.
+Serve the assets with CORS and a compatible `Cross-Origin-Resource-Policy`.
+If using CSP, allow `blob:` and the asset origin in `worker-src`.
+Firefox can load a CDN-hosted core on the page thread when its CDN bridge
+worker fails to start. See the [API deployment notes](docs/api.md) for the
+policy and runtime diagnostics.
+
 After publish, assets are CDN-available at:
 
 - `https://cdn.jsdelivr.net/gh/leehack/llama-web-bridge-assets@<tag>/llama_webgpu_bridge.js`

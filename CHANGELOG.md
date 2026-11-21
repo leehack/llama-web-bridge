@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Start cross-origin core pthreads through module blob workers. Report blocked pthread starts as `BlobWorkerBlockedError` and record worker startup routes in the runtime notes. (#223)
+
 - Clear the core initialization timer when initialization settles so it cannot keep a disposed or retired core in memory.
 
 - Stream Qwen3-TTS PCM through `onProgress` with `streamAudio`. The bridge reports `supportsIncrementalAudio` and rejects worker failures after delivery begins so callers never receive replayed audio. (#220)

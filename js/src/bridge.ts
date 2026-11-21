@@ -18,6 +18,8 @@ import {
 } from './internal/decision.ts';
 import { ModelUnloadedError } from './internal/core_guard.ts';
 import { SingleThreadCoreError } from './internal/isolation.ts';
+import { BlobWorkerBlockedError, blobStartBlockedReasonOf } from './internal/worker_start.ts';
+import type { BlobWorkerBlockReason } from './internal/worker_start.ts';
 import { logLevelForName, logThresholdForConfiguredLevel } from './internal/logging.ts';
 import {
   LORA_API_VERSION,
@@ -206,6 +208,7 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
   declare _workerDisposePromise: Promise<void> | null;
   declare _retiringWorkerDisposals: Set<Promise<void>>;
   declare _retiredWorkerProxies: WeakSet<object>;
+  declare _workerStartBlocked: BlobWorkerBlockReason | null;
   declare _workerFallbackReason: string | null;
   declare _metadata: ModelMetadata;
   declare _contextSize: number;
@@ -253,6 +256,7 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
     this._workerDisposePromise = null;
     this._retiringWorkerDisposals = new Set();
     this._retiredWorkerProxies = new WeakSet();
+    this._workerStartBlocked = null;
     this._workerFallbackReason = null;
 
     this._metadata = {};
@@ -316,6 +320,9 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
       ...this._config,
       disableWorker: true,
     });
+    if (this._workerStartBlocked) {
+      runtime._startNotes = [`worker_start_blocked:${this._workerStartBlocked}`];
+    }
     runtime._onCoreRetired = (retired) => this._handleRuntimeCoreRetired(retired);
     return runtime;
   }
@@ -1622,6 +1629,7 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
       isCoreRetiredError(error)
       || error instanceof SingleThreadCoreError
       || this._isNonRecoverableStagingError(error)
+      || error instanceof BlobWorkerBlockedError
     ) {
       return false;
     }
@@ -1747,6 +1755,29 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
   _disableWorkerFallback(error: unknown) {
     const reason = serializeWorkerError(error);
     this._workerFallbackReason = reason;
+    const startBlocked = blobStartBlockedReasonOf(error);
+    const recordStartBlocked = (blocked: BlobWorkerBlockReason) => {
+      if (this._disposed) return;
+      this._workerStartBlocked = blocked;
+      const note = `worker_start_blocked:${blocked}`;
+      if (this._runtime) {
+        this._runtime._startNotes = [note];
+        this._runtime._pushRuntimeNote?.(note);
+      }
+      if (!this._workerProxy) {
+        const key = 'llamadart.webgpu.runtime_notes';
+        const previousNotes = this._metadata[key];
+        const notes = typeof previousNotes === 'string' ? previousNotes.split(';').filter(Boolean) : [];
+        if (!notes.includes(note)) {
+          this._metadata = { ...this._metadata, [key]: [...notes, note].join(';') };
+        }
+      }
+    };
+    if (typeof startBlocked === 'string') {
+      recordStartBlocked(startBlocked);
+    } else if (startBlocked) {
+      void startBlocked.then(recordStartBlocked);
+    }
 
     if (typeof globalThis !== 'undefined') {
       (globalThis as WorkerFallbackGlobals).__llamadartBridgeWorkerFallbackReason = reason;
