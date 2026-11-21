@@ -1301,6 +1301,24 @@ var REQUIRED_JS_MODEL_STAGING_EXPORTS = [
   "_llamadart_webgpu_js_model_fs_release_mount_chunks",
   "llamadartJsModelFsWriteDirect"
 ];
+var HEAP_RESIDENT_STAGING_EXPORTS = [
+  "_llamadart_webgpu_js_model_fs_supports_heap_resident",
+  "_llamadart_webgpu_js_model_fs_open_direct_heap",
+  "_llamadart_webgpu_js_model_fs_heap_resident_bytes"
+];
+var HEAP_RESIDENT_STAGING_API_VERSION = 4;
+function supportsHeapResidentStaging(core, apiVersion) {
+  return Number.isInteger(apiVersion) && apiVersion >= HEAP_RESIDENT_STAGING_API_VERSION && HEAP_RESIDENT_STAGING_EXPORTS.every((name) => typeof core?.[name] === "function") && core?.ccall("llamadart_webgpu_js_model_fs_supports_heap_resident", "number", [], []) === 1;
+}
+function effectiveOffloadedGpuLayers(requestedGpuLayers) {
+  if (!Number.isFinite(requestedGpuLayers) || requestedGpuLayers < 0) {
+    return Infinity;
+  }
+  return Math.trunc(requestedGpuLayers);
+}
+function shouldUseHeapResidentStaging(inputs) {
+  return inputs.jsBackedStaging === true && effectiveOffloadedGpuLayers(inputs.nativeGpuLayers) <= 1 && inputs.useMmapDisabled !== true && inputs.useMlock !== true && inputs.shardCount === 1;
+}
 var ModelStagingError = class extends Error {
   constructor(code, message) {
     super(message);
@@ -1451,6 +1469,16 @@ function writeDirectChunk(directWriter, chunk, position, onBytesWritten) {
     onBytesWritten?.(written);
   }
   return offset;
+}
+function releaseChunkBuffer(chunk) {
+  const buffer = chunk.buffer;
+  if (chunk.byteOffset !== 0 || chunk.byteLength !== buffer.byteLength || typeof buffer.transfer !== "function") {
+    return;
+  }
+  try {
+    buffer.transfer(0);
+  } catch (_) {
+  }
 }
 function parseTotalFromContentRangeHeader(contentRangeHeader) {
   if (typeof contentRangeHeader !== "string" || contentRangeHeader.length === 0) {
@@ -1608,40 +1636,47 @@ async function drainResponseWithProgress(response, progressCallback, options = {
   const reader = response.body.getReader();
   let loaded = 0;
   let lastBucket = -1;
-  while (true) {
-    const { done, value } = await readStreamChunkWithTimeout(
-      reader,
-      chunkTimeoutMs,
-      "response drain read"
-    );
-    if (done) {
-      break;
-    }
-    if (!value || value.length === 0) {
-      continue;
-    }
-    loaded += value.length;
-    if (typeof progressCallback === "function") {
-      const effectiveTotal = total || loaded;
-      const bucket = effectiveTotal > 0 ? Math.floor(loaded / effectiveTotal * 100) : -1;
-      if (bucket > lastBucket) {
-        lastBucket = bucket;
-        progressCallback({ loaded, total: effectiveTotal });
+  try {
+    while (true) {
+      const { done, value } = await readStreamChunkWithTimeout(
+        reader,
+        chunkTimeoutMs,
+        "response drain read"
+      );
+      if (done) {
+        break;
+      }
+      if (!value || value.length === 0) {
+        continue;
+      }
+      loaded += value.length;
+      if (typeof progressCallback === "function") {
+        const effectiveTotal = total || loaded;
+        const bucket = effectiveTotal > 0 ? Math.floor(loaded / effectiveTotal * 100) : -1;
+        if (bucket > lastBucket) {
+          lastBucket = bucket;
+          progressCallback({ loaded, total: effectiveTotal });
+        }
       }
     }
-  }
-  if (typeof progressCallback === "function") {
-    progressCallback({ loaded, total: total || loaded });
+    if (typeof progressCallback === "function") {
+      progressCallback({ loaded, total: total || loaded });
+    }
+  } catch (error) {
+    void reader.cancel(error).catch(() => {
+    });
+    throw error;
   }
   return loaded;
 }
 var DEFAULT_CACHE_TEE_LAG_BYTES = 8 * 1024 * 1024;
-function teeResponseForCache(source, maxCacheLagBytes = DEFAULT_CACHE_TEE_LAG_BYTES) {
+function teeResponseForCache(source, maxCacheLagBytes = DEFAULT_CACHE_TEE_LAG_BYTES, recordId) {
   const reader = source.body.getReader();
   let cacheController = null;
   let wakeReader = null;
   let finished = false;
   let cancelled = false;
+  let decodedBytes = 0;
   const wake = () => {
     const resolve = wakeReader;
     wakeReader = null;
@@ -1709,6 +1744,7 @@ function teeResponseForCache(source, maxCacheLagBytes = DEFAULT_CACHE_TEE_LAG_BY
           cacheController = null;
           return;
         }
+        decodedBytes += result.value.byteLength;
         controller.enqueue(result.value);
         try {
           cacheController?.enqueue(result.value);
@@ -1731,14 +1767,77 @@ function teeResponseForCache(source, maxCacheLagBytes = DEFAULT_CACHE_TEE_LAG_BY
     url: { value: source.url },
     type: { value: source.type }
   });
+  const cacheHeaders = new Headers(source.headers);
+  cacheHeaders.delete(MODEL_CACHE_RECORD_HEADER);
+  if (recordId) cacheHeaders.set(MODEL_CACHE_RECORD_HEADER, recordId);
   return {
     response,
-    cacheResponse: new Response(cacheStream, init),
+    cacheResponse: new Response(cacheStream, { ...init, headers: cacheHeaders }),
     detachCache,
     get cancelled() {
       return cancelled;
+    },
+    get decodedBytes() {
+      return decodedBytes;
     }
   };
+}
+var MODEL_CACHE_RECORD_HEADER = "x-llamadart-cache-record";
+var MODEL_CACHE_SIZE_HEADER = "x-llamadart-decoded-size";
+async function modelCacheMetadataUrl(cacheKey) {
+  const key = new URL(cacheKey);
+  key.hash = "";
+  const hash = await globalThis.crypto.subtle.digest("SHA-256", new TextEncoder().encode(key.href));
+  const digest = Array.from(new Uint8Array(hash), (byte) => byte.toString(16).padStart(2, "0")).join("");
+  return "https://llamadart-cache.invalid/decoded-size/" + digest;
+}
+function modelCacheRecord(response) {
+  const record = response?.headers.get(MODEL_CACHE_RECORD_HEADER) ?? "";
+  return /^[0-9a-f-]{36}$/.test(record) ? record : null;
+}
+async function readCachedModelSize(cache, cacheKey, response) {
+  const record = modelCacheRecord(response);
+  if (!record) return null;
+  try {
+    const metadata = await cache.match(await modelCacheMetadataUrl(cacheKey) + "?record=" + record);
+    const bytes = parseByteLength(metadata?.headers.get(MODEL_CACHE_SIZE_HEADER) ?? null);
+    return bytes !== null && bytes > 0 ? bytes : null;
+  } catch (_) {
+    return null;
+  }
+}
+async function pruneCachedModelSizes(cache, cacheKey) {
+  try {
+    const url = await modelCacheMetadataUrl(cacheKey);
+    const entries = await cache.keys(url, { ignoreSearch: true });
+    if (entries.length === 0) return;
+    const cached = await cache.match(cacheKey);
+    const record = modelCacheRecord(cached);
+    void cached?.body?.cancel().catch(() => {
+    });
+    const keep = url + "?record=" + record;
+    await Promise.all(entries.filter((entry) => entry.url !== keep).map((entry) => cache.delete(entry)));
+  } catch (_) {
+  }
+}
+function startModelCacheStore(cache, cacheKey, response) {
+  const record = globalThis.crypto?.randomUUID?.();
+  const tee = teeResponseForCache(response, DEFAULT_CACHE_TEE_LAG_BYTES, record);
+  const stored = cache.put(cacheKey, tee.cacheResponse).then(async () => {
+    if (!record || !Number.isSafeInteger(tee.decodedBytes) || tee.decodedBytes <= 0) return;
+    try {
+      const url = await modelCacheMetadataUrl(cacheKey) + "?record=" + record;
+      await cache.put(url, new Response(null, {
+        headers: { [MODEL_CACHE_SIZE_HEADER]: String(tee.decodedBytes) }
+      }));
+      await pruneCachedModelSizes(cache, cacheKey);
+    } catch (_) {
+    }
+  }, (error) => {
+    tee.detachCache(error);
+    throw error;
+  });
+  return { tee, stored };
 }
 function ensureFsDirectory(fs, dirPath) {
   const slash = dirPath.lastIndexOf("/");
@@ -1798,7 +1897,9 @@ async function writeResponseToFsFileWithProgress(response, fs, filePath, progres
   const total = parsePositiveInteger(writeOptions.totalBytes) || inferResponseTotalBytes(response, 0);
   const useBigIntPosition = writeOptions.useBigIntPosition === true;
   const directWriter = writeOptions.directWriter || null;
+  const releaseConsumedChunks = directWriter != null && writeOptions.releaseConsumedChunks === true;
   const startOffset = parsePositiveInteger(writeOptions.startOffset);
+  const heapFileBytes = writeOptions.heapFileBytes ?? null;
   const preservePartialOnError = writeOptions.preservePartialOnError === true;
   const appendMode = startOffset > 0;
   const chunkTimeoutMs = parsePositiveInteger(writeOptions.chunkTimeoutMs);
@@ -1819,6 +1920,9 @@ async function writeResponseToFsFileWithProgress(response, fs, filePath, progres
         throw createModelTransferLengthError(
           bytes.byteLength < exactLength2 ? "Model response ended before its declared byte length." : "Model response exceeded its declared byte length."
         );
+      }
+      if (heapFileBytes !== null && startOffset + bytes.byteLength > heapFileBytes) {
+        throw createModelTransferLengthError("Model response exceeded its declared byte length.");
       }
       let directLoaded = 0;
       if (directWriter) {
@@ -1897,6 +2001,9 @@ async function writeResponseToFsFileWithProgress(response, fs, filePath, progres
       );
       if (done) {
         throwIfAborted(signal, abortMessage);
+        if (heapFileBytes !== null && startOffset + loaded > heapFileBytes) {
+          throw createModelTransferLengthError("Model response exceeded its declared byte length.");
+        }
         if (exactLength > 0 && loaded !== exactLength) {
           throw createModelTransferLengthError("Model response ended before its declared byte length.");
         }
@@ -1908,6 +2015,15 @@ async function writeResponseToFsFileWithProgress(response, fs, filePath, progres
       if (exactLength > 0 && value.length > exactLength - loaded) {
         throw createModelTransferLengthError("Model response exceeded its declared byte length.");
       }
+      if (heapFileBytes !== null && startOffset + loaded + value.length > heapFileBytes) {
+        if (response.status !== 206) {
+          throw createModelTransferLengthError("Model response exceeded its declared byte length.");
+        }
+        loaded += value.length;
+        emitProgressIfNeeded();
+        if (releaseConsumedChunks) releaseChunkBuffer(value);
+        continue;
+      }
       if (directWriter) {
         throwIfAborted(signal, abortMessage);
         writeDirectChunk(directWriter, value, writePosition, (written) => {
@@ -1915,6 +2031,9 @@ async function writeResponseToFsFileWithProgress(response, fs, filePath, progres
           loaded += written;
           emitProgressIfNeeded();
         });
+        if (releaseConsumedChunks) {
+          releaseChunkBuffer(value);
+        }
       } else {
         const chunk = value.slice ? value.slice() : new Uint8Array(value);
         throwIfAborted(signal, abortMessage);
@@ -1987,6 +2106,9 @@ function isSafariUserAgent(userAgent) {
   const hasSafariToken = /Safari\//.test(userAgent);
   const hasOtherBrowserToken = /(Chrome|Chromium|CriOS|Edg|OPR|Firefox|FxiOS)\//.test(userAgent);
   return hasSafariToken && !hasOtherBrowserToken;
+}
+function isWebKitUserAgent(userAgent) {
+  return typeof userAgent === "string" && /AppleWebKit\//.test(userAgent) && !/(Chrome|Chromium|Edg|OPR)\//.test(userAgent);
 }
 var SAFARI_UNCAPPED_GPU_MIN_MAJOR = 27;
 var APPLE_SAFARI_PLATFORM = /^Mozilla\/5\.0 \((?:Macintosh; Intel Mac OS X \d+(?:_\d+)*|(?:iPhone|iPad|iPod touch); CPU (?:iPhone )?OS \d+(?:_\d+)* like Mac OS X)\) AppleWebKit\/\d+(?:\.\d+)* \(KHTML, like Gecko\) /;
@@ -2180,6 +2302,7 @@ function scoredTokensFrom(entries) {
 }
 
 // js/src/runtime.ts
+var cachedModelSizes = /* @__PURE__ */ new WeakMap();
 var pendingModelCacheStores = /* @__PURE__ */ new WeakMap();
 var SAFARI_EMBEDDING_PROBE_MAX_COSINE = 0.999;
 var SAFARI_EMBEDDING_PROBE_MIN_COMPONENT = 1e-3;
@@ -2242,6 +2365,8 @@ var LlamaWebGpuBridgeRuntime = class {
     this._nSeqMax = 0;
     this._useMmap = false;
     this._useMlock = false;
+    this._useMmapDisabled = false;
+    this._jsModelStagingApiVersion = 0;
     this._flashAttention = -1;
     this._cacheTypeK = 1;
     this._cacheTypeV = 1;
@@ -2255,6 +2380,7 @@ var LlamaWebGpuBridgeRuntime = class {
     const userAgent = this._config.userAgent ?? globalThis.navigator?.userAgent ?? "";
     this._isSafari = isSafariUserAgent(userAgent);
     this._isAppleSafari = isAppleSafariUserAgent(userAgent);
+    this._isWebKit = isWebKitUserAgent(userAgent);
     this._safariDefaultMaxGpuLayers = safariDefaultMaxGpuLayers(userAgent);
     this._coreVariant = "uninitialized";
     this._coreRetired = false;
@@ -2741,6 +2867,7 @@ var LlamaWebGpuBridgeRuntime = class {
   _resolveNativeLoadOptions(options = {}) {
     this._nSeqMax = parsePositiveInteger(options.nSeqMax);
     this._useMmap = parseBooleanFlag(options.useMmap, false);
+    this._useMmapDisabled = !parseBooleanFlag(options.useMmap, true);
     this._useMlock = parseBooleanFlag(options.useMlock, false);
     this._flashAttention = parseEnumValue(options.flashAttention, [-1, 0, 1], -1);
     this._cacheTypeK = parseEnumValue(options.cacheTypeK, [1, 2, 8], 1);
@@ -2799,6 +2926,7 @@ var LlamaWebGpuBridgeRuntime = class {
       _nUbatch: this._nUbatch,
       _nSeqMax: this._nSeqMax,
       _useMmap: this._useMmap,
+      _useMmapDisabled: this._useMmapDisabled,
       _useMlock: this._useMlock,
       _flashAttention: this._flashAttention,
       _cacheTypeK: this._cacheTypeK,
@@ -3115,6 +3243,7 @@ var LlamaWebGpuBridgeRuntime = class {
         `JS-backed model staging requires native ABI version >= 3 (got ${apiVersion}). Update the core build or disable jsBackedModelStaging.`
       );
     }
+    this._jsModelStagingApiVersion = apiVersion;
     const mountPath = this._mountAtFreeJsStagingPath(core);
     const mountId = Number(
       core.ccall("llamadart_webgpu_js_model_fs_mount_id", "number", ["string"], [mountPath])
@@ -3185,16 +3314,39 @@ var LlamaWebGpuBridgeRuntime = class {
       return false;
     }
   }
-  _openDirectJsWriter(core, filePath, preallocBytes, append, assertMountOwned) {
+  _openDirectJsWriter(core, filePath, preallocBytes, append, assertMountOwned, heapBytes = 0) {
     assertMountOwned();
-    const directHandle = Number(
-      core.ccall(
-        "llamadart_webgpu_js_model_fs_open_direct",
-        "number",
-        ["string", "number", "number"],
-        [filePath, preallocBytes, append ? 1 : 0]
-      )
-    );
+    let heapResident = false;
+    let heapUnavailableReason;
+    let directHandle = 0;
+    if (heapBytes > 0 && !append) {
+      if (supportsHeapResidentStaging(core, this._jsModelStagingApiVersion)) {
+        directHandle = Number(
+          core.ccall(
+            "llamadart_webgpu_js_model_fs_open_direct_heap",
+            "number",
+            ["string", "number"],
+            [filePath, heapBytes]
+          )
+        );
+        heapResident = Number.isInteger(directHandle) && directHandle > 0;
+        if (!heapResident) {
+          heapUnavailableReason = String(directHandle);
+        }
+      } else {
+        heapUnavailableReason = "unsupported";
+      }
+    }
+    if (!heapResident) {
+      directHandle = Number(
+        core.ccall(
+          "llamadart_webgpu_js_model_fs_open_direct",
+          "number",
+          ["string", "number", "number"],
+          [filePath, preallocBytes, append ? 1 : 0]
+        )
+      );
+    }
     if (!Number.isInteger(directHandle) || directHandle <= 0) {
       const openErr = new Error(
         `Failed to open direct JS-backed model file (rc=${directHandle}).`
@@ -3242,7 +3394,9 @@ var LlamaWebGpuBridgeRuntime = class {
         return rc;
       },
       close,
-      assertMountOwned
+      assertMountOwned,
+      heapResident,
+      heapUnavailableReason
     };
   }
   _assertJsStagingMountOwned(core, mountPath, mountId) {
@@ -3457,6 +3611,10 @@ var LlamaWebGpuBridgeRuntime = class {
           if (requireReadableStream) {
             this._runtimeNotes.push("model_cache_stream");
           }
+          if (options.readDecodedCacheSize) {
+            const decodedSize = await readCachedModelSize(cache, cacheKey, cached);
+            if (decodedSize !== null) cachedModelSizes.set(cached, decodedSize);
+          }
           return cached;
         }
         this._runtimeNotes.push("model_cache_hit_no_stream");
@@ -3513,14 +3671,13 @@ var LlamaWebGpuBridgeRuntime = class {
       }
       return response;
     }
-    const tee = teeResponseForCache(response);
-    const stored = cache.put(cacheKey, tee.cacheResponse).then(
+    const { tee, stored: cacheStore } = startModelCacheStore(cache, cacheKey, response);
+    const stored = cacheStore.then(
       () => {
         this._runtimeNotes.push("model_cache_stored");
         return "stored";
       },
       (error) => {
-        tee.detachCache(error);
         return tee.cancelled ? "store_failed" : recordFailure(error);
       }
     );
@@ -3589,7 +3746,7 @@ var LlamaWebGpuBridgeRuntime = class {
             this._modelSource = "cache";
             this._modelCacheState = "hit";
             this._runtimeNotes.push("model_cache_hit");
-            headerTotal = Number(cached.headers.get("content-length")) || 0;
+            headerTotal = await readCachedModelSize(cache, cacheKey, cached) ?? (Number(cached.headers.get("content-length")) || 0);
             const resolved = headerTotal > 0 ? headerTotal : 1;
             shardLoaded[shardIndex] = resolved;
             shardTotals[shardIndex] = resolved;
@@ -3609,7 +3766,15 @@ var LlamaWebGpuBridgeRuntime = class {
         if (headerTotal > 0) {
           shardTotals[shardIndex] = headerTotal;
         }
-        const putPromise = cache ? cache.put(cacheKey, response.clone()).then(() => ({ ok: true, error: null })).catch((error) => ({ ok: false, error })) : null;
+        let cacheStore = null;
+        if (cache && hasReadableResponseStream(response)) {
+          const { tee, stored } = startModelCacheStore(cache, cacheKey, response);
+          response = tee.response;
+          cacheStore = stored;
+        } else if (cache) {
+          cacheStore = cache.put(cacheKey, response.clone());
+        }
+        const putPromise = cacheStore?.then(() => ({ ok: true, error: null })).catch((error) => ({ ok: false, error }));
         await drainResponseWithProgress(
           response,
           progressCallback ? (progress) => {
@@ -3682,6 +3847,7 @@ var LlamaWebGpuBridgeRuntime = class {
         const removed = await cache.delete(cacheKey);
         if (removed) {
           removedCount += 1;
+          await pruneCachedModelSizes(cache, cacheKey);
         }
       }
       const removedAny = removedCount > 0;
@@ -4053,6 +4219,13 @@ var LlamaWebGpuBridgeRuntime = class {
         } else {
           ensureFsDirectory(core.FS, "/models");
         }
+        const heapResidentStaging = shouldUseHeapResidentStaging({
+          jsBackedStaging: useJsBackedStaging,
+          nativeGpuLayers: this._nGpuLayers,
+          useMmapDisabled: this._useMmapDisabled,
+          useMlock: this._useMlock,
+          shardCount: modelUrls.length
+        });
         const progressCallback = typeof options.progressCallback === "function" ? options.progressCallback : null;
         const shardLoaded = new Array(modelUrls.length).fill(0);
         const shardTotals = new Array(modelUrls.length).fill(0);
@@ -4096,6 +4269,8 @@ var LlamaWebGpuBridgeRuntime = class {
             let knownTotalBytes = 0;
             let resumeIdentity = null;
             let minimumShardBytes = 0;
+            let heapFileBytes = null;
+            let heapUnavailableReason;
             const restartShard = (reason) => {
               this._runtimeNotes.push("model_stream_restart:" + reason);
               if (resumeAttempt >= maxStreamResumeRetries) {
@@ -4117,6 +4292,7 @@ var LlamaWebGpuBridgeRuntime = class {
               const response = await this._getCachedModelResponse(activeShardUrl, {
                 ...options,
                 requireReadableStream: true,
+                readDecodedCacheSize: heapResidentStaging,
                 useCache: requestHeaders ? false : options.useCache,
                 force: requestHeaders ? true : options.force,
                 requestHeaders
@@ -4170,7 +4346,8 @@ var LlamaWebGpuBridgeRuntime = class {
                 );
               }
               this._runtimeNotes.push("model_response_stream");
-              const responseTotal = inferResponseTotalBytes(response, knownTotalBytes);
+              const decodedCacheSize = cachedModelSizes.get(response);
+              const responseTotal = decodedCacheSize ?? inferResponseTotalBytes(response, knownTotalBytes);
               let fullGetSpanBytes = null;
               if (resumeOffset === 0) {
                 resumeIdentity = captureResumeIdentity(response, responseUrl);
@@ -4179,6 +4356,7 @@ var LlamaWebGpuBridgeRuntime = class {
                   });
                   throw createModelTransferLengthError("Model response reported conflicting Content-Range and X-Linked-Size totals.");
                 }
+                resumeIdentity.total ??= decodedCacheSize ?? null;
                 expectedShardBytes = resumeIdentity.total;
                 fullGetSpanBytes = resumeIdentity.initialSpanBytes;
               }
@@ -4197,8 +4375,14 @@ var LlamaWebGpuBridgeRuntime = class {
                   modelPath,
                   resumeOffset === 0 && knownTotalBytes > 0 ? knownTotalBytes : 0,
                   resumeOffset > 0,
-                  assertMountOwned
+                  assertMountOwned,
+                  // The block cannot grow, so it needs the exact decoded size.
+                  heapResidentStaging && resumeOffset === 0 && expectedShardBytes !== null ? expectedShardBytes : 0
                 ) : null;
+                if (resumeOffset === 0) {
+                  heapFileBytes = directWriter?.heapResident ? expectedShardBytes : null;
+                  heapUnavailableReason = heapResidentStaging && expectedShardBytes === null ? "unknown_size" : directWriter?.heapUnavailableReason;
+                }
                 shardBytes = await writeResponseToFsFileWithProgress(
                   response,
                   core.FS,
@@ -4216,7 +4400,12 @@ var LlamaWebGpuBridgeRuntime = class {
                     useBigIntPosition: this._coreVariant === "wasm64",
                     skipMemoryReservation: useJsBackedStaging,
                     directWriter,
+                    // Detaching frees a chunk at once on WebKit, which otherwise keeps
+                    // it past the load; Chromium keeps a detached chunk longer than a
+                    // dropped one. A cache tee still reads the chunks.
+                    releaseConsumedChunks: this._isWebKit && !pendingModelCacheStores.has(response),
                     startOffset: resumeOffset,
+                    heapFileBytes,
                     preservePartialOnError: true,
                     totalBytes: knownTotalBytes,
                     chunkTimeoutMs: streamChunkTimeoutMs,
@@ -4236,6 +4425,11 @@ var LlamaWebGpuBridgeRuntime = class {
                   );
                 }
                 await this._settleModelCacheStore(response);
+                if (heapFileBytes !== null) {
+                  this._pushRuntimeNote("model_staging_heap_resident");
+                } else if (heapUnavailableReason) {
+                  this._pushRuntimeNote(`model_staging_heap_resident_unavailable:${heapUnavailableReason}`);
+                }
                 break;
               } catch (error) {
                 if (assertMountOwned && !isCoreRetired(core)) {

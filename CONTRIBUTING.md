@@ -92,6 +92,15 @@ contract tests read the bridge the same way: `tests/bridge/bridge_js_source.mjs`
 joins every `js/src` module in the order the former single-file source declared
 them.
 
+Growable cores link with `--wrap=mmap` and `--wrap=munmap` so llama.cpp can
+map a heap-backed file directly. JS model FS ABI version 4 adds
+`llamadart_webgpu_js_model_fs_supports_heap_resident` so fixed-memory builds
+continue to use JS chunks. It also adds
+`llamadart_webgpu_js_model_fs_open_direct_heap` and the
+`llamadart_webgpu_js_model_fs_heap_resident_bytes` diagnostic. Production
+cores also export `llamadart_webgpu_test_fail_next_model_load` for the
+same-core load failure smoke.
+
 For local agent/maintainer validation, prefer external build and cache paths so
 generated files do not dirty the checkout:
 
@@ -200,7 +209,8 @@ node scripts/smoke/resume_integrity.mjs --dist-dir "$OUT_DIR" --baseline-dist-di
 ```
 
 Repeat with `--threading single`, `--js-backed-model-staging`, and both flags
-together. The baseline flag enables direct and worker comparisons for the
+together. Repeat the JS-backed cases with `--no-mmap` to exercise JS chunks.
+The baseline flag enables direct and worker comparisons for the
 control cases. CI passes the built dist as its own baseline. To compare two
 revisions locally, pass a separately built dist as the baseline.
 
@@ -235,6 +245,17 @@ Run each memory mode in worker and direct mode, with and without
 run's staged byte count and peak wasm heap. The worker run also calls the
 native URL loader directly and checks that it returns `-7`. This is a local
 acceptance check.
+
+For the heap-staging lifecycle check, run the same command with
+`--js-backed-model-staging --gpu-layers 0 --heap-staging-lifecycle`. It checks
+a same-core failed load, replacement, full-offload controls and output parity
+with staging off. Use `--heap-staging-reuse` instead for a tightly capped core
+to check an identical replacement without growing wasm memory or staging JS
+chunks. The abort recovery smoke also runs `staged-load-no-mmap`
+to cover retirement of a JS-chunk staging mount. To check fallback, pass
+`--expect-heap-fallback unsupported` with a fixed-memory core or
+`--expect-heap-fallback allocation` with a model larger than a growable
+core's maximum heap size.
 
 For the v0.7.0 embedding scheduler repair and its exact source fingerprint, see
 [the qualification notes](docs/v070_qualification.md). The build compiles a

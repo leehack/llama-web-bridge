@@ -5,21 +5,30 @@
 #include <limits>
 #include <memory>
 #include <string>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <unordered_map>
 
 #include <emscripten/emscripten.h>
+#include <emscripten/heap.h>
 #include <emscripten/wasmfs.h>
 
 #include "backend.h"
 #include "file.h"
+#include "llama_webgpu_heap_model_blocks.h"
 #include "memory_backend.h"
 #include "wasmfs.h"
 
 extern "C" {
 void _llamadart_js_model_fs_set_next_prealloc_bytes(int64_t bytes);
-void _llamadart_js_model_fs_alloc_file(uintptr_t file_id, int32_t mount_id);
+void _llamadart_js_model_fs_alloc_file(
+    uintptr_t file_id,
+    int32_t mount_id,
+    uint8_t * heap_ptr,
+    size_t heap_capacity);
+void * __real_mmap(void * addr, size_t len, int prot, int flags, int fd, off_t off);
+int __real_munmap(void * addr, size_t len);
 void _llamadart_js_model_fs_free_file(uintptr_t file_id);
 int32_t _llamadart_js_model_fs_bind_direct(uintptr_t file_id);
 void _llamadart_js_model_fs_unbind_direct(int32_t handle);
@@ -42,7 +51,29 @@ double _llamadart_js_model_fs_allocated_bytes();
 
 namespace {
 
+constexpr bool kHeapModelStagingEnabled = LLAMADART_WEBGPU_ALLOW_MEMORY_GROWTH != 0;
 thread_local uintptr_t g_last_opened_file_id = 0;
+// Set by open_direct_heap for the file its open() creates.
+thread_local size_t g_next_heap_bytes = 0;
+thread_local bool g_next_heap_failed = false;
+
+llamadart_webgpu::HeapModelBlocks & heap_model_blocks() {
+  static auto * blocks = new llamadart_webgpu::HeapModelBlocks();
+  return *blocks;
+}
+
+size_t heap_model_allocation_limit() {
+  constexpr size_t allocator_slack = 2 * llamadart_webgpu::HeapModelBlocks::kAlign;
+  const size_t maximum = emscripten_get_heap_max();
+  return maximum > allocator_slack ? maximum - allocator_slack : 0;
+}
+
+void release_js_model_mount(int32_t mount_id) {
+  _llamadart_js_model_fs_release_mount(mount_id);
+  if constexpr (kHeapModelStagingEnabled) {
+    heap_model_blocks().on_mount_released(mount_id);
+  }
+}
 
 class ChunkedJsModelFile : public wasmfs::DataFile {
   uintptr_t getFileIndex() const {
@@ -91,11 +122,25 @@ class ChunkedJsModelFile : public wasmfs::DataFile {
 public:
   ChunkedJsModelFile(mode_t mode, wasmfs::backend_t backend, int32_t mount_id)
       : wasmfs::DataFile(mode, backend) {
-    _llamadart_js_model_fs_alloc_file(getFileIndex(), mount_id);
+    uint8_t * heap_ptr = nullptr;
+    size_t heap_capacity = 0;
+    if constexpr (kHeapModelStagingEnabled) {
+      const size_t wanted = g_next_heap_bytes;
+      g_next_heap_bytes = 0;
+      if (wanted > 0) {
+        heap_ptr = heap_model_blocks().create(
+            getFileIndex(), mount_id, wanted, &heap_capacity, heap_model_allocation_limit());
+        g_next_heap_failed = heap_ptr == nullptr;
+      }
+    }
+    _llamadart_js_model_fs_alloc_file(getFileIndex(), mount_id, heap_ptr, heap_capacity);
   }
 
   ~ChunkedJsModelFile() override {
     _llamadart_js_model_fs_free_file(getFileIndex());
+    if constexpr (kHeapModelStagingEnabled) {
+      heap_model_blocks().on_file_destroyed(getFileIndex());
+    }
   }
 };
 
@@ -135,7 +180,7 @@ std::unordered_map<std::string, MountedJsModelEntry> & mounted_js_model_paths() 
 extern "C" {
 
 EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_js_model_fs_api_version() {
-  return 3;
+  return 4;
 }
 
 EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_js_model_fs_mount_id(const char * mount_path) {
@@ -157,7 +202,7 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_js_model_fs_mount_id(const char * 
 
 EMSCRIPTEN_KEEPALIVE void llamadart_webgpu_js_model_fs_release_mount_chunks(int32_t mount_id) {
   if (mount_id > 0) {
-    _llamadart_js_model_fs_release_mount(mount_id);
+    release_js_model_mount(mount_id);
   }
 }
 
@@ -238,7 +283,7 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_unmount_js_model_fs(const char * m
         ++it;
         continue;
       }
-      _llamadart_js_model_fs_release_mount(it->second.mount_id);
+      release_js_model_mount(it->second.mount_id);
       it = mounted.erase(it);
     }
     g_has_js_model_mounts = !mounted.empty();
@@ -255,7 +300,7 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_unmount_js_model_fs(const char * m
     return rc;
   }
 
-  _llamadart_js_model_fs_release_mount(it->second.mount_id);
+  release_js_model_mount(it->second.mount_id);
   mounted.erase(it);
   g_has_js_model_mounts = !mounted.empty();
   return 0;
@@ -269,10 +314,15 @@ EMSCRIPTEN_KEEPALIVE void llamadart_webgpu_js_model_fs_prealloc_next(double byte
   _llamadart_js_model_fs_set_next_prealloc_bytes(static_cast<int64_t>(bytes));
 }
 
-EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_js_model_fs_open_direct(
+}  // extern "C"
+
+namespace {
+
+int32_t open_direct_file(
     const char * file_path,
     double prealloc_bytes,
-    int32_t append) {
+    int32_t append,
+    size_t heap_bytes) {
   if (file_path == nullptr || std::strlen(file_path) == 0 || !llamadart_webgpu_is_js_model_path(file_path)) {
     return -EINVAL;
   }
@@ -289,11 +339,16 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_js_model_fs_open_direct(
     _llamadart_js_model_fs_set_next_prealloc_bytes(0);
   }
 
+  g_next_heap_bytes = heap_bytes;
+  g_next_heap_failed = false;
   g_last_opened_file_id = 0;
   const int flags = append != 0 ? (O_RDWR | O_CREAT) : (O_RDWR | O_CREAT | O_TRUNC);
   const int fd = ::open(file_path, flags, 0666);
   const int open_errno = errno;
   _llamadart_js_model_fs_set_next_prealloc_bytes(0);
+  g_next_heap_bytes = 0;
+  const bool heap_failed = g_next_heap_failed;
+  g_next_heap_failed = false;
   if (fd < 0) {
     return -(open_errno > 0 ? open_errno : EIO);
   }
@@ -303,6 +358,12 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_js_model_fs_open_direct(
   ::close(fd);
   if (file_id == 0) {
     return -EBADF;
+  }
+  if constexpr (kHeapModelStagingEnabled) {
+    if (heap_bytes > 0 && (heap_failed || !heap_model_blocks().is_live(file_id))) {
+      ::unlink(file_path);
+      return -ENOMEM;
+    }
   }
 
   const int32_t handle = _llamadart_js_model_fs_bind_direct(file_id);
@@ -314,6 +375,84 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_js_model_fs_open_direct(
   }
   return handle;
 }
+
+}  // namespace
+
+extern "C" {
+
+EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_js_model_fs_open_direct(
+    const char * file_path,
+    double prealloc_bytes,
+    int32_t append) {
+  return open_direct_file(file_path, prealloc_bytes, append, 0);
+}
+
+EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_js_model_fs_supports_heap_resident() {
+  return kHeapModelStagingEnabled;
+}
+
+// Like open_direct(path, total, 0), but the new file lives in one wasm heap
+// block of total_bytes that llama.cpp memory-maps without copying.
+EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_js_model_fs_open_direct_heap(
+    const char * file_path,
+    double total_bytes) {
+  if constexpr (!kHeapModelStagingEnabled) {
+    return -ENOSYS;
+  }
+  if (!(total_bytes > 0.0) || total_bytes > static_cast<double>(SIZE_MAX - llamadart_webgpu::HeapModelBlocks::kAlign)) {
+    return -EINVAL;
+  }
+  return open_direct_file(file_path, 0.0, 0, static_cast<size_t>(total_bytes));
+}
+
+EMSCRIPTEN_KEEPALIVE double llamadart_webgpu_js_model_fs_heap_resident_bytes() {
+  return kHeapModelStagingEnabled ? static_cast<double>(heap_model_blocks().resident_bytes()) : 0;
+}
+
+bool llamadart_webgpu_is_heap_model_path(const char * path) {
+  if (!kHeapModelStagingEnabled || !llamadart_webgpu_is_js_model_path(path)) {
+    return false;
+  }
+  struct stat st;
+  return ::stat(path, &st) == 0 && heap_model_blocks().is_live(static_cast<uintptr_t>(st.st_ino));
+}
+
+// Every llama.cpp object that mapped a staged file must be destroyed first.
+void llamadart_webgpu_release_heap_model_mappings() {
+  if constexpr (kHeapModelStagingEnabled) {
+    heap_model_blocks().release_mappings();
+  }
+}
+
+#if LLAMADART_WEBGPU_ALLOW_MEMORY_GROWTH
+void * __wrap_mmap(void * addr, size_t len, int prot, int flags, int fd, off_t off) {
+  if (fd >= 0 && g_has_js_model_mounts) {
+    struct stat st;
+    if (::fstat(fd, &st) == 0 && st.st_size >= 0) {
+      void * mapped = heap_model_blocks().map(
+          static_cast<uintptr_t>(st.st_ino),
+          static_cast<size_t>(st.st_size),
+          len,
+          static_cast<int64_t>(off),
+          (prot & PROT_WRITE) != 0,
+          (flags & MAP_FIXED) != 0);
+      if (mapped != nullptr) {
+        return mapped;
+      }
+    }
+  }
+  return __real_mmap(addr, len, prot, flags, fd, off);
+}
+
+// llama.cpp unmaps fragments of a mapping; the block is freed as a whole by
+// release_mappings().
+int __wrap_munmap(void * addr, size_t len) {
+  if (heap_model_blocks().contains(addr)) {
+    return 0;
+  }
+  return __real_munmap(addr, len);
+}
+#endif
 
 EMSCRIPTEN_KEEPALIVE void llamadart_webgpu_js_model_fs_close_direct(int32_t handle) {
   _llamadart_js_model_fs_unbind_direct(handle);

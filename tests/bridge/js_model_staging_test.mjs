@@ -91,6 +91,10 @@ function createStagingHarness({
   mountResult = 0,
   failWriteWith = null,
   onLoadModel = null,
+  apiVersion = 3,
+  heapOpenResult = null,
+  supportsHeapResident = 1,
+  userAgent,
 } = {}) {
   const fs = createStubFs({ failWriteWith });
   const ccalls = [];
@@ -110,7 +114,7 @@ function createStagingHarness({
     FS: fs,
     UTF8ToString: () => lastErrorText,
     ...(includeJsModelFsExports ? {
-      _llamadart_webgpu_js_model_fs_api_version: () => 3,
+      _llamadart_webgpu_js_model_fs_api_version: () => apiVersion,
       _llamadart_webgpu_js_model_fs_mount_id: () => 0,
       _llamadart_webgpu_mount_js_model_fs: () => 0,
       _llamadart_webgpu_unmount_js_model_fs: () => 0,
@@ -138,6 +142,11 @@ function createStagingHarness({
         });
         return chunk.byteLength;
       },
+    } : {}),
+    ...(apiVersion >= 4 ? {
+      _llamadart_webgpu_js_model_fs_supports_heap_resident: () => supportsHeapResident,
+      _llamadart_webgpu_js_model_fs_open_direct_heap: () => 0,
+      _llamadart_webgpu_js_model_fs_heap_resident_bytes: () => 0,
     } : {}),
     ccall(name, _returnType, _argTypes, args = []) {
       ccalls.push([name, ...args]);
@@ -179,6 +188,17 @@ function createStagingHarness({
       if (name === 'llamadart_webgpu_js_model_fs_prealloc_next') {
         preallocNextBytes = Number(args[0]) || 0;
         return 0;
+      }
+      if (name === 'llamadart_webgpu_js_model_fs_supports_heap_resident') {
+        return supportsHeapResident;
+      }
+      if (name === 'llamadart_webgpu_js_model_fs_open_direct_heap') {
+        if (heapOpenResult !== null) return heapOpenResult;
+        const [filePath] = args;
+        fs.files.set(filePath, 0);
+        const handle = nextDirectHandle++;
+        openDirectHandles.add(handle);
+        return handle;
       }
       if (name === 'llamadart_webgpu_js_model_fs_open_direct') {
         const [filePath, preallocBytes = 0, append = 0] = args;
@@ -228,6 +248,7 @@ function createStagingHarness({
     allowSingleThreadCore: true,
     preferMemory64: coreVariant === 'wasm64',
     jsBackedModelStaging,
+    userAgent,
   });
   runtime = bridge._runtime;
   runtime._core = core;
@@ -240,7 +261,7 @@ function createStagingHarness({
   };
   runtime._coreSupportsPthreads = () => pthreads;
   runtime._syncThreadPoolSizeHintFromCore = () => {};
-  runtime._resolveNativeLoadOptions = () => {};
+  if (apiVersion < 4) runtime._resolveNativeLoadOptions = () => {};
   runtime._emitSuppressedWarmupWarningSummaryIfNeeded = () => {};
   runtime._getCachedModelResponse = async () => new Response(new Uint8Array([1, 2, 3, 4]), {
     status: 200,
@@ -263,6 +284,113 @@ function createStagingHarness({
     setLastError: (msg) => { lastErrorText = msg; },
   };
 }
+
+const SAFARI_26 = 'Mozilla/5.0 (iPhone; CPU iPhone OS 26_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.5 Mobile/15E148 Safari/604.1';
+const CHROMIUM = 'Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36';
+
+test('heap model staging selects the writer using the effective layer count and the core ABI', async (t) => {
+  const model = 'https://models.test/model.gguf';
+  const cases = [
+    { name: 'zero layers', options: { nGpuLayers: 0 }, layers: 0, heap: true },
+    { name: 'one layer', options: { nGpuLayers: 1 }, layers: 1, heap: true },
+    { name: 'omitted layers', options: {}, layers: -1 },
+    ...[-1, -5, 2, 99].map((layers) => ({ name: `${layers} requested layers`, options: { nGpuLayers: layers }, layers })),
+    { name: 'explicit mmap', options: { nGpuLayers: 0, useMmap: true }, layers: 0, heap: true },
+    { name: 'mmap disabled', options: { nGpuLayers: 0, useMmap: false }, layers: 0 },
+    { name: 'mlock', options: { nGpuLayers: 0, useMlock: true }, layers: 0 },
+    { name: 'Safari capped', harness: { userAgent: SAFARI_26 }, options: { nGpuLayers: 99 }, layers: 1, heap: true },
+    { name: 'Safari omitted', harness: { userAgent: SAFARI_26 }, options: {}, layers: -1 },
+    { name: 'API v3', harness: { apiVersion: 3 }, options: { nGpuLayers: 0 }, layers: 0 },
+    { name: 'missing heap export', missingExport: true, options: { nGpuLayers: 0 }, layers: 0 },
+    { name: 'fixed heap', harness: { supportsHeapResident: 0 }, options: { nGpuLayers: 0 }, layers: 0 },
+    { name: 'unknown decoded size', encoding: 'gzip', options: { nGpuLayers: 0 }, layers: 0 },
+    { name: 'split model', split: true, options: { nGpuLayers: 0 }, layers: 0 },
+    { name: 'staging off', harness: { jsBackedModelStaging: false }, options: { nGpuLayers: 0 }, layers: 0 },
+    { name: 'heap allocation failure', harness: { heapOpenResult: -12 }, options: { nGpuLayers: 0 }, layers: 0 },
+  ];
+
+  for (const entry of cases) {
+    await t.test(entry.name, async () => {
+      const { runtime, core, ccalls } = createStagingHarness({ apiVersion: 4, userAgent: CHROMIUM, ...entry.harness });
+      if (entry.harness?.apiVersion === 3) {
+        core._llamadart_webgpu_js_model_fs_supports_heap_resident = () => 1;
+        core._llamadart_webgpu_js_model_fs_open_direct_heap = () => 0;
+        core._llamadart_webgpu_js_model_fs_heap_resident_bytes = () => 0;
+      }
+      if (entry.missingExport) delete core._llamadart_webgpu_js_model_fs_heap_resident_bytes;
+      const chunk = Uint8Array.of(1, 2, 3, 4);
+      runtime._getCachedModelResponse = async () => new Response(new ReadableStream({
+        start(controller) {
+          controller.enqueue(chunk.slice());
+          controller.close();
+        },
+      }), { headers: { 'content-length': '4', 'content-encoding': entry.encoding ?? 'identity' } });
+      runtime._gpuActive = true;
+      const urls = entry.split ? [
+        'https://models.test/model-00001-of-00002.gguf',
+        'https://models.test/model-00002-of-00002.gguf',
+      ] : model;
+      await runtime.loadModelFromUrl(urls, {
+        ...entry.options, nCtx: 128, useCache: false, forceRemoteFetchBackend: false, safariGpuProbe: false,
+      });
+
+      const heapCalls = ccalls.filter(([name]) => name === 'llamadart_webgpu_js_model_fs_open_direct_heap');
+      const chunkCalls = ccalls.filter(([name]) => name === 'llamadart_webgpu_js_model_fs_open_direct');
+      const failedAllocation = entry.harness?.heapOpenResult === -12;
+      assert.deepEqual(heapCalls.map(([, , bytes]) => bytes), entry.heap || failedAllocation ? [4] : []);
+      const expectedChunkWriters = entry.heap || entry.harness?.jsBackedModelStaging === false ? 0 : entry.split ? 2 : 1;
+      assert.equal(chunkCalls.length, expectedChunkWriters);
+      assert.equal(runtime._runtimeNotes.includes('model_staging_heap_resident'), entry.heap === true);
+      assert.equal(runtime._runtimeNotes.includes('model_staging_heap_resident_unavailable:-12'), failedAllocation);
+      const unsupported = entry.missingExport || entry.harness?.apiVersion === 3 || entry.harness?.supportsHeapResident === 0;
+      assert.equal(runtime._runtimeNotes.includes('model_staging_heap_resident_unavailable:unsupported'), unsupported === true);
+      const capabilityCalls = ccalls.filter(([name]) => name === 'llamadart_webgpu_js_model_fs_supports_heap_resident');
+      const capabilityChecked = entry.heap || failedAllocation || entry.harness?.supportsHeapResident === 0;
+      assert.equal(capabilityCalls.length, capabilityChecked ? 1 : 0);
+      const nativeLoad = ccalls.find(([name]) => name === 'llamadart_webgpu_load_model');
+      assert.equal(nativeLoad[7], entry.layers);
+      assert.equal(nativeLoad[9], entry.options.useMmap ? 1 : 0);
+    });
+  }
+});
+
+test('model staging releases consumed stream chunks on WebKit only', async () => {
+  for (const [userAgent, expectedLength] of [[SAFARI_26, 0], [CHROMIUM, 4]]) {
+    const { runtime } = createStagingHarness({ apiVersion: 4, userAgent });
+    const chunk = Uint8Array.of(1, 2, 3, 4);
+    runtime._getCachedModelResponse = async () => new Response(new ReadableStream({
+      start(controller) {
+        controller.enqueue(chunk);
+        controller.close();
+      },
+    }), { headers: { 'content-length': '4' } });
+    await runtime.loadModelFromUrl('https://models.test/model.gguf', {
+      nCtx: 128, nGpuLayers: 0, useCache: false, forceRemoteFetchBackend: false,
+    });
+    assert.equal(chunk.buffer.byteLength, expectedLength);
+  }
+});
+
+test('heap staging links mmap wrappers and releases mappings after their last native consumer', () => {
+  const cmake = readFileSync(path.join(rootDir, 'CMakeLists.txt'), 'utf8');
+  for (const name of ['mmap', 'munmap']) {
+    assert.match(cmake, new RegExp(`--wrap=${name}\\b`));
+  }
+  for (const name of [
+    'js_model_fs_supports_heap_resident',
+    'js_model_fs_open_direct_heap',
+    'js_model_fs_heap_resident_bytes',
+    'test_fail_next_model_load',
+  ]) {
+    assert.ok(cmake.includes(`_llamadart_webgpu_${name}`), `missing core export ${name}`);
+  }
+  const support = readFileSync(path.join(rootDir, 'src/core/support.inc'), 'utf8');
+  const freeRuntime = support.match(/void free_runtime\(\) \{([\s\S]*?)\n\}/)?.[1];
+  assert.match(freeRuntime, /llama_model_free\(g_state\.model\);\s*g_state\.model = nullptr;\s*\}\s*llamadart_webgpu_release_heap_model_mappings\(\);/);
+  const load = readFileSync(path.join(rootDir, 'src/core/model_load.inc'), 'utf8');
+  assert.match(load, /g_state\.model = llama_model_load_from_file\([^;]+;\s*if \(g_state\.model == nullptr\) \{[^}]*llamadart_webgpu_release_heap_model_mappings\(\);[^}]*return -2;/);
+  assert.match(load, /g_model_params = mparams;[^}]*g_model_params\.load_mode = requested_load_mode;/);
+});
 
 test('jsBackedModelStaging defaults off and works opt-in for threaded and non-threaded cores', async () => {
   const defaultBridge = new LlamaWebGpuBridge({ disableWorker: true });
@@ -1081,12 +1209,13 @@ test('resumed HTTP 206 with jsBackedModelStaging opens append handle and writes 
       },
     }), {
       status: 200,
-      headers: { 'content-length': '10', 'content-encoding': 'identity' },
+      headers: { 'content-encoding': 'identity' },
     });
   };
 
   const staged = new Uint8Array(10);
-  const resumeHarness = createStagingHarness({ jsBackedModelStaging: true, pthreads: false });
+  const resumeHarness = createStagingHarness({ apiVersion: 4 });
+  assert.ok(resumeHarness.core._llamadart_webgpu_js_model_fs_open_direct_heap);
   const baseWriteDirect = resumeHarness.core.llamadartJsModelFsWriteDirect;
   resumeHarness.core.llamadartJsModelFsWriteDirect = (handle, chunk, position) => {
     staged.set(chunk, position);
@@ -1115,11 +1244,12 @@ test('resumed HTTP 206 with jsBackedModelStaging opens append handle and writes 
     useCache: false,
     forceRemoteFetchBackend: false,
   });
+  assert.ok(!resumeHarness.ccalls.some(([name]) => name === 'llamadart_webgpu_js_model_fs_open_direct_heap'));
   const openCalls = resumeHarness.ccalls
     .filter((c) => c[0] === 'llamadart_webgpu_js_model_fs_open_direct')
     .map(([, filePath, preallocBytes, append]) => ({ filePath, preallocBytes, append }));
   assert.deepEqual(openCalls, [
-    { filePath: '/jsmodels-1/resumed.gguf', preallocBytes: 10, append: 0 },
+    { filePath: '/jsmodels-1/resumed.gguf', preallocBytes: 0, append: 0 },
     { filePath: '/jsmodels-1/resumed.gguf', preallocBytes: 0, append: 1 },
   ]);
   assert.deepEqual(
@@ -1130,6 +1260,88 @@ test('resumed HTTP 206 with jsBackedModelStaging opens append handle and writes 
     ],
   );
   assert.deepEqual(staged, fullPayload);
+});
+
+test('heap-file overrun preserves range restart and reports a false full length as a transfer error', async (t) => {
+  await t.test('the stream rejects an oversized range that reaches EOF', async () => {
+    const writes = [];
+    const response = new Response(Uint8Array.of(3, 4, 5, 6, 7, 8), { status: 206 });
+    await assert.rejects(writeResponseToFsFileWithProgress(response, {}, '/model.gguf', null, {
+      directWriter: {
+        writeChunk(chunk) { writes.push(chunk); return chunk.length; },
+      },
+      startOffset: 2,
+      heapFileBytes: 6,
+    }), { name: 'ModelTransferLengthError' });
+    assert.deepEqual(writes, []);
+  });
+  for (const scenario of ['range overrun', 'closed overrun', 'valid append', 'ETag restart', 'false full length']) {
+    await t.test(scenario, async () => {
+      let request = 0;
+      const { runtime, ccalls } = createStagingHarness({
+        apiVersion: 4,
+        failWriteWith: ({ position, length }) => (
+          request <= 2 && position + length > 6 ? { errno: 22 } : null
+        ),
+      });
+      const requests = [];
+      const brokenResponse = (status, bytes, headers) => {
+        let sent = false;
+        return new Response(new ReadableStream({
+          pull(controller) {
+            if (sent) {
+              controller.error(new TypeError('network error'));
+            } else {
+              sent = true;
+              controller.enqueue(Uint8Array.from(bytes));
+            }
+          },
+        }, { highWaterMark: 0 }), { status, headers });
+      };
+      runtime._getCachedModelResponse = async (_url, { requestHeaders }) => {
+        requests.push(requestHeaders?.Range ?? null);
+        request++;
+        if (scenario === 'false full length') {
+          return new Response(new Uint8Array(8), { headers: { 'x-linked-size': '6' } });
+        }
+        if (request === 1) {
+          return brokenResponse(200, [1, 2], { 'content-length': '6', 'content-encoding': 'identity', etag: '"a"' });
+        }
+        if (request === 2) {
+          const headers = {
+            'content-range': 'bytes 2-5/6', 'content-encoding': 'identity',
+            etag: scenario === 'ETag restart' ? '"b"' : '"a"',
+          };
+          if (scenario === 'closed overrun' || scenario === 'valid append') {
+            const suffix = scenario === 'valid append' ? [3, 4, 5, 6] : [3, 4, 5, 6, 7, 8];
+            return new Response(Uint8Array.from(suffix), { status: 206, headers });
+          }
+          return brokenResponse(206, [3, 4, 5, 6, 7, 8], headers);
+        }
+        return new Response(new Uint8Array(6));
+      };
+      const load = runtime.loadModelFromUrl('https://models.test/overrun.gguf', {
+        nGpuLayers: 0, useCache: false, forceRemoteFetchBackend: false,
+      });
+      if (scenario === 'false full length' || scenario === 'closed overrun') {
+        await assert.rejects(load, { name: 'ModelTransferLengthError' });
+        assert.deepEqual(requests, scenario === 'closed overrun' ? [null, 'bytes=2-'] : [null]);
+        assert.ok(!ccalls.some(([name]) => name === 'llamadart_webgpu_load_model'));
+        return;
+      }
+      assert.equal(await load, 1);
+      if (scenario === 'valid append') {
+        assert.deepEqual(requests, [null, 'bytes=2-']);
+        assert.ok(runtime._runtimeNotes.includes('model_staging_heap_resident'));
+        return;
+      }
+      assert.deepEqual(requests, [null, 'bytes=2-', null]);
+      const reason = scenario === 'ETag restart' ? 'etag' : 'range';
+      assert.ok(runtime._runtimeNotes.includes(`model_stream_restart:${reason}`));
+      assert.ok(!runtime._runtimeNotes.includes('model_staging_heap_resident'));
+      assert.ok(runtime._runtimeNotes.includes('model_staging_heap_resident_unavailable:unknown_size'));
+    });
+  }
 });
 
 test('loadMultimodalProjector uses JS-backed direct staging when jsBackedModelStaging is enabled', async () => {

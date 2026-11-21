@@ -62,6 +62,12 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_load_model(
       n_rs_seq);
 }
 
+// Test hook for the staging smoke: the next model load is cancelled after
+// llama.cpp has mapped the file. Not part of the API.
+EMSCRIPTEN_KEEPALIVE void llamadart_webgpu_test_fail_next_model_load() {
+  g_test_fail_next_model_load = true;
+}
+
 EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_free_model() {
   clear_error();
   if (g_generation_active || g_tts_active) {

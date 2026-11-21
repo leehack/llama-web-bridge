@@ -15,6 +15,53 @@ export const REQUIRED_JS_MODEL_STAGING_EXPORTS = [
   'llamadartJsModelFsWriteDirect',
 ] as const;
 
+// Optional: a core without these keeps staging on JS chunks.
+const HEAP_RESIDENT_STAGING_EXPORTS = [
+  '_llamadart_webgpu_js_model_fs_supports_heap_resident',
+  '_llamadart_webgpu_js_model_fs_open_direct_heap',
+  '_llamadart_webgpu_js_model_fs_heap_resident_bytes',
+] as const;
+
+const HEAP_RESIDENT_STAGING_API_VERSION = 4;
+
+export function supportsHeapResidentStaging(
+  core: LlamaCoreModule | null | undefined,
+  apiVersion: number,
+): boolean {
+  return Number.isInteger(apiVersion)
+    && apiVersion >= HEAP_RESIDENT_STAGING_API_VERSION
+    && HEAP_RESIDENT_STAGING_EXPORTS.every((name) => typeof core?.[name] === 'function')
+    && core?.ccall('llamadart_webgpu_js_model_fs_supports_heap_resident', 'number', [], []) === 1;
+}
+
+// The layers llama.cpp offloads for a requested count: it expands a negative
+// count to every layer, so the default (-1) is full offload, not zero.
+export function effectiveOffloadedGpuLayers(requestedGpuLayers: number): number {
+  if (!Number.isFinite(requestedGpuLayers) || requestedGpuLayers < 0) {
+    return Infinity;
+  }
+  return Math.trunc(requestedGpuLayers);
+}
+
+export interface HeapResidentStagingInputs {
+  jsBackedStaging: boolean;
+  // The count the native load receives, after the Safari cap.
+  nativeGpuLayers: number;
+  useMmapDisabled: boolean;
+  useMlock: boolean;
+  shardCount: number;
+}
+
+// The mapped block stays for the model's lifetime, so it only pays off when at
+// most one layer's weights are also copied to the GPU.
+export function shouldUseHeapResidentStaging(inputs: HeapResidentStagingInputs): boolean {
+  return inputs.jsBackedStaging === true
+    && effectiveOffloadedGpuLayers(inputs.nativeGpuLayers) <= 1
+    && inputs.useMmapDisabled !== true
+    && inputs.useMlock !== true
+    && inputs.shardCount === 1;
+}
+
 // Typed, worker-transportable failures raised when JS-backed model staging
 // fails, is unsupported by the core, collides on mount, or hits the wasm32 4 GiB limit.
 export class ModelStagingError extends Error {

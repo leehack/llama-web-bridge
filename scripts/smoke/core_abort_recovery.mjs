@@ -10,7 +10,8 @@ import {
   stageFile, webGpuLaunchArgs, withServer, withTempDir,
 } from './support.mjs';
 
-const DEFAULT_CASES = ['load', 'next-token', 'cancel-cleanup', 'state-write', 'staged-load', 'healthy'];
+const STAGED_CASES = ['staged-load', 'staged-load-no-mmap'];
+const DEFAULT_CASES = ['load', 'next-token', 'cancel-cleanup', 'state-write', ...STAGED_CASES, 'healthy'];
 const IFRAME_CASES = ['iframe', 'older-iframe'];
 const MODEL = 'abort-smoke.gguf';
 const TRUNCATED = 'abort-smoke-truncated.gguf';
@@ -211,7 +212,11 @@ async function runBrowserCase(settings) {
     }
     bridge = new LlamaWebGpuBridge(config);
     const nThreads = single ? 1 : 4;
-    const options = { nCtx: 128, nThreads, nThreadsBatch: nThreads, nGpuLayers: 0, useCache: false };
+    const noMmap = scenario === 'staged-load-no-mmap';
+    const options = {
+      nCtx: 128, nThreads, nThreadsBatch: nThreads, nGpuLayers: 0, useCache: false,
+      ...(noMmap ? { useMmap: false } : {}),
+    };
     const load = (url = modelUrl) => bridge.loadModelFromUrl(url, options);
     const complete = (extra = {}) => bridge.createCompletion('hello', {
       nPredict: 8, temp: 0, seed: 1, ...extra,
@@ -222,6 +227,9 @@ async function runBrowserCase(settings) {
     const initial = await snapshot(first.id);
     const metadata = bridge.getModelMetadata();
     const note = (value) => (value['llamadart.webgpu.runtime_notes'] || '').split(';');
+    if (noMmap) {
+      assert(!note(metadata).includes('model_staging_heap_resident'), 'useMmap:false staged into the heap');
+    }
     assert(iframe || metadata['llamadart.webgpu.core_variant'] === (memory64 ? 'wasm64' : 'wasm32'),
       'The selected Wasm core did not match the requested memory mode');
     assert(Number(metadata['llamadart.webgpu.n_threads']) === nThreads, 'Unexpected model thread count');
@@ -273,7 +281,7 @@ async function runBrowserCase(settings) {
       return;
     }
 
-    const abortedLoad = scenario === 'load' || scenario === 'staged-load';
+    const abortedLoad = scenario === 'load' || scenario === 'staged-load' || noMmap;
     const wasmTrap = (error) => error.message.includes('memory access out of bounds');
     const nativeAbort = (error) => /^Aborted\(/.test(error.message);
     if (abortedLoad) {
@@ -417,7 +425,7 @@ async function main() {
     if (args.baselineDistDir) return [false, true].map((staging) => ({ scenario: 'parity', worker, staging }));
     return [...DEFAULT_CASES, ...(worker ? [] : IFRAME_CASES)]
       .filter((scenario) => args.case == null || args.case === scenario)
-      .map((scenario) => ({ scenario, worker, staging: scenario === 'staged-load' }));
+      .map((scenario) => ({ scenario, worker, staging: STAGED_CASES.includes(scenario) }));
   });
   assert.ok(cases.length > 0, 'The selected case requires direct runtime');
   const results = await runDist(args, args.distDir, modelPath, cases);

@@ -452,6 +452,7 @@ void free_runtime() {
     llama_model_free(g_state.model);
     g_state.model = nullptr;
   }
+  llamadart_webgpu_release_heap_model_mappings();
 
   g_state.vocab = nullptr;
   g_state.n_ctx = 0;

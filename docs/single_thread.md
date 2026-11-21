@@ -33,7 +33,7 @@ load reports `core_single_thread`.
   allocations and filesystem growth.
 - **JS-backed staging.** With `jsBackedModelStaging: true`, the 2.50 GB
   Qwen3-4B-Q4_K_M generated on WebGPU in both modes and used 643 MiB peak wasm
-  heap. The model file lives in JS chunks during staging. The browser's JS
+  heap. This full-offload case uses JS chunks during staging. The browser's JS
   heap and device memory still limit model size. Qwen3-8B-Q4_K_M (4.68 GiB)
   returned `MODEL_TENSOR_SIZE_LIMIT_EXCEEDED` after staging because its
   tensor payload exceeds the wasm32 4 GiB bound.
@@ -41,6 +41,35 @@ load reports `core_single_thread`.
 Use JS-backed staging for models over about 1 GB. The
 [API measurements](api.md#browser-and-asset-requirements) include staging and
 heap costs on wasm32 and memory64.
+
+## iOS Safari
+
+On iOS Safari below 27, pass an explicit `nGpuLayers`. With
+`jsBackedModelStaging: true`, set `nGpuLayers: 0` for the highest model-size
+ceiling. A positive request defaults to at most one GPU layer on Safari below
+27, which keeps GPU acceleration with a lower memory ceiling. The default
+full-offload request uses JS chunks.
+
+On iOS and iPadOS Safari, pass `useCache: false` for models larger than about
+400 MB until the Cache Storage write is fixed. During a cold load with default
+caching, WebKit's `Cache.put` of the teed download stream can push WebContent
+past its memory limit. On an iPhone 17 Pro running iOS 26.5, the 805 MB Q8 model
+finished downloading with 767.5 MiB in the heap staging block and zero JS
+file-staging bytes. iOS killed WebContent at its 2 GiB limit while the cache
+write was still pending, before native model loading started.
+On the same device, the 397 MB Q4 model loaded with default caching and
+reloaded from Cache Storage using heap staging.
+[Q8 cold load](https://console.cloud.google.com/storage/browser/llamadart-cuda-qa-20260916-devicerun/automation/sessions/session-15958212-a0a7-455a-8ed1-5d1ed482250c/) ·
+[Q4 cold load and reload](https://console.cloud.google.com/storage/browser/llamadart-cuda-qa-20260916-devicerun/automation/sessions/session-d6f7a701-106b-42ac-97d5-2a29797374aa/)
+
+The memory estimates below come from Qwen3-0.6B-Q8_0 (767 MiB, `nCtx: 512`)
+and memory-headroom probes with `useCache: false` on the same device. The model
+architecture and context and batch settings affect the ceiling.
+
+| Effective GPU layers | Q8 result with heap staging | Estimated model-size ceiling |
+| --- | --- | --- |
+| 0 | Loads and generates with 448 MiB of additional JS allocations | About 1.2–1.4 GiB |
+| 1 | Loads and generates; smaller batches leave more memory for weights | About 0.8–1.1 GiB at batch size 64 |
 
 ## Local WebGPU acceptance inputs
 

@@ -30,6 +30,21 @@ addToLibrary({
   $llamadartJsModelFsWriteBytes: (file, copySlice, length, offset) => {
     const chunkSize = file.chunkSize;
     const end = offset + length;
+    if (file.heapPtr) {
+      if (end > file.heapCapacity) {
+        return -{{{ cDefs.EFBIG }}};
+      }
+      // The block is not zeroed up front; zero only the gap a write skips, so
+      // a sequential download never pays a second pass.
+      if (offset > file.size) {
+        HEAPU8.fill(0, file.heapPtr + file.size, file.heapPtr + offset);
+      }
+      copySlice(null, file.heapPtr + offset, 0, length);
+      if (end > file.size) {
+        file.size = end;
+      }
+      return length;
+    }
     const firstChunk = Math.floor(offset / chunkSize);
     const lastChunk = Math.floor((end - 1) / chunkSize);
 
@@ -76,15 +91,29 @@ addToLibrary({
     llamadartJsModelFsState.nextPreallocBytes = bytes > 0 ? bytes : 0;
   },
 
-  _llamadart_js_model_fs_alloc_file__sig: 'vpi',
+  _llamadart_js_model_fs_alloc_file__sig: 'vpipp',
   _llamadart_js_model_fs_alloc_file__deps: [
     '$llamadartJsModelFsState',
     '$llamadartJsModelFsFiles',
   ],
-  _llamadart_js_model_fs_alloc_file: (fileId, mountId) => {
+  _llamadart_js_model_fs_alloc_file: (fileId, mountId, heapPtr, heapCapacity) => {
     const chunkSize = llamadartJsModelFsState.chunkSize;
     const preallocBytes = llamadartJsModelFsState.nextPreallocBytes;
     llamadartJsModelFsState.nextPreallocBytes = 0;
+
+    if (Number(heapPtr) > 0) {
+      // Heap-resident: the bytes live in one wasm heap block the native side owns.
+      llamadartJsModelFsFiles().set(fileId, {
+        mountId: Number(mountId) | 0,
+        size: 0,
+        chunkSize,
+        chunks: [],
+        oomError: false,
+        heapPtr: Number(heapPtr),
+        heapCapacity: Number(heapCapacity),
+      });
+      return;
+    }
 
     const chunks = [];
     let oomError = false;
@@ -193,7 +222,7 @@ addToLibrary({
     return llamadartJsModelFsWriteBytes(
       file,
       (chunk, dstOff, srcOffset, copyLen) => {
-        chunk.set(source.subarray(srcOffset, srcOffset + copyLen), dstOff);
+        (chunk || HEAPU8).set(source.subarray(srcOffset, srcOffset + copyLen), dstOff);
       },
       length,
       offset,
@@ -227,7 +256,11 @@ addToLibrary({
       file,
       (chunk, dstOff, srcOffset, copyLen) => {
         const start = srcBase + srcOffset;
-        chunk.set(HEAPU8.subarray(start, start + copyLen), dstOff);
+        if (chunk) {
+          chunk.set(HEAPU8.subarray(start, start + copyLen), dstOff);
+        } else {
+          HEAPU8.copyWithin(dstOff, start, start + copyLen);
+        }
       },
       length,
       offset,
@@ -253,6 +286,10 @@ addToLibrary({
     const available = file.size - offset;
     const toRead = Math.min(length, available);
     const end = offset + toRead;
+    if (file.heapPtr) {
+      HEAPU8.copyWithin(Number(buffer), file.heapPtr + offset, file.heapPtr + end);
+      return toRead;
+    }
     const chunkSize = file.chunkSize;
     const firstChunk = Math.floor(offset / chunkSize);
     const lastChunk = Math.floor((end - 1) / chunkSize);
@@ -299,6 +336,17 @@ addToLibrary({
     }
     if (size < 0) {
       return -{{{ cDefs.EINVAL }}};
+    }
+    if (file.heapPtr) {
+      if (size > file.heapCapacity) {
+        return -{{{ cDefs.EFBIG }}};
+      }
+      // Bytes past the old size are whatever the block held before.
+      if (size > file.size) {
+        HEAPU8.fill(0, file.heapPtr + file.size, file.heapPtr + size);
+      }
+      file.size = size;
+      return 0;
     }
     if (size === 0) {
       if (file.size > 0) {

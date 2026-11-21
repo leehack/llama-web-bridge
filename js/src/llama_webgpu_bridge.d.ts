@@ -9,7 +9,11 @@ export interface LlamaWebGpuBridgeConfig {
   coreModuleFactory?: LlamaCoreModuleFactory | Promise<LlamaCoreModuleFactory>;
   /** Set for a `coreModuleUrl` core built without pthreads (`WEBGPU_BRIDGE_PTHREADS=0`): it loads on a page that is not cross-origin isolated, capped to one thread, instead of rejecting with `CrossOriginIsolationError`. */
   allowSingleThreadCore?: boolean;
-  /** Stage fetched model files into a chunked JS-backed WASMFS mount outside wasm linear memory. */
+  /**
+   * Stage fetched model files in a private WASMFS mount. A single-file GGUF
+   * with a known decoded size and 0 or 1 effective GPU layers is staged once
+   * in the wasm heap and memory-mapped on supported cores. Other loads use JS chunks.
+   */
   jsBackedModelStaging?: boolean;
   workerUrl?: string;
   disableWorker?: boolean;
@@ -54,6 +58,8 @@ export interface LoadModelOptions {
   signal?: AbortSignal;
   remoteFetchThresholdBytes?: number;
   remoteFetchChunkBytes?: number;
+  /** Pass false to keep JS-chunk staging when jsBackedModelStaging is enabled. */
+  useMmap?: boolean;
   /** Overrides the Safari GPU layer cap. Recognized Safari 27+ is uncapped by default. */
   safariMaxGpuLayers?: number;
   /** Set to false to skip the Safari load-time GPU probe. */
