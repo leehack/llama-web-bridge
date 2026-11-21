@@ -5169,7 +5169,7 @@ var LlamaWebGpuBridgeRuntime = class {
                 penalty: 1,
                 seed: index + seedOffset,
                 // The probe retries with the current staging mount. Generation recovery would release it.
-                _llamadartGenerationRecoveryAttempted: true
+                ...this._isAppleSafari && useJsBackedStaging ? { _llamadartGenerationRecoveryAttempted: true } : {}
               });
               if (looksLikeCorruptedGeneration(probeOutput)) return "failed";
             }

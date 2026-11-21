@@ -290,7 +290,7 @@ test('worker replay and main-thread fallback keep CPU after generation recovery'
       assert.equal(workers.length, execution === 'worker' ? 2 : 1);
       assert.equal(metadata(bridge, 'execution'), execution);
       assert.equal(metadata(bridge, 'n_gpu_layers'), '0');
-    }, { failGpuDecode: true }));
+    }, { failGpuDecodeAt: 1 }));
   }
 });
 
@@ -315,7 +315,7 @@ test('completion recovers to CPU again after replay of an omitted Safari count',
       assert.deepEqual(trace, [1, 0, 1, 0]);
       assert.equal(metadata(bridge, 'n_gpu_layers'), '0');
       assert.match(metadata(bridge, 'runtime_notes'), /generation_recovery_cpu_applied/);
-    }, { failGpuDecode: true }));
+    }, { failGpuDecodeAt: 1 }));
   }
 });
 
@@ -329,7 +329,36 @@ test('an omitted Safari count enables wasm64 CPU recovery and subsequent omitted
   assert.match(metadata(bridge, 'runtime_notes'), /generation_recovery_cpu_applied/);
   await loadModel(bridge, withoutProbe, 'b');
   assert.deepEqual(trace, [1, 0, 0]);
-}, { failGpuDecode: true }));
+}, { failGpuDecodeAt: 1 }));
+
+test('the Safari probe keeps wasm64 generation recovery outside Apple Safari JS staging', async (t) => {
+  const appleSafari = safari('26.2');
+  const lookalike = appleSafari.replace('Macintosh; Intel Mac OS X 10_15_7', 'X11; Linux x86_64');
+  for (const [name, userAgent, remote] of [
+    ['lookalike staged', lookalike, false],
+    ['Apple Safari native fetch', appleSafari, true],
+    ['lookalike native fetch', lookalike, true],
+    ['Apple Safari standard staging', appleSafari, false],
+  ]) {
+    await t.test(name, () => withSafariBridge({
+      userAgent, preferMemory64: true, jsBackedModelStaging: false,
+    }, async ({ bridge, trace, loadSources }) => {
+      await loadModel(bridge, {
+        ...(remote ? { nGpuLayers: 1 } : { nGpuLayers: 8, safariMaxGpuLayers: 4 }),
+        forceRemoteFetchBackend: remote,
+        modelBytesHint: 3,
+      });
+      assert.deepEqual(trace, [remote ? 1 : 4, 0]);
+      assert.deepEqual(loadSources, [remote ? 'native-fetch' : 'staged', 'staged']);
+      assert.equal(metadata(bridge, 'execution'), 'worker');
+      assert.equal(metadata(bridge, 'n_gpu_layers'), '0');
+      assert.match(metadata(bridge, 'runtime_notes'), /generation_recovery_cpu_applied/);
+      assert.ok(safariNotes(bridge).includes('safari_gpu_probe_passed'));
+      assert.equal(await bridge.createCompletion(PROMPT, { nPredict: 5 }), COMPLETION);
+      assert.equal(trace.length, 2);
+    }, { failGpuDecodeAt: remote ? 1 : 2, failNativeFetchRetry: remote }));
+  }
+});
 
 test('a failed probe of the omitted count stabilizes on CPU and subsequent loads inherit it', () => withSafariBridge({
   userAgent: safari('26.2'), disableWorker: true,

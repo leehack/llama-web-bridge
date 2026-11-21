@@ -18,23 +18,27 @@ const { instance: layerCountAbi } = await WebAssembly.instantiate(Uint8Array.of(
 let coreState;
 
 export default async function createCore() {
-  const { reportLoad, reportCompletion, failGpuDecode, corruptProbe } = coreState;
+  const { reportLoad, reportCompletion, failGpuDecodeAt, corruptProbe, failNativeFetchRetry } = coreState;
   const core = createStubCore();
   const ccall = core.ccall.bind(core);
   let loadedLayers;
+  let nativeFetches = 0;
   core.ccall = (name, type, types, args = []) => {
+    if (name === 'llamadart_webgpu_supports_pthreads') return 1;
     if (name === 'llamadart_webgpu_probe') return 1;
     if (name === 'llamadart_webgpu_backends_json') return '["WebGPU","CPU"]';
     if (name === 'llamadart_webgpu_load_model' || name === 'llamadart_webgpu_load_model_from_url') {
       loadedLayers = layerCountAbi.exports.n(args[6]);
       const reply = corruptProbe && loadedLayers > 0 ? '<pad>'.repeat(48) : COMPLETION;
       for (const prompt of PROBE_PROMPTS) core.scripts[prompt] = [reply];
-      reportLoad(loadedLayers);
+      const remote = name === 'llamadart_webgpu_load_model_from_url';
+      reportLoad(loadedLayers, remote ? 'native-fetch' : 'staged');
+      if (remote && failNativeFetchRetry && ++nativeFetches > 1) return -1;
       return 0;
     }
     if (name === 'llamadart_webgpu_free_model') return 0;
     if (name.startsWith('llamadart_webgpu_begin_generation')) reportCompletion?.();
-    if (failGpuDecode && loadedLayers > 0) {
+    if (loadedLayers >= failGpuDecodeAt) {
       if (name === 'llamadart_webgpu_next_token') return -1;
       if (name === 'llamadart_webgpu_last_error') return 'failed to decode';
     }
@@ -47,9 +51,12 @@ export default async function createCore() {
 }
 
 if (!isMainThread) {
+  globalThis.WorkerGlobalScope = class {
+    static [Symbol.hasInstance](value) { return value === globalThis; }
+  };
   globalThis.fetch = fetchModel;
   globalThis.self = { postMessage: (...args) => parentPort.postMessage(...args) };
-  coreState = { ...workerData, reportLoad: (layers) => parentPort.postMessage({ type: 'nativeLoad', layers }) };
+  coreState = { ...workerData, reportLoad: (layers, source) => parentPort.postMessage({ type: 'nativeLoad', layers, source }) };
   installBridgeWorkerHost();
   parentPort.on('message', (data) => {
     if (data.type === 'trapTokenize') coreState.trapTokenize = true;
@@ -57,22 +64,30 @@ if (!isMainThread) {
   });
 }
 
-export async function withSafariBridge(config, run, { failGpuDecode = false, corruptProbe = false } = {}) {
+export async function withSafariBridge(config, run, {
+  failGpuDecodeAt = Infinity, corruptProbe = false, failNativeFetchRetry = false,
+} = {}) {
   const originals = { Worker: globalThis.Worker, fetch: globalThis.fetch };
   const trace = [];
+  const loadSources = [];
+  const reportLoad = (layers, source) => {
+    trace.push(layers);
+    loadSources.push(source);
+  };
   const workers = [];
   const calls = { completion: 0 };
+  const coreOptions = { failGpuDecodeAt, corruptProbe, failNativeFetchRetry };
   coreState = {
-    failGpuDecode, corruptProbe, reportLoad: (layers) => trace.push(layers),
+    ...coreOptions, reportLoad,
     reportCompletion: () => { calls.completion += 1; },
   };
   globalThis.fetch = fetchModel;
   globalThis.Worker = class {
     constructor() {
-      this.thread = new NodeWorker(fixtureUrl, { workerData: { failGpuDecode, corruptProbe } });
+      this.thread = new NodeWorker(fixtureUrl, { workerData: coreOptions });
       this.thread.on('message', (data) => {
         if (data.type === 'nativeLoad') {
-          trace.push(data.layers);
+          reportLoad(data.layers, data.source);
         } else if (this.crashOnResult && data.type === 'result') {
           this.crashOnResult = false;
           this.onerror?.({ message: 'Bridge worker crashed' });
@@ -98,7 +113,7 @@ export async function withSafariBridge(config, run, { failGpuDecode = false, cor
     ...config,
   });
   try {
-    return await run({ bridge, trace, workers, calls });
+    return await run({ bridge, trace, loadSources, workers, calls });
   } finally {
     try {
       await bridge.dispose();
