@@ -577,6 +577,12 @@ Common `options` keys:
 | `mediaMaxPredict` | Cap for multimodal generation token count. |
 | `speculativeDecoding` | `{ strategies, ... }`: llama.cpp speculative decoding; see [Speculative decoding](#speculative-decoding). |
 
+When a multimodal worker reports `ModelTransferLengthError` or an active
+`ModelStagingError` during setup, restore, or completion, `createCompletion()`
+rejects with that typed error. The error triggers neither a worker restart nor a
+main-thread fallback. Warmup calls (`warmup: true`) skip these failures and return
+`''` without extra restarts.
+
 `thinkingBudget.naturalEndTags` is the complete ordered list of natural ends,
 including any normal close. Supply a non-empty array to use this option, which
 requires `thinkingBudgetMultiEnd`. By default only `endTag` closes the block.

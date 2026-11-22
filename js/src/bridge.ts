@@ -2276,7 +2276,7 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
         if (!this._workerProxy) {
           await this._replaceWorkerProxyForMultimodalCpuMode();
         }
-        await this._ensureWorkerMultimodalCpuMode();
+        await this._ensureWorkerMultimodalCpuMode({ nonRetryableTyped: true });
       } catch (error) {
         this._throwIfOperationCancelled(error, 'Generation was cancelled.');
         const reason = serializeWorkerError(error);
@@ -2297,7 +2297,7 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
           `llamadart: unable to prepare multimodal worker CPU mode (${reason}).`,
         );
 
-        if (this._isNonRecoverableStagingError(error)) {
+        if (this._isNonRetryableLoadError(error)) {
           throw error;
         }
         if (this._isCpuModelMode()) {
@@ -2428,8 +2428,11 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
             );
             try {
               await this._replaceWorkerProxyForMultimodalCpuMode();
-              await this._ensureWorkerMultimodalCpuMode();
+              await this._ensureWorkerMultimodalCpuMode({ nonRetryableTyped: true });
             } catch (retrySetupError) {
+              if (this._isNonRetryableLoadError(retrySetupError)) {
+                throw retrySetupError;
+              }
               this._emitBridgeWarn(
                 `llamadart: multimodal empty-response retry setup failed (${serializeWorkerError(retrySetupError)}).`,
               );
@@ -2472,7 +2475,7 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
           );
         }
 
-        if (this._isNonRecoverableStagingError(error)) {
+        if (this._isNonRetryableLoadError(error)) {
           throw error;
         }
         if (this._isCpuModelMode()) {

@@ -183,28 +183,6 @@ test('worker projector preserves a transfer length error during the CPU retry re
   });
 });
 
-for (const warmup of [false, true]) {
-  test(`worker ${warmup ? 'warmup' : 'completion'} retries a transfer length error during projector restore`, async (t) => {
-    const complete = t.mock.method(LlamaWebGpuBridgeRuntime.prototype, 'createCompletion', async () => 'generated');
-    let projectorLoads = 0;
-    await withWorkerProjector(t, 0, async () => {
-      if (++projectorLoads === 2) throw transferError();
-      return 1;
-    }, async ({ bridge, workers, workerLoads }) => {
-      await bridge.loadMultimodalProjector(PROJECTOR);
-      await bridge._replaceWorkerProxyForMultimodalCpuMode();
-      const workersBeforeRestore = workers.length;
-      assert.equal(await bridge.createCompletion('Describe the image.', {
-        warmup,
-        parts: [{ type: 'image', url: 'https://models.test/image.png' }],
-      }), 'generated');
-      assert.equal(workerLoads() - 1, 2, 'remembered projector restore attempts');
-      assert.equal(workers.length - workersBeforeRestore, 1, 'extra worker restarts');
-      assert.equal(complete.mock.callCount(), 1);
-    });
-  });
-}
-
 test('an empty-message transfer error keeps download fields off the worker wire', async (t) => {
   await withWorkerProjector(t, 0, async () => { throw transferError(''); },
     async ({ bridge, errorReplies }) => {
