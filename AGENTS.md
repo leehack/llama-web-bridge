@@ -103,6 +103,8 @@ The scripts below live in `scripts/smoke/` unless a different path is shown.
 - Follow the [workflow guardrails](CONTRIBUTING.md#agent-workflow-guardrails)
   and the [four-stage publish process](CONTRIBUTING.md#publish-process).
   Keep SHA-256 pins in the files named by the verifier.
+- Prepare the versioned changelog in a PR before dispatching the release
+  candidate. See the [publish process](CONTRIBUTING.md#publish-process).
 - Verify live settings before describing `bridge-assets-publication` or
   `bridge-npm-publication` as protected.
 

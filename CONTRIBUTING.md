@@ -565,6 +565,12 @@ starting alphanumeric, such as `manual-v0.1.83`. The input keeps its historical
 name `orchestrator_correlation_id` because published manifests and release
 notes record it.
 
+Before dispatching `bridge_candidate.yml` for `vX.Y.Z`, merge a release-prep
+PR that moves the changelog entries under `## Unreleased` to
+`## vX.Y.Z - YYYY-MM-DD` using the planned release date. Keep an empty
+`## Unreleased` at the top. Set the candidate's `bridge_source_sha` to a
+commit on `main` that includes the changelog update.
+
 Gather the inputs. Use the newest stable `llamadart-native` release: the
 candidate and publish workflows reject a development (`bNNNN`) native tag, but
 nothing checks that native releases are published in order. Substitute the
