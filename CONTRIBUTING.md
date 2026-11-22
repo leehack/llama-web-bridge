@@ -203,9 +203,9 @@ node scripts/smoke/cross_origin_assets.mjs \
 Rerun with `--memory-mode wasm64` for memory64 and `--browser firefox`
 with Playwright Firefox installed.
 
-The resume integrity smoke uses the model already downloaded by state
-persistence. Set the model URL, SHA-256 and cache directory to the same values
-as the state smoke and run:
+The resume integrity smoke uses the same checksum-pinned model as state
+persistence and downloads it on a cache miss. Set the model URL, SHA-256 and
+cache directory to the same values as the state smoke and run:
 
 ```bash
 node scripts/smoke/resume_integrity.mjs --dist-dir "$OUT_DIR" --baseline-dist-dir "$OUT_DIR"

@@ -180,6 +180,20 @@ for (const guarded of [{ if: false }, { 'continue-on-error': true }]) {
   });
 }
 
+for (const [job, env] of [
+  ['smoke-core', { LLAMA_WEBGPU_SMOKE_MODEL_URL: '' }],
+  ['smoke-resume', { LLAMA_WEBGPU_SMOKE_MODEL_PATH: '/cached-only.gguf' }],
+  ['smoke-multimodal', { LLAMA_WEBGPU_MULTIMODAL_MMPROJ_URL: '' }],
+  ['smoke-grammar-qwen', { LLAMA_WEBGPU_SMOKE_MODEL_PATH: '/cached-only.gguf' }],
+]) {
+  test(`CI reliability rejects a cache-only model input in ${job}`, () => {
+    const workflow = parseYaml(read(CI_PATH));
+    workflow.jobs[job].env = env;
+    const errors = collectRepositoryErrors({ [CI_PATH]: stringifyYaml(workflow) });
+    assertRejected(errors.filter((error) => error.includes(`job ${job} step `)), 'must use a downloadable checksum-pinned');
+  });
+}
+
 for (const prefix of ['webgpu-ccache-v3-', 'webgpu-core-v1-']) {
   test(`CI reliability rejects ${prefix} in the candidate`, () => {
     const candidate = parseYaml(read(CANDIDATE_PATH));

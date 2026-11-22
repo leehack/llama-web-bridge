@@ -1028,13 +1028,28 @@ function checkCiRunsContracts({ ci, candidate, qualification, publish }, testFil
       '--runtime-mode "$GRAMMAR_RUNTIME_MODE"',
     ].join(' ')],
   };
+  const smokeModels = {
+    'smoke-grammar-qwen': ['LLAMA_WEBGPU_MULTIMODAL_MODEL'],
+    'node scripts/smoke/multimodal.mjs': ['LLAMA_WEBGPU_MULTIMODAL_MODEL', 'LLAMA_WEBGPU_MULTIMODAL_MMPROJ'],
+  };
   for (const [job, commands] of Object.entries(smokeCommands)) {
     for (const command of commands) {
+      const step = ci.jobSteps(job).find((step) => shellCommands(step.run).trim() === command
+        && step.raw.if === undefined && step.raw['continue-on-error'] === undefined);
       check.require(
-        ci.jobSteps(job).some((step) => shellCommands(step.run).trim() === command
-          && step.raw.if === undefined && step.raw['continue-on-error'] === undefined),
+        step !== undefined,
         `${ci.path} job ${job} must run "${command}" unconditionally without continue-on-error`,
       );
+      if (!step || !command.startsWith('node ')) continue;
+      for (const model of smokeModels[job] ?? smokeModels[command] ?? ['LLAMA_WEBGPU_SMOKE_MODEL']) {
+        const checksum = `${model}_SHA256`;
+        const modelPath = job === 'smoke-grammar-qwen' ? 'LLAMA_WEBGPU_SMOKE_MODEL_PATH' : `${model}_PATH`;
+        check.require(
+          /^https:\/\//.test(step.env[`${model}_URL`]) && !step.env[modelPath]
+            && step.env[checksum] === EXPECTED_MODEL_PINS[CANONICAL_MODEL_PIN_NAMES[checksum]],
+          `${ci.path} job ${job} step ${step.name} must use a downloadable checksum-pinned ${model}`,
+        );
+      }
     }
   }
   const build = mapping(ci.job('build-core').strategy);
