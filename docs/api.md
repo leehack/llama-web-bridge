@@ -374,6 +374,9 @@ The class and its fields are preserved across the worker boundary.
 | `variant` | `wasm32`, `memory64`, or `null` when the error is independent of the core. |
 
 Core initialization logs and passthrough errors also redact core asset URLs.
+In passthrough errors and logs, the query and fragment of an absolute URL are
+removed up to the next whitespace, quote, or angle bracket, so separate URLs
+with whitespace or redact each URL before joining them.
 Loader syntax or reference errors, missing factory exports, isolation and
 pthread worker errors, and core initialization timeouts retain their original
 classification. A plausible asset response also preserves the initialization

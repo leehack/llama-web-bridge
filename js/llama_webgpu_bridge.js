@@ -972,6 +972,10 @@ function absoluteUrlEnd(message, start) {
   for (let end = start; end < message.length; end++) {
     const char = message[end];
     if (URL_TEXT_DELIMITER.test(char)) return end;
+    if (char === "?" || char === "#") {
+      const nextDelimiter = message.slice(end).search(URL_TEXT_DELIMITER);
+      return nextDelimiter === -1 ? message.length : end + nextDelimiter;
+    }
     if (char === "," && /^https?:\/\//i.test(message.slice(end + 1, end + 9))) return end;
     if (char === "[") closingDelimiters.push("]");
     if (char === "(") closingDelimiters.push(")");
@@ -979,15 +983,30 @@ function absoluteUrlEnd(message, start) {
   }
   return message.length;
 }
+function trailingQueryPunctuation(token, queryStart, punctuation) {
+  const closingDelimiters = [];
+  const suffixStart = token.length - punctuation.length;
+  let trailing = "";
+  for (let index = queryStart; index < token.length; index++) {
+    const char = token[index];
+    if (char === "[") closingDelimiters.push("]");
+    else if (char === "(") closingDelimiters.push(")");
+    else if (char === closingDelimiters.at(-1)) closingDelimiters.pop();
+    else if (index >= suffixStart) trailing += char;
+  }
+  return trailing;
+}
 function redactAbsoluteUrlToken(token) {
-  const punctuation = /[,.;]+$/.exec(token)?.[0] ?? "";
+  const queryStart = token.search(/[?#]/);
+  const punctuation = (queryStart === -1 ? /[,.;]+$/ : /[),.;!\]]+$/).exec(token)?.[0] ?? "";
   const urlToken = token.slice(0, token.length - punctuation.length);
   const hasPath = /[/?#]/.test(urlToken.slice(urlToken.indexOf("://") + 3));
   const position = hasPath ? /(?::\d+){1,2}$/.exec(urlToken)?.[0] ?? "" : "";
   try {
     const url = new URL(urlToken.slice(0, urlToken.length - position.length));
-    if (!url.username && !url.password && !url.search && !url.hash) return token;
-    return url.origin + url.pathname + position + punctuation;
+    if (queryStart === -1 && !url.username && !url.password) return token;
+    const trailing = queryStart === -1 || !punctuation ? punctuation : trailingQueryPunctuation(token, queryStart, punctuation);
+    return url.origin + url.pathname + position + trailing;
   } catch (_) {
     return token;
   }

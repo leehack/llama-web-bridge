@@ -888,20 +888,57 @@ test('core redaction preserves unsigned URLs and handles mixed URLs in an object
 });
 
 for (const mode of ['direct', 'worker']) {
+  const signedMirror = 'https://cdn.example.test/core.wasm?v=42';
+  const mirror = 'https://cdn.example.test/core.wasm';
+  const backup = 'https://backup.example.test/core.wasm';
+  const scrubbedList = [signedMirror, backup].map((candidate) => {
+    const { origin, pathname } = new URL(candidate);
+    return origin + pathname;
+  }).join(',');
   for (const [format, input, expected] of [
     [
       'comma-joined mirror list',
-      'Tried [https://cdn.example.test/core.wasm?v=42,https://backup.example.test/core.wasm]',
-      'Tried [https://cdn.example.test/core.wasm,https://backup.example.test/core.wasm]',
+      `Tried [${signedMirror},${backup}]`,
+      `Tried [${mirror}]`,
     ],
     ['single bracketed URL', '[https://x/core.wasm?v=42]', '[https://x/core.wasm]'],
     [
       'signed URL followed by an unsigned URL',
       'Tried https://x/core.wasm#preview,https://[::1]/core.wasm',
-      'Tried https://x/core.wasm,https://[::1]/core.wasm',
+      'Tried https://x/core.wasm',
     ],
+    ['comma-and-space mirror list', `Tried [${signedMirror}, ${backup}]`, `Tried [${mirror}, ${backup}]`],
+    ['space-separated mirror list', `Tried ${signedMirror} ${backup}`, `Tried ${mirror} ${backup}`],
+    ['JSON mirror list', JSON.stringify([signedMirror, backup]), JSON.stringify([mirror, backup])],
+    ['pre-scrubbed mirror list', `Tried [${scrubbedList}]`, `Tried [${mirror},${backup}]`],
+    ['path-only comma-joined mirror list', `Tried [${mirror},${backup}]`, `Tried [${mirror},${backup}]`],
   ]) {
     test(`${mode}: core diagnostic punctuation survives redaction for a ${format}`, async (t) => {
+      const lines = [];
+      for (const level of ['log', 'warn', 'error']) t.mock.method(console, level, (line) => lines.push(line));
+      withImports(t, { [loader]: ({ print, printErr }) => {
+        print(input);
+        printErr(input);
+        throw new Error(input);
+      } });
+      await withBridge(mode, config32, async (bridge) => {
+        await assert.rejects(bridge.loadModelFromUrl(model, loadOptions), { message: expected });
+      });
+      assert.deepEqual(lines, [expected, expected, expected, expected]);
+    });
+  }
+}
+
+for (const mode of ['direct', 'worker']) {
+  for (const [format, input, expected] of [
+    ['closing bracket', 'https://cdn/x.wasm?a=]&sig=SECRET', 'https://cdn/x.wasm'],
+    ['closing parenthesis', 'https://cdn/x.wasm?a=)&sig=SECRET', 'https://cdn/x.wasm'],
+    ['comma and scheme', 'https://cdn/x.wasm?next=,https://y/z&sig=SECRET', 'https://cdn/x.wasm'],
+    ['percent-decoded comma', decodeURIComponent('https://cdn/x.wasm?next=%2Chttps://decoded/z&sig=SECRET'), 'https://cdn/x.wasm'],
+    ['parenthesized frame', '(https://x/a.js?sig=S:10:5)', '(https://x/a.js:10:5)'],
+    ['Firefox frame', '@https://x/a.js?sig=S:3:7', '@https://x/a.js:3:7'],
+  ]) {
+    test(`${mode}: core URL hard terminators preserve ${format} formatting safely`, async (t) => {
       const lines = [];
       for (const level of ['log', 'warn', 'error']) t.mock.method(console, level, (line) => lines.push(line));
       withImports(t, { [loader]: ({ print, printErr }) => {
