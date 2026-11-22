@@ -965,7 +965,20 @@ function redactCoreAssetUrl(url) {
 function hasCoreAssetUrlSecrets(url) {
   return /[?#]/.test(url) || /^(?:[a-z][a-z\d+.-]*:)?\/\/[^/]*@/i.test(url);
 }
-var ABSOLUTE_HTTP_URL = /\bhttps?:\/\/[^\s"'()<>`‘’“”]+/gi;
+var HTTP_URL_START = /\bhttps?:\/\//gi;
+var URL_TEXT_DELIMITER = /[\s"'<>`‘’“”]/;
+function absoluteUrlEnd(message, start) {
+  const closingDelimiters = [];
+  for (let end = start; end < message.length; end++) {
+    const char = message[end];
+    if (URL_TEXT_DELIMITER.test(char)) return end;
+    if (char === "," && /^https?:\/\//i.test(message.slice(end + 1, end + 9))) return end;
+    if (char === "[") closingDelimiters.push("]");
+    if (char === "(") closingDelimiters.push(")");
+    if ((char === "]" || char === ")") && closingDelimiters.pop() !== char) return end;
+  }
+  return message.length;
+}
 function redactAbsoluteUrlToken(token) {
   const punctuation = /[,.;]+$/.exec(token)?.[0] ?? "";
   const urlToken = token.slice(0, token.length - punctuation.length);
@@ -993,14 +1006,9 @@ function createCoreAssetUrlRedactor() {
   function text(message) {
     let offset = 0;
     let redacted = "";
-    for (const match of message.matchAll(ABSOLUTE_HTTP_URL)) {
+    for (const match of message.matchAll(HTTP_URL_START)) {
       if (match.index < offset) continue;
-      const token = match[0];
-      let end = match.index + token.length;
-      if (/[?#]/.test(token) && message[end] === "(") {
-        const continuation = /^(?:\([^\s"'()<>`‘’“”]*\)[^\s"'()<>`‘’“”]*)+/.exec(message.slice(end));
-        end += continuation?.[0].length ?? 0;
-      }
+      const end = absoluteUrlEnd(message, match.index + match[0].length);
       redacted += redactRelativeText(message.slice(offset, match.index));
       redacted += redactAbsoluteUrlToken(message.slice(match.index, end));
       offset = end;
