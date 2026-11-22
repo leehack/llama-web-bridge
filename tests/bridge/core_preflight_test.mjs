@@ -796,12 +796,13 @@ for (const mode of ['direct', 'worker']) {
     const origin = 'http://127.0.0.1:52208';
     const absolute = `${origin}${coreModuleUrl}`;
     const baseFrame = `    at abort (${origin}/loader.js:1:2274)`;
+    const nestedFrame = `    at start (${origin}/folder(/loader.js:2:3))`;
     const notes = [];
     t.mock.method(console, 'log', (line) => notes.push(line));
     withImports(t, { [coreModuleUrl]: ({ locateFile, print }) => {
       locateFile('lib.wasm', base);
       const error = new WebAssembly.CompileError(`Initialization failed for ${coreModuleUrl}`);
-      error.stack = `CompileError: ${error.message}\n    at abort (${absolute}:1:2274)`;
+      error.stack = `CompileError: ${error.message}\n    at abort (${absolute}:1:2274)\n    at start (${origin}/folder(${coreModuleUrl}:2:3))`;
       print(error.stack);
       throw error;
     } });
@@ -809,12 +810,12 @@ for (const mode of ['direct', 'worker']) {
     await withBridge(mode, { ...config32, coreModuleUrl }, async (bridge) => {
       await assert.rejects(bridge.preflightCore(), (error) => {
         assert.equal(error.message, 'Initialization failed for file://[redacted]');
-        if (mode === 'direct') assert.equal(error.stack.split('\n')[1], baseFrame);
+        if (mode === 'direct') assert.deepEqual(error.stack.split('\n').slice(1), [baseFrame, nestedFrame]);
         return true;
       });
     });
     assert.equal(notes.length, 1);
-    assert.equal(notes[0].split('\n')[1], baseFrame);
+    assert.deepEqual(notes[0].split('\n').slice(1), [baseFrame, nestedFrame]);
   });
 }
 
@@ -994,6 +995,7 @@ for (const mode of ['direct', 'worker']) {
     ['https://cdn.example.test,ops@example.test,ready'],
     ['(https://cdn.example.test),owner=ops@example.test'],
     ['https://cdn.example.test)contact=ops@example.test'],
+    ['|https://cdn.example.test|ops@example.test|ready|'],
     ['https://user:pass@host/core.wasm', 'https://host/core.wasm'],
     ['https://TOKEN@host/core.wasm', 'https://host/core.wasm'],
   ]) {
@@ -1006,6 +1008,45 @@ for (const mode of ['direct', 'worker']) {
         throw new Error(input);
       } });
       await withBridge(mode, config32, async (bridge) => {
+        await assert.rejects(bridge.loadModelFromUrl(model, loadOptions), { message: expected });
+      });
+      assert.deepEqual(lines, [expected, expected, expected, expected]);
+    });
+  }
+
+  test(`${mode}: registered asset credentials are scrubbed even when the userinfo contains punctuation`, async (t) => {
+    const wasmUrl = new URL('https://us,er:p;as(s)@assets.test/core.wasm?sig=SECRET').href;
+    const input = `Wasm load failed at ${wasmUrl}`;
+    const expected = 'Wasm load failed at https://assets.test/core.wasm';
+    const lines = [];
+    for (const level of ['log', 'warn', 'error']) t.mock.method(console, level, (line) => lines.push(line));
+    withImports(t, { [loader]: ({ print, printErr }) => {
+      print(input);
+      printErr(input);
+      throw new Error(input);
+    } });
+    await withBridge(mode, { ...config32, wasmUrl }, async (bridge) => {
+      await assert.rejects(bridge.loadModelFromUrl(model, loadOptions), { message: expected });
+    });
+    assert.deepEqual(lines, [expected, expected, expected, expected]);
+  });
+
+  for (const [format, input, expected = input] of [
+    ['different asset and longer query', 'Fallback: vendor-core.wasm?version=10'],
+    ['different asset with the same query', 'Fallback: vendor-core.wasm?version=1'],
+    ['same path with a different query', 'Fallback: core.wasm?version=10'],
+    ['standalone configured URL with punctuation', 'Fallback: (core.wasm?version=1).', 'Fallback: (https://assets.test/core.wasm).'],
+  ]) {
+    test(`${mode}: exact registered URL boundaries preserve ${format}`, async (t) => {
+      setGlobal(t, 'document', { baseURI: base.replace('/bridge/', '/') });
+      const lines = [];
+      for (const level of ['log', 'warn', 'error']) t.mock.method(console, level, (line) => lines.push(line));
+      withImports(t, { [loader]: ({ print, printErr }) => {
+        print(input);
+        printErr(input);
+        throw new Error(input);
+      } });
+      await withBridge(mode, { ...config32, wasmUrl: 'core.wasm?version=1' }, async (bridge) => {
         await assert.rejects(bridge.loadModelFromUrl(model, loadOptions), { message: expected });
       });
       assert.deepEqual(lines, [expected, expected, expected, expected]);

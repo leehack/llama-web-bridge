@@ -315,7 +315,7 @@ the option.
 
 #### `LlamaWebGpuBridge.supportsCorePreflight`
 
-`true` when the bridge exposes `preflightCore()`. Bridges before v0.1.92 lack
+`true` when the bridge exposes `preflightCore()`. Bridges before v0.1.93 lack
 the flag. In worker mode, the bridge also checks the worker's support before
 dispatching preflight.
 
