@@ -967,8 +967,9 @@ function hasCoreAssetUrlSecrets(url) {
 }
 var HTTP_URL_START = /\bhttps?:\/\//gi;
 var URL_TEXT_DELIMITER = /[\s"'<>`‘’“”]/;
-var URL_PATH_CHARACTER = /[A-Za-z0-9._~%+\/-]/;
+var URL_PATH_CHARACTER = /[\p{L}\p{N}\p{M}._~%+\/-]/u;
 var URL_QUERY_CONTINUATION = /[?&#=]/;
+var URL_SENTENCE_BOUNDARY = /^[.,;:!?]+(?:$|[\s"'`‘’“”)\]}>])/;
 function absoluteUrlEnd(message, start) {
   const delimiter = message.slice(start).search(URL_TEXT_DELIMITER);
   return delimiter === -1 ? message.length : start + delimiter;
@@ -1000,11 +1001,15 @@ function redactAbsoluteUrlToken(token) {
   return queryStart === -1 ? url : url + queryFormatting(token, queryStart);
 }
 function atUrlStart(message, start) {
-  return start === 0 || !URL_PATH_CHARACTER.test(message[start - 1]);
+  if (start === 0) return true;
+  const previous = Array.from(message.slice(Math.max(0, start - 2), start)).at(-1);
+  return !URL_PATH_CHARACTER.test(previous);
 }
 function atUrlEnd(message, end) {
-  const next = message[end];
-  return next === void 0 || !(URL_PATH_CHARACTER.test(next) || URL_QUERY_CONTINUATION.test(next));
+  const codePoint = message.codePointAt(end);
+  if (codePoint === void 0) return true;
+  const next = String.fromCodePoint(codePoint);
+  return !(URL_PATH_CHARACTER.test(next) || URL_QUERY_CONTINUATION.test(next)) || URL_SENTENCE_BOUNDARY.test(message.slice(end));
 }
 function replaceRegisteredUrl(message, url, redacted) {
   return message.replaceAll(url, (match, index) => atUrlStart(message, index) && atUrlEnd(message, index + match.length) ? redacted : match);

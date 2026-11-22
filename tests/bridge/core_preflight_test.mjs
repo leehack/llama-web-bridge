@@ -1124,6 +1124,49 @@ for (const mode of ['direct', 'worker']) {
     assert.deepEqual(lines, [expected, expected, expected, expected]);
   });
 
+  for (const [name, wasmUrl, cases] of [
+    ['sentence punctuation after a registered URL', 'core.wasm?sig=S', [
+      ['Failed to load core.wasm?sig=S.', `Failed to load ${base}core.wasm.`],
+      ['core.wasm?sig=S. Next', `${base}core.wasm. Next`],
+      ['(core.wasm?sig=S.)', `(${base}core.wasm.)`],
+      ['core.wasm?sig=S...', `${base}core.wasm...`],
+      ['"core.wasm?sig=S?!"', `"${base}core.wasm?!"`],
+      ['core.wasm.bak'],
+      ['core.wasm?sig=S.bak'],
+      ['core.wasm?sig=S.wasm2'],
+      ['core.wasm?sig=S..x'],
+    ]],
+    ['Unicode filename boundaries', 'core.wasm?version=1', [
+      ['Loading écore.wasm?version=1'],
+      ['Loading 山core.wasm?version=1'],
+      ['Loading %C3%A9core.wasm?version=1'],
+      ['Loading 𠮷core.wasm?version=1'],
+      ['Loading a\u0301core.wasm?version=1'],
+      ['Loading ٢core.wasm?version=1'],
+      ['Loading core.wasm?version=1山'],
+      ['Loading core.wasm?version=1𠮷'],
+      ['Loading core.wasm?version=1\u0301'],
+      ['Loading core.wasm?version=1٢'],
+    ]],
+  ]) {
+    test(`${mode}: ${name}`, async (t) => {
+      const input = cases.map(([value]) => value).join('\n');
+      const expected = cases.map(([value, redacted = value]) => redacted).join('\n');
+      setGlobal(t, 'document', { baseURI: base });
+      const lines = [];
+      for (const level of ['log', 'warn', 'error']) t.mock.method(console, level, (line) => lines.push(line));
+      withImports(t, { [loader]: ({ print, printErr }) => {
+        print(input);
+        printErr(input);
+        throw new Error(input);
+      } });
+      await withBridge(mode, { ...config32, wasmUrl }, async (bridge) => {
+        await assert.rejects(bridge.loadModelFromUrl(model, loadOptions), { message: expected });
+      });
+      assert.deepEqual(lines, [expected, expected, expected, expected]);
+    });
+  }
+
   for (const asset of ['wasmUrl', 'coreModuleUrl', 'workerUrl']) {
     test(`${mode}: redact a configured ${asset} with an apostrophe in its path`, async (t) => {
       const configured = `HTTPS://Assets.Test/it's/${asset}.js?sig=SECRET`;

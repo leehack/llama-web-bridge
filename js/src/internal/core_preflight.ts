@@ -45,8 +45,9 @@ function hasCoreAssetUrlSecrets(url: string): boolean {
 
 const HTTP_URL_START = /\bhttps?:\/\//gi;
 const URL_TEXT_DELIMITER = /[\s"'<>`‘’“”]/;
-const URL_PATH_CHARACTER = /[A-Za-z0-9._~%+\/-]/;
+const URL_PATH_CHARACTER = /[\p{L}\p{N}\p{M}._~%+\/-]/u;
 const URL_QUERY_CONTINUATION = /[?&#=]/;
+const URL_SENTENCE_BOUNDARY = /^[.,;:!?]+(?:$|[\s"'`‘’“”)\]}>])/;
 
 function absoluteUrlEnd(message: string, start: number): number {
   const delimiter = message.slice(start).search(URL_TEXT_DELIMITER);
@@ -83,12 +84,17 @@ function redactAbsoluteUrlToken(token: string): string {
 }
 
 function atUrlStart(message: string, start: number): boolean {
-  return start === 0 || !URL_PATH_CHARACTER.test(message[start - 1]);
+  if (start === 0) return true;
+  const previous = Array.from(message.slice(Math.max(0, start - 2), start)).at(-1)!;
+  return !URL_PATH_CHARACTER.test(previous);
 }
 
 function atUrlEnd(message: string, end: number): boolean {
-  const next = message[end];
-  return next === undefined || !(URL_PATH_CHARACTER.test(next) || URL_QUERY_CONTINUATION.test(next));
+  const codePoint = message.codePointAt(end);
+  if (codePoint === undefined) return true;
+  const next = String.fromCodePoint(codePoint);
+  return !(URL_PATH_CHARACTER.test(next) || URL_QUERY_CONTINUATION.test(next))
+    || URL_SENTENCE_BOUNDARY.test(message.slice(end));
 }
 
 function replaceRegisteredUrl(message: string, url: string, redacted: string): string {
