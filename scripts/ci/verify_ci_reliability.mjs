@@ -921,6 +921,7 @@ export const RELEASE_CONTRACT_SUITES = Object.freeze([
   'tests/release/contract_test.mjs',
   'tests/release/manifest_test.mjs',
   'tests/release/npm_package_test.mjs',
+  'tests/release/npm_registry_readback_test.mjs',
   'tests/release/npm_release_test.mjs',
   'tests/release/publication_state_test.mjs',
   'tests/release/qualification_attestation_test.mjs',
@@ -1552,13 +1553,15 @@ function checkNpmPublication(workflow, errors) {
   `${label} must isolate npm user and global configuration with distinct paths`);
   includes(label, publish, ['if [[ "${STATUS}" != "404" ]]; then', 'https://registry.npmjs.org/llama-web-bridge/${VERSION}'],
     'refuse to publish an existing or unconfirmed version');
-  includes(label, publish, ['npm publish "./llama-web-bridge-${VERSION}.tgz" --provenance --access public --tag latest --registry https://registry.npmjs.org --ignore-scripts'],
+  const publishStep = workflow.jobSteps(publishJob).find((step) => step.run.includes('npm publish '));
+  const publishCommand = shellCommands(publishStep?.run ?? '').split('\n').find((line) => line.startsWith('npm publish '));
+  includes(label, publishCommand ?? '', ['npm publish "./llama-web-bridge-${VERSION}.tgz" --provenance --access public --tag latest --registry https://registry.npmjs.org --ignore-scripts'],
     'publish the exact tarball with OIDC');
+  require(publishCommand?.endsWith(' --fetch-retries=0'), `${label} must disable npm CLI retries on the publish command`);
   require(occurrences(workflow.runText, 'npm publish ') === 1,
     `${label} must publish only from the OIDC job`);
   includes(label, publish, [
-    '.dist.integrity == $integrity', 'sha256sum --check', '.dist.attestations.provenance.predicateType == $predicate',
-    '.latest == $version', 'gh attestation verify "${RUNNER_TEMP}/registry.tgz"',
+    'SHA512="$(node scripts/release/npm_registry_readback.mjs)"', 'gh attestation verify "${RUNNER_TEMP}/registry.tgz"',
     '--signer-workflow "${BRIDGE_REPO}/.github/workflows/publish_npm.yml"',
     '.subject == [{name: $subject, digest: {sha512: $sha}}]', '.signature.certificate.runInvocationURI == $run',
     '.predicate.runDetails.metadata.invocationId == $run', 'bridge-npm-publication-outcome.json',
@@ -1567,11 +1570,13 @@ function checkNpmPublication(workflow, errors) {
   includes(label, ` ${provenanceCommand} `, [
     ' --source-ref refs/heads/main ', ' --source-digest "${GITHUB_SHA}" ', ' --deny-self-hosted-runners ',
   ], 'bind npm provenance to main, the workflow commit and a GitHub-hosted runner');
-  const publishIndex = workflow.stepIndex(publishJob, (step) => step.run.includes('npm publish '));
   const envIndex = workflow.stepIndex(publishJob, (step) => step.run.includes('validate-environment'));
   const verifyIndex = workflow.stepIndex(publishJob, (step) => step.run.includes('verify-tarball'));
-  const readbackIndex = workflow.stepIndex(publishJob, (step) => step.run.includes('.dist.integrity'));
-  require(verifyIndex > download?.index && envIndex > verifyIndex && publishIndex > envIndex && readbackIndex > publishIndex,
+  const readbackStep = workflow.jobSteps(publishJob).find((step) => step.run.includes('npm_registry_readback.mjs'));
+  require(readbackStep?.env.EXPECTED_INTEGRITY === '${{ steps.tarball.outputs.integrity }}'
+    && workflow.job(publishJob).env?.EXPECTED_TARBALL_SHA256 === '${{ needs.stage-and-verify-package.outputs.tarball_sha256 }}',
+  `${label} must pass both verified digests to the npm registry readback`);
+  require(verifyIndex > download?.index && envIndex > verifyIndex && publishStep?.index > envIndex && readbackStep?.index > publishStep?.index,
     `${label} must verify the artifact and live environment before publishing, then read back the registry`);
 }
 

@@ -704,11 +704,15 @@ forms `vMAJOR.MINOR.PATCH-N`, `bNNNN` and `bNNNN-N`, historical
    publishing access to require two-factor authentication and disallow tokens.
 
 The workflow accepts stable unsuffixed tags with rebuild `0` and rejects
-`v0.0.0` and fixture manifests. It fails if the npm version already exists.
-It verifies the registry tarball, provenance, and `latest` tag after publishing
-and uploads a `bridge-npm-publication-outcome` receipt. If publication succeeds
-and readback fails, check the existing version and its provenance on npm before
-dispatching again.
+`v0.0.0` and fixture manifests. It requires an HTTP 404 for the version before
+running `npm publish` once with npm's fetch retries disabled. After publishing,
+it polls version metadata, dist-tags, and attestations, then polls the tarball
+under the same 30-minute deadline. It backs off from 15 to 60 seconds for 404s,
+transient server failures, and transient network errors. Metadata or digest
+mismatches fail immediately. The workflow verifies the tarball's digests, the
+`latest` tag, and signed provenance before uploading a
+`bridge-npm-publication-outcome` receipt. If publication succeeds and readback
+fails, check the existing version and its provenance on npm.
 
 ## CI change selection and compiler cache
 
