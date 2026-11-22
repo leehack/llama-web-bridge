@@ -41,8 +41,10 @@ LLAMA_CPP_DIR=../llama.cpp OUT_DIR=dist ./scripts/build/build_bridge.sh
 variables the build reads, with their defaults; the docs do not repeat the
 list.
 
-Bridge wrapper source lives under `js/src/`; `npm run build:js` regenerates the
-checked-in browser ESM outputs and declarations under `js/`. `npm run check:js`
+Bridge wrapper source lives under `js/src/`. `npm run build:js` regenerates the
+checked-in minified browser ESM bundles and declarations under `js/` and
+preserves the Vite and webpack ignore comments on the runtime core import.
+`npm run check:js`
 runs the same generator plus TypeScript and syntax checks, so commit any updated
 `js/` outputs after source changes. It ends with `npm test`, which runs every
 `tests/**/*_test.mjs` contract test in parallel through Node's test runner,
@@ -101,6 +103,12 @@ continue to use JS chunks. It also adds
 `llamadart_webgpu_js_model_fs_heap_resident_bytes` diagnostic. Production
 cores also export `llamadart_webgpu_test_fail_next_model_load` for the
 same-core load failure smoke.
+
+Release builds compile `llama`, `llama-common`, `llama-common-base`, `mtmd`,
+`ggml-webgpu`, and the bridge sources with `-Os` and link the core with
+`-Os`. `ggml-cpu` and `ggml-base` keep the Release `-O3` defaults for CPU
+throughput. The bridge keeps ggml-webgpu's upstream exception flags so
+partially initialized WebGPU contexts unwind safely on allocation failure.
 
 For local agent/maintainer validation, prefer external build and cache paths so
 generated files do not dirty the checkout:

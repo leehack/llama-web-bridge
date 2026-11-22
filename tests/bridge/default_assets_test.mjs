@@ -328,13 +328,32 @@ test('runtime URL constructors use string literals with import.meta.url', async 
 
 test('the generated bridge exposes literal assets and the worker has no relative import', async () => {
   const main = await readFile(bundle, 'utf8');
+  const mainSource = ts.createSourceFile('bridge.js', main, ts.ScriptTarget.ESNext);
+  const assetPaths = new Set();
+  function visit(node) {
+    if (ts.isNewExpression(node) && node.expression.getText(mainSource) === 'URL'
+        && node.arguments?.length === 2) {
+      const [path, base] = node.arguments;
+      if (ts.isStringLiteral(path) && base.getText(mainSource) === 'import.meta.url') {
+        assetPaths.add(path.text);
+      }
+    }
+    ts.forEachChild(node, visit);
+  }
+  visit(mainSource);
   for (const suffix of ['', '_mem64', '_st', '_mem64_st']) {
     for (const ext of ['js', 'wasm']) {
-      assert.ok(main.includes(`new URL("./llama_webgpu_core${suffix}.${ext}", import.meta.url)`));
+      const asset = `./llama_webgpu_core${suffix}.${ext}`;
+      assert.ok(assetPaths.has(asset), asset);
     }
   }
-  assert.ok(main.includes('new URL("./llama_webgpu_bridge_worker.js", import.meta.url)'));
-  assert.match(main, /import\(\s*\/\* @vite-ignore \*\/\s*\/\* webpackIgnore: true \*\/\s*moduleUrl\s*\)/);
+  assert.ok(assetPaths.has('./llama_webgpu_bridge_worker.js'));
+  assert.match(main, /import\(\s*\/\* @vite-ignore \*\/\s*\/\* webpackIgnore: true \*\/\s*[$\w]+\s*\)/);
   const worker = await readFile(new URL('./llama_webgpu_bridge_worker.js', bundle), 'utf8');
-  assert.doesNotMatch(worker, /^\s*import\b[^\n]*["']\.{1,2}\//m);
+  const source = ts.createSourceFile('worker.js', worker, ts.ScriptTarget.ESNext);
+  for (const node of source.statements) {
+    if (ts.isImportDeclaration(node) || ts.isExportDeclaration(node)) {
+      assert.doesNotMatch(node.moduleSpecifier?.getText(source) ?? '', /^["']\.{1,2}\//);
+    }
+  }
 });

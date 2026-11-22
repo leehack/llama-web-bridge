@@ -3,21 +3,14 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { LlamaWebGpuBridge as BundledBridge } from '../../js/llama_webgpu_bridge.js';
 import { LlamaWebGpuBridge } from '../../js/src/llama_webgpu_bridge.js';
+import { createStubCore } from './bridge_operation_queue_fixtures.mjs';
 import { readNativeCoreSource } from './native_core_source.mjs';
 
 const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const coreSource = readNativeCoreSource();
-const bridgeSources = {
-  'js/src/runtime.ts': readFileSync(
-    path.join(rootDir, 'js/src/runtime.ts'),
-    'utf8',
-  ),
-  'js/llama_webgpu_bridge.js': readFileSync(
-    path.join(rootDir, 'js/llama_webgpu_bridge.js'),
-    'utf8',
-  ),
-};
+const bridgeSources = ['js/src/runtime.ts', 'js/llama_webgpu_bridge.js'];
 
 const expectedSites = {
   llamadart_webgpu_load_model: 2,
@@ -182,7 +175,8 @@ for (const [name, expectedCount] of Object.entries(expectedSites)) {
   );
   const leadingParameters = nativeTypes.slice(0, leadingCount);
 
-  for (const [sourcePath, source] of Object.entries(bridgeSources)) {
+  for (const sourcePath of bridgeSources) {
+    const source = readFileSync(path.join(rootDir, sourcePath), 'utf8');
     const sites = ccallSites(source, name);
     assert.equal(sites.length, expectedCount, `${sourcePath}: ${name} ccall site count`);
     for (const [index, site] of sites.entries()) {
@@ -197,19 +191,70 @@ for (const [name, expectedCount] of Object.entries(expectedSites)) {
         nativeTypes.map(({ type }) => type),
         `${label} argument types do not match the native signature`,
       );
-      assert.deepEqual(
-        leadingValues.map((value, position) => {
+      if (sourcePath === 'js/src/runtime.ts') {
+        for (const [position, value] of leadingValues.entries()) {
           const parameter = leadingParameters[position].name;
-          const allowed = leadingValueTokens[parameter];
-          assert.ok(allowed, `${label}: no expected value token for native parameter ${parameter}`);
-          return allowed.some((token) => value.includes(token))
-            ? parameter
-            : `${parameter}=${value}`;
-        }),
-        leadingParameters.map(({ name: parameter }) => parameter),
-        `${label} leading values do not match the native parameter order`,
-      );
+          assert.ok(leadingValueTokens[parameter]?.includes(value), `${label}: ${parameter}=${value}`);
+        }
+      }
     }
+  }
+}
+
+for (const remote of [false, true]) {
+  const core = createStubCore();
+  const calls = [];
+  const ccall = core.ccall.bind(core);
+  core.ccall = (name, result, types, args, ...rest) => {
+    if (name === 'llamadart_webgpu_supports_pthreads') return 1;
+    if (name === 'llamadart_webgpu_pthread_pool_size') return 4;
+    if (name === 'llamadart_webgpu_probe') return 1;
+    if (name === 'llamadart_webgpu_backends_json') return '["WebGPU","CPU"]';
+    if (Object.hasOwn(expectedSites, name)) {
+      calls.push({ name, types, args });
+      return 0;
+    }
+    return ccall(name, result, types, args, ...rest);
+  };
+  const bundledRuntime = BundledBridge.prototype._createRuntime.call({
+    _config: { coreModuleFactory: async () => core },
+  });
+  const url = 'https://models.test/model.gguf';
+  const resolvedUrl = 'https://models.test/redirected.gguf';
+  const name = remote ? 'llamadart_webgpu_load_model_from_url' : 'llamadart_webgpu_load_model';
+  const localPath = '/models/model.gguf';
+  const chunkBytes = 1048576;
+  bundledRuntime._isSafari = true;
+  bundledRuntime._canUseRemoteFetchBackend = () => remote;
+  bundledRuntime._resolveRemoteFetchUrl = async () => ({ resolvedUrl, sizeBytes: 3 });
+  bundledRuntime._getCachedModelResponse = async () => new Response(new Uint8Array([1, 2, 3]));
+  bundledRuntime._resolveNativeLoadOptions = () => {
+    for (const { field, input } of optionParameters) bundledRuntime[field] = input;
+  };
+  bundledRuntime.createCompletion = async () => {
+    if (calls.length === 1) throw new Error('Test Safari GPU retry');
+    return 'A valid completion.';
+  };
+  try {
+    await bundledRuntime.loadModelFromUrl(url, {
+      nCtx: 271, nThreads: 2, nThreadsBatch: 3, nBatch: 96, nUbatch: 64, nGpuLayers: 7,
+      safariMaxGpuLayers: 7,
+      forceRemoteFetchBackend: remote, remoteFetchChunkBytes: chunkBytes,
+      modelBytesHint: 3, useCache: false, jsBackedModelStaging: false,
+    });
+    assert.equal(calls.length, 2, `${name}: initial and Safari retry call count`);
+    for (const [index, call] of calls.entries()) {
+      const layers = index === 0 ? 7 : 1;
+      assert.equal(call.name, name);
+      assert.deepEqual(call.types, nativeParameters(name).map(({ type }) => type));
+      assert.deepEqual(call.args, [
+        remote ? (index === 0 ? resolvedUrl : url) : localPath, 271, 2, 3, 96, 64, layers,
+        ...(remote ? [chunkBytes] : []),
+        ...optionParameters.map(({ expected }) => expected),
+      ], `${name}: bundled native argument order at ${layers} GPU layers`);
+    }
+  } finally {
+    await bundledRuntime.dispose();
   }
 }
 

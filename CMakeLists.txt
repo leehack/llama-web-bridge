@@ -217,6 +217,11 @@ target_include_directories(llama_webgpu_core PRIVATE
 
 target_link_libraries(llama_webgpu_core PRIVATE llama llama-common mtmd)
 
+# Keep the Release optimization defaults on ggml-cpu and ggml-base for CPU throughput.
+foreach(target IN ITEMS llama mtmd llama-common llama-common-base ggml-webgpu llama_webgpu_core)
+    target_compile_options(${target} PRIVATE "$<$<CONFIG:Release>:-Os>")
+endforeach()
+
 set(LLAMADART_WEBGPU_LINK_OPTIONS
     "-sWASMFS=1"
     "-sASYNCIFY=1"
@@ -278,7 +283,8 @@ else()
     )
 endif()
 
-target_link_options(llama_webgpu_core PRIVATE ${LLAMADART_WEBGPU_LINK_OPTIONS})
+target_link_options(llama_webgpu_core PRIVATE "$<$<CONFIG:Release>:-Os>"
+    ${LLAMADART_WEBGPU_LINK_OPTIONS})
 
 set(LLAMADART_WEBGPU_CORE_OUTPUT_SUFFIX "" CACHE STRING "Optional suffix for core output name")
 set(LLAMADART_WEBGPU_CORE_OUTPUT_NAME "llama_webgpu_core")
