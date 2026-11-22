@@ -129,8 +129,9 @@ jobs:
         id: native-inputs
         run: |
           set -euo pipefail
-          fingerprint="$(git ls-tree -r -z HEAD -- src CMakeLists.txt cmake \
-            scripts/build/build_bridge.sh scripts/build/patch_wasm64_runtime.mjs \
+          fingerprint="$(git ls-tree -r -z HEAD -- src CMakeLists.txt cmake scripts/build \
+            scripts/release/cli.mjs scripts/release/errors.mjs scripts/release/json.mjs \
+            scripts/release/python_compat.mjs scripts/release/unicode15.mjs \
             .github/workflows/ci.yml | sha256sum)"
           empty_fingerprint="$(sha256sum </dev/null)"
           if [[ "$fingerprint" == "$empty_fingerprint" || ! "${fingerprint%% *}" =~ ^[0-9a-f]{64}$ ]]; then

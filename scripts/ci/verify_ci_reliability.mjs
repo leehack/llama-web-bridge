@@ -1069,15 +1069,16 @@ function checkCiRunsContracts({ ci, candidate, qualification, publish }, testFil
   const checkout = buildSteps.find((step) => step.uses === 'actions/checkout@v4');
   const nativeInputs = buildSteps.find((step) => step.id === 'native-inputs');
   const fingerprintCommands = shellCommands(nativeInputs?.run ?? '').split('\n').map((line) => line.trim());
-  const fingerprintCommand = 'fingerprint="$(git ls-tree -r -z HEAD -- src CMakeLists.txt cmake '
-    + 'scripts/build/build_bridge.sh scripts/build/patch_wasm64_runtime.mjs .github/workflows/ci.yml | sha256sum)"';
+  const fingerprintCommand = 'fingerprint="$(git ls-tree -r -z HEAD -- src CMakeLists.txt cmake scripts/build '
+    + 'scripts/release/cli.mjs scripts/release/errors.mjs scripts/release/json.mjs '
+    + 'scripts/release/python_compat.mjs scripts/release/unicode15.mjs .github/workflows/ci.yml | sha256sum)"';
   check.require(
     checkout !== undefined && nativeInputs !== undefined && coreCache !== undefined
       && checkout.index < nativeInputs.index && nativeInputs.index < coreCache.index
       && nativeInputs.raw.if === undefined && nativeInputs.raw['continue-on-error'] === undefined
       && fingerprintCommands.includes('set -euo pipefail') && fingerprintCommands.includes(fingerprintCommand)
       && fingerprintCommands.includes('echo "sha256=${fingerprint%% *}" >> "$GITHUB_OUTPUT"'),
-    `${ci.path} must fingerprint the checked-out native input tree, including the workflow, before restoring the core cache`,
+    `${ci.path} must fingerprint the checked-out native input tree, including scripts/build, its local imports, and the workflow, before restoring the core cache`,
   );
   const coreKey = 'webgpu-core-v1-${{ runner.os }}-${{ runner.arch }}-${{ matrix.variant }}'
     + '-${{ env.EMSCRIPTEN_VERSION }}-${{ steps.compiler-cache.outputs.upstream }}-'

@@ -139,7 +139,7 @@ for (const [name, mutate, message] of [
     const build = jobs['build-core'];
     build.steps = build.steps.filter((step) => step.id !== 'native-inputs');
   }, 'must fingerprint the checked-out native input tree'],
-  ...['src', '.github/workflows/ci.yml'].map((input) => [`missing ${input} in the native input tree scope`, (jobs) => {
+  ...['src', 'scripts/build', 'scripts/release/unicode15.mjs', '.github/workflows/ci.yml'].map((input) => [`missing ${input} in the native input tree scope`, (jobs) => {
     const step = jobs['build-core'].steps.find((step) => step.id === 'native-inputs');
     step.run = step.run.replace(`${input} `, '');
   }, 'must fingerprint the checked-out native input tree']),

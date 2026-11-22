@@ -2,12 +2,13 @@
 // CI workflow shape it relies on.
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
 import { fileURLToPath } from 'node:url';
 
+import { build as traceBuildModules } from 'esbuild';
 import { parse as parseYaml } from 'yaml';
 
 import { changedPaths, nativeRequired, validateResults } from '../../scripts/ci/ci_scope.mjs';
@@ -159,6 +160,20 @@ const nativeJobs = ['build-core', ...smokeJobs];
   const { steps } = workflow.jobs['build-core'];
   const step = steps.find((step) => step.id === 'native-inputs');
   assert.ok(step, 'CI must fingerprint its checked-out native inputs');
+  const scope = step.run.match(/git ls-tree -r -z HEAD -- ([^|]+)\| sha256sum/)?.[1];
+  assert.ok(scope, 'CI must hash Git tree records');
+  const inputs = scope.replaceAll('\\\n', ' ').trim().split(/\s+/);
+  const entryPoints = readdirSync(path.join(rootDir, 'scripts/build'), { recursive: true, withFileTypes: true })
+    .filter((entry) => entry.isFile() && /\.[cm]?[jt]s$/.test(entry.name))
+    .map((entry) => path.join(entry.parentPath, entry.name));
+  const { metafile } = await traceBuildModules({
+    absWorkingDir: rootDir, entryPoints, bundle: true, packages: 'external', platform: 'node',
+    format: 'esm', outdir: 'out', write: false, metafile: true,
+  });
+  for (const module of Object.keys(metafile.inputs)) {
+    assert.ok(inputs.some((input) => input === module || module.startsWith(`${input}/`)),
+      `build module must be in the native input tree scope: ${module}`);
+  }
   const temp = mkdtempSync(path.join(tmpdir(), 'ci-native-inputs-'));
   const output = path.join(temp, 'output');
   const git = (...args) => execFileSync('git', ['-C', temp, '-c', 'commit.gpgsign=false', ...args], { stdio: ['ignore', 'pipe', 'ignore'] });
@@ -184,9 +199,11 @@ const nativeJobs = ['build-core', ...smokeJobs];
     mkdirSync(path.join(temp, 'scripts/build'), { recursive: true });
     const header = 'src/llama_webgpu_grammar.h';
     const buildScript = 'scripts/build/build_bridge.sh';
+    const compilerVerifier = 'scripts/build/verify_emscripten_version.mjs';
     writeFileSync(path.join(temp, header), '#pragma once\n');
     writeFileSync(path.join(temp, buildScript), '#!/usr/bin/env bash\n');
-    git('add', header, buildScript);
+    writeFileSync(path.join(temp, compilerVerifier), 'export const maxBuffer = Infinity;\n');
+    git('add', header, buildScript, compilerVerifier);
     git('update-index', '--chmod=+x', buildScript);
     git('commit', '-m', 'native inputs');
     const base = git('rev-parse', 'HEAD').toString().trim();
@@ -194,6 +211,11 @@ const nativeJobs = ['build-core', ...smokeJobs];
     git('mv', header, 'src/llama_webgpu_grammar.hpp');
     git('commit', '-m', 'rename header');
     assert.notEqual(run(), fingerprint, 'a same-byte source rename must change the core fingerprint');
+    git('checkout', '--detach', base);
+    writeFileSync(path.join(temp, compilerVerifier), 'export const maxBuffer = 256;\n');
+    git('add', compilerVerifier);
+    git('commit', '-m', 'change compiler verifier');
+    assert.notEqual(run(), fingerprint, 'changing the Emscripten verifier must change the core fingerprint');
     git('checkout', '--detach', base);
     git('update-index', '--chmod=-x', buildScript);
     git('commit', '-m', 'remove executable bit');
