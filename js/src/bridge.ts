@@ -2468,6 +2468,9 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
           );
           return '';
         }
+        if (this._isNonRetryableLoadError(error)) {
+          throw error;
+        }
         if (isCoreRetiredError(error)) {
           return this._rerunOnCpuAfterCoreAbort(
             error,
@@ -2475,9 +2478,6 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
           );
         }
 
-        if (this._isNonRetryableLoadError(error)) {
-          throw error;
-        }
         if (this._isCpuModelMode()) {
           this._emitBridgeWarn(
             `llamadart: CPU multimodal worker request failed (${reason}); skipping main-thread fallback.`,

@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { createModelTransferLengthError } from '../../js/src/internal/download.ts';
+import { REQUIRED_JS_MODEL_STAGING_EXPORTS } from '../../js/src/internal/model_staging.ts';
 import { LlamaWebGpuBridge, ModelStagingError } from '../../js/src/llama_webgpu_bridge.js';
 import { LlamaWebGpuBridgeRuntime } from '../../js/src/runtime.ts';
 import { installBridgeWorkerHost } from '../../js/src/worker_host.ts';
@@ -22,6 +23,52 @@ const stagingErrors = [
 ].map((code) => new ModelStagingError(code, 'Model staging failed.'));
 const mountError = stagingErrors.find(({ code }) => code === 'MODEL_STAGING_MOUNT_FAILED');
 const timeout = new Error('Worker request timed out');
+
+async function withConnectedWorkers(t, staging, run, { coreModuleFactory, onReply } = {}) {
+  return withStubWorkerEnvironment(async ({ workers }) => {
+    const bridge = createRealWorkerBridge({ jsBackedModelStaging: staging, logLevel: 0 });
+    const oldSelf = globalThis.self;
+    const connectHost = async (worker) => {
+      const host = {
+        postMessage(reply) {
+          onReply?.(reply);
+          worker.onmessage({ data: structuredClone(reply) });
+        },
+      };
+      globalThis.self = host;
+      installBridgeWorkerHost();
+      const receive = (request) => {
+        globalThis.self = host;
+        const data = structuredClone(request);
+        if (data.type === 'init' && coreModuleFactory) {
+          data.config.coreModuleFactory = coreModuleFactory;
+        }
+        return host.onmessage({ data });
+      };
+      worker.postMessage = (request) => {
+        worker.posted.push(request);
+        return receive(request);
+      };
+      await receive(worker.posted[0]);
+    };
+    const replace = bridge._replaceWorkerProxyForMultimodalCpuMode.bind(bridge);
+    t.mock.method(bridge, '_replaceWorkerProxyForMultimodalCpuMode', async () => {
+      await replace();
+      await connectHost(workers.at(-1));
+    });
+    try {
+      await connectHost(workers[0]);
+      return await run(bridge, workers);
+    } finally {
+      try {
+        await bridge.dispose();
+      } finally {
+        if (oldSelf === undefined) delete globalThis.self;
+        else globalThis.self = oldSelf;
+      }
+    }
+  });
+}
 
 async function runWorkerCase(t, nGpuLayers, {
   site = 'setup',
@@ -54,30 +101,8 @@ async function runWorkerCase(t, nGpuLayers, {
     return site === 'empty response' && completionCalls === 1 ? '' : 'generated';
   });
 
-  return withStubWorkerEnvironment(async ({ workers }) => {
-    bridge = createRealWorkerBridge({ jsBackedModelStaging: staging, logLevel: 0 });
-    const oldSelf = globalThis.self;
-    const connectHost = async (worker) => {
-      const host = {
-        postMessage: (reply) => worker.onmessage({ data: structuredClone(reply) }),
-      };
-      globalThis.self = host;
-      installBridgeWorkerHost();
-      const receive = (request) => {
-        globalThis.self = host;
-        return host.onmessage({ data: structuredClone(request) });
-      };
-      worker.postMessage = (request) => {
-        worker.posted.push(request);
-        return receive(request);
-      };
-      await receive(worker.posted[0]);
-    };
-    const replace = bridge._replaceWorkerProxyForMultimodalCpuMode.bind(bridge);
-    t.mock.method(bridge, '_replaceWorkerProxyForMultimodalCpuMode', async () => {
-      await replace();
-      await connectHost(workers.at(-1));
-    });
+  return withConnectedWorkers(t, staging, async (activeBridge, workers) => {
+    bridge = activeBridge;
     const workerErrors = [];
     const callWorker = bridge._callWorker.bind(bridge);
     t.mock.method(bridge, '_callWorker', async (...args) => {
@@ -88,47 +113,37 @@ async function runWorkerCase(t, nGpuLayers, {
         throw error;
       }
     });
-    try {
-      await connectHost(workers[0]);
-      await bridge.loadModelFromUrl(MODEL, { nGpuLayers });
-      await bridge.loadMultimodalProjector(PROJECTOR);
-      assert.equal(bridge._isCpuModelMode(), nGpuLayers === 0);
-      if (site === 'setup') await bridge._replaceWorkerProxyForMultimodalCpuMode();
-      if (site === 'request restore') bridge._workerModelMissing = true;
-      const workerCalls = (method) => workers.flatMap((worker) => worker.posted)
-        .filter((request) => request.method === method).length;
-      const workersBefore = workers.length;
-      const workerRestoresBefore = workerCalls(restoreMethod);
-      active = true;
+    await bridge.loadModelFromUrl(MODEL, { nGpuLayers });
+    await bridge.loadMultimodalProjector(PROJECTOR);
+    assert.equal(bridge._isCpuModelMode(), nGpuLayers === 0);
+    if (site === 'setup') await bridge._replaceWorkerProxyForMultimodalCpuMode();
+    if (site === 'request restore') bridge._workerModelMissing = true;
+    const workerCalls = (method) => workers.flatMap((worker) => worker.posted)
+      .filter((request) => request.method === method).length;
+    const workersBefore = workers.length;
+    const workerRestoresBefore = workerCalls(restoreMethod);
+    active = true;
 
-      const outcome = await bridge.createCompletion('Describe the image.', {
-        parts,
-        warmup,
-        onUsage: () => { usageCalls += 1; },
-      }).then(
-        (value) => ({ value }),
-        (error) => ({ error }),
-      );
-      return {
-        ...outcome,
-        workerErrors,
-        directRuntime: bridge._runtime !== null,
-        restarts: workers.length - workersBefore,
-        restoreAttempts,
-        workerRestores: workerCalls(restoreMethod) - workerRestoresBefore,
-        completionCalls,
-        workerCompletions: workerCalls('createCompletion'),
-        workerKept: bridge._workerProxy?._worker === workers.at(-1) && workers.at(-1).terminated === 0,
-        usageCalls,
-      };
-    } finally {
-      try {
-        await bridge.dispose();
-      } finally {
-        if (oldSelf === undefined) delete globalThis.self;
-        else globalThis.self = oldSelf;
-      }
-    }
+    const outcome = await bridge.createCompletion('Describe the image.', {
+      parts,
+      warmup,
+      onUsage: () => { usageCalls += 1; },
+    }).then(
+      (value) => ({ value }),
+      (error) => ({ error }),
+    );
+    return {
+      ...outcome,
+      workerErrors,
+      directRuntime: bridge._runtime !== null,
+      restarts: workers.length - workersBefore,
+      restoreAttempts,
+      workerRestores: workerCalls(restoreMethod) - workerRestoresBefore,
+      completionCalls,
+      workerCompletions: workerCalls('createCompletion'),
+      workerKept: bridge._workerProxy?._worker === workers.at(-1) && workers.at(-1).terminated === 0,
+      usageCalls,
+    };
   });
 }
 
@@ -324,4 +339,114 @@ for (const error of [transfer, ...stagingErrors, timeout]) {
       }
     });
   }
+}
+
+async function runCoreRetirementCase(t, nGpuLayers, { truncateProjector }) {
+  const runtime = LlamaWebGpuBridgeRuntime.prototype;
+  const layerHistory = [];
+  const wire = [];
+  let projectorGets = 0;
+  let completionCalls = 0;
+  let nativeTraps = 0;
+
+  t.mock.method(runtime, 'loadModelFromUrl', async function (_url, options) {
+    await this._ensureCore();
+    this._modelBytes = 1;
+    layerHistory.push(options.nGpuLayers);
+    return 1;
+  });
+  t.mock.method(runtime, 'createCompletion', async function () {
+    if (++completionCalls === 1) {
+      if (truncateProjector) return '';
+      this._core.ccall('llamadart_webgpu_begin_generation', 'number', [], []);
+    }
+    return 'generated';
+  });
+
+  t.mock.method(globalThis, 'fetch', async (url) => {
+    assert.equal(String(url), PROJECTOR);
+    const truncated = ++projectorGets === 2 && truncateProjector;
+    return new Response(new Uint8Array(truncated ? 3 : 4), {
+      // The stream length check applies to large identity-encoded responses.
+      headers: { 'content-length': truncated ? '1073741824' : '4', 'content-encoding': 'identity' },
+    });
+  });
+
+  const coreModuleFactory = async () => ({
+    ...Object.fromEntries(REQUIRED_JS_MODEL_STAGING_EXPORTS.map((name) => [name, () => 0])),
+    FS: {
+      lstat() { throw Object.assign(new Error('No such directory'), { errno: 44 }); },
+      unlink() {},
+    },
+    llamadartJsModelFsWriteDirect: (_handle, chunk) => chunk.byteLength,
+    ccall(name, returnType) {
+      if (name === 'llamadart_webgpu_js_model_fs_api_version') return 3;
+      if (name === 'llamadart_webgpu_js_model_fs_mount_id' || name === 'llamadart_webgpu_js_model_fs_open_direct') return 1;
+      if (
+        (name === 'llamadart_webgpu_unmount_js_model_fs' && truncateProjector && projectorGets === 2)
+        || name === 'llamadart_webgpu_begin_generation'
+      ) {
+        nativeTraps += 1;
+        throw new WebAssembly.RuntimeError('memory access out of bounds');
+      }
+      return returnType === 'string' ? '{}' : 0;
+    },
+  });
+  const onReply = ({ type, errorCode }) => {
+    if (type === 'core-retired' || type === 'error') wire.push([type, errorCode]);
+  };
+
+  return withConnectedWorkers(t, true, async (bridge, workers) => {
+    const chooseCpuRerun = t.mock.method(bridge, '_rerunOnCpuAfterCoreAbort');
+    await bridge.loadModelFromUrl(MODEL, { nGpuLayers });
+    await bridge.loadMultimodalProjector(PROJECTOR);
+    const outcome = await bridge.createCompletion('Describe the image.', { parts }).then(
+      (value) => ({ value }),
+      ({ name, code, message }) => ({ error: { name, code, message } }),
+    );
+    assert.equal(nativeTraps, 1);
+    assert.equal(bridge._coreRetirements, 1);
+    assert.equal(bridge._runtime, null);
+    assert.equal(bridge._workerProxy._worker, workers.at(-1));
+    assert.deepEqual(workers.map((worker) => worker.terminated), truncateProjector ? [1, 1, 0] : [1, 0]);
+    return {
+      ...outcome,
+      wire,
+      projectorGets,
+      completionCalls,
+      layerHistory,
+      rememberedGpuLayers: bridge._loadedModelOptions.nGpuLayers,
+      cpuRerunDecisions: chooseCpuRerun.mock.callCount(),
+    };
+  }, { coreModuleFactory, onReply });
+}
+
+for (const [nGpuLayers, mode] of [[0, 'CPU'], [1, 'non-CPU']]) {
+  test(`core retirement: ${mode} surfaces a typed projector transfer error after an empty response`, async (t) => {
+    assert.deepEqual(await runCoreRetirementCase(t, nGpuLayers, { truncateProjector: true }), {
+      error: { name: transfer.name, code: transfer.code, message: transfer.message },
+      wire: [['core-retired', undefined], ['error', transfer.code]],
+      projectorGets: 2,
+      completionCalls: 1,
+      layerHistory: [nGpuLayers, nGpuLayers],
+      rememberedGpuLayers: nGpuLayers,
+      cpuRerunDecisions: 0,
+    });
+  });
+
+  test(`core retirement: ${mode} preserves generic generation trap recovery`, async (t) => {
+    const cpu = nGpuLayers === 0;
+    const outcome = cpu
+      ? { error: { name: 'Error', code: undefined, message: 'memory access out of bounds' } }
+      : { value: 'generated' };
+    assert.deepEqual(await runCoreRetirementCase(t, nGpuLayers, { truncateProjector: false }), {
+      ...outcome,
+      wire: [['core-retired', undefined], ['error', undefined]],
+      projectorGets: cpu ? 1 : 2,
+      completionCalls: cpu ? 1 : 2,
+      layerHistory: cpu ? [0] : [nGpuLayers, 0],
+      rememberedGpuLayers: 0,
+      cpuRerunDecisions: 1,
+    });
+  });
 }
