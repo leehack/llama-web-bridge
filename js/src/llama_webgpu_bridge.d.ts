@@ -362,6 +362,11 @@ export class ModelUnloadedError extends Error {
   constructor(message?: string);
 }
 
+export interface ModelTransferLengthError extends Error {
+  readonly name: 'ModelTransferLengthError';
+  readonly code: 'MODEL_TRANSFER_LENGTH_ERROR';
+}
+
 export type ModelStagingErrorCode =
   | 'MODEL_STAGING_ALLOCATION_FAILED'
   | 'MODEL_TENSOR_SIZE_LIMIT_EXCEEDED'
@@ -556,6 +561,7 @@ export class LlamaWebGpuBridge {
 
   constructor(config?: LlamaWebGpuBridgeConfig);
 
+  /** Can reject with `ModelTransferLengthError` if transfer length validation fails. */
   loadModelFromUrl(url: string | string[], options?: LoadModelOptions): Promise<unknown>;
   prefetchModelToCache(url: string | string[], options?: LoadModelOptions): Promise<unknown>;
   evictModelFromCache(url: string | string[], options?: Record<string, unknown>): Promise<unknown>;
@@ -591,6 +597,7 @@ export class LlamaWebGpuBridge {
   embedBatch(inputs: EmbedInput[], options?: EmbedOptions): Promise<number[][]>;
   scoreNextToken(prompt: string, options?: NextTokenScoreOptions): Promise<NextTokenScores>;
 
+  /** Can reject with `ModelTransferLengthError` if transfer length validation fails. */
   loadMultimodalProjector(url: string, options?: MultimodalProjectorLoadOptions): Promise<unknown>;
   unloadMultimodalProjector(): Promise<unknown>;
   supportsVision(): boolean;

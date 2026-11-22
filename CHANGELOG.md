@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Worker projector loads no longer retry `ModelTransferLengthError` or `ModelStagingError`. They reject with the original typed error.
+- `ModelTransferLengthError` now carries `code: 'MODEL_TRANSFER_LENGTH_ERROR'`.
+
 - Add `LlamaWebGpuBridge.supportsJsBackedModelStaging`. Explicit JS-backed model and projector loads reject with `MODEL_STAGING_UNSUPPORTED` when the worker lacks the staging capability flag.
 
 - Give npm registry metadata and tarball readback a shared 30-minute retry window after publishing. Fail immediately on digest mismatches and disable retries on the publish request. (#319)
