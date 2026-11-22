@@ -51,8 +51,10 @@ test('the production build compiles the corrected copy and keys its cache on the
   const ci = readFileSync(path.join(root, '.github/workflows/ci.yml'), 'utf8');
   const steps = parseYaml(ci).jobs['build-core'].steps;
   const core = steps.find((step) => step.with?.key?.startsWith('webgpu-core-v1-'))?.with;
+  const fingerprint = steps.find((step) => step.id === 'native-inputs')?.run;
   const compiler = steps.find((step) => step.with?.key?.startsWith('webgpu-ccache-v3-'))?.with;
-  assert.match(core?.key ?? '', /hashFiles\([^)]*'cmake\/\*\*'/, 'core cache must cover the CMake module');
+  assert.match(core?.key ?? '', /steps\.native-inputs\.outputs\.sha256/, 'core cache must use the tree fingerprint');
+  assert.match(fingerprint ?? '', /git ls-tree -r -z HEAD -- src CMakeLists\.txt cmake\b/, 'core cache must cover the CMake module');
   assert.match(compiler?.key ?? '', /hashFiles\([^)]*'cmake\/(?:\*\.cmake|\*\*)'/, 'compiler cache must cover the CMake module');
   assert.equal(core['restore-keys'], undefined);
   assert.equal(compiler['restore-keys']?.trim(), [

@@ -1064,14 +1064,27 @@ function checkCiRunsContracts({ ci, candidate, qualification, publish }, testFil
     && (step.with.path === corePath || step.with.key === coreSaveKey
       || String(step.with.key ?? '').startsWith('webgpu-core-')));
   const coreCache = coreCacheSteps.find((step) => step.job === 'build-core' && step.id === 'core-cache');
+  const buildSteps = ci.jobSteps('build-core');
+  const checkout = buildSteps.find((step) => step.uses === 'actions/checkout@v4');
+  const nativeInputs = buildSteps.find((step) => step.id === 'native-inputs');
+  const fingerprintCommands = shellCommands(nativeInputs?.run ?? '').split('\n').map((line) => line.trim());
+  const fingerprintCommand = 'fingerprint="$(git ls-tree -r -z HEAD -- src CMakeLists.txt cmake '
+    + 'scripts/build/build_bridge.sh scripts/build/patch_wasm64_runtime.mjs .github/workflows/ci.yml | sha256sum)"';
+  check.require(
+    checkout !== undefined && nativeInputs !== undefined && coreCache !== undefined
+      && checkout.index < nativeInputs.index && nativeInputs.index < coreCache.index
+      && nativeInputs.raw.if === undefined && nativeInputs.raw['continue-on-error'] === undefined
+      && fingerprintCommands.includes('set -euo pipefail') && fingerprintCommands.includes(fingerprintCommand)
+      && fingerprintCommands.includes('echo "sha256=${fingerprint%% *}" >> "$GITHUB_OUTPUT"'),
+    `${ci.path} must fingerprint the checked-out native input tree, including the workflow, before restoring the core cache`,
+  );
   const coreKey = 'webgpu-core-v1-${{ runner.os }}-${{ runner.arch }}-${{ matrix.variant }}'
     + '-${{ env.EMSCRIPTEN_VERSION }}-${{ steps.compiler-cache.outputs.upstream }}-'
-    + "${{ hashFiles('src/**', 'CMakeLists.txt', 'cmake/**', 'scripts/build/build_bridge.sh', "
-    + "'scripts/build/patch_wasm64_runtime.mjs', '.github/workflows/ci.yml') }}";
+    + '${{ steps.native-inputs.outputs.sha256 }}';
   check.require(
     coreCache?.uses === 'actions/cache/restore@v4' && coreCache.with.key === coreKey
       && coreCache.with.path === corePath && !has(coreCache.with, 'restore-keys'),
-    `${ci.path} must restore the exact-key core cache with all native inputs, the workflow, and no restore-keys`,
+    `${ci.path} must restore the exact-key core cache using the native input tree fingerprint and no restore-keys`,
   );
   const coreSave = coreCacheSteps.find((step) => step.uses === 'actions/cache/save@v4');
   const coreBuild = ci.step('build-core', 'Build bridge artifacts');

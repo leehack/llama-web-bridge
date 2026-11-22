@@ -135,13 +135,17 @@ const CANDIDATE_PATH = '.github/workflows/bridge_candidate.yml';
 
 for (const [name, mutate, message] of [
   ['core cache restore keys', (jobs) => { jobs['build-core'].steps.find((step) => step.id === 'core-cache').with['restore-keys'] = 'webgpu-core-v1-'; }, 'exact-key core cache'],
-  ['missing core cache source hash', (jobs) => {
+  ['missing core cache fingerprint step', (jobs) => {
+    const build = jobs['build-core'];
+    build.steps = build.steps.filter((step) => step.id !== 'native-inputs');
+  }, 'must fingerprint the checked-out native input tree'],
+  ...['src', '.github/workflows/ci.yml'].map((input) => [`missing ${input} in the native input tree scope`, (jobs) => {
+    const step = jobs['build-core'].steps.find((step) => step.id === 'native-inputs');
+    step.run = step.run.replace(`${input} `, '');
+  }, 'must fingerprint the checked-out native input tree']),
+  ['core cache key without its tree fingerprint', (jobs) => {
     const cache = jobs['build-core'].steps.find((step) => step.id === 'core-cache').with;
-    cache.key = cache.key.replace("'src/**', ", '');
-  }, 'exact-key core cache'],
-  ['missing core cache workflow hash', (jobs) => {
-    const cache = jobs['build-core'].steps.find((step) => step.id === 'core-cache').with;
-    cache.key = cache.key.replace(", '.github/workflows/ci.yml'", '');
+    cache.key = cache.key.replace('steps.native-inputs.outputs.sha256', "hashFiles('src/**')");
   }, 'exact-key core cache'],
   ['combined core cache action', (jobs) => {
     jobs['build-core'].steps.find((step) => step.id === 'core-cache').uses = 'actions/cache@v4';

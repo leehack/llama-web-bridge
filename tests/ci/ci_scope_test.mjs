@@ -13,6 +13,7 @@ import { parse as parseYaml } from 'yaml';
 import { changedPaths, nativeRequired, validateResults } from '../../scripts/ci/ci_scope.mjs';
 
 const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
+const workflow = parseYaml(readFileSync(path.join(rootDir, '.github/workflows/ci.yml'), 'utf8'));
 const smokeJobs = ['smoke-core', 'smoke-resume', 'smoke-multimodal', 'smoke-grammar-qwen'];
 const nativeJobs = ['build-core', ...smokeJobs];
 
@@ -154,10 +155,57 @@ const nativeJobs = ['build-core', ...smokeJobs];
   }
 }
 
+{
+  const { steps } = workflow.jobs['build-core'];
+  const step = steps.find((step) => step.id === 'native-inputs');
+  assert.ok(step, 'CI must fingerprint its checked-out native inputs');
+  const temp = mkdtempSync(path.join(tmpdir(), 'ci-native-inputs-'));
+  const output = path.join(temp, 'output');
+  const git = (...args) => execFileSync('git', ['-C', temp, '-c', 'commit.gpgsign=false', ...args], { stdio: ['ignore', 'pipe', 'ignore'] });
+  const run = () => {
+    writeFileSync(output, '');
+    execFileSync('bash', ['-c', `command -v sha256sum >/dev/null || sha256sum() { shasum -a 256; }\n${step.run}`], {
+      cwd: temp, env: { ...process.env, GITHUB_OUTPUT: output }, stdio: 'pipe',
+    });
+    const result = readFileSync(output, 'utf8');
+    assert.match(result, /^sha256=[0-9a-f]{64}\n$/);
+    return result;
+  };
+  try {
+    git('init');
+    git('config', 'user.name', 'Fixture');
+    git('config', 'user.email', 'fixture@example.test');
+    assert.throws(run);
+    assert.equal(readFileSync(output, 'utf8'), '');
+    git('commit', '--allow-empty', '-m', 'empty');
+    assert.throws(run, (error) => /native input tree fingerprint is missing or invalid/.test(error.stderr?.toString()));
+    assert.equal(readFileSync(output, 'utf8'), '');
+    mkdirSync(path.join(temp, 'src'));
+    mkdirSync(path.join(temp, 'scripts/build'), { recursive: true });
+    const header = 'src/llama_webgpu_grammar.h';
+    const buildScript = 'scripts/build/build_bridge.sh';
+    writeFileSync(path.join(temp, header), '#pragma once\n');
+    writeFileSync(path.join(temp, buildScript), '#!/usr/bin/env bash\n');
+    git('add', header, buildScript);
+    git('update-index', '--chmod=+x', buildScript);
+    git('commit', '-m', 'native inputs');
+    const base = git('rev-parse', 'HEAD').toString().trim();
+    const fingerprint = run();
+    git('mv', header, 'src/llama_webgpu_grammar.hpp');
+    git('commit', '-m', 'rename header');
+    assert.notEqual(run(), fingerprint, 'a same-byte source rename must change the core fingerprint');
+    git('checkout', '--detach', base);
+    git('update-index', '--chmod=-x', buildScript);
+    git('commit', '-m', 'remove executable bit');
+    assert.notEqual(run(), fingerprint, 'a mode-only change must change the core fingerprint');
+  } finally {
+    rmSync(temp, { recursive: true, force: true });
+  }
+}
+
 // CI builds the pinned native lane behind the selector and reports a truthful
 // aggregate.
 {
-  const workflow = parseYaml(readFileSync(path.join(rootDir, '.github/workflows/ci.yml'), 'utf8'));
   const { jobs } = workflow;
   const build = jobs['build-core'];
   const { checks } = jobs;

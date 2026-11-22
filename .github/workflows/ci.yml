@@ -125,12 +125,26 @@ jobs:
         id: compiler-cache
         run: echo "upstream=$(git -C third_party/llama_cpp rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
+      - name: Fingerprint native input tree
+        id: native-inputs
+        run: |
+          set -euo pipefail
+          fingerprint="$(git ls-tree -r -z HEAD -- src CMakeLists.txt cmake \
+            scripts/build/build_bridge.sh scripts/build/patch_wasm64_runtime.mjs \
+            .github/workflows/ci.yml | sha256sum)"
+          empty_fingerprint="$(sha256sum </dev/null)"
+          if [[ "$fingerprint" == "$empty_fingerprint" || ! "${fingerprint%% *}" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "error: native input tree fingerprint is missing or invalid" >&2
+            exit 1
+          fi
+          echo "sha256=${fingerprint%% *}" >> "$GITHUB_OUTPUT"
+
       - name: Restore built core
         id: core-cache
         uses: actions/cache/restore@v4
         with:
           path: ${{ runner.temp }}/webgpu_bridge_dist
-          key: webgpu-core-v1-${{ runner.os }}-${{ runner.arch }}-${{ matrix.variant }}-${{ env.EMSCRIPTEN_VERSION }}-${{ steps.compiler-cache.outputs.upstream }}-${{ hashFiles('src/**', 'CMakeLists.txt', 'cmake/**', 'scripts/build/build_bridge.sh', 'scripts/build/patch_wasm64_runtime.mjs', '.github/workflows/ci.yml') }}
+          key: webgpu-core-v1-${{ runner.os }}-${{ runner.arch }}-${{ matrix.variant }}-${{ env.EMSCRIPTEN_VERSION }}-${{ steps.compiler-cache.outputs.upstream }}-${{ steps.native-inputs.outputs.sha256 }}
 
       # A stable SDK path keeps compiler and sysroot paths stable for ccache.
       - name: Setup Emscripten SDK
