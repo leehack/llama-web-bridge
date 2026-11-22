@@ -339,7 +339,9 @@ Initializes the selected core before any model transfer, using the same core
 selection, threading configuration, and memory64 fallback as a model load.
 It does not probe WebGPU. A successful preflight downloads and compiles Wasm
 once, and subsequent model loads reuse that core. Repeated preflights return
-copies of the cached result. A failed preflight can be retried.
+copies of the cached result. You can retry after a Wasm or transient core
+initialization failure. The browser caches a failed loader import by URL. To
+retry that import, reload the page or use a different loader URL.
 
 | Field | Value |
 | --- | --- |
@@ -371,6 +373,7 @@ The class and its fields are preserved across the worker boundary.
 | `httpStatus` | HTTP status if a diagnostic response was received. Otherwise `null`. |
 | `variant` | `wasm32`, `memory64`, or `null` when the error is independent of the core. |
 
+Core initialization logs and passthrough errors also redact core asset URLs.
 Loader syntax or reference errors, missing factory exports, isolation and
 pthread worker errors, and core initialization timeouts retain their original
 classification. A plausible asset response also preserves the initialization

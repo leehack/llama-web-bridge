@@ -39,6 +39,54 @@ export function redactCoreAssetUrl(url: string): string {
   }
 }
 
+export function createCoreAssetUrlRedactor() {
+  const replacements = new Map<string, string>();
+
+  function remember(url: string, absoluteUrl: string) {
+    const redacted = /^[a-z][a-z\d+.-]*:/i.test(absoluteUrl)
+      ? redactCoreAssetUrl(absoluteUrl)
+      : url.split(/[?#]/, 1)[0];
+    for (const form of [url, absoluteUrl]) {
+      if (form && form !== redacted) replacements.set(form, redacted);
+      const withoutFragment = form.split('#', 1)[0];
+      if (withoutFragment && withoutFragment !== redacted) replacements.set(withoutFragment, redacted);
+    }
+  }
+
+  function text(message: string) {
+    for (const [url, redacted] of replacements) message = message.replaceAll(url, () => redacted);
+    // Fetch errors can name a redirect destination instead of the requested URL.
+    return message.replace(/\bhttps?:\/\/[^\s"'<>`‘’“”]+/gi, (match) => {
+      if (!/[?@#]/.test(match)) return match;
+      const punctuation = /[),.;\]}]+$/.exec(match)?.[0] ?? '';
+      const url = match.slice(0, match.length - punctuation.length);
+      return redactCoreAssetUrl(url) + punctuation;
+    });
+  }
+
+  function error(failure: unknown): unknown {
+    if (typeof failure === 'string') return text(failure);
+    if (!failure || typeof failure !== 'object') return failure;
+    const { message: originalMessage, stack: originalStack, name } = failure as Partial<Error>;
+    if (typeof originalMessage !== 'string') return failure;
+    const message = text(originalMessage);
+    const stack = typeof originalStack === 'string' ? text(originalStack) : originalStack;
+    if (message === originalMessage && stack === originalStack) return failure;
+
+    const sanitized = typeof DOMException === 'function' && Object.prototype.toString.call(failure) === '[object DOMException]'
+      ? new DOMException(message, name)
+      : new Error(message);
+    Object.setPrototypeOf(sanitized, Object.getPrototypeOf(failure));
+    return Object.defineProperties(sanitized, {
+      ...Object.getOwnPropertyDescriptors(failure),
+      message: { value: message, writable: true, configurable: true },
+      stack: { value: stack, writable: true, configurable: true },
+    });
+  }
+
+  return { remember, text, error };
+}
+
 export class CoreAssetError extends Error implements CoreAssetErrorPayload {
   declare readonly code: CoreAssetErrorCode;
   declare readonly asset: CoreAssetKind;
@@ -48,7 +96,7 @@ export class CoreAssetError extends Error implements CoreAssetErrorPayload {
 
   constructor(code: CoreAssetErrorCode, message: string, details: CoreAssetErrorDetails) {
     const url = details.url ? redactCoreAssetUrl(details.url) : null;
-    super(details.url && url ? message.replaceAll(details.url, url) : message);
+    super(details.url && url ? message.replaceAll(details.url, () => url) : message);
     this.name = 'CoreAssetError';
     this.code = code;
     this.asset = details.asset;

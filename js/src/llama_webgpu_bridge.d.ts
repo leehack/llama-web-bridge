@@ -591,6 +591,10 @@ export class LlamaWebGpuBridge {
 
   constructor(config?: LlamaWebGpuBridgeConfig);
 
+  /**
+   * Initializes the selected core before model transfer. Wasm and transient core initialization failures can be retried.
+   * The browser caches a failed loader import by URL. To retry that import, reload the page or use a different loader URL.
+   */
   preflightCore(): Promise<CorePreflightResult>;
   loadModelFromUrl(url: string | string[], options?: LoadModelOptions): Promise<unknown>;
   prefetchModelToCache(url: string | string[], options?: LoadModelOptions): Promise<unknown>;

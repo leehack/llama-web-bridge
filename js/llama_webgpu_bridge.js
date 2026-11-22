@@ -962,10 +962,47 @@ function redactCoreAssetUrl(url) {
     return protocol ? `${protocol.toLowerCase()}//[redacted]` : "[invalid-url]";
   }
 }
+function createCoreAssetUrlRedactor() {
+  const replacements = /* @__PURE__ */ new Map();
+  function remember(url, absoluteUrl) {
+    const redacted = /^[a-z][a-z\d+.-]*:/i.test(absoluteUrl) ? redactCoreAssetUrl(absoluteUrl) : url.split(/[?#]/, 1)[0];
+    for (const form of [url, absoluteUrl]) {
+      if (form && form !== redacted) replacements.set(form, redacted);
+      const withoutFragment = form.split("#", 1)[0];
+      if (withoutFragment && withoutFragment !== redacted) replacements.set(withoutFragment, redacted);
+    }
+  }
+  function text(message) {
+    for (const [url, redacted] of replacements) message = message.replaceAll(url, () => redacted);
+    return message.replace(/\bhttps?:\/\/[^\s"'<>`‘’“”]+/gi, (match) => {
+      if (!/[?@#]/.test(match)) return match;
+      const punctuation = /[),.;\]}]+$/.exec(match)?.[0] ?? "";
+      const url = match.slice(0, match.length - punctuation.length);
+      return redactCoreAssetUrl(url) + punctuation;
+    });
+  }
+  function error(failure) {
+    if (typeof failure === "string") return text(failure);
+    if (!failure || typeof failure !== "object") return failure;
+    const { message: originalMessage, stack: originalStack, name } = failure;
+    if (typeof originalMessage !== "string") return failure;
+    const message = text(originalMessage);
+    const stack = typeof originalStack === "string" ? text(originalStack) : originalStack;
+    if (message === originalMessage && stack === originalStack) return failure;
+    const sanitized = typeof DOMException === "function" && Object.prototype.toString.call(failure) === "[object DOMException]" ? new DOMException(message, name) : new Error(message);
+    Object.setPrototypeOf(sanitized, Object.getPrototypeOf(failure));
+    return Object.defineProperties(sanitized, {
+      ...Object.getOwnPropertyDescriptors(failure),
+      message: { value: message, writable: true, configurable: true },
+      stack: { value: stack, writable: true, configurable: true }
+    });
+  }
+  return { remember, text, error };
+}
 var CoreAssetError = class extends Error {
   constructor(code, message, details) {
     const url = details.url ? redactCoreAssetUrl(details.url) : null;
-    super(details.url && url ? message.replaceAll(details.url, url) : message);
+    super(details.url && url ? message.replaceAll(details.url, () => url) : message);
     this.name = "CoreAssetError";
     this.code = code;
     this.asset = details.asset;
@@ -4450,6 +4487,7 @@ var LlamaWebGpuBridgeRuntime = class {
       return;
     }
     this._coreRetired = true;
+    this._corePreflight = null;
     this._runtimeNotes.push("core_retired");
     if (!stats) {
       this._runtimeNotes.push("core_retired_threads_unavailable");
@@ -4461,9 +4499,13 @@ var LlamaWebGpuBridgeRuntime = class {
     }
     this._onCoreRetired?.(this, cause);
   }
-  async _ensureCore() {
+  _assertCoreLive(core) {
+    if (this._coreRetired || isCoreRetired(core)) throw new ModelUnloadedError();
+  }
+  async _ensureCore(diagnosticUrls) {
     if (this._core) {
       this._applyCoreLogLevel();
+      this._assertCoreLive(this._core);
       return this._core;
     }
     if (!this._config.coreModuleFactory && this._config.allowSingleThreadCore !== true && !canPostSharedMemory()) {
@@ -4511,6 +4553,10 @@ var LlamaWebGpuBridgeRuntime = class {
       let factoryLoaded = false;
       let locatedWasmUrl = null;
       let initTimeoutError = null;
+      const loaderUrl = candidate.loaderUrl === null ? null : resolveCoreLoaderUrl(candidate.loaderUrl);
+      const redact = createCoreAssetUrlRedactor();
+      if (candidate.loaderUrl !== null && loaderUrl !== null) redact.remember(candidate.loaderUrl, loaderUrl);
+      if (candidate.wasmUrl) redact.remember(candidate.wasmUrl, normalizeAbsoluteUrl(candidate.wasmUrl));
       let candidateCore = null;
       let initTimer;
       const pthreadStart = candidate.variant === "custom" ? null : createPthreadWorkerStart({ pthreadScriptUrl: candidate.pthreadScriptUrl });
@@ -4532,13 +4578,14 @@ var LlamaWebGpuBridgeRuntime = class {
               const isWasm = path.endsWith(".wasm");
               const resolved = isWasm && candidate.wasmUrl || `${prefix}${path}`;
               if (isWasm) locatedWasmUrl = resolved;
+              redact.remember(resolved, normalizeAbsoluteUrl(resolved));
               return resolved;
             },
             print: (msg) => {
-              this._emitLogger("log", msg);
+              this._emitLogger("log", typeof msg === "string" ? redact.text(msg) : msg);
             },
             printErr: (msg) => {
-              const text = String(msg ?? "");
+              const text = redact.text(String(msg ?? ""));
               this._lastCoreErrorText = text;
               const trimmed = text.trim();
               if (trimmed.length > 0) {
@@ -4581,7 +4628,7 @@ var LlamaWebGpuBridgeRuntime = class {
               this._emitLogger("error", trimmed.length > 0 ? trimmed : text);
             },
             onAbort: (reason) => {
-              const text = String(reason ?? "").trim();
+              const text = redact.text(String(reason ?? "")).trim();
               if (text.length > 0) {
                 const token = text.slice(0, 120).replace(/[\s;=]+/g, "_").replace(/[^a-zA-Z0-9._:-]/g, "");
                 if (token.length > 0) {
@@ -4592,7 +4639,7 @@ var LlamaWebGpuBridgeRuntime = class {
                 this._runtimeNotes.push("core_abort");
                 this._emitLogger("error", "core abort");
               }
-              retireCore(candidateCore, reason);
+              retireCore(candidateCore, text);
             }
           }),
           new Promise((_, reject) => {
@@ -4609,13 +4656,16 @@ var LlamaWebGpuBridgeRuntime = class {
         this._pthreadStart = pthreadStart?.mode() ?? "direct";
         this._coreVariant = candidate.variant === "wasm64" ? "wasm64" : "wasm32";
         this._memory64FallbackReason = memory64FallbackReason;
+        const threading = this._coreSupportsPthreads() ? "threaded" : "single-thread";
+        this._applyCoreLogLevel();
+        this._assertCoreLive(candidateCore);
         this._corePreflight = {
           variant: candidate.variant === "wasm64" ? "memory64" : "wasm32",
-          threading: this._coreSupportsPthreads() ? "threaded" : "single-thread",
+          threading,
           execution: "main-thread",
           fallback: memory64FallbackReason !== null,
           fallbackReason: memory64FallbackReason,
-          loaderUrl: candidate.loaderUrl === null ? null : resolveCoreLoaderUrl(candidate.loaderUrl),
+          loaderUrl,
           wasmUrl: locatedWasmUrl ?? candidate.wasmUrl ?? null
         };
         if (candidate.variant === "wasm64") {
@@ -4626,6 +4676,7 @@ var LlamaWebGpuBridgeRuntime = class {
         break;
       } catch (caught) {
         const error = pthreadStart && caught !== initTimeoutError ? pthreadStart.failure(caught) : caught;
+        if (this._coreRetired || isCoreRetired(candidateCore)) throw redact.error(error);
         lastError = error;
         if (candidate.variant === "wasm64") {
           const reason = initTimeoutError && error === initTimeoutError ? "timeout" : factoryLoaded && isMemory64Unsupported() ? "unsupported" : "init_error";
@@ -4638,7 +4689,7 @@ var LlamaWebGpuBridgeRuntime = class {
       } finally {
         if (initTimer !== void 0) globalThis.clearTimeout(initTimer);
         if (pthreadStart) {
-          pthreadStart.settle(candidateCore !== null && this._core === candidateCore);
+          pthreadStart.settle(candidateCore !== null && this._core === candidateCore && !isCoreRetired(candidateCore));
           this._pendingPthreadStarts.delete(pthreadStart);
         }
       }
@@ -4647,24 +4698,27 @@ var LlamaWebGpuBridgeRuntime = class {
       const skipDiagnostic = factoryLoaded ? initTimeoutError !== null && lastError === initTimeoutError || lastError instanceof CrossOriginIsolationError || lastError instanceof BlobWorkerBlockedError : lastError instanceof SyntaxError || lastError instanceof ReferenceError || lastError instanceof MissingCoreFactoryExportError;
       if (assetUrl !== null && !skipDiagnostic) {
         const url = asset === "loader" ? resolveCoreLoaderUrl(assetUrl) : normalizeAbsoluteUrl(assetUrl);
-        const assetError = await probeUnavailableCoreAsset(url, asset, "wasm32");
-        if (assetError) throw assetError;
+        if (!diagnosticUrls?.has(url)) {
+          diagnosticUrls?.add(url);
+          const assetError = await probeUnavailableCoreAsset(url, asset, "wasm32");
+          if (assetError) throw assetError;
+        }
       }
-      throw lastError;
+      throw redact.error(lastError);
     }
     if (!this._core) {
       throw lastError || new Error("Failed to initialize bridge core module");
     }
-    this._applyCoreLogLevel();
     return this._core;
   }
   async preflightCore() {
-    await this._ensureCore();
+    const core = await this._ensureCore();
+    this._assertCoreLive(core);
     return { ...this._corePreflight };
   }
-  async _probeBackends() {
+  async _probeBackends(diagnosticUrls) {
     try {
-      const core = await this._ensureCore();
+      const core = await this._ensureCore(diagnosticUrls);
       const probeResult = Number(
         await core.ccall("llamadart_webgpu_probe", "number", [], [], { async: true })
       );
@@ -4680,7 +4734,7 @@ var LlamaWebGpuBridgeRuntime = class {
     } catch (error) {
       this._backendLabels = [];
       this._gpuActive = false;
-      if (error instanceof BlobWorkerBlockedError || error instanceof CoreAssetError || error instanceof CrossOriginIsolationError) throw error;
+      if (error instanceof BlobWorkerBlockedError || error instanceof CoreAssetError || error instanceof CrossOriginIsolationError || error instanceof ModelUnloadedError) throw error;
     }
     return this._gpuActive;
   }
@@ -4695,9 +4749,10 @@ var LlamaWebGpuBridgeRuntime = class {
     ];
     this._suppressedWarmupWarningCount = 0;
     this._didReportWarmupWarningSuppression = false;
-    await this._probeBackends();
+    const diagnosticUrls = /* @__PURE__ */ new Set();
+    await this._probeBackends(diagnosticUrls);
     throwIfAborted(operationSignal, abortMessage);
-    const core = await this._ensureCore();
+    const core = await this._ensureCore(diagnosticUrls);
     throwIfAborted(operationSignal, abortMessage);
     const modelUrls = expandModelShardUrls(url);
     if (modelUrls.length === 0) {

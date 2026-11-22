@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { registerHooks } from 'node:module';
 import { test } from 'node:test';
 import { setImmediate } from 'node:timers/promises';
@@ -24,6 +25,7 @@ const loadOptions = { nGpuLayers: 0, nThreads: 1, useCache: false };
 const config32 = { coreModuleUrl: loader, allowSingleThreadCore: true, preferMemory64: false };
 const config64 = { ...config32, coreModuleUrlMem64: loader64, preferMemory64: true };
 const signedLoader = 'https://user:pass@assets.test/bridge/llama_webgpu_core_st.js?v=0.1.92&token=secret#frag';
+const signedWasm = `${wasm.replace('https://', 'https://user:pass@')}?token=wasm(secret)#wasm-frag`;
 let fixtureSerial = 0;
 
 function setGlobal(t, key, value) {
@@ -571,5 +573,145 @@ test('worker CoreAssetError bypasses fallback and filesystem recovery even with 
       return true;
     });
     assert.equal(bridge._workerProxy, proxy);
+  });
+});
+
+for (const mode of ['direct', 'worker']) {
+  for (const stage of ['loader', 'wasm']) {
+    test(`${mode}: signed ${stage} URLs are redacted in core init logs and passthrough errors`, async (t) => {
+      const logs = [];
+      const log = (line) => logs.push(line);
+      for (const level of ['log', 'warn', 'error']) t.mock.method(console, level, log);
+      const expected = stage === 'loader' ? `Import failed (${loader}).` : `Compile failed (${wasm}).`;
+      const failure = stage === 'loader'
+        ? new TypeError(`Import failed (${signedLoader}).`)
+        : new WebAssembly.CompileError(`Compile failed (${signedWasm.split('#')[0]}).`);
+      withImports(t, {
+        [signedLoader]: stage === 'loader' ? failure : ({ locateFile, print, printErr, onAbort }) => {
+          const binary = locateFile('llama_webgpu_core_st.wasm', base);
+          print(`initializing '${signedLoader}'`);
+          printErr(`wasm streaming compile failed for (${binary})`);
+          printErr('redirect failed at “https://mirror.test/core.wasm?token=secret#mirror-frag”');
+          onAbort(`wasm startup aborted at ${binary}`);
+          throw failure;
+        },
+      });
+      const requests = mockDiagnostic(t, { status: 200, type: stage === 'loader' ? 'text/javascript' : 'application/wasm' });
+      await withBridge(mode, { ...config32, coreModuleUrl: signedLoader, wasmUrl: signedWasm }, async (bridge, replies) => {
+        for (const invoke of [() => bridge.preflightCore(), () => bridge.loadModelFromUrl(model, loadOptions)]) {
+          await assert.rejects(invoke, (error) => {
+            if (mode === 'direct') assert.ok(error instanceof failure.constructor);
+            assert.equal(error.message, expected);
+            assert.doesNotMatch(error.stack, /user:pass|token=|secret|#.*frag/);
+            return true;
+          });
+        }
+        const wireErrors = replies.filter((message) => message.type === 'error');
+        if (mode === 'worker') assert.deepEqual(wireErrors.map((message) => message.message), [expected, expected]);
+        assert.doesNotMatch(JSON.stringify(wireErrors), /user:pass|token=|secret|#.*frag/);
+        assert.ok(requests.urls.every((url) => url === (stage === 'loader' ? signedLoader : signedWasm)));
+      });
+      assert.doesNotMatch(logs.join('\n'), /user:pass|token=|secret|#.*frag/);
+      if (stage === 'wasm') {
+        assert.ok(logs.includes(`initializing '${loader}'`));
+        assert.ok(logs.includes(`wasm streaming compile failed for (${wasm})`));
+        assert.ok(logs.includes('redirect failed at “https://mirror.test/core.wasm”'));
+        assert.ok(logs.includes(`core abort: wasm startup aborted at ${wasm}`));
+      }
+    });
+  }
+}
+
+for (const exportName of ['llamadart_webgpu_supports_pthreads', 'llamadart_webgpu_set_log_level']) {
+  test(`direct preflight rejects retirement during ${exportName} before caching`, async (t) => {
+    let attempts = 0;
+    const trap = new WebAssembly.RuntimeError('Core initialization trapped');
+    const imports = withImports(t, {
+      [loader64]: (options) => {
+        options.locateFile('llama_webgpu_core_mem64_st.wasm', base);
+        const core = makeCore();
+        if (++attempts === 1) {
+          const ccall = core.ccall;
+          core.ccall = (name, ...args) => {
+            if (name === exportName) throw trap;
+            return ccall(name, ...args);
+          };
+        }
+        return core;
+      },
+      [loader]: wasmFactory(),
+    });
+    await withBridge('direct', config64, async (bridge) => {
+      const retired = bridge._runtime;
+      await assert.rejects(bridge.preflightCore(), (error) => error === trap || error instanceof api.ModelUnloadedError);
+      assert.equal(retired._corePreflight, null);
+      assert.notEqual(bridge._runtime, retired);
+      assert.equal(bridge._runtime._core, null);
+      assert.deepEqual(imports, [loader64]);
+      assertResult(await bridge.preflightCore(), { variant: 'memory64', loaderUrl: loader64, wasmUrl: wasm64 });
+      assert.equal(attempts, 2);
+    });
+  });
+}
+
+test('core init redaction preserves DOMException identity fields', async (t) => {
+  withImports(t, { [signedLoader]: new DOMException(`Import failed (${signedLoader})`, 'NetworkError') });
+  mockDiagnostic(t, { status: 200, type: 'text/javascript' });
+  await withBridge('direct', { ...config32, coreModuleUrl: signedLoader }, async (bridge) => {
+    await assert.rejects(bridge.preflightCore(), (error) => {
+      assert.ok(error instanceof DOMException);
+      assert.equal(error.name, 'NetworkError');
+      assert.equal(error.code, DOMException.NETWORK_ERR);
+      assert.equal(error.message, `Import failed (${loader})`);
+      return true;
+    });
+  });
+});
+
+test('direct preflight rejects a cached core that retires while applying its log level', async (t) => {
+  let trap = false;
+  withImports(t, { [loader]: (options) => {
+    options.locateFile('llama_webgpu_core_st.wasm', base);
+    const core = makeCore();
+    const ccall = core.ccall;
+    core.ccall = (name, ...args) => {
+      if (trap && name === 'llamadart_webgpu_set_log_level') throw new WebAssembly.RuntimeError('Core trapped');
+      return ccall(name, ...args);
+    };
+    return core;
+  } });
+  await withBridge('direct', config32, async (bridge) => {
+    const retired = bridge._runtime;
+    assertResult(await bridge.preflightCore());
+    trap = true;
+    await assert.rejects(bridge.preflightCore(), api.ModelUnloadedError);
+    assert.equal(retired._corePreflight, null);
+  });
+});
+
+test('preflight retry documentation describes the browser module map in both public references', () => {
+  const docs = readFileSync(new URL('../../docs/api.md', import.meta.url), 'utf8');
+  const types = readFileSync(new URL('../../js/src/llama_webgpu_bridge.d.ts', import.meta.url), 'utf8');
+  for (const text of [docs, types]) {
+    assert.match(text, /browser caches a failed loader import by URL/);
+    assert.match(text, /reload the page or use a different loader URL/);
+  }
+});
+
+test('a corrupt reachable Wasm gets one diagnostic GET per load operation', async (t) => {
+  let attempts = 0;
+  withImports(t, { [loader]: ({ locateFile }) => {
+    attempts += 1;
+    locateFile('llama_webgpu_core_st.wasm', base);
+    throw new WebAssembly.CompileError('invalid Wasm bytes');
+  } });
+  const requests = mockDiagnostic(t, { status: 200, type: 'application/wasm' });
+  await withBridge('direct', config32, async (bridge) => {
+    for (const count of [1, 2]) {
+      await assert.rejects(bridge.loadModelFromUrl(model, loadOptions), WebAssembly.CompileError);
+      assert.equal(attempts, 2 * count);
+      assert.equal(requests.urls.length, count);
+      assert.equal(requests.cancelled, count);
+    }
   });
 });
