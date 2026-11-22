@@ -11,7 +11,7 @@ import { gzipSync } from 'node:zlib';
 import { chromium } from 'playwright';
 
 import {
-  DEFAULT_MODEL_CACHE, cachedModelName, env, isDirectory, parseSmokeArgs, resolvePath, resolvePinnedModel,
+  DEFAULT_MODEL_CACHE, env, isDirectory, parseSmokeArgs, resolvePath, resolvePinnedModel,
   runMain, webGpuLaunchArgs,
 } from './support.mjs';
 
@@ -34,6 +34,7 @@ export function parseArgs(argv) {
       { flag: '--js-backed-model-staging', type: 'flag', default: () => false },
       { flag: '--no-mmap', type: 'flag', default: () => false },
       { flag: '--model-path', type: 'path', default: () => env.optionalPath('LLAMA_WEBGPU_SMOKE_MODEL_PATH') },
+      { flag: '--model-url', type: 'string', default: () => env.string('LLAMA_WEBGPU_SMOKE_MODEL_URL') },
       { flag: '--model-sha256', type: 'string', default: () => env.string('LLAMA_WEBGPU_SMOKE_MODEL_SHA256') },
       { flag: '--model-cache-dir', type: 'path', default: () => env.path('LLAMA_WEBGPU_SMOKE_MODEL_CACHE', DEFAULT_MODEL_CACHE) },
       { flag: '--timeout-ms', type: 'int', default: () => 60000 },
@@ -455,12 +456,7 @@ export async function main(argv = process.argv.slice(2)) {
   assert.ok(isDirectory(args.distDir), `dist directory does not exist: ${args.distDir}`);
   const baseline = args.baselineDistDir && resolvePath(args.baselineDistDir);
   if (baseline) assert.ok(isDirectory(baseline), `baseline dist directory does not exist: ${baseline}`);
-  const stateModelUrl = process.env.LLAMA_WEBGPU_SMOKE_MODEL_URL;
-  const modelPath = args.modelPath ?? (stateModelUrl
-    ? path.join(args.modelCacheDir, cachedModelName(stateModelUrl))
-    : null);
-  assert.ok(modelPath, '--model-path or the state smoke model cache is required');
-  const model = await resolvePinnedModel({ ...args, modelPath });
+  const model = await resolvePinnedModel(args);
   const revisions = makeRevisions(await fsp.readFile(model));
   const browser = await chromium.launch({
     args: webGpuLaunchArgs(process.platform, { sharedArrayBuffer: args.threading === 'default' }),

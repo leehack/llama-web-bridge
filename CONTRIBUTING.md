@@ -203,9 +203,9 @@ node scripts/smoke/cross_origin_assets.mjs \
 Rerun with `--memory-mode wasm64` for memory64 and `--browser firefox`
 with Playwright Firefox installed.
 
-The resume integrity smoke uses the model already downloaded by state
-persistence. Set the model URL, SHA-256 and cache directory to the same values
-as the state smoke and run:
+The resume integrity smoke uses the same checksum-pinned model as state
+persistence and downloads it on a cache miss. Set the model URL, SHA-256 and
+cache directory to the same values as the state smoke and run:
 
 ```bash
 node scripts/smoke/resume_integrity.mjs --dist-dir "$OUT_DIR" --baseline-dist-dir "$OUT_DIR"
@@ -724,9 +724,20 @@ deletion comparisons include both paths. The `CI validation` result always
 reports and rejects failed, cancelled, missing, or unexpectedly skipped work.
 Only superseded PR runs are cancelled; main/manual runs remain independent.
 
-The CI compiler cache stores objects outside the checkout, separated by runner
-OS/architecture, exact Emscripten version, resolved llama.cpp commit, and build
-script/CMake/patch inputs. ccache also checks compiler contents, source inputs,
-and compile flags. Every selected build still links fresh artifacts and runs
-every CI browser smoke. Candidate and publication workflows do not consume
-this cache or this change selector.
+CI builds the four core variants in parallel. Each variant can restore its
+generated core JS and WASM using an exact key for the runner OS and architecture,
+Emscripten version, verified llama.cpp commit, and a Git tree fingerprint. The
+fingerprint covers tracked paths, modes, and blob IDs for the bridge native
+sources, CMake inputs, the build scripts and their local imports, and the CI
+workflow. Every selected run combines the cores with the checked-in JS wrappers
+and runs the browser smokes. The separate JS checks verify the wrappers against
+their sources.
+
+On a core cache miss, CI restores a per-variant Emscripten sysroot cache
+(`EM_CACHE`) keyed by runner OS, architecture, and exact SDK version. The
+per-variant ccache key also includes the llama.cpp commit and native build
+inputs. It can reuse objects from the same toolchain and upstream commit
+because ccache verifies compiler contents, source inputs, and compile flags.
+Only pushes to `main` save missing core, Emscripten, and ccache entries.
+Candidate and publication workflows do not consume these CI caches or use this
+change selector.

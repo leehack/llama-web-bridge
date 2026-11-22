@@ -4,6 +4,7 @@ import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync, existsSync
 import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
+import { parse as parseYaml } from 'yaml';
 
 const root = path.resolve(import.meta.dirname, '../..');
 const modulePath = path.join(root, 'cmake/embedding_mode_reserve.cmake');
@@ -48,5 +49,16 @@ test('the production build compiles the corrected copy and keys its cache on the
   assert.match(module, /target_sources\(llama PRIVATE "\$\{LLAMADART_CONTEXT_PATCHED\}"\)/);
   assert.match(module, /SKIP_UNITY_BUILD_INCLUSION ON/);
   const ci = readFileSync(path.join(root, '.github/workflows/ci.yml'), 'utf8');
-  assert.equal(ci.match(/hashFiles\('CMakeLists.txt', 'cmake\/\*\.cmake'/g)?.length, 2);
+  const steps = parseYaml(ci).jobs['build-core'].steps;
+  const core = steps.find((step) => step.with?.key?.startsWith('webgpu-core-v1-'))?.with;
+  const fingerprint = steps.find((step) => step.id === 'native-inputs')?.run;
+  const compiler = steps.find((step) => step.with?.key?.startsWith('webgpu-ccache-v3-'))?.with;
+  assert.match(core?.key ?? '', /steps\.native-inputs\.outputs\.sha256/, 'core cache must use the tree fingerprint');
+  assert.match(fingerprint ?? '', /git ls-tree -r -z HEAD -- src CMakeLists\.txt cmake\b/, 'core cache must cover the CMake module');
+  assert.match(compiler?.key ?? '', /hashFiles\([^)]*'cmake\/(?:\*\.cmake|\*\*)'/, 'compiler cache must cover the CMake module');
+  assert.equal(core['restore-keys'], undefined);
+  assert.equal(compiler['restore-keys']?.trim(), [
+    'webgpu-ccache-v3-${{ runner.os }}-${{ runner.arch }}-${{ matrix.variant }}',
+    '${{ env.EMSCRIPTEN_VERSION }}-${{ steps.compiler-cache.outputs.upstream }}-',
+  ].join('-'));
 });

@@ -296,7 +296,7 @@ const invalidSamplerOptionsLiteral = () => `[${INVALID_SAMPLER_OPTIONS.map((opti
   Object.entries(options).map(([key, value]) => `${key}: ${String(value)}`).join(', ')
 } }`).join(', ')}]`;
 
-export function renderHarness(nCtx, memoryModes) {
+export function renderHarness(nCtx, memoryModes, runtimeModes = RUNTIME_MODES) {
   const config = pyJson({
     modelUrl: `/${MODEL_FILENAME}`,
     prompt: PROMPT,
@@ -316,7 +316,7 @@ export function renderHarness(nCtx, memoryModes) {
     maxThreads: MAX_THREADS,
     nCtx,
     memoryModes,
-    runtimeModes: RUNTIME_MODES,
+    runtimeModes,
   });
   const invalidSamplerOptions = invalidSamplerOptionsLiteral();
   return `
@@ -948,13 +948,13 @@ export function renderHarness(nCtx, memoryModes) {
 `;
 }
 
-export function validatePayload(payload, memoryModes) {
+export function validatePayload(payload, memoryModes, runtimeModes = RUNTIME_MODES) {
   const failures = [];
   if (payload.ok !== true) return [`harness failed: ${pyStr(pyGet(payload, 'error'))}`];
   const modeResults = pyGet(payload, 'modeResults');
   if (!Array.isArray(modeResults) || !pyEquals(
     modeResults.filter(isDict).map((entry) => pyGet(entry, 'mode')),
-    expectedModes(memoryModes, RUNTIME_MODES),
+    expectedModes(memoryModes, runtimeModes),
   )) {
     return ['mode results missing'];
   }
@@ -1206,6 +1206,13 @@ export function parseArgs(argv) {
         help: 'Core memory mode to run; wasm64 needs the mem64 artifacts.',
       },
       {
+        flag: '--runtime-mode',
+        type: 'string',
+        choices: ['all', ...RUNTIME_MODES],
+        default: () => 'all',
+        help: 'Bridge runtime to run, or all runtimes.',
+      },
+      {
         flag: '--n-ctx',
         type: 'int',
         default: () => 1024,
@@ -1228,12 +1235,13 @@ export async function main(argv = process.argv.slice(2)) {
   const artifactsDir = args.artifactsDir !== null ? resolvePath(args.artifactsDir) : null;
   const modelPath = await resolvePinnedModel(args);
   const memoryModes = args.memoryMode === 'all' ? MEMORY_MODES : [args.memoryMode];
+  const runtimeModes = args.runtimeMode === 'all' ? RUNTIME_MODES : [args.runtimeMode];
 
   const payload = await withTempDir('llama-web-bridge-grammar-smoke-', async (webRoot) => {
     await copyBridgeArtifacts(distDir, webRoot);
     if (memoryModes.includes('wasm64')) await copyMemory64Artifacts(distDir, webRoot);
     await stageFile(modelPath, path.join(webRoot, MODEL_FILENAME));
-    await fsp.writeFile(path.join(webRoot, 'index.html'), renderHarness(args.nCtx, memoryModes), 'utf8');
+    await fsp.writeFile(path.join(webRoot, 'index.html'), renderHarness(args.nCtx, memoryModes, runtimeModes), 'utf8');
     if (artifactsDir !== null) {
       await fsp.mkdir(artifactsDir, { recursive: true });
       await fsp.copyFile(path.join(webRoot, 'index.html'), path.join(artifactsDir, 'index.html'));
@@ -1245,7 +1253,7 @@ export async function main(argv = process.argv.slice(2)) {
   });
 
   writeStdout(`${pyJson(payload, { indent: 2, sortKeys: true })}\n`);
-  const failures = validatePayload(payload, memoryModes);
+  const failures = validatePayload(payload, memoryModes, runtimeModes);
   for (const failure of failures) process.stderr.write(`grammar browser smoke: ${failure}\n`);
   return failures.length ? 1 : 0;
 }

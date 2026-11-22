@@ -141,7 +141,7 @@ export function validateResults(needs) {
   const selected = get(get(scope, 'outputs') ?? {}, 'native');
   if (selected !== 'true' && selected !== 'false') return false;
   const expected = selected === 'true' ? 'success' : 'skipped';
-  const jobs = ['build-webgpu-bridge'];
+  const jobs = ['build-core', 'smoke-core', 'smoke-resume', 'smoke-multimodal', 'smoke-grammar-qwen'];
   if (get(get(needs, 'checks') ?? {}, 'result') !== 'success') return false;
   const names = new Set([...jobs, 'changes', 'checks']);
   const keys = Object.keys(needs);

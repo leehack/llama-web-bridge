@@ -1,5 +1,6 @@
 // Static contracts for single-thread (_st) core builds and artifact wiring.
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { test } from 'node:test';
@@ -47,4 +48,21 @@ test('manifest ARTIFACTS includes all 11 bridge and core files', () => {
     'llama_webgpu_core_mem64_st.js',
     'llama_webgpu_core_mem64_st.wasm',
   ]);
+});
+
+test('build_bridge.sh documents the variant and JS check controls', () => {
+  const help = spawnSync('bash', ['scripts/build/build_bridge.sh', '--help'], { cwd: ROOT, encoding: 'utf8' });
+  assert.equal(help.status, 0, help.stderr);
+  assert.match(help.stdout, /WEBGPU_BRIDGE_VARIANT.*wasm32.*wasm64.*wasm32_st.*wasm64_st/);
+  assert.match(help.stdout, /WEBGPU_BRIDGE_SKIP_JS_CHECK/);
+});
+
+test('build_bridge.sh rejects an unknown variant before using the SDK', () => {
+  const build = spawnSync('bash', ['scripts/build/build_bridge.sh'], {
+    cwd: ROOT,
+    encoding: 'utf8',
+    env: { ...process.env, WEBGPU_BRIDGE_VARIANT: 'wasm128' },
+  });
+  assert.equal(build.status, 1);
+  assert.match(build.stdout + build.stderr, /invalid WEBGPU_BRIDGE_VARIANT: wasm128/);
 });
