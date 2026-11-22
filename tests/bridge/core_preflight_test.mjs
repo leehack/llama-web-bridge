@@ -1081,6 +1081,49 @@ for (const mode of ['direct', 'worker']) {
     });
   }
 
+  test(`${mode}: registered relative URL boundaries across printable ASCII`, async (t) => {
+    const wasmUrl = 'core.wasm?sig=S';
+    const resolved = `${base}core.wasm`;
+    const filenameCharacters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._~%+-/';
+    const cases = Array.from({ length: 95 }, (_, index) => {
+      const character = String.fromCharCode(32 + index);
+      const prefix = `ASCII ${32 + index}: ${character}`;
+      return [prefix + wasmUrl, prefix + (filenameCharacters.includes(character) ? wasmUrl : resolved)];
+    });
+    const signedLoader = `${loader}?sig=S`;
+    cases.push(
+      [`a.js,${wasmUrl}`, `a.js,${resolved}`],
+      [`a.js;${wasmUrl}`, `a.js;${resolved}`],
+      [`${wasmUrl},next`, `${resolved},next`],
+      [`${wasmUrl};next`, `${resolved};next`],
+      [`${signedLoader}),https://mirror.test/core.wasm&extra=S`, loader],
+    );
+    for (const item of [
+      `vendor-${wasmUrl}`, `x${wasmUrl}`, `a/${wasmUrl}`,
+      'foo=core.wasm.bak', 'id:core.wasm2',
+      `${wasmUrl}.bak`, `${wasmUrl}2`, `${wasmUrl}/other`, `${wasmUrl}?next`,
+      `${wasmUrl}&extra=1`, `${wasmUrl}#fragment`, `${wasmUrl}=value`,
+    ]) cases.push([item, item]);
+
+    const input = cases.map(([value]) => value).join('\n');
+    const expected = cases.map(([, value]) => value).join('\n');
+    setGlobal(t, 'document', { baseURI: base });
+    const lines = [];
+    for (const level of ['log', 'warn', 'error']) t.mock.method(console, level, (line) => lines.push(line));
+    withImports(t, { [signedLoader]: ({ print, printErr }) => {
+      print(input);
+      printErr(input);
+      throw new Error(input);
+    } });
+    await withBridge(mode, { ...config32, coreModuleUrl: signedLoader, wasmUrl }, async (bridge) => {
+      await assert.rejects(bridge.loadModelFromUrl(model, loadOptions), (error) => {
+        assert.deepEqual(error.message.split('\n'), expected.split('\n'));
+        return true;
+      });
+    });
+    assert.deepEqual(lines, [expected, expected, expected, expected]);
+  });
+
   for (const asset of ['wasmUrl', 'coreModuleUrl', 'workerUrl']) {
     test(`${mode}: redact a configured ${asset} with an apostrophe in its path`, async (t) => {
       const configured = `HTTPS://Assets.Test/it's/${asset}.js?sig=SECRET`;

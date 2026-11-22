@@ -967,8 +967,8 @@ function hasCoreAssetUrlSecrets(url) {
 }
 var HTTP_URL_START = /\bhttps?:\/\//gi;
 var URL_TEXT_DELIMITER = /[\s"'<>`‘’“”]/;
-var URL_PATH_CHARACTER = /[A-Za-z0-9._~%!$&'*+,;=:@\/-]/;
-var URL_TRAILING_FORMAT = /^(?::\d+){0,2}[),.;!\]]*$/;
+var URL_PATH_CHARACTER = /[A-Za-z0-9._~%+\/-]/;
+var URL_QUERY_CONTINUATION = /[?&#=]/;
 function absoluteUrlEnd(message, start) {
   const delimiter = message.slice(start).search(URL_TEXT_DELIMITER);
   return delimiter === -1 ? message.length : start + delimiter;
@@ -1000,12 +1000,11 @@ function redactAbsoluteUrlToken(token) {
   return queryStart === -1 ? url : url + queryFormatting(token, queryStart);
 }
 function atUrlStart(message, start) {
-  if (start === 0) return true;
-  const previous = message[start - 1];
-  return URL_TEXT_DELIMITER.test(previous) || previous === "=" || previous === ":" || !URL_PATH_CHARACTER.test(previous);
+  return start === 0 || !URL_PATH_CHARACTER.test(message[start - 1]);
 }
 function atUrlEnd(message, end) {
-  return URL_TRAILING_FORMAT.test(message.slice(end, absoluteUrlEnd(message, end)));
+  const next = message[end];
+  return next === void 0 || !(URL_PATH_CHARACTER.test(next) || URL_QUERY_CONTINUATION.test(next));
 }
 function replaceRegisteredUrl(message, url, redacted) {
   return message.replaceAll(url, (match, index) => atUrlStart(message, index) && atUrlEnd(message, index + match.length) ? redacted : match);
@@ -1031,8 +1030,9 @@ function createCoreAssetUrlRedactor() {
     for (const url of absoluteUrls) {
       if (!/^https?:\/\//i.test(url)) continue;
       const end = start + url.length;
-      if (hasCoreAssetUrlSecrets(url) && message.startsWith(url, start) && atUrlEnd(message, end)) {
-        return { end, value: redactCoreAssetUrl(url) };
+      if (hasCoreAssetUrlSecrets(url) && message.startsWith(url, start)) {
+        const tail = message.slice(end, absoluteUrlEnd(message, end));
+        if (queryFormatting(tail, 0) === tail) return { end, value: redactCoreAssetUrl(url) };
       }
       const path = url.split(/[?#]/, 1)[0];
       const queryStart = start + path.length;
