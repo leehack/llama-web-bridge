@@ -242,7 +242,8 @@ jobs:
             ${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_core*.js
             ${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_core*.wasm
           if-no-files-found: error
-          retention-days: 1
+          # Smoke jobs consume these on "Re-run failed jobs", which GitHub allows for 30 days.
+          retention-days: 30
 
   smoke-core:
     name: Core browser smokes

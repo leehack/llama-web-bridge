@@ -273,6 +273,7 @@ const nativeJobs = ['build-core', ...smokeJobs];
     .map((step) => step.with.name);
   assert.deepEqual(uploadNames.sort(), [...pinnedArtifacts].sort());
   const buildSteps = Object.fromEntries(build.steps.map((step) => [step.name, step]));
+  assert.ok(buildSteps['Upload core artifacts'].with['retention-days'] >= 30, 'core artifacts must outlive the 30-day rerun window');
   const coreCache = buildSteps['Restore built core'];
   assert.match(coreCache.with.key, /^webgpu-core-v1-/);
   assert.equal('restore-keys' in coreCache.with, false);
