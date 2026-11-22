@@ -968,20 +968,8 @@ function hasCoreAssetUrlSecrets(url) {
 var HTTP_URL_START = /\bhttps?:\/\//gi;
 var URL_TEXT_DELIMITER = /[\s"'<>`‘’“”]/;
 function absoluteUrlEnd(message, start) {
-  const closingDelimiters = [];
-  for (let end = start; end < message.length; end++) {
-    const char = message[end];
-    if (URL_TEXT_DELIMITER.test(char)) return end;
-    if (char === "?" || char === "#") {
-      const nextDelimiter = message.slice(end).search(URL_TEXT_DELIMITER);
-      return nextDelimiter === -1 ? message.length : end + nextDelimiter;
-    }
-    if (char === "," && /^https?:\/\//i.test(message.slice(end + 1, end + 9))) return end;
-    if (char === "[") closingDelimiters.push("]");
-    if (char === "(") closingDelimiters.push(")");
-    if ((char === "]" || char === ")") && closingDelimiters.pop() !== char) return end;
-  }
-  return message.length;
+  const delimiter = message.slice(start).search(URL_TEXT_DELIMITER);
+  return delimiter === -1 ? message.length : start + delimiter;
 }
 function trailingQueryPunctuation(token, queryStart, punctuation) {
   const closingDelimiters = [];
@@ -998,18 +986,14 @@ function trailingQueryPunctuation(token, queryStart, punctuation) {
 }
 function redactAbsoluteUrlToken(token) {
   const queryStart = token.search(/[?#]/);
-  const punctuation = (queryStart === -1 ? /[,.;]+$/ : /[),.;!\]]+$/).exec(token)?.[0] ?? "";
-  const urlToken = token.slice(0, token.length - punctuation.length);
-  const hasPath = /[/?#]/.test(urlToken.slice(urlToken.indexOf("://") + 3));
-  const position = hasPath ? /(?::\d+){1,2}$/.exec(urlToken)?.[0] ?? "" : "";
-  try {
-    const url = new URL(urlToken.slice(0, urlToken.length - position.length));
-    if (queryStart === -1 && !url.username && !url.password) return token;
-    const trailing = queryStart === -1 || !punctuation ? punctuation : trailingQueryPunctuation(token, queryStart, punctuation);
-    return url.origin + url.pathname + position + trailing;
-  } catch (_) {
-    return token;
-  }
+  const path = queryStart === -1 ? token : token.slice(0, queryStart);
+  const url = path.replace(/(\bhttps?:\/\/)[^/?#]*@/gi, "$1");
+  if (queryStart === -1) return url;
+  const query = token.slice(queryStart);
+  const punctuation = /[),.;!\]]+$/.exec(query)?.[0] ?? "";
+  const position = /(?::\d+){1,2}$/.exec(query.slice(0, query.length - punctuation.length))?.[0] ?? "";
+  const trailing = punctuation ? trailingQueryPunctuation(token, queryStart, punctuation) : "";
+  return url + position + trailing;
 }
 function createCoreAssetUrlRedactor() {
   const replacements = /* @__PURE__ */ new Map();

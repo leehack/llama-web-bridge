@@ -954,6 +954,41 @@ for (const mode of ['direct', 'worker']) {
   }
 }
 
+for (const mode of ['direct', 'worker']) {
+  for (const [format, path] of [
+    ['audit filename with a closing parenthesis', '/volume-2).wasm'],
+    ['closing square bracket', '/volume-3].wasm'],
+    ['comma', '/volume,3).wasm'],
+    ['semicolon', '/volume;3].wasm'],
+    ['quote-free punctuation', '/volume!~|3).wasm'],
+    ['comma and another scheme', '/volume,https://nested.example.test/part].wasm'],
+  ]) {
+    test(`${mode}: signed asset path keeps ${format} without retaining its query`, async (t) => {
+      const location = new URL(path, 'https://assets.example.test').href;
+      const input = `Loading ${location}?sig=SECRET`;
+      const expected = `Loading ${location}`;
+      const lines = [];
+      for (const level of ['log', 'warn', 'error']) t.mock.method(console, level, (line) => lines.push(line));
+      withImports(t, { [loader]: ({ print, printErr }) => {
+        print(input);
+        printErr(input);
+        throw new Error(input);
+      } });
+      await withBridge(mode, config32, async (bridge) => {
+        await assert.rejects(bridge.loadModelFromUrl(model, loadOptions), { message: expected });
+      });
+      assert.deepEqual(lines, [expected, expected, expected, expected]);
+    });
+  }
+}
+
+test('stripping path-only userinfo preserves the other URL bytes', async () => {
+  const input = 'Loading HTTPS://u:p@ASSETS.example.test:443/volume-2).wasm';
+  await withBridge('direct', { coreModuleFactory() { throw new Error(input); } }, async (bridge) => {
+    await assert.rejects(bridge.preflightCore(), { message: 'Loading HTTPS://ASSETS.example.test:443/volume-2).wasm' });
+  });
+});
+
 test('direct preflight rejects a cached core that retires while applying its log level', async (t) => {
   let trap = false;
   withImports(t, { [loader]: (options) => {
