@@ -1068,6 +1068,13 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
     return error instanceof ModelStagingError || (error as { name?: unknown }).name === 'ModelStagingError';
   }
 
+  _isNonRetryableLoadError(error: unknown) {
+    const loadError = error as { name?: unknown; code?: unknown } | null;
+    return loadError?.name === 'ModelTransferLengthError'
+      || loadError?.code === 'MODEL_TRANSFER_LENGTH_ERROR'
+      || this._isNonRecoverableStagingError(error);
+  }
+
   _isRecoverableWorkerFsError(error: unknown) {
     if (
       isCoreRetiredError(error)
@@ -2536,7 +2543,7 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
     } catch (error) {
       this._throwIfOperationCancelled(error, 'Projector operation was cancelled.');
       this._throwIfWorkerCoreRetired(error);
-      if (!startedWithWorker || this._isNonRecoverableStagingError(error)) {
+      if (!startedWithWorker || this._isNonRetryableLoadError(error)) {
         throw error;
       }
       const reason = serializeWorkerError(error);
@@ -2555,7 +2562,7 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
           );
           return retryResult;
         } catch (retryError) {
-          if (this._isNonRecoverableStagingError(retryError)) {
+          if (this._isNonRetryableLoadError(retryError)) {
             throw retryError;
           }
           const retryReason = serializeWorkerError(retryError);

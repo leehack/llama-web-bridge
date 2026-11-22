@@ -39,6 +39,10 @@ export function redactCoreAssetUrl(url: string): string {
   }
 }
 
+function hasCoreAssetUrlSecrets(url: string): boolean {
+  return /[?#]/.test(url) || /^(?:[a-z][a-z\d+.-]*:)?\/\/[^/]*@/i.test(url);
+}
+
 export function createCoreAssetUrlRedactor() {
   const replacements = new Map<string, string>();
 
@@ -47,9 +51,7 @@ export function createCoreAssetUrlRedactor() {
       ? redactCoreAssetUrl(absoluteUrl)
       : url.split(/[?#]/, 1)[0];
     for (const form of [url, absoluteUrl]) {
-      if (form && form !== redacted) replacements.set(form, redacted);
-      const withoutFragment = form.split('#', 1)[0];
-      if (withoutFragment && withoutFragment !== redacted) replacements.set(withoutFragment, redacted);
+      if (hasCoreAssetUrlSecrets(form) && form !== redacted) replacements.set(form, redacted);
     }
   }
 
@@ -57,28 +59,42 @@ export function createCoreAssetUrlRedactor() {
     for (const [url, redacted] of replacements) message = message.replaceAll(url, () => redacted);
     // Fetch errors can name a redirect destination instead of the requested URL.
     return message.replace(/\bhttps?:\/\/[^\s"'<>`‘’“”]+/gi, (match) => {
-      if (!/[?@#]/.test(match)) return match;
-      const punctuation = /[),.;\]}]+$/.exec(match)?.[0] ?? '';
-      const url = match.slice(0, match.length - punctuation.length);
-      return redactCoreAssetUrl(url) + punctuation;
+      if (!hasCoreAssetUrlSecrets(match)) return match;
+      let end = match.search(/[),.;\]}]+$/);
+      if (end === -1) return redactCoreAssetUrl(match);
+      const prefix = match.slice(0, end);
+      let pending = (prefix.match(/\(/g)?.length ?? 0) - (prefix.match(/\)/g)?.length ?? 0);
+      // A balanced pair belongs to the URL. Leave the enclosing prose punctuation alone.
+      while (pending-- > 0 && match[end] === ')') end++;
+      return redactCoreAssetUrl(match.slice(0, end)) + match.slice(end);
     });
   }
 
-  function error(failure: unknown): unknown {
+  function error(failure: unknown, depth = 0, seen = new WeakSet<object>()): unknown {
     if (typeof failure === 'string') return text(failure);
     if (!failure || typeof failure !== 'object') return failure;
-    const { message: originalMessage, stack: originalStack, name } = failure as Partial<Error>;
+    // Returning the original tail would expose unsanitized errors past the bound.
+    if (depth > 5 || seen.has(failure)) return undefined;
+    const { message: originalMessage, stack: originalStack, cause: originalCause, name } = failure as Partial<Error>;
     if (typeof originalMessage !== 'string') return failure;
+    seen.add(failure);
     const message = text(originalMessage);
     const stack = typeof originalStack === 'string' ? text(originalStack) : originalStack;
-    if (message === originalMessage && stack === originalStack) return failure;
+    const cause = error(originalCause, depth + 1, seen);
+    if (message === originalMessage && stack === originalStack && cause === originalCause) return failure;
 
     const sanitized = typeof DOMException === 'function' && Object.prototype.toString.call(failure) === '[object DOMException]'
       ? new DOMException(message, name)
       : new Error(message);
     Object.setPrototypeOf(sanitized, Object.getPrototypeOf(failure));
+    const descriptors = Object.getOwnPropertyDescriptors(failure);
+    if (cause !== originalCause) {
+      descriptors.cause = {
+        value: cause, writable: true, configurable: true, enumerable: descriptors.cause?.enumerable ?? false,
+      };
+    }
     return Object.defineProperties(sanitized, {
-      ...Object.getOwnPropertyDescriptors(failure),
+      ...descriptors,
       message: { value: message, writable: true, configurable: true },
       stack: { value: stack, writable: true, configurable: true },
     });

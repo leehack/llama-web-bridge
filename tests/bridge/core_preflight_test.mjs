@@ -668,6 +668,101 @@ test('core init redaction preserves DOMException identity fields', async (t) => 
   });
 });
 
+for (const source of ['loader', 'custom factory']) {
+  test(`direct ${source} redacts an error cause even when the outer error has no URL`, async (t) => {
+    const failure = new TypeError('x', { cause: new Error('fetch https://u:p@h/a.wasm?sig=1 failed') });
+    let config;
+    if (source === 'loader') {
+      withImports(t, { [loader]: failure });
+      mockDiagnostic(t, { status: 200, type: 'text/javascript' });
+      config = config32;
+    } else {
+      config = { coreModuleFactory() { throw failure; } };
+    }
+    await withBridge('direct', config, async (bridge) => {
+      await assert.rejects(bridge.preflightCore(), (error) => {
+        assert.ok(error instanceof TypeError);
+        assert.equal(error.message, 'x');
+        assert.notEqual(error.cause, failure.cause);
+        assert.ok(error.cause instanceof Error);
+        assert.equal(error.cause.message, 'fetch https://h/a.wasm failed');
+        assert.doesNotMatch(error.cause.stack, /u:p|sig=1/);
+        assert.match(failure.cause.message, /sig=1/);
+        return true;
+      });
+    });
+  });
+}
+
+test('direct preflight redacts nested and string causes and bounds cyclic and deep causes', async () => {
+  const nested = new Error('outer', { cause: new TypeError('middle', {
+    cause: new WebAssembly.CompileError('inner', { cause: 'fetch https://u:p@h/a.wasm?sig=1 failed' }),
+  }) });
+  const cyclic = new TypeError('cycle');
+  cyclic.cause = new Error('fetch https://u:p@h/a.wasm?sig=1 failed', { cause: cyclic });
+  let deep = new Error('fetch https://u:p@h/a.wasm?sig=1 failed');
+  for (let index = 0; index < 10; index++) deep = new Error(`level ${index}`, { cause: deep });
+  for (const failure of [nested, cyclic, deep]) {
+    await withBridge('direct', { coreModuleFactory() { throw failure; } }, async (bridge) => {
+      await assert.rejects(bridge.preflightCore(), (error) => {
+        const visited = new Set();
+        let current = error;
+        while (current instanceof Error && !visited.has(current)) {
+          visited.add(current);
+          assert.doesNotMatch(`${current.message}\n${current.stack}`, /u:p|sig=1/);
+          current = current.cause;
+        }
+        assert.ok(visited.size <= 6);
+        if (failure === nested) {
+          assert.ok(error.cause instanceof TypeError);
+          assert.ok(error.cause.cause instanceof WebAssembly.CompileError);
+          assert.equal(current, 'fetch https://h/a.wasm failed');
+        }
+        if (failure === cyclic) {
+          assert.equal(error.cause.message, 'fetch https://h/a.wasm failed');
+        }
+        return true;
+      });
+    });
+  }
+});
+
+for (const mode of ['direct', 'worker']) {
+  test(`${mode}: unsigned relative core URLs preserve initialization log and stack text`, async (t) => {
+    setGlobal(t, 'document', { baseURI: 'http://127.0.0.1:52208/' });
+    const logLine = 'wasm streaming compile failed: CompileError: WebAssembly.instantiateStreaming(): expected magic word';
+    const message = 'Aborted(CompileError: WebAssembly.instantiate(): expected magic word)';
+    const stack = `RuntimeError: ${message}\n    at abort (http://127.0.0.1:52208/loader.js:1:2274)`;
+    const lines = [];
+    for (const level of ['log', 'warn', 'error']) t.mock.method(console, level, (line) => lines.push(line));
+    withImports(t, { '/loader.js': ({ locateFile, print, printErr }) => {
+      assert.equal(locateFile('lib.wasm', base), 'wasm');
+      printErr(logLine);
+      print(stack);
+      const error = new WebAssembly.RuntimeError(message);
+      error.stack = stack;
+      throw error;
+    } });
+    mockDiagnostic(t, { status: 200, type: 'application/wasm' });
+    await withBridge(mode, { ...config32, coreModuleUrl: '/loader.js', wasmUrl: 'wasm' }, async (bridge) => {
+      await assert.rejects(bridge.loadModelFromUrl(model, loadOptions), (error) => {
+        assert.equal(error.message, message);
+        if (mode === 'direct') assert.equal(error.stack, stack);
+        return true;
+      });
+    });
+    assert.deepEqual(lines, [logLine, stack, logLine, stack]);
+  });
+
+  test(`${mode}: a signed relative loader URL is redacted without changing other text`, async (t) => {
+    const coreModuleUrl = 'loader.js?sig=1';
+    withImports(t, { [coreModuleUrl]: new TypeError(`Import of ${coreModuleUrl} failed`) });
+    await withBridge(mode, { ...config32, coreModuleUrl }, async (bridge) => {
+      await assert.rejects(bridge.preflightCore(), { message: 'Import of loader.js failed' });
+    });
+  });
+}
+
 test('direct preflight rejects a cached core that retires while applying its log level', async (t) => {
   let trap = false;
   withImports(t, { [loader]: (options) => {

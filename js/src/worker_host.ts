@@ -56,11 +56,14 @@ export function installBridgeWorkerHost() {
       state = undefined;
     }
 
+    const message = error instanceof Error
+      ? error.message || error.name || 'Worker request failed'
+      : serializeWorkerError(error);
     const decisionErrorCode = decisionErrorCodeOf(error);
     self.postMessage({
       type: 'error',
       id,
-      message: serializeWorkerError(error),
+      message,
       ...(error instanceof EmbeddingError ? { embeddingErrorCode: error.code } : {}),
       ...(error instanceof CrossOriginIsolationError || error instanceof SingleThreadCoreError
         || error instanceof ModelUnloadedError

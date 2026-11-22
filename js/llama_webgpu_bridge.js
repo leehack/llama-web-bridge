@@ -962,37 +962,53 @@ function redactCoreAssetUrl(url) {
     return protocol ? `${protocol.toLowerCase()}//[redacted]` : "[invalid-url]";
   }
 }
+function hasCoreAssetUrlSecrets(url) {
+  return /[?#]/.test(url) || /^(?:[a-z][a-z\d+.-]*:)?\/\/[^/]*@/i.test(url);
+}
 function createCoreAssetUrlRedactor() {
   const replacements = /* @__PURE__ */ new Map();
   function remember(url, absoluteUrl) {
     const redacted = /^[a-z][a-z\d+.-]*:/i.test(absoluteUrl) ? redactCoreAssetUrl(absoluteUrl) : url.split(/[?#]/, 1)[0];
     for (const form of [url, absoluteUrl]) {
-      if (form && form !== redacted) replacements.set(form, redacted);
-      const withoutFragment = form.split("#", 1)[0];
-      if (withoutFragment && withoutFragment !== redacted) replacements.set(withoutFragment, redacted);
+      if (hasCoreAssetUrlSecrets(form) && form !== redacted) replacements.set(form, redacted);
     }
   }
   function text(message) {
     for (const [url, redacted] of replacements) message = message.replaceAll(url, () => redacted);
     return message.replace(/\bhttps?:\/\/[^\s"'<>`‘’“”]+/gi, (match) => {
-      if (!/[?@#]/.test(match)) return match;
-      const punctuation = /[),.;\]}]+$/.exec(match)?.[0] ?? "";
-      const url = match.slice(0, match.length - punctuation.length);
-      return redactCoreAssetUrl(url) + punctuation;
+      if (!hasCoreAssetUrlSecrets(match)) return match;
+      let end = match.search(/[),.;\]}]+$/);
+      if (end === -1) return redactCoreAssetUrl(match);
+      const prefix = match.slice(0, end);
+      let pending = (prefix.match(/\(/g)?.length ?? 0) - (prefix.match(/\)/g)?.length ?? 0);
+      while (pending-- > 0 && match[end] === ")") end++;
+      return redactCoreAssetUrl(match.slice(0, end)) + match.slice(end);
     });
   }
-  function error(failure) {
+  function error(failure, depth = 0, seen = /* @__PURE__ */ new WeakSet()) {
     if (typeof failure === "string") return text(failure);
     if (!failure || typeof failure !== "object") return failure;
-    const { message: originalMessage, stack: originalStack, name } = failure;
+    if (depth > 5 || seen.has(failure)) return void 0;
+    const { message: originalMessage, stack: originalStack, cause: originalCause, name } = failure;
     if (typeof originalMessage !== "string") return failure;
+    seen.add(failure);
     const message = text(originalMessage);
     const stack = typeof originalStack === "string" ? text(originalStack) : originalStack;
-    if (message === originalMessage && stack === originalStack) return failure;
+    const cause = error(originalCause, depth + 1, seen);
+    if (message === originalMessage && stack === originalStack && cause === originalCause) return failure;
     const sanitized = typeof DOMException === "function" && Object.prototype.toString.call(failure) === "[object DOMException]" ? new DOMException(message, name) : new Error(message);
     Object.setPrototypeOf(sanitized, Object.getPrototypeOf(failure));
+    const descriptors = Object.getOwnPropertyDescriptors(failure);
+    if (cause !== originalCause) {
+      descriptors.cause = {
+        value: cause,
+        writable: true,
+        configurable: true,
+        enumerable: descriptors.cause?.enumerable ?? false
+      };
+    }
     return Object.defineProperties(sanitized, {
-      ...Object.getOwnPropertyDescriptors(failure),
+      ...descriptors,
       message: { value: message, writable: true, configurable: true },
       stack: { value: stack, writable: true, configurable: true }
     });
@@ -1765,9 +1781,10 @@ function sumProgressValues(values) {
   return total;
 }
 function createModelTransferLengthError(message) {
-  const error = new Error(message);
-  error.name = "ModelTransferLengthError";
-  return error;
+  return Object.assign(new Error(message), {
+    name: "ModelTransferLengthError",
+    code: "MODEL_TRANSFER_LENGTH_ERROR"
+  });
 }
 function writeDirectChunk(directWriter, chunk, position, onBytesWritten) {
   let offset = 0;
@@ -8550,6 +8567,10 @@ var LlamaWebGpuBridge = class {
     }
     return error instanceof ModelStagingError || error.name === "ModelStagingError";
   }
+  _isNonRetryableLoadError(error) {
+    const loadError = error;
+    return loadError?.name === "ModelTransferLengthError" || loadError?.code === "MODEL_TRANSFER_LENGTH_ERROR" || this._isNonRecoverableStagingError(error);
+  }
   _isRecoverableWorkerFsError(error) {
     if (isCoreRetiredError(error) || error instanceof CoreAssetError || error instanceof SingleThreadCoreError || this._isNonRecoverableStagingError(error)) {
       return false;
@@ -9684,7 +9705,7 @@ var LlamaWebGpuBridge = class {
     } catch (error) {
       this._throwIfOperationCancelled(error, "Projector operation was cancelled.");
       this._throwIfWorkerCoreRetired(error);
-      if (!startedWithWorker || this._isNonRecoverableStagingError(error)) {
+      if (!startedWithWorker || this._isNonRetryableLoadError(error)) {
         throw error;
       }
       const reason = serializeWorkerError(error);
@@ -9702,7 +9723,7 @@ var LlamaWebGpuBridge = class {
           );
           return retryResult;
         } catch (retryError) {
-          if (this._isNonRecoverableStagingError(retryError)) {
+          if (this._isNonRetryableLoadError(retryError)) {
             throw retryError;
           }
           const retryReason = serializeWorkerError(retryError);
@@ -10967,11 +10988,12 @@ function installBridgeWorkerHost() {
     } catch (_) {
       state = void 0;
     }
+    const message = error instanceof Error ? error.message || error.name || "Worker request failed" : serializeWorkerError(error);
     const decisionErrorCode = decisionErrorCodeOf(error);
     self.postMessage({
       type: "error",
       id,
-      message: serializeWorkerError(error),
+      message,
       ...error instanceof EmbeddingError ? { embeddingErrorCode: error.code } : {},
       ...error instanceof CrossOriginIsolationError || error instanceof SingleThreadCoreError || error instanceof ModelUnloadedError ? { errorCode: error.code } : {},
       ...error instanceof Error && error.name === "ModelTransferLengthError" ? { errorCode: "MODEL_TRANSFER_LENGTH_ERROR" } : {},
