@@ -50,6 +50,7 @@ jobs:
     timeout-minutes: 330
     outputs:
       phase_artifact_id: ${{ steps.upload_phase.outputs.artifact-id }}
+      phase_sha256: ${{ steps.qualify_phase.outputs.sha256 }}
     env:
       LLAMA_WEBGPU_SPEECH_MODEL_URL: https://huggingface.co/ggml-org/Qwen3-ASR-0.6B-GGUF/resolve/928ab958557df9aa2ef1c93e0e83c7ad0933fae2/Qwen3-ASR-0.6B-Q8_0.gguf?download=true
       LLAMA_WEBGPU_SPEECH_MODEL_SHA256: bca259818b50ca7c4c05e9bdb35a5dc04fa039653a6d6f3f0f331f96f6aa1971
@@ -144,6 +145,10 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          if [[ ! "${CANDIDATE_ARTIFACT_ID}" =~ ^[1-9][0-9]*$ ]]; then
+            echo "error: candidate artifact ID must be a positive integer"
+            exit 1
+          fi
           mkdir -p "${RUNNER_TEMP}/candidate"
           gh api -H "Accept: application/vnd.github+json" \
             "repos/${BRIDGE_REPO}/actions/artifacts/${CANDIDATE_ARTIFACT_ID}/zip" \
@@ -250,6 +255,7 @@ jobs:
         run: npx --no-install playwright install --only-shell chromium
 
       - name: Run the Qwen3-ASR qualification gate
+        id: qualify_phase
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -264,6 +270,8 @@ jobs:
             --speech-timeout-seconds 5400 \
             --diagnostics-dir "${QUALIFICATION_DIAGNOSTICS_DIR}" \
             --output-phase "${RUNNER_TEMP}/phase/speech-to-text-phase.json"
+          digest="$(sha256sum "${RUNNER_TEMP}/phase/speech-to-text-phase.json")"
+          printf 'sha256=%s\n' "${digest%% *}" >> "${GITHUB_OUTPUT}"
 
       - name: Upload canonical phase record
         id: upload_phase
@@ -288,6 +296,7 @@ jobs:
     timeout-minutes: 330
     outputs:
       phase_artifact_id: ${{ steps.upload_phase.outputs.artifact-id }}
+      phase_sha256: ${{ steps.qualify_phase.outputs.sha256 }}
     env:
       LLAMA_WEBGPU_TTS_MODEL_URL: https://huggingface.co/ggml-org/Qwen3-TTS-12Hz-1.7B-Base-GGUF/resolve/ca27d74bc954b73dadab5b71ca265d87fc861a7c/Qwen3-TTS-12Hz-1.7B-Base-Q4_K_M.gguf?download=true
       LLAMA_WEBGPU_TTS_MODEL_SHA256: 8d18c94acb2addd042f97da63c98be144eafa76d0d9495177eab65130cf85129
@@ -380,6 +389,10 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          if [[ ! "${CANDIDATE_ARTIFACT_ID}" =~ ^[1-9][0-9]*$ ]]; then
+            echo "error: candidate artifact ID must be a positive integer"
+            exit 1
+          fi
           mkdir -p "${RUNNER_TEMP}/candidate"
           gh api -H "Accept: application/vnd.github+json" \
             "repos/${BRIDGE_REPO}/actions/artifacts/${CANDIDATE_ARTIFACT_ID}/zip" \
@@ -483,6 +496,7 @@ jobs:
         run: npx --no-install playwright install --only-shell chromium
 
       - name: Run the Qwen3-TTS qualification gate
+        id: qualify_phase
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -497,6 +511,8 @@ jobs:
             --tts-timeout-seconds 5400 \
             --diagnostics-dir "${QUALIFICATION_DIAGNOSTICS_DIR}" \
             --output-phase "${RUNNER_TEMP}/phase/text-to-speech-phase.json"
+          digest="$(sha256sum "${RUNNER_TEMP}/phase/text-to-speech-phase.json")"
+          printf 'sha256=%s\n' "${digest%% *}" >> "${GITHUB_OUTPUT}"
 
       - name: Upload canonical phase record
         id: upload_phase
@@ -604,6 +620,10 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          if [[ ! "${CANDIDATE_ARTIFACT_ID}" =~ ^[1-9][0-9]*$ ]]; then
+            echo "error: candidate artifact ID must be a positive integer"
+            exit 1
+          fi
           mkdir -p "${RUNNER_TEMP}/candidate"
           gh api -H "Accept: application/vnd.github+json" \
             "repos/${BRIDGE_REPO}/actions/artifacts/${CANDIDATE_ARTIFACT_ID}/zip" \
@@ -648,19 +668,51 @@ jobs:
           persist-credentials: false
           path: candidate-source
 
+      - name: Validate qualification phase artifact IDs
+        id: phase_artifacts
+        env:
+          SPEECH_ARTIFACT_ID: ${{ needs.qualify-asr.outputs.phase_artifact_id }}
+          TTS_ARTIFACT_ID: ${{ needs.qualify-tts.outputs.phase_artifact_id }}
+        run: |
+          set -euo pipefail
+          if [[ ! "${SPEECH_ARTIFACT_ID}" =~ ^[1-9][0-9]*$ || ! "${TTS_ARTIFACT_ID}" =~ ^[1-9][0-9]*$ ]]; then
+            echo "error: qualification shards must provide positive artifact IDs"
+            exit 1
+          fi
+          if [ "${SPEECH_ARTIFACT_ID}" = "${TTS_ARTIFACT_ID}" ]; then
+            echo "error: qualification phase artifact IDs must be distinct"
+            exit 1
+          fi
+          printf 'speech_id=%s\ntts_id=%s\n' "${SPEECH_ARTIFACT_ID}" "${TTS_ARTIFACT_ID}" >> "${GITHUB_OUTPUT}"
+
       - name: Download the exact ASR phase record
         uses: actions/download-artifact@v4
         with:
-          artifact-ids: ${{ needs.qualify-asr.outputs.phase_artifact_id }}
+          artifact-ids: ${{ steps.phase_artifacts.outputs.speech_id }}
           merge-multiple: true
           path: ${{ runner.temp }}/phases/speech
 
       - name: Download the exact TTS phase record
         uses: actions/download-artifact@v4
         with:
-          artifact-ids: ${{ needs.qualify-tts.outputs.phase_artifact_id }}
+          artifact-ids: ${{ steps.phase_artifacts.outputs.tts_id }}
           merge-multiple: true
           path: ${{ runner.temp }}/phases/tts
+
+      - name: Verify phase bytes against the qualification shards
+        id: verify_phase_bytes
+        env:
+          SPEECH_SHA256: ${{ needs.qualify-asr.outputs.phase_sha256 }}
+          TTS_SHA256: ${{ needs.qualify-tts.outputs.phase_sha256 }}
+        run: |
+          set -euo pipefail
+          if [[ ! "${SPEECH_SHA256}" =~ ^[0-9a-f]{64}$ || ! "${TTS_SHA256}" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "error: qualification shards must provide SHA-256 digests"
+            exit 1
+          fi
+          cd "${RUNNER_TEMP}/phases"
+          printf '%s  speech/speech-to-text-phase.json\n%s  tts/text-to-speech-phase.json\n' \
+            "${SPEECH_SHA256}" "${TTS_SHA256}" | sha256sum -c -
 
       - name: Assemble the canonical qualification attestation
         env:

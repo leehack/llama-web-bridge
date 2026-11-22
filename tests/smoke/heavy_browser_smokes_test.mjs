@@ -22,8 +22,7 @@ const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'heavy-browser-smokes-test-'))
 process.on('exit', () => fs.rmSync(tmp, { recursive: true, force: true }));
 const sha256 = (bytes) => createHash('sha256').update(bytes).digest('hex');
 
-{
-  const generatingSamples = 136320;
+for (const invalidStage of ['synthesize-streamed', 'cancel-streamed']) {
   const pcm = new Float32Array(140160).fill(0.125);
   const sampleRate = 24000;
   const channels = 1;
@@ -45,6 +44,8 @@ const sha256 = (bytes) => createHash('sha256').update(bytes).digest('hex');
       };
       failIfAborted();
       if (streamAudio) {
+        const stage = signal ? 'cancel-streamed' : 'synthesize-streamed';
+        const generatingSamples = stage === invalidStage ? 136320 : 138240;
         const chunk = (state, start, end) => {
           onProgress({ state, sampleOffset: start, pcm: pcm.subarray(start, end), sampleRate, channels });
           failIfAborted();
@@ -71,7 +72,7 @@ const sha256 = (bytes) => createHash('sha256').update(bytes).digest('hex');
     document: { getElementById: () => ({}) },
     console: { log() {} },
   });
-  assert.equal(window.__smokeStage, 'wasm64:direct:synthesize-streamed');
+  assert.equal(window.__smokeStage, `wasm64:direct:${invalidStage}`);
   assert.equal(window.__smokeResult.ok, false);
   assert.match(window.__smokeResult.error, /unexpected generating PCM window length: 136320/u);
 }

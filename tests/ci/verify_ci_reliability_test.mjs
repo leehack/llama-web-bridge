@@ -1,5 +1,8 @@
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
+import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
 import { parse as parseYaml, stringify as stringifyYaml } from 'yaml';
@@ -1022,17 +1025,17 @@ test('candidate contract rejects an optional release gate', () => {
 });
 
 test('qualification contract rejects missing shards and name-only phase downloads', () => {
-  for (const job of ['qualify-asr', 'qualify-tts']) {
+  for (const [job, output] of [['qualify-asr', 'speech_id'], ['qualify-tts', 'tts_id']]) {
     checkReleaseWorkflowMutation(QUALIFICATION_PATH,
       (jobs) => { jobs.attest.needs = jobs.attest.needs.filter((need) => need !== job); },
       'attest must depend on both');
     checkReleaseWorkflowMutation(QUALIFICATION_PATH, (jobs) => {
-      const step = jobs.attest.steps.find((step) => step.with?.['artifact-ids']?.includes(job));
+      const step = jobs.attest.steps.find((step) => step.with?.['artifact-ids']?.includes(output));
       delete step.with['artifact-ids'];
       step.with.name = 'phase';
     }, 'by immutable artifact id');
     checkReleaseWorkflowMutation(QUALIFICATION_PATH, (jobs) => {
-      const step = jobs.attest.steps.find((step) => step.with?.['artifact-ids']?.includes(job));
+      const step = jobs.attest.steps.find((step) => step.with?.['artifact-ids']?.includes(output));
       delete step.with['merge-multiple'];
     }, 'by immutable artifact id');
   }
@@ -1058,4 +1061,130 @@ test('qualification contract requires all model URLs and digests in its shards',
       }
     }
   }
+});
+
+test('release artifact contracts reject removing digests or bypassing ID guards', () => {
+  for (const [workflow, job, verifyId, message] of [
+    [CANDIDATE_PATH, 'gate-and-package', 'verify_core_bytes', 'verify downloaded core bytes'],
+    [QUALIFICATION_PATH, 'attest', 'verify_phase_bytes', 'verify downloaded phase bytes'],
+  ]) {
+    checkReleaseWorkflowMutation(workflow, (jobs) => {
+      jobs[job].steps = jobs[job].steps.filter((step) => step.id !== verifyId);
+    }, message);
+  }
+  checkReleaseWorkflowMutation(CANDIDATE_PATH, (jobs) => {
+    const guard = jobs['gate-and-package'].steps.find((step) => step.id === 'core_artifacts');
+    guard.run = guard.run.replace('^[1-9][0-9]*:', '^[0-9]*:');
+  }, 'guard positive, distinct core artifact IDs');
+  checkReleaseWorkflowMutation(CANDIDATE_PATH, (jobs) => {
+    const guard = jobs['gate-and-package'].steps.find((step) => step.id === 'core_artifacts');
+    guard.run = guard.run.replace('",${ids}," == *",${id},"*', '1 == 0');
+  }, 'guard positive, distinct core artifact IDs');
+  for (const replacement of ['""', "'invalid'", '${{ needs.qualify-asr.outputs.phase_artifact_id }}']) {
+    checkReleaseWorkflowMutation(QUALIFICATION_PATH, (jobs) => {
+      jobs.attest.steps.find((step) => step.id === 'phase_artifacts').env.TTS_ARTIFACT_ID = replacement;
+    }, 'download the text_to_speech record by immutable artifact id');
+  }
+  checkReleaseWorkflowMutation(QUALIFICATION_PATH, (jobs) => {
+    const guard = jobs.attest.steps.find((step) => step.id === 'phase_artifacts');
+    guard.run = guard.run.replace('"${SPEECH_ARTIFACT_ID}" = "${TTS_ARTIFACT_ID}"', '1 = 0');
+  }, 'guard positive, distinct phase artifact IDs');
+  for (const job of ['qualify-asr', 'qualify-tts', 'attest']) {
+    checkReleaseWorkflowMutation(QUALIFICATION_PATH, (jobs) => {
+      const step = jobs[job].steps.find((entry) => entry.name === 'Download the exact candidate artifact');
+      step.run = step.run.replace('^[1-9][0-9]*$', '^[0-9]*$');
+    }, `job ${job} must guard a positive candidate artifact ID`);
+  }
+});
+
+function replayTransfer(t) {
+  const directory = mkdtempSync(path.join(tmpdir(), 'rcs-artifact-test-'));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const output = path.join(directory, 'step-output');
+  const run = (step, env) => {
+    assert.ok(step?.run, 'workflow transfer script is required');
+    writeFileSync(output, '');
+    const result = spawnSync('bash', ['-c', step.run], {
+      encoding: 'utf8',
+      env: { ...process.env, RUNNER_TEMP: directory, GITHUB_OUTPUT: output, ...env },
+    });
+    assert.ifError(result.error);
+    return { status: result.status, output: readFileSync(output, 'utf8'), logs: result.stdout + result.stderr };
+  };
+  return { directory, run };
+}
+
+test('candidate transfer verifies staged pairs and requires four positive, distinct IDs', (t) => {
+  const jobs = parseYaml(read(CANDIDATE_PATH)).jobs;
+  const stage = jobs['build-core'].steps.find((step) => step.id === 'stage_core');
+  const guard = jobs['gate-and-package'].steps.find((step) => step.id === 'core_artifacts');
+  const verify = jobs['gate-and-package'].steps.find((step) => step.id === 'verify_core_bytes');
+  const { directory, run } = replayTransfer(t);
+  const dist = path.join(directory, 'dist');
+  const staging = path.join(directory, 'candidate-core');
+  mkdirSync(dist);
+  const env = { OUT_DIR: dist };
+  const files = [];
+  const cells = [['wasm32', ''], ['wasm64', '_mem64'], ['wasm32_st', '_st'], ['wasm64_st', '_mem64_st']];
+  for (const [index, [variant, suffix]] of cells.entries()) {
+    const pair = [`llama_webgpu_core${suffix}.js`, `llama_webgpu_core${suffix}.wasm`];
+    for (const name of pair) writeFileSync(path.join(dist, name), name);
+    const staged = run(stage, { ...env, VARIANT: variant });
+    assert.equal(staged.status, 0, staged.logs);
+    assert.match(staged.output, /^sha256=[0-9a-f]{64}\n$/u);
+    env[`CORE_${variant.toUpperCase()}`] = `${301 + index}:${staged.output.slice(7).trim()}`;
+    for (const name of pair) copyFileSync(path.join(staging, name), path.join(dist, name));
+    files.push(...pair);
+    rmSync(staging, { recursive: true });
+  }
+  const allowed = run(guard, env);
+  assert.equal(allowed.status, 0, allowed.logs);
+  assert.equal(allowed.output, 'ids=301,302,303,304\n');
+  const digest = env.CORE_WASM64_ST.split(':')[1];
+  for (const report of ['', `:${digest}`, `0:${digest}`, `abc:${digest}`, `301:${digest}`]) {
+    const denied = run(guard, { ...env, CORE_WASM64_ST: report });
+    assert.equal(denied.status, 1, report);
+    assert.equal(denied.output, '');
+  }
+  assert.equal(run(verify, env).status, 0);
+  for (const name of files) {
+    const file = path.join(dist, name);
+    writeFileSync(file, 'modified download');
+    assert.equal(run(verify, env).status, 1, name);
+    writeFileSync(file, name);
+  }
+});
+
+test('qualification transfer verifies both phase files and requires two positive, distinct IDs', (t) => {
+  const steps = parseYaml(read(QUALIFICATION_PATH)).jobs.attest.steps;
+  const guard = steps.find((step) => step.id === 'phase_artifacts');
+  const verify = steps.find((step) => step.id === 'verify_phase_bytes');
+  const { directory, run } = replayTransfer(t);
+  const allowed = run(guard, { SPEECH_ARTIFACT_ID: '701', TTS_ARTIFACT_ID: '702' });
+  assert.equal(allowed.status, 0, allowed.logs);
+  assert.equal(allowed.output, 'speech_id=701\ntts_id=702\n');
+  for (const [speech, tts] of [['', '702'], ['701', ''], ['invalid', '702'], ['701', '7e2'], ['701', '0'], ['701', '701']]) {
+    const denied = run(guard, { SPEECH_ARTIFACT_ID: speech, TTS_ARTIFACT_ID: tts });
+    assert.equal(denied.status, 1, JSON.stringify([speech, tts]));
+    assert.equal(denied.output, '');
+  }
+
+  const files = { SPEECH_SHA256: 'speech/speech-to-text-phase.json', TTS_SHA256: 'tts/text-to-speech-phase.json' };
+  const phaseRoot = path.join(directory, 'phases');
+  const env = {};
+  for (const [role, name] of Object.entries(files)) {
+    const file = path.join(phaseRoot, name);
+    mkdirSync(path.dirname(file), { recursive: true });
+    writeFileSync(file, name);
+    env[role] = createHash('sha256').update(name).digest('hex');
+  }
+  const matched = run(verify, env);
+  assert.equal(matched.status, 0, matched.logs);
+  for (const name of Object.values(files)) {
+    const file = path.join(phaseRoot, name);
+    writeFileSync(file, 'modified download');
+    assert.equal(run(verify, env).status, 1, name);
+    writeFileSync(file, name);
+  }
+  assert.equal(run(verify, { ...env, TTS_SHA256: '' }).status, 1);
 });

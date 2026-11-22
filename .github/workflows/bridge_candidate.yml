@@ -324,6 +324,11 @@ jobs:
     name: Build candidate core (${{ matrix.variant }})
     needs: [validate-inputs]
     runs-on: ubuntu-latest
+    outputs:
+      wasm32: ${{ matrix.variant == 'wasm32' && format('{0}:{1}', steps.upload_core.outputs.artifact-id, steps.stage_core.outputs.sha256) || '' }}
+      wasm64: ${{ matrix.variant == 'wasm64' && format('{0}:{1}', steps.upload_core.outputs.artifact-id, steps.stage_core.outputs.sha256) || '' }}
+      wasm32_st: ${{ matrix.variant == 'wasm32_st' && format('{0}:{1}', steps.upload_core.outputs.artifact-id, steps.stage_core.outputs.sha256) || '' }}
+      wasm64_st: ${{ matrix.variant == 'wasm64_st' && format('{0}:{1}', steps.upload_core.outputs.artifact-id, steps.stage_core.outputs.sha256) || '' }}
     strategy:
       fail-fast: true
       matrix:
@@ -436,6 +441,7 @@ jobs:
           ./scripts/build/build_bridge.sh
 
       - name: Stage the exact core pair for upload
+        id: stage_core
         env:
           OUT_DIR: ${{ runner.temp }}/webgpu_bridge_dist
           VARIANT: ${{ matrix.variant }}
@@ -451,8 +457,12 @@ jobs:
           mkdir "${RUNNER_TEMP}/candidate-core"
           cp "${OUT_DIR}/llama_webgpu_core${suffix}.js" \
             "${OUT_DIR}/llama_webgpu_core${suffix}.wasm" "${RUNNER_TEMP}/candidate-core/"
+          cd "${RUNNER_TEMP}/candidate-core"
+          digest="$(sha256sum "llama_webgpu_core${suffix}.js" "llama_webgpu_core${suffix}.wasm" | sha256sum)"
+          printf 'sha256=%s\n' "${digest%% *}" >> "${GITHUB_OUTPUT}"
 
       - name: Upload compiled core variant
+        id: upload_core
         uses: actions/upload-artifact@v4
         with:
           name: candidate-core-${{ matrix.variant }}
@@ -465,6 +475,10 @@ jobs:
     needs: [validate-inputs, validate-js, build-core]
     runs-on: ubuntu-latest
     env:
+      CORE_WASM32: ${{ needs.build-core.outputs.wasm32 }}
+      CORE_WASM64: ${{ needs.build-core.outputs.wasm64 }}
+      CORE_WASM32_ST: ${{ needs.build-core.outputs.wasm32_st }}
+      CORE_WASM64_ST: ${{ needs.build-core.outputs.wasm64_st }}
       LLAMA_WEBGPU_SMOKE_MODEL_URL: https://huggingface.co/aladar/llama-2-tiny-random-GGUF/resolve/main/llama-2-tiny-random.gguf
       LLAMA_WEBGPU_SMOKE_MODEL_SHA256: 81f226c62d28ed4a1a9b9fa080fcd9f0cc40e0f9d5680036583ff98fbcd035cb
       LLAMA_WEBGPU_SMOKE_MODEL_CACHE: ~/.cache/llama-web-bridge/state-smoke-models
@@ -574,12 +588,49 @@ jobs:
           echo "EMSCRIPTEN_VERSION=${EMSCRIPTEN_VERSION}" >> "${GITHUB_ENV}"
           echo "emscripten_version=${EMSCRIPTEN_VERSION}" >> "${GITHUB_OUTPUT}"
 
+      - name: Validate candidate core artifact IDs and digests
+        id: core_artifacts
+        run: |
+          set -euo pipefail
+          ids=""
+          for core in "${CORE_WASM32}" "${CORE_WASM64}" "${CORE_WASM32_ST}" "${CORE_WASM64_ST}"; do
+            if [[ ! "${core}" =~ ^[1-9][0-9]*:[0-9a-f]{64}$ ]]; then
+              echo "error: each core job must provide a positive artifact ID and SHA-256"
+              exit 1
+            fi
+            id="${core%%:*}"
+            if [[ ",${ids}," == *",${id},"* ]]; then
+              echo "error: candidate core artifact IDs must be distinct"
+              exit 1
+            fi
+            ids="${ids:+${ids},}${id}"
+          done
+          printf 'ids=%s\n' "${ids}" >> "${GITHUB_OUTPUT}"
+
       - name: Download compiled candidate cores
         uses: actions/download-artifact@v4
         with:
-          pattern: candidate-core-*
+          artifact-ids: ${{ steps.core_artifacts.outputs.ids }}
           merge-multiple: true
           path: ${{ runner.temp }}/webgpu_bridge_dist
+
+      - name: Verify candidate core bytes against the build jobs
+        id: verify_core_bytes
+        env:
+          OUT_DIR: ${{ runner.temp }}/webgpu_bridge_dist
+        run: |
+          set -euo pipefail
+          cd "${OUT_DIR}"
+          suffixes=("" _mem64 _st _mem64_st)
+          expected=("${CORE_WASM32#*:}" "${CORE_WASM64#*:}" "${CORE_WASM32_ST#*:}" "${CORE_WASM64_ST#*:}")
+          for index in "${!suffixes[@]}"; do
+            suffix="${suffixes[index]}"
+            digest="$(sha256sum "llama_webgpu_core${suffix}.js" "llama_webgpu_core${suffix}.wasm" | sha256sum)"
+            if [ "${digest%% *}" != "${expected[index]}" ]; then
+              echo "error: downloaded core pair does not match its build job (suffix: ${suffix})"
+              exit 1
+            fi
+          done
 
       - name: Assemble the candidate distribution
         env:
