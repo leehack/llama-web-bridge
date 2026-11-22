@@ -581,9 +581,12 @@ When a multimodal worker reports `ModelTransferLengthError` or an active
 `ModelStagingError` during setup, restore, or completion, `createCompletion()`
 rejects with that typed error. The error triggers neither a worker restart nor a
 main-thread fallback. Warmup calls (`warmup: true`) skip these failures and return
-`''` without extra restarts. An optional draft model is the exception: if its
-reload fails after a worker restart, the bridge warns, forgets the draft and
-continues the completion (see [Draft models](#draft-models)).
+`''` without extra restarts. An optional draft model is the exception: when its
+reload after a worker restart fails with a load error, including these typed
+errors, the bridge warns, forgets the draft and continues the completion (see
+[Draft models](#draft-models)). A native core abort or a cancelled `signal`
+during that reload instead follows [Native core aborts](#native-core-aborts) and
+[Cancellation while queued](#cancellation-while-queued).
 
 `thinkingBudget.naturalEndTags` is the complete ordered list of natural ends,
 including any normal close. Supply a non-empty array to use this option, which
