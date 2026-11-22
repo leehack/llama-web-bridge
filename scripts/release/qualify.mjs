@@ -61,6 +61,7 @@ import { rejectDuplicateKeys } from './contract.mjs';
 import { osErrorString, pyExpanduser, pyResolve } from './python_compat.mjs';
 import {
   EXPECTED_SPEECH_TRANSCRIPT,
+  HEAVY_GATES,
   MAX_ATTESTATION_BYTES,
   SPEECH_AUDIO_SHA256,
   SPEECH_MMPROJ_SHA256,
@@ -70,9 +71,12 @@ import {
   TTS_MODEL_SHA256,
   TTS_SMOKE,
   buildAttestation,
+  buildPhaseRecord,
   canonicalJson,
   fetchCandidate,
   loadCandidate,
+  loadPhaseRecord,
+  mergeQualificationEnvironments,
   normalizeTranscript,
   parseCancellationResult,
   qualificationEnvironment,
@@ -83,6 +87,7 @@ import {
   requireStr,
   sanitizeDiagnosticStdout,
   sanitizeDiagnosticText,
+  validatePhaseRecord,
   verifyAttestation,
 } from './qualification.mjs';
 import { readWavIdentity } from './wav.mjs';
@@ -951,8 +956,62 @@ function defaultStdout(text) {
 // stderr as Python prints it. `deps` replaces what the Python tests patch:
 // every collaborator by its camelCase name, plus `scriptsDir` and a `stderr`
 // writer.
-export async function qualifyCmd(args, write = defaultStdout, deps = {}) {
-  const use = {
+async function runSpeechGate({
+  use, args, node,
+  scriptsDir,
+  candidateDir, diagnosticsDir, speechArtifacts, speechModel, speechMmproj, speechAudio,
+}) {
+  const speechPayload = await use.runSmoke(
+    [
+      node,
+      pyJoinPath(scriptsDir, SPEECH_SMOKE),
+      '--dist-dir', candidateDir,
+      '--model-path', speechModel,
+      '--model-sha256', SPEECH_MODEL_SHA256,
+      '--mmproj-path', speechMmproj,
+      '--mmproj-sha256', SPEECH_MMPROJ_SHA256,
+      '--audio-path', speechAudio,
+      '--audio-sha256', SPEECH_AUDIO_SHA256,
+      '--memory-mode', 'all',
+      '--timeout-ms', String(pyIntMultiply(args.speechTimeoutSeconds, 1000)),
+      '--artifacts-dir', speechArtifacts,
+    ],
+    'speech-to-text',
+    diagnosticsDir,
+    { timeoutSeconds: Number(pyIntAdd(args.speechTimeoutSeconds, 60)), stderr: use.stderr },
+  );
+  return use.speechPhase(speechPayload, use.maxRssBytes());
+}
+
+async function runTtsGate({
+  use, args, node,
+  scriptsDir,
+  candidateDir, diagnosticsDir, ttsArtifacts, ttsModel, ttsMmproj,
+}) {
+  const ttsPayload = await use.runSmoke(
+    [
+      node,
+      pyJoinPath(scriptsDir, TTS_SMOKE),
+      '--dist-dir', candidateDir,
+      '--model-path', ttsModel,
+      '--model-sha256', TTS_MODEL_SHA256,
+      '--mmproj-path', ttsMmproj,
+      '--mmproj-sha256', TTS_MMPROJ_SHA256,
+      '--memory-mode', 'wasm64',
+      '--runtime-mode', 'all',
+      '--max-frames', String(args.ttsMaxFrames),
+      '--timeout-ms', String(pyIntMultiply(args.ttsTimeoutSeconds, 1000)),
+      '--artifacts-dir', ttsArtifacts,
+    ],
+    'text-to-speech',
+    diagnosticsDir,
+    { timeoutSeconds: Number(pyIntAdd(args.ttsTimeoutSeconds, 60)), stderr: use.stderr },
+  );
+  return use.ttsPhase(ttsPayload, use.maxRssBytes(), ttsArtifacts);
+}
+
+function qualificationDependencies(deps) {
+  return {
     nodeExecutable,
     qualificationEnvironment,
     qualificationRunIdentity,
@@ -969,6 +1028,10 @@ export async function qualifyCmd(args, write = defaultStdout, deps = {}) {
     stderr: defaultStderr,
     ...deps,
   };
+}
+
+export async function qualifyCmd(args, write = defaultStdout, deps = {}) {
+  const use = qualificationDependencies(deps);
   const scriptsDir = deps.scriptsDir ?? SCRIPTS_DIR;
   const print = (text) => use.stderr(`${text}\n`);
   const node = await use.nodeExecutable();
@@ -1010,48 +1073,18 @@ export async function qualifyCmd(args, write = defaultStdout, deps = {}) {
     print(`Candidate fingerprint ${fingerprint}`);
 
     print('Running Qwen3-ASR wasm32+wasm64 direct+worker gate');
-    const speechPayload = await use.runSmoke(
-      [
-        node,
-        pyJoinPath(scriptsDir, SPEECH_SMOKE),
-        '--dist-dir', candidateDir,
-        '--model-path', speechModel,
-        '--model-sha256', SPEECH_MODEL_SHA256,
-        '--mmproj-path', speechMmproj,
-        '--mmproj-sha256', SPEECH_MMPROJ_SHA256,
-        '--audio-path', speechAudio,
-        '--audio-sha256', SPEECH_AUDIO_SHA256,
-        '--memory-mode', 'all',
-        '--timeout-ms', String(pyIntMultiply(args.speechTimeoutSeconds, 1000)),
-        '--artifacts-dir', speechArtifacts,
-      ],
-      'speech-to-text',
-      diagnosticsDir,
-      { timeoutSeconds: Number(pyIntAdd(args.speechTimeoutSeconds, 60)), stderr: use.stderr },
-    );
-    const speech = await use.speechPhase(speechPayload, use.maxRssBytes());
+    const speech = await runSpeechGate({
+      use, args, node,
+      scriptsDir,
+      candidateDir, diagnosticsDir, speechArtifacts, speechModel, speechMmproj, speechAudio,
+    });
 
     print('Running Qwen3-TTS wasm64 direct+worker gate');
-    const ttsPayload = await use.runSmoke(
-      [
-        node,
-        pyJoinPath(scriptsDir, TTS_SMOKE),
-        '--dist-dir', candidateDir,
-        '--model-path', ttsModel,
-        '--model-sha256', TTS_MODEL_SHA256,
-        '--mmproj-path', ttsMmproj,
-        '--mmproj-sha256', TTS_MMPROJ_SHA256,
-        '--memory-mode', 'wasm64',
-        '--runtime-mode', 'all',
-        '--max-frames', String(args.ttsMaxFrames),
-        '--timeout-ms', String(pyIntMultiply(args.ttsTimeoutSeconds, 1000)),
-        '--artifacts-dir', ttsArtifacts,
-      ],
-      'text-to-speech',
-      diagnosticsDir,
-      { timeoutSeconds: Number(pyIntAdd(args.ttsTimeoutSeconds, 60)), stderr: use.stderr },
-    );
-    const tts = await use.ttsPhase(ttsPayload, use.maxRssBytes(), ttsArtifacts);
+    const tts = await runTtsGate({
+      use, args, node,
+      scriptsDir,
+      candidateDir, diagnosticsDir, ttsArtifacts, ttsModel, ttsMmproj,
+    });
 
     const attestation = await use.buildAttestation({
       manifest,
@@ -1090,6 +1123,128 @@ export async function qualifyCmd(args, write = defaultStdout, deps = {}) {
   pyWriteText(outputAttestation, canonical);
   write(canonical);
   print(`Canonical attestation written to ${outputAttestation}`);
+  return 0;
+}
+
+async function loadQualificationCandidate(args, use, directory, harnessDirectory, run) {
+  const [candidateArtifactId, candidateRunAttempt] = await use.fetchCandidate(args.candidateRunId, directory);
+  const [manifest, candidateFingerprint] = await use.loadCandidate(directory);
+  const harnessDigest = await use.requireHarnessMatchesBridgeSource(
+    harnessDirectory,
+    requireStr(manifest, 'bridge_commit', 'candidate manifest'),
+  );
+  return {
+    manifest,
+    candidateFingerprint,
+    candidateRunId: args.candidateRunId,
+    candidateArtifactId,
+    candidateRunAttempt,
+    qualificationRunId: run.qualification_run_id,
+    qualificationRunAttempt: run.qualification_run_attempt,
+    qualificationSourceSha: run.qualification_source_sha,
+    harnessDigest,
+  };
+}
+
+function phaseInputFile(filename, label) {
+  if (filename === null || filename === undefined) throw new ContractError(`${label} is required for this phase`);
+  return requireInputFile(filename, label);
+}
+
+export async function qualifyPhaseCmd(args, write = defaultStdout, deps = {}) {
+  const phaseName = args.phase;
+  if (!HEAVY_GATES.includes(phaseName)) throw new ContractError(`unknown qualification phase: ${phaseName}`);
+  const use = qualificationDependencies(deps);
+  const scriptsDir = deps.scriptsDir ?? SCRIPTS_DIR;
+  const node = await use.nodeExecutable();
+  const environment = await use.qualificationEnvironment();
+  const run = await use.qualificationRunIdentity();
+
+  const speech = phaseName === 'speech_to_text';
+  if (!speech && args.ttsMaxFrames <= 0) throw new ContractError('tts_max_frames must be positive');
+  if ((speech ? args.speechTimeoutSeconds : args.ttsTimeoutSeconds) <= 0) {
+    throw new ContractError('qualification gate timeouts must be positive');
+  }
+  const inputs = speech ? {
+    speechModel: phaseInputFile(args.speechModelPath, 'Qwen3-ASR model'),
+    speechMmproj: phaseInputFile(args.speechMmprojPath, 'Qwen3-ASR projector'),
+    speechAudio: phaseInputFile(args.speechAudioPath, 'speech WAV fixture'),
+  } : {
+    ttsModel: phaseInputFile(args.ttsModelPath, 'Qwen3-TTS model'),
+    ttsMmproj: phaseInputFile(args.ttsMmprojPath, 'Qwen3-TTS projector'),
+  };
+
+  const root = makeTempDirectory('llama-web-bridge-qualification-');
+  let record;
+  try {
+    const candidateDir = pyJoinPath(root, 'candidate');
+    const diagnosticsDir = args.diagnosticsDir !== null && args.diagnosticsDir !== undefined
+      ? pyResolve(pyExpanduser(pyPath(String(args.diagnosticsDir))))
+      : makeTempDirectory('llama-web-bridge-qualification-diag-');
+    pyMkdirParents(diagnosticsDir);
+    use.stderr(`Sanitized diagnostics directory ${diagnosticsDir}\n`);
+    use.stderr(`Downloading candidate artifact from run ${args.candidateRunId}\n`);
+    const identity = await loadQualificationCandidate(
+      args, use, candidateDir,
+      scriptsDir,
+      run,
+    );
+    use.stderr(`Candidate fingerprint ${identity.candidateFingerprint}\n`);
+    const gateOptions = {
+      use, args, node,
+      scriptsDir,
+      candidateDir, diagnosticsDir, ...inputs,
+    };
+    const phase = speech
+      ? await runSpeechGate({ ...gateOptions, speechArtifacts: pyJoinPath(diagnosticsDir, 'speech-to-text') })
+      : await runTtsGate({ ...gateOptions, ttsArtifacts: pyJoinPath(diagnosticsDir, 'text-to-speech') });
+    record = buildPhaseRecord(phaseName, identity, environment, phase);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+  return writeCanonicalRecord(record, args.outputPhase, 'phase record', write, use);
+}
+
+export async function assembleAttestationCmd(args, write = defaultStdout, deps = {}) {
+  const use = qualificationDependencies(deps);
+  const scriptsDir = deps.scriptsDir ?? SCRIPTS_DIR;
+  const assembler = await use.qualificationEnvironment();
+  const run = await use.qualificationRunIdentity();
+  const root = makeTempDirectory('llama-web-bridge-qualification-');
+  let attestation;
+  try {
+    const candidateDir = pyJoinPath(root, 'candidate');
+    const identity = await loadQualificationCandidate(
+      args, use, candidateDir,
+      scriptsDir,
+      run,
+    );
+    const speech = loadPhaseRecord(args.speechPhase);
+    const tts = loadPhaseRecord(args.ttsPhase);
+    const speechPhase = validatePhaseRecord(speech, 'speech_to_text', identity);
+    const ttsPhase = validatePhaseRecord(tts, 'text_to_speech', identity);
+    const environment = mergeQualificationEnvironments(
+      pyGet(speech, 'qualification_environment'),
+      pyGet(tts, 'qualification_environment'),
+      assembler,
+    );
+    attestation = await use.buildAttestation({ ...identity, environment, speechPhase, ttsPhase });
+    await use.verifyAttestation({ ...identity, attestation, candidateDir });
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+  return writeCanonicalRecord(attestation, args.outputAttestation, 'attestation', write, use);
+}
+
+async function writeCanonicalRecord(record, output, label, write, use) {
+  const canonical = await use.canonicalJson(record);
+  if (Buffer.byteLength(canonical, 'utf8') > MAX_ATTESTATION_BYTES) {
+    throw new ContractError(`${label} exceeds the ${MAX_ATTESTATION_BYTES}-byte artifact bound`);
+  }
+  const filename = pyPath(String(output));
+  pyWriteText(filename, canonical);
+  write(canonical);
+  use.stderr(`Canonical ${label} written to ${filename}\n`);
   return 0;
 }
 

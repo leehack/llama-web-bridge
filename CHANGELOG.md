@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Build WebGPU release cores in parallel and qualify speech recognition and synthesis concurrently.
+
 ## v0.1.92 - 2026-11-22
 
 - Add `LlamaWebGpuBridge.supportsJsBackedModelStaging`. Explicit JS-backed model and projector loads reject with `MODEL_STAGING_UNSUPPORTED` when the worker lacks the staging capability flag.

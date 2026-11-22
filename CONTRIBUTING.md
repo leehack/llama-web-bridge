@@ -565,6 +565,14 @@ starting alphanumeric, such as `manual-v0.1.83`. The input keeps its historical
 name `orchestrator_correlation_id` because published manifests and release
 notes record it.
 
+The candidate workflow builds all four WebGPU cores in parallel from clean
+source without CI artifacts or compiler caches. It runs the JS contract
+checks once, then packages the verified wrappers and compiled cores after
+running the hosted smoke gates. The qualification workflow runs the ASR and
+TTS gates in parallel against that candidate, then assembles and re-verifies
+the canonical attestation. Every job in both workflows checks that it is
+running on the first attempt.
+
 Before dispatching `bridge_candidate.yml` for `vX.Y.Z`, merge a release-prep
 PR that moves the changelog entries under `## Unreleased` to
 `## vX.Y.Z - YYYY-MM-DD` using the planned release date. Keep an empty
