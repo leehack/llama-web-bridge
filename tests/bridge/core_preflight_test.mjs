@@ -1124,7 +1124,37 @@ for (const mode of ['direct', 'worker']) {
     assert.deepEqual(lines, [expected, expected, expected, expected]);
   });
 
+  const punctuation = [...'.,;:!?'];
+  const pairs = punctuation.flatMap((first) => punctuation.map((second) => first + second));
+  const triples = pairs.flatMap((pair) => punctuation.map((last) => pair + last));
+  const runs = [...punctuation, ...pairs, ...triples, ...punctuation.map((char) => char.repeat(64))];
+  const terminators = [
+    '', ' next', '\tnext', '\nnext', '\u00a0next', '\u2028next',
+    '"', "'", '`', '‘', '’', '“', '”', ')', ']', '}', '>',
+  ];
+  const punctuationCases = runs.flatMap((run) => terminators.map((terminator) => {
+    const tail = run + terminator;
+    return [`core.wasm?v=42${tail}`, `${base}core.wasm${tail}`];
+  }));
+
   for (const [name, wasmUrl, cases] of [
+    ['localized sentence punctuation', 'core.wasm?v=42', [
+      ['El mensaje decía: «¿Se cargó core.wasm?v=42?»', `El mensaje decía: «¿Se cargó ${base}core.wasm?»`],
+      ['表示は「Failed to load core.wasm?v=42.」です。', `表示は「Failed to load ${base}core.wasm.」です。`],
+      ['状態（Failed to load core.wasm?v=42.）', `状態（Failed to load ${base}core.wasm.）`],
+      ['core.wasm.bak'],
+      ['core.wasm2'],
+      ['foo=core.wasm.bak'],
+      ['vendor-core.wasm'],
+      ['core.wasm?v=42.bak'],
+      ['core.wasm?v=42.wasm2'],
+      ['core.wasm?v=42.山'],
+      ['core.wasm?v=42.?𠮷'],
+      ['core.wasm?v=42.&next'],
+      ['core.wasm?v=42.#next'],
+      ['core.wasm?v=42.=next'],
+    ]],
+    ['sentence punctuation and terminator matrix', 'core.wasm?v=42', punctuationCases],
     ['sentence punctuation after a registered URL', 'core.wasm?sig=S', [
       ['Failed to load core.wasm?sig=S.', `Failed to load ${base}core.wasm.`],
       ['core.wasm?sig=S. Next', `${base}core.wasm. Next`],

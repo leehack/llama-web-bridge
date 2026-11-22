@@ -47,7 +47,7 @@ const HTTP_URL_START = /\bhttps?:\/\//gi;
 const URL_TEXT_DELIMITER = /[\s"'<>`‘’“”]/;
 const URL_PATH_CHARACTER = /[\p{L}\p{N}\p{M}._~%+\/-]/u;
 const URL_QUERY_CONTINUATION = /[?&#=]/;
-const URL_SENTENCE_BOUNDARY = /^[.,;:!?]+(?:$|[\s"'`‘’“”)\]}>])/;
+const URL_SENTENCE_PUNCTUATION = /^[.,;:!?]+/;
 
 function absoluteUrlEnd(message: string, start: number): number {
   const delimiter = message.slice(start).search(URL_TEXT_DELIMITER);
@@ -89,12 +89,17 @@ function atUrlStart(message: string, start: number): boolean {
   return !URL_PATH_CHARACTER.test(previous);
 }
 
-function atUrlEnd(message: string, end: number): boolean {
-  const codePoint = message.codePointAt(end);
-  if (codePoint === undefined) return true;
+function continuesUrl(message: string, index: number): boolean {
+  const codePoint = message.codePointAt(index);
+  if (codePoint === undefined) return false;
   const next = String.fromCodePoint(codePoint);
-  return !(URL_PATH_CHARACTER.test(next) || URL_QUERY_CONTINUATION.test(next))
-    || URL_SENTENCE_BOUNDARY.test(message.slice(end));
+  return URL_PATH_CHARACTER.test(next) || URL_QUERY_CONTINUATION.test(next);
+}
+
+function atUrlEnd(message: string, end: number): boolean {
+  if (!continuesUrl(message, end)) return true;
+  const punctuation = URL_SENTENCE_PUNCTUATION.exec(message.slice(end));
+  return punctuation !== null && !continuesUrl(message, end + punctuation[0].length);
 }
 
 function replaceRegisteredUrl(message: string, url: string, redacted: string): string {

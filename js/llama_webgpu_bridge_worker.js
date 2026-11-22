@@ -969,7 +969,7 @@ var HTTP_URL_START = /\bhttps?:\/\//gi;
 var URL_TEXT_DELIMITER = /[\s"'<>`‘’“”]/;
 var URL_PATH_CHARACTER = /[\p{L}\p{N}\p{M}._~%+\/-]/u;
 var URL_QUERY_CONTINUATION = /[?&#=]/;
-var URL_SENTENCE_BOUNDARY = /^[.,;:!?]+(?:$|[\s"'`‘’“”)\]}>])/;
+var URL_SENTENCE_PUNCTUATION = /^[.,;:!?]+/;
 function absoluteUrlEnd(message, start) {
   const delimiter = message.slice(start).search(URL_TEXT_DELIMITER);
   return delimiter === -1 ? message.length : start + delimiter;
@@ -1005,11 +1005,16 @@ function atUrlStart(message, start) {
   const previous = Array.from(message.slice(Math.max(0, start - 2), start)).at(-1);
   return !URL_PATH_CHARACTER.test(previous);
 }
-function atUrlEnd(message, end) {
-  const codePoint = message.codePointAt(end);
-  if (codePoint === void 0) return true;
+function continuesUrl(message, index) {
+  const codePoint = message.codePointAt(index);
+  if (codePoint === void 0) return false;
   const next = String.fromCodePoint(codePoint);
-  return !(URL_PATH_CHARACTER.test(next) || URL_QUERY_CONTINUATION.test(next)) || URL_SENTENCE_BOUNDARY.test(message.slice(end));
+  return URL_PATH_CHARACTER.test(next) || URL_QUERY_CONTINUATION.test(next);
+}
+function atUrlEnd(message, end) {
+  if (!continuesUrl(message, end)) return true;
+  const punctuation = URL_SENTENCE_PUNCTUATION.exec(message.slice(end));
+  return punctuation !== null && !continuesUrl(message, end + punctuation[0].length);
 }
 function replaceRegisteredUrl(message, url, redacted) {
   return message.replaceAll(url, (match, index) => atUrlStart(message, index) && atUrlEnd(message, index + match.length) ? redacted : match);
