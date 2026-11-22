@@ -2,17 +2,21 @@
 // CI workflow shape it relies on.
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
 import { fileURLToPath } from 'node:url';
 
+import { build as traceBuildModules } from 'esbuild';
 import { parse as parseYaml } from 'yaml';
 
 import { changedPaths, nativeRequired, validateResults } from '../../scripts/ci/ci_scope.mjs';
 
 const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
+const workflow = parseYaml(readFileSync(path.join(rootDir, '.github/workflows/ci.yml'), 'utf8'));
+const smokeJobs = ['smoke-core', 'smoke-resume', 'smoke-multimodal', 'smoke-grammar-qwen'];
+const nativeJobs = ['build-core', ...smokeJobs];
 
 // Documentation and tooling-only paths skip the native lane; everything else,
 // including unknown paths, keeps it.
@@ -93,15 +97,18 @@ const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../.
   for (const selected of ['true', 'false']) {
     for (const changes of states) {
       for (const checks of states) {
-        for (const build of states) {
-          const needs = {
-            changes: { result: changes, outputs: { native: selected } },
-            checks: { result: checks },
-            'build-webgpu-bridge': { result: build },
-          };
-          const expected = changes === 'success' && checks === 'success'
-            && build === (selected === 'true' ? 'success' : 'skipped');
-          assert.equal(validateResults(needs), expected, JSON.stringify(needs));
+        for (const job of nativeJobs) {
+          for (const result of states) {
+            const wanted = selected === 'true' ? 'success' : 'skipped';
+            const needs = {
+              changes: { result: changes, outputs: { native: selected } },
+              checks: { result: checks },
+              ...Object.fromEntries(nativeJobs.map((name) => [name, { result: wanted }])),
+              [job]: { result },
+            };
+            const expected = changes === 'success' && checks === 'success' && result === wanted;
+            assert.equal(validateResults(needs), expected, JSON.stringify(needs));
+          }
         }
       }
     }
@@ -149,19 +156,94 @@ const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../.
   }
 }
 
+{
+  const { steps } = workflow.jobs['build-core'];
+  const step = steps.find((step) => step.id === 'native-inputs');
+  assert.ok(step, 'CI must fingerprint its checked-out native inputs');
+  const scope = step.run.match(/git ls-tree -r -z HEAD -- ([^|]+)\| sha256sum/)?.[1];
+  assert.ok(scope, 'CI must hash Git tree records');
+  const inputs = scope.replaceAll('\\\n', ' ').trim().split(/\s+/);
+  const entryPoints = readdirSync(path.join(rootDir, 'scripts/build'), { recursive: true, withFileTypes: true })
+    .filter((entry) => entry.isFile() && /\.[cm]?[jt]s$/.test(entry.name))
+    .map((entry) => path.join(entry.parentPath, entry.name));
+  const { metafile } = await traceBuildModules({
+    absWorkingDir: rootDir, entryPoints, bundle: true, packages: 'external', platform: 'node',
+    format: 'esm', outdir: 'out', write: false, metafile: true,
+  });
+  for (const module of Object.keys(metafile.inputs)) {
+    assert.ok(inputs.some((input) => input === module || module.startsWith(`${input}/`)),
+      `build module must be in the native input tree scope: ${module}`);
+  }
+  const temp = mkdtempSync(path.join(tmpdir(), 'ci-native-inputs-'));
+  const output = path.join(temp, 'output');
+  const git = (...args) => execFileSync('git', ['-C', temp, '-c', 'commit.gpgsign=false', ...args], { stdio: ['ignore', 'pipe', 'ignore'] });
+  const run = () => {
+    writeFileSync(output, '');
+    execFileSync('bash', ['-c', `command -v sha256sum >/dev/null || sha256sum() { shasum -a 256; }\n${step.run}`], {
+      cwd: temp, env: { ...process.env, GITHUB_OUTPUT: output }, stdio: 'pipe',
+    });
+    const result = readFileSync(output, 'utf8');
+    assert.match(result, /^sha256=[0-9a-f]{64}\n$/);
+    return result;
+  };
+  try {
+    git('init');
+    git('config', 'user.name', 'Fixture');
+    git('config', 'user.email', 'fixture@example.test');
+    assert.throws(run);
+    assert.equal(readFileSync(output, 'utf8'), '');
+    git('commit', '--allow-empty', '-m', 'empty');
+    assert.throws(run, (error) => /native input tree fingerprint is missing or invalid/.test(error.stderr?.toString()));
+    assert.equal(readFileSync(output, 'utf8'), '');
+    mkdirSync(path.join(temp, 'src'));
+    mkdirSync(path.join(temp, 'scripts/build'), { recursive: true });
+    const header = 'src/llama_webgpu_grammar.h';
+    const buildScript = 'scripts/build/build_bridge.sh';
+    const compilerVerifier = 'scripts/build/verify_emscripten_version.mjs';
+    writeFileSync(path.join(temp, header), '#pragma once\n');
+    writeFileSync(path.join(temp, buildScript), '#!/usr/bin/env bash\n');
+    writeFileSync(path.join(temp, compilerVerifier), 'export const maxBuffer = Infinity;\n');
+    git('add', header, buildScript, compilerVerifier);
+    git('update-index', '--chmod=+x', buildScript);
+    git('commit', '-m', 'native inputs');
+    const base = git('rev-parse', 'HEAD').toString().trim();
+    const fingerprint = run();
+    git('mv', header, 'src/llama_webgpu_grammar.hpp');
+    git('commit', '-m', 'rename header');
+    assert.notEqual(run(), fingerprint, 'a same-byte source rename must change the core fingerprint');
+    git('checkout', '--detach', base);
+    writeFileSync(path.join(temp, compilerVerifier), 'export const maxBuffer = 256;\n');
+    git('add', compilerVerifier);
+    git('commit', '-m', 'change compiler verifier');
+    assert.notEqual(run(), fingerprint, 'changing the Emscripten verifier must change the core fingerprint');
+    git('checkout', '--detach', base);
+    git('update-index', '--chmod=-x', buildScript);
+    git('commit', '-m', 'remove executable bit');
+    assert.notEqual(run(), fingerprint, 'a mode-only change must change the core fingerprint');
+  } finally {
+    rmSync(temp, { recursive: true, force: true });
+  }
+}
+
 // CI builds the pinned native lane behind the selector and reports a truthful
 // aggregate.
 {
-  const workflow = parseYaml(readFileSync(path.join(rootDir, '.github/workflows/ci.yml'), 'utf8'));
   const { jobs } = workflow;
-  const build = jobs['build-webgpu-bridge'];
+  const build = jobs['build-core'];
   const { checks } = jobs;
-  assert.equal(build.name, 'Build WebGPU Bridge (WASM)');
-  assert.equal('strategy' in build, false);
-  assert.deepEqual(build.needs, ['changes', 'checks']);
-  assert.equal(build.if, "needs.changes.outputs.native == 'true'");
+  assert.ok(build, 'CI builds the cores in a matrix');
+  assert.deepEqual(build.strategy.matrix, { variant: ['wasm32', 'wasm64', 'wasm32_st', 'wasm64_st'] });
+  assert.equal(build.strategy['fail-fast'], true);
+  assert.deepEqual(build.needs, ['changes']);
+  for (const name of nativeJobs) {
+    assert.equal(jobs[name].if, "needs.changes.outputs.native == 'true'", name);
+  }
+  for (const name of smokeJobs) {
+    assert.deepEqual(jobs[name].needs, ['changes', 'build-core'], name);
+  }
+  assert.equal(jobs['ci-result'].name, 'CI validation');
   assert.equal(jobs['ci-result'].if, 'always()');
-  assert.deepEqual(new Set(jobs['ci-result'].needs), new Set(['changes', 'checks', 'build-webgpu-bridge']));
+  assert.deepEqual(new Set(jobs['ci-result'].needs), new Set(['changes', 'checks', ...nativeJobs]));
   assert.ok(jobs['ci-result'].steps.some((step) => step.run === 'node scripts/ci/ci_scope.mjs --check-results'));
   assert.ok(jobs.changes.steps.some((step) => step.run === 'node scripts/ci/ci_scope.mjs'));
   assert.equal(
@@ -181,31 +263,35 @@ const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../.
     'state-persistence-smoke-artifacts',
     'multimodal-smoke-artifacts',
     'grammar-smoke-artifacts',
+    'grammar-smoke-artifacts-qwen-${{ matrix.memory }}-${{ matrix.runtime }}',
     'next-token-scores-smoke-artifacts',
     'speculative-smoke-artifacts',
     'webgpu-bridge-dist',
   ];
-  const uploadNames = build.steps
+  const uploadNames = smokeJobs.flatMap((name) => jobs[name].steps)
     .filter((step) => step.uses?.startsWith('actions/upload-artifact@'))
     .map((step) => step.with.name);
   assert.deepEqual(uploadNames.sort(), [...pinnedArtifacts].sort());
   const buildSteps = Object.fromEntries(build.steps.map((step) => [step.name, step]));
-  for (const name of ['Run state persistence browser smoke', 'Run multimodal browser smoke', 'Build bridge artifacts', 'Verify outputs']) {
-    assert.equal('if' in buildSteps[name], false, name);
-  }
+  assert.ok(buildSteps['Upload core artifacts'].with['retention-days'] >= 30, 'core artifacts must outlive the 30-day rerun window');
+  const coreCache = buildSteps['Restore built core'];
+  assert.match(coreCache.with.key, /^webgpu-core-v1-/);
+  assert.equal('restore-keys' in coreCache.with, false);
+  assert.equal(coreCache.with.path, '${{ runner.temp }}/webgpu_bridge_dist');
   const cache = buildSteps['Restore compiler objects'].with;
+  assert.match(cache.key, /^webgpu-ccache-v3-/);
+  assert.doesNotMatch(cache.key, /github\.sha/);
   assert.match(buildSteps['Restore compiler objects'].uses, /^actions\/cache\/restore@/);
   const save = buildSteps['Save compiler objects'];
-  assert.equal(save.if, "github.event_name == 'push' && github.ref == 'refs/heads/main'");
+  assert.match(save.if, /github\.event_name == 'push' && github\.ref == 'refs\/heads\/main'/);
+  assert.match(save.if, /steps\.ccache\.outputs\.cache-hit != 'true'/);
   assert.equal(save.with.path, cache.path);
   assert.equal(save.with.key, '${{ steps.ccache.outputs.cache-primary-key }}');
   const order = build.steps.map((step) => step.name);
   assert.ok(order.indexOf('Build bridge artifacts') < order.indexOf('Save compiler objects'));
-  assert.ok(order.indexOf('Save compiler objects') < order.indexOf('Verify outputs'));
   assert.equal(cache.path, '${{ runner.temp }}/webgpu-ccache');
-  for (const token of ['runner.arch', 'env.EMSCRIPTEN_VERSION', 'steps.compiler-cache.outputs.upstream', 'hashFiles']) {
+  for (const token of ['runner.arch', 'matrix.variant', 'env.EMSCRIPTEN_VERSION', 'steps.compiler-cache.outputs.upstream', 'hashFiles']) {
     assert.ok(cache.key.includes(token), token);
-    assert.ok(cache['restore-keys'].includes(token), token);
   }
   assert.equal(buildSteps['Build bridge artifacts'].env.EM_COMPILER_WRAPPER, 'ccache');
   assert.ok(workflow.concurrency['cancel-in-progress'].includes("github.event_name == 'pull_request'"));

@@ -17,6 +17,30 @@ permissions:
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
+  LLAMA_WEBGPU_SMOKE_MODEL_URL: https://huggingface.co/aladar/llama-2-tiny-random-GGUF/resolve/main/llama-2-tiny-random.gguf
+  LLAMA_WEBGPU_SMOKE_MODEL_SHA256: 81f226c62d28ed4a1a9b9fa080fcd9f0cc40e0f9d5680036583ff98fbcd035cb
+  LLAMA_WEBGPU_SMOKE_MODEL_CACHE: ~/.cache/llama-web-bridge/state-smoke-models
+  LLAMA_WEBGPU_SMOKE_ARTIFACTS_DIR: /tmp/state-persistence-smoke-artifacts
+  LLAMA_WEBGPU_GRAMMAR_ARTIFACTS_DIR: /tmp/grammar-smoke-artifacts
+  LLAMA_WEBGPU_NEXT_TOKEN_SCORES_ARTIFACTS_DIR: /tmp/next-token-scores-smoke-artifacts
+  LLAMA_WEBGPU_SPECULATIVE_ARTIFACTS_DIR: /tmp/speculative-smoke-artifacts
+  LLAMA_WEBGPU_MULTIMODAL_MODEL_URL: https://huggingface.co/unsloth/Qwen3.5-0.8B-GGUF/resolve/main/Qwen3.5-0.8B-Q4_K_M.gguf
+  LLAMA_WEBGPU_MULTIMODAL_MODEL_SHA256: bd258782e35f7f458f8aced1adc053e6e92e89bc735ba3be89d38a06121dc517
+  LLAMA_WEBGPU_MULTIMODAL_MMPROJ_URL: https://huggingface.co/unsloth/Qwen3.5-0.8B-GGUF/resolve/main/mmproj-F16.gguf
+  LLAMA_WEBGPU_MULTIMODAL_MMPROJ_SHA256: 56e4c6cfe73b0c82e3e82bc518d7591997e61d81f723fc41a586f4fa69ea2453
+  LLAMA_WEBGPU_MULTIMODAL_MODEL_CACHE: ~/.cache/llama-web-bridge/multimodal-smoke-models
+  LLAMA_WEBGPU_MULTIMODAL_ARTIFACTS_DIR: /tmp/multimodal-smoke-artifacts
+  LLAMA_WEBGPU_MULTIMODAL_TIMEOUT_MS: 420000
+  LLAMA_WEBGPU_GRAMMAR_MULTIMODAL_TIMEOUT_MS: 900000
+  LLAMA_WEBGPU_SPEECH_MODEL_URL: https://huggingface.co/ggml-org/Qwen3-ASR-0.6B-GGUF/resolve/928ab958557df9aa2ef1c93e0e83c7ad0933fae2/Qwen3-ASR-0.6B-Q8_0.gguf?download=true
+  LLAMA_WEBGPU_SPEECH_MODEL_SHA256: bca259818b50ca7c4c05e9bdb35a5dc04fa039653a6d6f3f0f331f96f6aa1971
+  LLAMA_WEBGPU_SPEECH_MMPROJ_URL: https://huggingface.co/ggml-org/Qwen3-ASR-0.6B-GGUF/resolve/928ab958557df9aa2ef1c93e0e83c7ad0933fae2/mmproj-Qwen3-ASR-0.6B-Q8_0.gguf?download=true
+  LLAMA_WEBGPU_SPEECH_MMPROJ_SHA256: 41a342b5e4c514e968cb756de6cd1b7be39eff43c44c57a2ef5fc6522e36603d
+  LLAMA_WEBGPU_TTS_MODEL_URL: https://huggingface.co/ggml-org/Qwen3-TTS-12Hz-1.7B-Base-GGUF/resolve/ca27d74bc954b73dadab5b71ca265d87fc861a7c/Qwen3-TTS-12Hz-1.7B-Base-Q4_K_M.gguf?download=true
+  LLAMA_WEBGPU_TTS_MODEL_SHA256: 8d18c94acb2addd042f97da63c98be144eafa76d0d9495177eab65130cf85129
+  LLAMA_WEBGPU_TTS_MMPROJ_URL: https://huggingface.co/ggml-org/Qwen3-TTS-12Hz-1.7B-Base-GGUF/resolve/ca27d74bc954b73dadab5b71ca265d87fc861a7c/mmproj-Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf?download=true
+  LLAMA_WEBGPU_TTS_MMPROJ_SHA256: 6fd65188839bcd6ecc91b277ad471e22a0edfada4699a0fe82f1165c18cfcce2
+
 jobs:
   changes:
     name: Select CI validation
@@ -57,35 +81,15 @@ jobs:
       - name: Verify CI reliability contract
         run: node scripts/ci/verify_ci_reliability.mjs
 
-  build-webgpu-bridge:
-    needs: [changes, checks]
+  build-core:
+    name: Build core (${{ matrix.variant }})
+    needs: [changes]
     if: needs.changes.outputs.native == 'true'
-    name: Build WebGPU Bridge (WASM)
     runs-on: ubuntu-latest
-    env:
-      LLAMA_WEBGPU_SMOKE_MODEL_URL: https://huggingface.co/aladar/llama-2-tiny-random-GGUF/resolve/main/llama-2-tiny-random.gguf
-      LLAMA_WEBGPU_SMOKE_MODEL_SHA256: 81f226c62d28ed4a1a9b9fa080fcd9f0cc40e0f9d5680036583ff98fbcd035cb
-      LLAMA_WEBGPU_SMOKE_MODEL_CACHE: ~/.cache/llama-web-bridge/state-smoke-models
-      LLAMA_WEBGPU_SMOKE_ARTIFACTS_DIR: /tmp/state-persistence-smoke-artifacts
-      LLAMA_WEBGPU_GRAMMAR_ARTIFACTS_DIR: /tmp/grammar-smoke-artifacts
-      LLAMA_WEBGPU_NEXT_TOKEN_SCORES_ARTIFACTS_DIR: /tmp/next-token-scores-smoke-artifacts
-      LLAMA_WEBGPU_SPECULATIVE_ARTIFACTS_DIR: /tmp/speculative-smoke-artifacts
-      LLAMA_WEBGPU_MULTIMODAL_MODEL_URL: https://huggingface.co/unsloth/Qwen3.5-0.8B-GGUF/resolve/main/Qwen3.5-0.8B-Q4_K_M.gguf
-      LLAMA_WEBGPU_MULTIMODAL_MODEL_SHA256: bd258782e35f7f458f8aced1adc053e6e92e89bc735ba3be89d38a06121dc517
-      LLAMA_WEBGPU_MULTIMODAL_MMPROJ_URL: https://huggingface.co/unsloth/Qwen3.5-0.8B-GGUF/resolve/main/mmproj-F16.gguf
-      LLAMA_WEBGPU_MULTIMODAL_MMPROJ_SHA256: 56e4c6cfe73b0c82e3e82bc518d7591997e61d81f723fc41a586f4fa69ea2453
-      LLAMA_WEBGPU_MULTIMODAL_MODEL_CACHE: ~/.cache/llama-web-bridge/multimodal-smoke-models
-      LLAMA_WEBGPU_MULTIMODAL_ARTIFACTS_DIR: /tmp/multimodal-smoke-artifacts
-      LLAMA_WEBGPU_MULTIMODAL_TIMEOUT_MS: 420000
-      LLAMA_WEBGPU_GRAMMAR_MULTIMODAL_TIMEOUT_MS: 900000
-      LLAMA_WEBGPU_SPEECH_MODEL_URL: https://huggingface.co/ggml-org/Qwen3-ASR-0.6B-GGUF/resolve/928ab958557df9aa2ef1c93e0e83c7ad0933fae2/Qwen3-ASR-0.6B-Q8_0.gguf?download=true
-      LLAMA_WEBGPU_SPEECH_MODEL_SHA256: bca259818b50ca7c4c05e9bdb35a5dc04fa039653a6d6f3f0f331f96f6aa1971
-      LLAMA_WEBGPU_SPEECH_MMPROJ_URL: https://huggingface.co/ggml-org/Qwen3-ASR-0.6B-GGUF/resolve/928ab958557df9aa2ef1c93e0e83c7ad0933fae2/mmproj-Qwen3-ASR-0.6B-Q8_0.gguf?download=true
-      LLAMA_WEBGPU_SPEECH_MMPROJ_SHA256: 41a342b5e4c514e968cb756de6cd1b7be39eff43c44c57a2ef5fc6522e36603d
-      LLAMA_WEBGPU_TTS_MODEL_URL: https://huggingface.co/ggml-org/Qwen3-TTS-12Hz-1.7B-Base-GGUF/resolve/ca27d74bc954b73dadab5b71ca265d87fc861a7c/Qwen3-TTS-12Hz-1.7B-Base-Q4_K_M.gguf?download=true
-      LLAMA_WEBGPU_TTS_MODEL_SHA256: 8d18c94acb2addd042f97da63c98be144eafa76d0d9495177eab65130cf85129
-      LLAMA_WEBGPU_TTS_MMPROJ_URL: https://huggingface.co/ggml-org/Qwen3-TTS-12Hz-1.7B-Base-GGUF/resolve/ca27d74bc954b73dadab5b71ca265d87fc861a7c/mmproj-Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf?download=true
-      LLAMA_WEBGPU_TTS_MMPROJ_SHA256: 6fd65188839bcd6ecc91b277ad471e22a0edfada4699a0fe82f1165c18cfcce2
+    strategy:
+      fail-fast: true
+      matrix:
+        variant: [wasm32, wasm64, wasm32_st, wasm64_st]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -95,10 +99,6 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 24
-          cache: npm
-
-      - name: Install JS dependencies
-        run: npm ci --ignore-scripts
 
       - name: Resolve llama.cpp pin
         run: |
@@ -116,27 +116,40 @@ jobs:
           echo "EMSCRIPTEN_VERSION=${EMSCRIPTEN_VERSION}" >> "$GITHUB_ENV"
           echo "Using Emscripten ${EMSCRIPTEN_VERSION}"
 
-      - name: Cache state smoke model
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/llama-web-bridge/state-smoke-models
-          key: state-smoke-model-${{ env.LLAMA_WEBGPU_SMOKE_MODEL_SHA256 }}
-
-      - name: Cache multimodal smoke models
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/llama-web-bridge/multimodal-smoke-models
-          key: multimodal-smoke-${{ env.LLAMA_WEBGPU_MULTIMODAL_MODEL_SHA256 }}-${{ env.LLAMA_WEBGPU_MULTIMODAL_MMPROJ_SHA256 }}
-
       - name: Clone llama.cpp source
         run: |
           git clone --depth 1 --branch "$LLAMA_CPP_TAG" https://github.com/ggml-org/llama.cpp.git third_party/llama_cpp
           test "$(git -C third_party/llama_cpp rev-parse HEAD)" = b1b770d90d94cad9e9ea5b993bdbc383a522fb28
 
-      # Installed at a fixed path, not with setup-emsdk: its random temp
-      # directory changes the compiler and sysroot paths on every run, so
-      # ccache never hits.
+      - name: Resolve compiler cache identity
+        id: compiler-cache
+        run: echo "upstream=$(git -C third_party/llama_cpp rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Fingerprint native input tree
+        id: native-inputs
+        run: |
+          set -euo pipefail
+          fingerprint="$(git ls-tree -r -z HEAD -- src CMakeLists.txt cmake scripts/build \
+            scripts/release/cli.mjs scripts/release/errors.mjs scripts/release/json.mjs \
+            scripts/release/python_compat.mjs scripts/release/unicode15.mjs \
+            .github/workflows/ci.yml | sha256sum)"
+          empty_fingerprint="$(sha256sum </dev/null)"
+          if [[ "$fingerprint" == "$empty_fingerprint" || ! "${fingerprint%% *}" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "error: native input tree fingerprint is missing or invalid" >&2
+            exit 1
+          fi
+          echo "sha256=${fingerprint%% *}" >> "$GITHUB_OUTPUT"
+
+      - name: Restore built core
+        id: core-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/webgpu_bridge_dist
+          key: webgpu-core-v1-${{ runner.os }}-${{ runner.arch }}-${{ matrix.variant }}-${{ env.EMSCRIPTEN_VERSION }}-${{ steps.compiler-cache.outputs.upstream }}-${{ steps.native-inputs.outputs.sha256 }}
+
+      # A stable SDK path keeps compiler and sysroot paths stable for ccache.
       - name: Setup Emscripten SDK
+        if: steps.core-cache.outputs.cache-hit != 'true'
         env:
           EMSDK_DIR: ${{ runner.temp }}/emsdk
         run: |
@@ -152,31 +165,33 @@ jobs:
           } >> "$GITHUB_ENV"
 
       - name: Verify resolved Emscripten compiler
+        if: steps.core-cache.outputs.cache-hit != 'true'
         run: node scripts/build/verify_emscripten_version.mjs --emit-github-env "$GITHUB_ENV"
 
-      - name: Resolve compiler cache identity
-        id: compiler-cache
-        run: echo "upstream=$(git -C third_party/llama_cpp rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - name: Restore Emscripten cache
+        id: emcache
+        if: steps.core-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/emcache
+          key: emcache-v1-${{ runner.os }}-${{ runner.arch }}-${{ matrix.variant }}-${{ env.EMSCRIPTEN_VERSION }}
 
       - name: Install compiler cache
+        if: steps.core-cache.outputs.cache-hit != 'true'
         run: sudo apt-get update && sudo apt-get install -y ccache
 
-      # Every run restores the newest cache from its branch or main; only
-      # pushes to main save one, so pull requests do not grow the cache. The
-      # last prefix still warms a build that changes the build inputs or the
-      # llama.cpp pin: CCACHE_COMPILERCHECK=content makes a stale entry a miss,
-      # never a wrong hit.
       - name: Restore compiler objects
         id: ccache
+        if: steps.core-cache.outputs.cache-hit != 'true'
         uses: actions/cache/restore@v4
         with:
           path: ${{ runner.temp }}/webgpu-ccache
-          key: webgpu-ccache-v2-${{ runner.os }}-${{ runner.arch }}-${{ env.EMSCRIPTEN_VERSION }}-${{ steps.compiler-cache.outputs.upstream }}-${{ hashFiles('CMakeLists.txt', 'cmake/*.cmake', 'scripts/build/build_bridge.sh', 'scripts/build/patch_*.mjs') }}-${{ github.sha }}
+          key: webgpu-ccache-v3-${{ runner.os }}-${{ runner.arch }}-${{ matrix.variant }}-${{ env.EMSCRIPTEN_VERSION }}-${{ steps.compiler-cache.outputs.upstream }}-${{ hashFiles('CMakeLists.txt', 'cmake/*.cmake', 'scripts/build/build_bridge.sh', 'scripts/build/patch_*.mjs', 'src/**') }}
           restore-keys: |
-            webgpu-ccache-v2-${{ runner.os }}-${{ runner.arch }}-${{ env.EMSCRIPTEN_VERSION }}-${{ steps.compiler-cache.outputs.upstream }}-${{ hashFiles('CMakeLists.txt', 'cmake/*.cmake', 'scripts/build/build_bridge.sh', 'scripts/build/patch_*.mjs') }}-
-            webgpu-ccache-v2-${{ runner.os }}-${{ runner.arch }}-${{ env.EMSCRIPTEN_VERSION }}-
+            webgpu-ccache-v3-${{ runner.os }}-${{ runner.arch }}-${{ matrix.variant }}-${{ env.EMSCRIPTEN_VERSION }}-${{ steps.compiler-cache.outputs.upstream }}-
 
       - name: Build bridge artifacts
+        if: steps.core-cache.outputs.cache-hit != 'true'
         env:
           BUILD_DIR: ${{ runner.temp }}/webgpu-build
           MEM64_BUILD_DIR: ${{ runner.temp }}/webgpu-build-mem64
@@ -185,21 +200,73 @@ jobs:
           CCACHE_DIR: ${{ runner.temp }}/webgpu-ccache
           CCACHE_MAXSIZE: 2G
           CCACHE_COMPILERCHECK: content
+          EM_CACHE: ${{ runner.temp }}/emcache
           EM_COMPILER_WRAPPER: ccache
-          OUT_DIR: ${{ runner.temp }}/webgpu_bridge_dist
-          WEBGPU_BRIDGE_BUILD_MEM64: 1
-          WEBGPU_BRIDGE_BUILD_SINGLE_THREAD: 1
+          OUT_DIR: ${{ runner.temp }}/webgpu_build_output
+          CORE_DIST_DIR: ${{ runner.temp }}/webgpu_bridge_dist
+          WEBGPU_BRIDGE_VARIANT: ${{ matrix.variant }}
+          WEBGPU_BRIDGE_SKIP_JS_CHECK: 1
         run: |
           ccache --zero-stats
           trap 'ccache --show-stats' EXIT
           ./scripts/build/build_bridge.sh
+          mkdir -p "$CORE_DIST_DIR"
+          cp "$OUT_DIR"/llama_webgpu_core*.js "$OUT_DIR"/llama_webgpu_core*.wasm "$CORE_DIST_DIR/"
+
+      - name: Save built core
+        if: steps.core-cache.outputs.cache-hit != 'true' && github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/webgpu_bridge_dist
+          key: ${{ steps.core-cache.outputs.cache-primary-key }}
 
       - name: Save compiler objects
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        if: steps.core-cache.outputs.cache-hit != 'true' && steps.ccache.outputs.cache-hit != 'true' && github.event_name == 'push' && github.ref == 'refs/heads/main'
         uses: actions/cache/save@v4
         with:
           path: ${{ runner.temp }}/webgpu-ccache
           key: ${{ steps.ccache.outputs.cache-primary-key }}
+
+      - name: Save Emscripten cache
+        if: steps.core-cache.outputs.cache-hit != 'true' && steps.emcache.outputs.cache-hit != 'true' && github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/emcache
+          key: ${{ steps.emcache.outputs.cache-primary-key }}
+
+      - name: Upload core artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: webgpu-core-${{ matrix.variant }}
+          path: |
+            ${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_core*.js
+            ${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_core*.wasm
+          if-no-files-found: error
+          # Smoke jobs consume these on "Re-run failed jobs", which GitHub allows for 30 days.
+          retention-days: 30
+
+  smoke-core:
+    name: Core browser smokes
+    needs: [changes, build-core]
+    if: needs.changes.outputs.native == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Download core artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: webgpu-core-*
+          path: ${{ runner.temp }}/webgpu_bridge_dist
+          merge-multiple: true
+
+      - name: Copy checked-in bridge wrappers
+        env:
+          BRIDGE_DIST_DIR: ${{ runner.temp }}/webgpu_bridge_dist
+        run: |
+          cp js/llama_webgpu_bridge.js js/llama_webgpu_bridge_worker.js js/llama_webgpu_bridge.d.ts "$BRIDGE_DIST_DIR/"
 
       - name: Verify outputs
         run: |
@@ -215,7 +282,38 @@ jobs:
           test -f "${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_core_mem64_st.js"
           test -f "${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_core_mem64_st.wasm"
 
-      # The smokes use the locked playwright package.
+      - name: Upload bridge artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: webgpu-bridge-dist
+          path: |
+            ${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_bridge.js
+            ${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_bridge_worker.js
+            ${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_bridge.d.ts
+            ${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_core.js
+            ${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_core.wasm
+            ${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_core_mem64.js
+            ${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_core_mem64.wasm
+            ${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_core_st.js
+            ${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_core_st.wasm
+            ${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_core_mem64_st.js
+            ${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_core_mem64_st.wasm
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install JS dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Cache state smoke model
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/llama-web-bridge/state-smoke-models
+          key: state-smoke-model-${{ env.LLAMA_WEBGPU_SMOKE_MODEL_SHA256 }}
+
       - name: Install Playwright Chromium
         run: npx --no-install playwright install --only-shell chromium
 
@@ -259,36 +357,6 @@ jobs:
           BRIDGE_DIST_DIR: ${{ runner.temp }}/webgpu_bridge_dist
         run: node scripts/smoke/state_persistence.mjs --threading single --memory-mode wasm64
 
-      - name: Run threaded resume integrity browser smoke
-        env:
-          BRIDGE_DIST_DIR: ${{ runner.temp }}/webgpu_bridge_dist
-        run: node scripts/smoke/resume_integrity.mjs --baseline-dist-dir "$BRIDGE_DIST_DIR"
-
-      - name: Run single-thread resume integrity browser smoke
-        env:
-          BRIDGE_DIST_DIR: ${{ runner.temp }}/webgpu_bridge_dist
-        run: node scripts/smoke/resume_integrity.mjs --baseline-dist-dir "$BRIDGE_DIST_DIR" --threading single
-
-      - name: Run threaded resume integrity browser smoke with JS-backed staging
-        env:
-          BRIDGE_DIST_DIR: ${{ runner.temp }}/webgpu_bridge_dist
-        run: node scripts/smoke/resume_integrity.mjs --baseline-dist-dir "$BRIDGE_DIST_DIR" --js-backed-model-staging
-
-      - name: Run single-thread resume integrity browser smoke with JS-backed staging
-        env:
-          BRIDGE_DIST_DIR: ${{ runner.temp }}/webgpu_bridge_dist
-        run: node scripts/smoke/resume_integrity.mjs --baseline-dist-dir "$BRIDGE_DIST_DIR" --threading single --js-backed-model-staging
-
-      - name: Run threaded resume integrity with JS-backed staging and mmap disabled
-        env:
-          BRIDGE_DIST_DIR: ${{ runner.temp }}/webgpu_bridge_dist
-        run: node scripts/smoke/resume_integrity.mjs --baseline-dist-dir "$BRIDGE_DIST_DIR" --js-backed-model-staging --no-mmap
-
-      - name: Run single-thread resume integrity with JS-backed staging and mmap disabled
-        env:
-          BRIDGE_DIST_DIR: ${{ runner.temp }}/webgpu_bridge_dist
-        run: node scripts/smoke/resume_integrity.mjs --baseline-dist-dir "$BRIDGE_DIST_DIR" --threading single --js-backed-model-staging --no-mmap
-
       - name: Run native abort recovery browser smoke
         env:
           BRIDGE_DIST_DIR: ${{ runner.temp }}/webgpu_bridge_dist
@@ -324,6 +392,132 @@ jobs:
           BRIDGE_DIST_DIR: ${{ runner.temp }}/webgpu_bridge_dist
         run: node scripts/smoke/remote_fetch_backend.mjs --memory-mode wasm64
 
+      - name: Upload state persistence smoke diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: state-persistence-smoke-artifacts
+          path: ${{ env.LLAMA_WEBGPU_SMOKE_ARTIFACTS_DIR }}
+          if-no-files-found: ignore
+
+  smoke-resume:
+    name: Resume integrity browser smokes
+    needs: [changes, build-core]
+    if: needs.changes.outputs.native == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Download core artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: webgpu-core-*
+          path: ${{ runner.temp }}/webgpu_bridge_dist
+          merge-multiple: true
+
+      - name: Copy checked-in bridge wrappers
+        env:
+          BRIDGE_DIST_DIR: ${{ runner.temp }}/webgpu_bridge_dist
+        run: |
+          cp js/llama_webgpu_bridge.js js/llama_webgpu_bridge_worker.js js/llama_webgpu_bridge.d.ts "$BRIDGE_DIST_DIR/"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install JS dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Cache state smoke model
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.cache/llama-web-bridge/state-smoke-models
+          key: state-smoke-model-${{ env.LLAMA_WEBGPU_SMOKE_MODEL_SHA256 }}
+
+      - name: Install Playwright Chromium
+        run: npx --no-install playwright install --only-shell chromium
+
+      - name: Run threaded resume integrity browser smoke
+        env:
+          BRIDGE_DIST_DIR: ${{ runner.temp }}/webgpu_bridge_dist
+        run: node scripts/smoke/resume_integrity.mjs --baseline-dist-dir "$BRIDGE_DIST_DIR"
+
+      - name: Run single-thread resume integrity browser smoke
+        env:
+          BRIDGE_DIST_DIR: ${{ runner.temp }}/webgpu_bridge_dist
+        run: node scripts/smoke/resume_integrity.mjs --baseline-dist-dir "$BRIDGE_DIST_DIR" --threading single
+
+      - name: Run threaded resume integrity browser smoke with JS-backed staging
+        env:
+          BRIDGE_DIST_DIR: ${{ runner.temp }}/webgpu_bridge_dist
+        run: node scripts/smoke/resume_integrity.mjs --baseline-dist-dir "$BRIDGE_DIST_DIR" --js-backed-model-staging
+
+      - name: Run single-thread resume integrity browser smoke with JS-backed staging
+        env:
+          BRIDGE_DIST_DIR: ${{ runner.temp }}/webgpu_bridge_dist
+        run: node scripts/smoke/resume_integrity.mjs --baseline-dist-dir "$BRIDGE_DIST_DIR" --threading single --js-backed-model-staging
+
+      - name: Run threaded resume integrity with JS-backed staging and mmap disabled
+        env:
+          BRIDGE_DIST_DIR: ${{ runner.temp }}/webgpu_bridge_dist
+        run: node scripts/smoke/resume_integrity.mjs --baseline-dist-dir "$BRIDGE_DIST_DIR" --js-backed-model-staging --no-mmap
+
+      - name: Run single-thread resume integrity with JS-backed staging and mmap disabled
+        env:
+          BRIDGE_DIST_DIR: ${{ runner.temp }}/webgpu_bridge_dist
+        run: node scripts/smoke/resume_integrity.mjs --baseline-dist-dir "$BRIDGE_DIST_DIR" --threading single --js-backed-model-staging --no-mmap
+
+  smoke-multimodal:
+    name: Multimodal and sampler browser smokes
+    needs: [changes, build-core]
+    if: needs.changes.outputs.native == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Download core artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: webgpu-core-*
+          path: ${{ runner.temp }}/webgpu_bridge_dist
+          merge-multiple: true
+
+      - name: Copy checked-in bridge wrappers
+        env:
+          BRIDGE_DIST_DIR: ${{ runner.temp }}/webgpu_bridge_dist
+        run: |
+          cp js/llama_webgpu_bridge.js js/llama_webgpu_bridge_worker.js js/llama_webgpu_bridge.d.ts "$BRIDGE_DIST_DIR/"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install JS dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Cache state smoke model
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.cache/llama-web-bridge/state-smoke-models
+          key: state-smoke-model-${{ env.LLAMA_WEBGPU_SMOKE_MODEL_SHA256 }}
+
+      - name: Cache multimodal smoke models
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/llama-web-bridge/multimodal-smoke-models
+          key: multimodal-smoke-${{ env.LLAMA_WEBGPU_MULTIMODAL_MODEL_SHA256 }}-${{ env.LLAMA_WEBGPU_MULTIMODAL_MMPROJ_SHA256 }}
+
+      - name: Install Playwright Chromium
+        run: npx --no-install playwright install --only-shell chromium
+
       - name: Run multimodal browser smoke
         env:
           BRIDGE_DIST_DIR: ${{ runner.temp }}/webgpu_bridge_dist
@@ -335,12 +529,6 @@ jobs:
         run: |
           node scripts/smoke/grammar.mjs \
             --artifacts-dir "$LLAMA_WEBGPU_GRAMMAR_ARTIFACTS_DIR/state-smoke-model"
-          node scripts/smoke/grammar.mjs \
-            --model-url "$LLAMA_WEBGPU_MULTIMODAL_MODEL_URL" \
-            --model-sha256 "$LLAMA_WEBGPU_MULTIMODAL_MODEL_SHA256" \
-            --model-cache-dir "$LLAMA_WEBGPU_MULTIMODAL_MODEL_CACHE" \
-            --timeout-ms "$LLAMA_WEBGPU_GRAMMAR_MULTIMODAL_TIMEOUT_MS" \
-            --artifacts-dir "$LLAMA_WEBGPU_GRAMMAR_ARTIFACTS_DIR/multimodal-model"
 
       - name: Run next-token scores browser smoke
         env:
@@ -351,14 +539,6 @@ jobs:
         env:
           BRIDGE_DIST_DIR: ${{ runner.temp }}/webgpu_bridge_dist
         run: node scripts/smoke/speculative.mjs --group tiny
-
-      - name: Upload state persistence smoke diagnostics
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: state-persistence-smoke-artifacts
-          path: ${{ env.LLAMA_WEBGPU_SMOKE_ARTIFACTS_DIR }}
-          if-no-files-found: ignore
 
       - name: Upload multimodal smoke diagnostics
         if: failure()
@@ -392,27 +572,79 @@ jobs:
           path: ${{ env.LLAMA_WEBGPU_SPECULATIVE_ARTIFACTS_DIR }}
           if-no-files-found: ignore
 
-      - name: Upload bridge artifacts
+  smoke-grammar-qwen:
+    name: Qwen grammar browser smoke (${{ matrix.memory }}, ${{ matrix.runtime }})
+    needs: [changes, build-core]
+    if: needs.changes.outputs.native == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        memory: [wasm32, wasm64]
+        runtime: [direct, worker]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Download core artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: webgpu-core-*
+          path: ${{ runner.temp }}/webgpu_bridge_dist
+          merge-multiple: true
+
+      - name: Copy checked-in bridge wrappers
+        env:
+          BRIDGE_DIST_DIR: ${{ runner.temp }}/webgpu_bridge_dist
+        run: |
+          cp js/llama_webgpu_bridge.js js/llama_webgpu_bridge_worker.js js/llama_webgpu_bridge.d.ts "$BRIDGE_DIST_DIR/"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install JS dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Cache multimodal smoke models
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.cache/llama-web-bridge/multimodal-smoke-models
+          key: multimodal-smoke-${{ env.LLAMA_WEBGPU_MULTIMODAL_MODEL_SHA256 }}-${{ env.LLAMA_WEBGPU_MULTIMODAL_MMPROJ_SHA256 }}
+
+      - name: Install Playwright Chromium
+        run: npx --no-install playwright install --only-shell chromium
+
+      - name: Run Qwen grammar browser smoke
+        env:
+          BRIDGE_DIST_DIR: ${{ runner.temp }}/webgpu_bridge_dist
+          GRAMMAR_MEMORY_MODE: ${{ matrix.memory }}
+          GRAMMAR_RUNTIME_MODE: ${{ matrix.runtime }}
+        run: |
+          node scripts/smoke/grammar.mjs \
+            --model-url "$LLAMA_WEBGPU_MULTIMODAL_MODEL_URL" \
+            --model-sha256 "$LLAMA_WEBGPU_MULTIMODAL_MODEL_SHA256" \
+            --model-cache-dir "$LLAMA_WEBGPU_MULTIMODAL_MODEL_CACHE" \
+            --timeout-ms "$LLAMA_WEBGPU_GRAMMAR_MULTIMODAL_TIMEOUT_MS" \
+            --artifacts-dir "$LLAMA_WEBGPU_GRAMMAR_ARTIFACTS_DIR/multimodal-model" \
+            --memory-mode "$GRAMMAR_MEMORY_MODE" \
+            --runtime-mode "$GRAMMAR_RUNTIME_MODE"
+
+      - name: Upload grammar smoke diagnostics
+        if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: webgpu-bridge-dist
-          path: |
-            ${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_bridge.js
-            ${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_bridge_worker.js
-            ${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_bridge.d.ts
-            ${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_core.js
-            ${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_core.wasm
-            ${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_core_mem64.js
-            ${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_core_mem64.wasm
-            ${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_core_st.js
-            ${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_core_st.wasm
-            ${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_core_mem64_st.js
-            ${{ runner.temp }}/webgpu_bridge_dist/llama_webgpu_core_mem64_st.wasm
+          name: grammar-smoke-artifacts-qwen-${{ matrix.memory }}-${{ matrix.runtime }}
+          path: ${{ env.LLAMA_WEBGPU_GRAMMAR_ARTIFACTS_DIR }}
+          if-no-files-found: ignore
 
   ci-result:
     name: CI validation
     if: always()
-    needs: [changes, checks, build-webgpu-bridge]
+    needs: [changes, checks, build-core, smoke-core, smoke-resume, smoke-multimodal, smoke-grammar-qwen]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

@@ -81,8 +81,8 @@ export function createRealWorkerBridge(config = {}) {
 // Drives a real BridgeWorkerProxy and delivers replies by request id.
 export function workerDriver(proxy, worker) {
   return {
-    ready() {
-      proxy._worker.onmessage({ data: { type: 'ready' } });
+    ready(capabilities = {}) {
+      proxy._worker.onmessage({ data: { type: 'ready', ...capabilities } });
     },
     calls(method = null) {
       return worker.posted.filter(

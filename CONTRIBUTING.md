@@ -203,9 +203,9 @@ node scripts/smoke/cross_origin_assets.mjs \
 Rerun with `--memory-mode wasm64` for memory64 and `--browser firefox`
 with Playwright Firefox installed.
 
-The resume integrity smoke uses the model already downloaded by state
-persistence. Set the model URL, SHA-256 and cache directory to the same values
-as the state smoke and run:
+The resume integrity smoke uses the same checksum-pinned model as state
+persistence and downloads it on a cache miss. Set the model URL, SHA-256 and
+cache directory to the same values as the state smoke and run:
 
 ```bash
 node scripts/smoke/resume_integrity.mjs --dist-dir "$OUT_DIR" --baseline-dist-dir "$OUT_DIR"
@@ -710,11 +710,15 @@ forms `vMAJOR.MINOR.PATCH-N`, `bNNNN` and `bNNNN-N`, historical
    publishing access to require two-factor authentication and disallow tokens.
 
 The workflow accepts stable unsuffixed tags with rebuild `0` and rejects
-`v0.0.0` and fixture manifests. It fails if the npm version already exists.
-It verifies the registry tarball, provenance, and `latest` tag after publishing
-and uploads a `bridge-npm-publication-outcome` receipt. If publication succeeds
-and readback fails, check the existing version and its provenance on npm before
-dispatching again.
+`v0.0.0` and fixture manifests. It requires an HTTP 404 for the version before
+running `npm publish` once with npm's fetch retries disabled. After publishing,
+it polls version metadata, dist-tags, and attestations, then polls the tarball
+under the same 30-minute deadline. It backs off from 15 to 60 seconds for 404s,
+transient server failures, and transient network errors. Metadata or digest
+mismatches fail immediately. The workflow verifies the tarball's digests, the
+`latest` tag, and signed provenance before uploading a
+`bridge-npm-publication-outcome` receipt. If publication succeeds and readback
+fails, check the existing version and its provenance on npm.
 
 ## CI change selection and compiler cache
 
@@ -726,9 +730,20 @@ deletion comparisons include both paths. The `CI validation` result always
 reports and rejects failed, cancelled, missing, or unexpectedly skipped work.
 Only superseded PR runs are cancelled; main/manual runs remain independent.
 
-The CI compiler cache stores objects outside the checkout, separated by runner
-OS/architecture, exact Emscripten version, resolved llama.cpp commit, and build
-script/CMake/patch inputs. ccache also checks compiler contents, source inputs,
-and compile flags. Every selected build still links fresh artifacts and runs
-every CI browser smoke. Candidate and publication workflows do not consume
-this cache or this change selector.
+CI builds the four core variants in parallel. Each variant can restore its
+generated core JS and WASM using an exact key for the runner OS and architecture,
+Emscripten version, verified llama.cpp commit, and a Git tree fingerprint. The
+fingerprint covers tracked paths, modes, and blob IDs for the bridge native
+sources, CMake inputs, the build scripts and their local imports, and the CI
+workflow. Every selected run combines the cores with the checked-in JS wrappers
+and runs the browser smokes. The separate JS checks verify the wrappers against
+their sources.
+
+On a core cache miss, CI restores a per-variant Emscripten sysroot cache
+(`EM_CACHE`) keyed by runner OS, architecture, and exact SDK version. The
+per-variant ccache key also includes the llama.cpp commit and native build
+inputs. It can reuse objects from the same toolchain and upstream commit
+because ccache verifies compiler contents, source inputs, and compile flags.
+Only pushes to `main` save missing core, Emscripten, and ccache entries.
+Candidate and publication workflows do not consume these CI caches or use this
+change selector.

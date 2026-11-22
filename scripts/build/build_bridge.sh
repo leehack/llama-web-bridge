@@ -13,6 +13,8 @@ SINGLE_THREAD_BUILD_DIR="${SINGLE_THREAD_BUILD_DIR:-$ROOT_DIR/.build/webgpu_brid
 SINGLE_THREAD_MEM64_BUILD_DIR="${SINGLE_THREAD_MEM64_BUILD_DIR:-$ROOT_DIR/.build/webgpu_bridge_mem64_st}"
 OUT_DIR="${OUT_DIR:-$ROOT_DIR/dist}"
 CMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE:-Release}"
+SKIP_JS_CHECK="${WEBGPU_BRIDGE_SKIP_JS_CHECK:-0}"
+VARIANT="${WEBGPU_BRIDGE_VARIANT:-}"
 BUILD_MEM64="${WEBGPU_BRIDGE_BUILD_MEM64:-0}"
 BUILD_SINGLE_THREAD="${WEBGPU_BRIDGE_BUILD_SINGLE_THREAD:-0}"
 MEM64_MAX_MEMORY="${WEBGPU_BRIDGE_MEM64_MAX_MEMORY:-12884901888}"
@@ -54,6 +56,8 @@ Environment variables:
   SINGLE_THREAD_MEM64_BUILD_DIR  CMake build directory for the optional single-thread wasm64 build (default: .build/webgpu_bridge_mem64_st)
   OUT_DIR            Output directory for built assets (default: dist)
   CMAKE_BUILD_TYPE   CMake build type (default: Release)
+  WEBGPU_BRIDGE_SKIP_JS_CHECK  Skip JS checks and use the checked-in wrappers (default: 0)
+  WEBGPU_BRIDGE_VARIANT  Build one core: wasm32, wasm64, wasm32_st, or wasm64_st (default: empty)
   WEBGPU_BRIDGE_BUILD_MEM64  Build optional wasm64 artifacts (1/0)
   WEBGPU_BRIDGE_BUILD_SINGLE_THREAD  Build optional no-pthreads _st artifacts (1/0)
   WEBGPU_BRIDGE_MEM64_MAX_MEMORY  wasm64 max linear memory bytes (default: 12884901888)
@@ -69,6 +73,11 @@ Example:
 USAGE
   exit 0
 fi
+
+case "$VARIANT" in
+  ""|wasm32|wasm64|wasm32_st|wasm64_st) ;;
+  *) echo "error: invalid WEBGPU_BRIDGE_VARIANT: $VARIANT" >&2; exit 1 ;;
+esac
 
 if ! command -v emcmake >/dev/null 2>&1; then
   echo "error: emcmake not found in PATH"
@@ -108,56 +117,62 @@ if [[ ! -f "$LLAMA_CPP_DIR/CMakeLists.txt" ]]; then
   exit 1
 fi
 
-if ! command -v npm >/dev/null 2>&1; then
-  echo "error: npm not found in PATH"
-  exit 1
+if [[ "$SKIP_JS_CHECK" != "1" ]]; then
+  if ! command -v npm >/dev/null 2>&1; then
+    echo "error: npm not found in PATH"
+    exit 1
+  fi
+
+  if [[ ! -d "$BRIDGE_DIR/node_modules" ]]; then
+    echo "[bridge] installing JS build dependencies"
+    (cd "$BRIDGE_DIR" && npm ci --include=dev --ignore-scripts)
+  fi
+
+  echo "[bridge] building JS bridge wrapper"
+  (cd "$BRIDGE_DIR" && npm run check:js)
 fi
 
-if [[ ! -d "$BRIDGE_DIR/node_modules" ]]; then
-  echo "[bridge] installing JS build dependencies"
-  (cd "$BRIDGE_DIR" && npm ci --include=dev --ignore-scripts)
+if [[ -z "$VARIANT" || "$VARIANT" == "wasm32" ]]; then
+  mkdir -p "$BUILD_DIR"
+  mkdir -p "$OUT_DIR"
+
+  echo "[bridge] configuring with emcmake"
+  emcmake cmake \
+    -S "$BRIDGE_DIR" \
+    -B "$BUILD_DIR" \
+    -DLLAMA_CPP_DIR="$LLAMA_CPP_DIR" \
+    -DCMAKE_BUILD_TYPE="$CMAKE_BUILD_TYPE" \
+    -DLLAMADART_WEBGPU_STACK_SIZE="$STACK_SIZE" \
+    -DLLAMADART_WEBGPU_PTHREADS="$CMAKE_PTHREADS" \
+    -DLLAMADART_WEBGPU_PTHREAD_POOL_SIZE="$PTHREAD_POOL_SIZE" \
+    -DLLAMADART_WEBGPU_PTHREAD_POOL_SIZE_STRICT="$PTHREAD_POOL_SIZE_STRICT" \
+    -DLLAMADART_WEBGPU_ALLOW_MEMORY_GROWTH="$CMAKE_ALLOW_MEMORY_GROWTH" \
+    -DLLAMADART_WEBGPU_INITIAL_MEMORY="$INITIAL_MEMORY"
+
+  echo "[bridge] building"
+  cmake --build "$BUILD_DIR" -j "$(nproc 2>/dev/null || sysctl -n hw.logicalcpu 2>/dev/null || echo 4)"
+
+  CORE_JS="$BUILD_DIR/artifacts/llama_webgpu_core.js"
+  CORE_WASM="$BUILD_DIR/artifacts/llama_webgpu_core.wasm"
+  BRIDGE_JS="$BRIDGE_DIR/js/llama_webgpu_bridge.js"
+  BRIDGE_WORKER_JS="$BRIDGE_DIR/js/llama_webgpu_bridge_worker.js"
+  BRIDGE_DTS="$BRIDGE_DIR/js/llama_webgpu_bridge.d.ts"
+
+  if [[ ! -f "$CORE_JS" || ! -f "$CORE_WASM" || ! -f "$BRIDGE_JS" || ! -f "$BRIDGE_WORKER_JS" || ! -f "$BRIDGE_DTS" ]]; then
+    echo "error: expected build outputs were not found"
+    exit 1
+  fi
+
+  cp "$CORE_JS" "$OUT_DIR/llama_webgpu_core.js"
+  cp "$CORE_WASM" "$OUT_DIR/llama_webgpu_core.wasm"
+  cp "$BRIDGE_JS" "$OUT_DIR/llama_webgpu_bridge.js"
+  cp "$BRIDGE_WORKER_JS" "$OUT_DIR/llama_webgpu_bridge_worker.js"
+  cp "$BRIDGE_DTS" "$OUT_DIR/llama_webgpu_bridge.d.ts"
+else
+  mkdir -p "$OUT_DIR"
 fi
 
-echo "[bridge] building JS bridge wrapper"
-(cd "$BRIDGE_DIR" && npm run check:js)
-
-mkdir -p "$BUILD_DIR"
-mkdir -p "$OUT_DIR"
-
-echo "[bridge] configuring with emcmake"
-emcmake cmake \
-  -S "$BRIDGE_DIR" \
-  -B "$BUILD_DIR" \
-  -DLLAMA_CPP_DIR="$LLAMA_CPP_DIR" \
-  -DCMAKE_BUILD_TYPE="$CMAKE_BUILD_TYPE" \
-  -DLLAMADART_WEBGPU_STACK_SIZE="$STACK_SIZE" \
-  -DLLAMADART_WEBGPU_PTHREADS="$CMAKE_PTHREADS" \
-  -DLLAMADART_WEBGPU_PTHREAD_POOL_SIZE="$PTHREAD_POOL_SIZE" \
-  -DLLAMADART_WEBGPU_PTHREAD_POOL_SIZE_STRICT="$PTHREAD_POOL_SIZE_STRICT" \
-  -DLLAMADART_WEBGPU_ALLOW_MEMORY_GROWTH="$CMAKE_ALLOW_MEMORY_GROWTH" \
-  -DLLAMADART_WEBGPU_INITIAL_MEMORY="$INITIAL_MEMORY"
-
-echo "[bridge] building"
-cmake --build "$BUILD_DIR" -j "$(nproc 2>/dev/null || sysctl -n hw.logicalcpu 2>/dev/null || echo 4)"
-
-CORE_JS="$BUILD_DIR/artifacts/llama_webgpu_core.js"
-CORE_WASM="$BUILD_DIR/artifacts/llama_webgpu_core.wasm"
-BRIDGE_JS="$BRIDGE_DIR/js/llama_webgpu_bridge.js"
-BRIDGE_WORKER_JS="$BRIDGE_DIR/js/llama_webgpu_bridge_worker.js"
-BRIDGE_DTS="$BRIDGE_DIR/js/llama_webgpu_bridge.d.ts"
-
-if [[ ! -f "$CORE_JS" || ! -f "$CORE_WASM" || ! -f "$BRIDGE_JS" || ! -f "$BRIDGE_WORKER_JS" || ! -f "$BRIDGE_DTS" ]]; then
-  echo "error: expected build outputs were not found"
-  exit 1
-fi
-
-cp "$CORE_JS" "$OUT_DIR/llama_webgpu_core.js"
-cp "$CORE_WASM" "$OUT_DIR/llama_webgpu_core.wasm"
-cp "$BRIDGE_JS" "$OUT_DIR/llama_webgpu_bridge.js"
-cp "$BRIDGE_WORKER_JS" "$OUT_DIR/llama_webgpu_bridge_worker.js"
-cp "$BRIDGE_DTS" "$OUT_DIR/llama_webgpu_bridge.d.ts"
-
-if [[ "$BUILD_MEM64" == "1" ]]; then
+if [[ ( -z "$VARIANT" && "$BUILD_MEM64" == "1" ) || "$VARIANT" == "wasm64" ]]; then
   mkdir -p "$MEM64_BUILD_DIR"
 
   echo "[bridge] configuring optional wasm64 build"
@@ -200,7 +215,7 @@ if [[ "$BUILD_MEM64" == "1" ]]; then
   fi
 fi
 
-if [[ "$BUILD_SINGLE_THREAD" == "1" ]]; then
+if [[ ( -z "$VARIANT" && "$BUILD_SINGLE_THREAD" == "1" ) || "$VARIANT" == "wasm32_st" ]]; then
   mkdir -p "$SINGLE_THREAD_BUILD_DIR"
 
   echo "[bridge] configuring optional single-thread wasm32 build"
@@ -230,67 +245,69 @@ if [[ "$BUILD_SINGLE_THREAD" == "1" ]]; then
 
   cp "$CORE_ST_JS" "$OUT_DIR/llama_webgpu_core_st.js"
   cp "$CORE_ST_WASM" "$OUT_DIR/llama_webgpu_core_st.wasm"
+fi
 
-  if [[ "$BUILD_MEM64" == "1" ]]; then
-    mkdir -p "$SINGLE_THREAD_MEM64_BUILD_DIR"
+if [[ ( -z "$VARIANT" && "$BUILD_SINGLE_THREAD" == "1" && "$BUILD_MEM64" == "1" ) || "$VARIANT" == "wasm64_st" ]]; then
+  mkdir -p "$SINGLE_THREAD_MEM64_BUILD_DIR"
 
-    echo "[bridge] configuring optional single-thread wasm64 build"
-    emcmake cmake \
-      -S "$BRIDGE_DIR" \
-      -B "$SINGLE_THREAD_MEM64_BUILD_DIR" \
-      -DLLAMA_CPP_DIR="$LLAMA_CPP_DIR" \
-      -DCMAKE_BUILD_TYPE="$CMAKE_BUILD_TYPE" \
-      -DLLAMADART_WEBGPU_MEM64=ON \
-      -DLLAMADART_WEBGPU_MEM64_MAX_MEMORY="$MEM64_MAX_MEMORY" \
-      -DLLAMADART_WEBGPU_CORE_OUTPUT_SUFFIX="_st" \
-      -DLLAMADART_WEBGPU_STACK_SIZE="$STACK_SIZE" \
-      -DLLAMADART_WEBGPU_PTHREADS=OFF \
-      -DLLAMADART_WEBGPU_PTHREAD_POOL_SIZE="$PTHREAD_POOL_SIZE" \
-      -DLLAMADART_WEBGPU_PTHREAD_POOL_SIZE_STRICT="$PTHREAD_POOL_SIZE_STRICT" \
-      -DLLAMADART_WEBGPU_ALLOW_MEMORY_GROWTH="$CMAKE_ALLOW_MEMORY_GROWTH" \
-      -DLLAMADART_WEBGPU_INITIAL_MEMORY="$INITIAL_MEMORY"
+  echo "[bridge] configuring optional single-thread wasm64 build"
+  emcmake cmake \
+    -S "$BRIDGE_DIR" \
+    -B "$SINGLE_THREAD_MEM64_BUILD_DIR" \
+    -DLLAMA_CPP_DIR="$LLAMA_CPP_DIR" \
+    -DCMAKE_BUILD_TYPE="$CMAKE_BUILD_TYPE" \
+    -DLLAMADART_WEBGPU_MEM64=ON \
+    -DLLAMADART_WEBGPU_MEM64_MAX_MEMORY="$MEM64_MAX_MEMORY" \
+    -DLLAMADART_WEBGPU_CORE_OUTPUT_SUFFIX="_st" \
+    -DLLAMADART_WEBGPU_STACK_SIZE="$STACK_SIZE" \
+    -DLLAMADART_WEBGPU_PTHREADS=OFF \
+    -DLLAMADART_WEBGPU_PTHREAD_POOL_SIZE="$PTHREAD_POOL_SIZE" \
+    -DLLAMADART_WEBGPU_PTHREAD_POOL_SIZE_STRICT="$PTHREAD_POOL_SIZE_STRICT" \
+    -DLLAMADART_WEBGPU_ALLOW_MEMORY_GROWTH="$CMAKE_ALLOW_MEMORY_GROWTH" \
+    -DLLAMADART_WEBGPU_INITIAL_MEMORY="$INITIAL_MEMORY"
 
-    echo "[bridge] building optional single-thread wasm64 artifacts"
-    cmake --build "$SINGLE_THREAD_MEM64_BUILD_DIR" -j "$(nproc 2>/dev/null || sysctl -n hw.logicalcpu 2>/dev/null || echo 4)"
+  echo "[bridge] building optional single-thread wasm64 artifacts"
+  cmake --build "$SINGLE_THREAD_MEM64_BUILD_DIR" -j "$(nproc 2>/dev/null || sysctl -n hw.logicalcpu 2>/dev/null || echo 4)"
 
-    CORE_MEM64_ST_JS="$SINGLE_THREAD_MEM64_BUILD_DIR/artifacts/llama_webgpu_core_mem64_st.js"
-    CORE_MEM64_ST_WASM="$SINGLE_THREAD_MEM64_BUILD_DIR/artifacts/llama_webgpu_core_mem64_st.wasm"
+  CORE_MEM64_ST_JS="$SINGLE_THREAD_MEM64_BUILD_DIR/artifacts/llama_webgpu_core_mem64_st.js"
+  CORE_MEM64_ST_WASM="$SINGLE_THREAD_MEM64_BUILD_DIR/artifacts/llama_webgpu_core_mem64_st.wasm"
 
-    if [[ ! -f "$CORE_MEM64_ST_JS" || ! -f "$CORE_MEM64_ST_WASM" ]]; then
-      echo "error: expected single-thread wasm64 build outputs were not found"
-      exit 1
-    fi
+  if [[ ! -f "$CORE_MEM64_ST_JS" || ! -f "$CORE_MEM64_ST_WASM" ]]; then
+    echo "error: expected single-thread wasm64 build outputs were not found"
+    exit 1
+  fi
 
-    cp "$CORE_MEM64_ST_JS" "$OUT_DIR/llama_webgpu_core_mem64_st.js"
-    cp "$CORE_MEM64_ST_WASM" "$OUT_DIR/llama_webgpu_core_mem64_st.wasm"
+  cp "$CORE_MEM64_ST_JS" "$OUT_DIR/llama_webgpu_core_mem64_st.js"
+  cp "$CORE_MEM64_ST_WASM" "$OUT_DIR/llama_webgpu_core_mem64_st.wasm"
 
-    echo "[bridge] verifying single-thread memory64 and applying wasm64 runtime bigint interop patch"
-    patch_summary_st="$(node "$BRIDGE_DIR/scripts/build/patch_wasm64_runtime.mjs" \
-      "$OUT_DIR/llama_webgpu_core_mem64_st.js")"
-    echo "$patch_summary_st"
-    # Fail closed if the patcher returned without patching.
-    if [[ "$patch_summary_st" != "Patched wasm64 generated JavaScript: "* ]]; then
-      echo "[bridge] error: single-thread wasm64 runtime patch did not report a patched file" >&2
-      exit 1
-    fi
+  echo "[bridge] verifying single-thread memory64 and applying wasm64 runtime bigint interop patch"
+  patch_summary_st="$(node "$BRIDGE_DIR/scripts/build/patch_wasm64_runtime.mjs" \
+    "$OUT_DIR/llama_webgpu_core_mem64_st.js")"
+  echo "$patch_summary_st"
+  # Fail closed if the patcher returned without patching.
+  if [[ "$patch_summary_st" != "Patched wasm64 generated JavaScript: "* ]]; then
+    echo "[bridge] error: single-thread wasm64 runtime patch did not report a patched file" >&2
+    exit 1
   fi
 fi
 
 echo "[bridge] done"
-echo "  - $OUT_DIR/llama_webgpu_bridge.js"
-echo "  - $OUT_DIR/llama_webgpu_bridge_worker.js"
-echo "  - $OUT_DIR/llama_webgpu_bridge.d.ts"
-echo "  - $OUT_DIR/llama_webgpu_core.js"
-echo "  - $OUT_DIR/llama_webgpu_core.wasm"
-if [[ "$BUILD_MEM64" == "1" ]]; then
+if [[ -z "$VARIANT" || "$VARIANT" == "wasm32" ]]; then
+  echo "  - $OUT_DIR/llama_webgpu_bridge.js"
+  echo "  - $OUT_DIR/llama_webgpu_bridge_worker.js"
+  echo "  - $OUT_DIR/llama_webgpu_bridge.d.ts"
+  echo "  - $OUT_DIR/llama_webgpu_core.js"
+  echo "  - $OUT_DIR/llama_webgpu_core.wasm"
+fi
+if [[ ( -z "$VARIANT" && "$BUILD_MEM64" == "1" ) || "$VARIANT" == "wasm64" ]]; then
   echo "  - $OUT_DIR/llama_webgpu_core_mem64.js"
   echo "  - $OUT_DIR/llama_webgpu_core_mem64.wasm"
 fi
-if [[ "$BUILD_SINGLE_THREAD" == "1" ]]; then
+if [[ ( -z "$VARIANT" && "$BUILD_SINGLE_THREAD" == "1" ) || "$VARIANT" == "wasm32_st" ]]; then
   echo "  - $OUT_DIR/llama_webgpu_core_st.js"
   echo "  - $OUT_DIR/llama_webgpu_core_st.wasm"
-  if [[ "$BUILD_MEM64" == "1" ]]; then
-    echo "  - $OUT_DIR/llama_webgpu_core_mem64_st.js"
-    echo "  - $OUT_DIR/llama_webgpu_core_mem64_st.wasm"
-  fi
+fi
+if [[ ( -z "$VARIANT" && "$BUILD_SINGLE_THREAD" == "1" && "$BUILD_MEM64" == "1" ) || "$VARIANT" == "wasm64_st" ]]; then
+  echo "  - $OUT_DIR/llama_webgpu_core_mem64_st.js"
+  echo "  - $OUT_DIR/llama_webgpu_core_mem64_st.wasm"
 fi

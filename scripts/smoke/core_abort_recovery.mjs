@@ -389,29 +389,36 @@ async function runDist(args, distDir, modelPath, cases) {
     await fsp.writeFile(path.join(webRoot, 'core-frame.html'),
       '<script>window.loadCoreFactory = import("/instrumented-core.js").then(module => module.default)</script>');
     return withServer(webRoot, async (url) => {
-      const results = {};
-      for (const { scenario, worker, staging } of cases) {
-        const key = [args.threading, args.memoryMode, worker ? 'worker' : 'direct', scenario, ...(staging ? ['staging'] : [])].join('-');
-        await fsp.writeFile(path.join(webRoot, 'instrumented-core.js'),
-          renderInstrumentedCore(coreName, { hideRuntimeError: scenario === 'older-iframe' }));
-        await fsp.writeFile(path.join(webRoot, 'index.html'), renderHarness({
-          scenario, worker, staging, single, memory64, coreName,
-          modelUrl: '/' + MODEL, truncatedUrl: '/' + TRUNCATED,
-        }));
-        const payload = await runPollingPlaywright(url, args.timeoutMs, args.artifactsDir, {
-          artifactPrefix: key,
-          launchArgs: webGpuLaunchArgs(process.platform, { sharedArrayBuffer: !single }),
-          stageMarker: 'CORE_ABORT_SMOKE',
-          stagePrefix: key,
-        });
-        assert.equal(payload.ok, true, `${key}: ${payload.error || payload.disposeError}\n${JSON.stringify(payload.events)}`);
-        results[key] = scenario === 'parity' ? payload.parity : {
-          pthreadsCreated: payload.pthreadsCreated,
-          pthreadsTerminated: payload.pthreadsTerminated,
-          stagedBytes: payload.stagedBytes,
-        };
+      const { chromium } = await import('playwright');
+      const browser = await chromium.launch({ args: webGpuLaunchArgs(process.platform, { sharedArrayBuffer: !single }) });
+      try {
+        const results = {};
+        for (const { scenario, worker, staging } of cases) {
+          const key = [args.threading, args.memoryMode, worker ? 'worker' : 'direct', scenario, ...(staging ? ['staging'] : [])].join('-');
+          await fsp.writeFile(path.join(webRoot, 'instrumented-core.js'),
+            renderInstrumentedCore(coreName, { hideRuntimeError: scenario === 'older-iframe' }));
+          await fsp.writeFile(path.join(webRoot, 'index.html'), renderHarness({
+            scenario, worker, staging, single, memory64, coreName,
+            modelUrl: '/' + MODEL, truncatedUrl: '/' + TRUNCATED,
+          }));
+          const payload = await runPollingPlaywright(url, args.timeoutMs, args.artifactsDir, {
+            artifactPrefix: key,
+            // The polling helper owns the page and closes its context after each case.
+            launchBrowser: () => browser.newContext(),
+            stageMarker: 'CORE_ABORT_SMOKE',
+            stagePrefix: key,
+          });
+          assert.equal(payload.ok, true, `${key}: ${payload.error || payload.disposeError}\n${JSON.stringify(payload.events)}`);
+          results[key] = scenario === 'parity' ? payload.parity : {
+            pthreadsCreated: payload.pthreadsCreated,
+            pthreadsTerminated: payload.pthreadsTerminated,
+            stagedBytes: payload.stagedBytes,
+          };
+        }
+        return results;
+      } finally {
+        await browser.close();
       }
-      return results;
     }, { isolated: !single });
   });
 }

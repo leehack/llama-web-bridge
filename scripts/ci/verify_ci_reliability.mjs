@@ -921,6 +921,7 @@ export const RELEASE_CONTRACT_SUITES = Object.freeze([
   'tests/release/contract_test.mjs',
   'tests/release/manifest_test.mjs',
   'tests/release/npm_package_test.mjs',
+  'tests/release/npm_registry_readback_test.mjs',
   'tests/release/npm_release_test.mjs',
   'tests/release/publication_state_test.mjs',
   'tests/release/qualification_attestation_test.mjs',
@@ -988,47 +989,134 @@ function checkCiRunsContracts({ ci, candidate, qualification, publish }, testFil
     missingSuites.length === 0,
     `the release contract suites npm run check:js must run are missing: ${missingSuites.join(', ')}`,
   );
-  // Rows 21, 22, 101, 103: CI runs the checksum-pinned browser smokes.
-  check.require(
-    (ci.runText.match(/node scripts\/smoke\/grammar\.mjs\b/g) ?? []).length === 2
-      && ci.runText.includes('--model-sha256 "$LLAMA_WEBGPU_MULTIMODAL_MODEL_SHA256"'),
-    `${ci.path} must run the grammar smoke twice, once with the checksum-pinned multimodal model`,
-  );
-  check.includes(ci.path, ci.runText, [
-    'node scripts/smoke/next_token_scores.mjs',
-    'node scripts/smoke/state_persistence.mjs',
-    'node scripts/smoke/multimodal.mjs',
-  ], 'run the next-token scores, state persistence and multimodal browser smokes');
-  const ciBuildSteps = ci.jobSteps('build-webgpu-bridge');
-  for (const command of [
-    'node scripts/smoke/state_persistence.mjs --threading single',
-    'node scripts/smoke/state_persistence.mjs --threading single --memory-mode wasm64',
-    'node scripts/smoke/resume_integrity.mjs --baseline-dist-dir "$BRIDGE_DIST_DIR"',
-    'node scripts/smoke/resume_integrity.mjs --baseline-dist-dir "$BRIDGE_DIST_DIR" --threading single',
-    'node scripts/smoke/resume_integrity.mjs --baseline-dist-dir "$BRIDGE_DIST_DIR" --js-backed-model-staging',
-    'node scripts/smoke/resume_integrity.mjs --baseline-dist-dir "$BRIDGE_DIST_DIR" --threading single --js-backed-model-staging',
-    'node scripts/smoke/cross_origin_assets.mjs',
-    'npm ci --ignore-scripts --prefix scripts/smoke/bundler_deps',
-    'node scripts/smoke/bundler_packaging.mjs',
-    'node scripts/smoke/core_abort_recovery.mjs',
-    'node scripts/smoke/core_abort_recovery.mjs --threading single',
-    'node scripts/smoke/core_release.mjs',
-    'node scripts/smoke/core_release.mjs --memory-mode wasm64',
-    'node scripts/smoke/core_release.mjs --threading single',
-    'node scripts/smoke/remote_fetch_backend.mjs',
-    'node scripts/smoke/remote_fetch_backend.mjs --memory-mode wasm64',
-  ]) {
-    check.require(
-      ciBuildSteps.some((step) => step.run.trim() === command
-        && step.raw.if === undefined && step.raw['continue-on-error'] === undefined),
-      `${ci.path} job build-webgpu-bridge must run "${command}" unconditionally without continue-on-error`,
-    );
+  // Rows 21, 22, 101, 103: CI runs all checksum-pinned browser smokes.
+  const smokeCommands = {
+    'smoke-core': [
+      'npm ci --ignore-scripts --prefix scripts/smoke/bundler_deps',
+      'node scripts/smoke/bundler_packaging.mjs',
+      'node scripts/smoke/state_persistence.mjs',
+      'node scripts/smoke/state_persistence.mjs --memory-mode wasm64',
+      'node scripts/smoke/state_persistence.mjs --threading single',
+      'node scripts/smoke/state_persistence.mjs --threading single --memory-mode wasm64',
+      'node scripts/smoke/cross_origin_assets.mjs',
+      'node --test tests/bridge/js_model_staging_shared_core_browser_test.mjs',
+      'node scripts/smoke/core_abort_recovery.mjs',
+      'node scripts/smoke/core_abort_recovery.mjs --threading single',
+      'node scripts/smoke/core_release.mjs',
+      'node scripts/smoke/core_release.mjs --memory-mode wasm64',
+      'node scripts/smoke/core_release.mjs --threading single',
+      'node scripts/smoke/remote_fetch_backend.mjs',
+      'node scripts/smoke/remote_fetch_backend.mjs --memory-mode wasm64',
+    ],
+    'smoke-resume': ['', ' --threading single'].flatMap((threading) =>
+      ['', ' --js-backed-model-staging', ' --js-backed-model-staging --no-mmap'].map((staging) =>
+        'node scripts/smoke/resume_integrity.mjs --baseline-dist-dir "$BRIDGE_DIST_DIR"' + threading + staging)),
+    'smoke-multimodal': [
+      'node scripts/smoke/multimodal.mjs',
+      'node scripts/smoke/grammar.mjs --artifacts-dir "$LLAMA_WEBGPU_GRAMMAR_ARTIFACTS_DIR/state-smoke-model"',
+      'node scripts/smoke/next_token_scores.mjs',
+      'node scripts/smoke/speculative.mjs --group tiny',
+    ],
+    'smoke-grammar-qwen': [[
+      'node scripts/smoke/grammar.mjs',
+      '--model-url "$LLAMA_WEBGPU_MULTIMODAL_MODEL_URL"',
+      '--model-sha256 "$LLAMA_WEBGPU_MULTIMODAL_MODEL_SHA256"',
+      '--model-cache-dir "$LLAMA_WEBGPU_MULTIMODAL_MODEL_CACHE"',
+      '--timeout-ms "$LLAMA_WEBGPU_GRAMMAR_MULTIMODAL_TIMEOUT_MS"',
+      '--artifacts-dir "$LLAMA_WEBGPU_GRAMMAR_ARTIFACTS_DIR/multimodal-model"',
+      '--memory-mode "$GRAMMAR_MEMORY_MODE"',
+      '--runtime-mode "$GRAMMAR_RUNTIME_MODE"',
+    ].join(' ')],
+  };
+  const smokeModels = {
+    'smoke-grammar-qwen': ['LLAMA_WEBGPU_MULTIMODAL_MODEL'],
+    'node scripts/smoke/multimodal.mjs': ['LLAMA_WEBGPU_MULTIMODAL_MODEL', 'LLAMA_WEBGPU_MULTIMODAL_MMPROJ'],
+  };
+  for (const [job, commands] of Object.entries(smokeCommands)) {
+    for (const command of commands) {
+      const step = ci.jobSteps(job).find((step) => shellCommands(step.run).trim() === command
+        && step.raw.if === undefined && step.raw['continue-on-error'] === undefined);
+      check.require(
+        step !== undefined,
+        `${ci.path} job ${job} must run "${command}" unconditionally without continue-on-error`,
+      );
+      if (!step || !command.startsWith('node ')) continue;
+      for (const model of smokeModels[job] ?? smokeModels[command] ?? ['LLAMA_WEBGPU_SMOKE_MODEL']) {
+        const checksum = `${model}_SHA256`;
+        const modelPath = job === 'smoke-grammar-qwen' ? 'LLAMA_WEBGPU_SMOKE_MODEL_PATH' : `${model}_PATH`;
+        check.require(
+          /^https:\/\//.test(step.env[`${model}_URL`]) && !step.env[modelPath]
+            && step.env[checksum] === EXPECTED_MODEL_PINS[CANONICAL_MODEL_PIN_NAMES[checksum]],
+          `${ci.path} job ${job} step ${step.name} must use a downloadable checksum-pinned ${model}`,
+        );
+      }
+    }
   }
+  const build = mapping(ci.job('build-core').strategy);
+  const qwen = mapping(ci.job('smoke-grammar-qwen').strategy);
+  const exactMatrix = (matrix, axes) => {
+    const actual = mapping(matrix);
+    return Object.keys(actual).length === Object.keys(axes).length
+      && Object.entries(axes).every(([name, values]) => Array.isArray(actual[name])
+        && sorted(actual[name]).join(',') === sorted(values).join(','));
+  };
+  check.require(
+    build['fail-fast'] === true
+      && exactMatrix(build.matrix, { variant: ['wasm32', 'wasm64', 'wasm32_st', 'wasm64_st'] }),
+    `${ci.path} must run the four core build variants`,
+  );
+  const qwenStep = ci.jobSteps('smoke-grammar-qwen')
+    .find((step) => shellCommands(step.run).trim() === smokeCommands['smoke-grammar-qwen'][0]);
+  check.require(
+    qwen['fail-fast'] === false
+      && exactMatrix(qwen.matrix, { memory: ['wasm32', 'wasm64'], runtime: ['direct', 'worker'] })
+      && qwenStep?.env.GRAMMAR_MEMORY_MODE === '${{ matrix.memory }}'
+      && qwenStep?.env.GRAMMAR_RUNTIME_MODE === '${{ matrix.runtime }}',
+    `${ci.path} must run all four Qwen grammar cells with their selected memory and runtime modes`,
+  );
+  const corePath = '${{ runner.temp }}/webgpu_bridge_dist';
+  const coreSaveKey = '${{ steps.core-cache.outputs.cache-primary-key }}';
+  const coreCacheSteps = ci.steps.filter((step) => /^actions\/cache(?:\/[^@]+)?@/.test(step.uses)
+    && (step.with.path === corePath || step.with.key === coreSaveKey
+      || String(step.with.key ?? '').startsWith('webgpu-core-')));
+  const coreCache = coreCacheSteps.find((step) => step.job === 'build-core' && step.id === 'core-cache');
+  const buildSteps = ci.jobSteps('build-core');
+  const checkout = buildSteps.find((step) => step.uses === 'actions/checkout@v4');
+  const nativeInputs = buildSteps.find((step) => step.id === 'native-inputs');
+  const fingerprintCommands = shellCommands(nativeInputs?.run ?? '').split('\n').map((line) => line.trim());
+  const fingerprintCommand = 'fingerprint="$(git ls-tree -r -z HEAD -- src CMakeLists.txt cmake scripts/build '
+    + 'scripts/release/cli.mjs scripts/release/errors.mjs scripts/release/json.mjs '
+    + 'scripts/release/python_compat.mjs scripts/release/unicode15.mjs .github/workflows/ci.yml | sha256sum)"';
+  check.require(
+    checkout !== undefined && nativeInputs !== undefined && coreCache !== undefined
+      && checkout.index < nativeInputs.index && nativeInputs.index < coreCache.index
+      && nativeInputs.raw.if === undefined && nativeInputs.raw['continue-on-error'] === undefined
+      && fingerprintCommands.includes('set -euo pipefail') && fingerprintCommands.includes(fingerprintCommand)
+      && fingerprintCommands.includes('echo "sha256=${fingerprint%% *}" >> "$GITHUB_OUTPUT"'),
+    `${ci.path} must fingerprint the checked-out native input tree, including scripts/build, its local imports, and the workflow, before restoring the core cache`,
+  );
+  const coreKey = 'webgpu-core-v1-${{ runner.os }}-${{ runner.arch }}-${{ matrix.variant }}'
+    + '-${{ env.EMSCRIPTEN_VERSION }}-${{ steps.compiler-cache.outputs.upstream }}-'
+    + '${{ steps.native-inputs.outputs.sha256 }}';
+  check.require(
+    coreCache?.uses === 'actions/cache/restore@v4' && coreCache.with.key === coreKey
+      && coreCache.with.path === corePath && !has(coreCache.with, 'restore-keys'),
+    `${ci.path} must restore the exact-key core cache using the native input tree fingerprint and no restore-keys`,
+  );
+  const coreSave = coreCacheSteps.find((step) => step.uses === 'actions/cache/save@v4');
+  const coreBuild = ci.step('build-core', 'Build bridge artifacts');
+  check.require(
+    coreCacheSteps.length === 2 && coreSave?.job === 'build-core' && coreBuild !== undefined
+      && coreSave.index > coreBuild.index && coreSave.with.path === corePath && coreSave.with.key === coreSaveKey
+      && coreSave.raw.if === "steps.core-cache.outputs.cache-hit != 'true' && github.event_name == 'push' && github.ref == 'refs/heads/main'",
+    `${ci.path} must save the core cache only on a main push after copying the core files, using the restore key on a miss`,
+  );
+  check.excludes(candidate.path, candidate.text, ['webgpu-core-', 'webgpu-ccache-'], 'never reference CI core or compiler caches');
   for (const workflow of [ci, candidate, qualification, publish]) {
     check.require(
-      workflow.steps.every((step) => (workflow === ci && step.job === 'build-webgpu-bridge')
+      workflow.steps.every((step) => (workflow === ci && step.job === 'smoke-core')
         || !/scripts\/smoke\/(?:bundler_deps|bundler_packaging\.mjs)/.test(step.run)),
-      `${workflow.path} bundler smoke dependencies and execution must stay in build-webgpu-bridge`,
+      `${workflow.path} bundler smoke dependencies and execution must stay in smoke-core`,
     );
   }
   // Row 57: CI builds the llama.cpp pin.
@@ -1552,13 +1640,15 @@ function checkNpmPublication(workflow, errors) {
   `${label} must isolate npm user and global configuration with distinct paths`);
   includes(label, publish, ['if [[ "${STATUS}" != "404" ]]; then', 'https://registry.npmjs.org/llama-web-bridge/${VERSION}'],
     'refuse to publish an existing or unconfirmed version');
-  includes(label, publish, ['npm publish "./llama-web-bridge-${VERSION}.tgz" --provenance --access public --tag latest --registry https://registry.npmjs.org --ignore-scripts'],
+  const publishStep = workflow.jobSteps(publishJob).find((step) => step.run.includes('npm publish '));
+  const publishCommand = shellCommands(publishStep?.run ?? '').split('\n').find((line) => line.startsWith('npm publish '));
+  includes(label, publishCommand ?? '', ['npm publish "./llama-web-bridge-${VERSION}.tgz" --provenance --access public --tag latest --registry https://registry.npmjs.org --ignore-scripts'],
     'publish the exact tarball with OIDC');
+  require(publishCommand?.endsWith(' --fetch-retries=0'), `${label} must disable npm CLI retries on the publish command`);
   require(occurrences(workflow.runText, 'npm publish ') === 1,
     `${label} must publish only from the OIDC job`);
   includes(label, publish, [
-    '.dist.integrity == $integrity', 'sha256sum --check', '.dist.attestations.provenance.predicateType == $predicate',
-    '.latest == $version', 'gh attestation verify "${RUNNER_TEMP}/registry.tgz"',
+    'SHA512="$(node scripts/release/npm_registry_readback.mjs)"', 'gh attestation verify "${RUNNER_TEMP}/registry.tgz"',
     '--signer-workflow "${BRIDGE_REPO}/.github/workflows/publish_npm.yml"',
     '.subject == [{name: $subject, digest: {sha512: $sha}}]', '.signature.certificate.runInvocationURI == $run',
     '.predicate.runDetails.metadata.invocationId == $run', 'bridge-npm-publication-outcome.json',
@@ -1567,11 +1657,13 @@ function checkNpmPublication(workflow, errors) {
   includes(label, ` ${provenanceCommand} `, [
     ' --source-ref refs/heads/main ', ' --source-digest "${GITHUB_SHA}" ', ' --deny-self-hosted-runners ',
   ], 'bind npm provenance to main, the workflow commit and a GitHub-hosted runner');
-  const publishIndex = workflow.stepIndex(publishJob, (step) => step.run.includes('npm publish '));
   const envIndex = workflow.stepIndex(publishJob, (step) => step.run.includes('validate-environment'));
   const verifyIndex = workflow.stepIndex(publishJob, (step) => step.run.includes('verify-tarball'));
-  const readbackIndex = workflow.stepIndex(publishJob, (step) => step.run.includes('.dist.integrity'));
-  require(verifyIndex > download?.index && envIndex > verifyIndex && publishIndex > envIndex && readbackIndex > publishIndex,
+  const readbackStep = workflow.jobSteps(publishJob).find((step) => step.run.includes('npm_registry_readback.mjs'));
+  require(readbackStep?.env.EXPECTED_INTEGRITY === '${{ steps.tarball.outputs.integrity }}'
+    && workflow.job(publishJob).env?.EXPECTED_TARBALL_SHA256 === '${{ needs.stage-and-verify-package.outputs.tarball_sha256 }}',
+  `${label} must pass both verified digests to the npm registry readback`);
+  require(verifyIndex > download?.index && envIndex > verifyIndex && publishStep?.index > envIndex && readbackStep?.index > publishStep?.index,
     `${label} must verify the artifact and live environment before publishing, then read back the registry`);
 }
 

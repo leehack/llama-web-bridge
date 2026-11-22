@@ -247,9 +247,11 @@ assert.deepEqual(webGpuLaunchArgs('linux'), [
       () => stateSmoke.parseArgs(['--threading', 'bogus']),
       (error) => error instanceof UsageError && /argument --threading: invalid choice: 'bogus'/.test(error.message),
     );
-    assert.deepEqual(grammarSmoke.parseArgs([]), {
-      ...shared, timeoutMs: 7, memoryMode: 'all', nCtx: 1024, artifactsDir: '/a/grammar',
+    const grammarArgs = grammarSmoke.parseArgs([]);
+    assert.deepEqual(grammarArgs, {
+      ...shared, timeoutMs: 7, memoryMode: 'all', runtimeMode: 'all', nCtx: 1024, artifactsDir: '/a/grammar',
     });
+    assert.match(grammarSmoke.renderHarness(grammarArgs.nCtx, ['wasm32', 'wasm64']), /"runtimeModes": \["direct", "worker"\]/);
     assert.deepEqual(nextTokenSmoke.parseArgs(['--memory-mode', 'wasm64', '--n-ctx', '64']), {
       ...shared, timeoutMs: 300000, memoryMode: 'wasm64', nCtx: 64, artifactsDir: '/a/nts',
     });
