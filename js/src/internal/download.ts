@@ -75,10 +75,11 @@ export function sumProgressValues(values: Iterable<unknown> | null | undefined):
   return total;
 }
 
-export function createModelTransferLengthError(message: string): Error {
-  const error = new Error(message);
-  error.name = 'ModelTransferLengthError';
-  return error;
+export function createModelTransferLengthError(message: string) {
+  return Object.assign(new Error(message), {
+    name: 'ModelTransferLengthError',
+    code: 'MODEL_TRANSFER_LENGTH_ERROR' as const,
+  });
 }
 
 function writeDirectChunk(

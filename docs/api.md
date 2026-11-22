@@ -407,6 +407,10 @@ fails, the bridge retries at one GPU layer when possible, then on the CPU.
 Returns the underlying load result from the active runtime. After a successful
 load, metadata and capability helpers reflect the loaded model.
 
+A model or projector transfer that fails length validation rejects with an error
+named `ModelTransferLengthError` and `code: 'MODEL_TRANSFER_LENGTH_ERROR'` in both
+direct and worker modes.
+
 Calling it again replaces the loaded model in the same runtime, in both direct
 and worker modes. The bridge first frees the current model, its multimodal
 projector and any remaining filesystem copies, then downloads the new model, so both
@@ -1023,7 +1027,9 @@ capability helpers. A relative URL resolves against the page's base URL, as
 for `loadModelFromUrl()`. Once loaded, the downloaded file is freed from the
 core filesystem, so it does not occupy the WASM heap. Multimodal generation uses `createCompletion(prompt,
 { parts })` after this succeeds. The bridge may restart or switch worker/direct
-execution modes to satisfy projector constraints.
+execution modes to satisfy projector constraints. In worker mode,
+`ModelTransferLengthError` and `ModelStagingError` reject the load without either
+form of recovery.
 
 | Option | Behavior |
 | --- | --- |

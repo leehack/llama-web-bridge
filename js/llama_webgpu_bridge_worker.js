@@ -1652,9 +1652,10 @@ function sumProgressValues(values) {
   return total;
 }
 function createModelTransferLengthError(message) {
-  const error = new Error(message);
-  error.name = "ModelTransferLengthError";
-  return error;
+  return Object.assign(new Error(message), {
+    name: "ModelTransferLengthError",
+    code: "MODEL_TRANSFER_LENGTH_ERROR"
+  });
 }
 function writeDirectChunk(directWriter, chunk, position, onBytesWritten) {
   let offset = 0;
@@ -8381,6 +8382,10 @@ var LlamaWebGpuBridge = class {
     }
     return error instanceof ModelStagingError || error.name === "ModelStagingError";
   }
+  _isNonRetryableLoadError(error) {
+    const loadError = error;
+    return loadError?.name === "ModelTransferLengthError" || loadError?.code === "MODEL_TRANSFER_LENGTH_ERROR" || this._isNonRecoverableStagingError(error);
+  }
   _isRecoverableWorkerFsError(error) {
     if (isCoreRetiredError(error) || error instanceof SingleThreadCoreError || this._isNonRecoverableStagingError(error)) {
       return false;
@@ -9497,7 +9502,7 @@ var LlamaWebGpuBridge = class {
     } catch (error) {
       this._throwIfOperationCancelled(error, "Projector operation was cancelled.");
       this._throwIfWorkerCoreRetired(error);
-      if (!startedWithWorker || this._isNonRecoverableStagingError(error)) {
+      if (!startedWithWorker || this._isNonRetryableLoadError(error)) {
         throw error;
       }
       const reason = serializeWorkerError(error);
@@ -9515,7 +9520,7 @@ var LlamaWebGpuBridge = class {
           );
           return retryResult;
         } catch (retryError) {
-          if (this._isNonRecoverableStagingError(retryError)) {
+          if (this._isNonRetryableLoadError(retryError)) {
             throw retryError;
           }
           const retryReason = serializeWorkerError(retryError);
