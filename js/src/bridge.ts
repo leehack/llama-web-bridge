@@ -1109,7 +1109,7 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
     );
   }
 
-  async _ensureWorkerMultimodalCpuMode() {
+  async _ensureWorkerMultimodalCpuMode({ nonRetryableTyped = false } = {}) {
     this._throwIfDisposed();
     if (!this._workerProxy) {
       await this._replaceWorkerProxyForMultimodalCpuMode();
@@ -1155,7 +1155,10 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
         this._workerModelMissing = true;
         throw createAbortError('Bridge operation was cancelled.');
       }
-      if (this._isNonRecoverableStagingError(error)) {
+      const nonRetryable = nonRetryableTyped
+        ? this._isNonRetryableLoadError(error)
+        : this._isNonRecoverableStagingError(error);
+      if (nonRetryable) {
         throw error;
       }
       this._emitBridgeWarn(
@@ -2536,7 +2539,7 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
         return await invokeRuntimeLoad();
       }
 
-      await this._ensureWorkerMultimodalCpuMode();
+      await this._ensureWorkerMultimodalCpuMode({ nonRetryableTyped: true });
       const result = await this._callWorker('loadMultimodalProjector', workerArgs);
       this._rememberLoadedMmProj(url, cacheOptions);
       return result;
@@ -2554,7 +2557,7 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
       if (this._isCpuModelMode()) {
         try {
           await this._replaceWorkerProxyForMultimodalCpuMode();
-          await this._ensureWorkerMultimodalCpuMode();
+          await this._ensureWorkerMultimodalCpuMode({ nonRetryableTyped: true });
           const retryResult = await this._callWorker('loadMultimodalProjector', workerArgs);
           this._rememberLoadedMmProj(url, cacheOptions);
           this._emitBridgeWarn(

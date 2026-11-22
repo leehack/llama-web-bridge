@@ -128,6 +128,83 @@ test('worker projector preserves a transfer length error on the CPU retry', asyn
   });
 });
 
+for (const [code, makeError] of [
+  [transferCode, transferError],
+  ['MODEL_STAGING_MOUNT_FAILED', () => new ModelStagingError('MODEL_STAGING_MOUNT_FAILED', 'Projector staging failed.')],
+  [null, () => new Error('Worker request timed out')],
+]) {
+  test(`worker projector restore ${code ? `preserves ${code}` : 'recovers from a generic timeout'}`, async (t) => {
+    const error = makeError();
+    const nextProjector = 'https://models.test/next-mmproj.gguf';
+    let rememberedLoads = 0;
+    await withWorkerProjector(t, 0, async (url) => {
+      if (url === PROJECTOR) {
+        rememberedLoads += 1;
+        if (rememberedLoads === 2 || (code && rememberedLoads > 2)) throw error;
+      }
+      return 1;
+    }, async ({ bridge, workers, workerLoads }) => {
+      await bridge.loadMultimodalProjector(PROJECTOR);
+      await bridge._replaceWorkerProxyForMultimodalCpuMode();
+      const restoreWorker = bridge._workerProxy;
+      const workersBeforeRestore = workers.length;
+      const load = bridge.loadMultimodalProjector(nextProjector);
+      if (code) {
+        await assert.rejects(load, { name: error.name, code });
+        assert.equal(rememberedLoads - 1, 1, 'remembered projector restore attempts');
+        assert.equal(workers.length - workersBeforeRestore, 0, 'extra worker restarts');
+        assert.equal(workerLoads(), 2);
+        assert.equal(bridge._workerProxy, restoreWorker);
+      } else {
+        assert.equal(await load, 1);
+        assert.equal(rememberedLoads - 1, 2, 'remembered projector restore attempts');
+        assert.equal(workers.length - workersBeforeRestore, 1, 'extra worker restarts');
+        assert.equal(workerLoads(), 4);
+      }
+    });
+  });
+}
+
+test('worker projector preserves a transfer length error during the CPU retry restore', async (t) => {
+  const nextProjector = 'https://models.test/next-mmproj.gguf';
+  let rememberedLoads = 0;
+  await withWorkerProjector(t, 0, async (url) => {
+    if (url === nextProjector) throw new Error('Worker request timed out');
+    if (++rememberedLoads > 1) throw transferError();
+    return 1;
+  }, async ({ bridge, workers, workerLoads }) => {
+    await bridge.loadMultimodalProjector(PROJECTOR);
+    await assert.rejects(bridge.loadMultimodalProjector(nextProjector), {
+      name: 'ModelTransferLengthError', code: transferCode,
+    });
+    assert.equal(rememberedLoads - 1, 1, 'remembered projector restore attempts');
+    assert.equal(workers.length, 2, 'only the initial projector failure should restart the worker');
+    assert.equal(workerLoads(), 3);
+  });
+});
+
+for (const warmup of [false, true]) {
+  test(`worker ${warmup ? 'warmup' : 'completion'} retries a transfer length error during projector restore`, async (t) => {
+    const complete = t.mock.method(LlamaWebGpuBridgeRuntime.prototype, 'createCompletion', async () => 'generated');
+    let projectorLoads = 0;
+    await withWorkerProjector(t, 0, async () => {
+      if (++projectorLoads === 2) throw transferError();
+      return 1;
+    }, async ({ bridge, workers, workerLoads }) => {
+      await bridge.loadMultimodalProjector(PROJECTOR);
+      await bridge._replaceWorkerProxyForMultimodalCpuMode();
+      const workersBeforeRestore = workers.length;
+      assert.equal(await bridge.createCompletion('Describe the image.', {
+        warmup,
+        parts: [{ type: 'image', url: 'https://models.test/image.png' }],
+      }), 'generated');
+      assert.equal(workerLoads() - 1, 2, 'remembered projector restore attempts');
+      assert.equal(workers.length - workersBeforeRestore, 1, 'extra worker restarts');
+      assert.equal(complete.mock.callCount(), 1);
+    });
+  });
+}
+
 test('an empty-message transfer error keeps download fields off the worker wire', async (t) => {
   await withWorkerProjector(t, 0, async () => { throw transferError(''); },
     async ({ bridge, errorReplies }) => {
@@ -153,21 +230,26 @@ test('transfer length errors match by either name or code with staging disabled'
   assert.equal(bridge._isNonRetryableLoadError(new Error('Worker request timed out')), false);
 });
 
-test('direct projector preserves the transfer length error and its code', async (t) => {
-  const error = transferError();
-  const load = t.mock.method(LlamaWebGpuBridgeRuntime.prototype, 'loadMultimodalProjector', async () => {
-    throw error;
-  });
-  const bridge = new LlamaWebGpuBridge({ disableWorker: true });
-  try {
-    await assert.rejects(bridge.loadMultimodalProjector(PROJECTOR), (err) => {
-      assert.equal(err, error);
-      assert.equal(err.name, 'ModelTransferLengthError');
-      assert.equal(err.code, transferCode);
-      return true;
+for (const [code, makeError, , name] of [
+  ...failures,
+  [undefined, () => new Error('Projector setup failed'), Error, 'Error'],
+]) {
+  test(`direct projector preserves ${code ?? 'a generic error'}`, async (t) => {
+    const error = makeError();
+    const load = t.mock.method(LlamaWebGpuBridgeRuntime.prototype, 'loadMultimodalProjector', async () => {
+      throw error;
     });
-    assert.equal(load.mock.callCount(), 1);
-  } finally {
-    await bridge.dispose();
-  }
-});
+    const bridge = new LlamaWebGpuBridge({ disableWorker: true, jsBackedModelStaging: true });
+    try {
+      await assert.rejects(bridge.loadMultimodalProjector(PROJECTOR), (err) => {
+        assert.equal(err, error);
+        assert.equal(err.name, name);
+        assert.equal(err.code, code);
+        return true;
+      });
+      assert.equal(load.mock.callCount(), 1);
+    } finally {
+      await bridge.dispose();
+    }
+  });
+}
