@@ -233,43 +233,16 @@ jobs:
             exit 1
           fi
           npm publish "./llama-web-bridge-${VERSION}.tgz" \
-            --provenance --access public --tag latest --registry https://registry.npmjs.org --ignore-scripts
+            --provenance --access public --tag latest --registry https://registry.npmjs.org --ignore-scripts --fetch-retries=0
       - name: Read back exact registry bytes and provenance
         env:
           EXPECTED_INTEGRITY: ${{ steps.tarball.outputs.integrity }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          REGISTRY="https://registry.npmjs.org"
           PREDICATE="https://slsa.dev/provenance/v1"
-          ATTESTATION_URL="${REGISTRY}/-/npm/v1/attestations/llama-web-bridge@${VERSION}"
-          TARBALL_URL="${REGISTRY}/llama-web-bridge/-/llama-web-bridge-${VERSION}.tgz"
-          PACKAGE_URL="${REGISTRY}/llama-web-bridge/${VERSION}"
           RUN_URL="https://github.com/${BRIDGE_REPO}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}"
-          for attempt in {1..6}; do
-            if curl -fsS --max-time 30 "${PACKAGE_URL}" > "${RUNNER_TEMP}/npm-version.json" &&
-               jq -e --arg version "${VERSION}" --arg integrity "${EXPECTED_INTEGRITY}" \
-                 --arg attestation "${ATTESTATION_URL}" --arg tarball "${TARBALL_URL}" --arg predicate "${PREDICATE}" \
-                 '.name == "llama-web-bridge" and .version == $version and .dist.integrity == $integrity and
-                   .dist.tarball == $tarball and .dist.attestations.url == $attestation and
-                   .dist.attestations.provenance.predicateType == $predicate' "${RUNNER_TEMP}/npm-version.json" &&
-               curl -fsS --max-time 30 "${REGISTRY}/-/package/llama-web-bridge/dist-tags" |
-                 jq -e --arg version "${VERSION}" '.latest == $version' &&
-               curl -fsS --max-time 30 "${ATTESTATION_URL}" > "${RUNNER_TEMP}/npm-attestations.json"; then
-              break
-            fi
-            if [[ "${attempt}" == 6 ]]; then
-              echo "error: npm publication could not be verified from registry metadata" >&2
-              exit 1
-            fi
-            sleep 10
-          done
-          curl -fsS --max-time 120 "${TARBALL_URL}" > "${RUNNER_TEMP}/registry.tgz"
-          echo "${EXPECTED_TARBALL_SHA256}  ${RUNNER_TEMP}/registry.tgz" | sha256sum --check
-          SHA512="$(sha512sum "${RUNNER_TEMP}/registry.tgz" | cut -d ' ' -f 1)"
-          jq -er --arg predicate "${PREDICATE}" \
-            '[.attestations[] | select(.predicateType == $predicate)] |
-              select(length == 1) | .[0].bundle' "${RUNNER_TEMP}/npm-attestations.json" > "${RUNNER_TEMP}/npm-provenance.json"
+          SHA512="$(node scripts/release/npm_registry_readback.mjs)"
           gh attestation verify "${RUNNER_TEMP}/registry.tgz" --bundle "${RUNNER_TEMP}/npm-provenance.json" \
             --repo "${BRIDGE_REPO}" --signer-workflow "${BRIDGE_REPO}/.github/workflows/publish_npm.yml" \
             --source-ref refs/heads/main --source-digest "${GITHUB_SHA}" --deny-self-hosted-runners \
