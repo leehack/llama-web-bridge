@@ -3,7 +3,7 @@
 ## Unreleased
 
 - During `loadMultimodalProjector()`, surface typed transfer and staging errors from a remembered-projector restore without restarting the worker again.
-- During multimodal `createCompletion()`, surface `ModelTransferLengthError` and active `ModelStagingError` from worker setup, empty-response restore, or request handling without wrapping, extra restarts, or main-thread fallback. Warmup completions skip these errors and return `''` without extra restarts.
+- During multimodal `createCompletion()`, a worker-side `ModelTransferLengthError` or active `ModelStagingError` ends the completion during setup, empty-response restore, or request handling. Regular calls reject with the typed error and warmups return `''`. If the failure also retires the native core, the bridge attempts to replace the worker.
 - Build WebGPU release cores in parallel and qualify speech recognition and synthesis concurrently.
 - Add `LlamaWebGpuBridge.prototype.preflightCore()`, `LlamaWebGpuBridge.supportsCorePreflight` and `CoreAssetError` (`CORE_ASSET_UNAVAILABLE`, `CORE_PREFLIGHT_UNSUPPORTED`). `preflightCore()` initializes and verifies the selected core's loader and Wasm before any model transfer, in the active execution mode. It follows the memory64 fallback and finds Wasm binaries next to the loader. The bridge skips the wasm32 loader when memory64 initializes successfully. `loadModelFromUrl()` reuses the verified core and reports missing or unreachable core assets with the same `CoreAssetError`, including a redacted URL and the HTTP status when available.
 

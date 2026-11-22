@@ -126,7 +126,7 @@ runtime when available, and releases its JS-backed staging data.
 - In worker mode, the bridge replaces the worker and restores the remembered
   model on the next call that needs it. If a new load aborts, the previous
   model remains the one to restore. LoRA handles with a retained source remain
-  valid. Media completion and speech synthesis on a GPU-loaded model retry
+  valid. Media completion and speech synthesis on a GPU-loaded model can retry
   once on the replacement worker with a CPU-only restore.
 
 Decision heads stay tied to their original core and report `head-lost` after
