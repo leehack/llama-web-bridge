@@ -83,7 +83,10 @@ function redactAbsoluteUrlToken(token: string): string {
 }
 
 function atUrlStart(message: string, start: number): boolean {
-  return start === 0 || !URL_PATH_CHARACTER.test(message[start - 1]);
+  if (start === 0) return true;
+  const previous = message[start - 1];
+  return URL_TEXT_DELIMITER.test(previous) || previous === '=' || previous === ':'
+    || !URL_PATH_CHARACTER.test(previous);
 }
 
 function atUrlEnd(message: string, end: number): boolean {

@@ -1000,7 +1000,9 @@ function redactAbsoluteUrlToken(token) {
   return queryStart === -1 ? url : url + queryFormatting(token, queryStart);
 }
 function atUrlStart(message, start) {
-  return start === 0 || !URL_PATH_CHARACTER.test(message[start - 1]);
+  if (start === 0) return true;
+  const previous = message[start - 1];
+  return URL_TEXT_DELIMITER.test(previous) || previous === "=" || previous === ":" || !URL_PATH_CHARACTER.test(previous);
 }
 function atUrlEnd(message, end) {
   return URL_TRAILING_FORMAT.test(message.slice(end, absoluteUrlEnd(message, end)));

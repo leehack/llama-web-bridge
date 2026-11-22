@@ -1053,6 +1053,34 @@ for (const mode of ['direct', 'worker']) {
     });
   }
 
+  for (const [format, left, right, suffix = '?sig=S'] of [
+    ['single quotes', "'", "'"],
+    ['double quotes', '"', '"'],
+    ['backticks', '`', '`', '#t=S'],
+    ['parentheses', '(', ')'],
+    ['square brackets', '[', ']'],
+    ['assignment', 'asset=', ''],
+    ['label', 'asset:', ''],
+  ]) {
+    test(`${mode}: configured relative URL redaction preserves ${format}`, async (t) => {
+      const wasmUrl = `core.wasm${suffix}`;
+      const input = `Failed to load ${left}${wasmUrl}${right}`;
+      const expected = `Failed to load ${left}${base}core.wasm${right}`;
+      setGlobal(t, 'document', { baseURI: base });
+      const lines = [];
+      for (const level of ['log', 'warn', 'error']) t.mock.method(console, level, (line) => lines.push(line));
+      withImports(t, { [loader]: ({ print, printErr }) => {
+        print(input);
+        printErr(input);
+        throw new Error(input);
+      } });
+      await withBridge(mode, { ...config32, wasmUrl }, async (bridge) => {
+        await assert.rejects(bridge.loadModelFromUrl(model, loadOptions), { message: expected });
+      });
+      assert.deepEqual(lines, [expected, expected, expected, expected]);
+    });
+  }
+
   for (const asset of ['wasmUrl', 'coreModuleUrl', 'workerUrl']) {
     test(`${mode}: redact a configured ${asset} with an apostrophe in its path`, async (t) => {
       const configured = `HTTPS://Assets.Test/it's/${asset}.js?sig=SECRET`;
