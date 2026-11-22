@@ -63,6 +63,26 @@ set(GGML_BLAS OFF CACHE BOOL "" FORCE)
 
 add_subdirectory("${LLAMA_CPP_DIR}" "${CMAKE_BINARY_DIR}/llama_cpp")
 
+# ggml-webgpu has no exception handlers. Its flags add invoke trampolines to
+# WebGPU dispatch, so drop them while leaving the bridge's catch list in place.
+file(GLOB_RECURSE ggml_webgpu_sources CONFIGURE_DEPENDS
+    "${LLAMA_CPP_DIR}/ggml/src/ggml-webgpu/*.cpp"
+    "${LLAMA_CPP_DIR}/ggml/src/ggml-webgpu/*.h"
+    "${LLAMA_CPP_DIR}/ggml/src/ggml-webgpu/*.hpp")
+foreach(source IN LISTS ggml_webgpu_sources)
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${source}")
+    file(READ "${source}" source_text)
+    if (source_text MATCHES "(^|[^A-Za-z0-9_])(try[ \t\r\n]*\\{|catch[ \t\r\n]*\\()")
+        message(FATAL_ERROR "Exception handler found in ${source}; recheck ggml-webgpu exception flags")
+    endif()
+endforeach()
+get_target_property(webgpu_compile_options ggml-webgpu COMPILE_OPTIONS)
+list(REMOVE_ITEM webgpu_compile_options "-fexceptions")
+set_property(TARGET ggml-webgpu PROPERTY COMPILE_OPTIONS "${webgpu_compile_options}")
+get_target_property(webgpu_link_options ggml-webgpu INTERFACE_LINK_OPTIONS)
+list(REMOVE_ITEM webgpu_link_options "-exceptions")
+set_property(TARGET ggml-webgpu PROPERTY INTERFACE_LINK_OPTIONS "${webgpu_link_options}")
+
 include(cmake/embedding_mode_reserve.cmake)
 
 include(CheckCXXSourceCompiles)
@@ -217,6 +237,11 @@ target_include_directories(llama_webgpu_core PRIVATE
 
 target_link_libraries(llama_webgpu_core PRIVATE llama llama-common mtmd)
 
+# Keep the Release optimization defaults on ggml-cpu and ggml-base for CPU throughput.
+foreach(target IN ITEMS llama mtmd llama-common llama-common-base ggml-webgpu llama_webgpu_core)
+    target_compile_options(${target} PRIVATE "$<$<CONFIG:Release>:-Os>")
+endforeach()
+
 set(LLAMADART_WEBGPU_LINK_OPTIONS
     "-sWASMFS=1"
     "-sASYNCIFY=1"
@@ -278,7 +303,8 @@ else()
     )
 endif()
 
-target_link_options(llama_webgpu_core PRIVATE ${LLAMADART_WEBGPU_LINK_OPTIONS})
+target_link_options(llama_webgpu_core PRIVATE "$<$<CONFIG:Release>:-Os>"
+    ${LLAMADART_WEBGPU_LINK_OPTIONS})
 
 set(LLAMADART_WEBGPU_CORE_OUTPUT_SUFFIX "" CACHE STRING "Optional suffix for core output name")
 set(LLAMADART_WEBGPU_CORE_OUTPUT_NAME "llama_webgpu_core")
