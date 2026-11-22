@@ -54,6 +54,7 @@ try {
   assert.equal(posted.at(-1)?.message?.type, 'ready');
   assert.equal(posted.at(-1).message.supportsIncrementalAudio, true);
   assert.equal(posted.at(-1).message.supportsJsBackedModelStaging, true);
+  assert.equal(posted.at(-1).message.supportsCorePreflight, true);
 
   await globalThis.self.onmessage({
     data: { type: 'call', id: 1, method: 'createCompletion', args: ['prompt', {}] },

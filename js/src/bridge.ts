@@ -17,6 +17,7 @@ import {
   withDecisionErrorCode,
 } from './internal/decision.ts';
 import { ModelUnloadedError } from './internal/core_guard.ts';
+import { CoreAssetError } from './internal/core_preflight.ts';
 import { SingleThreadCoreError } from './internal/isolation.ts';
 import { BlobWorkerBlockedError, blobStartBlockedReasonOf } from './internal/worker_start.ts';
 import type { BlobWorkerBlockReason } from './internal/worker_start.ts';
@@ -45,6 +46,7 @@ import type {
   CompletionCapabilities,
   CompletionOptions,
   CompletionUsage,
+  CorePreflightResult,
   DecisionCapabilities,
   DecisionHeadInfo,
   DecisionHeadOptions,
@@ -253,6 +255,7 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
   static supportsCompletionUsage = true;
   static supportsModelCacheQuery = true;
   static supportsJsBackedModelStaging = true;
+  static supportsCorePreflight = true;
 
   constructor(config: BridgeConfig = {}) {
     this._config = config;
@@ -1068,6 +1071,7 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
   _isRecoverableWorkerFsError(error: unknown) {
     if (
       isCoreRetiredError(error)
+      || error instanceof CoreAssetError
       || error instanceof SingleThreadCoreError
       || this._isNonRecoverableStagingError(error)
     ) {
@@ -1300,6 +1304,7 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
   }
 
   _isWorkerTimeoutError(error: unknown) {
+    if (error instanceof CoreAssetError) return false;
     if (
       error
       && typeof error === 'object'
@@ -1643,6 +1648,7 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
   _shouldFallbackToMainThread(error: unknown) {
     if (
       isCoreRetiredError(error)
+      || error instanceof CoreAssetError
       || error instanceof SingleThreadCoreError
       || this._isNonRecoverableStagingError(error)
       || error instanceof BlobWorkerBlockedError
@@ -1990,6 +1996,25 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
       return;
     }
     this._applyShadowState(state);
+  }
+
+  async preflightCore(): Promise<CorePreflightResult> {
+    return this._runExclusive(() => this._preflightCoreUnlocked(), { kind: 'preflight-core' });
+  }
+
+  async _preflightCoreUnlocked(): Promise<CorePreflightResult> {
+    if (this._workerProxy) {
+      try {
+        const result = await this._callWorker<CorePreflightResult>('preflightCore', []);
+        return { ...result, execution: 'worker' };
+      } catch (error) {
+        if (!this._isWorkerUnusableError(error)) throw error;
+        this._disableWorkerFallback(error);
+        await this._waitForWorkerDisposal();
+        this._throwIfDisposed();
+      }
+    }
+    return this._runtime!.preflightCore();
   }
 
   async loadModelFromUrl(url: string | string[], options: LoadModelOptions = {}) {

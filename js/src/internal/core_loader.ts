@@ -9,6 +9,8 @@ type CoreModuleExport =
   | null
   | undefined;
 
+export class MissingCoreFactoryExportError extends Error {}
+
 function normalizeFactory(moduleExport: CoreModuleExport): LlamaCoreModuleFactory {
   if (typeof moduleExport === 'function') {
     return moduleExport;
@@ -22,7 +24,17 @@ function normalizeFactory(moduleExport: CoreModuleExport): LlamaCoreModuleFactor
     return moduleExport.createLlamaWebGpuCoreModule as LlamaCoreModuleFactory;
   }
 
-  throw new Error('Unable to resolve llama_webgpu_core factory function');
+  throw new MissingCoreFactoryExportError('Unable to resolve llama_webgpu_core factory function');
+}
+
+export function resolveCoreLoaderUrl(moduleUrl: string): string {
+  if (!/^(?:\.{0,2}\/|[a-z][a-z\d+.-]*:)/i.test(moduleUrl)) return moduleUrl;
+  const loaderBaseUrl = import.meta.url;
+  try {
+    return new URL(moduleUrl, loaderBaseUrl).href;
+  } catch (_) {
+    return moduleUrl;
+  }
 }
 
 export async function importCoreFactory(moduleUrl: string): Promise<LlamaCoreModuleFactory> {

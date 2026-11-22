@@ -14,6 +14,14 @@ import {
   SingleThreadCoreError,
 } from './internal/isolation.ts';
 import { MODEL_UNLOADED_AFTER_CORE_ABORT, ModelUnloadedError } from './internal/core_guard.ts';
+import {
+  CORE_PREFLIGHT_UNSUPPORTED,
+  PREFLIGHT_DIAGNOSTIC_TIMEOUT_MS,
+  CoreAssetError,
+  hasMemory64Candidate,
+  isCoreAssetErrorPayload,
+  resolveCoreInitTimeoutMs,
+} from './internal/core_preflight.ts';
 import { ModelStagingError, isModelStagingErrorCode, jsBackedStagingMode } from './internal/model_staging.ts';
 import { TextToSpeechStreamingUnsupportedError } from './internal/text_to_speech.ts';
 import type { LlamaWebGpuBridgeConfig, TextToSpeechOptions } from './llama_webgpu_bridge.d.ts';
@@ -93,6 +101,7 @@ export class BridgeWorkerProxy {
   declare _readyTimeoutHandle: ReturnType<typeof setTimeout> | null;
   declare _supportsIncrementalAudio: boolean;
   declare _supportsJsBackedModelStaging: boolean;
+  declare _supportsCorePreflight: boolean;
   // Set once the worker reports that its core aborted. It never clears: the
   // facade replaces this worker.
   declare coreRetired: boolean;
@@ -106,6 +115,7 @@ export class BridgeWorkerProxy {
     this.startMode = 'direct';
     this._supportsIncrementalAudio = false;
     this._supportsJsBackedModelStaging = false;
+    this._supportsCorePreflight = false;
     this.coreRetired = false;
 
     let workerInitError: unknown = null;
@@ -174,6 +184,7 @@ export class BridgeWorkerProxy {
       if (type === 'ready') {
         this._supportsIncrementalAudio = message.supportsIncrementalAudio === true;
         this._supportsJsBackedModelStaging = message.supportsJsBackedModelStaging === true;
+        this._supportsCorePreflight = message.supportsCorePreflight === true;
         this._clearReadyTimeout();
         this._endCspWatch();
         this._readyResolve?.();
@@ -198,7 +209,9 @@ export class BridgeWorkerProxy {
       this._pending.delete(id);
       if (type === 'error') {
         const errorMessage = String(message.message || 'Worker request failed');
-        const workerError: Error & { state?: unknown } = message.embeddingErrorCode
+        const workerError: Error & { state?: unknown } = isCoreAssetErrorPayload(message.coreAssetError)
+          ? new CoreAssetError(message.coreAssetError.code, errorMessage, message.coreAssetError)
+          : message.embeddingErrorCode
           ? new EmbeddingError(message.embeddingErrorCode, errorMessage)
           : (jsBackedStagingMode(this._config) !== 'off'
             && isModelStagingErrorCode(message.modelStagingErrorCode))
@@ -263,6 +276,13 @@ export class BridgeWorkerProxy {
     beforePost?: () => void,
   ): Promise<WorkerResponse> {
     await this._ready;
+    if (method === 'preflightCore' && !this._supportsCorePreflight) {
+      throw new CoreAssetError(
+        CORE_PREFLIGHT_UNSUPPORTED,
+        'The worker did not declare supportsCorePreflight. The bridge and worker scripts must come from the same release.',
+        { asset: 'worker' },
+      );
+    }
     if (
       method === 'synthesizeSpeech'
       && (args[0] as Partial<TextToSpeechOptions> | undefined)?.streamAudio === true
@@ -371,6 +391,14 @@ export class BridgeWorkerProxy {
 
   _resolveRequestTimeoutMs(method: string, args: unknown[] = []): number {
     const explicitGlobal = Number(this._config.workerRequestTimeoutMs);
+    if (method === 'preflightCore') {
+      if (Number.isFinite(explicitGlobal) && explicitGlobal > 0) return explicitGlobal;
+      const hasMemory64 = hasMemory64Candidate(this._config.preferMemory64 !== false, this._config.coreModuleUrlMem64);
+      const candidateCount = hasMemory64 ? 2 : 1;
+      const coreInitTimeout = resolveCoreInitTimeoutMs(this._config.coreInitTimeoutMs);
+      return Math.max(180_000, candidateCount * coreInitTimeout + PREFLIGHT_DIAGNOSTIC_TIMEOUT_MS + 30_000);
+    }
+
     const clamp = (value: number, fallback: number): number => {
       if (!Number.isFinite(value) || value <= 0) {
         return fallback;

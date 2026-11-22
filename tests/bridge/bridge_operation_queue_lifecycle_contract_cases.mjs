@@ -161,6 +161,7 @@ export const LIFECYCLE_CONTRACT_CASES = [
     assert.deepEqual(
       queued,
       [
+        'preflightCore',
         'loadModelFromUrl',
         'createCompletion',
         'getCompletionCapabilities',

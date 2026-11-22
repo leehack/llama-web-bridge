@@ -41,7 +41,7 @@ import {
 ```
 
 A browser page that imports the bridge also receives `window.LlamaWebGpuBridge`
-when the global is not already defined. Worker bootstrap code can either import
+and `window.CoreAssetError` when those globals are absent. Worker bootstrap code can either import
 `llama_webgpu_bridge_worker.js` or import `llama_webgpu_bridge.js` and call
 `enableBridgeWorkerHost()`.
 
@@ -49,6 +49,7 @@ The same module exports these error classes for callers to import:
 
 | Export | Reference |
 | --- | --- |
+| `CoreAssetError` | [Core asset errors](#coreasseterror) |
 | `ModelUnloadedError` | [Native core aborts](#native-core-aborts) |
 | `EmbeddingError` | [Embeddings](#embeddings) |
 | `CrossOriginIsolationError` | [Browser and asset requirements](#browser-and-asset-requirements) |
@@ -143,7 +144,7 @@ Worker mode never shows them: the replacement worker starts with no notes.
 Runtime-backed methods execute through a per-instance single-writer FIFO queue in
 both worker and direct runtime modes:
 
-`loadModelFromUrl`, `loadMultimodalProjector`, `unloadMultimodalProjector`,
+`preflightCore`, `loadModelFromUrl`, `loadMultimodalProjector`, `unloadMultimodalProjector`,
 `loadDraftModel`, `unloadDraftModel`, `getTextToSpeechCapabilities`,
 `synthesizeSpeech`, `getDecisionCapabilities`, `loadDecisionHead`,
 `runDecision`, `freeDecisionHead`, `getLoraAdapterCapabilities`,
@@ -312,6 +313,12 @@ before dispatching an explicit staging load, and validates the core ABI before
 staging. Bridges before v0.1.92 lack the flag. Bridges before v0.1.87 ignore
 the option.
 
+#### `LlamaWebGpuBridge.supportsCorePreflight`
+
+`true` when the bridge exposes `preflightCore()`. Bridges before v0.1.92 lack
+the flag. In worker mode, the bridge also checks the worker's support before
+dispatching preflight.
+
 ## Model loading and cache helpers
 
 When text generation on wasm64/WebGPU qualifies for CPU recovery, the reload
@@ -321,6 +328,53 @@ device split settings. It changes GPU placement to CPU and retains the existing
 memory32 preference and transfer safeguards for recovery. Thread counts remain
 subject to the replacement core's pool. Recovery
 continues to refuse active LoRA adapters and speculative generation.
+
+### `preflightCore()`
+
+```ts
+preflightCore(): Promise<CorePreflightResult>
+```
+
+Initializes the selected core before any model transfer, using the same core
+selection, threading configuration, and memory64 fallback as a model load.
+It does not probe WebGPU. A successful preflight downloads and compiles Wasm
+once, and subsequent model loads reuse that core. Repeated preflights return
+copies of the cached result. A failed preflight can be retried.
+
+| Field | Value |
+| --- | --- |
+| `variant` | `wasm32` or `memory64`. |
+| `threading` | `threaded` or `single-thread`, based on the initialized core. |
+| `execution` | `worker` or `main-thread`, reflecting the execution mode used. |
+| `fallback` | Whether memory64 initialization fell back to wasm32. |
+| `fallbackReason` | `unsupported`, `timeout`, or `init_error` for a memory64 fallback. Otherwise `null`. |
+| `loaderUrl` | The selected loader URL or specifier. `null` for `coreModuleFactory`. |
+| `wasmUrl` | The Wasm URL from the explicit override, resolved assets, or the loader's `locateFile` call. `null` if unavailable. |
+
+Core retirement invalidates the cached result. The next preflight initializes
+the replacement core without restoring the previous model. After `dispose()`,
+preflight rejects with `Bridge has been disposed.`
+
+### `CoreAssetError`
+
+`preflightCore()` and model loads can report `CoreAssetError` when a diagnostic
+GET finds that the final core candidate's loader or Wasm is missing, unreachable,
+or served with a response type that indicates the wrong asset. A preflight
+against a worker that lacks the capability flag also rejects with this error.
+The class and its fields are preserved across the worker boundary.
+
+| Field | Value |
+| --- | --- |
+| `code` | `CORE_ASSET_UNAVAILABLE` for an asset failure or `CORE_PREFLIGHT_UNSUPPORTED` for an older worker. |
+| `asset` | `loader`, `wasm`, or `worker`. |
+| `url` | Asset URL with credentials, search, and fragment removed, or `null`. The error message uses the same redaction. |
+| `httpStatus` | HTTP status if a diagnostic response was received. Otherwise `null`. |
+| `variant` | `wasm32`, `memory64`, or `null` when the error is independent of the core. |
+
+Loader syntax or reference errors, missing factory exports, isolation and
+pthread worker errors, and core initialization timeouts retain their original
+classification. A plausible asset response also preserves the initialization
+error, for example a `WebAssembly.CompileError` caused by corrupt Wasm.
 
 ### `loadModelFromUrl(url, options?)`
 

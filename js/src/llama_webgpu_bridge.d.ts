@@ -545,6 +545,40 @@ export function enableBridgeWorkerHost(): void;
  * remain out of band; disposal rejects queued/new work while active work settles
  * first. See docs/api.md "Operation serialization".
  */
+export type CoreMemoryVariant = 'wasm32' | 'memory64';
+export type CoreThreadingMode = 'threaded' | 'single-thread';
+export type CoreExecutionMode = 'worker' | 'main-thread';
+export type CoreFallbackReason = 'unsupported' | 'timeout' | 'init_error';
+
+export interface CorePreflightResult {
+  variant: CoreMemoryVariant;
+  threading: CoreThreadingMode;
+  execution: CoreExecutionMode;
+  fallback: boolean;
+  fallbackReason: CoreFallbackReason | null;
+  loaderUrl: string | null;
+  wasmUrl: string | null;
+}
+
+export type CoreAssetErrorCode = 'CORE_ASSET_UNAVAILABLE' | 'CORE_PREFLIGHT_UNSUPPORTED';
+export type CoreAssetKind = 'loader' | 'wasm' | 'worker';
+
+export interface CoreAssetErrorDetails {
+  asset: CoreAssetKind;
+  url?: string | null;
+  httpStatus?: number | null;
+  variant?: CoreMemoryVariant | null;
+}
+
+export class CoreAssetError extends Error {
+  readonly code: CoreAssetErrorCode;
+  readonly asset: CoreAssetKind;
+  readonly url: string | null;
+  readonly httpStatus: number | null;
+  readonly variant: CoreMemoryVariant | null;
+  constructor(code: CoreAssetErrorCode, message: string, details: CoreAssetErrorDetails);
+}
+
 export class LlamaWebGpuBridge {
   static supportsSafariAdaptiveGpu: boolean;
   /** `true` when `createCompletion` accepts `onUsage`. Bridges before v0.1.54 lack it; through v0.1.52 their worker mode rejects a function option with a `DataCloneError`. */
@@ -553,9 +587,11 @@ export class LlamaWebGpuBridge {
   static supportsModelCacheQuery: boolean;
   /** This bridge honors `jsBackedModelStaging` and validates worker/core staging support. */
   static supportsJsBackedModelStaging: boolean;
+  static supportsCorePreflight: boolean;
 
   constructor(config?: LlamaWebGpuBridgeConfig);
 
+  preflightCore(): Promise<CorePreflightResult>;
   loadModelFromUrl(url: string | string[], options?: LoadModelOptions): Promise<unknown>;
   prefetchModelToCache(url: string | string[], options?: LoadModelOptions): Promise<unknown>;
   evictModelFromCache(url: string | string[], options?: Record<string, unknown>): Promise<unknown>;

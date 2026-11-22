@@ -2,6 +2,7 @@
 // Modules under js/src/ are side-effect free; this file owns the load-time effects.
 
 import { LlamaWebGpuBridge } from './bridge.ts';
+import { CoreAssetError } from './internal/core_preflight.ts';
 import {
   enableBridgeWorkerHost,
   installBridgeWorkerHost,
@@ -13,13 +14,16 @@ if (shouldAutoBootBridgeWorkerHost()) {
 }
 
 if (typeof window !== 'undefined') {
-  const browserWindow = /** @type {Window & typeof globalThis & { LlamaWebGpuBridge?: typeof LlamaWebGpuBridge }} */ (window);
+  const browserWindow = /** @type {Window & typeof globalThis & { LlamaWebGpuBridge?: typeof LlamaWebGpuBridge, CoreAssetError?: typeof CoreAssetError }} */ (window);
   if (!browserWindow.LlamaWebGpuBridge) {
     browserWindow.LlamaWebGpuBridge = LlamaWebGpuBridge;
   }
+  if (!browserWindow.CoreAssetError) {
+    browserWindow.CoreAssetError = CoreAssetError;
+  }
 }
 
-export { LlamaWebGpuBridge, enableBridgeWorkerHost };
+export { CoreAssetError, LlamaWebGpuBridge, enableBridgeWorkerHost };
 export { ModelUnloadedError } from './internal/core_guard.ts';
 export { EmbeddingError } from './internal/embedding.ts';
 export { CrossOriginIsolationError, SingleThreadCoreError } from './internal/isolation.ts';

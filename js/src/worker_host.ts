@@ -5,6 +5,7 @@ import { resolveCoreAssets } from './default_assets.ts';
 import { decisionErrorCodeOf } from './internal/decision.ts';
 import { EMBED_BATCH_PROGRESS_OPTION, EmbeddingError } from './internal/embedding.ts';
 import { ModelUnloadedError } from './internal/core_guard.ts';
+import { CoreAssetError } from './internal/core_preflight.ts';
 import { CrossOriginIsolationError, SingleThreadCoreError } from './internal/isolation.ts';
 import { ModelStagingError } from './internal/model_staging.ts';
 import { textToSpeechProgressTransfers } from './internal/text_to_speech.ts';
@@ -67,6 +68,12 @@ export function installBridgeWorkerHost() {
       ...(error instanceof Error && error.name === 'ModelTransferLengthError'
         ? { errorCode: 'MODEL_TRANSFER_LENGTH_ERROR' } : {}),
       ...(error instanceof ModelStagingError ? { modelStagingErrorCode: error.code } : {}),
+      ...(error instanceof CoreAssetError ? {
+        coreAssetError: {
+          code: error.code, asset: error.asset, url: error.url,
+          httpStatus: error.httpStatus, variant: error.variant,
+        },
+      } : {}),
       ...(error instanceof BlobWorkerBlockedError ? { errorCode: error.code, blobWorkerBlockReason: error.reason } : {}),
       ...(decisionErrorCode ? { decisionErrorCode } : {}),
       state,
@@ -98,6 +105,7 @@ export function installBridgeWorkerHost() {
           type: 'ready',
           supportsIncrementalAudio: true,
           supportsJsBackedModelStaging: true,
+          supportsCorePreflight: true,
         });
         return;
       }
@@ -122,6 +130,12 @@ export function installBridgeWorkerHost() {
           bridge.cancel();
         }
         self.postMessage({ type: 'result', id, value: undefined });
+        return;
+      }
+
+      if (method === 'preflightCore') {
+        const value = await bridge.preflightCore();
+        self.postMessage({ type: 'result', id, value, state: snapshotBridgeState(bridge) });
         return;
       }
 
