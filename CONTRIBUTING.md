@@ -723,15 +723,15 @@ Only superseded PR runs are cancelled; main/manual runs remain independent.
 CI builds the four core variants in parallel. Each variant can restore its
 generated core JS and WASM using an exact key for the runner OS and architecture,
 Emscripten version, verified llama.cpp commit, bridge native sources, CMake
-inputs, build script, and wasm64 patch. Every selected run combines the cores
-with the checked-in JS wrappers and runs the browser smokes. The separate JS
-checks verify those wrappers against their sources.
+inputs, build script, wasm64 patch, and CI workflow. Every selected run combines
+the cores with the checked-in JS wrappers and runs the browser smokes. The
+separate JS checks verify those wrappers against their sources.
 
 On a core cache miss, CI restores a per-variant Emscripten sysroot cache
 (`EM_CACHE`) keyed by runner OS, architecture, and exact SDK version. The
 per-variant ccache key also includes the llama.cpp commit and native build
 inputs. It can reuse objects from the same toolchain and upstream commit
 because ccache verifies compiler contents, source inputs, and compile flags.
-Only pushes to `main` save missing Emscripten and ccache entries. Candidate
-and publication workflows do not consume these CI caches or use this change
-selector.
+Only pushes to `main` save missing core, Emscripten, and ccache entries.
+Candidate and publication workflows do not consume these CI caches or use this
+change selector.

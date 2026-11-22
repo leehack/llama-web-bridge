@@ -127,10 +127,10 @@ jobs:
 
       - name: Restore built core
         id: core-cache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: ${{ runner.temp }}/webgpu_bridge_dist
-          key: webgpu-core-v1-${{ runner.os }}-${{ runner.arch }}-${{ matrix.variant }}-${{ env.EMSCRIPTEN_VERSION }}-${{ steps.compiler-cache.outputs.upstream }}-${{ hashFiles('src/**', 'CMakeLists.txt', 'cmake/**', 'scripts/build/build_bridge.sh', 'scripts/build/patch_wasm64_runtime.mjs') }}
+          key: webgpu-core-v1-${{ runner.os }}-${{ runner.arch }}-${{ matrix.variant }}-${{ env.EMSCRIPTEN_VERSION }}-${{ steps.compiler-cache.outputs.upstream }}-${{ hashFiles('src/**', 'CMakeLists.txt', 'cmake/**', 'scripts/build/build_bridge.sh', 'scripts/build/patch_wasm64_runtime.mjs', '.github/workflows/ci.yml') }}
 
       # A stable SDK path keeps compiler and sysroot paths stable for ccache.
       - name: Setup Emscripten SDK
@@ -197,6 +197,13 @@ jobs:
           ./scripts/build/build_bridge.sh
           mkdir -p "$CORE_DIST_DIR"
           cp "$OUT_DIR"/llama_webgpu_core*.js "$OUT_DIR"/llama_webgpu_core*.wasm "$CORE_DIST_DIR/"
+
+      - name: Save built core
+        if: steps.core-cache.outputs.cache-hit != 'true' && github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/webgpu_bridge_dist
+          key: ${{ steps.core-cache.outputs.cache-primary-key }}
 
       - name: Save compiler objects
         if: steps.core-cache.outputs.cache-hit != 'true' && steps.ccache.outputs.cache-hit != 'true' && github.event_name == 'push' && github.ref == 'refs/heads/main'

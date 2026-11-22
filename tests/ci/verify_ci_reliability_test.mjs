@@ -139,6 +139,16 @@ for (const [name, mutate, message] of [
     const cache = jobs['build-core'].steps.find((step) => step.id === 'core-cache').with;
     cache.key = cache.key.replace("'src/**', ", '');
   }, 'exact-key core cache'],
+  ['missing core cache workflow hash', (jobs) => {
+    const cache = jobs['build-core'].steps.find((step) => step.id === 'core-cache').with;
+    cache.key = cache.key.replace(", '.github/workflows/ci.yml'", '');
+  }, 'exact-key core cache'],
+  ['combined core cache action', (jobs) => {
+    jobs['build-core'].steps.find((step) => step.id === 'core-cache').uses = 'actions/cache@v4';
+  }, 'exact-key core cache'],
+  ['ungated core cache save', (jobs) => {
+    delete jobs['build-core'].steps.find((step) => step.name === 'Save built core').if;
+  }, 'save the core cache only on a main push after copying the core files'],
   ['missing wasm64_st build', (jobs) => { jobs['build-core'].strategy.matrix.variant.pop(); }, 'four core build variants'],
   ['missing Qwen runtime cell', (jobs) => {
     jobs['smoke-grammar-qwen'].strategy.matrix.exclude = [{ memory: 'wasm64', runtime: 'direct' }];

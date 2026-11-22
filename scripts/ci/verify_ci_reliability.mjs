@@ -1058,14 +1058,28 @@ function checkCiRunsContracts({ ci, candidate, qualification, publish }, testFil
       && qwenStep?.env.GRAMMAR_RUNTIME_MODE === '${{ matrix.runtime }}',
     `${ci.path} must run all four Qwen grammar cells with their selected memory and runtime modes`,
   );
-  const coreCache = ci.jobSteps('build-core').find((step) => step.id === 'core-cache');
+  const corePath = '${{ runner.temp }}/webgpu_bridge_dist';
+  const coreSaveKey = '${{ steps.core-cache.outputs.cache-primary-key }}';
+  const coreCacheSteps = ci.steps.filter((step) => /^actions\/cache(?:\/[^@]+)?@/.test(step.uses)
+    && (step.with.path === corePath || step.with.key === coreSaveKey
+      || String(step.with.key ?? '').startsWith('webgpu-core-')));
+  const coreCache = coreCacheSteps.find((step) => step.job === 'build-core' && step.id === 'core-cache');
   const coreKey = 'webgpu-core-v1-${{ runner.os }}-${{ runner.arch }}-${{ matrix.variant }}'
     + '-${{ env.EMSCRIPTEN_VERSION }}-${{ steps.compiler-cache.outputs.upstream }}-'
-    + "${{ hashFiles('src/**', 'CMakeLists.txt', 'cmake/**', 'scripts/build/build_bridge.sh', 'scripts/build/patch_wasm64_runtime.mjs') }}";
+    + "${{ hashFiles('src/**', 'CMakeLists.txt', 'cmake/**', 'scripts/build/build_bridge.sh', "
+    + "'scripts/build/patch_wasm64_runtime.mjs', '.github/workflows/ci.yml') }}";
   check.require(
-    coreCache?.uses === 'actions/cache@v4' && coreCache.with.key === coreKey
-      && coreCache.with.path === '${{ runner.temp }}/webgpu_bridge_dist' && !has(coreCache.with, 'restore-keys'),
-    `${ci.path} must restore the exact-key core cache with all native inputs and no restore-keys`,
+    coreCache?.uses === 'actions/cache/restore@v4' && coreCache.with.key === coreKey
+      && coreCache.with.path === corePath && !has(coreCache.with, 'restore-keys'),
+    `${ci.path} must restore the exact-key core cache with all native inputs, the workflow, and no restore-keys`,
+  );
+  const coreSave = coreCacheSteps.find((step) => step.uses === 'actions/cache/save@v4');
+  const coreBuild = ci.step('build-core', 'Build bridge artifacts');
+  check.require(
+    coreCacheSteps.length === 2 && coreSave?.job === 'build-core' && coreBuild !== undefined
+      && coreSave.index > coreBuild.index && coreSave.with.path === corePath && coreSave.with.key === coreSaveKey
+      && coreSave.raw.if === "steps.core-cache.outputs.cache-hit != 'true' && github.event_name == 'push' && github.ref == 'refs/heads/main'",
+    `${ci.path} must save the core cache only on a main push after copying the core files, using the restore key on a miss`,
   );
   check.excludes(candidate.path, candidate.text, ['webgpu-core-', 'webgpu-ccache-'], 'never reference CI core or compiler caches');
   for (const workflow of [ci, candidate, qualification, publish]) {
