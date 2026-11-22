@@ -107,9 +107,8 @@ same-core load failure smoke.
 Release builds compile `llama`, `llama-common`, `llama-common-base`, `mtmd`,
 `ggml-webgpu`, and the bridge sources with `-Os` and link the core with
 `-Os`. `ggml-cpu` and `ggml-base` keep the Release `-O3` defaults for CPU
-throughput. The bridge removes ggml-webgpu's `-fexceptions` compile flag and
-`-exceptions` link flag after checking that its sources have no exception
-handlers. The core keeps its targeted exception-catching list.
+throughput. The bridge keeps ggml-webgpu's upstream exception flags so
+partially initialized WebGPU contexts unwind safely on allocation failure.
 
 For local agent/maintainer validation, prefer external build and cache paths so
 generated files do not dirty the checkout:

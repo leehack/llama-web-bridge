@@ -20,15 +20,12 @@ test('Release sizes model and bridge code while leaving CPU kernels at CMake def
   assert.doesNotMatch(cmake, /CMAKE_(?:C|CXX)_FLAGS_RELEASE|add_compile_options\([^)]*-O[sz]|target_compile_options\(ggml-(?:cpu|base)[^)]*-O[sz]/);
 });
 
-test('the bridge removes upstream WebGPU exception flags and guards the source assumption', () => {
-  const downstream = cmake.slice(cmake.indexOf('add_subdirectory('));
-  assert.match(downstream, /file\(GLOB_RECURSE ggml_webgpu_sources CONFIGURE_DEPENDS/);
-  assert.match(downstream, /foreach\(source IN LISTS ggml_webgpu_sources\)[\s\S]*?try[\s\S]*?catch[\s\S]*?message\(FATAL_ERROR/);
-  assert.match(downstream, /get_target_property\(webgpu_compile_options ggml-webgpu COMPILE_OPTIONS\)\s+list\(REMOVE_ITEM webgpu_compile_options "-fexceptions"\)\s+set_property\(TARGET ggml-webgpu PROPERTY COMPILE_OPTIONS "\$\{webgpu_compile_options\}"\)/);
-  assert.match(downstream, /get_target_property\(webgpu_link_options ggml-webgpu INTERFACE_LINK_OPTIONS\)\s+list\(REMOVE_ITEM webgpu_link_options "-exceptions"\)\s+set_property\(TARGET ggml-webgpu PROPERTY INTERFACE_LINK_OPTIONS "\$\{webgpu_link_options\}"\)/);
-  assert.match(cmake, /"-sASYNCIFY=1"/);
-  assert.match(cmake, /"-sFORCE_FILESYSTEM=1"/);
-  assert.match(cmake, /\$\{LLAMADART_WEBGPU_EXCEPTION_CATCHING_ALLOWED\}/);
+test('the bridge leaves upstream ggml-webgpu exception flags intact for unwind cleanup', () => {
+  const commands = cmake.replace(/^\s*#.*$/gm, '');
+  assert.match(commands, /set\(GGML_WEBGPU ON CACHE BOOL "" FORCE\)/);
+  assert.match(commands, /set\(GGML_WEBGPU_JSPI OFF CACHE BOOL "" FORCE\)/);
+  assert.match(commands, /add_subdirectory\("\$\{LLAMA_CPP_DIR\}" "\$\{CMAKE_BINARY_DIR\}\/llama_cpp"\)/);
+  assert.doesNotMatch(commands, /-(?:f(?:no-)?(?:wasm-)?)?exceptions\b/);
 });
 
 for (const file of ['llama_webgpu_bridge.js', 'llama_webgpu_bridge_worker.js']) {
