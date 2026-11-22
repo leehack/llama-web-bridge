@@ -658,7 +658,7 @@ test('ModelStagingError preserves class and code across worker host and proxy wi
 
     const proxy = bridge._workerProxy;
     const driver = workerDriver(proxy, workers[0]);
-    driver.ready();
+    driver.ready({ supportsJsBackedModelStaging: true });
 
     for (const code of [
       'MODEL_STAGING_ALLOCATION_FAILED',
@@ -702,7 +702,8 @@ test('ModelStagingError preserves class and code across worker host and proxy wi
         },
       },
     });
-    assert.ok(replies.some((m) => m.type === 'ready'));
+    const ready = replies.find((m) => m.type === 'ready');
+    assert.ok(ready);
 
     await self.onmessage({
       data: {
@@ -721,7 +722,7 @@ test('ModelStagingError preserves class and code across worker host and proxy wi
       const roundTripBridge = createRealWorkerBridge({ jsBackedModelStaging: true });
       const proxy = roundTripBridge._workerProxy;
       const driver = workerDriver(proxy, workers[0]);
-      driver.ready();
+      driver.ready(ready);
       const call = proxy.call('loadModelFromUrl', ['https://models.test/unsupported.gguf', {}]);
       await driver.settle();
       const pending = driver.calls('loadModelFromUrl').at(-1);
@@ -1470,7 +1471,7 @@ test('worker-mode loadMultimodalProjector preserves ModelStagingError without re
     const bridge = createRealWorkerBridge({ jsBackedModelStaging: true });
     const proxy = bridge._workerProxy;
     const driver = workerDriver(proxy, workers[0]);
-    driver.ready();
+    driver.ready({ supportsJsBackedModelStaging: true });
 
     const loadPromise = bridge.loadModelFromUrl('https://models.test/cpu-model.gguf', {
       nCtx: 2048,
@@ -2701,6 +2702,49 @@ test('the worker receives an explicit jsBackedModelStaging and resolves an unset
   }
 });
 
+test('the bridge constructor advertises JS-backed model staging support', () => {
+  assert.equal(LlamaWebGpuBridge.supportsJsBackedModelStaging, true);
+});
+
+for (const method of ['loadModelFromUrl', 'loadMultimodalProjector']) {
+  test(`${method} requires a staging-capable worker only when explicitly enabled`, async () => {
+    for (const config of [{}, { jsBackedModelStaging: false }, { jsBackedModelStaging: true }]) {
+      await withStubWorkerEnvironment(async ({ workers }) => {
+        const bridge = createRealWorkerBridge({ userAgent: SAFARI_26, ...config });
+        const proxy = bridge._workerProxy;
+        const worker = workers[0];
+        const driver = workerDriver(proxy, worker);
+        const postMessage = worker.postMessage.bind(worker);
+        worker.postMessage = (message) => {
+          postMessage(message);
+          if (message.type === 'call') {
+            queueMicrotask(() => driver.reply(message.id, 1));
+          }
+        };
+        driver.ready();
+
+        try {
+          const load = bridge[method]('https://models.test/model.gguf');
+          if (config.jsBackedModelStaging === true) {
+            await assert.rejects(load, (error) => (
+              error instanceof ModelStagingError && error.code === 'MODEL_STAGING_UNSUPPORTED'
+            ));
+            assert.equal(driver.calls().length, 0);
+          } else {
+            assert.equal(await load, 1);
+            assert.deepEqual(driver.calls().map((call) => call.method), [method]);
+          }
+          assert.equal(bridge._workerProxy, proxy);
+          assert.equal(bridge._runtime, null);
+          assert.equal(workers.length, 1);
+        } finally {
+          await bridge.dispose();
+        }
+      });
+    }
+  });
+}
+
 test('staging errors keep their type whenever staging can be active', async () => {
   const stagingError = new ModelStagingError('MODEL_STAGING_ALLOCATION_FAILED', 'out of memory');
   for (const [config, typed] of [
@@ -2714,7 +2758,7 @@ test('staging errors keep their type whenever staging can be active', async () =
       assert.equal(bridge._isNonRecoverableStagingError(stagingError), typed, JSON.stringify(config));
       const proxy = bridge._workerProxy;
       const driver = workerDriver(proxy, workers[0]);
-      driver.ready();
+      driver.ready({ supportsJsBackedModelStaging: true });
       const pendingLoad = bridge.loadModelFromUrl('https://models.test/x.gguf', { nCtx: 128, nGpuLayers: 0 });
       await driver.settle();
       proxy._worker.onmessage({

@@ -92,6 +92,7 @@ export class BridgeWorkerProxy {
   declare _readyReject: (reason?: unknown) => void;
   declare _readyTimeoutHandle: ReturnType<typeof setTimeout> | null;
   declare _supportsIncrementalAudio: boolean;
+  declare _supportsJsBackedModelStaging: boolean;
   // Set once the worker reports that its core aborted. It never clears: the
   // facade replaces this worker.
   declare coreRetired: boolean;
@@ -104,6 +105,7 @@ export class BridgeWorkerProxy {
     this._stopCspWatch = null;
     this.startMode = 'direct';
     this._supportsIncrementalAudio = false;
+    this._supportsJsBackedModelStaging = false;
     this.coreRetired = false;
 
     let workerInitError: unknown = null;
@@ -171,6 +173,7 @@ export class BridgeWorkerProxy {
       const type = message.type;
       if (type === 'ready') {
         this._supportsIncrementalAudio = message.supportsIncrementalAudio === true;
+        this._supportsJsBackedModelStaging = message.supportsJsBackedModelStaging === true;
         this._clearReadyTimeout();
         this._endCspWatch();
         this._readyResolve?.();
@@ -266,6 +269,16 @@ export class BridgeWorkerProxy {
       && !this._supportsIncrementalAudio
     ) {
       throw new TextToSpeechStreamingUnsupportedError();
+    }
+    if (
+      (method === 'loadModelFromUrl' || method === 'loadMultimodalProjector')
+      && this._config.jsBackedModelStaging === true
+      && !this._supportsJsBackedModelStaging
+    ) {
+      throw new ModelStagingError(
+        'MODEL_STAGING_UNSUPPORTED',
+        'The worker did not declare supportsJsBackedModelStaging. The bridge and worker scripts must come from the same release.',
+      );
     }
     const id = this._nextId++;
     const timeoutMs = this._resolveRequestTimeoutMs(method, args);

@@ -551,6 +551,8 @@ export class LlamaWebGpuBridge {
   static supportsCompletionUsage: boolean;
   /** This bridge supports cache queries and opt-in projector caching. */
   static supportsModelCacheQuery: boolean;
+  /** This bridge honors `jsBackedModelStaging` and validates worker/core staging support. */
+  static supportsJsBackedModelStaging: boolean;
 
   constructor(config?: LlamaWebGpuBridgeConfig);
 
