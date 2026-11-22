@@ -989,6 +989,75 @@ test('stripping path-only userinfo preserves the other URL bytes', async () => {
   });
 });
 
+for (const mode of ['direct', 'worker']) {
+  for (const [input, expected = input] of [
+    ['https://cdn.example.test,ops@example.test,ready'],
+    ['(https://cdn.example.test),owner=ops@example.test'],
+    ['https://cdn.example.test)contact=ops@example.test'],
+    ['https://user:pass@host/core.wasm', 'https://host/core.wasm'],
+    ['https://TOKEN@host/core.wasm', 'https://host/core.wasm'],
+  ]) {
+    test(`${mode}: strip only plain URL userinfo in ${input}`, async (t) => {
+      const lines = [];
+      for (const level of ['log', 'warn', 'error']) t.mock.method(console, level, (line) => lines.push(line));
+      withImports(t, { [loader]: ({ print, printErr }) => {
+        print(input);
+        printErr(input);
+        throw new Error(input);
+      } });
+      await withBridge(mode, config32, async (bridge) => {
+        await assert.rejects(bridge.loadModelFromUrl(model, loadOptions), { message: expected });
+      });
+      assert.deepEqual(lines, [expected, expected, expected, expected]);
+    });
+  }
+
+  for (const asset of ['wasmUrl', 'coreModuleUrl', 'workerUrl']) {
+    test(`${mode}: redact a configured ${asset} with an apostrophe in its path`, async (t) => {
+      const configured = `HTTPS://Assets.Test/it's/${asset}.js?sig=SECRET`;
+      const serialized = new URL(configured).href;
+      const expected = `Loading ${serialized.split('?')[0]}`;
+      const lines = [];
+      for (const level of ['log', 'warn', 'error']) t.mock.method(console, level, (line) => lines.push(line));
+      const config = { ...config32, [asset]: configured };
+      withImports(t, { [config.coreModuleUrl]: ({ print, printErr }) => {
+        const message = `Loading ${serialized}&extra=SECRET`;
+        print(message);
+        printErr(message);
+        throw new Error(message);
+      } });
+      await withBridge(mode, config, async (bridge) => {
+        await assert.rejects(bridge.loadModelFromUrl(model, loadOptions), { message: expected });
+      });
+      assert.deepEqual(lines, [expected, expected, expected, expected]);
+    });
+  }
+
+  test(`${mode}: redact an observed apostrophe URL after a diagnostic redirect`, async (t) => {
+    const redirectUrl = `https://mirror.test/it's/core.wasm?sig=SECRET`;
+    const expected = `Wasm failure at ${redirectUrl.split('?')[0]}`;
+    const lines = [];
+    for (const level of ['log', 'warn', 'error']) t.mock.method(console, level, (line) => lines.push(line));
+    let attempts = 0;
+    withImports(t, { [loader]: ({ locateFile, printErr }) => {
+      locateFile('core.wasm', base);
+      const message = `Wasm failure at ${redirectUrl}`;
+      if (++attempts === 2) printErr(message);
+      throw new WebAssembly.CompileError(message);
+    } });
+    const fetch = t.mock.method(globalThis, 'fetch', async () => {
+      const response = new Response('', { headers: { 'Content-Type': 'application/wasm' } });
+      Object.defineProperty(response, 'url', { value: redirectUrl });
+      return response;
+    });
+    await withBridge(mode, { ...config32, wasmUrl: wasm }, async (bridge) => {
+      await assert.rejects(bridge.loadModelFromUrl(model, loadOptions), { message: expected });
+    });
+    assert.deepEqual(lines, [expected]);
+    assert.equal(fetch.mock.callCount(), 1);
+  });
+}
+
 test('direct preflight rejects a cached core that retires while applying its log level', async (t) => {
   let trap = false;
   withImports(t, { [loader]: (options) => {

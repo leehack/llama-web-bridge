@@ -51,6 +51,7 @@ export interface WorkerRequest {
   type?: string;
   id?: number;
   config?: LlamaWebGpuBridgeConfig;
+  coreWorkerUrls?: string[];
   method?: unknown;
   args?: unknown;
   // The facade operation that made the call; on a `cancel`, the one it targets.

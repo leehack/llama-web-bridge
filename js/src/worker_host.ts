@@ -96,9 +96,13 @@ export function installBridgeWorkerHost() {
     try {
       if (type === 'init') {
         const config = message.config || {};
+        const workerUrls = Array.isArray(message.coreWorkerUrls)
+          ? message.coreWorkerUrls.filter((url) => typeof url === 'string') : [];
+        if (scope.location?.href) workerUrls.push(scope.location.href);
         bridge = new LlamaWebGpuBridge({
           ...config,
           ...resolveCoreAssets(config, false),
+          _coreWorkerUrls: workerUrls,
           disableWorker: true,
         });
         // Posted when the core retires, so it reaches the facade before the

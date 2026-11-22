@@ -68,7 +68,7 @@ function trailingQueryPunctuation(token: string, queryStart: number, punctuation
 function redactAbsoluteUrlToken(token: string): string {
   const queryStart = token.search(/[?#]/);
   const path = queryStart === -1 ? token : token.slice(0, queryStart);
-  const url = path.replace(/(\bhttps?:\/\/)[^/?#]*@/gi, '$1');
+  const url = path.replace(/(\bhttps?:\/\/)[^/?#@,()[\];]+@(?![^/?#@,();]*@)/gi, '$1');
   if (queryStart === -1) return url;
 
   const query = token.slice(queryStart);
@@ -79,14 +79,44 @@ function redactAbsoluteUrlToken(token: string): string {
 }
 
 export function createCoreAssetUrlRedactor() {
+  const absoluteUrls = new Set<string>();
   const replacements = new Map<string, string>();
 
-  function remember(url: string, absoluteUrl: string) {
+  function remember(url: string, absoluteUrl = url) {
+    let serialized = absoluteUrl;
+    try {
+      serialized = new URL(absoluteUrl).href;
+    } catch (_) {
+      // Bare loader specifiers can still appear in diagnostics as written.
+    }
+    for (const form of [url, absoluteUrl, serialized]) {
+      if (/^[a-z][a-z\d+.-]*:/i.test(form)) absoluteUrls.add(form);
+    }
     if (/^[a-z][a-z\d+.-]*:/i.test(url)) return;
     const redacted = /^[a-z][a-z\d+.-]*:/i.test(absoluteUrl)
       ? redactCoreAssetUrl(absoluteUrl)
       : url.split(/[?#]/, 1)[0];
     if (hasCoreAssetUrlSecrets(url) && url !== redacted) replacements.set(url, redacted);
+  }
+
+  function redactKnownAbsoluteUrls(message: string) {
+    for (const url of absoluteUrls) {
+      if (!/^https?:\/\//i.test(url)) {
+        if (hasCoreAssetUrlSecrets(url)) message = message.replaceAll(url, () => redactCoreAssetUrl(url));
+        continue;
+      }
+
+      let offset = 0;
+      let redacted = '';
+      for (let index = message.indexOf(url); index !== -1; index = message.indexOf(url, offset)) {
+        // Start past the known URL to keep literal quotes in its path and consume appended query fields.
+        const end = absoluteUrlEnd(message, index + url.length);
+        redacted += message.slice(offset, index) + redactAbsoluteUrlToken(message.slice(index, end));
+        offset = end;
+      }
+      if (offset) message = redacted + message.slice(offset);
+    }
+    return message;
   }
 
   function redactRelativeText(message: string) {
@@ -95,6 +125,7 @@ export function createCoreAssetUrlRedactor() {
   }
 
   function text(message: string) {
+    message = redactKnownAbsoluteUrls(message);
     let offset = 0;
     let redacted = '';
     for (const match of message.matchAll(HTTP_URL_START)) {
@@ -189,6 +220,7 @@ export async function probeUnavailableCoreAsset(
   url: string,
   asset: 'loader' | 'wasm',
   variant: CoreMemoryVariant,
+  rememberRedirect?: (url: string) => void,
 ): Promise<CoreAssetError | null> {
   if (!/^https?:\/\//i.test(url)) return null;
 
@@ -197,6 +229,7 @@ export async function probeUnavailableCoreAsset(
   let httpStatus: number | null = null;
   try {
     const response = await fetch(url, { method: 'GET', credentials: 'same-origin', signal: abort.signal });
+    if (response.url) rememberRedirect?.(response.url);
     // The headers suffice. A streaming response must not hold up the error.
     void response.body?.cancel().catch(() => {});
     const mime = response.headers.get('Content-Type')?.split(';', 1)[0]?.trim().toLowerCase() ?? '';

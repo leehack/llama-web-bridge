@@ -18,6 +18,7 @@ import {
   CORE_PREFLIGHT_UNSUPPORTED,
   PREFLIGHT_DIAGNOSTIC_TIMEOUT_MS,
   CoreAssetError,
+  createCoreAssetUrlRedactor,
   hasMemory64Candidate,
   isCoreAssetErrorPayload,
   resolveCoreInitTimeoutMs,
@@ -124,6 +125,9 @@ export class BridgeWorkerProxy {
     if (bridgeModuleFallback && bridgeModuleFallback !== moduleUrl) {
       moduleCandidates.push(bridgeModuleFallback);
     }
+    const workerUrls = new Set(moduleCandidates);
+    const redact = createCoreAssetUrlRedactor();
+    for (const url of workerUrls) redact.remember(url);
 
     for (const candidate of moduleCandidates) {
       if (this._worker) {
@@ -134,6 +138,8 @@ export class BridgeWorkerProxy {
       if (!directWorkerUrl) {
         continue;
       }
+      workerUrls.add(directWorkerUrl);
+      redact.remember(directWorkerUrl);
 
       try {
         this._worker = new Worker(directWorkerUrl, { type: 'module' });
@@ -164,7 +170,7 @@ export class BridgeWorkerProxy {
     }
 
     if (!this._worker) {
-      const error = workerInitError || new Error('Failed to initialize bridge worker');
+      const error = redact.error(workerInitError || new Error('Failed to initialize bridge worker'));
       if (this._stopCspWatch && error && typeof error === 'object') {
         markBlobStartBlocked(error, blobStartBlockReason(this._endCspWatch(), true));
       }
@@ -244,7 +250,7 @@ export class BridgeWorkerProxy {
       const message = event?.message || 'Bridge worker crashed';
       // The uncaught error's text is arbitrary, so the flag is what marks the
       // worker itself as gone.
-      const error: Error & { llamadartWorkerCrash?: boolean } = new Error(String(message));
+      const error: Error & { llamadartWorkerCrash?: boolean } = new Error(redact.text(String(message)));
       error.llamadartWorkerCrash = true;
 
       this._clearReadyTimeout();
@@ -264,7 +270,9 @@ export class BridgeWorkerProxy {
       this._pending.clear();
     };
 
-    this._worker.postMessage({ type: 'init', config: { ...config, workerStart: this.startMode } });
+    this._worker.postMessage({
+      type: 'init', config: { ...config, workerStart: this.startMode }, coreWorkerUrls: [...workerUrls],
+    });
   }
 
   async call(

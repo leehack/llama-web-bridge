@@ -2368,7 +2368,7 @@ export class LlamaWebGpuBridgeRuntime {
     if (this._coreRetired || isCoreRetired(core)) throw new ModelUnloadedError();
   }
 
-  async _ensureCore(diagnosticUrls?: Set<string>) {
+  async _ensureCore(diagnosticUrls?: Set<string>, redact = createCoreAssetUrlRedactor()) {
     if (this._core) {
       this._applyCoreLogLevel();
       this._assertCoreLive(this._core);
@@ -2377,6 +2377,14 @@ export class LlamaWebGpuBridgeRuntime {
 
     if (!this._config.coreModuleFactory && this._config.allowSingleThreadCore !== true && !canPostSharedMemory()) {
       throw new CrossOriginIsolationError();
+    }
+
+    const { coreModuleUrl, coreModuleUrlMem64, wasmUrl, wasmUrlMem64, _coreAssetSources } = resolveCoreAssets(this._config);
+    for (const url of [coreModuleUrl, coreModuleUrlMem64]) {
+      if (typeof url === 'string') redact.remember(url, resolveCoreLoaderUrl(url));
+    }
+    for (const url of [wasmUrl, wasmUrlMem64, this._config.workerUrl, ...(this._config._coreWorkerUrls ?? [])]) {
+      if (typeof url === 'string') redact.remember(url, normalizeAbsoluteUrl(url));
     }
 
     const candidates = [];
@@ -2389,7 +2397,6 @@ export class LlamaWebGpuBridgeRuntime {
         wasmUrl: this._config.wasmUrl,
       });
     } else {
-      const { coreModuleUrl, coreModuleUrlMem64, wasmUrl, wasmUrlMem64, _coreAssetSources } = resolveCoreAssets(this._config);
       const bridgeResolved64 = isBridgeResolvedAsset(_coreAssetSources.wasm64);
       if (hasMemory64Candidate(this._preferMemory64, coreModuleUrlMem64)) {
         const factoryPromise = importCoreFactory(coreModuleUrlMem64);
@@ -2425,9 +2432,7 @@ export class LlamaWebGpuBridgeRuntime {
       let locatedWasmUrl: string | null = null;
       let initTimeoutError: Error | null = null;
       const loaderUrl = candidate.loaderUrl === null ? null : resolveCoreLoaderUrl(candidate.loaderUrl);
-      const redact = createCoreAssetUrlRedactor();
       if (candidate.loaderUrl !== null && loaderUrl !== null) redact.remember(candidate.loaderUrl, loaderUrl);
-      if (candidate.wasmUrl) redact.remember(candidate.wasmUrl, normalizeAbsoluteUrl(candidate.wasmUrl));
       // Set once this candidate's core is adopted. A candidate that was
       // discarded keeps its callbacks, which must not reach the adopted core.
       let candidateCore: LlamaCoreModule | null = null;
@@ -2596,7 +2601,7 @@ export class LlamaWebGpuBridgeRuntime {
         const url = asset === 'loader' ? resolveCoreLoaderUrl(assetUrl) : normalizeAbsoluteUrl(assetUrl);
         if (!diagnosticUrls?.has(url)) {
           diagnosticUrls?.add(url);
-          const assetError = await probeUnavailableCoreAsset(url, asset, 'wasm32');
+          const assetError = await probeUnavailableCoreAsset(url, asset, 'wasm32', redact.remember);
           if (assetError) throw assetError;
         }
       }
@@ -2616,9 +2621,9 @@ export class LlamaWebGpuBridgeRuntime {
     return { ...this._corePreflight! };
   }
 
-  async _probeBackends(diagnosticUrls: Set<string>) {
+  async _probeBackends(diagnosticUrls: Set<string>, redact: ReturnType<typeof createCoreAssetUrlRedactor>) {
     try {
-      const core = await this._ensureCore(diagnosticUrls);
+      const core = await this._ensureCore(diagnosticUrls, redact);
       const probeResult = Number(
         await core.ccall('llamadart_webgpu_probe', 'number', [], [], { async: true }),
       );
@@ -2664,10 +2669,11 @@ export class LlamaWebGpuBridgeRuntime {
     this._didReportWarmupWarningSuppression = false;
     // Backend probing can swallow a failed initialization and retry below.
     const diagnosticUrls = new Set<string>();
-    await this._probeBackends(diagnosticUrls);
+    const redact = createCoreAssetUrlRedactor();
+    await this._probeBackends(diagnosticUrls, redact);
     throwIfAborted(operationSignal, abortMessage);
 
-    const core = await this._ensureCore(diagnosticUrls);
+    const core = await this._ensureCore(diagnosticUrls, redact);
     throwIfAborted(operationSignal, abortMessage);
 
     const modelUrls = expandModelShardUrls(url);

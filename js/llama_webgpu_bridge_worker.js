@@ -987,7 +987,7 @@ function trailingQueryPunctuation(token, queryStart, punctuation) {
 function redactAbsoluteUrlToken(token) {
   const queryStart = token.search(/[?#]/);
   const path = queryStart === -1 ? token : token.slice(0, queryStart);
-  const url = path.replace(/(\bhttps?:\/\/)[^/?#]*@/gi, "$1");
+  const url = path.replace(/(\bhttps?:\/\/)[^/?#@,()[\];]+@(?![^/?#@,();]*@)/gi, "$1");
   if (queryStart === -1) return url;
   const query = token.slice(queryStart);
   const punctuation = /[),.;!\]]+$/.exec(query)?.[0] ?? "";
@@ -996,17 +996,44 @@ function redactAbsoluteUrlToken(token) {
   return url + position + trailing;
 }
 function createCoreAssetUrlRedactor() {
+  const absoluteUrls = /* @__PURE__ */ new Set();
   const replacements = /* @__PURE__ */ new Map();
-  function remember(url, absoluteUrl) {
+  function remember(url, absoluteUrl = url) {
+    let serialized = absoluteUrl;
+    try {
+      serialized = new URL(absoluteUrl).href;
+    } catch (_) {
+    }
+    for (const form of [url, absoluteUrl, serialized]) {
+      if (/^[a-z][a-z\d+.-]*:/i.test(form)) absoluteUrls.add(form);
+    }
     if (/^[a-z][a-z\d+.-]*:/i.test(url)) return;
     const redacted = /^[a-z][a-z\d+.-]*:/i.test(absoluteUrl) ? redactCoreAssetUrl(absoluteUrl) : url.split(/[?#]/, 1)[0];
     if (hasCoreAssetUrlSecrets(url) && url !== redacted) replacements.set(url, redacted);
+  }
+  function redactKnownAbsoluteUrls(message) {
+    for (const url of absoluteUrls) {
+      if (!/^https?:\/\//i.test(url)) {
+        if (hasCoreAssetUrlSecrets(url)) message = message.replaceAll(url, () => redactCoreAssetUrl(url));
+        continue;
+      }
+      let offset = 0;
+      let redacted = "";
+      for (let index = message.indexOf(url); index !== -1; index = message.indexOf(url, offset)) {
+        const end = absoluteUrlEnd(message, index + url.length);
+        redacted += message.slice(offset, index) + redactAbsoluteUrlToken(message.slice(index, end));
+        offset = end;
+      }
+      if (offset) message = redacted + message.slice(offset);
+    }
+    return message;
   }
   function redactRelativeText(message) {
     for (const [url, redacted] of replacements) message = message.replaceAll(url, () => redacted);
     return message;
   }
   function text(message) {
+    message = redactKnownAbsoluteUrls(message);
     let offset = 0;
     let redacted = "";
     for (const match of message.matchAll(HTTP_URL_START)) {
@@ -1086,13 +1113,14 @@ function hasMemory64Candidate(preferMemory64, loaderUrl) {
   return preferMemory64 && typeof loaderUrl === "string" && loaderUrl.length > 0;
 }
 var JS_MIME = /^(?:application\/(?:x-)?(?:ecma|java)script|text\/(?:(?:x-)?(?:ecma|java)script|javascript1\.[0-5]|jscript|livescript))$/;
-async function probeUnavailableCoreAsset(url, asset, variant) {
+async function probeUnavailableCoreAsset(url, asset, variant, rememberRedirect) {
   if (!/^https?:\/\//i.test(url)) return null;
   const abort = new AbortController();
   const timer = globalThis.setTimeout(() => abort.abort(), PREFLIGHT_DIAGNOSTIC_TIMEOUT_MS);
   let httpStatus = null;
   try {
     const response = await fetch(url, { method: "GET", credentials: "same-origin", signal: abort.signal });
+    if (response.url) rememberRedirect?.(response.url);
     void response.body?.cancel().catch(() => {
     });
     const mime = response.headers.get("Content-Type")?.split(";", 1)[0]?.trim().toLowerCase() ?? "";
@@ -4569,7 +4597,7 @@ var LlamaWebGpuBridgeRuntime = class {
   _assertCoreLive(core) {
     if (this._coreRetired || isCoreRetired(core)) throw new ModelUnloadedError();
   }
-  async _ensureCore(diagnosticUrls) {
+  async _ensureCore(diagnosticUrls, redact = createCoreAssetUrlRedactor()) {
     if (this._core) {
       this._applyCoreLogLevel();
       this._assertCoreLive(this._core);
@@ -4577,6 +4605,13 @@ var LlamaWebGpuBridgeRuntime = class {
     }
     if (!this._config.coreModuleFactory && this._config.allowSingleThreadCore !== true && !canPostSharedMemory()) {
       throw new CrossOriginIsolationError();
+    }
+    const { coreModuleUrl, coreModuleUrlMem64, wasmUrl, wasmUrlMem64, _coreAssetSources } = resolveCoreAssets(this._config);
+    for (const url of [coreModuleUrl, coreModuleUrlMem64]) {
+      if (typeof url === "string") redact.remember(url, resolveCoreLoaderUrl(url));
+    }
+    for (const url of [wasmUrl, wasmUrlMem64, this._config.workerUrl, ...this._config._coreWorkerUrls ?? []]) {
+      if (typeof url === "string") redact.remember(url, normalizeAbsoluteUrl(url));
     }
     const candidates = [];
     const factory = this._config.coreModuleFactory;
@@ -4588,7 +4623,6 @@ var LlamaWebGpuBridgeRuntime = class {
         wasmUrl: this._config.wasmUrl
       });
     } else {
-      const { coreModuleUrl, coreModuleUrlMem64, wasmUrl, wasmUrlMem64, _coreAssetSources } = resolveCoreAssets(this._config);
       const bridgeResolved64 = isBridgeResolvedAsset(_coreAssetSources.wasm64);
       if (hasMemory64Candidate(this._preferMemory64, coreModuleUrlMem64)) {
         const factoryPromise = importCoreFactory(coreModuleUrlMem64);
@@ -4621,9 +4655,7 @@ var LlamaWebGpuBridgeRuntime = class {
       let locatedWasmUrl = null;
       let initTimeoutError = null;
       const loaderUrl = candidate.loaderUrl === null ? null : resolveCoreLoaderUrl(candidate.loaderUrl);
-      const redact = createCoreAssetUrlRedactor();
       if (candidate.loaderUrl !== null && loaderUrl !== null) redact.remember(candidate.loaderUrl, loaderUrl);
-      if (candidate.wasmUrl) redact.remember(candidate.wasmUrl, normalizeAbsoluteUrl(candidate.wasmUrl));
       let candidateCore = null;
       let initTimer;
       const pthreadStart = candidate.variant === "custom" ? null : createPthreadWorkerStart({ pthreadScriptUrl: candidate.pthreadScriptUrl });
@@ -4767,7 +4799,7 @@ var LlamaWebGpuBridgeRuntime = class {
         const url = asset === "loader" ? resolveCoreLoaderUrl(assetUrl) : normalizeAbsoluteUrl(assetUrl);
         if (!diagnosticUrls?.has(url)) {
           diagnosticUrls?.add(url);
-          const assetError = await probeUnavailableCoreAsset(url, asset, "wasm32");
+          const assetError = await probeUnavailableCoreAsset(url, asset, "wasm32", redact.remember);
           if (assetError) throw assetError;
         }
       }
@@ -4783,9 +4815,9 @@ var LlamaWebGpuBridgeRuntime = class {
     this._assertCoreLive(core);
     return { ...this._corePreflight };
   }
-  async _probeBackends(diagnosticUrls) {
+  async _probeBackends(diagnosticUrls, redact) {
     try {
-      const core = await this._ensureCore(diagnosticUrls);
+      const core = await this._ensureCore(diagnosticUrls, redact);
       const probeResult = Number(
         await core.ccall("llamadart_webgpu_probe", "number", [], [], { async: true })
       );
@@ -4817,9 +4849,10 @@ var LlamaWebGpuBridgeRuntime = class {
     this._suppressedWarmupWarningCount = 0;
     this._didReportWarmupWarningSuppression = false;
     const diagnosticUrls = /* @__PURE__ */ new Set();
-    await this._probeBackends(diagnosticUrls);
+    const redact = createCoreAssetUrlRedactor();
+    await this._probeBackends(diagnosticUrls, redact);
     throwIfAborted(operationSignal, abortMessage);
-    const core = await this._ensureCore(diagnosticUrls);
+    const core = await this._ensureCore(diagnosticUrls, redact);
     throwIfAborted(operationSignal, abortMessage);
     const modelUrls = expandModelShardUrls(url);
     if (modelUrls.length === 0) {
@@ -7653,6 +7686,9 @@ var BridgeWorkerProxy = class {
     if (bridgeModuleFallback && bridgeModuleFallback !== moduleUrl) {
       moduleCandidates.push(bridgeModuleFallback);
     }
+    const workerUrls = new Set(moduleCandidates);
+    const redact = createCoreAssetUrlRedactor();
+    for (const url of workerUrls) redact.remember(url);
     for (const candidate of moduleCandidates) {
       if (this._worker) {
         break;
@@ -7661,6 +7697,8 @@ var BridgeWorkerProxy = class {
       if (!directWorkerUrl) {
         continue;
       }
+      workerUrls.add(directWorkerUrl);
+      redact.remember(directWorkerUrl);
       try {
         this._worker = new Worker(directWorkerUrl, { type: "module" });
       } catch (error) {
@@ -7686,7 +7724,7 @@ var BridgeWorkerProxy = class {
       }
     }
     if (!this._worker) {
-      const error = workerInitError || new Error("Failed to initialize bridge worker");
+      const error = redact.error(workerInitError || new Error("Failed to initialize bridge worker"));
       if (this._stopCspWatch && error && typeof error === "object") {
         markBlobStartBlocked(error, blobStartBlockReason(this._endCspWatch(), true));
       }
@@ -7740,7 +7778,7 @@ var BridgeWorkerProxy = class {
     };
     this._worker.onerror = (event) => {
       const message = event?.message || "Bridge worker crashed";
-      const error = new Error(String(message));
+      const error = new Error(redact.text(String(message)));
       error.llamadartWorkerCrash = true;
       this._clearReadyTimeout();
       const stopWatch = this._stopCspWatch;
@@ -7756,7 +7794,11 @@ var BridgeWorkerProxy = class {
       }
       this._pending.clear();
     };
-    this._worker.postMessage({ type: "init", config: { ...config, workerStart: this.startMode } });
+    this._worker.postMessage({
+      type: "init",
+      config: { ...config, workerStart: this.startMode },
+      coreWorkerUrls: [...workerUrls]
+    });
   }
   async call(method, args, onEvent, transferList = [], operationMeta = null, beforePost) {
     await this._ready;
@@ -11070,9 +11112,12 @@ function installBridgeWorkerHost() {
     try {
       if (type === "init") {
         const config = message.config || {};
+        const workerUrls = Array.isArray(message.coreWorkerUrls) ? message.coreWorkerUrls.filter((url) => typeof url === "string") : [];
+        if (scope.location?.href) workerUrls.push(scope.location.href);
         bridge = new LlamaWebGpuBridge({
           ...config,
           ...resolveCoreAssets(config, false),
+          _coreWorkerUrls: workerUrls,
           disableWorker: true
         });
         bridge._onCoreRetired = () => self.postMessage({ type: "core-retired" });
