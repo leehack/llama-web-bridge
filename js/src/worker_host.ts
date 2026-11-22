@@ -94,7 +94,11 @@ export function installBridgeWorkerHost() {
         // Posted when the core retires, so it reaches the facade before the
         // reply of the call that hit the abort, whatever that reply carries.
         bridge._onCoreRetired = () => self.postMessage({ type: 'core-retired' });
-        self.postMessage({ type: 'ready', supportsIncrementalAudio: true });
+        self.postMessage({
+          type: 'ready',
+          supportsIncrementalAudio: true,
+          supportsJsBackedModelStaging: true,
+        });
         return;
       }
 

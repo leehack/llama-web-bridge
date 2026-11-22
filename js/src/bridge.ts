@@ -252,6 +252,7 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
 
   static supportsCompletionUsage = true;
   static supportsModelCacheQuery = true;
+  static supportsJsBackedModelStaging = true;
 
   constructor(config: BridgeConfig = {}) {
     this._config = config;

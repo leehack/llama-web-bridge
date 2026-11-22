@@ -24,6 +24,7 @@ export interface BridgeStateSnapshot {
 export interface WorkerResponse {
   type: string;
   supportsIncrementalAudio?: boolean;
+  supportsJsBackedModelStaging?: boolean;
   id?: number;
   value?: unknown;
   state?: BridgeStateSnapshot;

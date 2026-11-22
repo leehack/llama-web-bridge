@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Add `LlamaWebGpuBridge.supportsJsBackedModelStaging`. Explicit JS-backed model and projector loads reject with `MODEL_STAGING_UNSUPPORTED` when the worker lacks the staging capability flag.
+
 - Apply the one-layer cap to omitted and negative GPU layer counts on Apple Safari before 27. The cap is recomputed for each load, and `safariMaxGpuLayers: Infinity` opts out. (#270)
 
 - Resolve sibling worker and core assets automatically, including hashed bundler filenames and single-thread variants. Set `assetBaseUrl` to serve the assets from a separate directory.
