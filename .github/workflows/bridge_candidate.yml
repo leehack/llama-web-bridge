@@ -78,8 +78,391 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  build-candidate:
-    name: Build exact source and run hosted release gates
+  validate-inputs:
+    name: Validate exact candidate inputs
+    runs-on: ubuntu-latest
+    outputs:
+      native_commit: ${{ steps.native.outputs.native_commit }}
+      emscripten_version: ${{ steps.emscripten.outputs.emscripten_version }}
+    steps:
+      - name: Validate candidate request boundary
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_REPOSITORY}" != "${BRIDGE_REPO}" ]; then
+            echo "error: candidate workflow must execute in ${BRIDGE_REPO}"
+            exit 1
+          fi
+          if [ "${DISPATCHING_ACTOR}" != "${REPOSITORY_OWNER}" ]; then
+            echo "error: candidate dispatch is restricted to ${REPOSITORY_OWNER}"
+            exit 1
+          fi
+          if [ "${GITHUB_RUN_ATTEMPT_STRING}" != "1" ]; then
+            echo "error: candidate builds are first-attempt-only; dispatch a new run instead of rebuilding"
+            exit 1
+          fi
+          # This unprivileged workflow deliberately holds no credential that can
+          # read another repository's administration settings, so it cannot call
+          # the immutable-release governance API itself. It fails closed unless
+          # the dispatcher asserts governance is already enabled, and
+          # publish_assets.yml independently proves the real state through
+          # GET /repos/{owner}/{repo}/immutable-releases before publishing.
+          if [ "${ASSETS_IMMUTABLE_RELEASES_ENABLED}" != "true" ]; then
+            echo "error: candidate builds require immutable releases to be enabled on ${ASSETS_REPO} before dispatch"
+            exit 1
+          fi
+          if [[ ! "${ORCHESTRATOR_CORRELATION_ID}" =~ ^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$ ]]; then
+            echo "error: invalid orchestrator_correlation_id"
+            exit 1
+          fi
+          if [[ ! "${BRIDGE_SOURCE_SHA}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "error: bridge_source_sha must be a full lowercase commit SHA"
+            exit 1
+          fi
+          bridge_default="$(gh api "repos/${BRIDGE_REPO}" --jq '.default_branch')"
+          if [ "${GITHUB_REF}" != "refs/heads/${bridge_default}" ]; then
+            echo "error: candidate workflow must be dispatched from ${BRIDGE_REPO}'s default branch"
+            exit 1
+          fi
+          source_status="$(gh api \
+            "repos/${BRIDGE_REPO}/compare/${BRIDGE_SOURCE_SHA}...${bridge_default}" \
+            --jq '.status')"
+          if [ "${source_status}" != "ahead" ] && [ "${source_status}" != "identical" ]; then
+            echo "error: bridge source is not reachable from ${BRIDGE_REPO}'s default branch"
+            exit 1
+          fi
+
+      - name: Checkout exact bridge source
+        uses: actions/checkout@v4
+        with:
+          repository: leehack/llama-web-bridge
+          ref: ${{ env.BRIDGE_SOURCE_SHA }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Validate exact bridge and release inputs
+        run: |
+          set -euo pipefail
+          if [[ ! "${BRIDGE_SOURCE_SHA}" =~ ^[0-9a-f]{40}$ ]] || [ "$(git rev-parse HEAD)" != "${BRIDGE_SOURCE_SHA}" ]; then
+            echo "error: checked-out bridge source does not match the requested full SHA"
+            exit 1
+          fi
+          node scripts/release/contract.mjs validate-release \
+            --release-tag "${RELEASE_TAG}" --release-rebuild "${RELEASE_REBUILD}" \
+            --upstream-tag "${UPSTREAM_TAG}"
+          node scripts/release/contract.mjs validate-native-request \
+            --native-release-tag "${NATIVE_RELEASE_TAG}" \
+            --upstream-tag "${UPSTREAM_TAG}" --upstream-commit "${UPSTREAM_COMMIT}" \
+            --manifest-sha256 "${NATIVE_MANIFEST_SHA256}"
+          node scripts/release/contract.mjs require-correlation-id \
+            --orchestrator-correlation-id "${ORCHESTRATOR_CORRELATION_ID}"
+          node scripts/release/contract.mjs require-repository \
+            --repository "${ASSETS_REPO}" --field assets_repo
+          node scripts/release/contract.mjs require-repository \
+            --repository "${NATIVE_REPO}" --field native_repo
+
+      - name: Resolve immutable upstream and native release tag commits
+        id: native_tag
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/native-release"
+          git ls-remote https://github.com/ggml-org/llama.cpp.git \
+            "refs/tags/${UPSTREAM_TAG}" "refs/tags/${UPSTREAM_TAG}^{}" \
+            > "${RUNNER_TEMP}/upstream-tag-refs.txt"
+          RESOLVED_UPSTREAM_COMMIT="$(node scripts/release/contract.mjs resolve-tag-commit \
+            --ls-remote "${RUNNER_TEMP}/upstream-tag-refs.txt" \
+            --tag "${UPSTREAM_TAG}")"
+          if [ "${RESOLVED_UPSTREAM_COMMIT}" != "${UPSTREAM_COMMIT}" ]; then
+            echo "error: resolved upstream tag commit does not match upstream_commit"
+            exit 1
+          fi
+          git ls-remote "https://github.com/${NATIVE_REPO}.git" \
+            "refs/tags/${NATIVE_RELEASE_TAG}" "refs/tags/${NATIVE_RELEASE_TAG}^{}" \
+            > "${RUNNER_TEMP}/native-release/tag-refs.txt"
+          NATIVE_TAG_COMMIT="$(node scripts/release/contract.mjs resolve-tag-commit \
+            --ls-remote "${RUNNER_TEMP}/native-release/tag-refs.txt" \
+            --tag "${NATIVE_RELEASE_TAG}")"
+          echo "native_tag_commit=${NATIVE_TAG_COMMIT}" >> "${GITHUB_OUTPUT}"
+
+      - name: Download and independently verify native release inventory
+        id: native
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NATIVE_TAG_COMMIT: ${{ steps.native_tag.outputs.native_tag_commit }}
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/native-release"
+          gh api "repos/${NATIVE_REPO}/releases/tags/${NATIVE_RELEASE_TAG}" \
+            > "${RUNNER_TEMP}/native-release/release.json"
+          for name in assets.json SHA256SUMS; do
+            asset_id="$(jq -er --arg name "${name}" \
+              '[.assets[] | select(.name == $name)] | if length == 1 then .[0].id else error("missing/duplicate asset") end' \
+              "${RUNNER_TEMP}/native-release/release.json")"
+            gh api -H "Accept: application/octet-stream" \
+              "repos/${NATIVE_REPO}/releases/assets/${asset_id}" \
+              > "${RUNNER_TEMP}/native-release/${name}"
+          done
+          IDENTITY="$(node scripts/release/contract.mjs validate-native-release \
+            --manifest "${RUNNER_TEMP}/native-release/assets.json" \
+            --checksums "${RUNNER_TEMP}/native-release/SHA256SUMS" \
+            --release-json "${RUNNER_TEMP}/native-release/release.json" \
+            --manifest-sha256 "${NATIVE_MANIFEST_SHA256}" \
+            --native-release-tag "${NATIVE_RELEASE_TAG}" \
+            --upstream-tag "${UPSTREAM_TAG}" --upstream-commit "${UPSTREAM_COMMIT}" \
+            --native-tag-commit "${NATIVE_TAG_COMMIT}")"
+          echo "native_commit=$(jq -r '.native_commit' <<<"${IDENTITY}")" >> "${GITHUB_OUTPUT}"
+
+      - name: Verify exact native tag commit
+        env:
+          NATIVE_COMMIT: ${{ steps.native.outputs.native_commit }}
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "${NATIVE_RELEASE_TAG}" \
+            "https://github.com/${NATIVE_REPO}.git" "${RUNNER_TEMP}/native-source"
+          if [ "$(git -C "${RUNNER_TEMP}/native-source" rev-parse HEAD)" != "${NATIVE_COMMIT}" ]; then
+            echo "error: native tag does not resolve to manifest native_commit"
+            exit 1
+          fi
+
+      - name: Resolve Emscripten SDK pin
+        id: emscripten
+        run: |
+          EMSCRIPTEN_VERSION="$(node scripts/build/verify_emscripten_version.mjs --print-pin)"
+          echo "EMSCRIPTEN_VERSION=${EMSCRIPTEN_VERSION}" >> "${GITHUB_ENV}"
+          echo "emscripten_version=${EMSCRIPTEN_VERSION}" >> "${GITHUB_OUTPUT}"
+
+  validate-js:
+    name: Validate generated JS and release contracts
+    needs: [validate-inputs]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate candidate request boundary
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_REPOSITORY}" != "${BRIDGE_REPO}" ]; then
+            echo "error: candidate workflow must execute in ${BRIDGE_REPO}"
+            exit 1
+          fi
+          if [ "${DISPATCHING_ACTOR}" != "${REPOSITORY_OWNER}" ]; then
+            echo "error: candidate dispatch is restricted to ${REPOSITORY_OWNER}"
+            exit 1
+          fi
+          if [ "${GITHUB_RUN_ATTEMPT_STRING}" != "1" ]; then
+            echo "error: candidate builds are first-attempt-only; dispatch a new run instead of rebuilding"
+            exit 1
+          fi
+          # This unprivileged workflow deliberately holds no credential that can
+          # read another repository's administration settings, so it cannot call
+          # the immutable-release governance API itself. It fails closed unless
+          # the dispatcher asserts governance is already enabled, and
+          # publish_assets.yml independently proves the real state through
+          # GET /repos/{owner}/{repo}/immutable-releases before publishing.
+          if [ "${ASSETS_IMMUTABLE_RELEASES_ENABLED}" != "true" ]; then
+            echo "error: candidate builds require immutable releases to be enabled on ${ASSETS_REPO} before dispatch"
+            exit 1
+          fi
+          if [[ ! "${ORCHESTRATOR_CORRELATION_ID}" =~ ^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$ ]]; then
+            echo "error: invalid orchestrator_correlation_id"
+            exit 1
+          fi
+          if [[ ! "${BRIDGE_SOURCE_SHA}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "error: bridge_source_sha must be a full lowercase commit SHA"
+            exit 1
+          fi
+          bridge_default="$(gh api "repos/${BRIDGE_REPO}" --jq '.default_branch')"
+          if [ "${GITHUB_REF}" != "refs/heads/${bridge_default}" ]; then
+            echo "error: candidate workflow must be dispatched from ${BRIDGE_REPO}'s default branch"
+            exit 1
+          fi
+          source_status="$(gh api \
+            "repos/${BRIDGE_REPO}/compare/${BRIDGE_SOURCE_SHA}...${bridge_default}" \
+            --jq '.status')"
+          if [ "${source_status}" != "ahead" ] && [ "${source_status}" != "identical" ]; then
+            echo "error: bridge source is not reachable from ${BRIDGE_REPO}'s default branch"
+            exit 1
+          fi
+
+      - name: Checkout exact bridge source
+        uses: actions/checkout@v4
+        with:
+          repository: leehack/llama-web-bridge
+          ref: ${{ env.BRIDGE_SOURCE_SHA }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Verify exact bridge checkout
+        run: |
+          set -euo pipefail
+          if [ "$(git rev-parse HEAD)" != "${BRIDGE_SOURCE_SHA}" ]; then
+            echo "error: checked-out bridge source does not match the requested full SHA"
+            exit 1
+          fi
+
+      - name: Validate generated JS and release contracts
+        run: |
+          npm ci --ignore-scripts
+          npm run check:js
+          git ls-files --error-unmatch js/llama_webgpu_bridge.js js/llama_webgpu_bridge_worker.js js/llama_webgpu_bridge.d.ts
+          git diff --exit-code -- js/llama_webgpu_bridge.js js/llama_webgpu_bridge_worker.js js/llama_webgpu_bridge.d.ts
+          node scripts/ci/verify_ci_reliability.mjs
+
+  build-core:
+    name: Build candidate core (${{ matrix.variant }})
+    needs: [validate-inputs]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        variant: [wasm32, wasm64, wasm32_st, wasm64_st]
+    steps:
+      - name: Validate candidate request boundary
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_REPOSITORY}" != "${BRIDGE_REPO}" ]; then
+            echo "error: candidate workflow must execute in ${BRIDGE_REPO}"
+            exit 1
+          fi
+          if [ "${DISPATCHING_ACTOR}" != "${REPOSITORY_OWNER}" ]; then
+            echo "error: candidate dispatch is restricted to ${REPOSITORY_OWNER}"
+            exit 1
+          fi
+          if [ "${GITHUB_RUN_ATTEMPT_STRING}" != "1" ]; then
+            echo "error: candidate builds are first-attempt-only; dispatch a new run instead of rebuilding"
+            exit 1
+          fi
+          # This unprivileged workflow deliberately holds no credential that can
+          # read another repository's administration settings, so it cannot call
+          # the immutable-release governance API itself. It fails closed unless
+          # the dispatcher asserts governance is already enabled, and
+          # publish_assets.yml independently proves the real state through
+          # GET /repos/{owner}/{repo}/immutable-releases before publishing.
+          if [ "${ASSETS_IMMUTABLE_RELEASES_ENABLED}" != "true" ]; then
+            echo "error: candidate builds require immutable releases to be enabled on ${ASSETS_REPO} before dispatch"
+            exit 1
+          fi
+          if [[ ! "${ORCHESTRATOR_CORRELATION_ID}" =~ ^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$ ]]; then
+            echo "error: invalid orchestrator_correlation_id"
+            exit 1
+          fi
+          if [[ ! "${BRIDGE_SOURCE_SHA}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "error: bridge_source_sha must be a full lowercase commit SHA"
+            exit 1
+          fi
+          bridge_default="$(gh api "repos/${BRIDGE_REPO}" --jq '.default_branch')"
+          if [ "${GITHUB_REF}" != "refs/heads/${bridge_default}" ]; then
+            echo "error: candidate workflow must be dispatched from ${BRIDGE_REPO}'s default branch"
+            exit 1
+          fi
+          source_status="$(gh api \
+            "repos/${BRIDGE_REPO}/compare/${BRIDGE_SOURCE_SHA}...${bridge_default}" \
+            --jq '.status')"
+          if [ "${source_status}" != "ahead" ] && [ "${source_status}" != "identical" ]; then
+            echo "error: bridge source is not reachable from ${BRIDGE_REPO}'s default branch"
+            exit 1
+          fi
+
+      - name: Checkout exact bridge source
+        uses: actions/checkout@v4
+        with:
+          repository: leehack/llama-web-bridge
+          ref: ${{ env.BRIDGE_SOURCE_SHA }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Verify exact bridge checkout
+        run: |
+          set -euo pipefail
+          if [ "$(git rev-parse HEAD)" != "${BRIDGE_SOURCE_SHA}" ]; then
+            echo "error: checked-out bridge source does not match the requested full SHA"
+            exit 1
+          fi
+
+      - name: Verify exact upstream tag commit
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "${UPSTREAM_TAG}" https://github.com/ggml-org/llama.cpp.git third_party/llama_cpp
+          if [ "$(git -C third_party/llama_cpp rev-parse HEAD)" != "${UPSTREAM_COMMIT}" ]; then
+            echo "error: upstream tag does not resolve to requested commit"
+            exit 1
+          fi
+
+      - name: Resolve Emscripten SDK pin
+        id: emscripten
+        env:
+          VALIDATED_EMSCRIPTEN_VERSION: ${{ needs.validate-inputs.outputs.emscripten_version }}
+        run: |
+          set -euo pipefail
+          EMSCRIPTEN_VERSION="$(node scripts/build/verify_emscripten_version.mjs --print-pin)"
+          if [ "${EMSCRIPTEN_VERSION}" != "${VALIDATED_EMSCRIPTEN_VERSION}" ]; then
+            echo "error: Emscripten pin does not match validate-inputs"
+            exit 1
+          fi
+          echo "EMSCRIPTEN_VERSION=${EMSCRIPTEN_VERSION}" >> "${GITHUB_ENV}"
+          echo "emscripten_version=${EMSCRIPTEN_VERSION}" >> "${GITHUB_OUTPUT}"
+
+      - name: Setup pinned Emscripten SDK
+        uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: ${{ env.EMSCRIPTEN_VERSION }}
+
+      - name: Build exact core variant
+        env:
+          OUT_DIR: ${{ runner.temp }}/webgpu_bridge_dist
+          WEBGPU_BRIDGE_VARIANT: ${{ matrix.variant }}
+          WEBGPU_BRIDGE_SKIP_JS_CHECK: 1
+        run: |
+          node scripts/build/verify_emscripten_version.mjs --emit-github-env "$GITHUB_ENV"
+          ./scripts/build/build_bridge.sh
+
+      - name: Stage the exact core pair for upload
+        env:
+          OUT_DIR: ${{ runner.temp }}/webgpu_bridge_dist
+          VARIANT: ${{ matrix.variant }}
+        run: |
+          set -euo pipefail
+          case "${VARIANT}" in
+            wasm32) suffix="" ;;
+            wasm64) suffix="_mem64" ;;
+            wasm32_st) suffix="_st" ;;
+            wasm64_st) suffix="_mem64_st" ;;
+            *) exit 1 ;;
+          esac
+          mkdir "${RUNNER_TEMP}/candidate-core"
+          cp "${OUT_DIR}/llama_webgpu_core${suffix}.js" \
+            "${OUT_DIR}/llama_webgpu_core${suffix}.wasm" "${RUNNER_TEMP}/candidate-core/"
+
+      - name: Upload compiled core variant
+        uses: actions/upload-artifact@v4
+        with:
+          name: candidate-core-${{ matrix.variant }}
+          path: ${{ runner.temp }}/candidate-core/
+          if-no-files-found: error
+          retention-days: 1
+
+  gate-and-package:
+    name: Gate and package exact candidate
+    needs: [validate-inputs, validate-js, build-core]
     runs-on: ubuntu-latest
     env:
       LLAMA_WEBGPU_SMOKE_MODEL_URL: https://huggingface.co/aladar/llama-2-tiny-random-GGUF/resolve/main/llama-2-tiny-random.gguf
@@ -163,131 +546,63 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      # The release and build CLIs are zero-dependency Node modules; npm ci
-      # below installs only the JS toolchain and the gates' Playwright.
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: 24
           cache: npm
 
-      - name: Validate exact bridge and release inputs
+      - name: Verify exact bridge checkout
         run: |
           set -euo pipefail
-          if [[ ! "${BRIDGE_SOURCE_SHA}" =~ ^[0-9a-f]{40}$ ]] || [ "$(git rev-parse HEAD)" != "${BRIDGE_SOURCE_SHA}" ]; then
+          if [ "$(git rev-parse HEAD)" != "${BRIDGE_SOURCE_SHA}" ]; then
             echo "error: checked-out bridge source does not match the requested full SHA"
             exit 1
           fi
-          node scripts/release/contract.mjs validate-release \
-            --release-tag "${RELEASE_TAG}" --release-rebuild "${RELEASE_REBUILD}" \
-            --upstream-tag "${UPSTREAM_TAG}"
-          node scripts/release/contract.mjs validate-native-request \
-            --native-release-tag "${NATIVE_RELEASE_TAG}" \
-            --upstream-tag "${UPSTREAM_TAG}" --upstream-commit "${UPSTREAM_COMMIT}" \
-            --manifest-sha256 "${NATIVE_MANIFEST_SHA256}"
-          node scripts/release/contract.mjs require-correlation-id \
-            --orchestrator-correlation-id "${ORCHESTRATOR_CORRELATION_ID}"
-          node scripts/release/contract.mjs require-repository \
-            --repository "${ASSETS_REPO}" --field assets_repo
-          node scripts/release/contract.mjs require-repository \
-            --repository "${NATIVE_REPO}" --field native_repo
-
-      - name: Resolve immutable upstream and native release tag commits
-        id: native_tag
-        run: |
-          set -euo pipefail
-          mkdir -p "${RUNNER_TEMP}/native-release"
-          git ls-remote https://github.com/ggml-org/llama.cpp.git \
-            "refs/tags/${UPSTREAM_TAG}" "refs/tags/${UPSTREAM_TAG}^{}" \
-            > "${RUNNER_TEMP}/upstream-tag-refs.txt"
-          RESOLVED_UPSTREAM_COMMIT="$(node scripts/release/contract.mjs resolve-tag-commit \
-            --ls-remote "${RUNNER_TEMP}/upstream-tag-refs.txt" \
-            --tag "${UPSTREAM_TAG}")"
-          if [ "${RESOLVED_UPSTREAM_COMMIT}" != "${UPSTREAM_COMMIT}" ]; then
-            echo "error: resolved upstream tag commit does not match upstream_commit"
-            exit 1
-          fi
-          git ls-remote "https://github.com/${NATIVE_REPO}.git" \
-            "refs/tags/${NATIVE_RELEASE_TAG}" "refs/tags/${NATIVE_RELEASE_TAG}^{}" \
-            > "${RUNNER_TEMP}/native-release/tag-refs.txt"
-          NATIVE_TAG_COMMIT="$(node scripts/release/contract.mjs resolve-tag-commit \
-            --ls-remote "${RUNNER_TEMP}/native-release/tag-refs.txt" \
-            --tag "${NATIVE_RELEASE_TAG}")"
-          echo "native_tag_commit=${NATIVE_TAG_COMMIT}" >> "${GITHUB_OUTPUT}"
-
-      - name: Download and independently verify native release inventory
-        id: native
-        env:
-          GH_TOKEN: ${{ github.token }}
-          NATIVE_TAG_COMMIT: ${{ steps.native_tag.outputs.native_tag_commit }}
-        run: |
-          set -euo pipefail
-          mkdir -p "${RUNNER_TEMP}/native-release"
-          gh api "repos/${NATIVE_REPO}/releases/tags/${NATIVE_RELEASE_TAG}" \
-            > "${RUNNER_TEMP}/native-release/release.json"
-          for name in assets.json SHA256SUMS; do
-            asset_id="$(jq -er --arg name "${name}" \
-              '[.assets[] | select(.name == $name)] | if length == 1 then .[0].id else error("missing/duplicate asset") end' \
-              "${RUNNER_TEMP}/native-release/release.json")"
-            gh api -H "Accept: application/octet-stream" \
-              "repos/${NATIVE_REPO}/releases/assets/${asset_id}" \
-              > "${RUNNER_TEMP}/native-release/${name}"
-          done
-          IDENTITY="$(node scripts/release/contract.mjs validate-native-release \
-            --manifest "${RUNNER_TEMP}/native-release/assets.json" \
-            --checksums "${RUNNER_TEMP}/native-release/SHA256SUMS" \
-            --release-json "${RUNNER_TEMP}/native-release/release.json" \
-            --manifest-sha256 "${NATIVE_MANIFEST_SHA256}" \
-            --native-release-tag "${NATIVE_RELEASE_TAG}" \
-            --upstream-tag "${UPSTREAM_TAG}" --upstream-commit "${UPSTREAM_COMMIT}" \
-            --native-tag-commit "${NATIVE_TAG_COMMIT}")"
-          echo "native_commit=$(jq -r '.native_commit' <<<"${IDENTITY}")" >> "${GITHUB_OUTPUT}"
-
-      - name: Verify exact upstream and native tag commits
-        env:
-          NATIVE_COMMIT: ${{ steps.native.outputs.native_commit }}
-        run: |
-          set -euo pipefail
-          git clone --depth 1 --branch "${UPSTREAM_TAG}" https://github.com/ggml-org/llama.cpp.git third_party/llama_cpp
-          if [ "$(git -C third_party/llama_cpp rev-parse HEAD)" != "${UPSTREAM_COMMIT}" ]; then
-            echo "error: upstream tag does not resolve to requested commit"
-            exit 1
-          fi
-          git clone --depth 1 --branch "${NATIVE_RELEASE_TAG}" \
-            "https://github.com/${NATIVE_REPO}.git" "${RUNNER_TEMP}/native-source"
-          if [ "$(git -C "${RUNNER_TEMP}/native-source" rev-parse HEAD)" != "${NATIVE_COMMIT}" ]; then
-            echo "error: native tag does not resolve to manifest native_commit"
-            exit 1
-          fi
-
-      - name: Validate generated JS and release contracts
-        run: |
-          npm ci --ignore-scripts
-          npm run check:js
-          git ls-files --error-unmatch js/llama_webgpu_bridge.js js/llama_webgpu_bridge_worker.js js/llama_webgpu_bridge.d.ts
-          git diff --exit-code -- js/llama_webgpu_bridge.js js/llama_webgpu_bridge_worker.js js/llama_webgpu_bridge.d.ts
-          node scripts/ci/verify_ci_reliability.mjs
 
       - name: Resolve Emscripten SDK pin
         id: emscripten
+        env:
+          VALIDATED_EMSCRIPTEN_VERSION: ${{ needs.validate-inputs.outputs.emscripten_version }}
         run: |
+          set -euo pipefail
           EMSCRIPTEN_VERSION="$(node scripts/build/verify_emscripten_version.mjs --print-pin)"
+          if [ "${EMSCRIPTEN_VERSION}" != "${VALIDATED_EMSCRIPTEN_VERSION}" ]; then
+            echo "error: Emscripten pin does not match validate-inputs"
+            exit 1
+          fi
           echo "EMSCRIPTEN_VERSION=${EMSCRIPTEN_VERSION}" >> "${GITHUB_ENV}"
           echo "emscripten_version=${EMSCRIPTEN_VERSION}" >> "${GITHUB_OUTPUT}"
 
-      - name: Setup pinned Emscripten SDK
-        uses: mymindstorm/setup-emsdk@v14
+      - name: Download compiled candidate cores
+        uses: actions/download-artifact@v4
         with:
-          version: ${{ env.EMSCRIPTEN_VERSION }}
+          pattern: candidate-core-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/webgpu_bridge_dist
 
-      - name: Verify compiler and build wasm32 plus memory64
+      - name: Assemble the candidate distribution
         env:
           OUT_DIR: ${{ runner.temp }}/webgpu_bridge_dist
-          WEBGPU_BRIDGE_BUILD_MEM64: 1
-          WEBGPU_BRIDGE_BUILD_SINGLE_THREAD: 1
         run: |
-          node scripts/build/verify_emscripten_version.mjs --emit-github-env "$GITHUB_ENV"
-          ./scripts/build/build_bridge.sh
+          set -euo pipefail
+          wrappers=(llama_webgpu_bridge.js llama_webgpu_bridge_worker.js llama_webgpu_bridge.d.ts)
+          expected=("${wrappers[@]}")
+          for suffix in "" _mem64 _st _mem64_st; do
+            expected+=("llama_webgpu_core${suffix}.js" "llama_webgpu_core${suffix}.wasm")
+          done
+          for wrapper in "${wrappers[@]}"; do
+            cp "js/${wrapper}" "${OUT_DIR}/"
+          done
+          diff -u <(printf '%s\n' "${expected[@]}" | sort) \
+            <(find "${OUT_DIR}" -mindepth 1 -maxdepth 1 -printf '%y %f\n' | sed -n 's/^f //p' | sort)
+          if find "${OUT_DIR}" -mindepth 1 -maxdepth 1 ! -type f -print -quit | grep -q .; then
+            echo "error: candidate distribution includes a non-file entry"
+            exit 1
+          fi
+
+      - name: Install release smoke dependencies
+        run: npm ci --ignore-scripts
 
       - name: Cache release smoke models
         uses: actions/cache@v4
@@ -334,7 +649,7 @@ jobs:
       - name: Generate schema-v2 manifest and checksums
         env:
           OUT_DIR: ${{ runner.temp }}/webgpu_bridge_dist
-          NATIVE_COMMIT: ${{ steps.native.outputs.native_commit }}
+          NATIVE_COMMIT: ${{ needs.validate-inputs.outputs.native_commit }}
         run: |
           set -euo pipefail
           node scripts/release/manifest.mjs \
@@ -355,7 +670,7 @@ jobs:
           STATE_CONCLUSION: ${{ steps.state_gate.outcome }}
           MULTIMODAL_CONCLUSION: ${{ steps.multimodal_gate.outcome }}
           EMSCRIPTEN_VERSION_OUT: ${{ steps.emscripten.outputs.emscripten_version }}
-          NATIVE_COMMIT: ${{ steps.native.outputs.native_commit }}
+          NATIVE_COMMIT: ${{ needs.validate-inputs.outputs.native_commit }}
         run: |
           set -euo pipefail
           FINGERPRINT="$(node scripts/release/qualification.mjs candidate-fingerprint \

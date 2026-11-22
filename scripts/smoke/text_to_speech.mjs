@@ -241,7 +241,12 @@ export function renderHarness({
               const mismatch = bytes.findIndex((byte, index) => byte !== expectedBytes[byteOffset + index]);
               assert(mismatch === -1, \`streamed PCM differs at byte \${byteOffset + mismatch}\`);
               received += chunk.pcm.length;
-              streamWindowChunkTested ||= chunk.state === 2 && chunk.pcm.length === 138240;
+              if (chunk.state === 2) {
+                assert(chunk.pcm.length === 138240, 'unexpected generating PCM window length: ' + chunk.pcm.length);
+                streamWindowChunkTested = true;
+              } else {
+                assert(chunk.state === 3, 'unexpected streamed PCM state: ' + chunk.state);
+              }
             }
             assert(streamed.pcm instanceof Float32Array && streamed.pcm.length === 0, 'streamed result contains final PCM');
             assert(received === output.sampleCount && streamed.sampleCount === received, 'streamed sample count mismatch');
@@ -283,9 +288,12 @@ export function renderHarness({
               setStage(\`\${memoryMode}:\${runtimeMode}:cancel-streamed\`);
               const streamController = new AbortController();
               let firstChunkState = null;
+              const streamCancelRequest = streamWindowChunkTested
+                ? request
+                : { ...request, text: 'Ready.', maxFrames: 1, seed: 4 };
               try {
                 await bridge.synthesizeSpeech({
-                  ...request,
+                  ...streamCancelRequest,
                   streamAudio: true,
                   signal: streamController.signal,
                   onProgress: (event) => {

@@ -16,23 +16,34 @@ import { afterEach, beforeEach, test } from 'node:test';
 import { ContractError } from '../../scripts/release/errors.mjs';
 import { isPyException } from '../../scripts/release/json.mjs';
 import {
+  HARNESS_VERSION,
+  MAX_ATTESTATION_BYTES,
+  PHASE_RECORD_TYPE,
   QUALIFICATION_SMOKES,
+  REQUIRED_SPEECH_MODES,
+  REQUIRED_TTS_MODES,
   SPEECH_AUDIO_SHA256,
   SPEECH_MMPROJ_SHA256,
   SPEECH_MODEL_SHA256,
   TTS_MMPROJ_SHA256,
   TTS_MODEL_SHA256,
+  canonicalJson,
+  loadAttestationFile,
+  readWavIdentity,
 } from '../../scripts/release/qualification.mjs';
 import {
   SCRIPTS_DIR,
+  assembleAttestationCmd,
   nodeExecutable,
   pyFormatG,
   pyPathName,
   pyWhich,
   qualifyCmd,
+  qualifyPhaseCmd,
   requireInputFile,
 } from '../../scripts/release/qualify.mjs';
-import { REPO_SCRIPTS_DIR, makeTmp } from './qualify_fixtures.mjs';
+import { qualificationEnvironment, setUp } from './qualification_fixtures.mjs';
+import { REPO_SCRIPTS_DIR, makeTmp, speechModeResult, ttsModeResult, wavBytes } from './qualify_fixtures.mjs';
 
 const BRIDGE_SHA = '565c8396597ea7c0fb4e8d5d966da8d884b156d8';
 const CANDIDATE_RUN_ID = '32919086955';
@@ -440,4 +451,220 @@ test('pyFormatG matches Python format(value, "g")', () => {
     [-3.25, '-3.25'], [1e16, '1e+16'], [7, '7'], [2n ** 60n, '1.15292e+18'],
   ];
   for (const [value, expected] of cases) assert.equal(pyFormatG(value), expected, String(value));
+});
+
+test('qualify-phase rejects an unknown gate before fetching a candidate', async () => {
+  const deps = { fetchCandidate: () => assert.fail('must validate the phase before fetching') };
+  await assert.rejects(qualifyPhaseCmd({ phase: 'invalid' }, () => {}, deps), ContractError);
+});
+
+function shardFixture(t) {
+  const fixture = setUp();
+  t.after(fixture.cleanup);
+  const commands = [];
+  const wav = wavBytes([0, 8192, -8192, 4096]);
+  const wavPath = path.join(tmp, 'generated.wav');
+  fs.writeFileSync(wavPath, wav);
+  const evidence = readWavIdentity(wavPath);
+  let rss;
+  const deps = {
+    nodeExecutable: () => '/opt/node/bin/node',
+    qualificationEnvironment,
+    qualificationRunIdentity: () => ({
+      qualification_run_id: '32919086977',
+      qualification_run_attempt: 1,
+      qualification_source_sha: 'a'.repeat(40),
+    }),
+    fetchCandidate: (runId, destination) => {
+      assert.equal(runId, CANDIDATE_RUN_ID);
+      fs.cpSync(fixture.candidate, destination, { recursive: true });
+      return [7, 1];
+    },
+    requireHarnessMatchesBridgeSource: (directory, sha) => {
+      assert.equal(directory, REPO_SCRIPTS_DIR);
+      assert.equal(sha, BRIDGE_SHA);
+      return fixture.harnessDigest;
+    },
+    runSmoke: (command, gate) => {
+      commands.push(path.basename(command[1]));
+      if (gate === 'speech-to-text') {
+        rss = 8737062912;
+        return { modeResults: REQUIRED_SPEECH_MODES.map(([memory, mode]) => speechModeResult(memory, mode)) };
+      }
+      assert.equal(gate, 'text-to-speech');
+      rss = 10338385920;
+      const artifacts = command[command.indexOf('--artifacts-dir') + 1];
+      fs.mkdirSync(artifacts, { recursive: true });
+      fs.writeFileSync(path.join(artifacts, 'generated.wav'), wav);
+      return {
+        modeResults: REQUIRED_TTS_MODES.map(([, runtimeMode]) => ttsModeResult('generated.wav', {
+          runtimeMode,
+          execution: runtimeMode === 'worker' ? 'worker' : 'main-thread',
+          peak: evidence.peak,
+          rms: evidence.rms,
+        })),
+      };
+    },
+    maxRssBytes: () => rss,
+    stderr: () => {},
+  };
+  const args = qualifyArgs(writeInputs());
+  const inputs = {
+    candidateRunId: args.candidateRunId,
+    speechPhase: path.join(tmp, 'speech.json'),
+    ttsPhase: path.join(tmp, 'tts.json'),
+    outputAttestation: args.outputAttestation,
+  };
+  return { fixture, evidence, commands, deps, args, inputs };
+}
+
+async function runShards({ args, deps, inputs }, ttsMemory) {
+  await qualifyPhaseCmd({
+    ...args, phase: 'speech_to_text', ttsModelPath: null, ttsMmprojPath: null, outputPhase: inputs.speechPhase,
+  }, () => {}, deps);
+  await qualifyPhaseCmd({
+    ...args, phase: 'text_to_speech', speechModelPath: null, speechMmprojPath: null, speechAudioPath: null,
+    outputPhase: inputs.ttsPhase,
+  }, () => {}, {
+    ...deps,
+    qualificationEnvironment: () => qualificationEnvironment({ total_memory_bytes: ttsMemory }),
+  });
+}
+
+test('each qualification shard runs only its pinned gate and emits verified canonical evidence', async (t) => {
+  const context = shardFixture(t);
+  await runShards(context, qualificationEnvironment().total_memory_bytes);
+  assert.deepEqual(context.commands, ['speech_to_text.mjs', 'text_to_speech.mjs']);
+  const { fixture, evidence, inputs } = context;
+  for (const [name, file, modeCount] of [
+    ['speech_to_text', inputs.speechPhase, REQUIRED_SPEECH_MODES.length],
+    ['text_to_speech', inputs.ttsPhase, REQUIRED_TTS_MODES.length],
+  ]) {
+    const raw = fs.readFileSync(file, 'utf8');
+    const record = JSON.parse(raw);
+    assert.equal(raw, canonicalJson(loadAttestationFile(file)));
+    assert.deepEqual({ ...record, phase: undefined }, {
+      schema_version: 1,
+      phase_type: PHASE_RECORD_TYPE,
+      phase_name: name,
+      candidate_fingerprint: fixture.fingerprint,
+      candidate_run_id: CANDIDATE_RUN_ID,
+      candidate_artifact_id: 7,
+      candidate_run_attempt: 1,
+      bridge_source_sha: BRIDGE_SHA,
+      harness_version: HARNESS_VERSION,
+      harness_source_sha256: fixture.harnessDigest,
+      qualification_run_id: '32919086977',
+      qualification_run_attempt: 1,
+      qualification_source_sha: 'a'.repeat(40),
+      qualification_environment: qualificationEnvironment(),
+      phase: undefined,
+    });
+    assert.equal(record.phase.modes.length, modeCount);
+    if (name === 'text_to_speech') {
+      for (const mode of record.phase.modes) {
+        assert.equal(mode.wav.sha256, evidence.sha256);
+        assert.equal(mode.wav.frame_count, evidence.frame_count);
+        assert.equal(mode.peak, evidence.peak);
+        assert.equal(mode.rms, evidence.rms);
+      }
+    }
+  }
+});
+
+test('qualify-phase rejects missing inputs and nonpositive limits before fetching', async (t) => {
+  const { args, deps } = shardFixture(t);
+  const noFetch = { ...deps, fetchCandidate: () => assert.fail('must reject invalid inputs before fetching') };
+  for (const [phase, overrides, expected] of [
+    ['speech_to_text', { speechModelPath: null }, /ASR model is required/],
+    ['speech_to_text', { speechTimeoutSeconds: 0 }, /timeouts must be positive/],
+    ['text_to_speech', { ttsMmprojPath: null }, /TTS projector is required/],
+    ['text_to_speech', { ttsMaxFrames: 0 }, /tts_max_frames must be positive/],
+    ['text_to_speech', { ttsTimeoutSeconds: 0 }, /timeouts must be positive/],
+  ]) {
+    await assert.rejects(qualifyPhaseCmd({ ...args, ...overrides, phase }, () => {}, noFetch), expected);
+  }
+});
+
+test('assembled attestation matches sequential qualification and takes the lower gate VM memory', async (t) => {
+  const context = shardFixture(t);
+  const { fixture, args, deps, inputs } = context;
+  const ttsMemory = 16759431168;
+  await runShards(context, ttsMemory);
+  let sequential;
+  await qualifyCmd({ ...args, outputAttestation: path.join(tmp, 'sequential.json') }, (text) => { sequential = text; }, {
+    ...deps, qualificationEnvironment: () => qualificationEnvironment({ total_memory_bytes: ttsMemory }),
+  });
+  let assembled;
+  await assembleAttestationCmd(inputs, (text) => { assembled = text; }, {
+    ...deps,
+    qualificationEnvironment: () => qualificationEnvironment({ total_memory_bytes: 16700000000, cpu_count: 8 }),
+  });
+  assert.equal(assembled, sequential);
+  assert.equal(fs.readFileSync(inputs.outputAttestation, 'utf8'), sequential);
+  const attestation = loadAttestationFile(inputs.outputAttestation);
+  assert.equal(fixture.verify(attestation).verified, true);
+  assert.equal(JSON.parse(assembled).qualification_environment.total_memory_bytes, ttsMemory);
+});
+
+test('assembly rejects swapped, unbound, noncanonical, and invalid qualification phases', async (t) => {
+  const context = shardFixture(t);
+  const { inputs, deps } = context;
+  await runShards(context, qualificationEnvironment().total_memory_bytes);
+  const speech = fs.readFileSync(inputs.speechPhase, 'utf8');
+  const tts = fs.readFileSync(inputs.ttsPhase, 'utf8');
+  const assemble = (overrides = {}, changedDeps = deps) =>
+    assembleAttestationCmd({ ...inputs, ...overrides }, () => {}, changedDeps);
+  await assert.rejects(assemble({ speechPhase: inputs.ttsPhase, ttsPhase: inputs.speechPhase }), /phase_name mismatch/);
+  await assert.rejects(assemble({ ttsPhase: inputs.speechPhase }), /phase_name mismatch/);
+  for (const [key, value] of [
+    ['schema_version', 2], ['phase_type', 'other'],
+    ['candidate_fingerprint', 'b'.repeat(64)], ['candidate_run_id', '1'], ['candidate_artifact_id', 8],
+    ['candidate_run_attempt', 2], ['bridge_source_sha', 'b'.repeat(40)],
+    ['harness_version', '5.6.0'], ['harness_source_sha256', 'b'.repeat(64)],
+    ['qualification_run_id', '1'], ['qualification_run_attempt', 2], ['qualification_source_sha', 'b'.repeat(40)],
+  ]) {
+    fs.writeFileSync(inputs.speechPhase, canonicalJson({ ...loadAttestationFile(inputs.speechPhase), [key]: value }));
+    await assert.rejects(assemble(), (error) => error instanceof ContractError && error.message.includes(key));
+    fs.writeFileSync(inputs.speechPhase, speech);
+  }
+  for (const [key, value] of [
+    ['runner_os', 'Windows'], ['runner_arch', 'ARM64'], ['cpu_count', 8], ['execution', 'self-hosted'],
+  ]) {
+    const record = loadAttestationFile(inputs.speechPhase);
+    record.qualification_environment[key] = value;
+    fs.writeFileSync(inputs.speechPhase, canonicalJson(record));
+    await assert.rejects(assemble(), (error) => error instanceof ContractError && error.message.includes(key));
+    fs.writeFileSync(inputs.speechPhase, speech);
+  }
+  await assert.rejects(assemble({}, { ...deps, qualificationEnvironment: () => qualificationEnvironment({ runner_arch: 'ARM64' }) }),
+    /runner_arch mismatch/);
+  for (const [bytes, error] of [
+    [speech.trimEnd(), /canonical serialization/],
+    [speech.replace(/^(\{\n)([^\n]+\n)([^\n]+\n)/u, '$1$3$2'), /canonical serialization/],
+    [speech.replace('{\n', '{\n  "schema_version": 1,\n'), /duplicate/i],
+    [' '.repeat(MAX_ATTESTATION_BYTES + 1), /bound/],
+    [Buffer.from([0x80]), /not UTF-8/],
+    [speech.replace('"total_ms": 40', '"total_ms": NaN'), /non-standard JSON/],
+  ]) {
+    fs.writeFileSync(inputs.speechPhase, bytes);
+    await assert.rejects(assemble(), (failure) => failure instanceof ContractError && error.test(failure.message));
+  }
+  fs.writeFileSync(inputs.speechPhase, speech);
+  for (const mutate of [
+    (record) => { record.phase.modes.pop(); },
+    (record) => { record.phase.modes[0].cold_transcript = 'wrong transcript'; },
+  ]) {
+    const record = loadAttestationFile(inputs.speechPhase);
+    mutate(record);
+    fs.writeFileSync(inputs.speechPhase, canonicalJson(record));
+    await assert.rejects(assemble(), ContractError);
+    fs.writeFileSync(inputs.speechPhase, speech);
+  }
+  const record = loadAttestationFile(inputs.ttsPhase);
+  record.phase.modes[0].rms = 0;
+  fs.writeFileSync(inputs.ttsPhase, canonicalJson(record));
+  await assert.rejects(assemble(), /rms must be a positive finite number/);
+  fs.writeFileSync(inputs.ttsPhase, tts);
+  assert.equal(fs.existsSync(inputs.outputAttestation), false);
 });

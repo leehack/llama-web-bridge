@@ -10,6 +10,7 @@ import os from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
 import { fileURLToPath } from 'node:url';
+import { runInNewContext } from 'node:vm';
 
 import { pyB64Decode, pyJson, pyJsonLoads, readPyText, resolvePath } from '../../scripts/smoke/support.mjs';
 import * as decisionSmoke from '../../scripts/smoke/decision.mjs';
@@ -20,6 +21,60 @@ const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../.
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'heavy-browser-smokes-test-'));
 process.on('exit', () => fs.rmSync(tmp, { recursive: true, force: true }));
 const sha256 = (bytes) => createHash('sha256').update(bytes).digest('hex');
+
+{
+  const generatingSamples = 136320;
+  const pcm = new Float32Array(140160).fill(0.125);
+  const sampleRate = 24000;
+  const channels = 1;
+  const output = { pcm, sampleRate, channels, sampleCount: pcm.length, framesGenerated: 73, truncated: false };
+  class BridgeWithShortWindow {
+    async loadModelFromUrl() {}
+    async loadMultimodalProjector() {}
+    async unloadMultimodalProjector() { this.unloaded = true; }
+    async dispose() {}
+    async getTextToSpeechCapabilities() {
+      return { supported: !this.unloaded, apiVersion: 1, sampleRate, channels, supportsIncrementalAudio: true };
+    }
+    getModelMetadata() { return {}; }
+    isGpuActive() { return false; }
+    getBackendName() { return 'CPU'; }
+    async synthesizeSpeech({ streamAudio, signal, onProgress, maxFrames }) {
+      const failIfAborted = () => {
+        if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+      };
+      failIfAborted();
+      if (streamAudio) {
+        const chunk = (state, start, end) => {
+          onProgress({ state, sampleOffset: start, pcm: pcm.subarray(start, end), sampleRate, channels });
+          failIfAborted();
+        };
+        if (maxFrames !== 1) chunk(2, 0, generatingSamples);
+        chunk(3, maxFrames === 1 ? 0 : generatingSamples);
+        return { ...output, pcm: new Float32Array() };
+      }
+      onProgress?.({ state: 2, framesGenerated: 1 });
+      failIfAborted();
+      onProgress?.({ state: 3 });
+      return output;
+    }
+  }
+  const html = ttsSmoke.renderHarness({
+    prompt: 'Hi', modelSha256: 'm', mmprojSha256: 'p', speakerAudioSha256: null, memoryModes: ['wasm64'],
+    runtimeModes: ['direct'], maxFrames: 96, gpuLayers: 0, testCancellation: true, testStreaming: true,
+  });
+  const page = html.match(/<script type="module">([\s\S]*?)<\/script>/u)[1];
+  const window = { crossOriginIsolated: true, LlamaWebGpuBridge: BridgeWithShortWindow };
+  const script = page.replace("await import('/llama_webgpu_bridge.js')", '({})');
+  await runInNewContext(script, {
+    AbortController, DOMException, Float32Array, btoa, crypto, performance, window,
+    document: { getElementById: () => ({}) },
+    console: { log() {} },
+  });
+  assert.equal(window.__smokeStage, 'wasm64:direct:synthesize-streamed');
+  assert.equal(window.__smokeResult.ok, false);
+  assert.match(window.__smokeResult.error, /unexpected generating PCM window length: 136320/u);
+}
 
 // --- Speech fixture -------------------------------------------------------------
 
@@ -258,6 +313,8 @@ const sha256 = (bytes) => createHash('sha256').update(bytes).digest('hex');
   assert.ok(tts.includes('          if (false) {\n'));
   assert.ok(tts.includes('      speakerAudioSha256: null,\n'));
   assert.ok(tts.includes('    console.log(`tts-smoke-stage:${stage}`);\n'));
+  assert.match(tts, /const streamCancelRequest = streamWindowChunkTested\s*\? request\s*:\s*\{ \.\.\.request, text: 'Ready.', maxFrames: 1, seed: 4 \}/u);
+  assert.match(tts, /synthesizeSpeech\(\{\s*\.\.\.streamCancelRequest,/u);
   const fixtureFile = path.join(tmp, 'page-fixture.json');
   fs.writeFileSync(fixtureFile, '{"specialTokens": {"cls": 1, "sep": 2, "mask": 3}, "rows": [{"question": {"type": "choice"}, '
     + '"ids": [1, 2], "markers": [1, 1, 1], "rawLogits": [1.0, -0.0, 5e-05], "rawActLogits": [3]}]}');
