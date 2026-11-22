@@ -341,7 +341,7 @@ for (const error of [transfer, ...stagingErrors, timeout]) {
   }
 }
 
-async function runCoreRetirementCase(t, nGpuLayers, { truncateProjector }) {
+async function runCoreRetirementCase(t, nGpuLayers, { truncateProjector, initialSetup = false, warmup = false }) {
   const runtime = LlamaWebGpuBridgeRuntime.prototype;
   const layerHistory = [];
   const wire = [];
@@ -356,12 +356,17 @@ async function runCoreRetirementCase(t, nGpuLayers, { truncateProjector }) {
     return 1;
   });
   t.mock.method(runtime, 'createCompletion', async function () {
-    if (++completionCalls === 1) {
+    if (++completionCalls === 1 && !initialSetup) {
       if (truncateProjector) return '';
       this._core.ccall('llamadart_webgpu_begin_generation', 'number', [], []);
     }
     return 'generated';
   });
+  if (initialSetup) {
+    t.mock.method(runtime, 'tokenize', async function () {
+      this._core.ccall('llamadart_webgpu_tokenize_to_json', 'string', [], []);
+    });
+  }
 
   t.mock.method(globalThis, 'fetch', async (url) => {
     assert.equal(String(url), PROJECTOR);
@@ -384,7 +389,9 @@ async function runCoreRetirementCase(t, nGpuLayers, { truncateProjector }) {
       if (name === 'llamadart_webgpu_js_model_fs_mount_id' || name === 'llamadart_webgpu_js_model_fs_open_direct') return 1;
       if (
         (name === 'llamadart_webgpu_unmount_js_model_fs' && truncateProjector && projectorGets === 2)
+        || (name === 'llamadart_webgpu_mmproj_load' && initialSetup && !truncateProjector && projectorGets === 2)
         || name === 'llamadart_webgpu_begin_generation'
+        || name === 'llamadart_webgpu_tokenize_to_json'
       ) {
         nativeTraps += 1;
         throw new WebAssembly.RuntimeError('memory access out of bounds');
@@ -400,15 +407,22 @@ async function runCoreRetirementCase(t, nGpuLayers, { truncateProjector }) {
     const chooseCpuRerun = t.mock.method(bridge, '_rerunOnCpuAfterCoreAbort');
     await bridge.loadModelFromUrl(MODEL, { nGpuLayers });
     await bridge.loadMultimodalProjector(PROJECTOR);
-    const outcome = await bridge.createCompletion('Describe the image.', { parts }).then(
+    if (initialSetup) {
+      await assert.rejects(bridge.tokenize('test'), /memory access out of bounds/);
+      assert.equal(bridge._coreRetirements, 1);
+      assert.equal(workers.length, 2);
+      assert.equal(workers[0].terminated, 1);
+    }
+    const outcome = await bridge.createCompletion('Describe the image.', { parts, warmup }).then(
       (value) => ({ value }),
       ({ name, code, message }) => ({ error: { name, code, message } }),
     );
-    assert.equal(nativeTraps, 1);
-    assert.equal(bridge._coreRetirements, 1);
+    const retirements = initialSetup ? 2 : 1;
+    assert.equal(nativeTraps, retirements);
+    assert.equal(bridge._coreRetirements, retirements);
     assert.equal(bridge._runtime, null);
     assert.equal(bridge._workerProxy._worker, workers.at(-1));
-    assert.deepEqual(workers.map((worker) => worker.terminated), truncateProjector ? [1, 1, 0] : [1, 0]);
+    assert.deepEqual(workers.map((worker) => worker.terminated), initialSetup || truncateProjector ? [1, 1, 0] : [1, 0]);
     return {
       ...outcome,
       wire,
@@ -422,6 +436,46 @@ async function runCoreRetirementCase(t, nGpuLayers, { truncateProjector }) {
 }
 
 for (const [nGpuLayers, mode] of [[0, 'CPU'], [1, 'non-CPU']]) {
+  for (const warmup of [false, true]) {
+    test(`core retirement: ${mode} ${warmup ? 'warmup skips' : 'surfaces'} a typed projector transfer error during initial setup`, async (t) => {
+      const outcome = warmup
+        ? { value: '' }
+        : { error: { name: transfer.name, code: transfer.code, message: transfer.message } };
+      assert.deepEqual(await runCoreRetirementCase(t, nGpuLayers, {
+        truncateProjector: true,
+        initialSetup: true,
+        warmup,
+      }), {
+        ...outcome,
+        wire: [['core-retired', undefined], ['error', undefined], ['core-retired', undefined], ['error', transfer.code]],
+        projectorGets: 2,
+        completionCalls: 0,
+        layerHistory: [nGpuLayers, nGpuLayers],
+        rememberedGpuLayers: nGpuLayers,
+        cpuRerunDecisions: 0,
+      });
+    });
+  }
+
+  test(`core retirement: ${mode} preserves generic initial setup trap recovery`, async (t) => {
+    const cpu = nGpuLayers === 0;
+    const outcome = cpu
+      ? { error: { name: 'Error', code: undefined, message: 'memory access out of bounds' } }
+      : { value: 'generated' };
+    assert.deepEqual(await runCoreRetirementCase(t, nGpuLayers, {
+      truncateProjector: false,
+      initialSetup: true,
+    }), {
+      ...outcome,
+      wire: [['core-retired', undefined], ['error', undefined], ['core-retired', undefined], ['error', undefined]],
+      projectorGets: cpu ? 2 : 3,
+      completionCalls: cpu ? 0 : 1,
+      layerHistory: cpu ? [0, 0] : [nGpuLayers, nGpuLayers, 0],
+      rememberedGpuLayers: 0,
+      cpuRerunDecisions: 1,
+    });
+  });
+
   test(`core retirement: ${mode} surfaces a typed projector transfer error after an empty response`, async (t) => {
     assert.deepEqual(await runCoreRetirementCase(t, nGpuLayers, { truncateProjector: true }), {
       error: { name: transfer.name, code: transfer.code, message: transfer.message },

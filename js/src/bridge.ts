@@ -2286,7 +2286,8 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
           );
           return '';
         }
-        if (isCoreRetiredError(error)) {
+        const nonRetryable = this._isNonRetryableLoadError(error);
+        if (!nonRetryable && isCoreRetiredError(error)) {
           return this._rerunOnCpuAfterCoreAbort(
             error,
             () => this._createCompletionUnlocked(prompt, options),
@@ -2297,7 +2298,7 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
           `llamadart: unable to prepare multimodal worker CPU mode (${reason}).`,
         );
 
-        if (this._isNonRetryableLoadError(error)) {
+        if (nonRetryable) {
           throw error;
         }
         if (this._isCpuModelMode()) {
