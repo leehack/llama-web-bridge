@@ -126,8 +126,10 @@ runtime when available, and releases its JS-backed staging data.
 - In worker mode, the bridge replaces the worker and restores the remembered
   model on the next call that needs it. If a new load aborts, the previous
   model remains the one to restore. LoRA handles with a retained source remain
-  valid. Media completion and speech synthesis on a GPU-loaded model retry
-  once on the replacement worker with a CPU-only restore.
+  valid. A regular media completion or speech synthesis on a GPU-loaded model
+  can retry once on the replacement worker with a CPU-only restore. See
+  [Text generation](#text-generation) for the recovery rules when a draft reload
+  aborts the core during multimodal completion.
 
 Decision heads stay tied to their original core and report `head-lost` after
 retirement. State file paths also belong to that core. Applications can keep
@@ -587,10 +589,12 @@ If a remembered [draft model](#draft-models) fails to reload after a worker
 restart with a load error, including either typed error above, the bridge warns,
 forgets the draft and continues setup without it. A
 [native core abort](#native-core-aborts) during draft reload also clears the
-remembered draft and replaces the worker. During initial setup, a regular
-completion rejects on CPU or retries once with a CPU-only restore on GPU. Warmup
-returns `''`. During an empty-response retry, the replacement worker restores the
-model with the existing backend and continues the retry. If
+remembered draft and replaces the worker. During initial multimodal worker
+setup, a regular completion rejects on CPU or retries once with a CPU-only
+restore on GPU. A multimodal warmup returns `''`. A text-only completion rejects
+if the draft reload aborts the core, including during warmup. During an
+empty-response retry, the replacement worker restores the model with the
+existing backend and continues the retry. If
 [cancellation](#cancellation-while-queued) interrupts the draft reload, the
 completion rejects with `AbortError` and the bridge keeps the remembered draft.
 
