@@ -581,12 +581,18 @@ When a multimodal worker reports `ModelTransferLengthError` or an active
 `ModelStagingError` during setup, restore, or completion, `createCompletion()`
 rejects with that typed error. The error triggers neither a worker restart nor a
 main-thread fallback. Warmup calls (`warmup: true`) skip these failures and return
-`''` without extra restarts. An optional draft model is the exception: when its
-reload after a worker restart fails with a load error, including these typed
-errors, the bridge warns, forgets the draft and continues the completion (see
-[Draft models](#draft-models)). A native core abort or a cancelled `signal`
-during that reload instead follows [Native core aborts](#native-core-aborts) and
-[Cancellation while queued](#cancellation-while-queued).
+`''` without extra restarts.
+
+If a remembered [draft model](#draft-models) fails to reload after a worker
+restart with a load error, including either typed error above, the bridge warns,
+forgets the draft and continues setup without it. A
+[native core abort](#native-core-aborts) during draft reload also clears the
+remembered draft and replaces the worker. During initial setup, a regular
+completion rejects on CPU or retries once with a CPU-only restore on GPU. Warmup
+returns `''`. During an empty-response retry, the replacement worker restores the
+model with the existing backend and continues the retry. If
+[cancellation](#cancellation-while-queued) interrupts the draft reload, the
+completion rejects with `AbortError` and the bridge keeps the remembered draft.
 
 `thinkingBudget.naturalEndTags` is the complete ordered list of natural ends,
 including any normal close. Supply a non-empty array to use this option, which
@@ -768,9 +774,10 @@ and `force`, as `loadModelFromUrl()` does. Resolves to `{ architecture,
 strategy? }`: the GGUF's `general.architecture`, and `draft-dflash` or
 `draft-dspark` for a DFlash-architecture draft. An EAGLE3 or DFlash draft built
 for a different hidden size than the loaded model's rejects, naming both sizes.
-A target model load unloads the
-draft; the bridge reloads it after it reloads the target on its own, such as
-after a worker restart, and warns and forgets it when that reload fails.
+Loading a new target model unloads the draft. When the bridge restores the
+same target model, it also reloads the remembered draft. A load error or native
+core abort during that reload makes the bridge warn and forget the draft.
+Cancellation preserves the remembered draft.
 
 The draft is staged in the WASM heap before it loads. When the server reports
 the draft's size and it would not fit in the memory left, the call rejects
