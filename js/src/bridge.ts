@@ -2276,7 +2276,7 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
         if (!this._workerProxy) {
           await this._replaceWorkerProxyForMultimodalCpuMode();
         }
-        await this._ensureWorkerMultimodalCpuMode();
+        await this._ensureWorkerMultimodalCpuMode({ nonRetryableTyped: true });
       } catch (error) {
         this._throwIfOperationCancelled(error, 'Generation was cancelled.');
         const reason = serializeWorkerError(error);
@@ -2286,7 +2286,8 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
           );
           return '';
         }
-        if (isCoreRetiredError(error)) {
+        const nonRetryable = this._isNonRetryableLoadError(error);
+        if (!nonRetryable && isCoreRetiredError(error)) {
           return this._rerunOnCpuAfterCoreAbort(
             error,
             () => this._createCompletionUnlocked(prompt, options),
@@ -2297,7 +2298,7 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
           `llamadart: unable to prepare multimodal worker CPU mode (${reason}).`,
         );
 
-        if (this._isNonRecoverableStagingError(error)) {
+        if (nonRetryable) {
           throw error;
         }
         if (this._isCpuModelMode()) {
@@ -2428,8 +2429,11 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
             );
             try {
               await this._replaceWorkerProxyForMultimodalCpuMode();
-              await this._ensureWorkerMultimodalCpuMode();
+              await this._ensureWorkerMultimodalCpuMode({ nonRetryableTyped: true });
             } catch (retrySetupError) {
+              if (this._isNonRetryableLoadError(retrySetupError)) {
+                throw retrySetupError;
+              }
               this._emitBridgeWarn(
                 `llamadart: multimodal empty-response retry setup failed (${serializeWorkerError(retrySetupError)}).`,
               );
@@ -2465,6 +2469,9 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
           );
           return '';
         }
+        if (this._isNonRetryableLoadError(error)) {
+          throw error;
+        }
         if (isCoreRetiredError(error)) {
           return this._rerunOnCpuAfterCoreAbort(
             error,
@@ -2472,9 +2479,6 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
           );
         }
 
-        if (this._isNonRecoverableStagingError(error)) {
-          throw error;
-        }
         if (this._isCpuModelMode()) {
           this._emitBridgeWarn(
             `llamadart: CPU multimodal worker request failed (${reason}); skipping main-thread fallback.`,

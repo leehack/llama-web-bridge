@@ -126,7 +126,7 @@ runtime when available, and releases its JS-backed staging data.
 - In worker mode, the bridge replaces the worker and restores the remembered
   model on the next call that needs it. If a new load aborts, the previous
   model remains the one to restore. LoRA handles with a retained source remain
-  valid. Media completion and speech synthesis on a GPU-loaded model retry
+  valid. Media completion and speech synthesis on a GPU-loaded model can retry
   once on the replacement worker with a CPU-only restore.
 
 Decision heads stay tied to their original core and report `head-lost` after
@@ -577,6 +577,15 @@ Common `options` keys:
 | `mediaMaxPredict` | Cap for multimodal generation token count. |
 | `speculativeDecoding` | `{ strategies, ... }`: llama.cpp speculative decoding; see [Speculative decoding](#speculative-decoding). |
 
+When multimodal worker setup, restore, or completion fails with
+`ModelTransferLengthError` or a `ModelStagingError` while JS-backed staging is
+enabled or automatic, a regular `createCompletion()` rejects with the typed
+error. These errors do not trigger a recovery retry or a main-thread replay. A
+multimodal warmup (`warmup: true`) returns `''` instead. If the failure also
+retires the native core, the bridge still replaces that worker when possible.
+This applies to the target model and projector; a remembered draft model is
+reloaded on a best-effort basis, as described under [Draft models](#draft-models).
+
 `thinkingBudget.naturalEndTags` is the complete ordered list of natural ends,
 including any normal close. Supply a non-empty array to use this option, which
 requires `thinkingBudgetMultiEnd`. By default only `endTag` closes the block.
@@ -757,9 +766,13 @@ and `force`, as `loadModelFromUrl()` does. Resolves to `{ architecture,
 strategy? }`: the GGUF's `general.architecture`, and `draft-dflash` or
 `draft-dspark` for a DFlash-architecture draft. An EAGLE3 or DFlash draft built
 for a different hidden size than the loaded model's rejects, naming both sizes.
-A target model load unloads the
-draft; the bridge reloads it after it reloads the target on its own, such as
-after a worker restart, and warns and forgets it when that reload fails.
+Loading a new target model unloads the draft. When the bridge restores the
+remembered target on a replacement worker or during main-thread fallback, it
+tries to reload the remembered draft. A draft reload failure makes the bridge
+warn and forget the draft unless it is treated as cancellation. Cancellation
+preserves the draft while the target remains remembered. The runtime also tries
+to reload its draft during wasm64 generation CPU recovery and records
+`generation_recovery_draft_reload_failed` if that reload fails.
 
 The draft is staged in the WASM heap before it loads. When the server reports
 the draft's size and it would not fit in the memory left, the call rejects
