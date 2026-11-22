@@ -305,6 +305,13 @@ the flag; through v0.1.52 their worker mode rejects a function option with a
 `true` when the bridge exposes `isModelCached()` and accepts `useCache` in
 `loadMultimodalProjector()`. Earlier bridges lack the flag.
 
+#### `LlamaWebGpuBridge.supportsJsBackedModelStaging`
+
+`true` when the bridge honors `jsBackedModelStaging`, checks worker support
+before dispatching an explicit staging load, and validates the core ABI before
+staging. Bridges before v0.1.92 lack the flag. Bridges before v0.1.87 ignore
+the option.
+
 ## Model loading and cache helpers
 
 When text generation on wasm64/WebGPU qualifies for CPU recovery, the reload
@@ -1544,6 +1551,10 @@ uses standard WASMFS staging under `/models` or `/mmproj`. Set
 `jsBackedModelStaging: false` to opt out on any browser or `true` to require
 a staging-capable core.
 
+If a mismatched worker script omits `supportsJsBackedModelStaging` from its
+ready message, explicit `jsBackedModelStaging: true` model and projector loads
+reject with `ModelStagingError` (`MODEL_STAGING_UNSUPPORTED`) before dispatch.
+
 Heap-resident staging requires API version 4 or later and a growable core
 with heap staging support. It needs a single model file of known decoded
 size, an effective GPU layer count of 0 or 1 after any Safari cap, mmap
@@ -1570,7 +1581,7 @@ on WebKit. Use its `code` to distinguish these cases.
 | Code | Meaning |
 | --- | --- |
 | `MODEL_STAGING_ALLOCATION_FAILED` | JS memory allocation failed during staging. |
-| `MODEL_STAGING_UNSUPPORTED` | The selected core lacks a required export or supported API version. |
+| `MODEL_STAGING_UNSUPPORTED` | The worker lacks the capability flag for an explicit staging load, or the selected core lacks a required export or supported API version. |
 | `MODEL_STAGING_MOUNT_FAILED` | The bridge could not allocate or verify its private staging mount, or lost ownership during the load. |
 | `MODEL_TENSOR_SIZE_LIMIT_EXCEEDED` | The single-file or split GGUF tensor payload exceeds the wasm32 4 GiB address bound. |
 

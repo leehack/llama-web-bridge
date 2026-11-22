@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Add `LlamaWebGpuBridge.supportsJsBackedModelStaging`. Explicit JS-backed model and projector loads reject with `MODEL_STAGING_UNSUPPORTED` when the worker lacks the staging capability flag.
+
 - Give npm registry metadata and tarball readback a shared 30-minute retry window after publishing. Fail immediately on digest mismatches and disable retries on the publish request. (#319)
 
 - Apply the one-layer cap to omitted and negative GPU layer counts on Apple Safari before 27. The cap is recomputed for each load, and `safariMaxGpuLayers: Infinity` opts out. (#270)

@@ -7425,6 +7425,7 @@ var BridgeWorkerProxy = class {
     this._stopCspWatch = null;
     this.startMode = "direct";
     this._supportsIncrementalAudio = false;
+    this._supportsJsBackedModelStaging = false;
     this.coreRetired = false;
     let workerInitError = null;
     const moduleCandidates = [moduleUrl];
@@ -7482,6 +7483,7 @@ var BridgeWorkerProxy = class {
       const type = message.type;
       if (type === "ready") {
         this._supportsIncrementalAudio = message.supportsIncrementalAudio === true;
+        this._supportsJsBackedModelStaging = message.supportsJsBackedModelStaging === true;
         this._clearReadyTimeout();
         this._endCspWatch();
         this._readyResolve?.();
@@ -7539,6 +7541,12 @@ var BridgeWorkerProxy = class {
     await this._ready;
     if (method === "synthesizeSpeech" && args[0]?.streamAudio === true && !this._supportsIncrementalAudio) {
       throw new TextToSpeechStreamingUnsupportedError();
+    }
+    if ((method === "loadModelFromUrl" || method === "loadMultimodalProjector") && this._config.jsBackedModelStaging === true && !this._supportsJsBackedModelStaging) {
+      throw new ModelStagingError(
+        "MODEL_STAGING_UNSUPPORTED",
+        "The worker did not declare supportsJsBackedModelStaging. The bridge and worker scripts must come from the same release."
+      );
     }
     const id = this._nextId++;
     const timeoutMs = this._resolveRequestTimeoutMs(method, args);
@@ -7705,6 +7713,7 @@ var LlamaWebGpuBridge = class {
   static supportsSafariAdaptiveGpu = LlamaWebGpuBridgeRuntime.supportsSafariAdaptiveGpu === true;
   static supportsCompletionUsage = true;
   static supportsModelCacheQuery = true;
+  static supportsJsBackedModelStaging = true;
   constructor(config = {}) {
     this._config = config;
     this._runtime = null;
@@ -10799,7 +10808,11 @@ function installBridgeWorkerHost() {
           disableWorker: true
         });
         bridge._onCoreRetired = () => self.postMessage({ type: "core-retired" });
-        self.postMessage({ type: "ready", supportsIncrementalAudio: true });
+        self.postMessage({
+          type: "ready",
+          supportsIncrementalAudio: true,
+          supportsJsBackedModelStaging: true
+        });
         return;
       }
       if (type !== "call") {
