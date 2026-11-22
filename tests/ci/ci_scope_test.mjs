@@ -13,6 +13,8 @@ import { parse as parseYaml } from 'yaml';
 import { changedPaths, nativeRequired, validateResults } from '../../scripts/ci/ci_scope.mjs';
 
 const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
+const smokeJobs = ['smoke-core', 'smoke-resume', 'smoke-multimodal', 'smoke-grammar-qwen'];
+const nativeJobs = ['build-core', ...smokeJobs];
 
 // Documentation and tooling-only paths skip the native lane; everything else,
 // including unknown paths, keeps it.
@@ -93,15 +95,18 @@ const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../.
   for (const selected of ['true', 'false']) {
     for (const changes of states) {
       for (const checks of states) {
-        for (const build of states) {
-          const needs = {
-            changes: { result: changes, outputs: { native: selected } },
-            checks: { result: checks },
-            'build-webgpu-bridge': { result: build },
-          };
-          const expected = changes === 'success' && checks === 'success'
-            && build === (selected === 'true' ? 'success' : 'skipped');
-          assert.equal(validateResults(needs), expected, JSON.stringify(needs));
+        for (const job of nativeJobs) {
+          for (const result of states) {
+            const wanted = selected === 'true' ? 'success' : 'skipped';
+            const needs = {
+              changes: { result: changes, outputs: { native: selected } },
+              checks: { result: checks },
+              ...Object.fromEntries(nativeJobs.map((name) => [name, { result: wanted }])),
+              [job]: { result },
+            };
+            const expected = changes === 'success' && checks === 'success' && result === wanted;
+            assert.equal(validateResults(needs), expected, JSON.stringify(needs));
+          }
         }
       }
     }
@@ -154,14 +159,21 @@ const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../.
 {
   const workflow = parseYaml(readFileSync(path.join(rootDir, '.github/workflows/ci.yml'), 'utf8'));
   const { jobs } = workflow;
-  const build = jobs['build-webgpu-bridge'];
+  const build = jobs['build-core'];
   const { checks } = jobs;
-  assert.equal(build.name, 'Build WebGPU Bridge (WASM)');
-  assert.equal('strategy' in build, false);
-  assert.deepEqual(build.needs, ['changes', 'checks']);
-  assert.equal(build.if, "needs.changes.outputs.native == 'true'");
+  assert.ok(build, 'CI builds the cores in a matrix');
+  assert.deepEqual(build.strategy.matrix, { variant: ['wasm32', 'wasm64', 'wasm32_st', 'wasm64_st'] });
+  assert.equal(build.strategy['fail-fast'], true);
+  assert.deepEqual(build.needs, ['changes']);
+  for (const name of nativeJobs) {
+    assert.equal(jobs[name].if, "needs.changes.outputs.native == 'true'", name);
+  }
+  for (const name of smokeJobs) {
+    assert.deepEqual(jobs[name].needs, ['changes', 'build-core'], name);
+  }
+  assert.equal(jobs['ci-result'].name, 'CI validation');
   assert.equal(jobs['ci-result'].if, 'always()');
-  assert.deepEqual(new Set(jobs['ci-result'].needs), new Set(['changes', 'checks', 'build-webgpu-bridge']));
+  assert.deepEqual(new Set(jobs['ci-result'].needs), new Set(['changes', 'checks', ...nativeJobs]));
   assert.ok(jobs['ci-result'].steps.some((step) => step.run === 'node scripts/ci/ci_scope.mjs --check-results'));
   assert.ok(jobs.changes.steps.some((step) => step.run === 'node scripts/ci/ci_scope.mjs'));
   assert.equal(
@@ -181,31 +193,34 @@ const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../.
     'state-persistence-smoke-artifacts',
     'multimodal-smoke-artifacts',
     'grammar-smoke-artifacts',
+    'grammar-smoke-artifacts-qwen-${{ matrix.memory }}-${{ matrix.runtime }}',
     'next-token-scores-smoke-artifacts',
     'speculative-smoke-artifacts',
     'webgpu-bridge-dist',
   ];
-  const uploadNames = build.steps
+  const uploadNames = smokeJobs.flatMap((name) => jobs[name].steps)
     .filter((step) => step.uses?.startsWith('actions/upload-artifact@'))
     .map((step) => step.with.name);
   assert.deepEqual(uploadNames.sort(), [...pinnedArtifacts].sort());
   const buildSteps = Object.fromEntries(build.steps.map((step) => [step.name, step]));
-  for (const name of ['Run state persistence browser smoke', 'Run multimodal browser smoke', 'Build bridge artifacts', 'Verify outputs']) {
-    assert.equal('if' in buildSteps[name], false, name);
-  }
+  const coreCache = buildSteps['Restore built core'];
+  assert.match(coreCache.with.key, /^webgpu-core-v1-/);
+  assert.equal('restore-keys' in coreCache.with, false);
+  assert.equal(coreCache.with.path, '${{ runner.temp }}/webgpu_bridge_dist');
   const cache = buildSteps['Restore compiler objects'].with;
+  assert.match(cache.key, /^webgpu-ccache-v3-/);
+  assert.doesNotMatch(cache.key, /github\.sha/);
   assert.match(buildSteps['Restore compiler objects'].uses, /^actions\/cache\/restore@/);
   const save = buildSteps['Save compiler objects'];
-  assert.equal(save.if, "github.event_name == 'push' && github.ref == 'refs/heads/main'");
+  assert.match(save.if, /github\.event_name == 'push' && github\.ref == 'refs\/heads\/main'/);
+  assert.match(save.if, /steps\.ccache\.outputs\.cache-hit != 'true'/);
   assert.equal(save.with.path, cache.path);
   assert.equal(save.with.key, '${{ steps.ccache.outputs.cache-primary-key }}');
   const order = build.steps.map((step) => step.name);
   assert.ok(order.indexOf('Build bridge artifacts') < order.indexOf('Save compiler objects'));
-  assert.ok(order.indexOf('Save compiler objects') < order.indexOf('Verify outputs'));
   assert.equal(cache.path, '${{ runner.temp }}/webgpu-ccache');
-  for (const token of ['runner.arch', 'env.EMSCRIPTEN_VERSION', 'steps.compiler-cache.outputs.upstream', 'hashFiles']) {
+  for (const token of ['runner.arch', 'matrix.variant', 'env.EMSCRIPTEN_VERSION', 'steps.compiler-cache.outputs.upstream', 'hashFiles']) {
     assert.ok(cache.key.includes(token), token);
-    assert.ok(cache['restore-keys'].includes(token), token);
   }
   assert.equal(buildSteps['Build bridge artifacts'].env.EM_COMPILER_WRAPPER, 'ccache');
   assert.ok(workflow.concurrency['cancel-in-progress'].includes("github.event_name == 'pull_request'"));

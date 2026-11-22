@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
+import { test } from 'node:test';
+import { parse as parseYaml, stringify as stringifyYaml } from 'yaml';
 
 import { EXPECTED_MODEL_PINS as QUALIFICATION_MODEL_PINS } from '../../scripts/release/qualification.mjs';
 import {
@@ -130,6 +132,47 @@ const DOCUMENTED_ROLES = [
 ];
 const CI_PATH = '.github/workflows/ci.yml';
 const CANDIDATE_PATH = '.github/workflows/bridge_candidate.yml';
+
+for (const [name, mutate, message] of [
+  ['core cache restore keys', (jobs) => { jobs['build-core'].steps.find((step) => step.id === 'core-cache').with['restore-keys'] = 'webgpu-core-v1-'; }, 'exact-key core cache'],
+  ['missing core cache source hash', (jobs) => {
+    const cache = jobs['build-core'].steps.find((step) => step.id === 'core-cache').with;
+    cache.key = cache.key.replace("'src/**', ", '');
+  }, 'exact-key core cache'],
+  ['missing wasm64_st build', (jobs) => { jobs['build-core'].strategy.matrix.variant.pop(); }, 'four core build variants'],
+  ['missing Qwen runtime cell', (jobs) => {
+    jobs['smoke-grammar-qwen'].strategy.matrix.exclude = [{ memory: 'wasm64', runtime: 'direct' }];
+  }, 'four Qwen grammar cells'],
+]) {
+  test(`CI reliability rejects ${name}`, () => {
+    const workflow = parseYaml(read(CI_PATH));
+    mutate(workflow.jobs);
+    assertRejected(collectRepositoryErrors({ [CI_PATH]: stringifyYaml(workflow) }), message);
+  });
+}
+
+for (const guarded of [{ if: false }, { 'continue-on-error': true }]) {
+  test(`CI reliability rejects ${Object.keys(guarded)[0]} on any smoke step`, () => {
+    const workflow = parseYaml(read(CI_PATH));
+    for (const name of ['smoke-core', 'smoke-resume', 'smoke-multimodal', 'smoke-grammar-qwen']) {
+      const smokes = workflow.jobs[name].steps.filter((step) => /node (?:scripts\/smoke\/|--test tests\/bridge\/)/.test(step.run ?? ''));
+      assert.ok(smokes.length, name);
+      for (const step of smokes) {
+        Object.assign(step, guarded);
+        assertRejected(collectRepositoryErrors({ [CI_PATH]: stringifyYaml(workflow) }), 'unconditionally without continue-on-error');
+        delete step[Object.keys(guarded)[0]];
+      }
+    }
+  });
+}
+
+for (const prefix of ['webgpu-ccache-v3-', 'webgpu-core-v1-']) {
+  test(`CI reliability rejects ${prefix} in the candidate`, () => {
+    const candidate = parseYaml(read(CANDIDATE_PATH));
+    candidate.env = { ...candidate.env, CI_CACHE_KEY: `${prefix}test` };
+    assertRejected(collectRepositoryErrors({ [CANDIDATE_PATH]: stringifyYaml(candidate) }), 'must never reference CI core or compiler caches');
+  });
+}
 const QUALIFICATION_PATH = '.github/workflows/bridge_qualification.yml';
 
 function workflow(roles, { urls = {}, pins = {} } = {}) {
@@ -604,22 +647,22 @@ assertRejected(validatePublicationPatContract('jobs: [unterminated', EXPECTED_ST
     // Single-thread build/smoke gates in CI, candidate and publish excludes.
     [CI_PATH, '      - name: Run single-thread state persistence browser smoke\n        env:\n          BRIDGE_DIST_DIR: ${{ runner.temp }}/webgpu_bridge_dist\n        run: node scripts/smoke/state_persistence.mjs --threading single\n',
       '',
-      'job build-webgpu-bridge must run "node scripts/smoke/state_persistence.mjs --threading single" unconditionally without continue-on-error'],
+      'job smoke-core must run "node scripts/smoke/state_persistence.mjs --threading single" unconditionally without continue-on-error'],
     [CI_PATH, '      - name: Run single-thread memory64 state persistence browser smoke\n        env:\n          BRIDGE_DIST_DIR: ${{ runner.temp }}/webgpu_bridge_dist\n        run: node scripts/smoke/state_persistence.mjs --threading single --memory-mode wasm64\n',
       '',
-      'job build-webgpu-bridge must run "node scripts/smoke/state_persistence.mjs --threading single --memory-mode wasm64" unconditionally without continue-on-error'],
+      'job smoke-core must run "node scripts/smoke/state_persistence.mjs --threading single --memory-mode wasm64" unconditionally without continue-on-error'],
     [CI_PATH, '        run: node scripts/smoke/state_persistence.mjs --threading single\n',
       '        if: false\n        run: node scripts/smoke/state_persistence.mjs --threading single\n',
-      'job build-webgpu-bridge must run "node scripts/smoke/state_persistence.mjs --threading single" unconditionally without continue-on-error'],
+      'job smoke-core must run "node scripts/smoke/state_persistence.mjs --threading single" unconditionally without continue-on-error'],
     [CI_PATH, '        run: node scripts/smoke/state_persistence.mjs --threading single --memory-mode wasm64\n',
       '        if: false\n        run: node scripts/smoke/state_persistence.mjs --threading single --memory-mode wasm64\n',
-      'job build-webgpu-bridge must run "node scripts/smoke/state_persistence.mjs --threading single --memory-mode wasm64" unconditionally without continue-on-error'],
+      'job smoke-core must run "node scripts/smoke/state_persistence.mjs --threading single --memory-mode wasm64" unconditionally without continue-on-error'],
     [CI_PATH, '        run: node scripts/smoke/state_persistence.mjs --threading single\n',
       '        continue-on-error: true\n        run: node scripts/smoke/state_persistence.mjs --threading single\n',
-      'job build-webgpu-bridge must run "node scripts/smoke/state_persistence.mjs --threading single" unconditionally without continue-on-error'],
+      'job smoke-core must run "node scripts/smoke/state_persistence.mjs --threading single" unconditionally without continue-on-error'],
     [CI_PATH, '        run: node scripts/smoke/state_persistence.mjs --threading single --memory-mode wasm64\n',
       '        continue-on-error: true\n        run: node scripts/smoke/state_persistence.mjs --threading single --memory-mode wasm64\n',
-      'job build-webgpu-bridge must run "node scripts/smoke/state_persistence.mjs --threading single --memory-mode wasm64" unconditionally without continue-on-error'],
+      'job smoke-core must run "node scripts/smoke/state_persistence.mjs --threading single --memory-mode wasm64" unconditionally without continue-on-error'],
     [CANDIDATE_PATH, '          WEBGPU_BRIDGE_BUILD_SINGLE_THREAD: 1\n', '',
       'must build the memory64 and single-thread cores'],
     [CANDIDATE_PATH, '        id: state_st_gate\n', '        id: state_st_gate_renamed\n',
@@ -634,34 +677,34 @@ assertRejected(validatePublicationPatContract('jobs: [unterminated', EXPECTED_ST
       .map((flags) => {
         const command = `node scripts/smoke/resume_integrity.mjs --baseline-dist-dir "$BRIDGE_DIST_DIR"${flags}`;
         return [CI_PATH, `        run: ${command}\n`, `        if: false\n        run: ${command}\n`,
-          `job build-webgpu-bridge must run "${command}" unconditionally without continue-on-error`];
+          `job smoke-resume must run "${command}" unconditionally without continue-on-error`];
       }),
     [CI_PATH, '        run: node scripts/smoke/cross_origin_assets.mjs\n',
       '        if: false\n        run: node scripts/smoke/cross_origin_assets.mjs\n',
-      'job build-webgpu-bridge must run "node scripts/smoke/cross_origin_assets.mjs" unconditionally without continue-on-error'],
+      'job smoke-core must run "node scripts/smoke/cross_origin_assets.mjs" unconditionally without continue-on-error'],
     [CI_PATH, '        run: node scripts/smoke/bundler_packaging.mjs\n',
       '        if: false\n        run: node scripts/smoke/bundler_packaging.mjs\n',
-      'job build-webgpu-bridge must run "node scripts/smoke/bundler_packaging.mjs" unconditionally without continue-on-error'],
+      'job smoke-core must run "node scripts/smoke/bundler_packaging.mjs" unconditionally without continue-on-error'],
     [CI_PATH, '        run: npm ci --ignore-scripts --prefix scripts/smoke/bundler_deps\n',
       '        run: npm install --prefix scripts/smoke/bundler_deps\n',
-      'job build-webgpu-bridge must run "npm ci --ignore-scripts --prefix scripts/smoke/bundler_deps" unconditionally without continue-on-error'],
+      'job smoke-core must run "npm ci --ignore-scripts --prefix scripts/smoke/bundler_deps" unconditionally without continue-on-error'],
     [CI_PATH, '      - run: npm ci --ignore-scripts\n',
       '      - run: npm ci --ignore-scripts --prefix scripts/smoke/bundler_deps\n',
-      'bundler smoke dependencies and execution must stay in build-webgpu-bridge'],
+      'bundler smoke dependencies and execution must stay in smoke-core'],
     ...['', ' --threading single'].map((flags) => {
       const command = `node scripts/smoke/core_abort_recovery.mjs${flags}`;
       return [CI_PATH, `        run: ${command}\n`, `        if: false\n        run: ${command}\n`,
-        `job build-webgpu-bridge must run "${command}" unconditionally without continue-on-error`];
+        `job smoke-core must run "${command}" unconditionally without continue-on-error`];
     }),
     ...['', ' --memory-mode wasm64', ' --threading single'].map((flags) => {
       const command = `node scripts/smoke/core_release.mjs${flags}`;
       return [CI_PATH, `        run: ${command}\n`, `        if: false\n        run: ${command}\n`,
-        `job build-webgpu-bridge must run "${command}" unconditionally without continue-on-error`];
+        `job smoke-core must run "${command}" unconditionally without continue-on-error`];
     }),
     ...['', ' --memory-mode wasm64'].map((flags) => {
       const command = `node scripts/smoke/remote_fetch_backend.mjs${flags}`;
       return [CI_PATH, `        run: ${command}\n`, `        if: false\n        run: ${command}\n`,
-        `job build-webgpu-bridge must run "${command}" unconditionally without continue-on-error`];
+        `job smoke-core must run "${command}" unconditionally without continue-on-error`];
     }),
     [PUBLISH_PATH, '          set -euo pipefail\n          node publication-policy/scripts/release/qualification.mjs verify-attestation',
       '          set -euo pipefail\n          # WEBGPU_BRIDGE_BUILD_SINGLE_THREAD\n          node publication-policy/scripts/release/qualification.mjs verify-attestation',

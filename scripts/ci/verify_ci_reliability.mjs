@@ -988,47 +988,91 @@ function checkCiRunsContracts({ ci, candidate, qualification, publish }, testFil
     missingSuites.length === 0,
     `the release contract suites npm run check:js must run are missing: ${missingSuites.join(', ')}`,
   );
-  // Rows 21, 22, 101, 103: CI runs the checksum-pinned browser smokes.
-  check.require(
-    (ci.runText.match(/node scripts\/smoke\/grammar\.mjs\b/g) ?? []).length === 2
-      && ci.runText.includes('--model-sha256 "$LLAMA_WEBGPU_MULTIMODAL_MODEL_SHA256"'),
-    `${ci.path} must run the grammar smoke twice, once with the checksum-pinned multimodal model`,
-  );
-  check.includes(ci.path, ci.runText, [
-    'node scripts/smoke/next_token_scores.mjs',
-    'node scripts/smoke/state_persistence.mjs',
-    'node scripts/smoke/multimodal.mjs',
-  ], 'run the next-token scores, state persistence and multimodal browser smokes');
-  const ciBuildSteps = ci.jobSteps('build-webgpu-bridge');
-  for (const command of [
-    'node scripts/smoke/state_persistence.mjs --threading single',
-    'node scripts/smoke/state_persistence.mjs --threading single --memory-mode wasm64',
-    'node scripts/smoke/resume_integrity.mjs --baseline-dist-dir "$BRIDGE_DIST_DIR"',
-    'node scripts/smoke/resume_integrity.mjs --baseline-dist-dir "$BRIDGE_DIST_DIR" --threading single',
-    'node scripts/smoke/resume_integrity.mjs --baseline-dist-dir "$BRIDGE_DIST_DIR" --js-backed-model-staging',
-    'node scripts/smoke/resume_integrity.mjs --baseline-dist-dir "$BRIDGE_DIST_DIR" --threading single --js-backed-model-staging',
-    'node scripts/smoke/cross_origin_assets.mjs',
-    'npm ci --ignore-scripts --prefix scripts/smoke/bundler_deps',
-    'node scripts/smoke/bundler_packaging.mjs',
-    'node scripts/smoke/core_abort_recovery.mjs',
-    'node scripts/smoke/core_abort_recovery.mjs --threading single',
-    'node scripts/smoke/core_release.mjs',
-    'node scripts/smoke/core_release.mjs --memory-mode wasm64',
-    'node scripts/smoke/core_release.mjs --threading single',
-    'node scripts/smoke/remote_fetch_backend.mjs',
-    'node scripts/smoke/remote_fetch_backend.mjs --memory-mode wasm64',
-  ]) {
-    check.require(
-      ciBuildSteps.some((step) => step.run.trim() === command
-        && step.raw.if === undefined && step.raw['continue-on-error'] === undefined),
-      `${ci.path} job build-webgpu-bridge must run "${command}" unconditionally without continue-on-error`,
-    );
+  // Rows 21, 22, 101, 103: CI runs all checksum-pinned browser smokes.
+  const smokeCommands = {
+    'smoke-core': [
+      'npm ci --ignore-scripts --prefix scripts/smoke/bundler_deps',
+      'node scripts/smoke/bundler_packaging.mjs',
+      'node scripts/smoke/state_persistence.mjs',
+      'node scripts/smoke/state_persistence.mjs --memory-mode wasm64',
+      'node scripts/smoke/state_persistence.mjs --threading single',
+      'node scripts/smoke/state_persistence.mjs --threading single --memory-mode wasm64',
+      'node scripts/smoke/cross_origin_assets.mjs',
+      'node --test tests/bridge/js_model_staging_shared_core_browser_test.mjs',
+      'node scripts/smoke/core_abort_recovery.mjs',
+      'node scripts/smoke/core_abort_recovery.mjs --threading single',
+      'node scripts/smoke/core_release.mjs',
+      'node scripts/smoke/core_release.mjs --memory-mode wasm64',
+      'node scripts/smoke/core_release.mjs --threading single',
+      'node scripts/smoke/remote_fetch_backend.mjs',
+      'node scripts/smoke/remote_fetch_backend.mjs --memory-mode wasm64',
+    ],
+    'smoke-resume': ['', ' --threading single'].flatMap((threading) =>
+      ['', ' --js-backed-model-staging', ' --js-backed-model-staging --no-mmap'].map((staging) =>
+        'node scripts/smoke/resume_integrity.mjs --baseline-dist-dir "$BRIDGE_DIST_DIR"' + threading + staging)),
+    'smoke-multimodal': [
+      'node scripts/smoke/multimodal.mjs',
+      'node scripts/smoke/grammar.mjs --artifacts-dir "$LLAMA_WEBGPU_GRAMMAR_ARTIFACTS_DIR/state-smoke-model"',
+      'node scripts/smoke/next_token_scores.mjs',
+      'node scripts/smoke/speculative.mjs --group tiny',
+    ],
+    'smoke-grammar-qwen': [[
+      'node scripts/smoke/grammar.mjs',
+      '--model-url "$LLAMA_WEBGPU_MULTIMODAL_MODEL_URL"',
+      '--model-sha256 "$LLAMA_WEBGPU_MULTIMODAL_MODEL_SHA256"',
+      '--model-cache-dir "$LLAMA_WEBGPU_MULTIMODAL_MODEL_CACHE"',
+      '--timeout-ms "$LLAMA_WEBGPU_GRAMMAR_MULTIMODAL_TIMEOUT_MS"',
+      '--artifacts-dir "$LLAMA_WEBGPU_GRAMMAR_ARTIFACTS_DIR/multimodal-model"',
+      '--memory-mode "$GRAMMAR_MEMORY_MODE"',
+      '--runtime-mode "$GRAMMAR_RUNTIME_MODE"',
+    ].join(' ')],
+  };
+  for (const [job, commands] of Object.entries(smokeCommands)) {
+    for (const command of commands) {
+      check.require(
+        ci.jobSteps(job).some((step) => shellCommands(step.run).trim() === command
+          && step.raw.if === undefined && step.raw['continue-on-error'] === undefined),
+        `${ci.path} job ${job} must run "${command}" unconditionally without continue-on-error`,
+      );
+    }
   }
+  const build = mapping(ci.job('build-core').strategy);
+  const qwen = mapping(ci.job('smoke-grammar-qwen').strategy);
+  const exactMatrix = (matrix, axes) => {
+    const actual = mapping(matrix);
+    return Object.keys(actual).length === Object.keys(axes).length
+      && Object.entries(axes).every(([name, values]) => Array.isArray(actual[name])
+        && sorted(actual[name]).join(',') === sorted(values).join(','));
+  };
+  check.require(
+    build['fail-fast'] === true
+      && exactMatrix(build.matrix, { variant: ['wasm32', 'wasm64', 'wasm32_st', 'wasm64_st'] }),
+    `${ci.path} must run the four core build variants`,
+  );
+  const qwenStep = ci.jobSteps('smoke-grammar-qwen')
+    .find((step) => shellCommands(step.run).trim() === smokeCommands['smoke-grammar-qwen'][0]);
+  check.require(
+    qwen['fail-fast'] === false
+      && exactMatrix(qwen.matrix, { memory: ['wasm32', 'wasm64'], runtime: ['direct', 'worker'] })
+      && qwenStep?.env.GRAMMAR_MEMORY_MODE === '${{ matrix.memory }}'
+      && qwenStep?.env.GRAMMAR_RUNTIME_MODE === '${{ matrix.runtime }}',
+    `${ci.path} must run all four Qwen grammar cells with their selected memory and runtime modes`,
+  );
+  const coreCache = ci.jobSteps('build-core').find((step) => step.id === 'core-cache');
+  const coreKey = 'webgpu-core-v1-${{ runner.os }}-${{ runner.arch }}-${{ matrix.variant }}'
+    + '-${{ env.EMSCRIPTEN_VERSION }}-${{ steps.compiler-cache.outputs.upstream }}-'
+    + "${{ hashFiles('src/**', 'CMakeLists.txt', 'cmake/**', 'scripts/build/build_bridge.sh', 'scripts/build/patch_wasm64_runtime.mjs') }}";
+  check.require(
+    coreCache?.uses === 'actions/cache@v4' && coreCache.with.key === coreKey
+      && coreCache.with.path === '${{ runner.temp }}/webgpu_bridge_dist' && !has(coreCache.with, 'restore-keys'),
+    `${ci.path} must restore the exact-key core cache with all native inputs and no restore-keys`,
+  );
+  check.excludes(candidate.path, candidate.text, ['webgpu-core-', 'webgpu-ccache-'], 'never reference CI core or compiler caches');
   for (const workflow of [ci, candidate, qualification, publish]) {
     check.require(
-      workflow.steps.every((step) => (workflow === ci && step.job === 'build-webgpu-bridge')
+      workflow.steps.every((step) => (workflow === ci && step.job === 'smoke-core')
         || !/scripts\/smoke\/(?:bundler_deps|bundler_packaging\.mjs)/.test(step.run)),
-      `${workflow.path} bundler smoke dependencies and execution must stay in build-webgpu-bridge`,
+      `${workflow.path} bundler smoke dependencies and execution must stay in smoke-core`,
     );
   }
   // Row 57: CI builds the llama.cpp pin.
