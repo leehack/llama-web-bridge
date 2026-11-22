@@ -763,6 +763,130 @@ for (const mode of ['direct', 'worker']) {
   });
 }
 
+test('redirected core URLs lose their full query and keep stack positions during preflight and load', async (t) => {
+  const requested = 'http://127.0.0.1:52208/loader.js?v=42';
+  const redirected = `${requested}&fixtureLabel=BLUE_TEST_VALUE`;
+  const location = 'http://127.0.0.1:52208/loader.js';
+  const originalMessage = `Wasm initialization failed at ${redirected}`;
+  const stack = `CompileError: ${originalMessage}\n    at abort (${redirected}:10:5)\n    at start (${redirected}:11)`;
+  const expectedMessage = `Wasm initialization failed at ${location}`;
+  const expectedStack = `CompileError: ${expectedMessage}\n    at abort (${location}:10:5)\n    at start (${location}:11)`;
+  withImports(t, { [requested]: ({ locateFile }) => {
+    locateFile('lib.wasm', base);
+    const error = new WebAssembly.CompileError(originalMessage);
+    error.stack = stack;
+    throw error;
+  } });
+  mockDiagnostic(t, { status: 200, type: 'application/wasm' });
+  await withBridge('direct', { ...config32, coreModuleUrl: requested }, async (bridge) => {
+    for (const invoke of [() => bridge.preflightCore(), () => bridge.loadModelFromUrl(model, loadOptions)]) {
+      await assert.rejects(invoke, (error) => {
+        assert.ok(error instanceof WebAssembly.CompileError);
+        assert.equal(error.message, expectedMessage);
+        assert.equal(error.stack, expectedStack);
+        return true;
+      });
+    }
+  });
+});
+
+for (const mode of ['direct', 'worker']) {
+  test(`${mode}: a signed root-relative URL never rewrites inside an absolute stack frame`, async (t) => {
+    const coreModuleUrl = '/loader.js?v=42';
+    const origin = 'http://127.0.0.1:52208';
+    const absolute = `${origin}${coreModuleUrl}`;
+    const baseFrame = `    at abort (${origin}/loader.js:1:2274)`;
+    const notes = [];
+    t.mock.method(console, 'log', (line) => notes.push(line));
+    withImports(t, { [coreModuleUrl]: ({ locateFile, print }) => {
+      locateFile('lib.wasm', base);
+      const error = new WebAssembly.CompileError(`Initialization failed for ${coreModuleUrl}`);
+      error.stack = `CompileError: ${error.message}\n    at abort (${absolute}:1:2274)`;
+      print(error.stack);
+      throw error;
+    } });
+    mockDiagnostic(t, { status: 200, type: 'application/wasm' });
+    await withBridge(mode, { ...config32, coreModuleUrl }, async (bridge) => {
+      await assert.rejects(bridge.preflightCore(), (error) => {
+        assert.equal(error.message, 'Initialization failed for file://[redacted]');
+        if (mode === 'direct') assert.equal(error.stack.split('\n')[1], baseFrame);
+        return true;
+      });
+    });
+    assert.equal(notes.length, 1);
+    assert.equal(notes[0].split('\n')[1], baseFrame);
+  });
+}
+
+test('mirror error redaction cuts aggregate cycles and preserves shared children', async () => {
+  const child = new TypeError('Failed to import https://cdn.test/mirror.js?sig=1');
+  const failure = new AggregateError([child, child], 'All mirrors failed');
+  failure.errors.push(failure);
+  await withBridge('direct', { coreModuleFactory() { throw failure; } }, async (bridge) => {
+    await assert.rejects(bridge.preflightCore(), (error) => {
+      assert.ok(error instanceof AggregateError);
+      assert.equal(error.errors.length, 3);
+      for (const mirrored of error.errors.slice(0, 2)) {
+        assert.ok(mirrored instanceof TypeError);
+        assert.equal(mirrored.message, 'Failed to import https://cdn.test/mirror.js');
+      }
+      assert.equal(error.errors[2], undefined);
+      return true;
+    });
+  });
+});
+
+for (const wrapped of [false, true]) {
+  test(`mirror loader redacts Promise.any errors${wrapped ? ' under cause' : ''}`, async (t) => {
+    const mirrors = ['https://a%40b:pw@cdn.test/first.js?v=BLUE_TEST_VALUE', 'https://cdn.test/second.js#GREEN_TEST_VALUE'];
+    const paths = ['https://cdn.test/first.js', 'https://cdn.test/second.js'];
+    const rejections = mirrors.map((url) => {
+      const error = new TypeError(`Failed to import ${url}`);
+      error.stack = `TypeError: ${error.message}\n    at mirror (${url}:8:2)`;
+      return error;
+    });
+    withImports(t, {
+      ...Object.fromEntries(mirrors.map((url, index) => [url, rejections[index]])),
+      [loader]: async () => {
+        try {
+          return await Promise.any(mirrors.map((url) => import(url)));
+        } catch (error) {
+          if (wrapped) throw new Error('The mirror loader failed', { cause: error });
+          throw error;
+        }
+      },
+    });
+    await withBridge('direct', config32, async (bridge) => {
+      await assert.rejects(bridge.preflightCore(), (error) => {
+        const aggregate = wrapped ? error.cause : error;
+        assert.ok(aggregate instanceof AggregateError);
+        assert.equal(aggregate.name, 'AggregateError');
+        assert.equal(aggregate.message, 'All promises were rejected');
+        assert.equal(aggregate.errors.length, 2);
+        for (const [index, child] of aggregate.errors.entries()) {
+          assert.ok(child instanceof TypeError);
+          assert.equal(child.message, `Failed to import ${paths[index]}`);
+          assert.equal(child.stack, `TypeError: ${child.message}\n    at mirror (${paths[index]}:8:2)`);
+        }
+        return true;
+      });
+    });
+  });
+}
+
+test('core redaction preserves unsigned URLs and handles mixed URLs in an object cause', async () => {
+  const unsigned = 'https://Assets.test/with/@/loader.js';
+  const failure = new Error('Import failed', { cause: {
+    message: `Opening ${unsigned}, /loader.js and https://a%40b:secret@assets.test/loader.js?sig=1; then ${unsigned}.`,
+  } });
+  await withBridge('direct', { coreModuleFactory() { throw failure; } }, async (bridge) => {
+    await assert.rejects(bridge.preflightCore(), (error) => {
+      assert.equal(error.cause.message, `Opening ${unsigned}, /loader.js and https://assets.test/loader.js; then ${unsigned}.`);
+      return true;
+    });
+  });
+});
+
 test('direct preflight rejects a cached core that retires while applying its log level', async (t) => {
   let trap = false;
   withImports(t, { [loader]: (options) => {

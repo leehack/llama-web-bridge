@@ -965,38 +965,69 @@ function redactCoreAssetUrl(url) {
 function hasCoreAssetUrlSecrets(url) {
   return /[?#]/.test(url) || /^(?:[a-z][a-z\d+.-]*:)?\/\/[^/]*@/i.test(url);
 }
+var ABSOLUTE_HTTP_URL = /\bhttps?:\/\/[^\s"'()<>`‘’“”]+/gi;
+function redactAbsoluteUrlToken(token) {
+  const punctuation = /[,.;]+$/.exec(token)?.[0] ?? "";
+  const urlToken = token.slice(0, token.length - punctuation.length);
+  const hasPath = /[/?#]/.test(urlToken.slice(urlToken.indexOf("://") + 3));
+  const position = hasPath ? /(?::\d+){1,2}$/.exec(urlToken)?.[0] ?? "" : "";
+  try {
+    const url = new URL(urlToken.slice(0, urlToken.length - position.length));
+    if (!url.username && !url.password && !url.search && !url.hash) return token;
+    return url.origin + url.pathname + position + punctuation;
+  } catch (_) {
+    return token;
+  }
+}
 function createCoreAssetUrlRedactor() {
   const replacements = /* @__PURE__ */ new Map();
   function remember(url, absoluteUrl) {
+    if (/^[a-z][a-z\d+.-]*:/i.test(url)) return;
     const redacted = /^[a-z][a-z\d+.-]*:/i.test(absoluteUrl) ? redactCoreAssetUrl(absoluteUrl) : url.split(/[?#]/, 1)[0];
-    for (const form of [url, absoluteUrl]) {
-      if (hasCoreAssetUrlSecrets(form) && form !== redacted) replacements.set(form, redacted);
-    }
+    if (hasCoreAssetUrlSecrets(url) && url !== redacted) replacements.set(url, redacted);
+  }
+  function redactRelativeText(message) {
+    for (const [url, redacted] of replacements) message = message.replaceAll(url, () => redacted);
+    return message;
   }
   function text(message) {
-    for (const [url, redacted] of replacements) message = message.replaceAll(url, () => redacted);
-    return message.replace(/\bhttps?:\/\/[^\s"'<>`‘’“”]+/gi, (match) => {
-      if (!hasCoreAssetUrlSecrets(match)) return match;
-      let end = match.search(/[),.;\]}]+$/);
-      if (end === -1) return redactCoreAssetUrl(match);
-      const prefix = match.slice(0, end);
-      let pending = (prefix.match(/\(/g)?.length ?? 0) - (prefix.match(/\)/g)?.length ?? 0);
-      while (pending-- > 0 && match[end] === ")") end++;
-      return redactCoreAssetUrl(match.slice(0, end)) + match.slice(end);
-    });
+    let offset = 0;
+    let redacted = "";
+    for (const match of message.matchAll(ABSOLUTE_HTTP_URL)) {
+      if (match.index < offset) continue;
+      const token = match[0];
+      let end = match.index + token.length;
+      if (/[?#]/.test(token) && message[end] === "(") {
+        const continuation = /^(?:\([^\s"'()<>`‘’“”]*\)[^\s"'()<>`‘’“”]*)+/.exec(message.slice(end));
+        end += continuation?.[0].length ?? 0;
+      }
+      redacted += redactRelativeText(message.slice(offset, match.index));
+      redacted += redactAbsoluteUrlToken(message.slice(match.index, end));
+      offset = end;
+    }
+    return redacted + redactRelativeText(message.slice(offset));
   }
   function error(failure, depth = 0, seen = /* @__PURE__ */ new WeakSet()) {
     if (typeof failure === "string") return text(failure);
     if (!failure || typeof failure !== "object") return failure;
     if (depth > 5 || seen.has(failure)) return void 0;
-    const { message: originalMessage, stack: originalStack, cause: originalCause, name } = failure;
+    const {
+      message: originalMessage,
+      stack: originalStack,
+      cause: originalCause,
+      errors: originalErrors,
+      name
+    } = failure;
     if (typeof originalMessage !== "string") return failure;
     seen.add(failure);
     const message = text(originalMessage);
     const stack = typeof originalStack === "string" ? text(originalStack) : originalStack;
     const cause = error(originalCause, depth + 1, seen);
-    if (message === originalMessage && stack === originalStack && cause === originalCause) return failure;
-    const sanitized = typeof DOMException === "function" && Object.prototype.toString.call(failure) === "[object DOMException]" ? new DOMException(message, name) : new Error(message);
+    const aggregate = failure instanceof AggregateError || name === "AggregateError";
+    const errors = aggregate && Array.isArray(originalErrors) ? originalErrors.map((child) => error(child, depth + 1, seen)) : null;
+    seen.delete(failure);
+    if (message === originalMessage && stack === originalStack && cause === originalCause && (!errors || errors.every((child, index) => child === originalErrors[index]))) return failure;
+    const sanitized = aggregate ? new AggregateError(errors ?? [], message) : typeof DOMException === "function" && Object.prototype.toString.call(failure) === "[object DOMException]" ? new DOMException(message, name) : new Error(message);
     Object.setPrototypeOf(sanitized, Object.getPrototypeOf(failure));
     const descriptors = Object.getOwnPropertyDescriptors(failure);
     if (cause !== originalCause) {
@@ -1005,6 +1036,14 @@ function createCoreAssetUrlRedactor() {
         writable: true,
         configurable: true,
         enumerable: descriptors.cause?.enumerable ?? false
+      };
+    }
+    if (errors) {
+      descriptors.errors = {
+        value: errors,
+        writable: true,
+        configurable: true,
+        enumerable: descriptors.errors?.enumerable ?? false
       };
     }
     return Object.defineProperties(sanitized, {
