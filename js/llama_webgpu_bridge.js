@@ -943,6 +943,233 @@ function guardCore(rawModule, onRetired) {
   return proxy;
 }
 
+// js/src/internal/core_preflight.ts
+var CORE_ASSET_UNAVAILABLE = "CORE_ASSET_UNAVAILABLE";
+var CORE_PREFLIGHT_UNSUPPORTED = "CORE_PREFLIGHT_UNSUPPORTED";
+var PREFLIGHT_DIAGNOSTIC_TIMEOUT_MS = 1e4;
+function isCoreAssetErrorPayload(value) {
+  if (!value || typeof value !== "object") return false;
+  const { code, asset, url, httpStatus, variant } = value;
+  return (code === CORE_ASSET_UNAVAILABLE || code === CORE_PREFLIGHT_UNSUPPORTED) && (asset === "loader" || asset === "wasm" || asset === "worker") && (url === null || typeof url === "string") && (httpStatus === null || typeof httpStatus === "number" && Number.isInteger(httpStatus) && httpStatus >= 0 && httpStatus <= 599) && (variant === null || variant === "wasm32" || variant === "memory64");
+}
+function redactCoreAssetUrl(url) {
+  try {
+    const { protocol, origin, pathname } = new URL(url);
+    if (protocol === "http:" || protocol === "https:") return origin + pathname;
+    return `${protocol}//[redacted]`;
+  } catch (_) {
+    const protocol = /^[a-z][a-z\d+.-]*:/i.exec(url)?.[0];
+    return protocol ? `${protocol.toLowerCase()}//[redacted]` : "[invalid-url]";
+  }
+}
+function hasCoreAssetUrlSecrets(url) {
+  return /[?#]/.test(url) || /^(?:[a-z][a-z\d+.-]*:)?\/\/[^/]*@/i.test(url);
+}
+var HTTP_URL_START = /\bhttps?:\/\//gi;
+var URL_TEXT_DELIMITER = /[\s"'<>`‘’“”]/;
+var URL_PATH_CHARACTER = /[\p{L}\p{N}\p{M}._~%+\/-]/u;
+var URL_QUERY_CONTINUATION = /[?&#=]/;
+var URL_SENTENCE_PUNCTUATION = /^[.,;:!?]+/;
+function absoluteUrlEnd(message, start) {
+  const delimiter = message.slice(start).search(URL_TEXT_DELIMITER);
+  return delimiter === -1 ? message.length : start + delimiter;
+}
+function trailingQueryPunctuation(token, queryStart, punctuation) {
+  const closingDelimiters = [];
+  const suffixStart = token.length - punctuation.length;
+  let trailing = "";
+  for (let index = queryStart; index < token.length; index++) {
+    const char = token[index];
+    if (char === "[") closingDelimiters.push("]");
+    else if (char === "(") closingDelimiters.push(")");
+    else if (char === closingDelimiters.at(-1)) closingDelimiters.pop();
+    else if (index >= suffixStart) trailing += char;
+  }
+  return trailing;
+}
+function queryFormatting(token, queryStart) {
+  const query = token.slice(queryStart);
+  const punctuation = /[),.;!\]]+$/.exec(query)?.[0] ?? "";
+  const position = /(?::\d+){1,2}$/.exec(query.slice(0, query.length - punctuation.length))?.[0] ?? "";
+  const trailing = punctuation ? trailingQueryPunctuation(token, queryStart, punctuation) : "";
+  return position + trailing;
+}
+function redactAbsoluteUrlToken(token) {
+  const queryStart = token.search(/[?#]/);
+  const path = queryStart === -1 ? token : token.slice(0, queryStart);
+  const url = path.replace(/(\bhttps?:\/\/)[A-Za-z0-9._~%!$&'*+=:-]+@(?![^/?#@,();|]*@)/gi, "$1");
+  return queryStart === -1 ? url : url + queryFormatting(token, queryStart);
+}
+function atUrlStart(message, start) {
+  if (start === 0) return true;
+  const previous = Array.from(message.slice(Math.max(0, start - 2), start)).at(-1);
+  return !URL_PATH_CHARACTER.test(previous);
+}
+function continuesUrl(message, index) {
+  const codePoint = message.codePointAt(index);
+  if (codePoint === void 0) return false;
+  const next = String.fromCodePoint(codePoint);
+  return URL_PATH_CHARACTER.test(next) || URL_QUERY_CONTINUATION.test(next);
+}
+function atUrlEnd(message, end) {
+  if (!continuesUrl(message, end)) return true;
+  const punctuation = URL_SENTENCE_PUNCTUATION.exec(message.slice(end));
+  return punctuation !== null && !continuesUrl(message, end + punctuation[0].length);
+}
+function replaceRegisteredUrl(message, url, redacted) {
+  return message.replaceAll(url, (match, index) => atUrlStart(message, index) && atUrlEnd(message, index + match.length) ? redacted : match);
+}
+function createCoreAssetUrlRedactor() {
+  const absoluteUrls = /* @__PURE__ */ new Set();
+  const replacements = /* @__PURE__ */ new Map();
+  function remember(url, absoluteUrl = url) {
+    let serialized = absoluteUrl;
+    try {
+      serialized = new URL(absoluteUrl).href;
+    } catch (_) {
+    }
+    for (const form of [url, absoluteUrl, serialized]) {
+      if (/^[a-z][a-z\d+.-]*:/i.test(form)) absoluteUrls.add(form);
+    }
+    if (/^[a-z][a-z\d+.-]*:/i.test(url)) return;
+    const redacted = /^[a-z][a-z\d+.-]*:/i.test(absoluteUrl) ? redactCoreAssetUrl(absoluteUrl) : url.split(/[?#]/, 1)[0];
+    if (hasCoreAssetUrlSecrets(url) && url !== redacted) replacements.set(url, redacted);
+  }
+  function knownHttpUrlAt(message, start) {
+    if (!atUrlStart(message, start)) return null;
+    for (const url of absoluteUrls) {
+      if (!/^https?:\/\//i.test(url)) continue;
+      const end = start + url.length;
+      if (hasCoreAssetUrlSecrets(url) && message.startsWith(url, start)) {
+        const tail = message.slice(end, absoluteUrlEnd(message, end));
+        if (queryFormatting(tail, 0) === tail) return { end, value: redactCoreAssetUrl(url) };
+      }
+      const path = url.split(/[?#]/, 1)[0];
+      const queryStart = start + path.length;
+      if (URL_TEXT_DELIMITER.test(path) && message.startsWith(path, start) && (message[queryStart] === "?" || message[queryStart] === "#")) {
+        const end2 = absoluteUrlEnd(message, queryStart);
+        const token = message.slice(start, end2);
+        return { end: end2, value: redactCoreAssetUrl(url) + queryFormatting(token, path.length) };
+      }
+    }
+    return null;
+  }
+  function redactRelativeText(message) {
+    for (const [url, redacted] of replacements) message = replaceRegisteredUrl(message, url, redacted);
+    return message;
+  }
+  function text(message) {
+    for (const url of absoluteUrls) {
+      if (!/^https?:\/\//i.test(url) && hasCoreAssetUrlSecrets(url)) {
+        message = replaceRegisteredUrl(message, url, redactCoreAssetUrl(url));
+      }
+    }
+    let offset = 0;
+    let redacted = "";
+    for (const match of message.matchAll(HTTP_URL_START)) {
+      if (match.index < offset) continue;
+      const known = knownHttpUrlAt(message, match.index);
+      const end = known?.end ?? absoluteUrlEnd(message, match.index + match[0].length);
+      redacted += redactRelativeText(message.slice(offset, match.index));
+      redacted += known?.value ?? redactAbsoluteUrlToken(message.slice(match.index, end));
+      offset = end;
+    }
+    return redacted + redactRelativeText(message.slice(offset));
+  }
+  function error(failure, depth = 0, seen = /* @__PURE__ */ new WeakSet()) {
+    if (typeof failure === "string") return text(failure);
+    if (!failure || typeof failure !== "object") return failure;
+    if (depth > 5 || seen.has(failure)) return void 0;
+    const {
+      message: originalMessage,
+      stack: originalStack,
+      cause: originalCause,
+      errors: originalErrors,
+      name
+    } = failure;
+    if (typeof originalMessage !== "string") return failure;
+    seen.add(failure);
+    const message = text(originalMessage);
+    const stack = typeof originalStack === "string" ? text(originalStack) : originalStack;
+    const cause = error(originalCause, depth + 1, seen);
+    const aggregate = failure instanceof AggregateError || name === "AggregateError";
+    const errors = aggregate && Array.isArray(originalErrors) ? originalErrors.map((child) => error(child, depth + 1, seen)) : null;
+    seen.delete(failure);
+    if (message === originalMessage && stack === originalStack && cause === originalCause && (!errors || errors.every((child, index) => child === originalErrors[index]))) return failure;
+    const sanitized = aggregate ? new AggregateError(errors ?? [], message) : typeof DOMException === "function" && Object.prototype.toString.call(failure) === "[object DOMException]" ? new DOMException(message, name) : new Error(message);
+    Object.setPrototypeOf(sanitized, Object.getPrototypeOf(failure));
+    const descriptors = Object.getOwnPropertyDescriptors(failure);
+    if (cause !== originalCause) {
+      descriptors.cause = {
+        value: cause,
+        writable: true,
+        configurable: true,
+        enumerable: descriptors.cause?.enumerable ?? false
+      };
+    }
+    if (errors) {
+      descriptors.errors = {
+        value: errors,
+        writable: true,
+        configurable: true,
+        enumerable: descriptors.errors?.enumerable ?? false
+      };
+    }
+    return Object.defineProperties(sanitized, {
+      ...descriptors,
+      message: { value: message, writable: true, configurable: true },
+      stack: { value: stack, writable: true, configurable: true }
+    });
+  }
+  return { remember, text, error };
+}
+var CoreAssetError = class extends Error {
+  constructor(code, message, details) {
+    const url = details.url ? redactCoreAssetUrl(details.url) : null;
+    super(details.url && url ? message.replaceAll(details.url, () => url) : message);
+    this.name = "CoreAssetError";
+    this.code = code;
+    this.asset = details.asset;
+    this.url = url;
+    this.httpStatus = details.httpStatus ?? null;
+    this.variant = details.variant ?? null;
+  }
+};
+function resolveCoreInitTimeoutMs(timeout) {
+  const configured = Number(timeout);
+  if (!Number.isFinite(configured) || configured <= 0) return 9e4;
+  return Math.max(1e4, Math.min(6e5, Math.trunc(configured)));
+}
+function hasMemory64Candidate(preferMemory64, loaderUrl) {
+  return preferMemory64 && typeof loaderUrl === "string" && loaderUrl.length > 0;
+}
+var JS_MIME = /^(?:application\/(?:x-)?(?:ecma|java)script|text\/(?:(?:x-)?(?:ecma|java)script|javascript1\.[0-5]|jscript|livescript))$/;
+async function probeUnavailableCoreAsset(url, asset, variant, rememberRedirect) {
+  if (!/^https?:\/\//i.test(url)) return null;
+  const abort = new AbortController();
+  const timer = globalThis.setTimeout(() => abort.abort(), PREFLIGHT_DIAGNOSTIC_TIMEOUT_MS);
+  let httpStatus = null;
+  try {
+    const response = await fetch(url, { method: "GET", credentials: "same-origin", signal: abort.signal });
+    if (response.url) rememberRedirect?.(response.url);
+    void response.body?.cancel().catch(() => {
+    });
+    const mime = response.headers.get("Content-Type")?.split(";", 1)[0]?.trim().toLowerCase() ?? "";
+    const plausible = asset === "loader" ? JS_MIME.test(mime) : mime !== "text/html";
+    if (response.ok && plausible) return null;
+    httpStatus = response.status;
+  } catch (_) {
+  } finally {
+    globalThis.clearTimeout(timer);
+  }
+  const status = httpStatus === null ? "" : ` (HTTP ${httpStatus})`;
+  return new CoreAssetError(
+    CORE_ASSET_UNAVAILABLE,
+    `Bridge core ${asset} unavailable${status}: ${redactCoreAssetUrl(url)}`,
+    { asset, url, httpStatus, variant }
+  );
+}
+
 // js/src/internal/isolation.ts
 var CROSS_ORIGIN_ISOLATION_REQUIRED = "CROSS_ORIGIN_ISOLATION_REQUIRED";
 var CrossOriginIsolationError = class extends Error {
@@ -1574,6 +1801,8 @@ function textToSpeechProgressTransfers({ pcm }) {
 }
 
 // js/src/internal/core_loader.ts
+var MissingCoreFactoryExportError = class extends Error {
+};
 function normalizeFactory(moduleExport) {
   if (typeof moduleExport === "function") {
     return moduleExport;
@@ -1584,7 +1813,16 @@ function normalizeFactory(moduleExport) {
   if (moduleExport && typeof moduleExport.createLlamaWebGpuCoreModule === "function") {
     return moduleExport.createLlamaWebGpuCoreModule;
   }
-  throw new Error("Unable to resolve llama_webgpu_core factory function");
+  throw new MissingCoreFactoryExportError("Unable to resolve llama_webgpu_core factory function");
+}
+function resolveCoreLoaderUrl(moduleUrl) {
+  if (!/^(?:\.{0,2}\/|[a-z][a-z\d+.-]*:)/i.test(moduleUrl)) return moduleUrl;
+  const loaderBaseUrl = import.meta.url;
+  try {
+    return new URL(moduleUrl, loaderBaseUrl).href;
+  } catch (_) {
+    return moduleUrl;
+  }
 }
 async function importCoreFactory(moduleUrl) {
   const exportedModule = await import(
@@ -2748,6 +2986,7 @@ var LlamaWebGpuBridgeRuntime = class {
   constructor(config = {}) {
     this._config = config;
     this._core = null;
+    this._corePreflight = null;
     this._ownsCore = false;
     this._backendLabels = [];
     this._gpuActive = false;
@@ -3560,11 +3799,7 @@ var LlamaWebGpuBridgeRuntime = class {
     return defaultTimeoutMs;
   }
   _resolveCoreInitTimeoutMs() {
-    const configured = Number(this._config.coreInitTimeoutMs);
-    if (!Number.isFinite(configured) || configured <= 0) {
-      return 9e4;
-    }
-    return Math.max(1e4, Math.min(6e5, Math.trunc(configured)));
+    return resolveCoreInitTimeoutMs(this._config.coreInitTimeoutMs);
   }
   _resolveMediaImageMaxPixels(options = {}) {
     if (options.disableImageDownscale === true || this._disableImageDownscale) {
@@ -4378,6 +4613,7 @@ var LlamaWebGpuBridgeRuntime = class {
       return;
     }
     this._coreRetired = true;
+    this._corePreflight = null;
     this._runtimeNotes.push("core_retired");
     if (!stats) {
       this._runtimeNotes.push("core_retired_threads_unavailable");
@@ -4389,41 +4625,52 @@ var LlamaWebGpuBridgeRuntime = class {
     }
     this._onCoreRetired?.(this, cause);
   }
-  async _ensureCore() {
+  _assertCoreLive(core) {
+    if (this._coreRetired || isCoreRetired(core)) throw new ModelUnloadedError();
+  }
+  async _ensureCore(diagnosticUrls, redact = createCoreAssetUrlRedactor()) {
     if (this._core) {
       this._applyCoreLogLevel();
+      this._assertCoreLive(this._core);
       return this._core;
     }
     if (!this._config.coreModuleFactory && this._config.allowSingleThreadCore !== true && !canPostSharedMemory()) {
       throw new CrossOriginIsolationError();
+    }
+    const { coreModuleUrl, coreModuleUrlMem64, wasmUrl, wasmUrlMem64, _coreAssetSources } = resolveCoreAssets(this._config);
+    for (const url of [coreModuleUrl, coreModuleUrlMem64]) {
+      if (typeof url === "string") redact.remember(url, resolveCoreLoaderUrl(url));
+    }
+    for (const url of [wasmUrl, wasmUrlMem64, this._config.workerUrl, ...this._config._coreWorkerUrls ?? []]) {
+      if (typeof url === "string") redact.remember(url, normalizeAbsoluteUrl(url));
     }
     const candidates = [];
     const factory = this._config.coreModuleFactory;
     if (factory) {
       candidates.push({
         variant: "custom",
+        loaderUrl: null,
         loadFactory: () => Promise.resolve(factory),
         wasmUrl: this._config.wasmUrl
       });
     } else {
-      const { coreModuleUrl, coreModuleUrlMem64, wasmUrl, wasmUrlMem64, _coreAssetSources } = resolveCoreAssets(this._config);
       const bridgeResolved64 = isBridgeResolvedAsset(_coreAssetSources.wasm64);
-      if (this._preferMemory64 && typeof coreModuleUrlMem64 === "string" && coreModuleUrlMem64.length > 0) {
-        const factoryPromise2 = importCoreFactory(coreModuleUrlMem64);
+      if (hasMemory64Candidate(this._preferMemory64, coreModuleUrlMem64)) {
+        const factoryPromise = importCoreFactory(coreModuleUrlMem64);
         candidates.push({
           variant: "wasm64",
-          loadFactory: () => factoryPromise2,
+          loaderUrl: coreModuleUrlMem64,
+          loadFactory: () => factoryPromise,
           wasmUrl: wasmUrlMem64 || wasmUrl,
           pthreadScriptUrl: bridgeResolved64 ? coreModuleUrlMem64 : void 0
         });
       }
       const moduleUrl = coreModuleUrl ?? "./llama_webgpu_core.js";
       const bridgeResolved32 = isBridgeResolvedAsset(_coreAssetSources.wasm32);
-      const lazyFallback = bridgeResolved32 || bridgeResolved64 && candidates.length > 0;
-      const factoryPromise = lazyFallback ? void 0 : importCoreFactory(moduleUrl);
       candidates.push({
         variant: "wasm32",
-        loadFactory: () => factoryPromise ?? importCoreFactory(moduleUrl),
+        loaderUrl: moduleUrl,
+        loadFactory: () => importCoreFactory(moduleUrl),
         wasmUrl,
         pthreadScriptUrl: bridgeResolved32 ? coreModuleUrl : void 0
       });
@@ -4436,7 +4683,10 @@ var LlamaWebGpuBridgeRuntime = class {
         this._runtimeNotes.push("core_mem64_attempt");
       }
       let factoryLoaded = false;
+      let locatedWasmUrl = null;
       let initTimeoutError = null;
+      const loaderUrl = candidate.loaderUrl === null ? null : resolveCoreLoaderUrl(candidate.loaderUrl);
+      if (candidate.loaderUrl !== null && loaderUrl !== null) redact.remember(candidate.loaderUrl, loaderUrl);
       let candidateCore = null;
       let initTimer;
       const pthreadStart = candidate.variant === "custom" ? null : createPthreadWorkerStart({ pthreadScriptUrl: candidate.pthreadScriptUrl });
@@ -4455,16 +4705,17 @@ var LlamaWebGpuBridgeRuntime = class {
           moduleFactory({
             ...pthreadStart ? { [PTHREAD_WORKER_HOOK]: pthreadStart.Worker } : {},
             locateFile: (path, prefix) => {
-              if (path.endsWith(".wasm") && candidate.wasmUrl) {
-                return candidate.wasmUrl;
-              }
-              return `${prefix}${path}`;
+              const isWasm = path.endsWith(".wasm");
+              const resolved = isWasm && candidate.wasmUrl || `${prefix}${path}`;
+              if (isWasm) locatedWasmUrl = resolved;
+              redact.remember(resolved, normalizeAbsoluteUrl(resolved));
+              return resolved;
             },
             print: (msg) => {
-              this._emitLogger("log", msg);
+              this._emitLogger("log", typeof msg === "string" ? redact.text(msg) : msg);
             },
             printErr: (msg) => {
-              const text = String(msg ?? "");
+              const text = redact.text(String(msg ?? ""));
               this._lastCoreErrorText = text;
               const trimmed = text.trim();
               if (trimmed.length > 0) {
@@ -4507,7 +4758,7 @@ var LlamaWebGpuBridgeRuntime = class {
               this._emitLogger("error", trimmed.length > 0 ? trimmed : text);
             },
             onAbort: (reason) => {
-              const text = String(reason ?? "").trim();
+              const text = redact.text(String(reason ?? "")).trim();
               if (text.length > 0) {
                 const token = text.slice(0, 120).replace(/[\s;=]+/g, "_").replace(/[^a-zA-Z0-9._:-]/g, "");
                 if (token.length > 0) {
@@ -4518,7 +4769,7 @@ var LlamaWebGpuBridgeRuntime = class {
                 this._runtimeNotes.push("core_abort");
                 this._emitLogger("error", "core abort");
               }
-              retireCore(candidateCore, reason);
+              retireCore(candidateCore, text);
             }
           }),
           new Promise((_, reject) => {
@@ -4535,6 +4786,18 @@ var LlamaWebGpuBridgeRuntime = class {
         this._pthreadStart = pthreadStart?.mode() ?? "direct";
         this._coreVariant = candidate.variant === "wasm64" ? "wasm64" : "wasm32";
         this._memory64FallbackReason = memory64FallbackReason;
+        const threading = this._coreSupportsPthreads() ? "threaded" : "single-thread";
+        this._applyCoreLogLevel();
+        this._assertCoreLive(candidateCore);
+        this._corePreflight = {
+          variant: candidate.variant === "wasm64" ? "memory64" : "wasm32",
+          threading,
+          execution: "main-thread",
+          fallback: memory64FallbackReason !== null,
+          fallbackReason: memory64FallbackReason,
+          loaderUrl,
+          wasmUrl: locatedWasmUrl ?? candidate.wasmUrl ?? null
+        };
         if (candidate.variant === "wasm64") {
           this._runtimeNotes.push("core_mem64_active");
         } else if (candidate.variant === "wasm32") {
@@ -4543,6 +4806,7 @@ var LlamaWebGpuBridgeRuntime = class {
         break;
       } catch (caught) {
         const error = pthreadStart && caught !== initTimeoutError ? pthreadStart.failure(caught) : caught;
+        if (this._coreRetired || isCoreRetired(candidateCore)) throw redact.error(error);
         lastError = error;
         if (candidate.variant === "wasm64") {
           const reason = initTimeoutError && error === initTimeoutError ? "timeout" : factoryLoaded && isMemory64Unsupported() ? "unsupported" : "init_error";
@@ -4552,24 +4816,39 @@ var LlamaWebGpuBridgeRuntime = class {
           this._emitLogger("warn", `Memory64 core unavailable (${reason}). Trying the wasm32 core.`);
           continue;
         }
-        throw error;
       } finally {
         if (initTimer !== void 0) globalThis.clearTimeout(initTimer);
         if (pthreadStart) {
-          pthreadStart.settle(candidateCore !== null && this._core === candidateCore);
+          pthreadStart.settle(candidateCore !== null && this._core === candidateCore && !isCoreRetired(candidateCore));
           this._pendingPthreadStarts.delete(pthreadStart);
         }
       }
+      const asset = factoryLoaded ? "wasm" : "loader";
+      const assetUrl = factoryLoaded ? locatedWasmUrl : candidate.loaderUrl;
+      const skipDiagnostic = factoryLoaded ? initTimeoutError !== null && lastError === initTimeoutError || lastError instanceof CrossOriginIsolationError || lastError instanceof BlobWorkerBlockedError : lastError instanceof SyntaxError || lastError instanceof ReferenceError || lastError instanceof MissingCoreFactoryExportError;
+      if (assetUrl !== null && !skipDiagnostic) {
+        const url = asset === "loader" ? resolveCoreLoaderUrl(assetUrl) : normalizeAbsoluteUrl(assetUrl);
+        if (!diagnosticUrls?.has(url)) {
+          diagnosticUrls?.add(url);
+          const assetError = await probeUnavailableCoreAsset(url, asset, "wasm32", redact.remember);
+          if (assetError) throw assetError;
+        }
+      }
+      throw redact.error(lastError);
     }
     if (!this._core) {
       throw lastError || new Error("Failed to initialize bridge core module");
     }
-    this._applyCoreLogLevel();
     return this._core;
   }
-  async _probeBackends() {
+  async preflightCore() {
+    const core = await this._ensureCore();
+    this._assertCoreLive(core);
+    return { ...this._corePreflight };
+  }
+  async _probeBackends(diagnosticUrls, redact) {
     try {
-      const core = await this._ensureCore();
+      const core = await this._ensureCore(diagnosticUrls, redact);
       const probeResult = Number(
         await core.ccall("llamadart_webgpu_probe", "number", [], [], { async: true })
       );
@@ -4585,7 +4864,7 @@ var LlamaWebGpuBridgeRuntime = class {
     } catch (error) {
       this._backendLabels = [];
       this._gpuActive = false;
-      if (error instanceof BlobWorkerBlockedError) throw error;
+      if (error instanceof BlobWorkerBlockedError || error instanceof CoreAssetError || error instanceof CrossOriginIsolationError || error instanceof ModelUnloadedError) throw error;
     }
     return this._gpuActive;
   }
@@ -4600,9 +4879,11 @@ var LlamaWebGpuBridgeRuntime = class {
     ];
     this._suppressedWarmupWarningCount = 0;
     this._didReportWarmupWarningSuppression = false;
-    await this._probeBackends();
+    const diagnosticUrls = /* @__PURE__ */ new Set();
+    const redact = createCoreAssetUrlRedactor();
+    await this._probeBackends(diagnosticUrls, redact);
     throwIfAborted(operationSignal, abortMessage);
-    const core = await this._ensureCore();
+    const core = await this._ensureCore(diagnosticUrls, redact);
     throwIfAborted(operationSignal, abortMessage);
     const modelUrls = expandModelShardUrls(url);
     if (modelUrls.length === 0) {
@@ -7259,6 +7540,7 @@ var LlamaWebGpuBridgeRuntime = class {
     }
   }
   async dispose() {
+    this._corePreflight = null;
     this._pthreadStartGeneration += 1;
     for (const start of this._pendingPthreadStarts) start.settle(false);
     this._pendingPthreadStarts.clear();
@@ -7427,6 +7709,7 @@ var BridgeWorkerProxy = class {
     this.startMode = "direct";
     this._supportsIncrementalAudio = false;
     this._supportsJsBackedModelStaging = false;
+    this._supportsCorePreflight = false;
     this.coreRetired = false;
     let workerInitError = null;
     const moduleCandidates = [moduleUrl];
@@ -7434,6 +7717,9 @@ var BridgeWorkerProxy = class {
     if (bridgeModuleFallback && bridgeModuleFallback !== moduleUrl) {
       moduleCandidates.push(bridgeModuleFallback);
     }
+    const workerUrls = new Set(moduleCandidates);
+    const redact = createCoreAssetUrlRedactor();
+    for (const url of workerUrls) redact.remember(url);
     for (const candidate of moduleCandidates) {
       if (this._worker) {
         break;
@@ -7442,6 +7728,8 @@ var BridgeWorkerProxy = class {
       if (!directWorkerUrl) {
         continue;
       }
+      workerUrls.add(directWorkerUrl);
+      redact.remember(directWorkerUrl);
       try {
         this._worker = new Worker(directWorkerUrl, { type: "module" });
       } catch (error) {
@@ -7467,7 +7755,7 @@ var BridgeWorkerProxy = class {
       }
     }
     if (!this._worker) {
-      const error = workerInitError || new Error("Failed to initialize bridge worker");
+      const error = redact.error(workerInitError || new Error("Failed to initialize bridge worker"));
       if (this._stopCspWatch && error && typeof error === "object") {
         markBlobStartBlocked(error, blobStartBlockReason(this._endCspWatch(), true));
       }
@@ -7485,6 +7773,7 @@ var BridgeWorkerProxy = class {
       if (type === "ready") {
         this._supportsIncrementalAudio = message.supportsIncrementalAudio === true;
         this._supportsJsBackedModelStaging = message.supportsJsBackedModelStaging === true;
+        this._supportsCorePreflight = message.supportsCorePreflight === true;
         this._clearReadyTimeout();
         this._endCspWatch();
         this._readyResolve?.();
@@ -7506,7 +7795,7 @@ var BridgeWorkerProxy = class {
       this._pending.delete(id);
       if (type === "error") {
         const errorMessage = String(message.message || "Worker request failed");
-        const workerError = message.embeddingErrorCode ? new EmbeddingError(message.embeddingErrorCode, errorMessage) : jsBackedStagingMode(this._config) !== "off" && isModelStagingErrorCode(message.modelStagingErrorCode) ? new ModelStagingError(message.modelStagingErrorCode, errorMessage) : message.errorCode === CROSS_ORIGIN_ISOLATION_REQUIRED ? new CrossOriginIsolationError(errorMessage) : message.errorCode === SINGLE_THREAD_CORE_UNSUPPORTED ? new SingleThreadCoreError(errorMessage) : message.errorCode === BLOB_WORKER_BLOCKED ? new BlobWorkerBlockedError(message.blobWorkerBlockReason ?? "script", errorMessage) : message.errorCode === MODEL_UNLOADED_AFTER_CORE_ABORT ? new ModelUnloadedError(errorMessage) : message.errorCode === "MODEL_TRANSFER_LENGTH_ERROR" ? createModelTransferLengthError(errorMessage) : new Error(errorMessage);
+        const workerError = isCoreAssetErrorPayload(message.coreAssetError) ? new CoreAssetError(message.coreAssetError.code, errorMessage, message.coreAssetError) : message.embeddingErrorCode ? new EmbeddingError(message.embeddingErrorCode, errorMessage) : jsBackedStagingMode(this._config) !== "off" && isModelStagingErrorCode(message.modelStagingErrorCode) ? new ModelStagingError(message.modelStagingErrorCode, errorMessage) : message.errorCode === CROSS_ORIGIN_ISOLATION_REQUIRED ? new CrossOriginIsolationError(errorMessage) : message.errorCode === SINGLE_THREAD_CORE_UNSUPPORTED ? new SingleThreadCoreError(errorMessage) : message.errorCode === BLOB_WORKER_BLOCKED ? new BlobWorkerBlockedError(message.blobWorkerBlockReason ?? "script", errorMessage) : message.errorCode === MODEL_UNLOADED_AFTER_CORE_ABORT ? new ModelUnloadedError(errorMessage) : message.errorCode === "MODEL_TRANSFER_LENGTH_ERROR" ? createModelTransferLengthError(errorMessage) : new Error(errorMessage);
         if (isDecisionErrorCode(message.decisionErrorCode)) {
           withDecisionErrorCode(workerError, message.decisionErrorCode);
         }
@@ -7520,7 +7809,7 @@ var BridgeWorkerProxy = class {
     };
     this._worker.onerror = (event) => {
       const message = event?.message || "Bridge worker crashed";
-      const error = new Error(String(message));
+      const error = new Error(redact.text(String(message)));
       error.llamadartWorkerCrash = true;
       this._clearReadyTimeout();
       const stopWatch = this._stopCspWatch;
@@ -7536,10 +7825,21 @@ var BridgeWorkerProxy = class {
       }
       this._pending.clear();
     };
-    this._worker.postMessage({ type: "init", config: { ...config, workerStart: this.startMode } });
+    this._worker.postMessage({
+      type: "init",
+      config: { ...config, workerStart: this.startMode },
+      coreWorkerUrls: [...workerUrls]
+    });
   }
   async call(method, args, onEvent, transferList = [], operationMeta = null, beforePost) {
     await this._ready;
+    if (method === "preflightCore" && !this._supportsCorePreflight) {
+      throw new CoreAssetError(
+        CORE_PREFLIGHT_UNSUPPORTED,
+        "The worker did not declare supportsCorePreflight. The bridge and worker scripts must come from the same release.",
+        { asset: "worker" }
+      );
+    }
     if (method === "synthesizeSpeech" && args[0]?.streamAudio === true && !this._supportsIncrementalAudio) {
       throw new TextToSpeechStreamingUnsupportedError();
     }
@@ -7627,6 +7927,13 @@ var BridgeWorkerProxy = class {
   }
   _resolveRequestTimeoutMs(method, args = []) {
     const explicitGlobal = Number(this._config.workerRequestTimeoutMs);
+    if (method === "preflightCore") {
+      if (Number.isFinite(explicitGlobal) && explicitGlobal > 0) return explicitGlobal;
+      const hasMemory64 = hasMemory64Candidate(this._config.preferMemory64 !== false, this._config.coreModuleUrlMem64);
+      const candidateCount = hasMemory64 ? 2 : 1;
+      const coreInitTimeout = resolveCoreInitTimeoutMs(this._config.coreInitTimeoutMs);
+      return Math.max(18e4, candidateCount * coreInitTimeout + PREFLIGHT_DIAGNOSTIC_TIMEOUT_MS + 3e4);
+    }
     const clamp = (value, fallback) => {
       if (!Number.isFinite(value) || value <= 0) {
         return fallback;
@@ -7715,6 +8022,7 @@ var LlamaWebGpuBridge = class {
   static supportsCompletionUsage = true;
   static supportsModelCacheQuery = true;
   static supportsJsBackedModelStaging = true;
+  static supportsCorePreflight = true;
   constructor(config = {}) {
     this._config = config;
     this._runtime = null;
@@ -8387,7 +8695,7 @@ var LlamaWebGpuBridge = class {
     return loadError?.name === "ModelTransferLengthError" || loadError?.code === "MODEL_TRANSFER_LENGTH_ERROR" || this._isNonRecoverableStagingError(error);
   }
   _isRecoverableWorkerFsError(error) {
-    if (isCoreRetiredError(error) || error instanceof SingleThreadCoreError || this._isNonRecoverableStagingError(error)) {
+    if (isCoreRetiredError(error) || error instanceof CoreAssetError || error instanceof SingleThreadCoreError || this._isNonRecoverableStagingError(error)) {
       return false;
     }
     const text = serializeWorkerError(error).toLowerCase();
@@ -8563,6 +8871,7 @@ var LlamaWebGpuBridge = class {
     return this._isWorkerTimeoutError(error) || this._shouldFallbackToMainThread(error);
   }
   _isWorkerTimeoutError(error) {
+    if (error instanceof CoreAssetError) return false;
     if (error && typeof error === "object" && error.llamadartWorkerTimeout === true) {
       return true;
     }
@@ -8810,7 +9119,7 @@ var LlamaWebGpuBridge = class {
     }
   }
   _shouldFallbackToMainThread(error) {
-    if (isCoreRetiredError(error) || error instanceof SingleThreadCoreError || this._isNonRecoverableStagingError(error) || error instanceof BlobWorkerBlockedError) {
+    if (isCoreRetiredError(error) || error instanceof CoreAssetError || error instanceof SingleThreadCoreError || this._isNonRecoverableStagingError(error) || error instanceof BlobWorkerBlockedError) {
       return false;
     }
     const text = serializeWorkerError(error).toLowerCase();
@@ -9068,6 +9377,23 @@ var LlamaWebGpuBridge = class {
       return;
     }
     this._applyShadowState(state);
+  }
+  async preflightCore() {
+    return this._runExclusive(() => this._preflightCoreUnlocked(), { kind: "preflight-core" });
+  }
+  async _preflightCoreUnlocked() {
+    if (this._workerProxy) {
+      try {
+        const result = await this._callWorker("preflightCore", []);
+        return { ...result, execution: "worker" };
+      } catch (error) {
+        if (!this._isWorkerUnusableError(error)) throw error;
+        this._disableWorkerFallback(error);
+        await this._waitForWorkerDisposal();
+        this._throwIfDisposed();
+      }
+    }
+    return this._runtime.preflightCore();
   }
   async loadModelFromUrl(url, options = {}) {
     return this._runExclusive(
@@ -10795,6 +11121,15 @@ function installBridgeWorkerHost() {
       ...error instanceof CrossOriginIsolationError || error instanceof SingleThreadCoreError || error instanceof ModelUnloadedError ? { errorCode: error.code } : {},
       ...error instanceof Error && error.name === "ModelTransferLengthError" ? { errorCode: "MODEL_TRANSFER_LENGTH_ERROR" } : {},
       ...error instanceof ModelStagingError ? { modelStagingErrorCode: error.code } : {},
+      ...error instanceof CoreAssetError ? {
+        coreAssetError: {
+          code: error.code,
+          asset: error.asset,
+          url: error.url,
+          httpStatus: error.httpStatus,
+          variant: error.variant
+        }
+      } : {},
       ...error instanceof BlobWorkerBlockedError ? { errorCode: error.code, blobWorkerBlockReason: error.reason } : {},
       ...decisionErrorCode ? { decisionErrorCode } : {},
       state
@@ -10808,16 +11143,20 @@ function installBridgeWorkerHost() {
     try {
       if (type === "init") {
         const config = message.config || {};
+        const workerUrls = Array.isArray(message.coreWorkerUrls) ? message.coreWorkerUrls.filter((url) => typeof url === "string") : [];
+        if (scope.location?.href) workerUrls.push(scope.location.href);
         bridge = new LlamaWebGpuBridge({
           ...config,
           ...resolveCoreAssets(config, false),
+          _coreWorkerUrls: workerUrls,
           disableWorker: true
         });
         bridge._onCoreRetired = () => self.postMessage({ type: "core-retired" });
         self.postMessage({
           type: "ready",
           supportsIncrementalAudio: true,
-          supportsJsBackedModelStaging: true
+          supportsJsBackedModelStaging: true,
+          supportsCorePreflight: true
         });
         return;
       }
@@ -10834,6 +11173,11 @@ function installBridgeWorkerHost() {
           bridge.cancel();
         }
         self.postMessage({ type: "result", id, value: void 0 });
+        return;
+      }
+      if (method === "preflightCore") {
+        const value2 = await bridge.preflightCore();
+        self.postMessage({ type: "result", id, value: value2, state: snapshotBridgeState(bridge) });
         return;
       }
       if (method === "loadModelFromUrl") {
@@ -11171,15 +11515,19 @@ if (shouldAutoBootBridgeWorkerHost()) {
 }
 if (typeof window !== "undefined") {
   const browserWindow = (
-    /** @type {Window & typeof globalThis & { LlamaWebGpuBridge?: typeof LlamaWebGpuBridge }} */
+    /** @type {Window & typeof globalThis & { LlamaWebGpuBridge?: typeof LlamaWebGpuBridge, CoreAssetError?: typeof CoreAssetError }} */
     window
   );
   if (!browserWindow.LlamaWebGpuBridge) {
     browserWindow.LlamaWebGpuBridge = LlamaWebGpuBridge;
   }
+  if (!browserWindow.CoreAssetError) {
+    browserWindow.CoreAssetError = CoreAssetError;
+  }
 }
 export {
   BlobWorkerBlockedError,
+  CoreAssetError,
   CrossOriginIsolationError,
   EmbeddingError,
   LlamaWebGpuBridge,

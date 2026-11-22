@@ -8,6 +8,7 @@ type CoreUrls = Pick<LlamaWebGpuBridgeConfig, 'coreModuleUrl' | 'coreModuleUrlMe
 
 export interface BridgeConfig extends LlamaWebGpuBridgeConfig {
   _coreAssetSources?: CoreAssetSources;
+  _coreWorkerUrls?: string[];
 }
 
 const workerAsset = ['llama_webgpu_bridge_worker.js', () => new URL('./llama_webgpu_bridge_worker.js', import.meta.url).href] as const;

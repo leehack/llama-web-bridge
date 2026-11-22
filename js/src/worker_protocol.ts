@@ -9,6 +9,7 @@ import type {
   ModelStagingErrorCode,
 } from './llama_webgpu_bridge.d.ts';
 import type { BlobWorkerBlockReason } from './internal/worker_start.ts';
+import type { CoreAssetErrorPayload } from './internal/core_preflight.ts';
 
 // Model state a worker reports so the facade can answer synchronous getters.
 export interface BridgeStateSnapshot {
@@ -25,6 +26,7 @@ export interface WorkerResponse {
   type: string;
   supportsIncrementalAudio?: boolean;
   supportsJsBackedModelStaging?: boolean;
+  supportsCorePreflight?: boolean;
   id?: number;
   value?: unknown;
   state?: BridgeStateSnapshot;
@@ -32,6 +34,7 @@ export interface WorkerResponse {
   embeddingErrorCode?: EmbeddingErrorCode;
   decisionErrorCode?: DecisionErrorCode;
   modelStagingErrorCode?: ModelStagingErrorCode;
+  coreAssetError?: CoreAssetErrorPayload;
   errorCode?: 'CROSS_ORIGIN_ISOLATION_REQUIRED' | 'SINGLE_THREAD_CORE_UNSUPPORTED' | 'MODEL_TRANSFER_LENGTH_ERROR'
     | 'MODEL_UNLOADED_AFTER_CORE_ABORT' | 'BLOB_WORKER_BLOCKED';
   blobWorkerBlockReason?: BlobWorkerBlockReason;
@@ -48,6 +51,7 @@ export interface WorkerRequest {
   type?: string;
   id?: number;
   config?: LlamaWebGpuBridgeConfig;
+  coreWorkerUrls?: string[];
   method?: unknown;
   args?: unknown;
   // The facade operation that made the call; on a `cancel`, the one it targets.

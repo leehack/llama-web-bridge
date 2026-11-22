@@ -3,6 +3,9 @@
 ## Unreleased
 
 - Build WebGPU release cores in parallel and qualify speech recognition and synthesis concurrently.
+- Add `LlamaWebGpuBridge.prototype.preflightCore()`, `LlamaWebGpuBridge.supportsCorePreflight` and `CoreAssetError` (`CORE_ASSET_UNAVAILABLE`, `CORE_PREFLIGHT_UNSUPPORTED`). `preflightCore()` initializes and verifies the selected core's loader and Wasm before any model transfer, in the active execution mode. It follows the memory64 fallback and finds Wasm binaries next to the loader. The bridge skips the wasm32 loader when memory64 initializes successfully. `loadModelFromUrl()` reuses the verified core and reports missing or unreachable core assets with the same `CoreAssetError`, including a redacted URL and the HTTP status when available.
+
+- Redact complete URL queries and fragments in core initialization logs and passthrough errors. Separate URLs with whitespace or redact each URL before joining them.
 
 ## v0.1.92 - 2026-11-22
 

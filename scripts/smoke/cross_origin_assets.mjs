@@ -67,9 +67,9 @@ export function renderHarness(name, assetOrigin, memoryMode) {
   const bridgeUrl = `${bridgeOrigin}/llama_webgpu_bridge.js`;
   const coreFile = scenario.bundledLoader ? 'bundled-loader.js' : `${scenario.oldCore ? 'old/' : ''}${core}.js`;
   const coreUrl = `${scenario.relativeCore ? '.' : assetOrigin}/${coreFile}`;
-  const wasmUrl = `${assetOrigin}/${scenario.failedWasm ? 'missing' : core}.wasm`;
+  const wasmUrl = `${assetOrigin}/${scenario.failedWasm ? 'missing.wasm?token=smoke-fixture' : `${core}.wasm`}`;
   return `
-const { LlamaWebGpuBridge, BlobWorkerBlockedError } = await import(${JSON.stringify(bridgeUrl)});
+const { LlamaWebGpuBridge, BlobWorkerBlockedError, CoreAssetError } = await import(${JSON.stringify(bridgeUrl)});
 const config = ${JSON.stringify({
     disableWorker: scenario.direct === true,
     allowSingleThreadCore: scenario.single === true,
@@ -119,7 +119,15 @@ try {
   ${scenario.failedWasm ? `
   result.rejections = [];
   for (let attempt = 0; attempt < 2; attempt++) {
-    try { await load(); } catch (error) { result.rejections.push(String(error)); }
+    try {
+      await load();
+    } catch (error) {
+      result.rejections.push({
+        name: error.name, code: error.code, asset: error.asset, httpStatus: error.httpStatus,
+        variant: error.variant, url: error.url,
+        typed: typeof CoreAssetError === 'function' && error instanceof CoreAssetError,
+      });
+    }
   }
   ` : `
   await load();
@@ -194,7 +202,16 @@ export function verifyScenario(name, memoryMode, result, workers, wasmRequests, 
   assert.equal(result.error, undefined, result.error?.message);
   if (scenario.failedWasm) {
     assert.equal(result.rejections?.length, 2, 'load and retry must both reject');
-    for (const error of result.rejections) assert.match(error, /fetching of the wasm failed/);
+    for (const error of result.rejections) {
+      assert.equal(error.typed, true);
+      assert.equal(error.name, 'CoreAssetError');
+      assert.equal(error.code, 'CORE_ASSET_UNAVAILABLE');
+      assert.equal(error.asset, 'wasm');
+      assert.equal(error.httpStatus, 404);
+      assert.equal(error.variant, 'wasm32');
+      const url = new URL(error.url);
+      assert.equal(error.url, `${url.origin}/missing.wasm`);
+    }
     assert.equal(result.liveWorkers, 0, 'failed core retained pthread workers');
     return;
   }

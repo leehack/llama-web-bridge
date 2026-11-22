@@ -1,4 +1,4 @@
-// Characterization of how main's runtime hands URL options to import() and to the core. Passes on main.
+// Characterization of how the runtime hands URL options to import() and to the core.
 import assert from 'node:assert/strict';
 import { registerHooks } from 'node:module';
 import { test } from 'node:test';
@@ -6,7 +6,7 @@ import { LlamaWebGpuBridgeRuntime } from '../../js/src/runtime.ts';
 const LOADER = new URL('../../js/src/internal/core_loader.ts', import.meta.url).href;
 
 // Serves a fake core for any specifier in `specifiers` and records what import() was asked for.
-function fakeCores(t, specifiers) {
+function fakeCores(t, specifiers, failingSpecifier) {
   const seen = [];
   const serial = (fakeCores.serial = (fakeCores.serial ?? 0) + 1);
   globalThis.__parityCoreArgs = [];
@@ -18,7 +18,10 @@ function fakeCores(t, specifiers) {
     },
     load(url, context, nextLoad) {
       if (!url.startsWith('fake-core:')) return nextLoad(url, context);
-      return { format: 'module', shortCircuit: true, source: 'export default async (arg) => { globalThis.__parityCoreArgs.push(arg); return { ccall: () => 0 }; };' };
+      const source = url === `fake-core:${serial}-${specifiers.indexOf(failingSpecifier)}`
+        ? 'export default async () => { throw new Error("Memory64 init failed"); };'
+        : 'export default async (arg) => { globalThis.__parityCoreArgs.push(arg); return { ccall: () => 0 }; };';
+      return { format: 'module', shortCircuit: true, source };
     },
   });
   t.after(() => { hook.deregister(); delete globalThis.__parityCoreArgs; });
@@ -38,16 +41,18 @@ for (const [form, base] of Object.entries(forms)) {
     assert.equal(runtime._coreVariant, 'wasm32');
   });
 
-  test(`coreModuleUrlMem64 ${form}: import() gets the caller's specifier, before the wasm32 one`, async (t) => {
+  test(`coreModuleUrlMem64 ${form}: import() gets the caller's specifier and uses wasm32 only on failure`, async (t) => {
     const mem64 = `${base}_mem64.js`;
-    const seen = fakeCores(t, [mem64, 'https://app.test/core32.js']);
-    const runtime = new LlamaWebGpuBridgeRuntime({ allowSingleThreadCore: true, preferMemory64: true, coreModuleUrlMem64: mem64, coreModuleUrl: 'https://app.test/core32.js' });
-    runtime._preferMemory64 = true;
-    await runtime._ensureCore();
-    assert.deepEqual(seen.map((s) => s.specifier), [mem64, 'https://app.test/core32.js']);
-    assert.ok(seen.every((s) => s.parentURL === LOADER));
-    assert.equal(globalThis.__parityCoreArgs.length, 1);
-    assert.equal(runtime._coreVariant, 'wasm64');
+    const core32 = 'https://app.test/core32.js';
+    for (const fallback of [false, true]) {
+      const seen = fakeCores(t, [mem64, core32], fallback ? mem64 : undefined);
+      const runtime = new LlamaWebGpuBridgeRuntime({ allowSingleThreadCore: true, preferMemory64: true, coreModuleUrlMem64: mem64, coreModuleUrl: core32 });
+      await runtime._ensureCore();
+      assert.deepEqual(seen.map((s) => s.specifier), fallback ? [mem64, core32] : [mem64]);
+      assert.ok(seen.every((s) => s.parentURL === LOADER));
+      assert.equal(globalThis.__parityCoreArgs.length, 1);
+      assert.equal(runtime._coreVariant, fallback ? 'wasm32' : 'wasm64');
+    }
   });
 
   test(`wasmUrl ${form}: locateFile returns the caller's value untouched`, async (t) => {
