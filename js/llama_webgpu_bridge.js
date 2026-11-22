@@ -10785,11 +10785,12 @@ function installBridgeWorkerHost() {
     } catch (_) {
       state = void 0;
     }
+    const message = error instanceof Error ? error.message || error.name || "Worker request failed" : serializeWorkerError(error);
     const decisionErrorCode = decisionErrorCodeOf(error);
     self.postMessage({
       type: "error",
       id,
-      message: serializeWorkerError(error),
+      message,
       ...error instanceof EmbeddingError ? { embeddingErrorCode: error.code } : {},
       ...error instanceof CrossOriginIsolationError || error instanceof SingleThreadCoreError || error instanceof ModelUnloadedError ? { errorCode: error.code } : {},
       ...error instanceof Error && error.name === "ModelTransferLengthError" ? { errorCode: "MODEL_TRANSFER_LENGTH_ERROR" } : {},

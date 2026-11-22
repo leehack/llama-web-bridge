@@ -11,7 +11,7 @@ const MODEL = 'https://models.test/model.gguf';
 const PROJECTOR = 'https://models.test/mmproj.gguf';
 const transferCode = 'MODEL_TRANSFER_LENGTH_ERROR';
 const transferMessage = 'Model response ended before its declared byte length.';
-const transferError = () => Object.assign(createModelTransferLengthError(transferMessage), {
+const transferError = (message = transferMessage) => Object.assign(createModelTransferLengthError(message), {
   llamadartLoadedBytes: 3,
   llamadartFilePath: '/mmproj/local.gguf',
 });
@@ -28,8 +28,15 @@ async function withWorkerProjector(t, nGpuLayers, loadProjector, run) {
   await withStubWorkerEnvironment(async ({ workers }) => {
     const bridge = createRealWorkerBridge({ jsBackedModelStaging: true, logLevel: 0 });
     const oldSelf = globalThis.self;
+    const errorReplies = [];
     const connectHost = async (worker) => {
-      const host = { postMessage: (reply) => worker.onmessage({ data: structuredClone(reply) }) };
+      const host = {
+        postMessage: (reply) => {
+          const data = structuredClone(reply);
+          if (data.type === 'error') errorReplies.push(data);
+          worker.onmessage({ data });
+        },
+      };
       globalThis.self = host;
       installBridgeWorkerHost();
       worker.postMessage = (request) => {
@@ -49,7 +56,7 @@ async function withWorkerProjector(t, nGpuLayers, loadProjector, run) {
       assert.equal(bridge._isCpuModelMode(), nGpuLayers === 0);
       const workerLoads = () => workers.flatMap((worker) => worker.posted)
         .filter((request) => request.method === 'loadMultimodalProjector').length;
-      await run({ bridge, workers, workerLoads, totalLoads: () => load.mock.callCount() });
+      await run({ bridge, workers, workerLoads, totalLoads: () => load.mock.callCount(), errorReplies });
     } finally {
       try {
         await bridge.dispose();
@@ -119,6 +126,23 @@ test('worker projector preserves a transfer length error on the CPU retry', asyn
     assert.equal(workerLoads(), 2);
     assert.equal(workers.length, 2);
   });
+});
+
+test('an empty-message transfer error keeps download fields off the worker wire', async (t) => {
+  await withWorkerProjector(t, 0, async () => { throw transferError(''); },
+    async ({ bridge, errorReplies }) => {
+      const error = await bridge.loadMultimodalProjector(PROJECTOR)
+        .then(() => assert.fail('projector load should reject'), (err) => err);
+      assert.equal(errorReplies.length, 1);
+      const [reply] = errorReplies;
+      assert.doesNotMatch(JSON.stringify(reply), /llamadartLoadedBytes|llamadartFilePath|local\.gguf/);
+      assert.equal(reply.errorCode, transferCode);
+      assert.equal(reply.message, 'ModelTransferLengthError');
+      assert.deepEqual(
+        { name: error.name, code: error.code, message: error.message },
+        { name: 'ModelTransferLengthError', code: transferCode, message: 'ModelTransferLengthError' },
+      );
+    });
 });
 
 test('transfer length errors match by either name or code with staging disabled', () => {
