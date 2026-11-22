@@ -218,6 +218,7 @@ export function renderHarness({
           let streamingTested = false;
           let streamChunkCount = 0;
           let streamWindowChunkTested = false;
+          const streamWindowSamples = 138240;
           if (${pyJson(testStreaming)}) {
             setStage(\`\${memoryMode}:\${runtimeMode}:synthesize-streamed\`);
             assert(capabilities.supportsIncrementalAudio === true, 'incremental audio capability is absent');
@@ -241,7 +242,12 @@ export function renderHarness({
               const mismatch = bytes.findIndex((byte, index) => byte !== expectedBytes[byteOffset + index]);
               assert(mismatch === -1, \`streamed PCM differs at byte \${byteOffset + mismatch}\`);
               received += chunk.pcm.length;
-              streamWindowChunkTested ||= chunk.state === 2 && chunk.pcm.length === 138240;
+              if (chunk.state === 2) {
+                assert(chunk.pcm.length === streamWindowSamples, 'unexpected generating PCM window length: ' + chunk.pcm.length);
+                streamWindowChunkTested = true;
+              } else {
+                assert(chunk.state === 3, 'unexpected streamed PCM state: ' + chunk.state);
+              }
             }
             assert(streamed.pcm instanceof Float32Array && streamed.pcm.length === 0, 'streamed result contains final PCM');
             assert(received === output.sampleCount && streamed.sampleCount === received, 'streamed sample count mismatch');
@@ -283,14 +289,21 @@ export function renderHarness({
               setStage(\`\${memoryMode}:\${runtimeMode}:cancel-streamed\`);
               const streamController = new AbortController();
               let firstChunkState = null;
+              let invalidWindowLength = null;
+              const streamCancelRequest = streamWindowChunkTested
+                ? request
+                : { ...request, text: 'Ready.', maxFrames: 1, seed: 4 };
               try {
                 await bridge.synthesizeSpeech({
-                  ...request,
+                  ...streamCancelRequest,
                   streamAudio: true,
                   signal: streamController.signal,
                   onProgress: (event) => {
                     if (event.pcm === undefined) return;
                     chunkAfterRejection ||= streamRejected;
+                    if (event.state === 2 && event.pcm.length !== streamWindowSamples) {
+                      invalidWindowLength ??= event.pcm.length;
+                    }
                     if (firstChunkState === null) {
                       firstChunkState = event.state;
                       streamController.abort();
@@ -302,6 +315,7 @@ export function renderHarness({
                 assert(error?.name === 'AbortError', \`unexpected streamed cancellation error: \${error}\`);
                 streamRejected = true;
               }
+              assert(invalidWindowLength === null, 'unexpected generating PCM window length: ' + invalidWindowLength);
               assert(
                 firstChunkState === (streamWindowChunkTested ? 2 : 3),
                 'streaming was not cancelled on the first PCM chunk',

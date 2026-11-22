@@ -96,6 +96,14 @@ export {
 
 export const QUALIFICATION_SCHEMA_VERSION = 2;
 export const ATTESTATION_TYPE = 'llama-web-bridge-automated-qualification';
+export const PHASE_RECORD_SCHEMA_VERSION = 1;
+export const PHASE_RECORD_TYPE = 'llama-web-bridge-qualification-phase';
+export const PHASE_RECORD_KEYS = Object.freeze([
+  'schema_version', 'phase_type', 'phase_name', 'candidate_fingerprint',
+  'candidate_run_id', 'candidate_artifact_id', 'candidate_run_attempt', 'bridge_source_sha',
+  'harness_version', 'harness_source_sha256', 'qualification_run_id',
+  'qualification_run_attempt', 'qualification_source_sha', 'qualification_environment', 'phase',
+]);
 // 4.0.0: the heavy gates run the Node smokes (scripts/*_browser_smoke.mjs).
 // 5.0.0: the harness itself is Node (scripts/release/*.mjs); the Python
 // release_*.py harness is gone.
@@ -1053,6 +1061,92 @@ export function validateQualificationEnvironment(value) {
   }
 }
 
+export function mergeQualificationEnvironments(speech, tts, assembler) {
+  for (const environment of [speech, tts, assembler]) validateQualificationEnvironment(environment);
+  for (const key of ['execution', 'runner_os', 'runner_arch', 'cpu_count']) {
+    const value = pyGet(speech, key);
+    if (!pyEquals(value, pyGet(tts, key)) || (key !== 'cpu_count' && !pyEquals(value, pyGet(assembler, key)))) {
+      throw new ContractError(`qualification_environment ${key} mismatch across qualification jobs`);
+    }
+  }
+  return Object.fromEntries(QUALIFICATION_ENVIRONMENT_KEYS.map((key) => [
+    key,
+    key === 'total_memory_bytes'
+      ? Math.min(Number(pyGet(speech, key)), Number(pyGet(tts, key)))
+      : pyGet(speech, key),
+  ]));
+}
+
+function phaseRecordBindings(phaseName, {
+  manifest,
+  candidateFingerprint,
+  candidateRunId,
+  candidateArtifactId,
+  candidateRunAttempt,
+  qualificationRunId,
+  qualificationRunAttempt,
+  qualificationSourceSha,
+  harnessDigest,
+}) {
+  if (!HEAVY_GATES.includes(phaseName)) throw new ContractError(`unknown qualification phase: ${phaseName}`);
+  if (requireStr(manifest, 'github_run_id', 'candidate manifest') !== candidateRunId) {
+    throw new ContractError('candidate manifest github_run_id does not match the candidate run');
+  }
+  if (candidateRunAttempt !== 1 || qualificationRunAttempt !== 1) {
+    throw new ContractError('candidate and qualification phase records require first attempts');
+  }
+  return {
+    schema_version: PHASE_RECORD_SCHEMA_VERSION,
+    phase_type: PHASE_RECORD_TYPE,
+    phase_name: phaseName,
+    candidate_fingerprint: candidateFingerprint,
+    candidate_run_id: candidateRunId,
+    candidate_artifact_id: candidateArtifactId,
+    candidate_run_attempt: candidateRunAttempt,
+    bridge_source_sha: requireStr(manifest, 'bridge_commit', 'candidate manifest'),
+    harness_version: HARNESS_VERSION,
+    harness_source_sha256: harnessDigest,
+    qualification_run_id: qualificationRunId,
+    qualification_run_attempt: qualificationRunAttempt,
+    qualification_source_sha: qualificationSourceSha,
+  };
+}
+
+export function buildPhaseRecord(phaseName, identity, environment, phase) {
+  const record = {
+    ...phaseRecordBindings(phaseName, identity),
+    qualification_environment: environment,
+    phase,
+  };
+  validatePhaseRecord(record, phaseName, identity);
+  return record;
+}
+
+export function loadPhaseRecord(filename) {
+  return loadAttestationFile(filename);
+}
+
+export function validatePhaseRecord(record, phaseName, identity) {
+  const label = `phase record ${phaseName}`;
+  requireExactMapping(record, PHASE_RECORD_KEYS, label);
+  for (const [key, expected] of Object.entries(phaseRecordBindings(phaseName, identity))) {
+    const actual = pyGet(record, key);
+    if ((isPyInt(expected) && !isPyInt(actual)) || !pyEquals(expected, actual)) {
+      throw new ContractError(`${label} ${key} mismatch: expected ${pyRepr(expected)}, got ${pyRepr(actual)}`);
+    }
+  }
+  validateQualificationEnvironment(pyGet(record, 'qualification_environment'));
+  const phase = pyGet(record, 'phase');
+  const requireWav = phaseName === 'text_to_speech';
+  validatePhase(phase, {
+    label: `${label}.phase`,
+    requiredModes: requireWav ? REQUIRED_TTS_MODES : REQUIRED_SPEECH_MODES,
+    phaseKeys: requireWav ? TTS_PHASE_KEYS : SPEECH_PHASE_KEYS,
+    requireWav,
+  });
+  return phase;
+}
+
 // --- workflow runs and artifacts ------------------------------------------------------------
 
 // Fail closed unless a run is the exact successful dispatch we require.
@@ -1674,6 +1768,30 @@ export const COMMANDS = Object.freeze({
       required('--output-attestation', 'path'),
     ],
   },
+  'qualify-phase': {
+    options: [
+      required('--phase'),
+      required('--candidate-run-id'),
+      optional('--speech-model-path', 'path'),
+      optional('--speech-mmproj-path', 'path'),
+      optional('--speech-audio-path', 'path'),
+      optional('--tts-model-path', 'path'),
+      optional('--tts-mmproj-path', 'path'),
+      optional('--tts-max-frames', 'int', 24),
+      optional('--speech-timeout-seconds', 'int', 1800),
+      optional('--tts-timeout-seconds', 'int', 1800),
+      optional('--diagnostics-dir', 'path'),
+      required('--output-phase', 'path'),
+    ],
+  },
+  'assemble-attestation': {
+    options: [
+      required('--candidate-run-id'),
+      required('--speech-phase', 'path'),
+      required('--tts-phase', 'path'),
+      required('--output-attestation', 'path'),
+    ],
+  },
   'verify-run': {
     options: [
       required('--run-json', 'path'),
@@ -1792,6 +1910,8 @@ async function qualifyCmd(args, write) {
 
 const RUNNERS = Object.freeze({
   qualify: qualifyCmd,
+  'qualify-phase': async (args, write) => (await import('./qualify.mjs')).qualifyPhaseCmd(args, write),
+  'assemble-attestation': async (args, write) => (await import('./qualify.mjs')).assembleAttestationCmd(args, write),
   'verify-run': verifyRunCmd,
   'verify-attestation': verifyAttestationCmd,
   'candidate-fingerprint': candidateFingerprintCmd,

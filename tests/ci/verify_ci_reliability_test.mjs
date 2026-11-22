@@ -1,5 +1,8 @@
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
+import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
 import { parse as parseYaml, stringify as stringifyYaml } from 'yaml';
@@ -10,7 +13,8 @@ import {
   EMSCRIPTEN_VERIFIER,
   EXPECTED_MODEL_PINS,
   QUALIFICATION_MODULE,
-  QUALIFY_COMMAND,
+  ASSEMBLE_ATTESTATION_COMMAND,
+  QUALIFY_PHASE_COMMAND,
   RELEASE_CONTRACT_SUITES,
   RELEASE_MANIFEST_MODULE,
   collectErrors as collectRepositoryErrors,
@@ -433,40 +437,40 @@ assertRejected(
 // --- Qualification harness setup --------------------------------------------
 
 // qualify runs the candidate's Node smokes: Node.js 24, npm ci and the
-// Playwright Chromium in candidate-source come first, and pip Playwright never.
-{
-  const qualificationErrors = (text) => {
-    const errors = [];
-    requireQualificationNodeHarness(text, errors);
-    return errors;
+// Playwright Chromium in candidate-source comes before either gate.
+test('qualification installs the locked candidate dependencies before each gate', () => {
+  const errors = (workflow) => {
+    const messages = [];
+    requireQualificationNodeHarness(stringifyYaml(workflow), messages);
+    return messages;
   };
-  const real = read(QUALIFICATION_PATH);
-  assert.deepEqual(qualificationErrors(real), []);
-  const setupNode = '        uses: actions/setup-node@v4\n        with:\n          node-version: 24\n';
-  const npmCi = '      - name: Install the candidate\'s locked npm dependencies\n        working-directory: candidate-source\n        run: npm ci --ignore-scripts\n';
-  const chromium = '        working-directory: candidate-source\n        run: npx --no-install playwright install --only-shell chromium\n';
-  for (const needle of [setupNode, npmCi, chromium, QUALIFY_COMMAND]) assert.ok(real.includes(needle), needle);
-  assert.equal(real.split(setupNode).length - 1, 2);
-  const qualifyStep = real.slice(real.indexOf('      - name: Run the heavy Qwen3-ASR and Qwen3-TTS gates'), real.indexOf('      - name: Re-verify the attestation'));
-  const setupMessage = 'must set up Node.js 24, run npm ci --ignore-scripts and install the Playwright Chromium in candidate-source';
-  for (const [label, text] of [
-    ['no setup-node', real.replaceAll(setupNode, '        uses: actions/cache@v4\n        with:\n          node-version: 24\n')],
-    ['Node 22', real.replaceAll(setupNode, setupNode.replace('24', '22'))],
-    ['npm ci in the trusted checkout', real.replace(npmCi, npmCi.replace('        working-directory: candidate-source\n', ''))],
-    ['npm ci with lifecycle scripts', real.replace(npmCi, npmCi.replace('npm ci --ignore-scripts', 'npm ci'))],
-    ['Chromium from the trusted checkout', real.replace(chromium, chromium.replace('        working-directory: candidate-source\n', ''))],
-    ['setup after qualify', real.replace(qualifyStep, '').replace('      - name: Re-verify the attestation', `${qualifyStep}      - name: Re-verify the attestation`)
-      .replace(npmCi, '').replace('      - name: Upload verified', `${npmCi}\n      - name: Upload verified`)],
-    ['no qualify', real.replace(QUALIFY_COMMAND, 'node candidate-source/scripts/release/qualification.mjs run-gates')],
-    ['qualify from the trusted checkout', real.replace(QUALIFY_COMMAND, 'node scripts/release/qualification.mjs qualify')],
-  ]) {
-    assert.ok(qualificationErrors(text).some((error) => error.includes(setupMessage)), label);
+  const original = () => parseYaml(read(QUALIFICATION_PATH));
+  assert.deepEqual(errors(original()), []);
+  for (const job of ['qualify-asr', 'qualify-tts']) {
+    for (const command of ['npm ci --ignore-scripts', 'npx --no-install playwright install --only-shell chromium']) {
+      for (const mutation of [
+        (steps, index) => { delete steps[index]['working-directory']; },
+        (steps, index) => { steps.push(...steps.splice(index, 1)); },
+      ]) {
+        const workflow = original();
+        const steps = workflow.jobs[job].steps;
+        mutation(steps, steps.findIndex((step) => step.run === command));
+        assertRejected(errors(workflow), `job ${job} must set up Node.js 24, run npm ci --ignore-scripts`);
+      }
+    }
+    for (const mutation of [
+      (step) => { step.run = step.run.replace(QUALIFY_PHASE_COMMAND, 'node candidate-source/scripts/release/qualification.mjs run-gates'); },
+      (step) => { step.run = step.run.replace(QUALIFY_PHASE_COMMAND, 'node scripts/release/qualification.mjs qualify-phase'); },
+    ]) {
+      const workflow = original();
+      mutation(workflow.jobs[job].steps.find((step) => step.run?.includes(QUALIFY_PHASE_COMMAND)));
+      assertRejected(errors(workflow), `job ${job} must set up Node.js 24, run npm ci --ignore-scripts`);
+    }
   }
-  assertRejected(
-    qualificationErrors(real.replace(chromium, `${chromium}      - run: python3 -m pip install --user playwright==1.63.0\n`)),
-    'must never install Python Playwright; found: "pip install"',
-  );
-}
+  const workflow = original();
+  workflow.jobs['qualify-tts'].steps.push({ run: 'python3 -m pip install --user playwright==1.63.0' });
+  assertRejected(errors(workflow), 'must never install Python Playwright; found: "pip install"');
+});
 
 // --- Publication PAT contract ------------------------------------------------
 
@@ -691,7 +695,7 @@ assertRejected(validatePublicationPatContract('jobs: [unterminated', EXPECTED_ST
     [CI_PATH, '        run: node scripts/smoke/state_persistence.mjs --threading single --memory-mode wasm64\n',
       '        continue-on-error: true\n        run: node scripts/smoke/state_persistence.mjs --threading single --memory-mode wasm64\n',
       'job smoke-core must run "node scripts/smoke/state_persistence.mjs --threading single --memory-mode wasm64" unconditionally without continue-on-error'],
-    [CANDIDATE_PATH, '          WEBGPU_BRIDGE_BUILD_SINGLE_THREAD: 1\n', '',
+    [CANDIDATE_PATH, '          WEBGPU_BRIDGE_SKIP_JS_CHECK: 1\n', '',
       'must build the memory64 and single-thread cores'],
     [CANDIDATE_PATH, '        id: state_st_gate\n', '        id: state_st_gate_renamed\n',
       'must build the memory64 and single-thread cores'],
@@ -824,17 +828,17 @@ assertRejected(validatePublicationPatContract('jobs: [unterminated', EXPECTED_ST
     [QUALIFICATION_PATH, 'node scripts/release/qualification.mjs extract-artifact --type candidate', 'node scripts/release/qualification.mjs extract-artifact --type attestation',
       'bind the attestation to the exact candidate artifact id'],
     [QUALIFICATION_PATH, 'node scripts/release/qualification.mjs verify-attestation', 'node candidate-source/scripts/release/qualification.mjs verify-attestation',
-      `missing: "${RELEASE_QUALIFICATION_COMMAND} verify-attestation"`],
+      'before trusted node scripts/release/qualification.mjs verify-attestation'],
     [QUALIFICATION_PATH, 'node scripts/release/qualification.mjs candidate-fingerprint', 'python3 scripts/release_qualification.py candidate-fingerprint',
       `missing: "${RELEASE_QUALIFICATION_COMMAND} candidate-fingerprint"`],
-    [QUALIFICATION_PATH, QUALIFY_COMMAND, 'python3 candidate-source/scripts/release_qualification.py qualify', `missing: "${QUALIFY_COMMAND}`],
+    [QUALIFICATION_PATH, QUALIFY_PHASE_COMMAND, 'python3 candidate-source/scripts/release_qualification.py qualify', 'before node candidate-source/scripts/release/qualification.mjs qualify-phase'],
     [QUALIFICATION_PATH, '--harness-dir candidate-source/scripts', '--harness-dir scripts', 'missing: "--harness-dir candidate-source/scripts"'],
     // Node.js 24 before each job's first node command; the privileged publish
     // jobs without a package cache and without packages.
     [QUALIFICATION_PATH, '      - name: Setup Node.js for the trusted contract\n        uses: actions/setup-node@v4\n        with:\n          node-version: 24\n\n', '',
-      `${QUALIFICATION_PATH} job qualify must set up Node.js 24 with actions/setup-node@v4 before its first node command`],
+      `${QUALIFICATION_PATH} job qualify-asr must set up Node.js 24 with actions/setup-node@v4 before its first node command`],
     [CANDIDATE_PATH, 'uses: actions/setup-node@v4', 'uses: actions/setup-node@v5',
-      `${CANDIDATE_PATH} job build-candidate must set up Node.js 24`],
+      `${CANDIDATE_PATH} job validate-inputs must set up Node.js 24`],
     [CI_PATH, '      - uses: actions/setup-node@v4\n        with:\n          node-version: 24\n      - id: scope', '      - id: scope',
       `${CI_PATH} job changes must set up Node.js 24`],
     [PUBLISH_PATH, '      - name: Setup Node.js\n        uses: actions/setup-node@v4\n        with:\n          node-version: 24\n      - name: Fail closed', '      - name: Fail closed',
@@ -949,3 +953,238 @@ console.log('CI reliability verifier tests passed');
     '.github/workflows/publish_assets.yml': assetWorkflow.replace('  actions: read', '  id-token: write\n  actions: read'),
   }), 'publish_assets.yml must declare read-only top-level permissions');
 }
+
+test('release workflow jobs build and qualify in parallel with first-attempt guards', () => {
+  const candidate = parseYaml(read(CANDIDATE_PATH)).jobs;
+  assert.deepEqual(candidate['build-core']?.strategy.matrix.variant, ['wasm32', 'wasm64', 'wasm32_st', 'wasm64_st']);
+  assert.deepEqual(candidate['gate-and-package'].needs, ['validate-inputs', 'validate-js', 'build-core']);
+  for (const job of Object.values(candidate)) {
+    assert.ok(job.steps.some((step) => step.run?.includes('"${GITHUB_RUN_ATTEMPT_STRING}" != "1"')));
+  }
+
+  const qualification = parseYaml(read(QUALIFICATION_PATH)).jobs;
+  assert.deepEqual(qualification.attest.needs, ['qualify-asr', 'qualify-tts']);
+  for (const job of Object.values(qualification)) {
+    assert.ok(job.steps.some((step) => step.run?.includes('"${GITHUB_RUN_ATTEMPT}" != "1"')));
+  }
+});
+
+function checkReleaseWorkflowMutation(workflowPath, mutate, expected) {
+  const workflow = parseYaml(read(workflowPath));
+  mutate(workflow.jobs);
+  assertRejected(collectRepositoryErrors({ [workflowPath]: stringifyYaml(workflow) }), expected);
+}
+
+test('candidate contract guards all four core variants and the packaging dependencies', () => {
+  const core = 'must build the memory64 and single-thread cores in the fail-fast four-variant matrix';
+  for (const mutate of [
+    (jobs) => { jobs['build-core'].strategy.matrix.variant.pop(); },
+    (jobs) => { jobs['build-core'].strategy['fail-fast'] = false; },
+    (jobs) => { delete jobs['build-core'].steps.find((step) => step.env?.WEBGPU_BRIDGE_VARIANT).env.WEBGPU_BRIDGE_SKIP_JS_CHECK; },
+    (jobs) => { jobs['build-core'].steps.push({ uses: 'actions/cache@v4', with: { path: '.build', key: 'build' } }); },
+  ]) {
+    checkReleaseWorkflowMutation(CANDIDATE_PATH, mutate, core);
+  }
+  checkReleaseWorkflowMutation(CANDIDATE_PATH,
+    (jobs) => { jobs['gate-and-package'].needs = ['validate-inputs', 'build-core']; },
+    'gate-and-package must depend on validate-inputs, validate-js and build-core');
+  for (const reference of ['ccache', 'EM_CACHE', 'EM_COMPILER_WRAPPER', 'emcache-', 'webgpu-core-', 'webgpu-ccache-']) {
+    checkReleaseWorkflowMutation(CANDIDATE_PATH,
+      (jobs) => { jobs['validate-js'].steps.push({ run: `test -n '${reference}'` }); },
+      'never reference CI core or compiler caches');
+  }
+  checkReleaseWorkflowMutation(CANDIDATE_PATH,
+    (jobs) => { jobs['gate-and-package'].steps.find((step) => step.uses === 'actions/cache@v4').with.path += '\n${{ runner.temp }}/webgpu_bridge_dist'; },
+    'Actions cache paths must be limited to the release smoke models');
+  checkReleaseWorkflowMutation(CANDIDATE_PATH,
+    (jobs) => { jobs['gate-and-package'].steps.find((step) => step.uses === 'actions/download-artifact@v4').with['run-id'] = 42; },
+    "must download only the current run's compiled core artifacts");
+});
+
+for (const [workflow, jobs, attempt] of [
+  [CANDIDATE_PATH, ['validate-inputs', 'validate-js', 'build-core', 'gate-and-package'], 'GITHUB_RUN_ATTEMPT_STRING'],
+  [QUALIFICATION_PATH, ['qualify-asr', 'qualify-tts', 'attest'], 'GITHUB_RUN_ATTEMPT'],
+]) {
+  for (const job of jobs) {
+    test(`release workflow rejects missing attempt guard in ${job}`, () => {
+      checkReleaseWorkflowMutation(workflow,
+        (jobs) => { jobs[job].steps[0].run = jobs[job].steps[0].run.replace(`"\${${attempt}}" != "1"`, '"1" != "1"'); },
+        `job ${job} must validate`);
+    });
+  }
+}
+
+test('candidate contract rejects an optional release gate', () => {
+  for (const id of ['state_gate', 'state_mem64_gate', 'state_st_gate', 'state_mem64_st_gate', 'multimodal_gate']) {
+    for (const gate of [{ if: false }, { 'continue-on-error': true }]) {
+      checkReleaseWorkflowMutation(CANDIDATE_PATH,
+        (jobs) => { Object.assign(jobs['gate-and-package'].steps.find((step) => step.id === id), gate); },
+        'run all five gates unconditionally without continue-on-error');
+    }
+  }
+});
+
+test('qualification contract rejects missing shards and name-only phase downloads', () => {
+  for (const [job, output] of [['qualify-asr', 'speech_id'], ['qualify-tts', 'tts_id']]) {
+    checkReleaseWorkflowMutation(QUALIFICATION_PATH,
+      (jobs) => { jobs.attest.needs = jobs.attest.needs.filter((need) => need !== job); },
+      'attest must depend on both');
+    checkReleaseWorkflowMutation(QUALIFICATION_PATH, (jobs) => {
+      const step = jobs.attest.steps.find((step) => step.with?.['artifact-ids']?.includes(output));
+      delete step.with['artifact-ids'];
+      step.with.name = 'phase';
+    }, 'by immutable artifact id');
+    checkReleaseWorkflowMutation(QUALIFICATION_PATH, (jobs) => {
+      const step = jobs.attest.steps.find((step) => step.with?.['artifact-ids']?.includes(output));
+      delete step.with['merge-multiple'];
+    }, 'by immutable artifact id');
+  }
+  checkReleaseWorkflowMutation(QUALIFICATION_PATH, (jobs) => {
+    const step = jobs.attest.steps.find((step) => step.run?.includes(ASSEMBLE_ATTESTATION_COMMAND));
+    step.run = step.run.replace(ASSEMBLE_ATTESTATION_COMMAND, 'node scripts/release/qualification.mjs assemble-attestation');
+  }, 'attest must run node candidate-source/scripts/release/qualification.mjs assemble-attestation before trusted');
+  checkReleaseWorkflowMutation(QUALIFICATION_PATH,
+    (jobs) => { jobs.attest.steps.push({ run: 'npm ci --ignore-scripts' }); },
+    'attest must never install or run packages');
+});
+
+test('qualification contract requires all model URLs and digests in its shards', () => {
+  for (const [job, models] of [
+    ['qualify-asr', ['SPEECH_MODEL', 'SPEECH_MMPROJ', 'SPEECH_AUDIO']],
+    ['qualify-tts', ['TTS_MODEL', 'TTS_MMPROJ']],
+  ]) {
+    for (const model of models) {
+      for (const suffix of ['URL', 'SHA256']) {
+        checkReleaseWorkflowMutation(QUALIFICATION_PATH,
+          (jobs) => { delete jobs[job].env[`LLAMA_WEBGPU_${model}_${suffix}`]; },
+          model);
+      }
+    }
+  }
+});
+
+test('release artifact contracts reject removing digests or bypassing ID guards', () => {
+  for (const [workflow, job, verifyId, message] of [
+    [CANDIDATE_PATH, 'gate-and-package', 'verify_core_bytes', 'verify downloaded core bytes'],
+    [QUALIFICATION_PATH, 'attest', 'verify_phase_bytes', 'verify downloaded phase bytes'],
+  ]) {
+    checkReleaseWorkflowMutation(workflow, (jobs) => {
+      jobs[job].steps = jobs[job].steps.filter((step) => step.id !== verifyId);
+    }, message);
+  }
+  checkReleaseWorkflowMutation(CANDIDATE_PATH, (jobs) => {
+    const guard = jobs['gate-and-package'].steps.find((step) => step.id === 'core_artifacts');
+    guard.run = guard.run.replace('^[1-9][0-9]*:', '^[0-9]*:');
+  }, 'guard positive, distinct core artifact IDs');
+  checkReleaseWorkflowMutation(CANDIDATE_PATH, (jobs) => {
+    const guard = jobs['gate-and-package'].steps.find((step) => step.id === 'core_artifacts');
+    guard.run = guard.run.replace('",${ids}," == *",${id},"*', '1 == 0');
+  }, 'guard positive, distinct core artifact IDs');
+  for (const replacement of ['""', "'invalid'", '${{ needs.qualify-asr.outputs.phase_artifact_id }}']) {
+    checkReleaseWorkflowMutation(QUALIFICATION_PATH, (jobs) => {
+      jobs.attest.steps.find((step) => step.id === 'phase_artifacts').env.TTS_ARTIFACT_ID = replacement;
+    }, 'download the text_to_speech record by immutable artifact id');
+  }
+  checkReleaseWorkflowMutation(QUALIFICATION_PATH, (jobs) => {
+    const guard = jobs.attest.steps.find((step) => step.id === 'phase_artifacts');
+    guard.run = guard.run.replace('"${SPEECH_ARTIFACT_ID}" = "${TTS_ARTIFACT_ID}"', '1 = 0');
+  }, 'guard positive, distinct phase artifact IDs');
+  for (const job of ['qualify-asr', 'qualify-tts', 'attest']) {
+    checkReleaseWorkflowMutation(QUALIFICATION_PATH, (jobs) => {
+      const step = jobs[job].steps.find((entry) => entry.name === 'Download the exact candidate artifact');
+      step.run = step.run.replace('^[1-9][0-9]*$', '^[0-9]*$');
+    }, `job ${job} must guard a positive candidate artifact ID`);
+  }
+});
+
+function replayTransfer(t) {
+  const directory = mkdtempSync(path.join(tmpdir(), 'rcs-artifact-test-'));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const output = path.join(directory, 'step-output');
+  const run = (step, env) => {
+    assert.ok(step?.run, 'workflow transfer script is required');
+    writeFileSync(output, '');
+    const result = spawnSync('bash', ['-c', step.run], {
+      encoding: 'utf8',
+      env: { ...process.env, RUNNER_TEMP: directory, GITHUB_OUTPUT: output, ...env },
+    });
+    assert.ifError(result.error);
+    return { status: result.status, output: readFileSync(output, 'utf8'), logs: result.stdout + result.stderr };
+  };
+  return { directory, run };
+}
+
+test('candidate transfer verifies staged pairs and requires four positive, distinct IDs', (t) => {
+  const jobs = parseYaml(read(CANDIDATE_PATH)).jobs;
+  const stage = jobs['build-core'].steps.find((step) => step.id === 'stage_core');
+  const guard = jobs['gate-and-package'].steps.find((step) => step.id === 'core_artifacts');
+  const verify = jobs['gate-and-package'].steps.find((step) => step.id === 'verify_core_bytes');
+  const { directory, run } = replayTransfer(t);
+  const dist = path.join(directory, 'dist');
+  const staging = path.join(directory, 'candidate-core');
+  mkdirSync(dist);
+  const env = { OUT_DIR: dist };
+  const files = [];
+  const cells = [['wasm32', ''], ['wasm64', '_mem64'], ['wasm32_st', '_st'], ['wasm64_st', '_mem64_st']];
+  for (const [index, [variant, suffix]] of cells.entries()) {
+    const pair = [`llama_webgpu_core${suffix}.js`, `llama_webgpu_core${suffix}.wasm`];
+    for (const name of pair) writeFileSync(path.join(dist, name), name);
+    const staged = run(stage, { ...env, VARIANT: variant });
+    assert.equal(staged.status, 0, staged.logs);
+    assert.match(staged.output, /^sha256=[0-9a-f]{64}\n$/u);
+    env[`CORE_${variant.toUpperCase()}`] = `${301 + index}:${staged.output.slice(7).trim()}`;
+    for (const name of pair) copyFileSync(path.join(staging, name), path.join(dist, name));
+    files.push(...pair);
+    rmSync(staging, { recursive: true });
+  }
+  const allowed = run(guard, env);
+  assert.equal(allowed.status, 0, allowed.logs);
+  assert.equal(allowed.output, 'ids=301,302,303,304\n');
+  const digest = env.CORE_WASM64_ST.split(':')[1];
+  for (const report of ['', `:${digest}`, `0:${digest}`, `abc:${digest}`, `301:${digest}`]) {
+    const denied = run(guard, { ...env, CORE_WASM64_ST: report });
+    assert.equal(denied.status, 1, report);
+    assert.equal(denied.output, '');
+  }
+  assert.equal(run(verify, env).status, 0);
+  for (const name of files) {
+    const file = path.join(dist, name);
+    writeFileSync(file, 'modified download');
+    assert.equal(run(verify, env).status, 1, name);
+    writeFileSync(file, name);
+  }
+});
+
+test('qualification transfer verifies both phase files and requires two positive, distinct IDs', (t) => {
+  const steps = parseYaml(read(QUALIFICATION_PATH)).jobs.attest.steps;
+  const guard = steps.find((step) => step.id === 'phase_artifacts');
+  const verify = steps.find((step) => step.id === 'verify_phase_bytes');
+  const { directory, run } = replayTransfer(t);
+  const allowed = run(guard, { SPEECH_ARTIFACT_ID: '701', TTS_ARTIFACT_ID: '702' });
+  assert.equal(allowed.status, 0, allowed.logs);
+  assert.equal(allowed.output, 'speech_id=701\ntts_id=702\n');
+  for (const [speech, tts] of [['', '702'], ['701', ''], ['invalid', '702'], ['701', '7e2'], ['701', '0'], ['701', '701']]) {
+    const denied = run(guard, { SPEECH_ARTIFACT_ID: speech, TTS_ARTIFACT_ID: tts });
+    assert.equal(denied.status, 1, JSON.stringify([speech, tts]));
+    assert.equal(denied.output, '');
+  }
+
+  const files = { SPEECH_SHA256: 'speech/speech-to-text-phase.json', TTS_SHA256: 'tts/text-to-speech-phase.json' };
+  const phaseRoot = path.join(directory, 'phases');
+  const env = {};
+  for (const [role, name] of Object.entries(files)) {
+    const file = path.join(phaseRoot, name);
+    mkdirSync(path.dirname(file), { recursive: true });
+    writeFileSync(file, name);
+    env[role] = createHash('sha256').update(name).digest('hex');
+  }
+  const matched = run(verify, env);
+  assert.equal(matched.status, 0, matched.logs);
+  for (const name of Object.values(files)) {
+    const file = path.join(phaseRoot, name);
+    writeFileSync(file, 'modified download');
+    assert.equal(run(verify, env).status, 1, name);
+    writeFileSync(file, name);
+  }
+  assert.equal(run(verify, { ...env, TTS_SHA256: '' }).status, 1);
+});

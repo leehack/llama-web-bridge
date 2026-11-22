@@ -965,7 +965,8 @@ function checkCiRunsContracts({ ci, candidate, qualification, publish }, testFil
   // Row 41: CI, candidate and publish run the JS contract tests without npm
   // lifecycle scripts and prove the tracked generated bridge matches its source.
   for (const workflow of [ci, candidate, publish]) {
-    check.includes(workflow.path, workflow.runText, [
+    const commands = workflow === candidate ? workflow.jobRunText('validate-js') : workflow.runText;
+    check.includes(workflow.path, commands, [
       'npm ci --ignore-scripts',
       'npm run check:js',
       'git ls-files --error-unmatch js/llama_webgpu_bridge.js js/llama_webgpu_bridge_worker.js js/llama_webgpu_bridge.d.ts',
@@ -979,7 +980,8 @@ function checkCiRunsContracts({ ci, candidate, qualification, publish }, testFil
   // own checkout. They are Node tests under tests/, which npm run check:js
   // (row 41) runs through npm test's glob; each named suite must exist.
   for (const workflow of [candidate, publish]) {
-    check.includes(workflow.path, workflow.runText, [
+    const commands = workflow === candidate ? workflow.jobRunText('validate-js') : workflow.runText;
+    check.includes(workflow.path, commands, [
       'npm run check:js',
       'node scripts/ci/verify_ci_reliability.mjs',
     ], 'run the release contract suites (through npm run check:js) and the CI reliability contract');
@@ -1111,7 +1113,6 @@ function checkCiRunsContracts({ ci, candidate, qualification, publish }, testFil
       && coreSave.raw.if === "steps.core-cache.outputs.cache-hit != 'true' && github.event_name == 'push' && github.ref == 'refs/heads/main'",
     `${ci.path} must save the core cache only on a main push after copying the core files, using the restore key on a miss`,
   );
-  check.excludes(candidate.path, candidate.text, ['webgpu-core-', 'webgpu-ccache-'], 'never reference CI core or compiler caches');
   for (const workflow of [ci, candidate, qualification, publish]) {
     check.require(
       workflow.steps.every((step) => (workflow === ci && step.job === 'smoke-core')
@@ -1200,7 +1201,8 @@ export const POLICY_QUALIFICATION_COMMAND = 'node publication-policy/scripts/rel
 export const POLICY_PUBLICATION_STATE_COMMAND = 'node publication-policy/scripts/release/publication_state.mjs';
 export const EXTRACT_ARTIFACT_COMMAND = `${RELEASE_QUALIFICATION_COMMAND} extract-artifact`;
 // qualify runs the candidate's own harness, from its checkout.
-export const QUALIFY_COMMAND = 'node candidate-source/scripts/release/qualification.mjs qualify';
+export const QUALIFY_PHASE_COMMAND = 'node candidate-source/scripts/release/qualification.mjs qualify-phase';
+export const ASSEMBLE_ATTESTATION_COMMAND = 'node candidate-source/scripts/release/qualification.mjs assemble-attestation';
 const NODE_COMMAND = /(?:^|[\s;&|(`$])node\s/;
 const PACKAGE_COMMAND = /\b(?:npm|pnpm|yarn|npx|pip3?|corepack)\b/;
 const hasFullActionSha = (uses) => /^[\w./-]+@[0-9a-f]{40}$/.test(uses);
@@ -1248,7 +1250,8 @@ export const PRIVILEGED_PUBLISH_JOBS = Object.freeze(['validate-request', 'verif
 export function checkNodeSetup({ ci, candidate, qualification, publish }, errors) {
   for (const workflow of [ci, candidate, qualification, publish]) {
     for (const name of Object.keys(workflow.jobs)) {
-      const privileged = workflow === publish && PRIVILEGED_PUBLISH_JOBS.includes(name);
+      const privileged = (workflow === publish && PRIVILEGED_PUBLISH_JOBS.includes(name))
+        || (workflow === qualification && name === 'attest');
       errors.push(...nodeSetupErrors(workflow, name, { privileged }));
     }
   }
@@ -1669,44 +1672,125 @@ function checkNpmPublication(workflow, errors) {
 
 function checkCandidateAndQualification({ candidate, qualification, publish }, errors) {
   const check = checker(errors);
-  // Row 84: the candidate is built once, on the first attempt, unprivileged.
-  const attempt = candidate.steps.find((step) => step.run.includes('"${GITHUB_RUN_ATTEMPT_STRING}" != "1"'));
+  const candidateJobs = ['validate-inputs', 'validate-js', 'build-core', 'gate-and-package'];
   check.require(
-    attempt !== undefined && attempt.env.GITHUB_RUN_ATTEMPT_STRING === '${{ github.run_attempt }}',
-    `${candidate.path} must refuse any run attempt other than 1`,
+    sameList(sorted(Object.keys(candidate.jobs)), sorted(candidateJobs)),
+    `${candidate.path} must declare the input, JS, core and packaging jobs`,
   );
+  for (const job of candidateJobs) {
+    const boundary = candidate.jobSteps(job)[0];
+    check.require(
+      hasReleaseBoundary(boundary, [
+        '"${GITHUB_RUN_ATTEMPT_STRING}" != "1"',
+        '"${ASSETS_IMMUTABLE_RELEASES_ENABLED}" != "true"',
+        '"${ORCHESTRATOR_CORRELATION_ID}"',
+        '"${BRIDGE_SOURCE_SHA}"',
+      ]) && boundary.env.GITHUB_RUN_ATTEMPT_STRING === '${{ github.run_attempt }}',
+      `${candidate.path} job ${job} must validate the request boundary and refuse any run attempt other than 1`,
+    );
+  }
   check.require(
-    (candidate.runText.match(/\.\/scripts\/build\/build_bridge\.sh\b/g) ?? []).length === 1,
-    `${candidate.path} must build the candidate exactly once`,
+    (candidate.runText.match(/\.\/scripts\/build\/build_bridge\.sh\b/g) ?? []).length === 1
+      && occurrences(candidate.runText, 'npm run check:js') === 1,
+    `${candidate.path} must build the candidate exactly once per variant and run check:js once`,
   );
   check.require(
     !candidate.text.includes(PUBLICATION_PAT_NAME)
       && Object.keys(candidate.jobs).every((name) => candidate.job(name).environment === undefined),
     `${candidate.path} must stay unprivileged: no publication PAT and no environment`,
   );
-  const build = candidate.steps.find((step) => /\.\/scripts\/build\/build_bridge\.sh\b/.test(step.run));
-  const stateGate = candidate.steps.find((step) => step.id === 'state_gate');
-  const multimodalGate = candidate.steps.find((step) => step.id === 'multimodal_gate');
+  const strategy = mapping(candidate.job('build-core').strategy);
+  const variants = mapping(strategy.matrix).variant;
+  const coreVariants = ['wasm32', 'wasm64', 'wasm32_st', 'wasm64_st'];
+  const build = candidate.jobSteps('build-core').find((step) => /\.\/scripts\/build\/build_bridge\.sh\b/.test(step.run));
   check.require(
-    build !== undefined
-      && String(build.env.WEBGPU_BRIDGE_BUILD_MEM64) === '1'
-      && String(build.env.WEBGPU_BRIDGE_BUILD_SINGLE_THREAD) === '1'
-      && stateGate?.run.trim() === 'node scripts/smoke/state_persistence.mjs'
-      && candidate.steps.some((step) => step.id === 'state_mem64_gate'
-        && step.run.trim() === 'node scripts/smoke/state_persistence.mjs --memory-mode wasm64'
-        && step.raw.if === undefined && step.raw['continue-on-error'] === undefined)
-      && candidate.steps.some((step) => step.id === 'state_st_gate'
-        && step.run.trim() === 'node scripts/smoke/state_persistence.mjs --threading single'
-        && step.raw.if === undefined && step.raw['continue-on-error'] === undefined)
-      && candidate.steps.some((step) => step.id === 'state_mem64_st_gate'
-        && step.run.trim() === 'node scripts/smoke/state_persistence.mjs --threading single --memory-mode wasm64'
-        && step.raw.if === undefined && step.raw['continue-on-error'] === undefined)
-      && multimodalGate?.run.trim() === 'node scripts/smoke/multimodal.mjs'
-      && candidate.steps.some((step) => step.env.STATE_CONCLUSION === '${{ steps.state_gate.outcome }}'
-        && step.env.MULTIMODAL_CONCLUSION === '${{ steps.multimodal_gate.outcome }}'),
-    `${candidate.path} must build the memory64 and single-thread cores and record the outcomes of its state persistence and multimodal gates`,
+    strategy['fail-fast'] === true
+      && deepEqual(variants, coreVariants)
+      && Object.keys(mapping(strategy.matrix)).length === 1
+      && build?.env.WEBGPU_BRIDGE_VARIANT === '${{ matrix.variant }}'
+      && String(build.env.WEBGPU_BRIDGE_SKIP_JS_CHECK) === '1'
+      && !candidate.jobSteps('build-core').some((step) => /^actions\/cache(?:[\/@])/.test(step.uses)),
+    `${candidate.path} must build the memory64 and single-thread cores in the fail-fast four-variant matrix, skipping JS checks and Actions caches`,
   );
-  const uploads = candidate.steps.filter((step) => /^actions\/upload-artifact@/.test(step.uses)).map((step) => step.with.name);
+  check.excludes(candidate.path, candidate.text, [
+    'webgpu-core-', 'webgpu-ccache-', 'emcache-', 'EM_CACHE', 'EM_COMPILER_WRAPPER', 'ccache',
+  ], 'never reference CI core or compiler caches');
+  const modelCachePaths = [
+    '~/.cache/llama-web-bridge/state-smoke-models',
+    '~/.cache/llama-web-bridge/multimodal-smoke-models',
+  ];
+  check.require(
+    candidate.steps.filter((step) => /^actions\/cache(?:[\/@])/.test(step.uses)).every((step) =>
+      step.job === 'gate-and-package' && step.uses === 'actions/cache@v4'
+      && sameList(String(step.with.path).trim().split(/\s+/u), modelCachePaths)
+      && String(step.with.key).startsWith('release-smoke-')),
+    `${candidate.path} Actions cache paths must be limited to the release smoke models`,
+  );
+  const coreDownloads = candidate.steps.filter((step) => /^actions\/download-artifact@/.test(step.uses));
+  const [coreDownload] = coreDownloads;
+  const packagingSteps = candidate.jobSteps('gate-and-package');
+  const coreGuard = packagingSteps.find((step) => step.id === 'core_artifacts');
+  const coreVerification = packagingSteps.find((step) => step.id === 'verify_core_bytes');
+  check.require(
+    coreDownloads.length === 1 && isRequiredStep(coreDownload) && coreDownload.job === 'gate-and-package'
+      && coreDownload.uses === 'actions/download-artifact@v4'
+      && coreDownload.with['artifact-ids'] === '${{ steps.core_artifacts.outputs.ids }}'
+      && coreDownload.with['merge-multiple'] === true
+      && coreDownload.with.path === '${{ runner.temp }}/webgpu_bridge_dist'
+      && ['run-id', 'github-token', 'name', 'pattern'].every((key) => !has(coreDownload.with, key)),
+    `${candidate.path} must download only the current run's compiled core artifacts`,
+  );
+  check.require(
+    isRequiredStep(coreGuard) && coreDownload !== undefined && coreGuard.index < coreDownload.index
+      && coreGuard.run.includes('! "${core}" =~ ^[1-9][0-9]*:[0-9a-f]{64}$')
+      && coreGuard.run.includes('",${ids}," == *",${id},"*')
+      && coreGuard.run.includes("printf 'ids=%s\\n' \"${ids}\" >> \"${GITHUB_OUTPUT}\""),
+    `${candidate.path} must guard positive, distinct core artifact IDs before download`,
+  );
+  const coreDigest = 'sha256sum "llama_webgpu_core${suffix}.js" "llama_webgpu_core${suffix}.wasm" | sha256sum';
+  const coreBuildSteps = candidate.jobSteps('build-core');
+  const stageCore = coreBuildSteps.find((step) => step.id === 'stage_core');
+  const uploadCore = coreBuildSteps.find((step) => step.id === 'upload_core');
+  const buildOutputs = mapping(candidate.job('build-core').outputs);
+  check.require(
+    isRequiredStep(stageCore) && stageCore.run.includes(coreDigest)
+      && stageCore.run.includes("printf 'sha256=%s\\n' \"${digest%% *}\" >> \"${GITHUB_OUTPUT}\"")
+      && isRequiredStep(uploadCore) && stageCore.index < uploadCore.index
+      && uploadCore.uses === 'actions/upload-artifact@v4'
+      && uploadCore.with.name === 'candidate-core-${{ matrix.variant }}'
+      && uploadCore.with.path === '${{ runner.temp }}/candidate-core/'
+      && isRequiredStep(coreVerification) && coreDownload !== undefined && coreDownload.index < coreVerification.index
+      && packagingSteps.some((step) => step.name === 'Assemble the candidate distribution' && coreVerification.index < step.index)
+      && coreVerification.run.includes(coreDigest)
+      && coreVerification.run.includes('"${digest%% *}" != "${expected[index]}"')
+      && coreVariants.every((variant) =>
+        buildOutputs[variant] === `\${{ matrix.variant == '${variant}' && format('{0}:{1}', steps.upload_core.outputs.artifact-id, steps.stage_core.outputs.sha256) || '' }}`
+        && coreGuard?.env[`CORE_${variant.toUpperCase()}`] === `\${{ needs.build-core.outputs.${variant} }}`
+        && coreGuard.run.includes(`"\${CORE_${variant.toUpperCase()}}"`)
+        && coreVerification.run.includes(`"\${CORE_${variant.toUpperCase()}#*:}"`)),
+    `${candidate.path} must verify downloaded core bytes against the producing jobs before assembly`,
+  );
+  check.require(
+    ['validate-js', 'build-core'].every((job) => sameList(candidate.needs(job), ['validate-inputs']))
+      && sameList(sorted(candidate.needs('gate-and-package')), sorted(candidateJobs.slice(0, 3))),
+    `${candidate.path} gate-and-package must depend on validate-inputs, validate-js and build-core`,
+  );
+  const stateSmoke = 'node scripts/smoke/state_persistence.mjs';
+  const gates = {
+    state_gate: stateSmoke,
+    state_mem64_gate: `${stateSmoke} --memory-mode wasm64`,
+    state_st_gate: `${stateSmoke} --threading single`,
+    state_mem64_st_gate: `${stateSmoke} --threading single --memory-mode wasm64`,
+    multimodal_gate: 'node scripts/smoke/multimodal.mjs',
+  };
+  check.require(
+    Object.entries(gates).every(([id, command]) => packagingSteps.some((step) =>
+      step.id === id && step.run.trim() === command && isRequiredStep(step)))
+      && packagingSteps.some((step) => step.env.STATE_CONCLUSION === '${{ steps.state_gate.outcome }}'
+        && step.env.MULTIMODAL_CONCLUSION === '${{ steps.multimodal_gate.outcome }}'),
+    `${candidate.path} must build the memory64 and single-thread cores, run all five gates unconditionally without continue-on-error, and record the state and multimodal outcomes`,
+  );
+  const uploads = packagingSteps.filter((step) => /^actions\/upload-artifact@/.test(step.uses)).map((step) => step.with.name);
   check.require(
     uploads.includes('exact-webgpu-bridge-dist') && uploads.includes('bridge-candidate-prequalification')
       && candidate.text.includes('pending-automated-qualification'),
@@ -1811,7 +1895,6 @@ function checkCandidateAndQualification({ candidate, qualification, publish }, e
   ], 'never accept a transported attestation or hold the publication PAT');
   check.includes(qualification.path, shellCommands(qualification.runText), [
     `${RELEASE_QUALIFICATION_COMMAND} verify-run`,
-    `${QUALIFY_COMMAND} --candidate-run-id "\${CANDIDATE_RUN_ID}"`,
     `${RELEASE_QUALIFICATION_COMMAND} verify-attestation`,
     `${RELEASE_QUALIFICATION_COMMAND} candidate-fingerprint`,
     '--harness-dir candidate-source/scripts',
@@ -1825,23 +1908,139 @@ function checkCandidateAndQualification({ candidate, qualification, publish }, e
   requireQualificationNodeHarness(qualification.text, errors);
 }
 
-// qualify runs the candidate's Node smokes, so Node.js 24 and the candidate's
-// locked npm dependencies (with their Playwright Chromium) are installed in
-// candidate-source before it, and no Python Playwright is.
+function isRequiredStep(step) {
+  return step !== undefined && step.raw.if === undefined && step.raw['continue-on-error'] === undefined;
+}
+
+function hasReleaseBoundary(step, conditions) {
+  return isRequiredStep(step)
+    && step.env.DISPATCHING_ACTOR === '${{ github.triggering_actor }}'
+    && step.env.REPOSITORY_OWNER === '${{ github.repository_owner }}'
+    && [
+      '"${GITHUB_REPOSITORY}" != "${BRIDGE_REPO}"',
+      '"${DISPATCHING_ACTOR}" != "${REPOSITORY_OWNER}"',
+      '"${GITHUB_REF}" != "refs/heads/${bridge_default}"',
+      ...conditions,
+    ].every((test) => step.run.includes(test));
+}
+
 export function requireQualificationNodeHarness(text, errors, relativePath = WORKFLOWS.qualification) {
   const check = checker(errors);
   const qualification = new Workflow(relativePath, text, errors);
-  const qualifyIndex = qualification.steps.findIndex((step) => shellCommands(step.run).includes(QUALIFY_COMMAND));
-  const before = (predicate) => qualification.steps.some((step, index) => index < qualifyIndex && predicate(step));
-  const inCandidateSource = (step, command) => step.run.trim() === command && step.raw['working-directory'] === 'candidate-source';
+  const jobs = ['qualify-asr', 'qualify-tts', 'attest'];
   check.require(
-    qualifyIndex >= 0
-      && before((step) => /^actions\/setup-node@/.test(step.uses) && String(step.with['node-version']) === '24')
-      && before((step) => inCandidateSource(step, 'npm ci --ignore-scripts'))
-      && before((step) => inCandidateSource(step, 'npx --no-install playwright install --only-shell chromium')),
-    `${relativePath} must set up Node.js 24, run npm ci --ignore-scripts and install the Playwright Chromium `
-      + `in candidate-source before ${QUALIFY_COMMAND}`,
+    sameList(sorted(Object.keys(qualification.jobs)), sorted(jobs))
+      && jobs.slice(0, 2).every((job) => qualification.needs(job).length === 0)
+      && sameList(sorted(qualification.needs('attest')), jobs.slice(0, 2)),
+    `${relativePath} must qualify ASR and TTS in parallel and attest must depend on both`,
   );
+  for (const job of jobs) {
+    check.require(
+      hasReleaseBoundary(qualification.jobSteps(job)[0], [
+        '"${GITHUB_ACTOR}" != "${REPOSITORY_OWNER}"',
+        '"${GITHUB_RUN_ATTEMPT}" != "1"',
+        '"${CANDIDATE_RUN_ID}"',
+        '"${ORCHESTRATOR_CORRELATION_ID}"',
+      ]),
+      `${relativePath} job ${job} must validate the dispatcher and repository boundary and refuse any run attempt other than 1`,
+    );
+    check.includes(`${relativePath} job ${job}`, shellCommands(qualification.jobRunText(job)), [
+      `${RELEASE_QUALIFICATION_COMMAND} verify-run`,
+      `${RELEASE_QUALIFICATION_COMMAND} candidate-fingerprint`,
+      `${EXTRACT_ARTIFACT_COMMAND} --type candidate --archive "\${RUNNER_TEMP}/candidate.zip" --destination "\${RUNNER_TEMP}/candidate"`,
+      '--run-attempt 1',
+      'actions/artifacts/${CANDIDATE_ARTIFACT_ID}/zip',
+      'repos/${BRIDGE_REPO}/compare/${head_sha}...${bridge_default}',
+      '"${candidate_correlation_id}" != "${ORCHESTRATOR_CORRELATION_ID}"',
+    ], 'prove the candidate run, first attempt, artifact id and correlation');
+    const candidateDownload = qualification.jobSteps(job).find((step) =>
+      step.run.includes('actions/artifacts/${CANDIDATE_ARTIFACT_ID}/zip'));
+    const candidateIdGuard = 'if [[ ! "${CANDIDATE_ARTIFACT_ID}" =~ ^[1-9][0-9]*$ ]]; then';
+    check.require(
+      isRequiredStep(candidateDownload) && candidateDownload.run.includes(candidateIdGuard)
+        && candidateDownload.run.indexOf(candidateIdGuard) < candidateDownload.run.indexOf('gh api'),
+      `${relativePath} job ${job} must guard a positive candidate artifact ID before download`,
+    );
+  }
+
+  const attestationSteps = qualification.jobSteps('attest');
+  const assembly = attestationSteps.find((step) => step.run.includes(ASSEMBLE_ATTESTATION_COMMAND));
+  const verification = attestationSteps.find((step) => step.run.includes(`${RELEASE_QUALIFICATION_COMMAND} verify-attestation`));
+  const phaseGuard = attestationSteps.find((step) => step.id === 'phase_artifacts');
+  const phaseVerification = attestationSteps.find((step) => step.id === 'verify_phase_bytes');
+  check.require(
+    isRequiredStep(phaseGuard)
+      && phaseGuard.run.includes('! "${SPEECH_ARTIFACT_ID}" =~ ^[1-9][0-9]*$')
+      && phaseGuard.run.includes('! "${TTS_ARTIFACT_ID}" =~ ^[1-9][0-9]*$')
+      && phaseGuard.run.includes('"${SPEECH_ARTIFACT_ID}" = "${TTS_ARTIFACT_ID}"')
+      && phaseGuard.run.includes("printf 'speech_id=%s\\ntts_id=%s\\n' \"${SPEECH_ARTIFACT_ID}\" \"${TTS_ARTIFACT_ID}\" >> \"${GITHUB_OUTPUT}\""),
+    `${relativePath} attest must guard positive, distinct phase artifact IDs before download`,
+  );
+  check.require(
+    isRequiredStep(phaseVerification) && assembly !== undefined && phaseVerification.index < assembly.index
+      && phaseVerification.run.includes('set -euo pipefail')
+      && phaseVerification.run.includes('"${SPEECH_SHA256}" "${TTS_SHA256}" | sha256sum -c -')
+      && phaseVerification.run.includes("printf '%s  speech/speech-to-text-phase.json\\n%s  tts/text-to-speech-phase.json\\n'"),
+    `${relativePath} attest must verify downloaded phase bytes against the producing shards before assembly`,
+  );
+  check.require(
+    isRequiredStep(assembly) && isRequiredStep(verification) && assembly.index < verification.index
+      && verification.run.includes('--harness-dir candidate-source/scripts'),
+    `${relativePath} attest must run ${ASSEMBLE_ATTESTATION_COMMAND} before trusted ${RELEASE_QUALIFICATION_COMMAND} verify-attestation`,
+  );
+  check.require(
+    !attestationSteps.some((step) => PACKAGE_COMMAND.test(step.run)),
+    `${relativePath} attest must never install or run packages`,
+  );
+  for (const [job, phase, directory] of [
+    ['qualify-asr', 'speech_to_text', 'speech'],
+    ['qualify-tts', 'text_to_speech', 'tts'],
+  ]) {
+    const steps = qualification.jobSteps(job);
+    const command = `${QUALIFY_PHASE_COMMAND} --phase ${phase} --candidate-run-id "\${CANDIDATE_RUN_ID}"`;
+    const qualify = steps.find((step) => shellCommands(step.run).includes(command));
+    const before = (predicate) => steps.some((step) =>
+      qualify !== undefined && step.index < qualify.index && isRequiredStep(step) && predicate(step));
+    const inSource = (step, run) => step.run.trim() === run && step.raw['working-directory'] === 'candidate-source';
+    check.require(
+      isRequiredStep(qualify)
+        && before((step) => step.uses === 'actions/setup-node@v4' && String(step.with['node-version']) === '24')
+        && before((step) => inSource(step, 'npm ci --ignore-scripts'))
+        && before((step) => inSource(step, 'npx --no-install playwright install --only-shell chromium')),
+      `${relativePath} job ${job} must set up Node.js 24, run npm ci --ignore-scripts and install the Playwright Chromium `
+        + `in candidate-source before ${command}`,
+    );
+    const upload = steps.find((step) => step.id === 'upload_phase');
+    const digestPath = phase.replaceAll('_', '-') + '-phase.json';
+    const prefix = directory.toUpperCase();
+    const download = attestationSteps.find((step) =>
+      step.with['artifact-ids'] === `\${{ steps.phase_artifacts.outputs.${directory}_id }}`);
+    check.require(
+      isRequiredStep(upload) && qualify !== undefined && upload.index > qualify.index
+        && upload.uses === 'actions/upload-artifact@v4'
+        && upload.with.name === `qualification-phase-${phase.replaceAll('_', '-')}`
+        && upload.with['if-no-files-found'] === 'error'
+        && Number(upload.with['retention-days']) === 1
+        && mapping(qualification.job(job).outputs).phase_artifact_id === '${{ steps.upload_phase.outputs.artifact-id }}'
+        && phaseGuard?.env[`${prefix}_ARTIFACT_ID`] === `\${{ needs.${job}.outputs.phase_artifact_id }}`
+        && isRequiredStep(download) && phaseGuard.index < download.index
+        && download.uses === 'actions/download-artifact@v4'
+        && download.with['merge-multiple'] === true
+        && download.with.path === `\${{ runner.temp }}/phases/${directory}`
+        && ['name', 'pattern', 'run-id', 'github-token'].every((key) => !has(download.with, key)),
+      `${relativePath} attest must download the ${phase} record by immutable artifact id from ${job}`,
+    );
+    check.require(
+      qualify?.id === 'qualify_phase'
+        && qualify.run.includes(`digest="$(sha256sum "\${RUNNER_TEMP}/phase/${digestPath}")"`)
+        && qualify.run.includes("printf 'sha256=%s\\n' \"${digest%% *}\" >> \"${GITHUB_OUTPUT}\"")
+        && upload?.with.path === `\${{ runner.temp }}/phase/${digestPath}`
+        && mapping(qualification.job(job).outputs).phase_sha256 === '${{ steps.qualify_phase.outputs.sha256 }}'
+        && phaseVerification?.env[`${prefix}_SHA256`] === `\${{ needs.${job}.outputs.phase_sha256 }}`
+        && download !== undefined && download.index < phaseVerification.index,
+      `${relativePath} attest must verify the ${phase} digest emitted by ${job}`,
+    );
+  }
   check.excludes(relativePath, qualification.runText, ['pip install', '-m playwright'], 'never install Python Playwright');
   // Only the lockfile decides the gate dependencies: no other npm install.
   check.require(

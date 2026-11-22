@@ -381,3 +381,15 @@ test('qualify parses the Python options and defaults', () => {
     outputAttestation: 'f',
   });
 });
+
+test('sharded qualification CLI only accepts a candidate run ID', () => {
+  for (const [command, options] of [
+    ['qualify-phase', ['--phase', 'speech_to_text', '--output-phase', 'phase.json']],
+    ['assemble-attestation', ['--speech-phase', 'asr.json', '--tts-phase', 'tts.json', '--output-attestation', 'attestation.json']],
+  ]) {
+    const args = [command, '--candidate-run-id', CANDIDATE_RUN_ID, ...options];
+    assert.equal(parseArgs(args).args.candidateRunId, CANDIDATE_RUN_ID);
+    assert.throws(() => parseArgs([...args, '--candidate-dist', 'dist']), ArgparseExit);
+    assert.throws(() => main([...args, '--candidate-dist', 'dist'], () => {}), ArgparseExit);
+  }
+});
