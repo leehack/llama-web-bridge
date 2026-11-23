@@ -54,7 +54,7 @@ and `SharedArrayBuffer` was unavailable. The cores used one CPU thread.
 | Qwen3-4B-Q4_K_M (2.33 GiB) | `memory64` Off (`/models`), worker | 4,388 ms | 8.01 GiB (8.60 GB) | — | 124.9 / 42.0 tok/s | Pass |
 | Qwen3-4B-Q4_K_M (2.33 GiB) | `memory64` JS-backed (`/jsmodels`), direct | 2,049 ms | 656 MiB (0.69 GB) | 3.79 GB (drops to 23.5 MB) | 124.8 / 50.7 tok/s | Pass |
 | Qwen3-4B-Q4_K_M (2.33 GiB) | `memory64` JS-backed (`/jsmodels`), worker | 1,585 ms | 656 MiB (0.69 GB) | — | 128.6 / 50.0 tok/s | Pass |
-| Gemma 4 E2B Q4_K_S (2.83 GiB) | `wasm32` JS-backed (`/jsmodels`), direct | 1,389 ms | 2.09 GiB | — | — / 64.0 tok/s | Pass (`36/36` GPU layers) |
+| Gemma 4 E2B Q4_K_S (2.83 GiB) | `wasm32` JS-backed (`/jsmodels`), direct | 2,120 ms (3-run median) | 2.09 GiB | — | 134.4 / 49.2 tok/s | Pass (`36/36` GPU layers) |
 | Qwen3-8B-Q4_K_M (4.68 GiB) | `wasm32` JS-backed (`/jsmodels`), direct | — | — | — | — | Fail: wasm32 4 GiB `gguf_init_from_reader` tensor overflow |
 
 For the 767 MiB model, median native load time rose from 444.6 ms to 480.9 ms
@@ -66,10 +66,11 @@ before staging chunks were released. The 8B model exceeded the separate
 wasm32 tensor payload limit of 4 GiB and reported
 `MODEL_TENSOR_SIZE_LIMIT_EXCEEDED`.
 
-The Gemma 4 run used Chrome 158 on an Apple M4 Max. The wasm32 core reads
-the model's per-layer token embeddings eagerly so chunked staging can load
-them without a file mapping. The embedding table uses about 1.5 GiB of CPU
-memory with all GPU layers offloaded.
+The Gemma 4 runs used headless Chrome 153 on an Apple M4 Max and generated 128
+tokens from a 28-token prompt. The first run's prefill was 66.2 tok/s and the
+table lists the median. The wasm32 core reads the model's per-layer token
+embeddings eagerly so chunked staging can load them without a file mapping. The
+embedding table uses about 1.5 GiB of CPU memory with all GPU layers offloaded.
 
 ## iOS Safari
 
