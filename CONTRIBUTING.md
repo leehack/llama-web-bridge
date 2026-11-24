@@ -126,6 +126,9 @@ WEBGPU_BRIDGE_BUILD_SINGLE_THREAD=1 \
 ./scripts/build/build_bridge.sh
 ```
 
+CMake applies the [carried llama.cpp patches](patches/llama.cpp/README.md)
+to build-directory source copies and verifies their markers in each Wasm core.
+
 ## Validate Outputs
 
 ### Expected build outputs

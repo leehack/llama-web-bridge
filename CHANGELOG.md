@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Upload WebGPU model weights in bounded batches to reduce browser transfer memory during model load.
 - Turn off llama.cpp lazy tensor reads in wasm32 cores. Its 4 GiB threshold truncates to zero in a 32-bit `size_t`, which made llama.cpp read every lazy-marked tensor, such as Gemma 4's per-layer embeddings, through a file mapping and aborted JS-backed model staging. Memory64 cores keep the default.
 
 ## v0.1.93 - 2026-11-22

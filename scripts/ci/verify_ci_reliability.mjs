@@ -1086,7 +1086,7 @@ function checkCiRunsContracts({ ci, candidate, qualification, publish }, testFil
   const checkout = buildSteps.find((step) => step.uses === 'actions/checkout@v4');
   const nativeInputs = buildSteps.find((step) => step.id === 'native-inputs');
   const fingerprintCommands = shellCommands(nativeInputs?.run ?? '').split('\n').map((line) => line.trim());
-  const fingerprintCommand = 'fingerprint="$(git ls-tree -r -z HEAD -- src CMakeLists.txt cmake scripts/build '
+  const fingerprintCommand = 'fingerprint="$(git ls-tree -r -z HEAD -- src CMakeLists.txt cmake patches/llama.cpp scripts/build '
     + 'scripts/release/cli.mjs scripts/release/errors.mjs scripts/release/json.mjs '
     + 'scripts/release/python_compat.mjs scripts/release/unicode15.mjs .github/workflows/ci.yml | sha256sum)"';
   check.require(
@@ -1095,7 +1095,7 @@ function checkCiRunsContracts({ ci, candidate, qualification, publish }, testFil
       && nativeInputs.raw.if === undefined && nativeInputs.raw['continue-on-error'] === undefined
       && fingerprintCommands.includes('set -euo pipefail') && fingerprintCommands.includes(fingerprintCommand)
       && fingerprintCommands.includes('echo "sha256=${fingerprint%% *}" >> "$GITHUB_OUTPUT"'),
-    `${ci.path} must fingerprint the checked-out native input tree, including scripts/build, its local imports, and the workflow, before restoring the core cache`,
+    `${ci.path} must fingerprint the checked-out native input tree, including carried patches, scripts/build, its local imports, and the workflow, before restoring the core cache`,
   );
   const coreKey = 'webgpu-core-v1-${{ runner.os }}-${{ runner.arch }}-${{ matrix.variant }}'
     + '-${{ env.EMSCRIPTEN_VERSION }}-${{ steps.compiler-cache.outputs.upstream }}-'
@@ -1107,6 +1107,14 @@ function checkCiRunsContracts({ ci, candidate, qualification, publish }, testFil
   );
   const coreSave = coreCacheSteps.find((step) => step.uses === 'actions/cache/save@v4');
   const coreBuild = ci.step('build-core', 'Build bridge artifacts');
+  const verifyPatches = ci.step('build-core', 'Verify carried patches in built core');
+  check.require(
+    verifyPatches !== undefined && coreBuild !== undefined && coreSave !== undefined
+      && coreBuild.index < verifyPatches.index && verifyPatches.index < coreSave.index
+      && verifyPatches.raw.if === undefined && verifyPatches.raw['continue-on-error'] === undefined
+      && shellCommands(verifyPatches.run).trim() === 'node scripts/build/llama_cpp_patches.mjs verify third_party/llama_cpp "$RUNNER_TEMP"/webgpu_bridge_dist/llama_webgpu_core*.wasm',
+    `${ci.path} must verify carried-patch markers in restored and newly built cores before caching them`,
+  );
   check.require(
     coreCacheSteps.length === 2 && coreSave?.job === 'build-core' && coreBuild !== undefined
       && coreSave.index > coreBuild.index && coreSave.with.path === corePath && coreSave.with.key === coreSaveKey
@@ -1749,6 +1757,13 @@ function checkCandidateAndQualification({ candidate, qualification, publish }, e
   );
   const coreDigest = 'sha256sum "llama_webgpu_core${suffix}.js" "llama_webgpu_core${suffix}.wasm" | sha256sum';
   const coreBuildSteps = candidate.jobSteps('build-core');
+  const releasePatchLinks = candidate.step('build-core', 'Verify release patch issue links');
+  check.require(
+    isRequiredStep(releasePatchLinks) && build !== undefined && releasePatchLinks.index < build.index
+      && releasePatchLinks.run.trim().split('\n').map((line) => line.trim()).join('\n')
+        === 'if [[ -d patches/llama.cpp ]]; then\nnode scripts/build/llama_cpp_patches.mjs verify-release\nfi',
+    candidate.path + " must verify release patch issue links before building a core",
+  );
   const stageCore = coreBuildSteps.find((step) => step.id === 'stage_core');
   const uploadCore = coreBuildSteps.find((step) => step.id === 'upload_core');
   const buildOutputs = mapping(candidate.job('build-core').outputs);

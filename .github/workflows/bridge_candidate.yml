@@ -403,6 +403,12 @@ jobs:
             exit 1
           fi
 
+      - name: Verify release patch issue links
+        run: |
+          if [[ -d patches/llama.cpp ]]; then
+            node scripts/build/llama_cpp_patches.mjs verify-release
+          fi
+
       - name: Verify exact upstream tag commit
         run: |
           set -euo pipefail
