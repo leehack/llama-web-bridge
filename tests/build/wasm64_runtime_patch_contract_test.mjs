@@ -20,12 +20,14 @@ import {
 // Representative fragments from the Emscripten 6.0.8 output shape validated on
 // main. Both raw numeric values and already-wrapped values are included because
 // the patch is intentionally idempotent.
+const writeCopyLoop = (heap) => `for(var i=0;i<length;i++){${heap}[dataBuffer+i]=buffer[offset+i]}var bytesRead;`;
 const CURRENT_EMSCRIPTEN_OUTPUT = `
 bytesRead=__wasmfs_pread(stream.fd,dataBuffer,length,position);
 bytesRead=__wasmfs_read(stream.fd,BigInt(dataBuffer),BigInt(length));
 bytesRead=__wasmfs_pwrite(stream.fd,dataBuffer,length,position);
 bytesRead=__wasmfs_write(stream.fd,BigInt(dataBuffer),BigInt(length));
 allocated=__wasmfs_mmap(length,prot,flags,stream.fd,offset);
+${writeCopyLoop('HEAP8')}
 `;
 
 // Tiny wasm modules shaped like the cores: a pthread link imports its shared
@@ -115,13 +117,13 @@ const WASM64_IMPORTED = importedMemory(0x07);
     '__wasmfs_read', '__wasmfs_pread', '__wasmfs_write', '__wasmfs_pwrite', '__wasmfs_mmap',
   ]);
   const { text, counts } = patchWasm64Runtime(CURRENT_EMSCRIPTEN_OUTPUT);
-  assert.deepEqual(counts, Object.fromEntries(PATCHES.map(([name]) => [name, 1])));
+  assert.deepEqual(counts, { ...Object.fromEntries(PATCHES.map(([name]) => [name, 1])), wasmfs_write_copy: 1 });
   for (const [, , replacement] of PATCHES) assert.ok(text.includes(replacement), `patched output must contain ${replacement}`);
 }
 
 // Each single match still fails the five-symbol contract and names the others.
 {
-  const lines = CURRENT_EMSCRIPTEN_OUTPUT.split('\n').filter((line) => line);
+  const lines = CURRENT_EMSCRIPTEN_OUTPUT.split('\n').filter((line) => line.includes('__wasmfs_'));
   assert.equal(lines.length, 5);
   for (const [onlyName] of PATCHES) {
     const onlyLine = lines.find((line) => line.includes(onlyName));
@@ -136,6 +138,59 @@ const WASM64_IMPORTED = importedMemory(0x07);
     });
   }
 }
+
+// The generated writer must skip the indexed loop for a large, complete
+// byte buffer but keep its legacy behavior for other buffer shapes.
+for (const [raw, threaded] of [
+  [writeCopyLoop('HEAP8'), false],
+  [writeCopyLoop('(growMemViews(),HEAP8)'), true],
+  ['for (var i = 0; i < length; i++) {\n  HEAP8[(dataBuffer)+(i)] = buffer[offset + i];\n}\nvar bytesRead;', false],
+]) {
+  const input = CURRENT_EMSCRIPTEN_OUTPUT.replace(writeCopyLoop('HEAP8'), raw);
+  const output = patchWasm64Runtime(input).text;
+  const body = output.slice(output.indexOf('\n', output.indexOf('allocated=')) + 1);
+  const copy = new Function('HEAP8', 'growMemViews', 'dataBuffer', 'buffer', 'offset', 'length', body);
+  const address = 3 * 1024 ** 3;
+  const large = Uint8Array.of(1, 127, 128, 255);
+  let refreshes = 0;
+  const written = new Map();
+  const bulk = [];
+  const target = new Proxy({
+    set(buffer, offset) {
+      bulk.push({ buffer, offset });
+    },
+  }, {
+    set(_, key, value) {
+      written.set(Number(key), value);
+      return true;
+    },
+  });
+  const refresh = () => { refreshes += 1; };
+  copy(target, refresh, address, large, 0, large.length);
+  assert.deepEqual(bulk, [{ buffer: large, offset: address }]);
+  assert.deepEqual([...written], []);
+  assert.equal(refreshes, threaded ? 1 : 0);
+
+  copy(target, refresh, address, large, 1, 2);
+  copy(target, refresh, address + 2, [9], 0, 1);
+  copy(target, refresh, address + 4, large, 0, 2);
+  copy(target, refresh, 1, large, 0, large.length);
+  assert.deepEqual([...written], [
+    [address, 127], [address + 1, 128], [address + 2, 9], [address + 4, 1], [address + 5, 127],
+    [1, 1], [2, 127], [3, 128], [4, 255],
+  ]);
+  assert.equal(bulk.length, 1);
+  assert.equal(patchWasm64Runtime(output).text, output);
+}
+
+assert.throws(
+  () => patchWasm64Runtime(CURRENT_EMSCRIPTEN_OUTPUT.replace(writeCopyLoop('HEAP8'), '')),
+  /expected one generated wasm64 WASMFS write copy, found 0/,
+);
+assert.throws(
+  () => patchWasm64Runtime(CURRENT_EMSCRIPTEN_OUTPUT + writeCopyLoop('HEAP8')),
+  /expected one generated wasm64 WASMFS write copy, found 2/,
+);
 
 // Each missing symbol is named independently.
 for (const [missingName] of PATCHES) {

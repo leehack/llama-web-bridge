@@ -45,7 +45,7 @@ Module['llamadartRetire'] = () => {
   const files = llamadartJsModelFsFiles();
   for (const file of files.values()) {
     stagedBytes += file.size;
-    file.chunks.length = 0;
+    llamadartJsModelFsDiscardChunks(file.chunks);
   }
   files.clear();
   llamadartJsModelFsHandles().clear();

@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
@@ -98,13 +99,30 @@ class ChunkedJsModelFile : public wasmfs::DataFile {
   }
 
   ssize_t read(uint8_t * buf, size_t len, off_t offset) override {
-    const size_t max_chunk = static_cast<size_t>(std::numeric_limits<int32_t>::max());
-    const uint32_t clamped = static_cast<uint32_t>(len > max_chunk ? max_chunk : len);
-    return _llamadart_js_model_fs_read(
-        getFileIndex(),
-        buf,
-        clamped,
-        static_cast<int64_t>(offset));
+    if (offset < 0) {
+      return -EINVAL;
+    }
+    constexpr size_t max_chunk = std::numeric_limits<int32_t>::max();
+    const size_t readable = std::min(len, static_cast<size_t>(std::numeric_limits<ssize_t>::max()));
+    const auto offset_headroom = static_cast<uint64_t>(std::numeric_limits<int64_t>::max() - offset);
+    size_t total = 0;
+    // A JS call returns i32, but WASMFS mmap zero-fills any short memory64 read.
+    while (total < readable) {
+      if (total > offset_headroom) {
+        return -EOVERFLOW;
+      }
+      const auto step = static_cast<uint32_t>(std::min(readable - total, max_chunk));
+      const int32_t got = _llamadart_js_model_fs_read(
+          getFileIndex(), buf + total, step, offset + static_cast<int64_t>(total));
+      if (got < 0) {
+        return total == 0 ? got : static_cast<ssize_t>(total);
+      }
+      total += static_cast<size_t>(got);
+      if (static_cast<uint32_t>(got) < step) {
+        break;
+      }
+    }
+    return static_cast<ssize_t>(total);
   }
 
   off_t getSize() override {

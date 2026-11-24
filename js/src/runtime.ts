@@ -3062,11 +3062,12 @@ export class LlamaWebGpuBridgeRuntime {
                 {
                   useBigIntPosition: this._coreVariant === 'wasm64',
                   skipMemoryReservation: useJsBackedStaging,
+                  memory64ReservationLimitBytes: this._coreVariant === 'wasm64' && !useJsBackedStaging && resumeOffset === 0
+                    ? this._heapHeadroomBytes(core)
+                    : null,
                   directWriter,
-                  // Detaching frees a chunk at once on WebKit, which otherwise keeps
-                  // it past the load; Chromium keeps a detached chunk longer than a
-                  // dropped one. A cache tee still reads the chunks.
-                  releaseConsumedChunks: this._isWebKit && !teedModelResponses.has(response),
+                  // The cache tee and staging writer share each network buffer.
+                  releaseConsumedChunks: !teedModelResponses.has(response),
                   startOffset: resumeOffset,
                   heapFileBytes,
                   preservePartialOnError: true,

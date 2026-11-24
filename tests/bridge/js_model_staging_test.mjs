@@ -401,8 +401,8 @@ test('heap model staging selects the writer using the effective layer count and 
   }
 });
 
-test('model staging releases consumed stream chunks on WebKit only', async () => {
-  for (const [userAgent, expectedLength] of [[SAFARI_26, 0], [CHROMIUM, 4]]) {
+test('model staging releases unshared stream chunks on WebKit and Chromium', async () => {
+  for (const userAgent of [SAFARI_26, CHROMIUM]) {
     const { runtime } = createStagingHarness({ apiVersion: 4, userAgent });
     const chunk = Uint8Array.of(1, 2, 3, 4);
     runtime._getCachedModelResponse = async () => new Response(new ReadableStream({
@@ -414,8 +414,70 @@ test('model staging releases consumed stream chunks on WebKit only', async () =>
     await runtime.loadModelFromUrl('https://models.test/model.gguf', {
       nCtx: 128, nGpuLayers: 0, useCache: false, forceRemoteFetchBackend: false,
     });
-    assert.equal(chunk.buffer.byteLength, expectedLength);
+    assert.equal(chunk.buffer.byteLength, 0, userAgent);
   }
+});
+
+test('Chromium staging keeps a tee chunk intact until Cache Storage reads it', async (t) => {
+  const { runtime, directWrites } = createStagingHarness({ apiVersion: 4, userAgent: CHROMIUM });
+  delete runtime._getCachedModelResponse;
+  const chunk = Uint8Array.of(1, 2, 3, 4);
+  runtime._fetchWithTimeout = async () => new Response(new ReadableStream({
+    start(controller) {
+      controller.enqueue(chunk);
+      controller.close();
+    },
+  }), { headers: { 'content-length': '4' } });
+  const cacheMayRead = Promise.withResolvers();
+  let cachedBytes;
+  const originalCaches = Object.getOwnPropertyDescriptor(globalThis, 'caches');
+  Object.defineProperty(globalThis, 'caches', {
+    configurable: true,
+    value: {
+      open: async () => ({
+        match: async () => undefined,
+        put: async (url, response) => {
+          if (url !== 'https://models.test/model.gguf') return;
+          await cacheMayRead.promise;
+          cachedBytes = new Uint8Array(await response.arrayBuffer());
+        },
+      }),
+    },
+  });
+  t.after(() => {
+    if (originalCaches) Object.defineProperty(globalThis, 'caches', originalCaches);
+    else delete globalThis.caches;
+  });
+  await runtime.loadModelFromUrl('https://models.test/model.gguf', {
+    nCtx: 128, nGpuLayers: 0, useCache: true, forceRemoteFetchBackend: false,
+    progressCallback: () => {
+      if (directWrites.length > 0) cacheMayRead.resolve();
+    },
+  });
+  assert.equal(directWrites.length, 1);
+  assert.deepEqual(cachedBytes, Uint8Array.of(1, 2, 3, 4));
+  assert.equal(runtime._modelCacheState, 'stored');
+});
+
+test('memory64 heap staging passes the core reservation limit to the writer', async () => {
+  const { runtime, core, fs } = createStagingHarness({
+    apiVersion: 4, coreVariant: 'wasm64', jsBackedModelStaging: false, userAgent: CHROMIUM,
+  });
+  const modelBytes = 3 * 1024 ** 3;
+  const ccall = core.ccall;
+  core.ccall = (name, ...args) => name === 'llamadart_webgpu_heap_headroom_bytes'
+    ? modelBytes + 1024
+    : ccall(name, ...args);
+  runtime._getCachedModelResponse = async () => new Response(new Uint8Array(4), {
+    headers: { 'content-length': String(modelBytes), 'content-encoding': 'identity' },
+  });
+  await assert.rejects(runtime.loadModelFromUrl('https://models.test/model.gguf', {
+    nCtx: 128, nGpuLayers: 0, useCache: false, forceRemoteFetchBackend: false,
+  }), { name: 'ModelTransferLengthError' });
+  assert.deepEqual(fs.writes[0], {
+    filePath: '/models/model.gguf', length: 1, position: modelBytes - 1, positionType: 'bigint',
+  });
+  assert.equal(fs.files.has('/models/model.gguf'), false);
 });
 
 test('heap staging links mmap wrappers and releases mappings after their last native consumer', () => {
