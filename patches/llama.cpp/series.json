@@ -3,8 +3,8 @@
     {
       "file": "0001-webgpu-weight-upload-batching.patch",
       "target": "ggml-webgpu",
-      "tracking": "https://github.com/leehack/llama-web-bridge/issues/TRACKING-ISSUE-PENDING",
-      "upstream": "https://github.com/ggml-org/llama.cpp/issues/UPSTREAM-ISSUE-PENDING",
+      "tracking": "https://github.com/leehack/llama-web-bridge/issues/344",
+      "upstream": "https://github.com/ggml-org/llama.cpp/blob/b1b770d90d94cad9e9ea5b993bdbc383a522fb28/ggml/src/ggml-webgpu/ggml-webgpu.cpp#L3990-L3992",
       "wasm_marker": "flushing batched WebGPU weight uploads"
     }
   ]

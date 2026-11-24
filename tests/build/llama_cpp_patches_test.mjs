@@ -163,7 +163,7 @@ test('retirement applies only when the untouched source contains the upstream fi
   assert.throws(() => applySeries(f.upstream, f.patches), /does not exist/);
 });
 
-test('release candidates require real owner and upstream issue links', (t) => {
+test('release candidates require an owner issue and an upstream issue, PR, or pinned source link', (t) => {
   const links = {
     tracking: 'https://github.com/leehack/llama-web-bridge/issues/1',
     upstream: 'https://github.com/ggml-org/llama.cpp/pull/2',
@@ -171,7 +171,14 @@ test('release candidates require real owner and upstream issue links', (t) => {
   assert.throws(() => verifyReleaseLinks(fixture(t).patches), /pending tracking issue URL/);
   assert.throws(() => verifyReleaseLinks(fixture(t, { entry: { tracking: links.tracking } }).patches),
     /pending upstream issue URL/);
+  assert.throws(() => verifyReleaseLinks(fixture(t, { entry: { ...links, upstream: undefined } }).patches), /series\.json/);
   verifyReleaseLinks(fixture(t, { entry: links }).patches);
+  const commit = 'a'.repeat(40);
+  const blob = 'https://github.com/ggml-org/llama.cpp/blob/';
+  verifyReleaseLinks(fixture(t, { entry: { ...links, upstream: blob + commit + '/src/upload.cpp#L2-L4' } }).patches);
+  for (const upstream of [blob + 'main/src/upload.cpp#L2-L4', blob + commit + '/src/upload.cpp']) {
+    assert.throws(() => verifyReleaseLinks(fixture(t, { entry: { ...links, upstream } }).patches), /series\.json/);
+  }
 });
 
 test('series lists all patch files exactly once in order', (t) => {

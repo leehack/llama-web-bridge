@@ -5,10 +5,11 @@ bridge build has a reproduced runtime problem that cannot be repaired in the
 bridge's own source or build settings.
 
 Each `series.json` entry names a patch, the CMake `target` that compiles its
-source, the bridge `tracking` issue, the `upstream` issue or PR, and a
-`wasm_marker` compiled by the patch. Replace the clearly marked pending issue
-URLs after their owners file them. The release candidate workflow runs
-`verify-release` before compiling any core to reject either placeholder.
+source, the bridge `tracking` issue, and a `wasm_marker` compiled by the patch.
+Use an upstream issue or PR for `upstream` when one exists. Otherwise use a
+GitHub permalink with the full upstream commit SHA and the source line or
+line range. The release candidate workflow runs `verify-release` before
+compiling any core to reject unresolved placeholders.
 A patch is a unified diff of one existing
 `.c` or `.cpp` translation unit. Edit a scratch copy to produce the diff and
 leave the upstream checkout intact.

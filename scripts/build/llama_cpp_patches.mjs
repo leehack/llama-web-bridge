@@ -7,7 +7,8 @@ const patchName = /^\d{4}-[a-z0-9]+(?:-[a-z0-9]+)*\.patch$/;
 const sourcePath = /^(?:[a-zA-Z0-9_-][a-zA-Z0-9_.+-]*\/)*[a-zA-Z0-9_-][a-zA-Z0-9_.+-]*\.(?:c|cpp)$/;
 const keys = new Set(['file', 'target', 'tracking', 'upstream', 'wasm_marker', 'upstream_fix']);
 const trackingLink = /^https:\/\/github\.com\/leehack\/llama-web-bridge\/issues\/(?:[1-9]\d*|TRACKING-ISSUE-PENDING)$/;
-const upstreamLink = /^https:\/\/github\.com\/ggml-org\/llama\.cpp\/(?:issues\/(?:[1-9]\d*|UPSTREAM-ISSUE-PENDING)|pull\/[1-9]\d*)$/;
+const upstreamIssueLink = /^https:\/\/github\.com\/ggml-org\/llama\.cpp\/(?:issues\/(?:[1-9]\d*|UPSTREAM-ISSUE-PENDING)|pull\/[1-9]\d*)$/;
+const upstreamSourceLink = /^https:\/\/github\.com\/ggml-org\/llama\.cpp\/blob\/[0-9a-f]{40}\/[^?#\s]+#L[1-9]\d*(?:-L[1-9]\d*)?$/;
 
 const readText = (file) => readFileSync(file, 'utf8').replaceAll('\r\n', '\n');
 const nonempty = (value) => typeof value === 'string' && value.trim() !== '' && !value.includes('\0');
@@ -27,11 +28,12 @@ export function loadSeries(patches = patchDir) {
       if (Object.keys(entry).some((key) => !keys.has(key))
           || typeof entry.target !== 'string' || !/^[A-Za-z0-9_-]+$/.test(entry.target)
           || typeof entry.tracking !== 'string' || !trackingLink.test(entry.tracking)
-          || typeof entry.upstream !== 'string' || !upstreamLink.test(entry.upstream)
+          || typeof entry.upstream !== 'string'
+          || !(upstreamIssueLink.test(entry.upstream) || upstreamSourceLink.test(entry.upstream))
           || !nonempty(entry.wasm_marker) || markers.has(entry.wasm_marker)
           || (Object.hasOwn(entry, 'upstream_fix') && (!nonempty(entry.upstream_fix)
             || entry.upstream_fix.includes(entry.wasm_marker)))) {
-        throw new Error(entry.file + ': expected a CMake target, owner tracking issue, upstream issue or PR, '
+        throw new Error(entry.file + ': expected a CMake target, owner tracking issue, upstream issue, PR or pinned source link, '
           + 'unique Wasm marker and optional upstream fix text');
       }
       names.push(entry.file);
