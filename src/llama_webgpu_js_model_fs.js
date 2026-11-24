@@ -26,7 +26,24 @@ addToLibrary({
     return llamadartJsModelFsState.handles;
   },
 
-  $llamadartJsModelFsWriteBytes__deps: ['$llamadartJsModelFsState'],
+  $llamadartJsModelFsDiscardChunks: (chunks, keep = 0) => {
+    // Reads copy into WASM synchronously, and direct writes copy into these
+    // private chunks. Heap mappings use a separate native block.
+    for (let i = keep; i < chunks.length; i += 1) {
+      const buffer = chunks[i]?.buffer;
+      try {
+        buffer?.transfer?.(0);
+      } catch (_) {
+        // Dropping the reference still lets GC reclaim the buffer.
+      }
+    }
+    chunks.length = keep;
+  },
+
+  $llamadartJsModelFsWriteBytes__deps: [
+    '$llamadartJsModelFsState',
+    '$llamadartJsModelFsDiscardChunks',
+  ],
   $llamadartJsModelFsWriteBytes: (file, copySlice, length, offset) => {
     const chunkSize = file.chunkSize;
     const end = offset + length;
@@ -77,7 +94,7 @@ addToLibrary({
       return length;
     } catch (_) {
       file.oomError = true;
-      file.chunks.length = 0;
+      llamadartJsModelFsDiscardChunks(file.chunks);
       file.size = 0;
       llamadartJsModelFsState.lastOomBytes = end;
       return -{{{ cDefs.ENOMEM }}};
@@ -95,6 +112,7 @@ addToLibrary({
   _llamadart_js_model_fs_alloc_file__deps: [
     '$llamadartJsModelFsState',
     '$llamadartJsModelFsFiles',
+    '$llamadartJsModelFsDiscardChunks',
   ],
   _llamadart_js_model_fs_alloc_file: (fileId, mountId, heapPtr, heapCapacity) => {
     const chunkSize = llamadartJsModelFsState.chunkSize;
@@ -126,7 +144,7 @@ addToLibrary({
           chunks.push(new Uint8Array(len));
         }
       } catch (_) {
-        chunks.length = 0;
+        llamadartJsModelFsDiscardChunks(chunks);
         oomError = true;
         llamadartJsModelFsState.lastOomBytes = preallocBytes;
       }
@@ -145,12 +163,13 @@ addToLibrary({
   _llamadart_js_model_fs_free_file__deps: [
     '$llamadartJsModelFsFiles',
     '$llamadartJsModelFsHandles',
+    '$llamadartJsModelFsDiscardChunks',
   ],
   _llamadart_js_model_fs_free_file: (fileId) => {
     const files = llamadartJsModelFsFiles();
     const file = files.get(fileId);
     if (file) {
-      file.chunks.length = 0;
+      llamadartJsModelFsDiscardChunks(file.chunks);
       file.size = 0;
       files.delete(fileId);
     }
@@ -328,7 +347,10 @@ addToLibrary({
 
   _llamadart_js_model_fs_set_size__sig: 'ipj',
   _llamadart_js_model_fs_set_size__i53abi: true,
-  _llamadart_js_model_fs_set_size__deps: ['$llamadartJsModelFsFiles'],
+  _llamadart_js_model_fs_set_size__deps: [
+    '$llamadartJsModelFsFiles',
+    '$llamadartJsModelFsDiscardChunks',
+  ],
   _llamadart_js_model_fs_set_size: (fileId, size) => {
     const file = llamadartJsModelFsFiles().get(fileId);
     if (!file) {
@@ -350,7 +372,7 @@ addToLibrary({
     }
     if (size === 0) {
       if (file.size > 0) {
-        file.chunks.length = 0;
+        llamadartJsModelFsDiscardChunks(file.chunks);
         file.size = 0;
       }
       return 0;
@@ -359,7 +381,7 @@ addToLibrary({
     const chunkSize = file.chunkSize;
     if (size < file.size) {
       const keepChunks = Math.ceil(size / chunkSize);
-      file.chunks.length = keepChunks;
+      llamadartJsModelFsDiscardChunks(file.chunks, keepChunks);
       const lastIdx = keepChunks - 1;
       const tailLen = size - lastIdx * chunkSize;
       const lastChunk = file.chunks[lastIdx];
@@ -375,6 +397,7 @@ addToLibrary({
   _llamadart_js_model_fs_release_mount__deps: [
     '$llamadartJsModelFsFiles',
     '$llamadartJsModelFsHandles',
+    '$llamadartJsModelFsDiscardChunks',
   ],
   _llamadart_js_model_fs_release_mount: (mountId) => {
     const files = llamadartJsModelFsFiles();
@@ -384,7 +407,7 @@ addToLibrary({
       if ((file.mountId | 0) !== targetMountId) {
         continue;
       }
-      file.chunks.length = 0;
+      llamadartJsModelFsDiscardChunks(file.chunks);
       file.size = 0;
       files.delete(fileId);
     }

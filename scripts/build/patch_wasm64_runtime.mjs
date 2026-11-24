@@ -1,14 +1,9 @@
 #!/usr/bin/env node
 // Patch the Emscripten wasm64 WASMFS JavaScript boundary: wrap the pointer,
 // length and offset arguments the generated JS passes to the five __wasmfs_*
-// imports in BigInt(), in place. Idempotent; fails without writing when the
-// sibling .wasm is not memory64 or any of the five symbols is missing from the
-// generated output. A wasm32 link emits the same call sites, so the symbols
-// alone cannot tell the builds apart.
-//
-// Ported from scripts/patch_wasm64_runtime.py with byte-identical output: the
-// file is read as UTF-8 dropping undecodable bytes and with universal
-// newlines, and `\s` is Python's whitespace class, not JavaScript's.
+// imports in BigInt() and use bulk copies for large heap addresses. Idempotent;
+// fails without writing when the sibling .wasm is not memory64 or an expected
+// generated fragment is missing. The call sites alone cannot tell the builds apart.
 
 import fs from 'node:fs';
 import process from 'node:process';
@@ -24,6 +19,15 @@ const LENGTH = bigintOrName('length');
 const POSITION = bigintOrName('position');
 const OFFSET = bigintOrName('offset');
 const call = (name, args) => `${name}\\(${SPACES}${args.join(`${SPACES},${SPACES}`)}${SPACES}\\)`;
+
+// V8 can spend far longer in the indexed copy once a reservation moves
+// _malloc's result past 2 GiB. Keep the generated path for other callers.
+const BULK_WRITE_GUARD = 'if(dataBuffer>=2147483648&&offset===0&&buffer instanceof Uint8Array&&length===buffer.length)';
+const FS_WRITE_LOOP = new RegExp([
+  String.raw`for\s*\(\s*var i\s*=\s*0;\s*i\s*<\s*length;\s*i\+\+\s*\)\s*\{\s*`,
+  String.raw`(HEAP8|\(\s*growMemViews\(\),\s*HEAP8\s*\))\[\s*(?:dataBuffer|\(dataBuffer\))\s*\+\s*(?:i|\(i\))\s*\]`,
+  String.raw`\s*=\s*buffer\[\s*offset\s*\+\s*i\s*\];?\s*\}(?=\s*var bytesRead;)`,
+].join(''), 'g');
 
 export const PATCHES = [
   [
@@ -73,6 +77,15 @@ export function patchWasm64Runtime(text) {
       + 'changing the expected symbol set',
     );
   }
+  let writeCopies = text.split(BULK_WRITE_GUARD).length - 1;
+  text = text.replace(FS_WRITE_LOOP, (loop, heap) => {
+    writeCopies += 1;
+    return `${BULK_WRITE_GUARD}{${heap}.set(buffer,dataBuffer)}else{${loop}}`;
+  });
+  if (writeCopies !== 1) {
+    throw new PatchError(`expected one generated wasm64 WASMFS write copy, found ${writeCopies}`);
+  }
+  counts.wasmfs_write_copy = writeCopies;
   return { text, counts };
 }
 
