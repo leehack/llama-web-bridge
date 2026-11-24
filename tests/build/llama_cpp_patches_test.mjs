@@ -87,6 +87,11 @@ llamadart_apply_llama_cpp_patches("${root}" "${f.patches}")
   const config = (qualification) => spawnSync('cmake', ['-S', cmakeSource, '-B', build,
     `-DLLAMADART_LLAMA_CPP_PATCH_QUALIFICATION=${qualification}`, '-DCMAKE_EXPORT_COMPILE_COMMANDS=ON'], { encoding: 'utf8' });
   const applied = config('OFF');
+  if (applied.error?.code === 'ENOENT') {
+    t.skip('cmake is not available on PATH');
+    return;
+  }
+  assert.ifError(applied.error);
   assert.equal(applied.status, 0, applied.stderr);
   assert.match(applied.stdout, /ggml-webgpu compiles patched src\/upload\.cpp/);
   assert.equal(readFileSync(f.target, 'utf8'), original);

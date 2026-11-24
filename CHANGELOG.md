@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- Upload WebGPU model weights in bounded batches to reduce browser transfer memory during model load.
+- Upload WebGPU model weights in bounded batches to reduce browser transfer memory during model load. Apps that share one core through `coreModuleFactory` must serialize calls across those bridges.
 - Turn off llama.cpp lazy tensor reads on both core memory modes. On wasm32, the 4 GiB threshold wrapped to zero and aborted JS-backed staging for models such as Gemma 4. On memory64, disabling lazy reads avoids forced full-file WasmFS copies for lazy tensors over 4 GiB, and large JS-backed reads now copy all requested bytes.
 - Reduce memory use during model loading by releasing private JS staging buffers promptly and reserving WasmFS capacity for large memory64 downloads with a known length that fits the core's heap.
 
