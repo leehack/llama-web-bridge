@@ -10,13 +10,13 @@ assert.ok(loadCall > 0);
 
 assert.match(
   loader.slice(0, loadCall),
-  /^#if SIZE_MAX <= 0xffffffffULL\n(?:  \/\/[^\n]*\n)*  mparams\.lazy_mode = LLAMA_LAZY_MODE_OFF;\n/m,
-  'every wasm32 load must disable lazy reads before loading the model',
+  /^  mparams\.lazy_mode = LLAMA_LAZY_MODE_OFF;\n\s*#if SIZE_MAX <= 0xffffffffULL\n/m,
+  'both wasm32 and memory64 must disable lazy reads before loading the model',
 );
 assert.equal(
   [...loader.matchAll(/\blazy_mode\s*=/g)].length,
   1,
-  'memory64 and draft loads must not override lazy mode',
+  'the main model loader sets lazy mode once for both main and draft loads',
 );
 assert.ok(loader.indexOf('g_model_params = mparams;') > loadCall);
 assert.match(source, /llamadart_webgpu_draft_model_load_file\(path, g_model_params, &load_error\)/);

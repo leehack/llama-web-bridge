@@ -12,6 +12,7 @@ import { heapBlocksHarness } from './fixtures/heap_blocks.mjs';
 const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const jsFsSource = readFileSync(path.join(rootDir, 'src/llama_webgpu_js_model_fs.js'), 'utf8');
 const cppFsSource = readFileSync(path.join(rootDir, 'src/llama_webgpu_js_model_fs.cpp'), 'utf8');
+const corePostSource = readFileSync(path.join(rootDir, 'src/llama_webgpu_core_post.js'), 'utf8');
 
 function instantiateJsModelFsLibrary({
   mutatedSource = jsFsSource,
@@ -19,6 +20,7 @@ function instantiateJsModelFsLibrary({
   wasm64 = false,
   heapWindowBase = 0,
   failingChunkAlloc = null,
+  onChunkAlloc = null,
   onHeapFill = null,
 } = {}) {
   const heapBacking = new Uint8Array(4 * 1024 * 1024);
@@ -68,13 +70,14 @@ function instantiateJsModelFsLibrary({
     );
 
   let registered = null;
-  const Uint8ArrayProxy = failingChunkAlloc
+  const Uint8ArrayProxy = failingChunkAlloc || onChunkAlloc
     ? class extends Uint8Array {
         constructor(arg, ...rest) {
-          if (typeof arg === 'number' && failingChunkAlloc(arg)) {
+          if (typeof arg === 'number' && failingChunkAlloc?.(arg)) {
             throw new RangeError('Array buffer allocation failed');
           }
           super(arg, ...rest);
+          if (typeof arg === 'number') onChunkAlloc?.(this);
         }
       }
     : Uint8Array;
@@ -87,6 +90,8 @@ function instantiateJsModelFsLibrary({
     Map,
     Number,
     BigInt,
+    Module: {},
+    ccall() {},
     addToLibrary(obj) {
       registered = obj;
       for (const [key, value] of Object.entries(obj)) {
@@ -97,6 +102,7 @@ function instantiateJsModelFsLibrary({
     },
   };
   vm.runInNewContext(transformed, sandbox);
+  vm.runInNewContext(corePostSource, sandbox);
   assert.ok(registered, 'addToLibrary must register the backend symbols');
 
   const bigintToI53Checked = (num) => {
@@ -142,8 +148,98 @@ function instantiateJsModelFsLibrary({
     heapBacking,
     view,
     cDefs,
+    state: sandbox.llamadartJsModelFsState,
+    retire: sandbox.Module.llamadartRetire,
   };
 }
+
+test('discarding model chunks detaches only their private backing buffers', () => {
+  const { callNative, writeDirect, heapBacking, state, retire, cDefs } = instantiateJsModelFsLibrary();
+  const call = (suffix, ...args) => callNative(`_llamadart_js_model_fs_${suffix}`, args);
+  state.chunkSize = 4;
+  for (const [fileId, mountId] of [[1, 1], [2, 1], [3, 2]]) {
+    call('set_next_prealloc_bytes', 8);
+    call('alloc_file', fileId, mountId);
+  }
+  const first = [...state.files.get(1).chunks];
+  const second = [...state.files.get(2).chunks];
+  const other = [...state.files.get(3).chunks];
+  const writer = call('bind_direct', 1);
+  const source = Uint8Array.of(1, 2, 3, 4, 5, 6, 7, 8);
+  assert.equal(writeDirect(writer, source, 0), 8);
+  assert.equal(call('read', 1, 0, 8, 0), 8);
+  const nativeCopy = heapBacking.subarray(0, 8);
+
+  call('free_file', 1);
+  assert.deepEqual(first.map((chunk) => chunk.buffer.byteLength), [0, 0]);
+  assert.equal(writeDirect(writer, source, 0), -cDefs.EBADF);
+  assert.deepEqual(nativeCopy, source);
+  assert.deepEqual(second.map((chunk) => chunk.buffer.byteLength), [4, 4]);
+
+  call('release_mount', 1);
+  assert.deepEqual(second.map((chunk) => chunk.buffer.byteLength), [0, 0]);
+  assert.deepEqual(other.map((chunk) => chunk.buffer.byteLength), [4, 4]);
+
+  retire();
+  assert.deepEqual(other.map((chunk) => chunk.buffer.byteLength), [0, 0]);
+  assert.deepEqual(nativeCopy, source);
+  assert.equal(call('allocated_bytes'), 0);
+});
+
+test('truncation detaches discarded chunks and preserves an empty file’s preallocation', () => {
+  const { callNative, writeDirect, state } = instantiateJsModelFsLibrary();
+  const call = (suffix, ...args) => callNative(`_llamadart_js_model_fs_${suffix}`, args);
+  state.chunkSize = 4;
+  call('set_next_prealloc_bytes', 12);
+  call('alloc_file', 1, 1);
+  const chunks = [...state.files.get(1).chunks];
+  assert.equal(call('set_size', 1, 0), 0);
+  assert.deepEqual(chunks.map((chunk) => chunk.buffer.byteLength), [4, 4, 4]);
+  const writer = call('bind_direct', 1);
+  assert.equal(writeDirect(writer, new Uint8Array(12), 0), 12);
+  assert.equal(call('set_size', 1, 5), 0);
+  assert.deepEqual(chunks.map((chunk) => chunk.buffer.byteLength), [4, 4, 0]);
+  assert.equal(call('set_size', 1, 0), 0);
+  assert.deepEqual(chunks.map((chunk) => chunk.buffer.byteLength), [0, 0, 0]);
+});
+
+test('OOM releases both partially preallocated and already written chunks', () => {
+  let allocation = 0;
+  const chunks = [];
+  const { callNative, heapBacking, state, cDefs } = instantiateJsModelFsLibrary({
+    failingChunkAlloc: () => ++allocation === 2 || allocation === 4,
+    onChunkAlloc: (chunk) => chunks.push(chunk),
+  });
+  const call = (suffix, ...args) => callNative(`_llamadart_js_model_fs_${suffix}`, args);
+  state.chunkSize = 4;
+  call('set_next_prealloc_bytes', 8);
+  call('alloc_file', 1, 1);
+  assert.equal(call('bind_direct', 1), -cDefs.ENOMEM);
+  assert.equal(call('allocated_bytes'), 0);
+  assert.equal(chunks[0].buffer.byteLength, 0);
+
+  call('alloc_file', 2, 2);
+  heapBacking[0] = 1;
+  assert.equal(call('write', 2, 0, 1, 0), 1);
+  const chunk = state.files.get(2).chunks[0];
+  assert.equal(call('write', 2, 0, 1, 4), -cDefs.ENOMEM);
+  assert.equal(chunk.buffer.byteLength, 0);
+  assert.equal(call('allocated_bytes'), 0);
+});
+
+test('chunk release falls back to dropping references if transfer is missing or throws', () => {
+  const { callNative, state } = instantiateJsModelFsLibrary();
+  const call = (suffix, ...args) => callNative(`_llamadart_js_model_fs_${suffix}`, args);
+  state.chunkSize = 4;
+  call('set_next_prealloc_bytes', 12);
+  call('alloc_file', 1, 1);
+  const chunks = [...state.files.get(1).chunks];
+  Object.defineProperty(chunks[0].buffer, 'transfer', { value: undefined });
+  Object.defineProperty(chunks[1].buffer, 'transfer', { value: () => { throw new TypeError(); } });
+  call('free_file', 1);
+  assert.equal(call('allocated_bytes'), 0);
+  assert.deepEqual(chunks.map((chunk) => chunk.buffer.byteLength), [4, 4, 0]);
+});
 
 test('js model fs backend C++ and JS signatures enforce 64-bit i53 ABI', () => {
   const { registered } = instantiateJsModelFsLibrary();
@@ -485,6 +581,7 @@ inline WasmFS wasmFS;
 `);
 
     const cppHarness = `
+#include <algorithm>
 #include <cassert>
 #include <cerrno>
 #include <cstdint>
@@ -495,6 +592,7 @@ inline WasmFS wasmFS;
 #include <string>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <vector>
 
 static size_t g_alloc_calls = 0;
 static bool g_track_allocs = false;
@@ -521,6 +619,14 @@ struct DummyMemBackend {};
 DummyMemBackend g_mem_backend_obj;
 ::backend_t g_mem_backend = reinterpret_cast<::backend_t>(&g_mem_backend_obj);
 int64_t g_prealloc = 0;
+struct ReadRequest {
+  uint8_t* destination;
+  uint32_t length;
+  int64_t offset;
+};
+std::vector<ReadRequest> g_reads;
+size_t g_remaining_bytes = 0;
+size_t g_fail_read = 0;
 struct ChunkEntry {
   size_t bytes = 0;
   int32_t mount_id = 0;
@@ -549,7 +655,13 @@ int32_t _llamadart_js_model_fs_write(uintptr_t id, const uint8_t*, uint32_t len,
   }
   return static_cast<int32_t>(len);
 }
-int32_t _llamadart_js_model_fs_read(uintptr_t, uint8_t*, uint32_t, int64_t) { return 0; }
+int32_t _llamadart_js_model_fs_read(uintptr_t, uint8_t* buf, uint32_t len, int64_t offset) {
+  g_reads.push_back({buf, len, offset});
+  if (g_reads.size() == g_fail_read) return -EIO;
+  const size_t result = std::min(g_remaining_bytes, static_cast<size_t>(len));
+  g_remaining_bytes -= result;
+  return static_cast<int32_t>(result);
+}
 void _llamadart_js_model_fs_get_size(uintptr_t, int64_t* out) { *out = 0; }
 int32_t _llamadart_js_model_fs_set_size(uintptr_t, int64_t) { return 0; }
 void _llamadart_js_model_fs_release_mount(int32_t mount_id) {
@@ -598,6 +710,40 @@ double llamadart_webgpu_js_model_fs_allocated_bytes();
 bool llamadart_webgpu_is_js_model_path(const char* path);
 }
 
+void test_large_reads(wasmfs::DataFile &file) {
+  constexpr size_t max_chunk = INT32_MAX;
+  constexpr size_t length = 2 * max_chunk + 29;
+  constexpr int64_t offset = 5ll << 30;
+  auto* dest = static_cast<uint8_t*>(mmap(nullptr, length, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+  assert(dest != MAP_FAILED);
+
+  g_remaining_bytes = length;
+  assert(file.read(dest, length, offset) == length);
+  assert(g_reads.size() == 3);
+  for (size_t i = 0; i < g_reads.size(); ++i) {
+    assert(g_reads[i].destination == dest + i * max_chunk);
+    assert(g_reads[i].offset == offset + i * max_chunk);
+    assert(g_reads[i].length == (i < 2 ? max_chunk : 29));
+  }
+
+  g_reads.clear();
+  g_remaining_bytes = max_chunk + 7;
+  assert(file.read(dest, length, offset) == max_chunk + 7);
+  assert(g_reads.size() == 2);
+
+  g_reads.clear();
+  g_remaining_bytes = length;
+  g_fail_read = 2;
+  assert(file.read(dest, length, offset) == max_chunk);
+  assert(g_reads.size() == 2);
+
+  g_reads.clear();
+  g_fail_read = 1;
+  assert(file.read(dest, length, offset) == -EIO);
+  assert(g_reads.size() == 1);
+  assert(munmap(dest, length) == 0);
+}
+
 int main() {
   assert(llamadart_webgpu_js_model_fs_api_version() == 4);
   assert(llamadart_webgpu_js_model_fs_supports_heap_resident() == 0);
@@ -639,6 +785,7 @@ int main() {
     std::shared_ptr<wasmfs::DataFile> open_fd = backend->createFile(0666);
     std::shared_ptr<wasmfs::DataFile> snap_fd = snap_backend->createFile(0666);
     uint8_t byte = 42;
+    test_large_reads(*open_fd);
     assert(open_fd->write(&byte, 1, 0) == 1);
     assert(snap_fd->write(&byte, 1, 0) == 1);
     assert(llamadart_webgpu_js_model_fs_allocated_bytes() == 128.0 * 1024.0 * 1024.0);

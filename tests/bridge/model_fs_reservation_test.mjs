@@ -10,8 +10,9 @@ function filesystem({ failReservation = false, shortReservation = false } = {}) 
     open(path, mode) { this.opens.push(mode); this.exists = true; if (mode === 'w') this.length = 0; return {}; },
     close() { this.closes++; }, writeFile() { throw new Error('Unexpected non-stream write'); },
     write(_stream, _bytes, _offset, length, position) {
+      const positionType = typeof position;
       position = Number(position);
-      this.writes.push({ length, position });
+      this.writes.push({ length, position, positionType });
       if (length === 1 && position >= gib - 1) {
         if (failReservation) throw { excPtr: 123 };
         if (shortReservation) return 0;
@@ -45,9 +46,22 @@ test('known large decoded length reserves capacity and restores logical length b
   const { value } = response({ bytes: gib + 65536, headers: { 'content-length': String(gib + 65536) } });
   assert.equal(await writeResponseToFsFileWithProgress(value, fs, '/model'), gib + 65536);
   assert.deepEqual(fs.opens, ['w', 'w']);
-  assert.deepEqual(fs.writes[0], { length: 1, position: gib + 65535 });
+  assert.deepEqual(fs.writes[0], { length: 1, position: gib + 65535, positionType: 'number' });
   assert.equal(fs.length, gib + 65536);
   assert.equal(fs.closes, 2);
+});
+
+test('memory64 reserves capacity above 2 GiB with a BigInt file position', async () => {
+  const fs = filesystem();
+  const length = 3 * gib + 65536;
+  const { value } = response({
+    bytes: length, headers: { 'content-length': String(length), 'content-encoding': 'identity' },
+  });
+  const options = { useBigIntPosition: true, memory64ReservationLimitBytes: 4 * gib };
+  assert.equal(await writeResponseToFsFileWithProgress(value, fs, '/model', null, options), length);
+  assert.deepEqual(fs.writes[0], { length: 1, position: length - 1, positionType: 'bigint' });
+  assert.deepEqual(fs.opens, ['w', 'w']);
+  assert.equal(fs.length, length);
 });
 
 for (const [name, headers, options, status] of [
@@ -59,7 +73,11 @@ for (const [name, headers, options, status] of [
   ['fractional', { 'content-length': '1073741824.5' }, {}, 200],
   ['resumed', { 'content-length': String(gib) }, { startOffset: 4 }, 200],
   ['range', { 'content-length': String(gib), 'content-range': 'bytes 0-2/1073741824' }, {}, 206],
-  ['memory64', { 'content-length': String(gib) }, { useBigIntPosition: true }, 200],
+  ['memory64 without a heap limit', { 'content-length': String(gib) }, { useBigIntPosition: true }, 200],
+  ['memory64 beyond heap headroom', { 'content-length': String(3 * gib) },
+    { useBigIntPosition: true, memory64ReservationLimitBytes: 2 * gib }, 200],
+  ['JS-backed memory64 fallback', { 'content-length': String(3 * gib) },
+    { useBigIntPosition: true, memory64ReservationLimitBytes: 4 * gib, skipMemoryReservation: true }, 200],
 ]) test(`${name} responses preserve incremental streaming`, async () => {
   const fs = filesystem();
   const { value } = response({ headers, status });

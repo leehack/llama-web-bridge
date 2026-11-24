@@ -471,9 +471,11 @@ int32_t load_model_internal(
     }
   }
 
-#if SIZE_MAX <= 0xffffffffULL
-  // The 4 GiB AUTO threshold wraps to zero on wasm32 and forces lazy mmap.
+  // Lazy reads force a full-file WASMFS mmap copy even with mmap disabled.
+  // AUTO can select tensors above 4 GiB on memory64, and wraps to zero on wasm32.
   mparams.lazy_mode = LLAMA_LAZY_MODE_OFF;
+
+#if SIZE_MAX <= 0xffffffffULL
   if (llamadart_webgpu_is_js_model_path(model_path) &&
       !check_wasm32_gguf_tensor_size_limit(model_path)) {
     return -4;

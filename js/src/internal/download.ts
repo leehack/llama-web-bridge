@@ -40,6 +40,7 @@ export interface DirectFileChunkWriter {
 export interface WriteResponseOptions {
   totalBytes?: unknown;
   useBigIntPosition?: boolean;
+  memory64ReservationLimitBytes?: number | null;
   skipMemoryReservation?: boolean;
   directWriter?: DirectFileChunkWriter | null;
   // Free each network chunk once it is copied. Only for a response nothing
@@ -104,8 +105,7 @@ function writeDirectChunk(
   return offset;
 }
 
-// Safari keeps consumed stream chunks alive long after they are dropped;
-// detaching returns the memory at once.
+// Detaching returns memory before the browser collects the consumed chunk.
 function releaseChunkBuffer(chunk: Uint8Array): void {
   const buffer = chunk.buffer as ArrayBuffer & { transfer?: (length: number) => ArrayBuffer };
   if (
@@ -1065,10 +1065,9 @@ function parseIdentityLength(response: Response, startOffset: number): { length:
   return { length, encoding };
 }
 
-function reservableResponseLength(response: Response, startOffset: number, bigInt: boolean): number {
-  if (bigInt) return 0;
+function reservableResponseLength(response: Response, startOffset: number, limit: number): number {
   const { length } = parseIdentityLength(response, startOffset);
-  return length <= 2147483647 ? length : 0;
+  return length <= limit ? length : 0;
 }
 
 function exactExpectedTransferLength(response: Response, startOffset: number): number {
@@ -1159,9 +1158,10 @@ export async function writeResponseToFsFileWithProgress(
   }
 
   const skipReservation = directWriter != null || writeOptions.skipMemoryReservation === true;
+  const reservationLimit = useBigIntPosition ? writeOptions.memory64ReservationLimitBytes ?? 0 : 2147483647;
   const reservedLength = skipReservation
     ? 0
-    : reservableResponseLength(response, startOffset, useBigIntPosition);
+    : reservableResponseLength(response, startOffset, reservationLimit);
   // CORS can hide Content-Encoding while exposing compressed Content-Length.
   // Constructed/cache responses can also lose the original response type.
   const encoding = response.headers.get('content-encoding')?.trim().toLowerCase();
@@ -1194,7 +1194,8 @@ export async function writeResponseToFsFileWithProgress(
     if (!directWriter) stream = fs.open(filePath, openMode);
     if (reservedLength > 0 && stream != null) {
       try {
-        const written = fs.write(stream, new Uint8Array(1), 0, 1, reservedLength - 1);
+        const lastByte = reservedLength - 1;
+        const written = fs.write(stream, new Uint8Array(1), 0, 1, useBigIntPosition ? BigInt(lastByte) : lastByte);
         if (written !== 1) throw new Error('Filesystem reservation returned a short write.');
       } catch (_) {
         // A size hint must not reject a body that incremental writes can load.
