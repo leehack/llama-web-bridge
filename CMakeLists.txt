@@ -9,6 +9,7 @@ if (NOT DEFINED LLAMA_CPP_DIR)
     set(LLAMA_CPP_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama_cpp")
 endif()
 
+get_filename_component(LLAMA_CPP_DIR "${LLAMA_CPP_DIR}" REALPATH BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
 if (NOT EXISTS "${LLAMA_CPP_DIR}/CMakeLists.txt")
     message(FATAL_ERROR "LLAMA_CPP_DIR is invalid: ${LLAMA_CPP_DIR}")
 endif()
@@ -64,6 +65,8 @@ set(GGML_BLAS OFF CACHE BOOL "" FORCE)
 add_subdirectory("${LLAMA_CPP_DIR}" "${CMAKE_BINARY_DIR}/llama_cpp")
 
 include(cmake/embedding_mode_reserve.cmake)
+include(cmake/llama_cpp_patches.cmake)
+llamadart_apply_llama_cpp_patches("${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/patches/llama.cpp")
 
 include(CheckCXXSourceCompiles)
 include(CMakePushCheckState)
@@ -299,3 +302,4 @@ set_target_properties(llama_webgpu_core PROPERTIES
     OUTPUT_NAME "${LLAMADART_WEBGPU_CORE_OUTPUT_NAME}"
     SUFFIX ".js"
 )
+llamadart_verify_llama_cpp_patches(llama_webgpu_core)

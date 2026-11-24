@@ -129,7 +129,7 @@ jobs:
         id: native-inputs
         run: |
           set -euo pipefail
-          fingerprint="$(git ls-tree -r -z HEAD -- src CMakeLists.txt cmake scripts/build \
+          fingerprint="$(git ls-tree -r -z HEAD -- src CMakeLists.txt cmake patches/llama.cpp scripts/build \
             scripts/release/cli.mjs scripts/release/errors.mjs scripts/release/json.mjs \
             scripts/release/python_compat.mjs scripts/release/unicode15.mjs \
             .github/workflows/ci.yml | sha256sum)"
@@ -186,7 +186,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: ${{ runner.temp }}/webgpu-ccache
-          key: webgpu-ccache-v3-${{ runner.os }}-${{ runner.arch }}-${{ matrix.variant }}-${{ env.EMSCRIPTEN_VERSION }}-${{ steps.compiler-cache.outputs.upstream }}-${{ hashFiles('CMakeLists.txt', 'cmake/*.cmake', 'scripts/build/build_bridge.sh', 'scripts/build/patch_*.mjs', 'src/**') }}
+          key: webgpu-ccache-v3-${{ runner.os }}-${{ runner.arch }}-${{ matrix.variant }}-${{ env.EMSCRIPTEN_VERSION }}-${{ steps.compiler-cache.outputs.upstream }}-${{ hashFiles('CMakeLists.txt', 'cmake/*.cmake', 'patches/llama.cpp/*', 'scripts/build/llama_cpp_patches.mjs', 'scripts/build/build_bridge.sh', 'scripts/build/patch_*.mjs', 'src/**') }}
           restore-keys: |
             webgpu-ccache-v3-${{ runner.os }}-${{ runner.arch }}-${{ matrix.variant }}-${{ env.EMSCRIPTEN_VERSION }}-${{ steps.compiler-cache.outputs.upstream }}-
 
@@ -212,6 +212,9 @@ jobs:
           ./scripts/build/build_bridge.sh
           mkdir -p "$CORE_DIST_DIR"
           cp "$OUT_DIR"/llama_webgpu_core*.js "$OUT_DIR"/llama_webgpu_core*.wasm "$CORE_DIST_DIR/"
+
+      - name: Verify carried patches in built core
+        run: node scripts/build/llama_cpp_patches.mjs verify third_party/llama_cpp "$RUNNER_TEMP"/webgpu_bridge_dist/llama_webgpu_core*.wasm
 
       - name: Save built core
         if: steps.core-cache.outputs.cache-hit != 'true' && github.event_name == 'push' && github.ref == 'refs/heads/main'

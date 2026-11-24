@@ -143,7 +143,7 @@ for (const [name, mutate, message] of [
     const build = jobs['build-core'];
     build.steps = build.steps.filter((step) => step.id !== 'native-inputs');
   }, 'must fingerprint the checked-out native input tree'],
-  ...['src', 'scripts/build', 'scripts/release/unicode15.mjs', '.github/workflows/ci.yml'].map((input) => [`missing ${input} in the native input tree scope`, (jobs) => {
+  ...['src', 'patches/llama.cpp', 'scripts/build', 'scripts/release/unicode15.mjs', '.github/workflows/ci.yml'].map((input) => [`missing ${input} in the native input tree scope`, (jobs) => {
     const step = jobs['build-core'].steps.find((step) => step.id === 'native-inputs');
     step.run = step.run.replace(`${input} `, '');
   }, 'must fingerprint the checked-out native input tree']),
@@ -157,6 +157,13 @@ for (const [name, mutate, message] of [
   ['ungated core cache save', (jobs) => {
     delete jobs['build-core'].steps.find((step) => step.name === 'Save built core').if;
   }, 'save the core cache only on a main push after copying the core files'],
+  ['missing carried-patch marker check', (jobs) => {
+    const build = jobs['build-core'];
+    build.steps = build.steps.filter((step) => step.name !== 'Verify carried patches in built core');
+  }, 'verify carried-patch markers in restored and newly built cores'],
+  ['cache-hit bypass of carried-patch marker check', (jobs) => {
+    jobs['build-core'].steps.find((step) => step.name === 'Verify carried patches in built core').if = "steps.core-cache.outputs.cache-hit != 'true'";
+  }, 'verify carried-patch markers in restored and newly built cores'],
   ['missing wasm64_st build', (jobs) => { jobs['build-core'].strategy.matrix.variant.pop(); }, 'four core build variants'],
   ['missing Qwen runtime cell', (jobs) => {
     jobs['smoke-grammar-qwen'].strategy.matrix.exclude = [{ memory: 'wasm64', runtime: 'direct' }];
@@ -974,6 +981,17 @@ function checkReleaseWorkflowMutation(workflowPath, mutate, expected) {
   mutate(workflow.jobs);
   assertRejected(collectRepositoryErrors({ [workflowPath]: stringifyYaml(workflow) }), expected);
 }
+
+test('candidate rejects a missing or optional patch issue link check', () => {
+  const stepName = 'Verify release patch issue links';
+  for (const mutate of [
+    (job) => { job.steps = job.steps.filter((step) => step.name !== stepName); },
+    (job) => { job.steps.find((step) => step.name === stepName)['continue-on-error'] = true; },
+  ]) {
+    checkReleaseWorkflowMutation(CANDIDATE_PATH, (jobs) => mutate(jobs['build-core']),
+      'must verify release patch issue links before building a core');
+  }
+});
 
 test('candidate contract guards all four core variants and the packaging dependencies', () => {
   const core = 'must build the memory64 and single-thread cores in the fail-fast four-variant matrix';

@@ -1,0 +1,35 @@
+--- a/ggml/src/ggml-webgpu/ggml-webgpu.cpp
++++ b/ggml/src/ggml-webgpu/ggml-webgpu.cpp
+@@ -192,2 +192,5 @@
+     wgpu::Queue    queue;
++#ifdef __EMSCRIPTEN__
++    size_t         weight_upload_bytes = 0;
++#endif
+     uint32_t       command_submit_batch_size = WEBGPU_DEFAULT_COMMAND_SUBMIT_BATCH_SIZE;
+@@ -3990,3 +3993,25 @@
+     if (size > 0) {
+-        buf_ctx->global_ctx->queue.WriteBuffer(buf_ctx->buffer, total_offset, data, (size / 4) * 4);
++#ifdef __EMSCRIPTEN__
++        if (ggml_backend_buffer_get_usage(buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
++            constexpr size_t chunk_bytes = 32 * 1024 * 1024;
++            constexpr size_t batch_bytes = 64 * 1024 * 1024;
++            auto & ctx = buf_ctx->global_ctx;
++            const size_t aligned_size = (size / 4) * 4;
++            for (size_t pos = 0; pos < aligned_size;) {
++                const size_t n = std::min({chunk_bytes, batch_bytes - ctx->weight_upload_bytes, aligned_size - pos});
++                ctx->queue.WriteBuffer(buf_ctx->buffer, total_offset + pos, (const uint8_t *) data + pos, n);
++                pos += n;
++                ctx->weight_upload_bytes += n;
++                if (ctx->weight_upload_bytes == batch_bytes) {
++                    // Asyncify lets Dawn service its queue completion promise on this thread.
++                    GGML_LOG_DEBUG("%s: flushing batched WebGPU weight uploads\n", __func__);
++                    ggml_backend_webgpu_wait_queue(ctx);
++                    ctx->weight_upload_bytes = 0;
++                }
++            }
++        } else
++#endif
++        {
++            buf_ctx->global_ctx->queue.WriteBuffer(buf_ctx->buffer, total_offset, data, (size / 4) * 4);
++        }
+     }
