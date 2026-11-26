@@ -44,6 +44,10 @@ allow `'self'`, `blob:`, and the asset origin in `worker-src`. See
 [deployment requirements](docs/api.md#browser-and-asset-requirements) for
 cross-origin assets and the other CSP directives.
 
+For instruction-tuned models, format the prompt with the loaded model's chat
+template before calling `createCompletion()`. The JS/TS API accepts formatted
+prompt text and leaves chat templating to the caller.
+
 ### Bundler configuration
 
 In Vite 7 dev, add this setting to `vite.config.ts` so the bridge module stays

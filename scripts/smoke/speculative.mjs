@@ -195,18 +195,30 @@ export const GROUPS = Object.freeze({
     target: 'qwen3_5_0_8b',
     loadOptions: { speculativeRollbackTokenMax: 16 },
     runs: [
-      { prompt: 'draft', strategies: ['draft-dflash'], draft: 'dflash_qwen3_5_0_8b', expectDrafts: true, expectAccepted: true },
+      {
+        prompt: 'draft',
+        strategies: ['draft-dflash'],
+        draft: 'dflash_qwen3_5_0_8b',
+        draftStrategy: 'draft-dflash',
+        expectDrafts: true,
+        expectAccepted: true,
+      },
       {
         prompt: 'draft',
         strategies: ['draft-dspark'],
         options: { draftTokenMax: 7 },
         draft: 'dspark_qwen3_5_0_8b',
+        draftStrategy: 'draft-dspark',
         expectDrafts: true,
         expectAccepted: true,
       },
     ],
     rejections: [
-      { label: 'draft-dflash with a DSpark draft', strategies: ['draft-dflash'], error: 'draft-dflash needs a dflash draft model' },
+      {
+        label: 'draft-dflash with a DSpark draft',
+        strategies: ['draft-dflash'],
+        error: "draft-dflash needs a dflash draft model; the loaded draft model's architecture is dflash (draft-dspark)",
+      },
     ],
   },
   // A recurrent target without rollback snapshots: n-gram drafts are verified
@@ -324,6 +336,7 @@ export function renderHarness(groups, nCtx, memoryModes, runtimeModes, gpuLayers
         await bridge.loadModelFromUrl('/' + group.target, loadOptions);
         const baselines = {};
         let loadedDraft = null;
+        let draftInfo = null;
         for (const run of group.runs) {
           const label = run.strategies.join('+') + (run.cache ? ' (' + run.cache + ' cache)' : '');
           const prompt = config.prompts[run.prompt];
@@ -331,17 +344,26 @@ export function renderHarness(groups, nCtx, memoryModes, runtimeModes, gpuLayers
           const baseline = baselines[run.prompt];
           if (run.draft && run.draft !== loadedDraft) {
             let progressEvents = 0;
-            const info = await bridge.loadDraftModel('/' + run.draft, {
+            draftInfo = await bridge.loadDraftModel('/' + run.draft, {
               useCache: false,
               progressCallback: () => { progressEvents += 1; },
             });
-            check(typeof info.architecture === 'string' && info.architecture.length > 0, label + ': draft has no architecture');
+            check(typeof draftInfo.architecture === 'string' && draftInfo.architecture.length > 0, label + ': draft has no architecture');
             check(progressEvents > 0, label + ': draft load reported no progress');
             loadedDraft = run.draft;
           }
           const capabilities = await bridge.getCompletionCapabilities();
           for (const strategy of run.strategies) {
             check(capabilities.speculativeDecoding[strategy] === true, label + ': ' + strategy + ' is not reported as supported');
+          }
+          let draftCapabilities = null;
+          if (run.draftStrategy) {
+            check(draftInfo?.strategy === run.draftStrategy, label + ': draft reports ' + draftInfo?.strategy);
+            draftCapabilities = {};
+            for (const name of ['draft-dflash', 'draft-dspark']) {
+              draftCapabilities[name] = capabilities.speculativeDecoding[name];
+              check(draftCapabilities[name] === (name === run.draftStrategy), label + ': incorrect ' + name + ' capability');
+            }
           }
           const speculativeDecoding = { strategies: run.strategies, ...(run.options || {}) };
           if (run.cache === 'generated') {
@@ -367,7 +389,10 @@ export function renderHarness(groups, nCtx, memoryModes, runtimeModes, gpuLayers
             if (run.expectReplay) check(counts.replayTokens > 0, label + ': replayed nothing');
             else check(counts.replayTokens === 0, label + ': replayed tokens without a checkpoint');
           }
-          runs.push({ label, text: speculative.text, baseline: baseline.text, usage: counts || null });
+          runs.push({
+            label, text: speculative.text, baseline: baseline.text, usage: counts || null,
+            ...(draftCapabilities ? { draftInfo, draftCapabilities } : {}),
+          });
         }
         for (const rejection of group.rejections) {
           const speculativeDecoding = { strategies: rejection.strategies };

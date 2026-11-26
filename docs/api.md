@@ -236,7 +236,7 @@ it.
 | `threadPoolSize` | `number` | Hint for the compiled pthread pool size, used before the core can report it. |
 | `nBatch` | `number` | llama.cpp batch size override. |
 | `nUbatch` | `number` | llama.cpp micro-batch size override. |
-| `nGpuLayers` | `number` | Default GPU layer request. `0` forces CPU/WASM execution. Omitting the count or passing a negative value requests full offload, subject to the Safari cap. An effective count of `0` or `1` enables heap staging for eligible JS-backed loads, including the WebKit default. |
+| `nGpuLayers` | `number` | Default GPU layer request as a signed 32-bit integer. An invalid value throws `RangeError`. `0` forces CPU/WASM execution. Omitting the count or passing a negative value requests full offload, subject to the Safari cap. An effective count of `0` or `1` enables heap staging for eligible JS-backed loads, including the WebKit default. |
 | `userAgent` | `string` | User-agent override for automatic WebKit staging and the Safari GPU layer cap. The Safari version check requires an Apple platform and Safari's product tokens. |
 | `remoteFetchThresholdBytes` | `number` | Size threshold for trying the native remote-fetch backend for large single-file models. |
 | `remoteFetchChunkBytes` | `number` | Chunk size used by remote-fetch streaming paths. |
@@ -438,7 +438,7 @@ Common `options` keys:
 | `signal` | `AbortSignal` used to cancel model transfer. |
 | `nCtx` | Context size. Defaults to the bridge runtime default, initially 4096. |
 | `nThreads`, `nThreadsBatch` | Per-load thread overrides, capped to the active runtime. |
-| `nGpuLayers` | GPU layer request. Use `0` for CPU/WASM mode or a negative value to request full offload. With no configured or previously set count in the runtime, an omitted value requests full offload. Apple Safari applies the per-load cap to the request without changing the stored count. An effective count of `0` or `1` selects heap staging for eligible JS-backed model loads. Uncapped full offload uses JS chunks when JS-backed staging is enabled. |
+| `nGpuLayers` | GPU layer request as a signed 32-bit integer. An invalid value rejects the load with `RangeError`. Use `0` for CPU/WASM mode or a negative value to request full offload. With no configured or previously set count in the runtime, an omitted value requests full offload. Apple Safari applies the per-load cap to the request without changing the stored count. An effective count of `0` or `1` selects heap staging for eligible JS-backed model loads. Uncapped full offload uses JS chunks when JS-backed staging is enabled. |
 | `useMmap` | Pass `false` to keep eligible JS-backed model loads on JS chunks. |
 | `safariMaxGpuLayers` | Per-load Safari GPU layer cap. Apple Safari before 27 or with an unknown version defaults to one layer, including for full-offload requests. Safari 27 and newer default to no cap. On Apple Safari, finite values up to `2147483647` set a maximum (rounded down to an integer of at least `1`). Larger values, including `Infinity`, opt out. |
 | `safariGpuProbe` | Set to `false` to skip the Safari load-time GPU probe. |
@@ -717,7 +717,7 @@ completion without it. Strategies use llama.cpp's `--spec-type` names:
 | `ngram-cache` | Prompt and output n-grams, optionally with `ngramCacheStatic`/`ngramCacheDynamic` files from `llama-lookup-create`. |
 | `draft-simple` | A standalone draft model from `loadDraftModel()` that shares the target's vocabulary. |
 | `draft-eagle3` | An EAGLE3 draft from `loadDraftModel()`. |
-| `draft-dflash`, `draft-dspark` | A DFlash-architecture block draft from `loadDraftModel()`; llama.cpp reads which of the two it is from its tensors. |
+| `draft-dflash`, `draft-dspark` | A plain DFlash or DSpark block draft, respectively. The strategy must match the loaded draft variant reported by llama.cpp. |
 | `draft-mtp` | The target's own MTP layers; load the model with `loadMtp: true`. |
 
 `strategies` combines any n-gram strategies with at most one `draft-*`
@@ -763,8 +763,10 @@ loadDraftModel(url: string, options?: DraftModelLoadOptions): Promise<DraftModel
 Downloads a draft GGUF and loads it with the target model's load settings,
 replacing any draft. `options` takes `progressCallback`, `signal`, `useCache`
 and `force`, as `loadModelFromUrl()` does. Resolves to `{ architecture,
-strategy? }`: the GGUF's `general.architecture`, and `draft-dflash` or
-`draft-dspark` for a DFlash-architecture draft. An EAGLE3 or DFlash draft built
+strategy? }`: the GGUF's `general.architecture` and the recognized block draft
+strategy. Plain DFlash reports `draft-dflash` and a DSpark draft reports
+`draft-dspark`. DFlash2, LiliCorr, and unrecognized DFlash variants reject with
+a diagnostic naming the unsupported variant. An EAGLE3 or DFlash draft built
 for a different hidden size than the loaded model's rejects, naming both sizes.
 Loading a new target model unloads the draft. When the bridge restores the
 remembered target on a replacement worker or during main-thread fallback, it
@@ -939,7 +941,7 @@ the active runtime. An unloaded model returns all false. Probe again after
 projector load/unload; completion vision/audio support alone does not enable
 media embeddings. Pooled embedding models support text; mixed media requires
 a noncausal decoder with MEAN pooling and the extended batch API. Audio also
-requires a 16 kHz projector. The v1.0.0 source pin exposes the mixed-batch API.
+requires a 16 kHz projector. The v1.1.0 source pin exposes the mixed-batch API.
 Use this probe to check the loaded assets and models. The local BF16 CPU
 results use v0.7.0. [Qualification record](multimodal_embeddings.md)
 
@@ -1498,7 +1500,7 @@ include:
 | `model_stream_restart:<reason>` | The shard download restarted at byte zero. `model_stream_restart:cache` identifies a retry after a cache entry error. |
 | `model_cache_parts` | The operation read or stored a WebKit part entry. |
 | `model_cache_entry_invalid`, `mmproj_cache_entry_invalid` | A missing or damaged cache part caused a model or projector retry. |
-| `gpu_unavailable:<reason>` | A load with `nGpuLayers > 0` uses the CPU and logs a warning. Reasons are `no_webgpu`, `no_adapter`, `adapter_missing_shader_f16`, and `unknown`. |
+| `gpu_unavailable:<reason>` | A load requesting GPU offload uses the CPU and logs a warning. Reasons are `no_webgpu`, `no_adapter`, `adapter_missing_shader_f16`, and `unknown`. |
 | `safari_gpu_layers_capped:<n>` | A Safari cap or successful probe retry lowered effective offload to `n` layers. This includes capped full-offload requests on Apple Safari. |
 | `safari_gpu_probe_embedding` | Safari probed the GPU with embeddings. |
 | `safari_gpu_probe_passed`, `safari_gpu_probe_failed` | Result of the initial Safari GPU probe. |

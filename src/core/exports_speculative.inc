@@ -94,6 +94,34 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_draft_model_load(const char * path
           model, "general.architecture", architecture, sizeof(architecture)) < 0) {
     architecture[0] = '\0';
   }
+  auto block_type = COMMON_SPECULATIVE_TYPE_NONE;
+  if (std::strcmp(architecture, "dflash") == 0) {
+    const auto variant = llama_model_dflash_variant(model);
+    std::string unsupported;
+    switch (variant) {
+      case LLAMA_DFLASH_VARIANT_DFLASH:
+        block_type = COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH;
+        break;
+      case LLAMA_DFLASH_VARIANT_DSPARK:
+        block_type = COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
+        break;
+      case LLAMA_DFLASH_VARIANT_DFLASH2:
+        unsupported = "DFlash2";
+        break;
+      case LLAMA_DFLASH_VARIANT_LILICORR:
+        unsupported = "LiliCorr";
+        break;
+      default:
+        unsupported = "Unknown DFlash variant (" + std::to_string(variant) + ")";
+        break;
+    }
+    if (!unsupported.empty()) {
+      llama_model_free(model);
+      g_draft_model_unsupported_error = unsupported + " is unsupported by this bridge version";
+      set_error(g_draft_model_unsupported_error);
+      return -6;
+    }
+  }
   const int64_t draft_hidden_size = draft_target_hidden_size(model, architecture);
   const int64_t target_hidden_size = llama_model_n_embd(g_state.model);
   if (draft_hidden_size >= 0 && draft_hidden_size != target_hidden_size) {
@@ -107,15 +135,7 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_draft_model_load(const char * path
   }
   g_draft_model = model;
   g_draft_model_architecture = architecture;
-  // common_speculative_types_from_gguf asserts on a non-DFlash GGUF without
-  // a block count, so only DFlash-architecture files reach it.
-  if (g_draft_model_architecture == "dflash") {
-    const std::vector<common_speculative_type> types =
-        common_speculative_types_from_gguf(path);
-    if (types.size() == 1) {
-      g_draft_model_block_type = types[0];
-    }
-  }
+  g_draft_model_block_type = block_type;
 
   g_draft_model_json =
       "{\"architecture\":\"" + escape_json(g_draft_model_architecture) + "\"";

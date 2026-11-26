@@ -1,12 +1,12 @@
 --- a/ggml/src/ggml-webgpu/ggml-webgpu.cpp
 +++ b/ggml/src/ggml-webgpu/ggml-webgpu.cpp
-@@ -192,2 +192,5 @@
+@@ -192,2 +192,5 @@ struct webgpu_global_context_struct {
      wgpu::Queue    queue;
 +#ifdef __EMSCRIPTEN__
 +    size_t         weight_upload_bytes = 0;
 +#endif
      uint32_t       command_submit_batch_size = WEBGPU_DEFAULT_COMMAND_SUBMIT_BATCH_SIZE;
-@@ -3990,3 +3993,25 @@
+@@ -4181,3 +4184,25 @@ static void ggml_backend_webgpu_buffer_set_tensor(ggml_backend_buffer_t buffer,
      if (size > 0) {
 -        buf_ctx->global_ctx->queue.WriteBuffer(buf_ctx->buffer, total_offset, data, (size / 4) * 4);
 +#ifdef __EMSCRIPTEN__

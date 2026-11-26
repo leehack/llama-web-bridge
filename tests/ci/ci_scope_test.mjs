@@ -254,7 +254,7 @@ const nativeJobs = ['build-core', ...smokeJobs];
   assert.doesNotMatch(clone, /matrix\.upstream/);
   assert.match(
     clone,
-    /test "\$\(git -C third_party\/llama_cpp rev-parse HEAD\)" = b1b770d90d94cad9e9ea5b993bdbc383a522fb28\b/,
+    /test "\$\(git -C third_party\/llama_cpp rev-parse HEAD\)" = 171527522610996f5f0acf12334e185156ca8f44\b/,
   );
   const resolver = build.steps.find((step) => step.name === 'Resolve llama.cpp pin').run;
   assert.match(resolver, /llama_cpp.version/);

@@ -1,6 +1,6 @@
 # llama.cpp v1.0.0 qualification
 
-`llama_cpp.version` pins `v1.0.0`. CI verifies that the cloned tag resolves to
+For this qualification, `llama_cpp.version` pinned `v1.0.0`. CI verified that the cloned tag resolved to
 `b1b770d90d94cad9e9ea5b993bdbc383a522fb28` before building the threaded and
 single-thread cores for both wasm32 and memory64.
 

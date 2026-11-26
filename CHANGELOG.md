@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Preserve separate DFlash and DSpark draft strategies on llama.cpp v1.1.0 and report unsupported draft variants by name.
+
+- Update the runtime to llama.cpp v1.1.0 and retain bounded WebGPU weight uploads. Text-to-speech uses the model's normal speaking speed and respects the context's prompt batch limit.
+- Report omitted and negative GPU layer counts as full offload, run Safari's probe and one-layer retry for those requests, and reject GPU layer counts outside the signed 32-bit integer range.
+
 ## v0.1.95 - 2026-11-26
 
 - Expose the vocabulary's BOS and EOS token text and effective automatic BOS setting in model metadata so chat templates can use the loaded tokenizer.

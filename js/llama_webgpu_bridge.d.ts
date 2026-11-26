@@ -39,6 +39,7 @@ export interface LlamaWebGpuBridgeConfig {
   threadPoolSize?: number;
   nBatch?: number;
   nUbatch?: number;
+  /** Signed 32-bit default GPU layer count. Zero selects CPU. A negative value requests full offload. */
   nGpuLayers?: number;
   userAgent?: string;
   remoteFetchThresholdBytes?: number;
@@ -63,6 +64,8 @@ export interface BridgeProgressEvent {
 export interface LoadModelOptions {
   progressCallback?: (progress: BridgeProgressEvent) => void;
   signal?: AbortSignal;
+  /** Signed 32-bit GPU layer count for this load. Zero selects CPU. A negative value requests full offload. */
+  nGpuLayers?: number;
   remoteFetchThresholdBytes?: number;
   remoteFetchChunkBytes?: number;
   /** Pass false to keep JS-chunk staging when jsBackedModelStaging is enabled. */

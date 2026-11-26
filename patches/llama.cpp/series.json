@@ -4,7 +4,7 @@
       "file": "0001-webgpu-weight-upload-batching.patch",
       "target": "ggml-webgpu",
       "tracking": "https://github.com/leehack/llama-web-bridge/issues/344",
-      "upstream": "https://github.com/ggml-org/llama.cpp/blob/b1b770d90d94cad9e9ea5b993bdbc383a522fb28/ggml/src/ggml-webgpu/ggml-webgpu.cpp#L3990-L3992",
+      "upstream": "https://github.com/ggml-org/llama.cpp/blob/171527522610996f5f0acf12334e185156ca8f44/ggml/src/ggml-webgpu/ggml-webgpu.cpp#L4181-L4183",
       "wasm_marker": "flushing batched WebGPU weight uploads"
     }
   ]

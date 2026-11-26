@@ -681,12 +681,6 @@ const CASES = [
     assert.match(validation, /request\.draft_n_max > n_ctx \|\| request\.ngram_n_max > n_ctx/,
       'upstream allocates draft buffers of these sizes and aborts on bad_alloc');
     assert.match(validation, /!is_ngram_size\(request\.ngram_match\)/, 'upstream narrows ngram_match to uint16_t');
-    const draftLoad = functionBody('EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_draft_model_load(');
-    assert.ok(
-      draftLoad.indexOf('if (g_draft_model_architecture == "dflash") {')
-        < draftLoad.indexOf('common_speculative_types_from_gguf(path)'),
-      'types_from_gguf asserts on a non-DFlash GGUF without a block count',
-    );
   }],
 ];
 

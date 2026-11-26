@@ -18,6 +18,7 @@ const IPHONE_27 = 'Mozilla/5.0 (iPhone; CPU iPhone OS 27_0 like Mac OS X) AppleW
 const IPAD_27 = IPHONE_27.replace('iPhone; CPU iPhone OS', 'iPad; CPU OS');
 const IPHONE_26 = IPHONE_27.replace('27_0', '18_7').replace('Version/27.0', 'Version/26.5');
 const CHROME = `${MAC.replace('605.1.15', '537.36')} Chrome/157.0.0.0 Safari/537.36`;
+const FIREFOX = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:157.0) Gecko/20100101 Firefox/157.0';
 const PADS = '<pad>'.repeat(48);
 const SAFARI_LIKE_UAS = {
   'GNOME Web / WebKitGTK': safari('60.5').replace('Macintosh; Intel Mac OS X 10_15_7', 'X11; Linux x86_64'),
@@ -146,7 +147,7 @@ test('the Apple Safari cap fits the signed Wasm load parameter', async (t) => {
           assert.equal(metadata(bridge, 'n_gpu_layers'), String(requested));
           assert.deepEqual(safariNotes(bridge), []);
           assert.equal(bridge.getBackendName(), 'WebGPU, CPU');
-          assert.equal(bridge.isGpuActive(), false);
+          assert.equal(bridge.isGpuActive(), true);
         }
       }
       await loadModel(bridge, { ...withoutProbe, safariMaxGpuLayers: maxInt32 });
@@ -160,18 +161,69 @@ test('the Apple Safari cap fits the signed Wasm load parameter', async (t) => {
   }
 });
 
-test('Apple Safari accepts opt-out and Safari 27 and Chrome preserve uncapped requests', async () => {
-  for (const userAgent of [safari('26.2'), safari('27.0'), IPHONE_27, IPAD_27, CHROME]) {
-    await withSafariBridge({ userAgent, disableWorker: true }, async ({ bridge, trace, calls }) => {
-      const override = userAgent === safari('26.2') ? { safariMaxGpuLayers: Infinity } : {};
-      await loadModel(bridge, override);
-      assert.deepEqual(safariNotes(bridge), [], userAgent);
-      await loadModel(bridge, { ...override, nGpuLayers: -5 });
-      assert.deepEqual(safariNotes(bridge), [], userAgent);
-      assert.equal(calls.completion, 0);
-      await loadModel(bridge, { ...override, nGpuLayers: 99 });
-      assert.deepEqual(trace, [-1, -5, 99], userAgent);
-      assert.deepEqual(safariNotes(bridge), userAgent === CHROME ? [] : ['safari_gpu_probe_passed'], userAgent);
+test('uncapped default and explicit GPU requests report offload and run the Safari probe', async (t) => {
+  for (const [name, userAgent, options, probes] of [
+    ['Safari 26 with cap lifted', safari('26.2'), { safariMaxGpuLayers: Infinity }, true],
+    ['Safari 27', safari('27.0'), {}, true],
+    ['iPhone Safari 27', IPHONE_27, {}, true],
+    ['iPad Safari 27', IPAD_27, {}, true],
+    ['Chrome', CHROME, {}, false],
+    ['Firefox', FIREFOX, {}, false],
+  ]) {
+    for (const disableWorker of [true, false]) {
+      await t.test(`${name}, ${disableWorker ? 'direct' : 'worker'}`, () => withSafariBridge({
+        userAgent, disableWorker,
+      }, async ({ bridge, trace }) => {
+        for (const nGpuLayers of [undefined, -1, 1, 0]) {
+          await loadModel(bridge, { ...options, nGpuLayers });
+          assert.equal(bridge.isGpuActive(), nGpuLayers !== 0);
+          assert.deepEqual(safariNotes(bridge), probes && nGpuLayers !== 0 ? ['safari_gpu_probe_passed'] : []);
+        }
+        assert.deepEqual(trace, [-1, -1, 1, 0]);
+      }));
+    }
+  }
+});
+
+test('uncapped Safari probes full offload, then tries one layer before CPU', async () => {
+  for (const disableWorker of [true, false]) {
+    await withSafariBridge({ userAgent: safari('27.0'), disableWorker }, async ({ bridge, trace }) => {
+      await loadModel(bridge);
+      assert.deepEqual(trace, [-1, 1, 0]);
+      assert.equal(bridge.isGpuActive(), false);
+      assert.ok(safariNotes(bridge).includes('safari_fallback_cpu'));
+    }, { corruptProbe: true });
+  }
+});
+
+test('full-offload requests report unavailable WebGPU in direct and worker modes', async () => {
+  for (const disableWorker of [true, false]) {
+    await withSafariBridge({ userAgent: CHROME, disableWorker }, async ({ bridge }) => {
+      await loadModel(bridge);
+      assert.equal(bridge.isGpuActive(), false);
+      assert.match(metadata(bridge, 'runtime_notes'), /gpu_unavailable:/);
+      await loadModel(bridge, { nGpuLayers: 0 });
+      assert.doesNotMatch(metadata(bridge, 'runtime_notes'), /gpu_unavailable:/);
+    }, { gpuAvailable: false });
+  }
+});
+
+test('GPU layer requests must fit the signed Wasm load parameter', async () => {
+  for (const disableWorker of [true, false]) {
+    for (const nGpuLayers of [2 ** 32, Number.MAX_SAFE_INTEGER, -(2 ** 31) - 1, 0.5, Infinity, NaN]) {
+      const config = { userAgent: CHROME, disableWorker };
+      await assert.rejects(withSafariBridge({ ...config, nGpuLayers }, async () => {}), RangeError);
+      await withSafariBridge(config, async ({ bridge, trace }) => {
+        await loadModel(bridge, { nGpuLayers: 1 });
+        await assert.rejects(loadModel(bridge, { nGpuLayers }), RangeError);
+        assert.deepEqual(trace, [1]);
+        assert.equal(bridge.isGpuActive(), true);
+      });
+    }
+    await withSafariBridge({ userAgent: CHROME, disableWorker, nGpuLayers: -(2 ** 31) }, async ({ bridge, trace }) => {
+      await loadModel(bridge);
+      await loadModel(bridge, { nGpuLayers: 2 ** 31 - 1 });
+      assert.deepEqual(trace, [-(2 ** 31), 2 ** 31 - 1]);
     });
   }
 });
@@ -233,10 +285,10 @@ test('Safari lookalikes keep their sticky positive caps and pass through full of
         await withSafariBridge({ userAgent, disableWorker }, async ({ bridge, trace, calls }) => {
           for (const options of [{}, { nGpuLayers: -5 }]) {
             await loadModel(bridge, options);
-            assert.deepEqual(safariNotes(bridge), []);
+            assert.deepEqual(safariNotes(bridge), ['safari_gpu_probe_passed']);
           }
           assert.deepEqual(trace, [-1, -5]);
-          if (disableWorker) assert.equal(calls.completion, 0);
+          if (disableWorker) assert.equal(calls.completion, 4);
           assert.equal(metadata(bridge, 'execution'), execution);
         });
       });
