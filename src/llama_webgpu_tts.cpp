@@ -1,6 +1,7 @@
 #include "llama_webgpu_tts.h"
 #include "llama_webgpu_mtmd_compat.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <cstring>
@@ -38,6 +39,14 @@ struct llama_webgpu_tts {
 };
 
 namespace {
+
+template <typename Input>
+auto set_default_audio_speed(Input & input, int) -> decltype(input.speed = 1.0f, void()) {
+  input.speed = 1.0f;
+}
+
+template <typename Input>
+void set_default_audio_speed(Input &, long) {}
 
 void release_task_resources(llama_webgpu_tts * tts) {
   if (tts == nullptr) {
@@ -363,7 +372,7 @@ llama_webgpu_tts_status llama_webgpu_tts_start(
   tts->error.clear();
   tts->cancel_requested.store(false, std::memory_order_release);
   tts->sequence_id = request.sequence_id;
-  tts->prompt_batch_size = request.prompt_batch_size;
+  tts->prompt_batch_size = std::min<uint32_t>(request.prompt_batch_size, llama_n_batch(tts->llama));
   tts->max_frames = request.max_frames;
   tts->language = request.language != nullptr ? request.language : "";
 
@@ -412,6 +421,7 @@ llama_webgpu_tts_status llama_webgpu_tts_start(
   input.top_k = request.top_k;
   input.top_p = request.top_p;
   input.seed = request.seed;
+  set_default_audio_speed(input, 0);
   input.out_type = MTMD_HELPER_GEN_AUDIO_OUTTYPE_PCM;
   input.stream = tts->stream;
   if (mtmd_helper_gen_audio_set_input(tts->generator, &input) != 0) {

@@ -279,7 +279,7 @@ test('test_upstream_channels_are_exact', () => {
 // scripts/ci/verify_ci_reliability.mjs gates llama_cpp.version with the same form.
 test('test_ordinary_pin_accepts_either_upstream_channel', () => {
   const pinContents = readFileSync(path.join(rootDir, 'llama_cpp.version'), 'utf8');
-  assert.equal(pinContents, 'v1.0.0\n');
+  assert.equal(pinContents, 'v1.1.0\n');
   const pin = pinContents.endsWith('\n') ? pinContents.slice(0, -1) : pinContents;
   assert.ok([Channel.STABLE, Channel.DEVELOPMENT].includes(parseUpstreamTag(pin).channel));
   for (const [tag, channel] of [['v0.2.0', Channel.STABLE], ['b10514', Channel.DEVELOPMENT]]) {

@@ -99,6 +99,7 @@ std::string g_draft_model_architecture;
 // draft-dspark when it carries a Markov head. NONE for other drafts.
 common_speculative_type g_draft_model_block_type = COMMON_SPECULATIVE_TYPE_NONE;
 std::string g_draft_model_json = "{}";
+std::string g_draft_model_unsupported_error;
 
 // Speculative configuration for the next begin_generation, which consumes it.
 struct speculative_request {

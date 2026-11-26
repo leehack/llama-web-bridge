@@ -158,7 +158,9 @@ bool validate_speculative_request(
     }
     const std::string name = common_speculative_type_to_str(type);
     if (g_draft_model == nullptr) {
-      set_error(name + " needs a draft model: call loadDraftModel first");
+      set_error(g_draft_model_unsupported_error.empty()
+          ? name + " needs a draft model: call loadDraftModel first"
+          : g_draft_model_unsupported_error);
       return false;
     }
     const bool is_block_type = type == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH ||

@@ -18,18 +18,18 @@ const { instance: layerCountAbi } = await WebAssembly.instantiate(Uint8Array.of(
 let coreState;
 
 export default async function createCore() {
-  const { reportLoad, reportCompletion, failGpuDecodeAt, corruptProbe, failNativeFetchRetry } = coreState;
+  const { reportLoad, reportCompletion, failGpuDecodeAt, corruptProbe, failNativeFetchRetry, gpuAvailable } = coreState;
   const core = createStubCore();
   const ccall = core.ccall.bind(core);
   let loadedLayers;
   let nativeFetches = 0;
   core.ccall = (name, type, types, args = []) => {
     if (name === 'llamadart_webgpu_supports_pthreads') return 1;
-    if (name === 'llamadart_webgpu_probe') return 1;
-    if (name === 'llamadart_webgpu_backends_json') return '["WebGPU","CPU"]';
+    if (name === 'llamadart_webgpu_probe') return gpuAvailable ? 1 : 0;
+    if (name === 'llamadart_webgpu_backends_json') return gpuAvailable ? '["WebGPU","CPU"]' : '["CPU"]';
     if (name === 'llamadart_webgpu_load_model' || name === 'llamadart_webgpu_load_model_from_url') {
       loadedLayers = layerCountAbi.exports.n(args[6]);
-      const reply = corruptProbe && loadedLayers > 0 ? '<pad>'.repeat(48) : COMPLETION;
+      const reply = corruptProbe && loadedLayers !== 0 ? '<pad>'.repeat(48) : COMPLETION;
       for (const prompt of PROBE_PROMPTS) core.scripts[prompt] = [reply];
       const remote = name === 'llamadart_webgpu_load_model_from_url';
       reportLoad(loadedLayers, remote ? 'native-fetch' : 'staged');
@@ -65,7 +65,7 @@ if (!isMainThread) {
 }
 
 export async function withSafariBridge(config, run, {
-  failGpuDecodeAt = Infinity, corruptProbe = false, failNativeFetchRetry = false,
+  failGpuDecodeAt = Infinity, corruptProbe = false, failNativeFetchRetry = false, gpuAvailable = true,
 } = {}) {
   const originals = { Worker: globalThis.Worker, fetch: globalThis.fetch };
   const trace = [];
@@ -76,7 +76,7 @@ export async function withSafariBridge(config, run, {
   };
   const workers = [];
   const calls = { completion: 0 };
-  const coreOptions = { failGpuDecodeAt, corruptProbe, failNativeFetchRetry };
+  const coreOptions = { failGpuDecodeAt, corruptProbe, failNativeFetchRetry, gpuAvailable };
   coreState = {
     ...coreOptions, reportLoad,
     reportCompletion: () => { calls.completion += 1; },
@@ -103,20 +103,21 @@ export async function withSafariBridge(config, run, {
     terminate() { return this.thread.terminate(); }
   };
 
-  const bridge = new LlamaWebGpuBridge({
-    coreModuleUrl: fixtureUrl.href,
-    coreModuleUrlMem64: fixtureUrl.href,
-    workerRequestTimeoutMs: 5000,
-    allowSingleThreadCore: true,
-    preferMemory64: false,
-    logLevel: 0,
-    ...config,
-  });
+  let bridge;
   try {
+    bridge = new LlamaWebGpuBridge({
+      coreModuleUrl: fixtureUrl.href,
+      coreModuleUrlMem64: fixtureUrl.href,
+      workerRequestTimeoutMs: 5000,
+      allowSingleThreadCore: true,
+      preferMemory64: false,
+      logLevel: 0,
+      ...config,
+    });
     return await run({ bridge, trace, loadSources, workers, calls });
   } finally {
     try {
-      await bridge.dispose();
+      await bridge?.dispose();
     } finally {
       globalThis.fetch = originals.fetch;
       if (originals.Worker === undefined) delete globalThis.Worker;

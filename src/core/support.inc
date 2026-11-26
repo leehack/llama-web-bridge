@@ -340,6 +340,7 @@ void free_draft_model() {
   }
   g_draft_model_architecture.clear();
   g_draft_model_block_type = COMMON_SPECULATIVE_TYPE_NONE;
+  g_draft_model_unsupported_error.clear();
   g_draft_model_json = "{}";
 }
 

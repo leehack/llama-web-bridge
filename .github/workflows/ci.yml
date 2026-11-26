@@ -119,7 +119,7 @@ jobs:
       - name: Clone llama.cpp source
         run: |
           git clone --depth 1 --branch "$LLAMA_CPP_TAG" https://github.com/ggml-org/llama.cpp.git third_party/llama_cpp
-          test "$(git -C third_party/llama_cpp rev-parse HEAD)" = b1b770d90d94cad9e9ea5b993bdbc383a522fb28
+          test "$(git -C third_party/llama_cpp rev-parse HEAD)" = 171527522610996f5f0acf12334e185156ca8f44
 
       - name: Resolve compiler cache identity
         id: compiler-cache

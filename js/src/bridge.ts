@@ -35,7 +35,7 @@ import type { BridgeConfig } from './default_assets.ts';
 import { ModelStagingError, jsBackedStagingMode } from './internal/model_staging.ts';
 import { TEXT_TO_SPEECH_CANCELLED } from './internal/text_to_speech.ts';
 import { withoutNul } from './internal/text.ts';
-import { bufferSourceBytes, toUint8Array } from './internal/typed_values.ts';
+import { bufferSourceBytes, isInt32, toUint8Array } from './internal/typed_values.ts';
 import { LlamaWebGpuBridgeRuntime } from './runtime.ts';
 import { emptyBridgeState, isCoreRetiredError, serializeWorkerError } from './worker_protocol.ts';
 import { BridgeWorkerProxy } from './worker_proxy.ts';
@@ -198,6 +198,12 @@ interface WorkerFallbackGlobals {
 
 // Operations that reject with "No model loaded" on a bridge without a model.
 // Decision calls are left out: they report it as their own `no-model` code.
+function validateGpuLayerRequest(value: unknown) {
+  if (value !== undefined && !isInt32(value)) {
+    throw new RangeError('nGpuLayers must be a signed 32-bit integer.');
+  }
+}
+
 const MODEL_OPERATION_KINDS: ReadonlySet<string> = new Set([
   'generation', 'projector-load', 'draft-model-load', 'text-to-speech',
   'lora-adapter-load', 'lora-adapter-set', 'lora-adapter-remove', 'lora-adapters-clear',
@@ -258,6 +264,7 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
   static supportsCorePreflight = true;
 
   constructor(config: BridgeConfig = {}) {
+    validateGpuLayerRequest(config.nGpuLayers);
     this._config = config;
     this._runtime = null;
     this._workerProxy = null;
@@ -2039,6 +2046,7 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
   }
 
   async _loadModelFromUrlUnlocked(url: string | string[], options: LoadModelOptions = {}) {
+    validateGpuLayerRequest(options?.nGpuLayers);
     const attempt: WorkerLoadAttempt = { proxy: null, state: null, loaded: false };
     try {
       // The worker resolves relative URLs against its own script URL.

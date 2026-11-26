@@ -13,7 +13,8 @@ const llama = String.raw`
 using llama_token = int32_t;
 using llama_seq_id = int32_t;
 constexpr llama_token LLAMA_TOKEN_NULL = -1;
-struct llama_context {};
+struct llama_context { uint32_t batch_size = 256; };
+inline uint32_t llama_n_batch(const llama_context * ctx) { return ctx->batch_size; }
 struct llama_model {};
 struct llama_vocab {};
 struct llama_sampler {};
@@ -63,6 +64,7 @@ const helper = String.raw`
 #pragma once
 #include "llama.h"
 #include "mtmd.h"
+#include <cassert>
 #include <cstddef>
 #include <vector>
 
@@ -79,11 +81,15 @@ struct mtmd_helper_gen_audio_inp {
   const char * lang;
   int top_k;
   float top_p;
+#if !defined(TTS_TEST_LEGACY_INPUT)
+  float speed;
+#endif
   uint32_t seed;
   int out_type;
   bool stream;
 };
 struct mtmd_helper_gen_audio {
+  llama_context * llama;
   bool stream = false;
   int pending_frames = 0;
   size_t sent = 0;
@@ -93,17 +99,25 @@ constexpr int window_frames = 72;
 constexpr int samples_per_frame = 1920;
 inline bool fail_flush = false;
 inline bool fail_output = false;
-inline mtmd_helper_gen_audio * mtmd_helper_gen_audio_init(llama_context *, mtmd_context *) {
-  return new mtmd_helper_gen_audio;
+inline int last_prompt_batch = 0;
+inline mtmd_helper_gen_audio * mtmd_helper_gen_audio_init(llama_context * llama, mtmd_context *) {
+  return new mtmd_helper_gen_audio{llama};
 }
 inline void mtmd_helper_gen_audio_free(mtmd_helper_gen_audio * gen) { delete gen; }
-inline void mtmd_helper_gen_audio_reset(mtmd_helper_gen_audio * gen) { *gen = {}; }
+inline void mtmd_helper_gen_audio_reset(mtmd_helper_gen_audio * gen) { *gen = {gen->llama}; }
 inline int mtmd_helper_gen_audio_set_input(mtmd_helper_gen_audio * gen, const mtmd_helper_gen_audio_inp * input) {
+#if !defined(TTS_TEST_LEGACY_INPUT)
+  assert(input->speed == 1.0f);
+#endif
   generated_frames = 0;
   gen->stream = input->stream;
   return 0;
 }
-inline int mtmd_helper_gen_audio_step_prompt(mtmd_helper_gen_audio *, int) { return 0; }
+inline int mtmd_helper_gen_audio_step_prompt(mtmd_helper_gen_audio * gen, int batch) {
+  assert(batch > 0 && static_cast<uint32_t>(batch) <= llama_n_batch(gen->llama));
+  last_prompt_batch = batch;
+  return 0;
+}
 inline int mtmd_helper_gen_audio_flush(mtmd_helper_gen_audio * gen) {
   if (fail_flush) return 1;
   for (int i = 0; i < gen->pending_frames * samples_per_frame; ++i) {
@@ -141,11 +155,11 @@ constexpr char pcm_path[] = "tts.pcm";
 constexpr auto ok = LLAMADART_WEBGPU_TTS_STATUS_OK;
 constexpr auto invalid_state = LLAMADART_WEBGPU_TTS_STATUS_INVALID_STATE;
 
-void start(llama_webgpu_tts * tts, bool stream, int max_frames) {
+void start(llama_webgpu_tts * tts, bool stream, int max_frames, int prompt_batch = 512) {
   llama_webgpu_tts_request request{};
   request.text = "test";
   request.text_length = 4;
-  request.prompt_batch_size = 512;
+  request.prompt_batch_size = prompt_batch;
   request.max_frames = max_frames;
   request.top_p = 1;
   request.stream_audio = stream;
@@ -205,6 +219,13 @@ int main() {
   llama_webgpu_tts * tts = llama_webgpu_tts_init(&llama, &mtmd, nullptr);
   assert(tts);
   assert(llama_webgpu_tts_get_info(&mtmd).capabilities == 11);
+  for (const auto batch : {128, 256, 512}) {
+    start(tts, true, 1, batch);
+    llama_webgpu_tts_progress progress{};
+    assert(llama_webgpu_tts_step(tts, &progress) == ok);
+    assert(last_prompt_batch == (batch <= 256 ? batch : 256));
+    assert(llama_webgpu_tts_reset(tts) == ok);
+  }
   generate(tts, true, window_frames, 1);
   assert(tts->stream_chunk.capacity() >= window_frames * samples_per_frame);
   assert(llama_webgpu_tts_reset(tts) == ok);
@@ -278,10 +299,12 @@ test('native streamed TTS drains only pending chunks and keeps one-shot PCM byte
     })) {
       writeFileSync(path.join(dir, name), source);
     }
-    execFileSync(process.env.CXX || 'c++', [
-      '-std=c++17', '-I', dir, '-I', repoRoot, 'fixture.cpp', '-o', 'fixture',
-    ], { cwd: dir, stdio: 'pipe' });
-    execFileSync(path.join(dir, 'fixture'), [], { cwd: dir, stdio: 'pipe' });
+    for (const flags of [[], ['-DTTS_TEST_LEGACY_INPUT']]) {
+      execFileSync(process.env.CXX || 'c++', [
+        '-std=c++17', ...flags, '-I', dir, '-I', repoRoot, 'fixture.cpp', '-o', 'fixture',
+      ], { cwd: dir, stdio: 'pipe' });
+      execFileSync(path.join(dir, 'fixture'), [], { cwd: dir, stdio: 'pipe' });
+    }
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

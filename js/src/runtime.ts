@@ -84,6 +84,7 @@ import {
 } from './internal/model_source.ts';
 import {
   ModelStagingError,
+  effectiveOffloadedGpuLayers,
   isJsAllocationError,
   isSupportedJsModelStagingApiVersion,
   isWasm32TensorLimitText,
@@ -2728,7 +2729,7 @@ export class LlamaWebGpuBridgeRuntime {
     }
     this._effectiveGpuLayers = this._nGpuLayers;
 
-    if (this._nGpuLayers > 0 && !this._gpuActive) {
+    if (effectiveOffloadedGpuLayers(this._nGpuLayers) > 0 && !this._gpuActive) {
       const unavailable = await describeWebGpuUnavailable();
       throwIfAborted(operationSignal, abortMessage);
       this._pushRuntimeNote(`gpu_unavailable:${unavailable.reason}`);
@@ -3291,7 +3292,7 @@ export class LlamaWebGpuBridgeRuntime {
 
     assertMountOwned?.();
     const shouldProbeSafariGpu = this._isSafari
-      && this._effectiveGpuLayers > 0
+      && effectiveOffloadedGpuLayers(this._effectiveGpuLayers) > 0
       && options.safariGpuProbe !== false;
 
     if (shouldProbeSafariGpu) {
@@ -3362,7 +3363,7 @@ export class LlamaWebGpuBridgeRuntime {
         this._runtimeNotes.push('safari_gpu_probe_failed');
 
         const retryCandidates = [];
-        if (this._effectiveGpuLayers > 1) {
+        if (effectiveOffloadedGpuLayers(this._effectiveGpuLayers) > 1) {
           retryCandidates.push(1);
         }
         retryCandidates.push(0);
@@ -3487,7 +3488,7 @@ export class LlamaWebGpuBridgeRuntime {
     this._mediaFileCounter = 0;
     this._stateFileCounter = 0;
     this._stagedMediaPaths = [];
-    this._gpuActive = this._gpuActive && this._effectiveGpuLayers > 0;
+    this._gpuActive = this._gpuActive && effectiveOffloadedGpuLayers(this._effectiveGpuLayers) > 0;
 
       if (this._releaseModelFiles(stagingMountPath, assertMountOwned) > 0) {
         this._runtimeNotes.push('model_file_released');

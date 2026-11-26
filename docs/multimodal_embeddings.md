@@ -3,7 +3,7 @@
 Tracking: [llamadart #1072](https://github.com/leehack/llamadart/issues/1072).
 
 **Status: local BF16 CPU wasm memory64 qualification passed.** The run used
-llama.cpp v0.7.0. The current bridge pin, v1.0.0, also exposes the mixed-batch
+llama.cpp v0.7.0. The current bridge pin, v1.1.0, also exposes the mixed-batch
 API. See [Embeddings](api.md#embeddings) for the runtime contract.
 
 ## Source and inputs

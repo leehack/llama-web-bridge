@@ -97,7 +97,7 @@ The scripts below live in `scripts/smoke/` unless a different path is shown.
 
 - `AGENTS.md` is outside the docs allowlist in `scripts/ci/ci_scope.mjs`.
   Editing it runs the full WASM build and browser smoke lane.
-- See the [current pin qualification](docs/v100_qualification.md).
+- See the [v1.0.0 qualification](docs/v100_qualification.md).
   Keep `src/llama_webgpu_mtmd_compat.h` and its static contract. CI no longer
   builds llama.cpp v0.4.0.
 - Follow the [workflow guardrails](CONTRIBUTING.md#agent-workflow-guardrails)
