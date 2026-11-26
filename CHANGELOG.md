@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.1.95 - 2026-11-26
+
 - Expose the vocabulary's BOS and EOS token text and effective automatic BOS setting in model metadata so chat templates can use the loaded tokenizer.
 
 ## v0.1.94 - 2026-11-23
