@@ -30,8 +30,9 @@ import {
 const DESCRIPTION = 'Real-model browser smoke for multimodal bridge prompt ingestion.';
 const DEFAULT_MODEL_CACHE = '~/.cache/llama-web-bridge/multimodal-smoke-models';
 const MODES = Object.freeze(['direct runtime', 'worker runtime']);
+const QWEN35_MODEL_SHA256 = 'bd258782e35f7f458f8aced1adc053e6e92e89bc735ba3be89d38a06121dc517';
 
-export function renderHarness() {
+export function renderHarness(checkTokenizerMetadata = false) {
   return `
 <!doctype html>
 <meta charset="utf-8">
@@ -98,6 +99,19 @@ export function renderHarness() {
           useCache: false,
           forceRemoteFetchBackend: false,
         });
+        if (${pyJson(checkTokenizerMetadata)}) {
+          const metadata = bridge.getModelMetadata();
+          assert(metadata['llamadart.webgpu.execution'] === (disableWorker ? 'main-thread' : 'worker'),
+            \`\${mode} silently changed execution path\`);
+          // The pinned llama.cpp server reports the default BPE BOS as "," in /props.
+          for (const [key, expected] of Object.entries({
+            bos_token: ',', eos_token: '<|im_end|>', add_bos_token: 'false',
+          })) {
+            const actual = metadata['tokenizer.ggml.' + key];
+            assert(actual === expected,
+              \`\${mode} tokenizer.ggml.\${key} expected \${JSON.stringify(expected)}, got \${JSON.stringify(actual)}\`);
+          }
+        }
         await bridge.loadMultimodalProjector('/multimodal-mmproj.gguf');
         assert(bridge.supportsVision(), \`\${mode} did not report vision support\`);
 
@@ -318,12 +332,13 @@ export async function main(argv = process.argv.slice(2)) {
     label: 'multimodal projector',
   });
   const artifactsDir = args.artifactsDir !== null ? resolvePath(args.artifactsDir) : null;
+  const checkTokenizerMetadata = args.modelSha256?.toLowerCase() === QWEN35_MODEL_SHA256;
 
   const payload = await withTempDir('llama-web-bridge-multimodal-', async (webRoot) => {
     await copyBridgeArtifacts(distDir, webRoot);
     await fsp.copyFile(modelPath, path.join(webRoot, 'multimodal-model.gguf'));
     await fsp.copyFile(mmprojPath, path.join(webRoot, 'multimodal-mmproj.gguf'));
-    await fsp.writeFile(path.join(webRoot, 'index.html'), renderHarness(), 'utf8');
+    await fsp.writeFile(path.join(webRoot, 'index.html'), renderHarness(checkTokenizerMetadata), 'utf8');
     if (artifactsDir !== null) {
       await fsp.mkdir(artifactsDir, { recursive: true });
       await fsp.copyFile(path.join(webRoot, 'index.html'), path.join(artifactsDir, 'index.html'));

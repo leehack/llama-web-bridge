@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Expose the vocabulary's BOS and EOS token text and effective automatic BOS setting in model metadata so chat templates can use the loaded tokenizer.
+
 ## v0.1.94 - 2026-11-23
 
 - Upload WebGPU model weights in bounded batches to reduce browser transfer memory during model load. Apps that share one core through `coreModuleFactory` must serialize calls across those bridges.
