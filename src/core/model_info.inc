@@ -100,41 +100,46 @@ std::string read_model_meta_string(
   return "";
 }
 
+std::string token_to_piece(const llama_token token, const bool special);
+
 void rebuild_model_metadata_json() {
   if (g_state.model == nullptr) {
     g_model_meta_json = "{}";
     return;
   }
 
-  const int32_t count = llama_model_meta_count(g_state.model);
-  if (count <= 0) {
-    g_model_meta_json = "{}";
-    return;
-  }
+  constexpr const char * bos_key = "tokenizer.ggml.bos_token";
+  constexpr const char * eos_key = "tokenizer.ggml.eos_token";
+  constexpr const char * add_bos_key = "tokenizer.ggml.add_bos_token";
 
   std::string json = "{";
-  bool wrote_any = false;
-
-  for (int32_t i = 0; i < count; ++i) {
-    const std::string key = read_model_meta_string(g_state.model, i, true);
-    const std::string value = read_model_meta_string(g_state.model, i, false);
-
-    if (key.empty()) {
-      continue;
+  const auto append_metadata = [&json](const std::string & key, const std::string & value) {
+    if (json.size() > 1) {
+      json += ',';
     }
-
-    if (wrote_any) {
-      json += ",";
-    }
-    wrote_any = true;
 
     json += '"';
     json += escape_json(key);
-    json += "\":";
-    json += '"';
+    json += "\":\"";
     json += escape_json(value);
     json += '"';
+  };
+
+  const int32_t count = llama_model_meta_count(g_state.model);
+  for (int32_t i = 0; i < count; ++i) {
+    const std::string key = read_model_meta_string(g_state.model, i, true);
+    if (key.empty() || key == bos_key || key == eos_key || key == add_bos_key) {
+      continue;
+    }
+
+    append_metadata(key, read_model_meta_string(g_state.model, i, false));
   }
+
+  const llama_token bos = llama_vocab_bos(g_state.vocab);
+  const llama_token eos = llama_vocab_eos(g_state.vocab);
+  append_metadata(bos_key, bos < 0 ? "" : token_to_piece(bos, true));
+  append_metadata(eos_key, eos < 0 ? "" : token_to_piece(eos, true));
+  append_metadata(add_bos_key, llama_vocab_get_add_bos(g_state.vocab) ? "true" : "false");
 
   json += "}";
   g_model_meta_json = json;

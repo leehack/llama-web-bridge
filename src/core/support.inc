@@ -12,6 +12,7 @@ std::string to_lower(std::string value) {
 }
 
 std::string escape_json(const std::string & value) {
+  constexpr char hex_digits[] = "0123456789abcdef";
   std::string escaped;
   escaped.reserve(value.size() + 8);
   for (const char c : value) {
@@ -31,9 +32,17 @@ std::string escape_json(const std::string & value) {
       case '\t':
         escaped += "\\t";
         break;
-      default:
-        escaped += c;
+      default: {
+        const auto byte = static_cast<unsigned char>(c);
+        if (byte < 0x20) {
+          escaped += "\\u00";
+          escaped += hex_digits[byte >> 4];
+          escaped += hex_digits[byte & 0x0f];
+        } else {
+          escaped += c;
+        }
         break;
+      }
     }
   }
   return escaped;

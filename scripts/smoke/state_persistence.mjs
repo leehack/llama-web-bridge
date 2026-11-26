@@ -7,6 +7,7 @@
 import fsp from 'node:fs/promises';
 import path from 'node:path';
 import process from 'node:process';
+import { gunzipSync } from 'node:zlib';
 
 import {
   DEFAULT_MODEL_CACHE,
@@ -54,8 +55,24 @@ export const REQUIRED_METHODS = Object.freeze([
 ]);
 const MODES = Object.freeze(['direct runtime', 'worker runtime']);
 const MODEL_FILENAME = 'state-smoke-model.gguf';
+const LLAMA2_MODEL_SHA256 = '81f226c62d28ed4a1a9b9fa080fcd9f0cc40e0f9d5680036583ff98fbcd035cb';
+const METADATA_FIXTURE = 'tokenizer_metadata.gguf';
+const METADATA_FIXTURE_SHA256 = '949d405bdec86980d21ae9211afde156805497e758b31a5444a274cac9d613e5';
+// Inline the fixture so the release harness digest covers its bytes.
+const METADATA_FIXTURE_GZIP_BASE64 = [
+  'H4sIAAAAAAAA/+2US27bMBCG5UecGGmLpGmKpA/Ai6JdRfCum8JwN80Biq4ZWhxLgihSpajY7q6X6Cl6jV6kJyllkQllS9aq',
+  'O/4AQWn8f8PRaOTb229fBp7nnXqVLvT+Qu8hMBCY+lgEUSwhkIWAExU/0r9TilP8ZMfMcLo1vdPxrxsmI5BxMJE8ARb/ADFJ',
+  'QWKCJZ4s43WZ9L2d0MdSApMxZz7FGxCIcZEikeYIsjymnI2U8/efDx9NmQ95/TBMqZ9yAnSvzMtm8/Y2H6sfTvTyLPJTwZLZ',
+  'U3Oji71Z8Hz2bDd4Cio60NG/v3729CU2FwtzEYwMO11PP89aCssDLmBb2MgqrEvXB54SyU0GY/10JmFfrYFevZ1VHnzVnFC1',
+  'AG1DZR4zNgKvyt7cZBQHEHFKQLTg0IZDHX/TjGNC0EMFx6XBjEI1QAFnEtYSUWChjIYqPlfrZc0D6QIIiVloucpqzmuuBeVB',
+  'ggJeMDnUXbmuGZYABC25WGFBrExnar2qGR+HOgJM6infdjpRcm/M9bSCZ+CTOFVDrIjHtOWjvO54dygmJmmLFXasfatBVVy1',
+  'kfgriMNI9q2xaprX53rnhcwKuf2qNdnbJfSnYt7Ygib+tOwLO0RNNHWxT33vKHHejiZdaL8Vve9C9d/F1T5a9aiLH1b7ZY1f',
+  'Lg92aX7UBoVYQsOJZxZ81woTvmIWbCD75Lvjpk6VcJF1nTv2nJycnJycnJycnJz+r/4BDCTgXyASAAA=',
+].join('');
 
-export function renderHarness(modelFilename, memoryMode = 'wasm32', threading = 'pthreads') {
+export function renderHarness(
+  modelFilename, memoryMode = 'wasm32', threading = 'pthreads', checkTokenizerMetadata = false,
+) {
   const methodsJson = pyJson(REQUIRED_METHODS);
   const modelUrlJson = pyJson(modelFilename ? `/${modelFilename}` : null);
   const singleThread = threading === 'single';
@@ -197,6 +214,15 @@ ${isolationCheck}
       });
 
       const metadata = bridge.getModelMetadata();
+      if (${pyJson(checkTokenizerMetadata)}) {
+        for (const [key, expected] of Object.entries({
+          bos_token: '<s>', eos_token: '</s>', add_bos_token: 'true',
+        })) {
+          const actual = metadata['tokenizer.ggml.' + key];
+          assert(actual === expected,
+            \`\${mode} tokenizer.ggml.\${key} expected \${JSON.stringify(expected)}, got \${JSON.stringify(actual)}\`);
+        }
+      }
       assert(metadata['llamadart.webgpu.core_variant'] === ${pyJson(memoryMode)},
         \`\${mode} did not use the requested ${memoryMode} core\`);
       assert(metadata['llamadart.webgpu.execution'] === (mode === 'worker runtime' ? 'worker' : 'main-thread'),
@@ -535,12 +561,34 @@ ${isolationCheck}
       };
     };
 
+    const verifyUniqueTokenizerMetadata = async (bridge) => {
+      await bridge.loadModelFromUrl('/${METADATA_FIXTURE}', {
+        nCtx: 64, nThreads: 1, nGpuLayers: 0, useCache: false, forceRemoteFetchBackend: false,
+      });
+      const core = bridge._runtime?._core;
+      assert(core && typeof core.ccall === 'function', 'direct core unavailable for raw metadata check');
+      const raw = core.ccall('llamadart_webgpu_model_meta_json', 'string', [], []);
+      const metadata = JSON.parse(raw);
+      for (const [key, expected] of Object.entries({
+        bos_token: '<fixture-bos>', eos_token: '<fixture-\\u000beos>', add_bos_token: 'false',
+      })) {
+        const fullKey = 'tokenizer.ggml.' + key;
+        // JSON.parse keeps the last value when a key is repeated.
+        const occurrences = raw.split(JSON.stringify(fullKey) + ':').length - 1;
+        assert(occurrences === 1, \`raw metadata contains \${occurrences} occurrences of \${fullKey}\`);
+        assert(metadata[fullKey] === expected, \`unexpected fixture metadata for \${fullKey}\`);
+      }
+    };
+
     const verifyBridgeStateApi = async (bridge, mode) => {
       try {
         await verifyPreloadStateApi(bridge, mode);
         const modeResult = { mode, preload: true };
         if (modelUrl) {
           Object.assign(modeResult, await verifyModelRoundTrip(bridge, mode));
+          if (${pyJson(checkTokenizerMetadata)} && mode === 'direct runtime') {
+            await verifyUniqueTokenizerMetadata(bridge);
+          }
         }
         modeResults.push(modeResult);
       } finally {
@@ -709,6 +757,7 @@ export async function main(argv = process.argv.slice(2)) {
 
   const singleThread = args.threading === 'single';
   const modelPath = await resolveModel(args);
+  const checkTokenizerMetadata = modelPath !== null && args.modelSha256?.toLowerCase() === LLAMA2_MODEL_SHA256;
   const payload = await withTempDir('llama-web-bridge-smoke-', async (webRoot) => {
     await copyBridgeArtifacts(distDir, webRoot);
     if (args.memoryMode === 'wasm64') await copyMemory64Artifacts(distDir, webRoot);
@@ -718,7 +767,13 @@ export async function main(argv = process.argv.slice(2)) {
       await fsp.copyFile(modelPath, path.join(webRoot, MODEL_FILENAME));
       modelFilename = MODEL_FILENAME;
     }
-    await fsp.writeFile(path.join(webRoot, 'index.html'), renderHarness(modelFilename, args.memoryMode, args.threading), 'utf8');
+    if (checkTokenizerMetadata) {
+      const fixturePath = path.join(webRoot, METADATA_FIXTURE);
+      await fsp.writeFile(fixturePath, gunzipSync(Buffer.from(METADATA_FIXTURE_GZIP_BASE64, 'base64')));
+      await validateHash(fixturePath, METADATA_FIXTURE_SHA256);
+    }
+    const harness = renderHarness(modelFilename, args.memoryMode, args.threading, checkTokenizerMetadata);
+    await fsp.writeFile(path.join(webRoot, 'index.html'), harness, 'utf8');
     if (artifactsDir !== null) {
       await fsp.mkdir(artifactsDir, { recursive: true });
       await fsp.copyFile(path.join(webRoot, 'index.html'), path.join(artifactsDir, 'index.html'));

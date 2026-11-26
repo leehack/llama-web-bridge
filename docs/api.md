@@ -1461,6 +1461,9 @@ include:
 
 | Key | Meaning |
 | --- | --- |
+| `tokenizer.ggml.bos_token` | Vocabulary beginning-of-sequence token text. Empty if the vocabulary lacks a BOS token or its text is empty or unreadable. |
+| `tokenizer.ggml.eos_token` | Vocabulary end-of-sequence token text. Empty if the vocabulary lacks an EOS token or its text is empty or unreadable. |
+| `tokenizer.ggml.add_bos_token` | The string `"true"` or `"false"` for llama.cpp's effective automatic BOS setting, including tokenizer defaults. |
 | `llamadart.webgpu.execution` | `worker` or `main-thread`. |
 | `llamadart.webgpu.backends` | Comma-separated backend labels detected by the bridge. |
 | `llamadart.webgpu.model_bytes` | Loaded model byte count. |

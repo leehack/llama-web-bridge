@@ -185,6 +185,25 @@ exercise extraction toggles, generation and state restore through direct and
 worker paths; metadata assertions reject memory-mode or worker fallback. CI
 and candidate qualification require both runs.
 
+The pinned tiny model also checks the vocabulary's BOS and EOS text and
+effective automatic BOS setting in both runtimes. The direct runtime then
+checks that the raw JSON has one copy of each key and preserves a vertical tab
+in the EOS token text. The 4,640-byte GGUF v3 fixture contains one Llama
+layer with zero-filled FP32 weights and eight synthetic tokens. Its raw GGUF
+metadata uses placeholder BOS and EOS strings and explicitly disables
+automatic BOS.
+
+Regenerate the GGUF with the standalone Python standard-library script:
+
+```bash
+python3 scripts/smoke/generate_tokenizer_metadata_fixture.py /tmp/tokenizer_metadata.gguf
+shasum -a 256 /tmp/tokenizer_metadata.gguf
+```
+
+The state smoke embeds the fixture as gzip-compressed base64 so the release
+harness digest covers its bytes. Compare the regenerated SHA-256 with
+`METADATA_FIXTURE_SHA256` in the [state smoke](scripts/smoke/state_persistence.mjs).
+
 To validate the single-thread `_st` cores on a non-isolated page
 (`crossOriginIsolated === false` and no `SharedArrayBuffer`):
 
