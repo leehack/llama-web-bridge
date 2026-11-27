@@ -4,6 +4,7 @@ import assert from 'node:assert/strict';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
 
+import { buildLargeOutputGguf } from './synthetic_gguf.mjs';
 import {
   DEFAULT_MODEL_CACHE, copyBridgeArtifacts, copyMemory64Artifacts, copySingleThreadArtifacts,
   env, parseSmokeArgs, resolvePinnedModel, runMain, runPollingPlaywright,
@@ -11,10 +12,14 @@ import {
 } from './support.mjs';
 
 const STAGED_CASES = ['staged-load', 'staged-load-no-mmap'];
-const DEFAULT_CASES = ['load', 'cpp-throw', 'next-token', 'cancel-cleanup', 'state-write', ...STAGED_CASES, 'healthy'];
+const LATE_READER_CASES = ['reader-late-mmap', 'reader-late-no-mmap'];
+const READER_CASES = ['reader-header', 'reader-tensor', 'reader-tensor-no-mmap', 'reader-cancel', 'reader-cold', ...LATE_READER_CASES];
+const LEAK_CASE = 'failed-load-leak';
+const DEFAULT_CASES = ['load', 'cpp-throw', 'next-token', 'cancel-cleanup', 'state-write', ...STAGED_CASES, 'healthy', LEAK_CASE, ...READER_CASES];
 const IFRAME_CASES = ['iframe', 'older-iframe'];
 const MODEL = 'abort-smoke.gguf';
 const TRUNCATED = 'abort-smoke-truncated.gguf';
+const LARGE = 'abort-smoke-large.gguf';
 
 export function parseArgs(argv) {
   return parseSmokeArgs(argv, {
@@ -88,8 +93,52 @@ async function instrumentCore(createCore, settings, options) {
   };
   core.ccall = (name, ...args) => {
     enter(name);
-    return originalCcall(name, ...args);
+    const result = originalCcall(name, ...args);
+    if (name !== 'llamadart_webgpu_load_model') return result;
+    return Promise.resolve(result).then((rc) => {
+      report('load-rc', { rc });
+      return rc;
+    });
   };
+  // Wraps the next bound model reader so a read fails or waits at a chosen point.
+  let armedReader = null;
+  const originalBind = core.llamadartJsModelFsBindExternal;
+  if (originalBind) {
+    core.llamadartJsModelFsBindExternal = (handle, mountId, reader) => {
+      report('bind', { mode: reader.mode, size: reader.size });
+      const fault = armedReader;
+      armedReader = null;
+      if (!fault) return originalBind(handle, mountId, reader);
+      let injected = false;
+      const wrapped = {
+        get mode() { return reader.mode; },
+        get size() { return reader.size; },
+        get signal() { return reader.signal; },
+        get failure() { return reader.failure; },
+        set failure(value) { reader.failure = value; },
+        close: () => reader.close(),
+        read: (offset, length, copy) => {
+          // The header is read in small pieces. A whole-file mapping or a tensor
+          // read is a large read, or one that starts in the second half.
+          const header = length <= 65536 && offset < reader.size / 2;
+          // A late fault is damage past the first 16 MiB step of a larger read.
+          const hit = fault === 'late' ? offset >= 16 * 1024 * 1024
+            : fault === 'header' ? header : !injected && !header;
+          if (!hit) return reader.read(offset, length, copy);
+          if (!injected) report('reader-fault', { fault, offset, length });
+          injected = true;
+          if (fault !== 'cancel') throw new Error('injected model read failure');
+          return (async () => {
+            for (let i = 0; i < 500 && !reader.signal?.aborted; i += 1) {
+              await new Promise((resolve) => setTimeout(resolve, 10));
+            }
+            return reader.read(offset, length, copy);
+          })();
+        },
+      };
+      return originalBind(handle, mountId, wrapped);
+    };
+  }
   core.FS = new Proxy(core.FS, {
     get(target, name) {
       const value = Reflect.get(target, name);
@@ -112,11 +161,20 @@ async function instrumentCore(createCore, settings, options) {
   }
   channel.onmessage = ({ data }) => {
     if (data.command === 'arm' && data.id === id) {
-      armed = { point: data.point, fault: data.fault };
+      if (data.point === 'reader') {
+        armedReader = data.fault;
+        // A synchronous OPFS read cannot wait for a cancel, so a cancel reads the
+        // Blob that browsers without exclusive sync handles fall back to.
+        if (data.fault === 'cancel' && typeof FileSystemFileHandle !== 'undefined') {
+          Object.defineProperty(FileSystemFileHandle.prototype, 'createSyncAccessHandle',
+            { value: undefined, configurable: true });
+        }
+      } else armed = { point: data.point, fault: data.fault };
       report('armed');
     }
     if (data.command === 'snapshot') {
-      report('snapshot', { request: data.request, created, terminated });
+      const headroom = Number(originalCcall('llamadart_webgpu_heap_headroom_bytes', 'number', [], []));
+      report('snapshot', { request: data.request, created, terminated, headroom });
     }
   };
   report('created', { created, terminated });
@@ -132,7 +190,8 @@ export default (options) => instrumentCore(createCore, ${JSON.stringify({ hideRu
 
 async function runBrowserCase(settings) {
   const { LlamaWebGpuBridge } = await import('/llama_webgpu_bridge.js');
-  const { scenario, modelUrl, truncatedUrl, worker, single, memory64, staging, coreName } = settings;
+  const { scenario, modelUrl: smallModelUrl, largeUrl, truncatedUrl, worker, single, memory64, staging, coreName } = settings;
+  const modelUrl = scenario.startsWith('reader-late-') ? largeUrl : smallModelUrl;
   const channel = new BroadcastChannel('core-abort-smoke');
   const events = [];
   const workers = [];
@@ -216,6 +275,84 @@ async function runBrowserCase(settings) {
     }
     bridge = new LlamaWebGpuBridge(config);
     const nThreads = single ? 1 : 4;
+    if (scenario.startsWith('reader-')) {
+      // A model that llama.cpp cannot read through an external reader fails the
+      // native load with -2. The core stays usable, a damaged cache entry is
+      // replaced once, and a cancel leaves the next load unaffected.
+      const cacheName = 'reader-smoke-' + crypto.randomUUID();
+      const readerOptions = {
+        nCtx: 128, nThreads, nThreadsBatch: nThreads, nGpuLayers: 0, useCache: true, cacheName,
+        ...(scenario.endsWith('-no-mmap') ? { useMmap: false } : {}),
+        ...(scenario === 'reader-late-mmap' ? { useMmap: true } : {}),
+      };
+      const loadCached = (extra = {}) => bridge.loadModelFromUrl(modelUrl, { ...readerOptions, ...extra });
+      // The synthetic model has no byte-fallback tokens, so its prompt uses only its own pieces.
+      const completeText = () => bridge.createCompletion(modelUrl === largeUrl ? 'a b c' : 'hello', { nPredict: 8, temp: 0, seed: 1 });
+      const notes = () => (bridge.getModelMetadata()['llamadart.webgpu.runtime_notes'] || '').split(';');
+      if (scenario === 'reader-cold') {
+        // A download that was just streamed into OPFS is not a cache entry anyone
+        // could have damaged, so a failed read there is reported, not retried.
+        await bridge.loadModelFromUrl(modelUrl, { ...readerOptions, useCache: false });
+        const core = await waitFor(() => events.find((event) => event.type === 'created'), 'No core creation event');
+        const mark = events.length;
+        await arm(core.id, 'reader', 'header');
+        await expectError(() => loadCached(),
+          (error) => error.name === 'ModelStagingError' && error.code === 'MODEL_READ_FAILED');
+        assert(events.slice(mark).some((event) => event.type === 'bind' && event.mode === 0), 'The cold load did not read through OPFS');
+        assert(!events.some((event) => event.type === 'abort' || event.type === 'retired'), 'A read failure aborted or retired the core');
+        await loadCached();
+        const recovered = await completeText();
+        assert(typeof recovered === 'string' && recovered.length > 0, 'Generation failed after the read failure');
+        assert(events.filter((event) => event.type === 'created').length === 1, 'A read failure replaced the core');
+        await bridge.evictModelFromCache(modelUrl, { cacheName });
+        result.ok = true;
+        return;
+      }
+      window.__smokeStage = scenario + ':cold';
+      await loadCached();
+      const created = await waitFor(() => events.find((event) => event.type === 'created'), 'No core creation event');
+      assert(notes().includes(worker ? 'model_cache_opfs' : 'model_cache_stored'), 'The cold load did not store the model');
+      assert(await bridge.isModelCached(modelUrl, { cacheName }), 'The cold load did not leave a cached model');
+      const fault = scenario.startsWith('reader-late-') ? 'late' : scenario.slice('reader-'.length).replace('-no-mmap', '');
+      const clean = fault === 'late' ? await completeText() : null;
+      const from = events.length;
+      window.__smokeStage = scenario + ':fault';
+      await arm(created.id, 'reader', fault);
+      if (fault === 'cancel') {
+        const controller = new AbortController();
+        const aborting = waitFor(() => events.slice(from).find((event) => event.type === 'reader-fault'),
+          'The load never reached a tensor read').then(() => controller.abort());
+        await expectError(() => loadCached({ signal: controller.signal }), (error) => error.name === 'AbortError');
+        await aborting;
+        assert(await bridge.isModelCached(modelUrl, { cacheName }), 'A cancelled load evicted the cache entry');
+      } else {
+        await loadCached();
+        if (clean !== null) {
+          const reloaded = await completeText();
+          assert(reloaded === clean, `A read that failed late changed the output: ${JSON.stringify(clean)} then ${JSON.stringify(reloaded)}`);
+        }
+        assert(notes().includes('model_cache_entry_invalid') && notes().includes('model_stream_restart:cache'),
+          'The damaged cache entry was not replaced: ' + notes().join(','));
+        assert(await bridge.isModelCached(modelUrl, { cacheName }), 'The replaced model is not cached');
+      }
+      const faultEvents = events.slice(from);
+      const rcs = faultEvents.filter((event) => event.type === 'load-rc').map((event) => event.rc);
+      const bound = faultEvents.find((event) => event.type === 'bind');
+      assert(bound, 'The load did not use an external reader');
+      assert(bound.mode === (worker && fault !== 'cancel' ? 0 : 1), `Unexpected reader mode ${bound.mode}`);
+      // A mapped load may finish with rc 0 over zeroed bytes; the bridge must then reject it.
+      assert(rcs[0] === -2 || (fault === 'late' && rcs[0] === 0), `The failed read did not fail the load: ${rcs}`);
+      assert(!events.some((event) => event.type === 'abort'), 'A read failure called onAbort');
+      assert(!bridge._coreRetirements && !events.some((event) => event.type === 'retired'), 'A read failure retired the core');
+      window.__smokeStage = scenario + ':reload';
+      if (fault === 'cancel') await loadCached();
+      const text = await completeText();
+      assert(typeof text === 'string' && text.length > 0, 'Generation failed after the read failure');
+      assert(events.filter((event) => event.type === 'created').length === 1, 'A read failure replaced the core');
+      await bridge.evictModelFromCache(modelUrl, { cacheName });
+      Object.assign(result, { ok: true, rcs });
+      return;
+    }
     const noMmap = scenario === 'staged-load-no-mmap';
     const options = {
       nCtx: 128, nThreads, nThreadsBatch: nThreads, nGpuLayers: 0, useCache: false,
@@ -268,6 +405,24 @@ async function runBrowserCase(settings) {
     }
 
     window.__smokeStage = scenario + ':fault';
+    if (scenario === 'failed-load-leak') {
+      // llama.cpp frees what a failed load allocated only when its own unwind runs.
+      // Without it every failure keeps its loader's buffers in the Wasm heap for good.
+      const failLoad = () => expectError(() => load(truncatedUrl), (error) => error.message.startsWith('Failed to load GGUF model'));
+      for (let i = 0; i < 3; i += 1) await failLoad();
+      const warm = await snapshot(first.id);
+      assert(warm.headroom > 0, 'The core did not report its heap headroom');
+      for (let i = 0; i < 60; i += 1) await failLoad();
+      const settled = await snapshot(first.id);
+      const growth = warm.headroom - settled.headroom;
+      assert(growth <= 2 * 1024 * 1024, `60 failed loads used ${growth} bytes of heap headroom`);
+      await load();
+      const text = await complete();
+      assert(typeof text === 'string' && text.length > 0, 'Generation failed after the failed loads');
+      assert(!events.some(({ type }) => type === 'abort' || type === 'retired'), 'A failed load aborted or retired the core');
+      Object.assign(result, { ok: true, growth });
+      return;
+    }
     if (scenario === 'healthy') {
       await expectError(() => complete({ grammar: 'root ::= answer' }), (error) => error.message.includes('(invalid grammar)'));
       const controller = new AbortController();
@@ -398,6 +553,9 @@ async function runDist(args, distDir, modelPath, cases) {
     await stageFile(modelPath, path.join(webRoot, MODEL));
     const model = await fsp.readFile(modelPath);
     await fsp.writeFile(path.join(webRoot, TRUNCATED), model.subarray(0, 1_000_000));
+    if (cases.some(({ scenario }) => LATE_READER_CASES.includes(scenario))) {
+      await fsp.writeFile(path.join(webRoot, LARGE), buildLargeOutputGguf());
+    }
     await fsp.writeFile(path.join(webRoot, 'core-frame.html'),
       '<script>window.loadCoreFactory = import("/instrumented-core.js").then(module => module.default)</script>');
     return withServer(webRoot, async (url) => {
@@ -411,7 +569,7 @@ async function runDist(args, distDir, modelPath, cases) {
             renderInstrumentedCore(coreName, { hideRuntimeError: scenario === 'older-iframe' }));
           await fsp.writeFile(path.join(webRoot, 'index.html'), renderHarness({
             scenario, worker, staging, single, memory64, coreName,
-            modelUrl: '/' + MODEL, truncatedUrl: '/' + TRUNCATED,
+            modelUrl: '/' + MODEL, largeUrl: '/' + LARGE, truncatedUrl: '/' + TRUNCATED,
           }));
           const payload = await runPollingPlaywright(url, args.timeoutMs, args.artifactsDir, {
             artifactPrefix: key,
@@ -444,7 +602,8 @@ async function main() {
     if (args.baselineDistDir) return [false, true].map((staging) => ({ scenario: 'parity', worker, staging }));
     return [...DEFAULT_CASES, ...(worker ? [] : IFRAME_CASES)]
       .filter((scenario) => args.case == null || args.case === scenario)
-      .map((scenario) => ({ scenario, worker, staging: STAGED_CASES.includes(scenario) }));
+      .filter((scenario) => worker || scenario !== 'reader-cold')
+      .map((scenario) => ({ scenario, worker, staging: STAGED_CASES.includes(scenario) || READER_CASES.includes(scenario) }));
   });
   assert.ok(cases.length > 0, 'The selected case requires direct runtime');
   const results = await runDist(args, args.distDir, modelPath, cases);

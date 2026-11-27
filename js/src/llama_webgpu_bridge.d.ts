@@ -374,7 +374,8 @@ export type ModelStagingErrorCode =
   | 'MODEL_STAGING_ALLOCATION_FAILED'
   | 'MODEL_TENSOR_SIZE_LIMIT_EXCEEDED'
   | 'MODEL_STAGING_MOUNT_FAILED'
-  | 'MODEL_STAGING_UNSUPPORTED';
+  | 'MODEL_STAGING_UNSUPPORTED'
+  | 'MODEL_READ_FAILED';
 /** Thrown when JS-backed model staging fails, is unsupported by the core, collides on mount, or exceeds the wasm32 4 GiB tensor limit. */
 export class ModelStagingError extends Error {
   code: ModelStagingErrorCode;

@@ -191,7 +191,12 @@ Cancellation remains cooperative, not preemptive. A direct model transfer is
 checked before each stream read/write and immediately before native model-load
 entry; an abort that arrives before that entry skips the native call and removes
 partial files. Once an unpreemptible native call has started, cancellation waits
-for it to return and then discards and cleans up its result.
+for it to return and then discards and cleans up its result. A load that reads
+its model through an external reader (see `jsBackedModelStaging`) checks the
+signal before every bounded read. An abort that arrives while llama.cpp waits on
+an asynchronous read ends the load early with an `AbortError`, and the core stays
+usable. A synchronous OPFS read cannot be interrupted, so that load finishes
+first.
 
 ### Disposal
 
@@ -224,7 +229,7 @@ it.
 | `workerUrl` | `string` | URL for `llama_webgpu_bridge_worker.js`. Defaults to a sibling of the bridge module when possible. |
 | `disableWorker` | `boolean` | Force direct runtime mode. |
 | `allowSingleThreadCore` | `boolean` | Set to `true` to select the single-thread defaults on pages without cross-origin isolation. When supplying core URLs, point them at single-thread cores for those pages. Single-thread cores use one CPU thread and report `core_single_thread`. A core that starts a pthread pool can still hit `Bridge core init timeout` if the page cannot share memory with workers. See [single-thread setup and timeout behavior](single_thread.md). |
-| `jsBackedModelStaging` | `boolean` | Unset enables JS-backed staging on WebKit when the core supports it. `false` opts out on any browser. `true` requires JS-backed staging support. JS-backed staging places models and projectors in a private per-operation `/jsmodels-<n>` mount. A supported core stages a single model file of known decoded size in one memory-mapped wasm heap block when the effective GPU layer count after the Safari cap is 0 or 1. Other JS-backed loads use 64 MiB JS `Uint8Array` chunks. |
+| `jsBackedModelStaging` | `boolean` | Unset enables JS-backed staging on WebKit when the core supports it. `false` opts out on any browser. `true` requires JS-backed staging support. JS-backed staging places models and projectors in a private per-operation `/jsmodels-<n>` mount. A supported core stages a single model file of known decoded size in one memory-mapped wasm heap block when the effective GPU layer count after the Safari cap is 0 or 1. Other JS-backed loads use 64 MiB JS `Uint8Array` chunks. A core with JS model FS ABI version 5 instead reads a cached model on demand, without staging it, from an OPFS file or a Cache Storage response. In a worker, a download that needs caching streams into an OPFS file under `llamadart-model-cache-v1/` instead. Neither the OPFS names nor its manifests contain the URL. A model loaded from OPFS keeps its exclusive lock while it stays loaded, so another tab loads the same model without the cache until it is released. Only the main-thread cold download, a load with `useCache: false` outside a worker and an environment without OPFS still use chunks. |
 | `preferMemory64` | `boolean` | Prefer the wasm64 core when available. Defaults to `true`; the runtime can still fall back to wasm32. |
 | `workerRequestTimeoutMs` | `number` | Default timeout for worker RPC calls, 2 minutes unless a method has its own default. It also sets the `embed`/`embedBatch` budget, which defaults to 10 minutes when an input has image or audio parts. |
 | `workerInitTimeoutMs` | `number` | Timeout for worker initialization. |
@@ -491,6 +496,7 @@ prefetchModelToCache(url: string | string[], options?: LoadModelOptions): Promis
 ```
 
 Fetches model URL(s) into Cache Storage without loading them into llama.cpp.
+A later JS-backed load reads the Cache Storage entry on demand.
 This uses a direct runtime helper even when the main bridge instance is currently
 worker-backed. Use it to warm the browser cache before calling
 `loadModelFromUrl()`. After a successful cache-enabled HTTP(S) prefetch with
@@ -508,7 +514,9 @@ evictModelFromCache(url: string | string[], options?: Record<string, unknown>): 
 ```
 
 Removes one model URL, explicit shard array, or expanded split-model URL set from
-Cache Storage, including both whole-body entries and WebKit part entries.
+Cache Storage, including both whole-body entries and WebKit part entries, and
+from OPFS when a worker stored it there. An OPFS entry that a reader holds open
+stays until that reader closes.
 Eviction skips a model while an active store or cache cleanup holds its lock.
 This includes cleanup in the same context immediately after cancellation.
 Removing part entries requires Web Locks. Returns whether any requested model
@@ -522,8 +530,9 @@ isModelCached(url: string | string[], options?: ModelCacheQueryOptions): Promise
 ```
 
 Resolves `true` when the bridge cache holds a committed record for every HTTP(S)
-URL. A WebKit manifest or a whole-body entry counts on WebKit. On other engines,
-only the whole-body entry counts. Pass `options.cacheName` to select a cache.
+URL. A committed OPFS file counts on every engine. A WebKit manifest or a
+whole-body entry counts on WebKit. On other engines, only the whole-body entry
+counts. Pass `options.cacheName` to select a cache.
 The default is the bridge's configured `cacheName`.
 
 An explicit shard array or a split GGUF filename requires every shard. Relative
@@ -1503,7 +1512,13 @@ include:
 | `model_stream_resume_validated`, `model_stream_resume_unvalidated` | The model stream resumed with or without sufficient validation. |
 | `model_stream_restart:<reason>` | The shard download restarted at byte zero. `model_stream_restart:cache` identifies a retry after a cache entry error. |
 | `model_cache_parts` | The operation read or stored a WebKit part entry. |
-| `model_cache_entry_invalid`, `mmproj_cache_entry_invalid` | A missing or damaged cache part caused a model or projector retry. |
+| `model_cache_entry_invalid`, `mmproj_cache_entry_invalid` | A missing or damaged cache part, or a cached model that could not be read during the native load, caused a model or projector retry. The entry is removed and the retry restages from the network once. |
+| `model_reader:<kind>` | JS-backed staging on a core with JS model FS ABI version 5 read the model on demand instead of copying it into JS chunks. `opfs_sync` reads a committed OPFS file synchronously in a worker, `opfs_blob` reads the same file as a Blob, `blob_cache` reads a Cache Storage response, and `cache_parts` reads WebKit's part entry. `mmproj_reader:<kind>` reports the same for a projector. |
+| `model_opfs_download`, `model_cache_opfs` | A worker streamed the model into an OPFS file instead of JS chunks. `model_cache_opfs` means the file is now a cache entry. |
+| `model_opfs_fallback:<reason>` | OPFS could not accept the download, and the load staged the model in JS chunks instead. |
+| `model_read_failed` | A read of the staged model failed during the native load. |
+| `model_reader_bind_failed` | The core could not attach a reader to a cached model's staging file, so the load staged the model in JS chunks. A failed bind after a worker OPFS cold download rejects with `MODEL_STAGING_MOUNT_FAILED` instead. |
+| `model_mmap_disabled:external_reader` | `useMmap: true` was ignored because the model is read through an external reader. A mapping would copy the whole file into the heap. |
 | `gpu_unavailable:<reason>` | A load requesting GPU offload uses the CPU and logs a warning. Reasons are `no_webgpu`, `no_adapter`, `adapter_missing_shader_f16`, and `unknown`. |
 | `safari_gpu_layers_capped:<n>` | A Safari cap or successful probe retry lowered effective offload to `n` layers. This includes capped full-offload requests on Apple Safari. |
 | `safari_gpu_probe_embedding` | Safari probed the GPU with embeddings. |
@@ -1672,6 +1687,7 @@ on WebKit. Use its `code` to distinguish these cases.
 | `MODEL_STAGING_UNSUPPORTED` | The worker lacks the capability flag for an explicit staging load, or the selected core lacks a required export or supported API version. |
 | `MODEL_STAGING_MOUNT_FAILED` | The bridge could not allocate or verify its private staging mount, or lost ownership during the load. |
 | `MODEL_TENSOR_SIZE_LIMIT_EXCEEDED` | The single-file or split GGUF tensor payload exceeds the wasm32 4 GiB address bound. |
+| `MODEL_READ_FAILED` | A read of the staged model failed during the native load and a retry was not possible. The core stays usable for another load. |
 
 See the [Chromium measurements](single_thread.md#chromium-webgpu-measurements)
 and [iOS Safari results](single_thread.md#ios-safari) for observed limits and

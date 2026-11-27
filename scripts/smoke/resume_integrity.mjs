@@ -182,8 +182,24 @@ export default async (options) => {
   const core = await createCore(options);
   const ccall = core.ccall.bind(core);
   const channel = new BroadcastChannel('resume-integrity');
+  let readerSize = 0;
+  const bindExternal = core.llamadartJsModelFsBindExternal?.bind(core);
+  if (bindExternal) {
+    core.llamadartJsModelFsBindExternal = (handle, mountId, reader) => {
+      readerSize = reader.size;
+      return bindExternal(handle, mountId, reader);
+    };
+  }
   core.ccall = (name, type, types, args, opts) => {
     if (name !== 'llamadart_webgpu_load_model') return ccall(name, type, types, args, opts);
+    if (readerSize > 0) {
+      // A file the core reads on demand cannot be read back synchronously.
+      const bytes = readerSize;
+      readerSize = 0;
+      const recorded = new Promise((resolve) => channel.addEventListener('message', resolve, { once: true }));
+      channel.postMessage({ reader: true, bytes });
+      return recorded.then(() => ccall(name, type, types, args, opts));
+    }
     const bytes = core.FS.readFile(args[0]);
     return crypto.subtle.digest('SHA-256', bytes).then(async (hash) => {
       const sha256 = Array.from(new Uint8Array(hash), (b) => b.toString(16).padStart(2, '0')).join('');
@@ -439,11 +455,14 @@ function verifyCase(args, revisions, name, result, worker = false) {
     assert.equal(result.notes.includes('model_staging_js_backed'), args.jsBackedModelStaging);
     const expected = revisions.expected[scenario.expected];
     const staged = { sha256: expected.sha256, bytes: revisions.revA.length };
-    assert.deepEqual(result.staged, scenario.cacheReload ? [staged, staged] : [staged]);
+    const reloaded = args.jsBackedModelStaging ? { reader: true, bytes: revisions.revA.length } : staged;
+    assert.deepEqual(result.staged, scenario.cacheReload ? [staged, reloaded] : [staged]);
     if (scenario.cacheReload) {
       assert.equal(result.initialCache, 'stored');
       assert.equal(result.cache, 'hit');
-      assert.equal(result.notes.includes('model_staging_heap_resident'), args.jsBackedModelStaging && !args.noMmap);
+      assert.equal(result.notes.includes('model_reader:blob_cache'), args.jsBackedModelStaging,
+        'a cached model is read on demand only when the core stages through JS');
+      assert.equal(result.notes.includes('model_staging_heap_resident'), false);
     }
     assert.equal(result.name, expected.name);
     assert.deepEqual(result.tokens, [29871, expected.token]);

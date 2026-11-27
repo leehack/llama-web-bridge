@@ -107,6 +107,19 @@ cores also export `llamadart_webgpu_test_fail_next_model_load`,
 `src/llama_webgpu_core_post.js` must turn into an abort) for the abort and
 load failure smokes.
 
+JS model FS ABI version 5 adds `llamadart_webgpu_js_model_fs_open_external` and
+the `llamadartJsModelFsBindExternal` runtime method. They make a staging file
+read-only and answer its reads from a JS reader (`js/src/internal/external_model_reader.ts`)
+that copies at most 16 MiB per call. A mode `0` reader answers synchronously
+(OPFS). A mode `1` reader returns a promise and the read suspends the core
+through ASYNCIFY (Blob and Cache Storage parts). Every failed read records
+`reader.failure` and returns `-errno`, so the loader can classify a native load
+that fails afterwards. Check `reader.failure` after any native call that opens a
+file by path, successful or not, because some llama.cpp readers do not check every
+read and a memory-mapped load finishes over the bytes a failed read left zeroed.
+For the same reason a failed read of an external file returns `-errno`, never a
+partial count.
+
 Release builds compile `llama`, `llama-common`, `llama-common-base`, `mtmd`,
 `ggml-webgpu`, and the bridge sources with `-Os` and link the core with
 `-Os`. `ggml-cpu` and `ggml-base` keep the Release `-O3` defaults for CPU

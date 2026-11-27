@@ -40,6 +40,19 @@ export function isSupportedJsModelStagingApiVersion(apiVersion: number): boolean
   return Number.isInteger(apiVersion) && apiVersion >= JS_MODEL_STAGING_API_VERSION;
 }
 
+const EXTERNAL_MODEL_READER_API_VERSION = 5;
+
+// A core that cannot read a model on demand keeps staging it in JS chunks.
+export function supportsExternalModelReader(
+  core: LlamaCoreModule | null | undefined,
+  apiVersion: number,
+): boolean {
+  return Number.isInteger(apiVersion)
+    && apiVersion >= EXTERNAL_MODEL_READER_API_VERSION
+    && typeof core?._llamadart_webgpu_js_model_fs_open_external === 'function'
+    && typeof core?.llamadartJsModelFsBindExternal === 'function';
+}
+
 // Optional: a core without these keeps staging on JS chunks.
 const HEAP_RESIDENT_STAGING_EXPORTS = [
   '_llamadart_webgpu_js_model_fs_supports_heap_resident',
@@ -103,7 +116,8 @@ export function isModelStagingErrorCode(value: unknown): value is ModelStagingEr
   return value === 'MODEL_STAGING_ALLOCATION_FAILED'
     || value === 'MODEL_TENSOR_SIZE_LIMIT_EXCEEDED'
     || value === 'MODEL_STAGING_MOUNT_FAILED'
-    || value === 'MODEL_STAGING_UNSUPPORTED';
+    || value === 'MODEL_STAGING_UNSUPPORTED'
+    || value === 'MODEL_READ_FAILED';
 }
 
 export function missingJsModelStagingExports(core: LlamaCoreModule | null | undefined): string[] {

@@ -237,3 +237,28 @@ test('the carried WebGPU patch drains the queue before resetting its weight byte
     .map((line) => line.slice(1)).join('\n');
   assert.match(added, /ctx->weight_upload_bytes == batch_bytes\) \{[^}]*ggml_backend_webgpu_wait_queue\(ctx\);\s*ctx->weight_upload_bytes = 0;/);
 });
+
+test('the carried loader patch bounds the tensor read buffer and keeps WebGPU uploads aligned', () => {
+  const file = path.join(root, 'patches/llama.cpp/0002-chunked-model-loader-read.patch');
+  const added = readFileSync(file, 'utf8').split('\n').filter((line) => line.startsWith('+'))
+    .map((line) => line.slice(1)).join('\n');
+  assert.match(added, /#if defined\(__EMSCRIPTEN__\)/);
+  assert.match(added, /constexpr size_t max_chunk_bytes = 16 \* 1024 \* 1024;/);
+  assert.match(added, /check_tensors \? std::lcm\(size_t\(4\), ggml_type_size\(cur->type\)\) : 4/);
+  assert.match(added, /ggml_backend_tensor_set\(cur, data, pos, count\);/);
+  assert.match(added, /ggml_validate_row_data\(cur->type, data, count\)/);
+  assert.match(added, /progress_callback\(float\(size_done \+ pos\) \/ size_data/);
+  const series = JSON.parse(readFileSync(path.join(root, 'patches/llama.cpp/series.json'), 'utf8')).patches;
+  const entry = series.find(({ file: name }) => name === '0002-chunked-model-loader-read.patch');
+  assert.equal(entry.target, 'llama');
+  assert.equal(entry.tracking, 'https://github.com/leehack/llama-web-bridge/issues/346');
+  assert.match(entry.upstream, /^https:\/\/github\.com\/ggml-org\/llama\.cpp\/blob\/[0-9a-f]{40}\/src\/llama-model-loader\.cpp#L\d+-L\d+$/);
+  assert.match(added, new RegExp(entry.wasm_marker));
+});
+
+test('a replaced llama.cpp source keeps its compile options and stays out of unity builds', () => {
+  const cmake = readFileSync(path.join(root, 'CMakeLists.txt'), 'utf8');
+  assert.match(cmake, /get_target_property\(llama_sources llama SOURCES\)\s+set\(patched "\$\{CMAKE_CURRENT_BINARY_DIR\}\/llama\.cpp-patched\/src\/\$\{filename\}"\)\s+if \("\$\{patched\}" IN_LIST llama_sources\)\s+set\(source "\$\{patched\}"\)/);
+  const patches = readFileSync(path.join(root, 'cmake/llama_cpp_patches.cmake'), 'utf8');
+  assert.match(patches, /set_source_files_properties\("\$\{output_dir\}\/\$\{relative\}"\s+DIRECTORY "\$\{source_dir\}" PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON\)/);
+});

@@ -51,7 +51,7 @@ function instantiateJsModelFsLibrary({
           heapBacking.copyWithin(toWindowIndex(dst), toWindowIndex(start), toWindowIndex(end));
         },
       };
-  const cDefs = { EBADF: 8, EFBIG: 22, ENOMEM: 12, EINVAL: 28 };
+  const cDefs = { EBADF: 8, EFBIG: 22, ENOMEM: 12, EINVAL: 28, EIO: 29, EROFS: 69, ECANCELED: 11 };
   const heapRef = HEAPU8;
 
   const transformed = mutatedSource
@@ -91,6 +91,7 @@ function instantiateJsModelFsLibrary({
     Number,
     BigInt,
     Module: {},
+    Asyncify: { handleSleep: (resume) => new Promise(resume) },
     ccall() {},
     addToLibrary(obj) {
       registered = obj;
@@ -144,6 +145,7 @@ function instantiateJsModelFsLibrary({
     registered,
     callNative,
     writeDirect: sandbox.llamadartJsModelFsWriteDirect,
+    bindExternal: sandbox.llamadartJsModelFsBindExternal,
     HEAPU8,
     heapBacking,
     view,
@@ -152,6 +154,99 @@ function instantiateJsModelFsLibrary({
     retire: sandbox.Module.llamadartRetire,
   };
 }
+
+test('ABI v5 reads an external file at a full-width offset without allocating staging chunks', async () => {
+  assert.match(cppFsSource, /llamadart_webgpu_js_model_fs_api_version\(\)\s*\{\s*return 5;/);
+  for (const wasm64 of [false, true]) {
+    const { callNative, bindExternal, writeDirect, heapBacking, view, cDefs, retire } =
+      instantiateJsModelFsLibrary({ wasm64 });
+    const call = (suffix, ...args) => callNative(`_llamadart_js_model_fs_${suffix}`, args);
+    const offset = (wasm64 ? 2 ** 32 : 2 ** 31) + 1024;
+    const size = offset + 3;
+    const mode = wasm64 ? 1 : 0;
+    const controller = new AbortController();
+    const bytes = Uint8Array.of(1, 2, 3);
+    const offsets = [];
+    let closed = 0;
+    const read = (at, count, copy) => {
+      offsets.push(at);
+      copy(bytes.subarray(0, count));
+    };
+
+    call('alloc_file', 1, 1);
+    call('mark_external', 1, size, mode);
+    const handle = call('bind_direct', 1);
+    assert.equal(bindExternal(handle, 2, { mode, size, read, close() {} }), -cDefs.EINVAL);
+    assert.equal(bindExternal(handle, 1, {
+      mode, size, signal: controller.signal,
+      read: wasm64 ? async (...args) => read(...args) : read,
+      close() { ++closed; },
+    }), 0);
+    const nativeRead = (...args) => call(wasm64 ? 'read_async' : 'read', 1, ...args);
+    assert.equal(await nativeRead(0, 8, offset), 3);
+    assert.deepEqual(heapBacking.subarray(0, 3), bytes);
+    assert.deepEqual(offsets, [offset]);
+    assert.equal(await nativeRead(0, 8, size), 0);
+    assert.equal(await nativeRead(0, 1, Number.MAX_SAFE_INTEGER + 1), -cDefs.EINVAL);
+    assert.equal(writeDirect(handle, bytes, 0), -cDefs.EROFS);
+    assert.equal(call('set_size', 1, 0), -cDefs.EROFS);
+    call('get_size', 1, 8);
+    assert.equal(view.getBigInt64(8, true), BigInt(size));
+    assert.equal(call('allocated_bytes'), 0);
+    controller.abort();
+    assert.equal(await nativeRead(0, 1, offset), -cDefs.ECANCELED);
+    call('release_mount', 1);
+    retire();
+    assert.equal(closed, 1);
+  }
+});
+
+test('every failed external read records its reason on the reader and later reads keep the first', async () => {
+  const { callNative, bindExternal, cDefs } = instantiateJsModelFsLibrary();
+  const call = (suffix, ...args) => callNative(`_llamadart_js_model_fs_${suffix}`, args);
+  const bytes = Uint8Array.of(1, 2, 3, 4);
+  const cases = [
+    ['a thrown read', cDefs.EIO, () => { throw new Error('thrown'); }],
+    ['a rejected read', cDefs.EIO, async () => { throw new Error('rejected'); }],
+    ['a read that copies nothing', cDefs.EIO, () => {}],
+    ['a read that copies a short count', cDefs.EIO, (offset, count, copy) => copy(bytes.subarray(0, count - 1))],
+    ['a read that copies nothing asynchronously', cDefs.EIO, async () => {}],
+  ];
+  for (const [label, code, read] of cases) {
+    const reader = { mode: 1, size: 4, read, close() {} };
+    call('alloc_file', 1, 1);
+    call('mark_external', 1, 4, 1);
+    const handle = call('bind_direct', 1);
+    assert.equal(bindExternal(handle, 1, reader), 0);
+    assert.equal(reader.failure, undefined, label);
+    assert.equal(await call('read_async', 1, 0, 4, 0), -code, label);
+    assert.equal(reader.failure.code, code, label);
+    const first = reader.failure.error;
+    assert.ok(first, label);
+    assert.equal(await call('read_async', 1, 0, 4, 0), -code, label);
+    assert.equal(reader.failure.error, first, label + ' keeps the first failure');
+    call('release_mount', 1);
+  }
+
+  const ok = { mode: 1, size: 4, read: (offset, count, copy) => copy(bytes.subarray(offset, offset + count)), close() {} };
+  call('alloc_file', 2, 1);
+  call('mark_external', 2, 4, 1);
+  assert.equal(bindExternal(call('bind_direct', 2), 1, ok), 0);
+  assert.equal(await call('read_async', 2, 0, 4, 0), 4);
+  assert.equal(ok.failure, undefined);
+  assert.equal(await call('read_async', 2, 0, 4, 4), 0);
+  assert.equal(ok.failure, undefined, 'a read at the end of the file is not a failure');
+
+  const controller = new AbortController();
+  const cancelled = { mode: 1, size: 4, signal: controller.signal, read: ok.read, close() {} };
+  call('alloc_file', 3, 1);
+  call('mark_external', 3, 4, 1);
+  assert.equal(bindExternal(call('bind_direct', 3), 1, cancelled), 0);
+  controller.abort(new Error('stop'));
+  assert.equal(await call('read_async', 3, 0, 4, 0), -cDefs.ECANCELED);
+  assert.equal(cancelled.failure.code, cDefs.ECANCELED);
+  assert.equal(cancelled.failure.error.message, 'stop');
+});
 
 test('discarding model chunks detaches only their private backing buffers', () => {
   const { callNative, writeDirect, heapBacking, state, retire, cDefs } = instantiateJsModelFsLibrary();
@@ -662,6 +757,10 @@ int32_t _llamadart_js_model_fs_read(uintptr_t, uint8_t* buf, uint32_t len, int64
   g_remaining_bytes -= result;
   return static_cast<int32_t>(result);
 }
+void _llamadart_js_model_fs_mark_external(uintptr_t, double, int32_t) {}
+int32_t _llamadart_js_model_fs_read_async(uintptr_t, uint8_t *, uint32_t, int64_t) {
+  return -ENOSYS;
+}
 void _llamadart_js_model_fs_get_size(uintptr_t, int64_t* out) { *out = 0; }
 int32_t _llamadart_js_model_fs_set_size(uintptr_t, int64_t) { return 0; }
 void _llamadart_js_model_fs_release_mount(int32_t mount_id) {
@@ -745,7 +844,7 @@ void test_large_reads(wasmfs::DataFile &file) {
 }
 
 int main() {
-  assert(llamadart_webgpu_js_model_fs_api_version() == 4);
+  assert(llamadart_webgpu_js_model_fs_api_version() == 5);
   assert(llamadart_webgpu_js_model_fs_supports_heap_resident() == 0);
   assert(llamadart_webgpu_js_model_fs_open_direct_heap("/jsmodels/model.gguf", 2 * 1024 * 1024) == -ENOSYS);
   // 0) Path predicate must make zero heap allocations when nothing is mounted.
@@ -996,4 +1095,10 @@ test('direct JS chunk writer accepts cross-realm Uint8Array chunks and rejects n
   callNative('_llamadart_js_model_fs_unbind_direct', [handle]);
   callNative('_llamadart_js_model_fs_free_file', [fileId]);
   assert.equal(callNative('_llamadart_js_model_fs_allocated_bytes'), 0);
+});
+
+test('a failed read of an external file returns the error, never a partial count', () => {
+  const read = cppFsSource.slice(cppFsSource.indexOf('ssize_t read(uint8_t * buf'));
+  const failure = read.slice(read.indexOf('if (got < 0) {'), read.indexOf('total += static_cast<size_t>(got);'));
+  assert.match(failure, /return external_mode_ >= 0 \|\| total == 0 \? got : static_cast<ssize_t>\(total\);/);
 });

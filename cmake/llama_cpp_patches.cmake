@@ -69,6 +69,10 @@ function(llamadart_replace_llama_cpp_source target relative output_dir)
         message(FATAL_ERROR "llama.cpp patches: ${target} must compile ${relative} exactly once (found ${matches})")
     endif()
     set_property(TARGET "${target}" PROPERTY SOURCES "${replacements}")
+    # A unity build would compile the copy inside another file's translation
+    # unit and drop the options that apply to it alone.
+    set_source_files_properties("${output_dir}/${relative}"
+        DIRECTORY "${source_dir}" PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON)
     # The relocated source no longer finds its private headers next to itself.
     get_filename_component(original_dir "${original}" DIRECTORY)
     target_include_directories("${target}" BEFORE PRIVATE "${original_dir}")
