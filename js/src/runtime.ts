@@ -95,6 +95,13 @@ import {
   supportsHeapResidentStaging,
   supportsJsBackedStaging,
 } from './internal/model_staging.ts';
+import {
+  CALLER_MODEL_SOURCE_URL,
+  inspectCallerModel,
+  isCallerModelSource,
+  openCallerModelSource,
+} from './internal/caller_model_source.ts';
+import type { CallerModelSource } from './internal/caller_model_source.ts';
 import { ExternalReadRetry, externalReadFailure, openCachedExternalModel } from './internal/external_model_source.ts';
 import type { ExternalModelReader } from './internal/external_model_reader.ts';
 import { createOpfsModelDownload, evictOpfsModel, hasOpfsModel, OpfsWriteError } from './internal/opfs_model_store.ts';
@@ -320,6 +327,8 @@ export class LlamaWebGpuBridgeRuntime {
   declare _modelCacheState: string;
   declare _modelCacheName: string;
   declare _loadedModelUrl: ModelSource | null;
+  declare _loadedCallerSource: CallerModelSource | null;
+  declare _callerSourceHold: ExternalModelReader | null;
   declare _mmProjSourceUrl: string | null;
   declare _mmProjSourceOptions: MultimodalProjectorLoadOptions | undefined;
   declare _draftModel: { url: string; options: DraftModelLoadOptions; info: DraftModelInfo } | null;
@@ -429,6 +438,8 @@ export class LlamaWebGpuBridgeRuntime {
     this._modelCacheState = 'disabled';
     this._modelCacheName = defaultModelCacheName;
     this._loadedModelUrl = null;
+    this._loadedCallerSource = null;
+    this._callerSourceHold = null;
     this._mmProjSourceUrl = null;
     this._mmProjSourceOptions = undefined;
     this._draftModel = null;
@@ -736,6 +747,7 @@ export class LlamaWebGpuBridgeRuntime {
     try {
       this._preferMemory64 = false;
       await this.loadModelFromUrl(modelUrl, {
+        ...(this._loadedCallerSource ? { callerModelSource: this._loadedCallerSource } : {}),
         nCtx: this._nCtx,
         nThreads: this._threads,
         nGpuLayers: 0,
@@ -1886,6 +1898,19 @@ export class LlamaWebGpuBridgeRuntime {
     return removed;
   }
 
+  // A worker keeps the sync access handle of a caller's OPFS file open for as long
+  // as a model loaded from it exists, so nothing else can write the file and the
+  // bridge's own reload reads the bytes it loaded.
+  _releaseCallerSourceHold() {
+    const hold = this._callerSourceHold;
+    this._callerSourceHold = null;
+    try {
+      hold?.close();
+    } catch (_) {
+      // The handle is already unusable.
+    }
+  }
+
   // A load replaces the current model. Free it, its projector and their FS files
   // before downloading the next model so both never occupy the wasm heap at once.
   // The core refuses while a generation or speech synthesis is still active,
@@ -1905,6 +1930,7 @@ export class LlamaWebGpuBridgeRuntime {
       throw new Error(this._coreErrorMessage('Failed to release the loaded model', rc));
     }
 
+    this._releaseCallerSourceHold();
     this._loraAdaptersLoaded = false;
     this._clearStagedMediaFiles();
     if (
@@ -2420,6 +2446,7 @@ export class LlamaWebGpuBridgeRuntime {
     }
     this._coreRetired = true;
     this._corePreflight = null;
+    this._releaseCallerSourceHold();
     this._runtimeNotes.push('core_retired');
     if (!stats) {
       this._runtimeNotes.push('core_retired_threads_unavailable');
@@ -2686,7 +2713,34 @@ export class LlamaWebGpuBridgeRuntime {
   async preflightCore(): Promise<CorePreflightResult> {
     const core = await this._ensureCore();
     this._assertCoreLive(core);
-    return { ...this._corePreflight! };
+    return { ...this._corePreflight!, externalModelReader: this._coreReadsExternalModels(core) };
+  }
+
+  _coreReadsExternalModels(core: LlamaCoreModule): boolean {
+    try {
+      const apiVersion = typeof core._llamadart_webgpu_js_model_fs_api_version === 'function'
+        ? Number(core.ccall('llamadart_webgpu_js_model_fs_api_version', 'number', [], []))
+        : 0;
+      return supportsExternalModelReader(core, apiVersion);
+    } catch (_) {
+      return false;
+    }
+  }
+
+  _requireCallerModelSource(core: LlamaCoreModule, value: unknown): CallerModelSource {
+    if (!isCallerModelSource(value)) {
+      throw new ModelStagingError(
+        'MODEL_SOURCE_INVALID',
+        'A model source must be a Blob, a File or a FileSystemFileHandle.',
+      );
+    }
+    if (!this._coreReadsExternalModels(core)) {
+      throw new ModelStagingError(
+        'MODEL_SOURCE_UNSUPPORTED',
+        'This core cannot read a model from a caller source. It needs JS model filesystem API version 5 or later.',
+      );
+    }
+    return value;
   }
 
   async _probeBackends(diagnosticUrls: Set<string>, redact: ReturnType<typeof createCoreAssetUrlRedactor>) {
@@ -2744,7 +2798,10 @@ export class LlamaWebGpuBridgeRuntime {
     const core = await this._ensureCore(diagnosticUrls, redact);
     throwIfAborted(operationSignal, abortMessage);
 
-    const modelUrls = expandModelShardUrls(url);
+    const callerSource = options.callerModelSource === undefined
+      ? null
+      : this._requireCallerModelSource(core, options.callerModelSource);
+    const modelUrls = callerSource ? [CALLER_MODEL_SOURCE_URL] : expandModelShardUrls(url);
     if (modelUrls.length === 0) {
       throw new Error('Model URL is empty.');
     }
@@ -2883,6 +2940,7 @@ export class LlamaWebGpuBridgeRuntime {
     }
 
     this._loadedModelUrl = cloneModelSource(url);
+    this._loadedCallerSource = callerSource;
     if (modelUrls.length > 1) {
       this._runtimeNotes.push(`model_split_detected:${modelUrls.length}`);
     }
@@ -2890,7 +2948,9 @@ export class LlamaWebGpuBridgeRuntime {
     let loadedViaRemoteFetch = false;
     let remoteFetchReloadUrl = null;
     const remoteFetchReloadChunkBytes = this._resolveRemoteFetchChunkBytes(options);
-    if (modelUrls.length === 1) {
+    if (callerSource) {
+      this._runtimeNotes.push('model_fetch_backend_skipped_caller_source');
+    } else if (modelUrls.length === 1) {
       const remoteResult = await this._tryLoadModelFromRemoteFetchBackend(
         core,
         modelUrls[0],
@@ -2909,7 +2969,7 @@ export class LlamaWebGpuBridgeRuntime {
     let assertMountOwned: (() => void) | undefined;
     try {
       if (!loadedViaRemoteFetch) {
-      useJsBackedStaging = this._usesJsBackedStaging(core);
+      useJsBackedStaging = callerSource ? true : this._usesJsBackedStaging(core);
       let modelDir = '/models';
       let stagingMountId = 0;
       if (useJsBackedStaging) {
@@ -2963,6 +3023,7 @@ export class LlamaWebGpuBridgeRuntime {
       const cacheName = this._resolveCacheName(options);
       const externalCapable = useJsBackedStaging && this._supportsExternalReaders(core);
       const externalReaders: ExternalModelReader[] = [];
+      let verifyCallerSource: (() => Promise<void>) | null = null;
       const cachedReaders = new Set<ExternalModelReader>();
       let useCachedReaders = externalCapable;
       let bypassCacheOnRetry = false;
@@ -2995,7 +3056,7 @@ export class LlamaWebGpuBridgeRuntime {
           let opfsDownload: OpfsModelDownload | null = null;
           let externalStaged = false;
           const shardCacheKey = normalizeAbsoluteUrl(shardUrl);
-          const cacheable = options.useCache !== false && isModelCacheUrl(shardCacheKey);
+          const cacheable = !callerSource && options.useCache !== false && isModelCacheUrl(shardCacheKey);
 
           const restartShard = (reason: 'url' | 'range' | 'etag' | 'cache' | 'opfs') => {
             this._runtimeNotes.push('model_stream_restart:' + reason);
@@ -3024,7 +3085,48 @@ export class LlamaWebGpuBridgeRuntime {
 
           let activeOpfsDownload: OpfsModelDownload | null = null;
           try {
-            if (useCachedReaders && cacheable && options.force !== true) {
+            if (callerSource) {
+              const opened = await openCallerModelSource(callerSource, {
+                worker: this._isWorkerRuntime(),
+                signal: operationSignal,
+              });
+              try {
+                await inspectCallerModel(opened.reader);
+              } catch (error) {
+                opened.reader.close();
+                throw error;
+              }
+              if (!ownedPaths.includes(modelPath)) ownedPaths.push(modelPath);
+              // The staging file closes its reader when the load is done. A locked read
+              // outlives it: the runtime closes the real reader when the model unloads.
+              const bindReader = opened.kind === 'caller_opfs_sync'
+                ? { ...opened.reader, close() {} }
+                : opened.reader;
+              let bound: boolean;
+              try {
+                bound = this._bindExternalModelFile(core, modelPath, stagingMountId, bindReader, assertMountOwned!);
+              } catch (error) {
+                opened.reader.close();
+                throw error;
+              }
+              if (!bound) {
+                opened.reader.close();
+                throw new ModelStagingError(
+                  'MODEL_STAGING_MOUNT_FAILED',
+                  'The model source could not be attached to the staging mount.',
+                );
+              }
+              externalReaders.push(bindReader);
+              this._callerSourceHold = bindReader === opened.reader ? null : opened.reader;
+              verifyCallerSource = opened.verify;
+              shardBytes = opened.reader.size;
+              externalStaged = true;
+              this._modelCacheState = 'disabled';
+              this._modelSource = 'caller';
+              this._pushRuntimeNote('model_source:caller');
+              this._pushRuntimeNote('model_reader:' + opened.kind);
+            }
+            if (!externalStaged && useCachedReaders && cacheable && options.force !== true) {
               const cached = await openCachedExternalModel(cacheName, shardCacheKey, {
                 worker: this._isWorkerRuntime(),
                 wholeBody: !this._isWebKit,
@@ -3418,6 +3520,15 @@ export class LlamaWebGpuBridgeRuntime {
           // A memory-mapped load can finish over bytes a failed read left zeroed.
           await core.ccall('llamadart_webgpu_free_model', 'number', [], [], { async: true });
         }
+        if (rc === 0 && !readFailure && verifyCallerSource) {
+          try {
+            await verifyCallerSource();
+          } catch (error) {
+            await core.ccall('llamadart_webgpu_free_model', 'number', [], [], { async: true });
+            this._pushRuntimeNote('model_source_changed_during_load');
+            throw error;
+          }
+        }
         if (rc !== 0 || readFailure) {
           const errorMessage = rc === 0
             ? 'Failed to load GGUF model'
@@ -3471,6 +3582,7 @@ export class LlamaWebGpuBridgeRuntime {
         this._modelPaths = [];
         if (operationSignal?.aborted) {
           this._loadedModelUrl = null;
+          this._loadedCallerSource = null;
         }
         if (useJsBackedStaging) {
           try {
@@ -3697,6 +3809,7 @@ export class LlamaWebGpuBridgeRuntime {
         this._runtimeNotes.push('model_file_released');
       }
     } catch (error) {
+      this._releaseCallerSourceHold();
       if (assertMountOwned && this._modelBytes > 0 && error instanceof ModelStagingError
           && error.code === 'MODEL_STAGING_MOUNT_FAILED') {
         try {
@@ -6011,6 +6124,7 @@ export class LlamaWebGpuBridgeRuntime {
   }
 
   async dispose() {
+    this._releaseCallerSourceHold();
     this._corePreflight = null;
     this._pthreadStartGeneration += 1;
     for (const start of this._pendingPthreadStarts) start.settle(false);
@@ -6073,6 +6187,7 @@ export class LlamaWebGpuBridgeRuntime {
     this._modelSource = 'network';
     this._modelCacheState = 'disabled';
     this._loadedModelUrl = null;
+    this._loadedCallerSource = null;
     this._mmProjPath = null;
     this._mmProjSourceUrl = null;
     this._mmProjSourceOptions = undefined;

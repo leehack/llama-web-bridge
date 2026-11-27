@@ -1,6 +1,6 @@
 // Public bridge facade: picks the worker or direct runtime and owns the operation queue.
 
-import { createAbortError } from './internal/abort.ts';
+import { createAbortError, throwIfAborted } from './internal/abort.ts';
 import { embeddingAssetVersion, embeddingCapabilitiesFrom, missingEmbeddingCapability, snapshotEmbedInput } from './internal/embedding.ts';
 import { NO_COMPLETION_CAPABILITIES, completionCapabilitiesFrom, requireCompletionCapabilities, resolveCompletionSamplingOptions } from './internal/completion_options.ts';
 import {
@@ -32,6 +32,7 @@ import {
 import { cloneModelSource, hasModelSource, normalizeAbsoluteUrl, resolveModelSource, resolvePartUrls } from './internal/model_source.ts';
 import { isBridgeResolvedAsset, resolveCoreAssets, resolveWorkerAsset } from './default_assets.ts';
 import type { BridgeConfig } from './default_assets.ts';
+import { CALLER_MODEL_SOURCE_URL, describeCallerModelSource } from './internal/caller_model_source.ts';
 import { ModelStagingError, jsBackedStagingMode } from './internal/model_staging.ts';
 import { TEXT_TO_SPEECH_CANCELLED } from './internal/text_to_speech.ts';
 import { withoutNul } from './internal/text.ts';
@@ -262,6 +263,7 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
   static supportsModelCacheQuery = true;
   static supportsJsBackedModelStaging = true;
   static supportsCorePreflight = true;
+  static supportsCallerModelSource = true;
 
   constructor(config: BridgeConfig = {}) {
     validateGpuLayerRequest(config.nGpuLayers);
@@ -2037,6 +2039,25 @@ export class LlamaWebGpuBridge implements PublicLlamaWebGpuBridge {
   async loadModelFromUrl(url: string | string[], options: LoadModelOptions = {}) {
     return this._runExclusive(
       () => this._loadModelFromUrlUnlocked(url, options),
+      {
+        signal: options?.signal,
+        abortMessage: 'Model load was cancelled.',
+        kind: 'load-model',
+      },
+    );
+  }
+
+  /**
+   * Loads one GGUF the caller already holds: a Blob, a File or an OPFS or picker
+   * `FileSystemFileHandle`. The bridge reads it on demand and never copies it,
+   * writes to it or closes the caller's handle. It keeps the reference to
+   * reload the model after a worker restart or a CPU fallback.
+   */
+  async loadModelFromSource(source: unknown, options: LoadModelOptions = {}) {
+    throwIfAborted(options?.signal ?? null, 'Model load was cancelled.');
+    const description = await describeCallerModelSource(source);
+    return this._runExclusive(
+      () => this._loadModelFromUrlUnlocked(CALLER_MODEL_SOURCE_URL, { ...options, callerModelSource: description }),
       {
         signal: options?.signal,
         abortMessage: 'Model load was cancelled.',

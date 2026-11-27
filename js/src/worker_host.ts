@@ -113,6 +113,7 @@ export function installBridgeWorkerHost() {
           supportsIncrementalAudio: true,
           supportsJsBackedModelStaging: true,
           supportsCorePreflight: true,
+          supportsCallerModelSource: true,
         });
         return;
       }

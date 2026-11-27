@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 import vm from 'node:vm';
 
 import { LlamaWebGpuBridge, ModelStagingError } from '../../js/src/llama_webgpu_bridge.js';
+import { CALLER_MODEL_SOURCE_URL, describeCallerModelSource } from '../../js/src/internal/caller_model_source.ts';
 import { guardCore, retireCore } from '../../js/src/internal/core_guard.ts';
 import {
   isRetryableStreamNetworkError,
@@ -3019,4 +3020,305 @@ test('a projector read failure frees the projector and retries once without the 
     'the projector that loaded from damaged bytes is freed');
   assert.ok(runtime._runtimeNotes.includes('mmproj_read_failed'));
   assert.ok(runtime._runtimeNotes.includes('mmproj_cache_entry_invalid'));
+});
+
+const ggufU32 = (value) => { const b = Buffer.alloc(4); b.writeUInt32LE(value); return b; };
+const ggufU64 = (value) => { const b = Buffer.alloc(8); b.writeBigUInt64LE(BigInt(value)); return b; };
+const ggufString = (value) => Buffer.concat([ggufU64(Buffer.byteLength(value)), Buffer.from(value)]);
+
+function callerGguf(extra = []) {
+  const entries = [['general.architecture', 8, ggufString('llama')], ...extra];
+  return Buffer.concat([
+    Buffer.from('GGUF'), ggufU32(3), ggufU64(0), ggufU64(entries.length),
+    ...entries.flatMap(([key, type, value]) => [ggufString(key), ggufU32(type), value]),
+    Buffer.alloc(64),
+  ]);
+}
+
+async function callerLoadOptions(source, extra = {}) {
+  const callerModelSource = await describeCallerModelSource(source);
+  return { nCtx: 128, nGpuLayers: 0, callerModelSource, ...extra };
+}
+
+test('a caller Blob is attached as a reader without a download, a cache entry or a mapping', async () => {
+  const harness = createStagingHarness({ apiVersion: 5, onLoadModel: () => 0 });
+  const { runtime, externalBinds, ccalls } = harness;
+  runtime._getCachedModelResponse = async () => assert.fail('a caller source must not be downloaded');
+  const blob = new Blob([callerGguf()]);
+
+  await runtime.loadModelFromUrl(CALLER_MODEL_SOURCE_URL, await callerLoadOptions(blob, { useMmap: true, useCache: true }));
+
+  assert.equal(externalBinds.length, 1);
+  assert.deepEqual([externalBinds[0].reader.size, externalBinds[0].reader.mode], [blob.size, 1]);
+  const load = ccalls.find(([name]) => name === 'llamadart_webgpu_load_model');
+  assert.match(load[1], /^\/jsmodels-\d+\/model\.gguf$/);
+  assert.equal(load[9], 0, 'a mapping would copy the whole file into the heap');
+  for (const note of ['model_source:caller', 'model_reader:caller_blob', 'model_mmap_disabled:external_reader']) {
+    assert.ok(runtime._runtimeNotes.includes(note), note);
+  }
+  assert.equal(runtime._modelSource, 'caller');
+  assert.equal(runtime._modelCacheState, 'disabled');
+  assert.equal(runtime._modelBytes, blob.size);
+  assert.equal(runtime._loadedCallerSource.source, blob);
+  assert.ok(!ccalls.some(([name]) => name === 'llamadart_webgpu_load_model_from_url'));
+});
+
+test('a caller source that cannot be read fails the load without retrying or touching a cache', async (t) => {
+  const restore = stubCachedModel(new Uint8Array(64));
+  t.after(restore);
+  for (const returnCode of [-2, 0]) {
+    let loads = 0;
+    const harness = createStagingHarness({
+      apiVersion: 5,
+      onLoadModel: () => {
+        loads += 1;
+        harness.externalBinds[0].reader.failure = { code: 5, error: new Error('source is damaged') };
+        return returnCode;
+      },
+    });
+    const { runtime, ccalls } = harness;
+    runtime._getCachedModelResponse = async () => assert.fail('a caller source must not be downloaded');
+
+    await assert.rejects(
+      runtime.loadModelFromUrl(CALLER_MODEL_SOURCE_URL, await callerLoadOptions(new Blob([callerGguf()]))),
+      (error) => error.name === 'ModelStagingError' && error.code === 'MODEL_READ_FAILED' && /source is damaged/.test(error.message),
+    );
+    assert.equal(loads, 1, `rc ${returnCode} must not retry`);
+    assert.equal(ccalls.filter(([name]) => name === 'llamadart_webgpu_free_model').length, returnCode === 0 ? 1 : 0);
+    assert.ok(!runtime._runtimeNotes.includes('model_cache_entry_invalid'));
+    assert.equal(runtime._modelBytes, 0);
+  }
+});
+
+test('a core without readers refuses a caller source before it drops the loaded model', async () => {
+  const harness = createStagingHarness({ apiVersion: 4, onLoadModel: () => 0 });
+  const { runtime, ccalls } = harness;
+  runtime._modelBytes = 123;
+
+  await assert.rejects(
+    runtime.loadModelFromUrl(CALLER_MODEL_SOURCE_URL, await callerLoadOptions(new Blob([callerGguf()]))),
+    (error) => error.name === 'ModelStagingError' && error.code === 'MODEL_SOURCE_UNSUPPORTED',
+  );
+  assert.equal(runtime._modelBytes, 123);
+  assert.ok(!ccalls.some(([name]) => name === 'llamadart_webgpu_free_model'));
+  assert.ok(!ccalls.some(([name]) => name === 'llamadart_webgpu_load_model'));
+});
+
+test('a value that is not a described source is invalid', async () => {
+  const { runtime } = createStagingHarness({ apiVersion: 5, onLoadModel: () => 0 });
+  for (const callerModelSource of [null, 'url', { source: new Blob(['x']) }, { source: 1, size: 1, lastModified: null }]) {
+    await assert.rejects(
+      runtime.loadModelFromUrl(CALLER_MODEL_SOURCE_URL, { nCtx: 128, callerModelSource }),
+      (error) => error.code === 'MODEL_SOURCE_INVALID',
+    );
+  }
+});
+
+test('a split GGUF caller source is rejected before the native load and releases its reader', async () => {
+  const harness = createStagingHarness({ apiVersion: 5, onLoadModel: () => 0 });
+  const { runtime, ccalls } = harness;
+  const split = new Blob([callerGguf([['split.count', 2, Buffer.from([3, 0])]])]);
+
+  await assert.rejects(
+    runtime.loadModelFromUrl(CALLER_MODEL_SOURCE_URL, await callerLoadOptions(split)),
+    (error) => error.name === 'ModelStagingError' && error.code === 'MODEL_SOURCE_SPLIT_UNSUPPORTED',
+  );
+  assert.ok(!ccalls.some(([name]) => name === 'llamadart_webgpu_load_model'));
+  assert.equal(harness.externalBinds.length, 0);
+  assert.equal(runtime._modelBytes, 0);
+});
+
+test('a source whose file changed since it was described is refused', async () => {
+  const { runtime, externalBinds } = createStagingHarness({ apiVersion: 5, onLoadModel: () => 0 });
+  const file = new File([callerGguf()], 'm.gguf', { lastModified: 10 });
+  const options = await callerLoadOptions(file);
+  options.callerModelSource = { ...options.callerModelSource, lastModified: 11 };
+
+  await assert.rejects(
+    runtime.loadModelFromUrl(CALLER_MODEL_SOURCE_URL, options),
+    (error) => error.name === 'ModelStagingError' && error.code === 'MODEL_SOURCE_CHANGED',
+  );
+  assert.equal(externalBinds.length, 0);
+});
+
+test('CPU recovery reloads the same caller source', async () => {
+  const harness = createStagingHarness({ apiVersion: 5, onLoadModel: () => 0 });
+  const { runtime, externalBinds } = harness;
+  const blob = new Blob([callerGguf()]);
+  await runtime.loadModelFromUrl(CALLER_MODEL_SOURCE_URL, await callerLoadOptions(blob, { nGpuLayers: 0 }));
+  const first = runtime._loadedCallerSource;
+
+  assert.equal(await runtime._recoverGenerationWithCpuFallback({}), true);
+
+  assert.equal(externalBinds.length, 2);
+  assert.equal(runtime._loadedCallerSource.source, blob);
+  assert.equal(runtime._loadedCallerSource, first);
+});
+
+test('preflight reports whether the core reads models on demand', async () => {
+  for (const [apiVersion, expected] of [[5, true], [4, false], [3, false]]) {
+    const { runtime } = createStagingHarness({ apiVersion });
+    runtime._corePreflight = {
+      variant: 'wasm32', threading: 'single-thread', execution: 'main-thread', fallback: false,
+      fallbackReason: null, loaderUrl: null, wasmUrl: null,
+    };
+    assert.equal((await runtime.preflightCore()).externalModelReader, expected, `API version ${apiVersion}`);
+  }
+});
+
+function callerHandle(content) {
+  const bytes = Uint8Array.from(content);
+  const state = { syncClosed: 0, open: 0 };
+  return {
+    state,
+    editInPlace: (position) => { bytes[position] ^= 0xff; },
+    // A writer such as createWritable() is refused while a sync access handle is open.
+    canWrite: () => state.open === 0,
+    handle: {
+      kind: 'file',
+      getFile: async () => new File([bytes.slice()], 'model.gguf', { lastModified: 50 }),
+      createSyncAccessHandle: async () => {
+        if (state.open > 0) throw new DOMException('locked', 'NoModificationAllowedError');
+        state.open += 1;
+        return {
+          getSize: () => bytes.length,
+          read: (buffer, { at }) => {
+            const chunk = bytes.subarray(at, at + buffer.length);
+            buffer.set(chunk);
+            return chunk.length;
+          },
+          close: () => { state.open -= 1; state.syncClosed += 1; },
+        };
+      },
+    },
+  };
+}
+
+test('a handle source edited in place during the native load is freed and refused', async () => {
+  for (const worker of [true, false]) {
+    const fixture = callerHandle(callerGguf());
+    const harness = createStagingHarness({
+      apiVersion: 5,
+      onLoadModel: () => {
+        fixture.editInPlace(callerGguf().length - 8);
+        return 0;
+      },
+    });
+    const { runtime, ccalls } = harness;
+    runtime._isWorkerRuntime = () => worker;
+
+    await assert.rejects(
+      runtime.loadModelFromUrl(CALLER_MODEL_SOURCE_URL, await callerLoadOptions(fixture.handle)),
+      (error) => error.name === 'ModelStagingError' && error.code === 'MODEL_SOURCE_CHANGED',
+    );
+    assert.equal(ccalls.filter(([name]) => name === 'llamadart_webgpu_free_model').length, 1);
+    assert.equal(runtime._modelBytes, 0);
+    assert.ok(runtime._runtimeNotes.includes('model_source_changed_during_load'));
+  }
+});
+
+test('an unchanged handle source passes the recheck and keeps its model', async () => {
+  const fixture = callerHandle(callerGguf());
+  const harness = createStagingHarness({ apiVersion: 5, onLoadModel: () => 0 });
+  harness.runtime._isWorkerRuntime = () => true;
+
+  await harness.runtime.loadModelFromUrl(CALLER_MODEL_SOURCE_URL, await callerLoadOptions(fixture.handle));
+
+  assert.ok(!harness.ccalls.some(([name]) => name === 'llamadart_webgpu_free_model'));
+  assert.ok(harness.runtime._runtimeNotes.includes('model_reader:caller_opfs_sync'));
+});
+
+test('a sync access handle is released when the staging mount is lost before it binds', async () => {
+  const fixture = callerHandle(callerGguf());
+  const harness = createStagingHarness({ apiVersion: 5, onLoadModel: () => 0 });
+  harness.runtime._isWorkerRuntime = () => true;
+  harness.runtime._bindExternalModelFile = () => {
+    throw new ModelStagingError('MODEL_STAGING_MOUNT_FAILED', 'mount lost');
+  };
+
+  await assert.rejects(
+    harness.runtime.loadModelFromUrl(CALLER_MODEL_SOURCE_URL, await callerLoadOptions(fixture.handle)),
+    (error) => error.code === 'MODEL_STAGING_MOUNT_FAILED',
+  );
+  assert.equal(fixture.state.syncClosed, 1);
+});
+
+async function loadedHandleSource(extra = {}) {
+  const fixture = callerHandle(callerGguf());
+  const harness = createStagingHarness({ apiVersion: 5, onLoadModel: () => 0, ...extra });
+  harness.runtime._isWorkerRuntime = () => true;
+  await harness.runtime.loadModelFromUrl(CALLER_MODEL_SOURCE_URL, await callerLoadOptions(fixture.handle));
+  return { fixture, ...harness };
+}
+
+test('a worker keeps the sync access handle of a handle source while the model is loaded', async () => {
+  const { fixture, runtime } = await loadedHandleSource();
+  assert.ok(runtime._modelBytes > 0);
+  assert.equal(fixture.state.open, 1, 'the lock was dropped when the load returned');
+  assert.equal(fixture.canWrite(), false);
+  assert.ok(runtime._runtimeNotes.includes('model_reader:caller_opfs_sync'));
+});
+
+test('the lock of a handle source is released when the model unloads, is replaced or is disposed', async () => {
+  const replaced = await loadedHandleSource();
+  await replaced.runtime._releaseLoadedModel(replaced.core);
+  assert.equal(replaced.fixture.state.open, 0, 'unloading did not release the lock');
+  assert.equal(replaced.fixture.canWrite(), true);
+
+  const disposed = await loadedHandleSource();
+  await disposed.runtime.dispose();
+  assert.equal(disposed.fixture.state.open, 0, 'dispose did not release the lock');
+
+  const retired = await loadedHandleSource({ guard: true });
+  retireCore(retired.runtime._core, 'abort');
+  assert.equal(retired.fixture.state.open, 0, 'a retired core kept the lock');
+});
+
+test('a reload of the same handle releases its own lock first and holds a new one', async () => {
+  const { fixture, runtime } = await loadedHandleSource();
+  await runtime.loadModelFromUrl(CALLER_MODEL_SOURCE_URL, await callerLoadOptions(fixture.handle));
+  assert.equal(fixture.state.open, 1);
+  assert.equal(fixture.state.syncClosed, 1);
+
+  assert.equal(await runtime._recoverGenerationWithCpuFallback({}), true);
+  assert.equal(fixture.state.open, 1);
+  assert.equal(fixture.state.syncClosed, 2);
+
+  await runtime.loadModelFromUrl(CALLER_MODEL_SOURCE_URL, await callerLoadOptions(new Blob([callerGguf()])));
+  assert.equal(fixture.state.open, 0, 'loading another source kept the lock');
+});
+
+test('a failed or cancelled load of a handle source holds no lock', async () => {
+  for (const failure of ['native', 'abort']) {
+    const fixture = callerHandle(callerGguf());
+    const controller = new AbortController();
+    const harness = createStagingHarness({
+      apiVersion: 5,
+      onLoadModel: () => {
+        if (failure === 'abort') controller.abort();
+        return failure === 'native' ? -1 : 0;
+      },
+    });
+    harness.runtime._isWorkerRuntime = () => true;
+    const options = await callerLoadOptions(fixture.handle, { signal: controller.signal });
+
+    await assert.rejects(harness.runtime.loadModelFromUrl(CALLER_MODEL_SOURCE_URL, options));
+    assert.equal(fixture.state.open, 0, `${failure} kept the lock`);
+    assert.equal(fixture.canWrite(), true);
+  }
+});
+
+test('a source that cannot be attached to the staging mount holds no lock', async () => {
+  const fixture = callerHandle(callerGguf());
+  const harness = createStagingHarness({ apiVersion: 5, onLoadModel: () => 0 });
+  harness.runtime._isWorkerRuntime = () => true;
+  harness.runtime._bindExternalModelFile = (core, path, mountId, reader) => {
+    reader.close();
+    return false;
+  };
+  await assert.rejects(
+    harness.runtime.loadModelFromUrl(CALLER_MODEL_SOURCE_URL, await callerLoadOptions(fixture.handle)),
+    (error) => error.code === 'MODEL_STAGING_MOUNT_FAILED',
+  );
+  assert.equal(fixture.state.open, 0);
 });

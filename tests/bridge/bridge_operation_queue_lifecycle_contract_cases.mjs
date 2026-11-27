@@ -163,6 +163,7 @@ export const LIFECYCLE_CONTRACT_CASES = [
       [
         'preflightCore',
         'loadModelFromUrl',
+        'loadModelFromSource',
         'createCompletion',
         'getCompletionCapabilities',
         'loadMultimodalProjector',

@@ -411,4 +411,27 @@ export const DIRECT_CASES = [
     slow.bridge.cancel();
     await slowCompletion;
   }],
+
+  [42, 'loadModelFromSource queues behind an active operation and honours an abort while queued (direct)', async () => {
+    const { bridge } = createDirectBridge({ alpha: Array.from({ length: 80 }, () => 'A') });
+    const loaded = [];
+    bridge._runtime.loadModelFromUrl = async (url, options) => {
+      loaded.push([url, options.callerModelSource.size]);
+    };
+
+    const completion = settleQuietly(bridge.createCompletion('alpha'));
+    const load = bridge.loadModelFromSource(new Blob([new Uint8Array(8)]));
+    const controller = new AbortController();
+    const aborted = bridge.loadModelFromSource(new Blob([new Uint8Array(4)]), { signal: controller.signal });
+    const abortedRejection = assert.rejects(aborted, (error) => error.name === 'AbortError');
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.deepEqual(loaded, [], 'a source load must wait for the operation that owns the runtime');
+
+    controller.abort();
+    bridge.cancel();
+    await completion;
+    await load.catch(() => {});
+    await abortedRejection;
+    assert.ok(loaded.every(([, size]) => size !== 4), 'an aborted queued source load must not reach the runtime');
+  }],
 ];

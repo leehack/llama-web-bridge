@@ -79,6 +79,9 @@ export interface LoadModelOptions {
   [key: string]: unknown;
 }
 
+/** Options for `loadModelFromSource`. Cache and download options (`useCache`, `cacheName`, `force`, the fetch and remote-fetch options) have no effect, and `useMmap: true` is ignored. */
+export type LoadModelFromSourceOptions = Omit<LoadModelOptions, 'callerModelSource'>;
+
 export interface ModelCacheQueryOptions {
   /** Cache Storage cache to inspect. Defaults to the bridge's `cacheName`. */
   cacheName?: string;
@@ -375,7 +378,12 @@ export type ModelStagingErrorCode =
   | 'MODEL_TENSOR_SIZE_LIMIT_EXCEEDED'
   | 'MODEL_STAGING_MOUNT_FAILED'
   | 'MODEL_STAGING_UNSUPPORTED'
-  | 'MODEL_READ_FAILED';
+  | 'MODEL_READ_FAILED'
+  | 'MODEL_SOURCE_INVALID'
+  | 'MODEL_SOURCE_UNSUPPORTED'
+  | 'MODEL_SOURCE_SPLIT_UNSUPPORTED'
+  | 'MODEL_SOURCE_CHANGED'
+  | 'MODEL_SOURCE_BUSY';
 /** Thrown when JS-backed model staging fails, is unsupported by the core, collides on mount, or exceeds the wasm32 4 GiB tensor limit. */
 export class ModelStagingError extends Error {
   code: ModelStagingErrorCode;
@@ -567,6 +575,11 @@ export interface CorePreflightResult {
   fallbackReason: CoreFallbackReason | null;
   loaderUrl: string | null;
   wasmUrl: string | null;
+  /**
+   * The core reads a model on demand from a Blob, an OPFS file or a caller source
+   * (JS model filesystem API version 5). Absent from a bridge before this flag.
+   */
+  externalModelReader?: boolean;
 }
 
 export type CoreAssetErrorCode = 'CORE_ASSET_UNAVAILABLE' | 'CORE_PREFLIGHT_UNSUPPORTED';
@@ -597,6 +610,8 @@ export class LlamaWebGpuBridge {
   /** This bridge honors `jsBackedModelStaging` and validates worker/core staging support. */
   static supportsJsBackedModelStaging: boolean;
   static supportsCorePreflight: boolean;
+  /** This bridge has `loadModelFromSource()`. The core must also report `externalModelReader` from `preflightCore()`. */
+  static supportsCallerModelSource: boolean;
 
   constructor(config?: LlamaWebGpuBridgeConfig);
 
@@ -607,6 +622,23 @@ export class LlamaWebGpuBridge {
   preflightCore(): Promise<CorePreflightResult>;
   /** Can reject with `ModelTransferLengthError` if transfer length validation fails. */
   loadModelFromUrl(url: string | string[], options?: LoadModelOptions): Promise<unknown>;
+  /**
+   * Loads one GGUF the caller holds: a `Blob`, a `File`, or a `FileSystemFileHandle` (OPFS or file picker).
+   * The core reads it on demand and never copies it, so the caller must keep the source valid, and a
+   * handle unchanged, while a model loaded from it can be reloaded. The bridge never writes to or closes
+   * the caller's handle.
+   *
+   * A `Blob` or `File` is a snapshot. A handle is a live file. In a worker the bridge keeps an exclusive
+   * sync access handle on an OPFS file for as long as a model loaded from it exists, so the file cannot be
+   * written then (`MODEL_SOURCE_BUSY` if another context already holds one). Otherwise (main thread, a
+   * handle outside OPFS) the bridge compares size, `lastModified` and a sampled content fingerprint at
+   * every open and after the native load, and an in-place edit that keeps all of them (including one
+   * between the sampled stripes) is not detected.
+   *
+   * Rejects with `ModelStagingError` (`MODEL_SOURCE_INVALID`, `MODEL_SOURCE_UNSUPPORTED`,
+   * `MODEL_SOURCE_SPLIT_UNSUPPORTED`, `MODEL_SOURCE_CHANGED`, `MODEL_SOURCE_BUSY` or `MODEL_READ_FAILED`).
+   */
+  loadModelFromSource(source: Blob | FileSystemFileHandle, options?: LoadModelFromSourceOptions): Promise<unknown>;
   prefetchModelToCache(url: string | string[], options?: LoadModelOptions): Promise<unknown>;
   evictModelFromCache(url: string | string[], options?: Record<string, unknown>): Promise<unknown>;
   /**

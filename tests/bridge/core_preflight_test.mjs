@@ -139,7 +139,10 @@ function assertResult(result, {
   variant = 'wasm32', threading = 'single-thread', mode = 'direct',
   loaderUrl = loader, wasmUrl = wasm, fallbackReason = null,
 } = {}) {
-  assert.deepEqual(result, {
+  // The mock cores export no JS model filesystem, so none reads models on demand.
+  const { externalModelReader, ...reported } = result;
+  if (mode === 'direct') assert.equal(externalModelReader, false);
+  assert.deepEqual(reported, {
     variant, threading, execution: mode === 'direct' ? 'main-thread' : 'worker',
     fallback: fallbackReason !== null, fallbackReason, loaderUrl, wasmUrl,
   });

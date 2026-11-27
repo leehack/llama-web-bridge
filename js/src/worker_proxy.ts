@@ -103,6 +103,7 @@ export class BridgeWorkerProxy {
   declare _supportsIncrementalAudio: boolean;
   declare _supportsJsBackedModelStaging: boolean;
   declare _supportsCorePreflight: boolean;
+  declare _supportsCallerModelSource: boolean;
   // Set once the worker reports that its core aborted. It never clears: the
   // facade replaces this worker.
   declare coreRetired: boolean;
@@ -117,6 +118,7 @@ export class BridgeWorkerProxy {
     this._supportsIncrementalAudio = false;
     this._supportsJsBackedModelStaging = false;
     this._supportsCorePreflight = false;
+    this._supportsCallerModelSource = false;
     this.coreRetired = false;
 
     let workerInitError: unknown = null;
@@ -191,6 +193,7 @@ export class BridgeWorkerProxy {
         this._supportsIncrementalAudio = message.supportsIncrementalAudio === true;
         this._supportsJsBackedModelStaging = message.supportsJsBackedModelStaging === true;
         this._supportsCorePreflight = message.supportsCorePreflight === true;
+        this._supportsCallerModelSource = message.supportsCallerModelSource === true;
         this._clearReadyTimeout();
         this._endCspWatch();
         this._readyResolve?.();
@@ -308,6 +311,14 @@ export class BridgeWorkerProxy {
         'The worker did not declare supportsJsBackedModelStaging. The bridge and worker scripts must come from the same release.',
       );
     }
+    const hasCallerSource = method === 'loadModelFromUrl'
+      && (args[1] as { callerModelSource?: unknown } | undefined)?.callerModelSource !== undefined;
+    if (hasCallerSource && !this._supportsCallerModelSource) {
+      throw new ModelStagingError(
+        'MODEL_SOURCE_UNSUPPORTED',
+        'The worker did not declare supportsCallerModelSource. The bridge and worker scripts must come from the same release.',
+      );
+    }
     const id = this._nextId++;
     const timeoutMs = this._resolveRequestTimeoutMs(method, args);
     const transfers = Array.isArray(transferList)
@@ -355,7 +366,17 @@ export class BridgeWorkerProxy {
       if (operationMeta && typeof operationMeta === 'object') {
         Object.assign(message, operationMeta);
       }
-      this._worker.postMessage(message, transfers);
+      try {
+        this._worker.postMessage(message, transfers);
+      } catch (error) {
+        if (!hasCallerSource || (error as { name?: string } | null)?.name !== 'DataCloneError') throw error;
+        clearTimer();
+        this._pending.delete(id);
+        reject(new ModelStagingError(
+          'MODEL_SOURCE_INVALID',
+          'The model source cannot be sent to the worker. Pass a Blob, a File or a native FileSystemFileHandle.',
+        ));
+      }
     });
   }
 

@@ -8,6 +8,8 @@
 
 - Replace a cached model that cannot be read during a load and retry once, or reject with `ModelStagingError` code `MODEL_READ_FAILED`. The core stays usable either way.
 
+- Add `loadModelFromSource()` to load one GGUF from a `Blob`, `File` or `FileSystemFileHandle` the page already holds. The core reads it on demand without copying it. A worker restart or CPU fallback reloads the same source. A handle is checked by size, modification time and a sampled content fingerprint on every reload and after the native load, and a worker keeps an exclusive lock on an OPFS file while a model loaded from it exists, refusing one that another context holds open (`MODEL_SOURCE_BUSY`). Only that lock guarantees the bytes. `preflightCore()` reports `externalModelReader` and the bridge `supportsCallerModelSource` for feature detection.
+
 - Preserve separate DFlash and DSpark draft strategies on llama.cpp v1.1.0 and report unsupported draft variants by name.
 
 - Update the runtime to llama.cpp v1.1.0 and retain bounded WebGPU weight uploads. Text-to-speech uses the model's normal speaking speed and respects the context's prompt batch limit.
