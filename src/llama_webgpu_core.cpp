@@ -8,6 +8,7 @@
 #include <cstring>
 #include <cstdio>
 #include <fstream>
+#include <stdexcept>
 #include <limits>
 #include <map>
 #include <memory>

@@ -13,7 +13,7 @@ import {
 
 const MODEL_PATH = '/mm/tiny.gguf';
 const SIGNED_MODEL_PATH = `${MODEL_PATH}?sig=a/b&token=${'x'.repeat(280)}`;
-const TRUNCATED_MODEL_PATH = '/mm/bad.gguf';
+const ABORT_MODEL_PATH = MODEL_PATH + '?load=abort';
 const MOUNT_PROBE_PATH = '/fetch-mount-probe';
 const CHUNK_SIZE = 64 * 1024;
 const LARGE_CHUNK_SIZE = 2 * CHUNK_SIZE;
@@ -78,7 +78,6 @@ function sendModel(req, res, model) {
 export async function withModelRangeServer(webRoot, model, run) {
   const requests = [];
   const mounts = [];
-  const truncated = model.subarray(0, Math.min(1_000_000, Math.floor(model.length * 0.75)));
   const server = http.createServer(async (req, res) => {
     for (const [name, value] of ISOLATION_HEADERS) res.setHeader(name, value);
     try {
@@ -89,8 +88,6 @@ export async function withModelRangeServer(webRoot, model, run) {
         res.writeHead(405, { Allow: 'GET, HEAD' }).end();
       } else if (pathname === MODEL_PATH) {
         sendModel(req, res, model);
-      } else if (pathname === TRUNCATED_MODEL_PATH) {
-        sendModel(req, res, truncated);
       } else if (pathname === MOUNT_PROBE_PATH) {
         mounts.push({
           core: searchParams.get('core'),
@@ -143,11 +140,14 @@ export default async (options) => {
   const coreId = crypto.randomUUID();
   const ccall = core.ccall.bind(core);
   core.ccall = (name, ...args) => {
-    const result = ccall(name, ...args);
-    if (name !== 'llamadart_webgpu_load_model_from_url') return result;
-    return Promise.resolve(result).then(async (rc) => {
-      const url = new URL(args[2][0]);
-      const query = new URLSearchParams({ core: coreId, url: url.pathname + url.search });
+    if (name !== 'llamadart_webgpu_load_model_from_url') return ccall(name, ...args);
+    const url = new URL(args[2][0]);
+    const modelPath = url.pathname + url.search;
+    if (modelPath === '${ABORT_MODEL_PATH}') {
+      ccall('llamadart_webgpu_test_abort_next_model_load', null, [], []);
+    }
+    return Promise.resolve(ccall(name, ...args)).then(async (rc) => {
+      const query = new URLSearchParams({ core: coreId, url: modelPath });
       for (const file of core.FS.readdir('/')) {
         if (/^remote_model_\\d+\\.gguf$/.test(file)) query.append('file', file);
       }
@@ -280,7 +280,7 @@ async function main() {
   const args = parseArgs(process.argv.slice(2));
   const model = await fsp.readFile(await resolvePinnedModel(args));
   assert.ok(model.length > 2 * LARGE_CHUNK_SIZE, 'Use a model larger than two chunks to trigger WasmFS range fetches');
-  const abortLoad = { modelPath: TRUNCATED_MODEL_PATH, chunkSize: CHUNK_SIZE };
+  const abortLoad = { modelPath: ABORT_MODEL_PATH, chunkSize: CHUNK_SIZE };
   const recoveryLoad = { modelPath: `${MODEL_PATH}?load=recovery`, chunkSize: LARGE_CHUNK_SIZE };
   const scenarios = [
     { scenario: 'app-worker', loads: repeatedLoads(MODEL_PATH), nThreads: 4, abortLoad, recoveryLoad },

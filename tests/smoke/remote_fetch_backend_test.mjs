@@ -84,15 +84,15 @@ test('isolated model server supports exact-path HEAD and byte ranges without a d
   });
 });
 
-test('the isolated server can serve a truncated model and capture mounts from either worker', async () => {
+test('the isolated server serves the native abort fixture and captures mounts from either worker', async () => {
   const model = Buffer.alloc(1_500_000, 42);
   assert.match(renderTrackedCore('llama_webgpu_core_mem64'), /import createCore from '\/llama_webgpu_core_mem64\.js'/);
   await withTempDir('lane301-remote-fetch-test-', (webRoot) => withModelRangeServer(webRoot, model, async (url, requests, mounts) => {
-    const head = await fetch(new URL('/mm/bad.gguf', url), {
+    const head = await fetch(new URL('/mm/tiny.gguf?load=abort', url), {
       method: 'HEAD', headers: { Range: 'bytes=0-' },
     });
-    assert.equal(head.headers.get('content-length'), '1000000');
-    const reply = await fetch(new URL('/mm/bad.gguf', url), { headers: { Range: 'bytes=999998-1000001' } });
+    assert.equal(head.headers.get('content-length'), '1500000');
+    const reply = await fetch(new URL('/mm/tiny.gguf?load=abort', url), { headers: { Range: 'bytes=1499998-1500001' } });
     assert.equal(reply.status, 206);
     assert.deepEqual(new Uint8Array(await reply.arrayBuffer()), new Uint8Array([42, 42]));
     assert.equal(requests.length, 2);
@@ -102,18 +102,6 @@ test('the isolated server can serve a truncated model and capture mounts from ei
     });
     assert.equal((await fetch(probe)).status, 204);
     assert.deepEqual(mounts, [{ core: 'test-id', url: '/mm/tiny.gguf?sig=a/b', files: ['remote_model_1.gguf'] }]);
-  }));
-});
-
-test('the abort route still truncates models smaller than one megabyte', async () => {
-  const model = Buffer.alloc(800_000);
-  await withTempDir('lane301-remote-fetch-test-', (webRoot) => withModelRangeServer(webRoot, model, async (url) => {
-    const headLength = async (route) => {
-      const response = await fetch(new URL(route, url), { method: 'HEAD' });
-      return Number(response.headers.get('content-length'));
-    };
-    assert.equal(await headLength('/mm/tiny.gguf'), 800_000);
-    assert.equal(await headLength('/mm/bad.gguf'), 600_000);
   }));
 });
 

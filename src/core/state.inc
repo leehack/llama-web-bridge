@@ -43,6 +43,8 @@ std::string g_last_error;
 // of the current state, bit 4 the heap probe that allows both.
 int32_t g_state_load_test_failures = 0;
 bool g_test_fail_next_model_load = false;
+bool g_test_abort_next_model_load = false;
+bool g_test_throw_next_model_load = false;
 std::string g_last_output;
 std::string g_last_output_bytes_json = "[]";
 std::string g_last_piece;

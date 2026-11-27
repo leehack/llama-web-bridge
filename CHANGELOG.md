@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Keep the WebGPU core usable for another load when llama.cpp rejects a model or cannot read its GGUF.
+
 - Preserve separate DFlash and DSpark draft strategies on llama.cpp v1.1.0 and report unsupported draft variants by name.
 
 - Update the runtime to llama.cpp v1.1.0 and retain bounded WebGPU weight uploads. Text-to-speech uses the model's normal speaking speed and respects the context's prompt batch limit.

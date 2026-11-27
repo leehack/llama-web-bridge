@@ -101,8 +101,11 @@ map a heap-backed file directly. JS model FS ABI version 4 adds
 continue to use JS chunks. It also adds
 `llamadart_webgpu_js_model_fs_open_direct_heap` and the
 `llamadart_webgpu_js_model_fs_heap_resident_bytes` diagnostic. Production
-cores also export `llamadart_webgpu_test_fail_next_model_load` for the
-same-core load failure smoke.
+cores also export `llamadart_webgpu_test_fail_next_model_load`,
+`llamadart_webgpu_test_abort_next_model_load` (`std::abort()` during load) and
+`llamadart_webgpu_test_throw_next_model_load` (an uncaught C++ exception, which
+`src/llama_webgpu_core_post.js` must turn into an abort) for the abort and
+load failure smokes.
 
 Release builds compile `llama`, `llama-common`, `llama-common-base`, `mtmd`,
 `ggml-webgpu`, and the bridge sources with `-Os` and link the core with

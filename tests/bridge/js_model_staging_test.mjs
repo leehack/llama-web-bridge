@@ -490,6 +490,8 @@ test('heap staging links mmap wrappers and releases mappings after their last na
     'js_model_fs_open_direct_heap',
     'js_model_fs_heap_resident_bytes',
     'test_fail_next_model_load',
+    'test_abort_next_model_load',
+    'test_throw_next_model_load',
   ]) {
     assert.ok(cmake.includes(`_llamadart_webgpu_${name}`), `missing core export ${name}`);
   }

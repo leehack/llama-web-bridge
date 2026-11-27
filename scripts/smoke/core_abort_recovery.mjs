@@ -11,7 +11,7 @@ import {
 } from './support.mjs';
 
 const STAGED_CASES = ['staged-load', 'staged-load-no-mmap'];
-const DEFAULT_CASES = ['load', 'next-token', 'cancel-cleanup', 'state-write', ...STAGED_CASES, 'healthy'];
+const DEFAULT_CASES = ['load', 'cpp-throw', 'next-token', 'cancel-cleanup', 'state-write', ...STAGED_CASES, 'healthy'];
 const IFRAME_CASES = ['iframe', 'older-iframe'];
 const MODEL = 'abort-smoke.gguf';
 const TRUNCATED = 'abort-smoke-truncated.gguf';
@@ -77,6 +77,10 @@ async function instrumentCore(createCore, settings, options) {
       armed = null;
       report('injected', { name, fault });
       if (fault === 'plain') throw new Error('operation aborted(foo)');
+      if (fault === 'native-abort' || fault === 'cpp-throw') {
+        originalCcall(`llamadart_webgpu_test_${fault === 'cpp-throw' ? 'throw' : 'abort'}_next_model_load`, null, [], []);
+        return;
+      }
       originalCcall('llamadart_webgpu_tokenize_bytes_to_json', 'number',
         ['pointer', 'number', 'number'], [0x7ffffff0, 64, 0]);
       throw new Error('The native trap unexpectedly returned');
@@ -271,8 +275,12 @@ async function runBrowserCase(settings) {
       await expectError(() => complete({ signal: controller.signal }), (error) => error.name === 'AbortError');
       await arm(first.id, 'llamadart_webgpu_next_token', 'plain');
       await expectError(() => complete(), (error) => error.message === 'operation aborted(foo)');
-      await complete();
+      await expectError(() => load(truncatedUrl), (error) => error.message.startsWith('Failed to load GGUF model'));
+      await load();
+      const text = await complete();
+      assert(typeof text === 'string' && text.length > 0, 'Generation failed after reloading on the same core');
       await snapshot(first.id);
+      assert(!events.some(({ type }) => type === 'abort'), 'A healthy error called onAbort');
       assert(!bridge._coreRetirements && !events.some(({ type }) => type === 'retired'), 'A healthy error retired the core');
       assert(events.filter(({ type }) => type === 'created').length === 1, 'A healthy error replaced the core');
       assert(workers.filter(({ terminated }) => !terminated).length === Number(worker),
@@ -281,11 +289,15 @@ async function runBrowserCase(settings) {
       return;
     }
 
-    const abortedLoad = scenario === 'load' || scenario === 'staged-load' || noMmap;
+    const abortedLoad = scenario === 'load' || scenario === 'cpp-throw' || scenario === 'staged-load' || noMmap;
     const wasmTrap = (error) => error.message.includes('memory access out of bounds');
     const nativeAbort = (error) => /^Aborted\(/.test(error.message);
+    const abortDuringLoad = async (fault = 'native-abort') => {
+      await arm(first.id, 'llamadart_webgpu_load_model', fault);
+      await expectError(() => load(), nativeAbort);
+    };
     if (abortedLoad) {
-      await expectError(() => load(truncatedUrl), nativeAbort);
+      await abortDuringLoad(scenario === 'cpp-throw' ? 'cpp-throw' : 'native-abort');
     } else if (scenario === 'state-write') {
       await arm(first.id, 'FS.writeFile');
       await expectError(() => bridge.stateLoadBytes(new Uint8Array(64)), wasmTrap);
@@ -307,7 +319,7 @@ async function runBrowserCase(settings) {
       if (scenario === 'older-iframe') {
         assert(!bridge._coreRetirements, 'An older iframe core retired on an unrecognized bare trap');
         await snapshot(first.id);
-        await expectError(() => load(truncatedUrl), nativeAbort);
+        await abortDuringLoad();
       }
     }
 

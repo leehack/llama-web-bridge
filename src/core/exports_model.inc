@@ -68,6 +68,14 @@ EMSCRIPTEN_KEEPALIVE void llamadart_webgpu_test_fail_next_model_load() {
   g_test_fail_next_model_load = true;
 }
 
+EMSCRIPTEN_KEEPALIVE void llamadart_webgpu_test_abort_next_model_load() {
+  g_test_abort_next_model_load = true;
+}
+
+EMSCRIPTEN_KEEPALIVE void llamadart_webgpu_test_throw_next_model_load() {
+  g_test_throw_next_model_load = true;
+}
+
 EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_free_model() {
   clear_error();
   if (g_generation_active || g_tts_active) {
