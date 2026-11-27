@@ -13,7 +13,6 @@ import {
 const CASES = ['dispose', 'abort'];
 const DECISION_CASE = 'decision-abort';
 const MODEL = 'release-smoke.gguf';
-const TRUNCATED = 'release-smoke-truncated.gguf';
 const DECISION_MODEL = 'decision-encoder.gguf';
 const DECISION_HEAD = 'decision-head.safetensors';
 
@@ -53,7 +52,7 @@ export default async (options) => {
 
 async function runBrowserCase(settings) {
   const { LlamaWebGpuBridge } = await import('/llama_webgpu_bridge.js');
-  const { scenario, modelUrl, truncatedUrl, decisionModelUrl, decisionHeadUrl, single, memory64, coreName } = settings;
+  const { scenario, modelUrl, decisionModelUrl, decisionHeadUrl, single, memory64, coreName } = settings;
   const assert = (condition, message) => {
     if (!condition) throw new Error(message);
   };
@@ -110,8 +109,9 @@ async function runBrowserCase(settings) {
       bridge = new LlamaWebGpuBridge(config);
     } else {
       let aborted = null;
-      await load(truncatedUrl).catch((error) => { aborted = error; });
-      assert(aborted && /^Aborted\(/.test(aborted.message), `The truncated model did not abort the core: ${aborted}`);
+      cores()[0].deref().ccall('llamadart_webgpu_test_abort_next_model_load', null, [], []);
+      await load().catch((error) => { aborted = error; });
+      assert(aborted && /^Aborted\(/.test(aborted.message), `The injected native abort did not retire the core: ${aborted}`);
       assert(bridge._coreRetirements === 1, 'Expected exactly one retirement');
     }
     await load();
@@ -180,15 +180,13 @@ async function main() {
       await stageFile(args.decisionModelPath, path.join(webRoot, DECISION_MODEL));
       await stageFile(args.decisionHeadPath, path.join(webRoot, DECISION_HEAD));
     }
-    const model = await fsp.readFile(modelPath);
-    await fsp.writeFile(path.join(webRoot, TRUNCATED), model.subarray(0, 1_000_000));
     await fsp.writeFile(path.join(webRoot, 'tracked-core.js'), renderTrackedCore(coreName));
     return withServer(webRoot, async (url) => {
       const collected = {};
       for (const scenario of scenarios) {
         const key = [args.threading, args.memoryMode, scenario].join('-');
         await fsp.writeFile(path.join(webRoot, 'index.html'), renderHarness({
-          scenario, single, memory64, coreName, modelUrl: '/' + MODEL, truncatedUrl: '/' + TRUNCATED,
+          scenario, single, memory64, coreName, modelUrl: '/' + MODEL,
           decisionModelUrl: decision ? '/' + DECISION_MODEL : null,
           decisionHeadUrl: decision ? '/' + DECISION_HEAD : null,
         }));

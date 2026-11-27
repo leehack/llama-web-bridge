@@ -608,7 +608,7 @@ const CASES = [
     assert.match(upstream, /common_speculative_type_from_name\(name\)/, 'the core maps names through llama.cpp');
   }],
 
-  ['only the grammar, LoRA, speculative and state restore wrappers and context creation catch exceptions and every new export is linked', () => {
+  ['the exception allowlist is limited to the bridge wrappers and native model and context cleanup', () => {
     const allowed = cmake.match(/-sEXCEPTION_CATCHING_ALLOWED=\[([^\]]*)\]/)[1];
     const names = allowed.split(',').map((name) => name.trim().replace(/^'|'$/g, ''));
     const speculativeWrappers = [
@@ -626,6 +626,12 @@ const CASES = [
       'llama_init_from_model',
       '_ZN13llama_contextC2ERK11llama_model20llama_context_params',
       '_ZN13llama_context13sched_reserveEv',
+      '_ZL31llama_model_load_from_file_implP12gguf_contextPFvP11ggml_tensorPvES3_RKNSt3__212basic_stringIcNS6_11char_traitsIcEENS6_9allocatorIcEEEERNS6_6vectorISC_NSA_ISC_EEEEP8_IO_FILE18llama_model_params',
+      '_ZL16llama_model_loadP12gguf_contextPFvP11ggml_tensorPvES3_RKNSt3__212basic_stringIcNS6_11char_traitsIcEENS6_9allocatorIcEEEERNS6_6vectorISC_NSA_ISC_EEEEP8_IO_FILER18llama_model_params',
+      '_ZN18llama_model_loaderC1EP12gguf_contextPFvP11ggml_tensorPvES4_RKNSt3__212basic_stringIcNS7_11char_traitsIcEENS7_9allocatorIcEEEERNS7_6vectorISD_NSB_ISD_EEEEP8_IO_FILE15llama_load_modebbbPK23llama_model_kv_overridePK32llama_model_tensor_buft_override',
+      '_ZN18llama_model_loaderC2EP12gguf_contextPFvP11ggml_tensorPvES4_RKNSt3__212basic_stringIcNS7_11char_traitsIcEENS7_9allocatorIcEEEERNS7_6vectorISD_NSB_ISD_EEEEP8_IO_FILE15llama_load_modebbbPK23llama_model_kv_overridePK32llama_model_tensor_buft_override',
+      '_ZN18llama_model_loader13load_all_dataEP12ggml_contextRNSt3__26vectorIP19ggml_backend_bufferNS2_9allocatorIS5_EEEEPNS3_INS2_10unique_ptrI11llama_mlockNS2_14default_deleteISB_EEEENS6_ISE_EEEEPFbfPvESI_',
+      '_ZN16llama_model_base12load_tensorsER18llama_model_loader',
     ]);
     for (const name of speculativeWrappers) {
       assert.match(wrappers, new RegExp(`extern "C" __attribute__\\(\\(noinline\\)\\)[^\\n]*\\n${name}\\(`), `${name} must stay noinline`);
@@ -635,6 +641,29 @@ const CASES = [
     for (const [, name] of speculativeExports.matchAll(/EMSCRIPTEN_KEEPALIVE [^(]*?\b(llamadart_webgpu_\w+)\(/g)) {
       assert.ok(exported.includes(`'_${name}'`), `${name} is not in EXPORTED_FUNCTIONS`);
     }
+  }],
+
+  ['native model failures unwind through the loader and preserve draft diagnostics', () => {
+    assert.match(cmake, /function\(llamadart_enable_model_load_unwind filename\)[\s\S]*?set_property\(SOURCE "\$\{source\}" DIRECTORY "\$\{LLAMA_CPP_DIR\}\/src"\s+APPEND PROPERTY COMPILE_OPTIONS "\$\{LLAMADART_WEBGPU_EXCEPTION_CATCHING_ALLOWED\}"\)/);
+    for (const marker of [
+      String.raw`llamadart_enable_model_load_unwind(llama.cpp
+    "llama_model_load\\(struct gguf_context"
+    "llama_model_load_from_file_impl\\("
+    "error loading model: %s")`,
+      String.raw`llamadart_enable_model_load_unwind(llama-model-loader.cpp
+    "llama_model_loader::llama_model_loader\\("
+    "bool llama_model_loader::load_all_data\\(")`,
+      String.raw`llamadart_enable_model_load_unwind(llama-model.cpp
+    "bool llama_model_base::load_tensors\\(")`,
+    ]) {
+      assert.ok(cmake.includes(marker), `configuration does not check ${marker}`);
+    }
+    const loadDraft = wrappers.slice(
+      wrappers.indexOf('llamadart_webgpu_draft_model_load_file('),
+      wrappers.indexOf('llamadart_webgpu_draft_context_init('),
+    );
+    assert.match(loadDraft, /const init_failure_log log\(kModelLoadFailure\);\s+llama_model \* model = llama_model_load_from_file/);
+    assert.match(loadDraft, /"the draft model does not fit in memory: " \+ reason/);
   }],
 
   ['a draft context that cannot be allocated is freed by llama.cpp and names smaller batches or memory64', () => {
@@ -654,7 +683,7 @@ const CASES = [
     assert.match(wrappers, /constexpr const char \* kContextInitFailure = "failed to initialize the context: ";/);
     const draftContext = wrappers.slice(wrappers.indexOf('llamadart_webgpu_draft_context_init('));
     assert.ok(
-      draftContext.indexOf('const context_init_log log;') < draftContext.indexOf('llama_init_from_model(model, params)'),
+      draftContext.indexOf('const init_failure_log log(kContextInitFailure);') < draftContext.indexOf('llama_init_from_model(model, params)'),
       'the failure reason is captured around context creation',
     );
 

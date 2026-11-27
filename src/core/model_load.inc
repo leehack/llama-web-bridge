@@ -487,6 +487,16 @@ int32_t load_model_internal(
     // Cancels in load_all_data, after load_tensors has mapped the file.
     mparams.progress_callback = [](float, void *) { return false; };
   }
+  if (g_test_abort_next_model_load) {
+    g_test_abort_next_model_load = false;
+    // Abort after llama.cpp has opened and parsed the staged or fetch-backed file.
+    mparams.progress_callback = [](float, void *) -> bool { std::abort(); };
+  }
+  if (g_test_throw_next_model_load) {
+    g_test_throw_next_model_load = false;
+    // Outside the exception allow-list, so the throw must still abort the core.
+    throw std::runtime_error("injected uncaught C++ exception");
+  }
   g_state.model = llama_model_load_from_file(model_path, mparams);
   if (g_state.model == nullptr) {
     // llama.cpp destroyed its model and loader, and with them every mapping.

@@ -115,6 +115,10 @@ Most methods require a model loaded by `loadModelFromUrl()` and reject with
 
 ### Native core aborts
 
+If llama.cpp rejects a model, cannot read its GGUF, or reports an allocation
+failure during load, `loadModelFromUrl()` rejects and the core stays usable for
+another load. A successful replacement load is required before inference.
+
 The bridge retires a core after its native abort callback or a
 `WebAssembly.RuntimeError`. It stops calling that core, ends its pthread
 runtime when available, and releases its JS-backed staging data.

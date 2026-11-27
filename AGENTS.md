@@ -147,9 +147,13 @@ The scripts below live in `scripts/smoke/` unless a different path is shown.
   `llama_context` constructor and `sched_reserve` (mangled) and is applied to
   `llama-context.cpp`, so a context that cannot be allocated is freed by
   llama.cpp's own catch instead of leaking; configuration fails when those
-  upstream signatures change. Do not widen it with `-fexceptions` or
-  `-fwasm-exceptions`: whole-TU catching puts `invoke_*` trampolines and their
-  ASYNCIFY instrumentation on hot paths, and Wasm EH conflicts with ASYNCIFY.
+  upstream signatures change. It also names the model load entry, model loader
+  constructors, and tensor loading functions and is applied to
+  `llama.cpp`, `llama-model-loader.cpp`, and `llama-model.cpp` so llama.cpp can
+  unwind a failed load and free partial allocations. Do not widen it with
+  `-fexceptions` or `-fwasm-exceptions`: whole-TU catching puts `invoke_*`
+  trampolines and their ASYNCIFY instrumentation on hot paths, and Wasm EH
+  conflicts with ASYNCIFY.
   The link setting makes every other uncaught throw escape `ccall` as a
   `CppException`; `src/llama_webgpu_core_post.js` turns it back into
   `abort()` for `ccall`, the bridge's only entry into the core, so keep the two

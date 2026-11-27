@@ -7,28 +7,29 @@
 
 namespace {
 
+constexpr const char * kModelLoadFailure = "error loading model: ";
 constexpr const char * kContextInitFailure = "failed to initialize the context: ";
 
-// llama_init_from_model frees a context it cannot create and reports why only
-// in its log. While alive, this keeps that reason and forwards every message.
-class context_init_log {
+// llama.cpp returns null after cleaning up a failed load or context creation.
+// Capture the reason from its log while forwarding every message.
+class init_failure_log {
  public:
-  context_init_log() {
+  explicit init_failure_log(const char * prefix) : prefix_(prefix) {
     llama_log_get(&forward_, &forward_data_);
     llama_log_set(capture, this);
   }
-  ~context_init_log() { llama_log_set(forward_, forward_data_); }
-  context_init_log(const context_init_log &) = delete;
-  context_init_log & operator=(const context_init_log &) = delete;
+  ~init_failure_log() { llama_log_set(forward_, forward_data_); }
+  init_failure_log(const init_failure_log &) = delete;
+  init_failure_log & operator=(const init_failure_log &) = delete;
 
   const std::string & reason() const { return reason_; }
 
  private:
   static void capture(ggml_log_level level, const char * text, void * user_data) {
-    auto * log = static_cast<context_init_log *>(user_data);
-    const char * reason = text == nullptr ? nullptr : std::strstr(text, kContextInitFailure);
+    auto * log = static_cast<init_failure_log *>(user_data);
+    const char * reason = text == nullptr ? nullptr : std::strstr(text, log->prefix_);
     if (level == GGML_LOG_LEVEL_ERROR && reason != nullptr) {
-      log->reason_ = reason + std::strlen(kContextInitFailure);
+      log->reason_ = reason + std::strlen(log->prefix_);
       while (!log->reason_.empty() && (log->reason_.back() == '\n' || log->reason_.back() == '\r')) {
         log->reason_.pop_back();
       }
@@ -38,6 +39,7 @@ class context_init_log {
     }
   }
 
+  const char * prefix_;
   ggml_log_callback forward_ = nullptr;
   void * forward_data_ = nullptr;
   std::string reason_;
@@ -53,9 +55,15 @@ llamadart_webgpu_draft_model_load_file(
     llama_model_params params,
     std::string * error_out) {
   try {
+    const init_failure_log log(kModelLoadFailure);
     llama_model * model = llama_model_load_from_file(path, params);
     if (model == nullptr && error_out != nullptr) {
-      *error_out = "llama.cpp could not load the draft model";
+      const auto & reason = log.reason();
+      if (reason.find("bad_alloc") != std::string::npos) {
+        *error_out = "the draft model does not fit in memory: " + reason;
+      } else {
+        *error_out = reason.empty() ? "llama.cpp could not load the draft model" : reason;
+      }
     }
     return model;
   } catch (const std::bad_alloc &) {
@@ -77,7 +85,7 @@ llamadart_webgpu_draft_context_init(
     llama_context_params params,
     std::string * error_out) {
   try {
-    const context_init_log log;
+    const init_failure_log log(kContextInitFailure);
     llama_context * ctx = llama_init_from_model(model, params);
     if (ctx == nullptr && error_out != nullptr) {
       *error_out = log.reason().empty() ? "llama.cpp could not create the draft context" : log.reason();
