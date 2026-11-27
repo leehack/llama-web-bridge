@@ -182,8 +182,24 @@ export default async (options) => {
   const core = await createCore(options);
   const ccall = core.ccall.bind(core);
   const channel = new BroadcastChannel('resume-integrity');
+  let readerSize = 0;
+  const bindExternal = core.llamadartJsModelFsBindExternal?.bind(core);
+  if (bindExternal) {
+    core.llamadartJsModelFsBindExternal = (handle, mountId, reader) => {
+      readerSize = reader.size;
+      return bindExternal(handle, mountId, reader);
+    };
+  }
   core.ccall = (name, type, types, args, opts) => {
     if (name !== 'llamadart_webgpu_load_model') return ccall(name, type, types, args, opts);
+    if (readerSize > 0) {
+      // A file the core reads on demand cannot be read back synchronously.
+      const bytes = readerSize;
+      readerSize = 0;
+      const recorded = new Promise((resolve) => channel.addEventListener('message', resolve, { once: true }));
+      channel.postMessage({ reader: true, bytes });
+      return recorded.then(() => ccall(name, type, types, args, opts));
+    }
     const bytes = core.FS.readFile(args[0]);
     return crypto.subtle.digest('SHA-256', bytes).then(async (hash) => {
       const sha256 = Array.from(new Uint8Array(hash), (b) => b.toString(16).padStart(2, '0')).join('');
@@ -203,7 +219,6 @@ const FULL = [[MODEL, null]];
 const RESUME = [...FULL, [MODEL, RANGE]];
 const RESTART = [...RESUME, ...FULL];
 const REDIRECT = [...RESUME, [OTHER, RANGE], ...FULL];
-const EMPTY_SHA256 = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855';
 const VALIDATED = 'model_stream_resume_validated';
 const UNVALIDATED = 'model_stream_resume_unvalidated';
 
@@ -440,7 +455,7 @@ function verifyCase(args, revisions, name, result, worker = false) {
     assert.equal(result.notes.includes('model_staging_js_backed'), args.jsBackedModelStaging);
     const expected = revisions.expected[scenario.expected];
     const staged = { sha256: expected.sha256, bytes: revisions.revA.length };
-    const reloaded = args.jsBackedModelStaging ? { sha256: EMPTY_SHA256, bytes: 0 } : staged;
+    const reloaded = args.jsBackedModelStaging ? { reader: true, bytes: revisions.revA.length } : staged;
     assert.deepEqual(result.staged, scenario.cacheReload ? [staged, reloaded] : [staged]);
     if (scenario.cacheReload) {
       assert.equal(result.initialCache, 'stored');
