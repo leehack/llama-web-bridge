@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <cerrno>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <fcntl.h>
@@ -43,6 +44,12 @@ int32_t _llamadart_js_model_fs_read(
     uint8_t * buffer,
     uint32_t length,
     int64_t offset);
+int32_t _llamadart_js_model_fs_read_async(
+    uintptr_t file_id,
+    uint8_t * buffer,
+    uint32_t length,
+    int64_t offset);
+void _llamadart_js_model_fs_mark_external(uintptr_t file_id, double size, int32_t mode);
 void _llamadart_js_model_fs_get_size(uintptr_t file_id, int64_t * out_size);
 int32_t _llamadart_js_model_fs_set_size(uintptr_t file_id, int64_t size);
 void _llamadart_js_model_fs_release_mount(int32_t mount_id);
@@ -57,6 +64,8 @@ thread_local uintptr_t g_last_opened_file_id = 0;
 // Set by open_direct_heap for the file its open() creates.
 thread_local size_t g_next_heap_bytes = 0;
 thread_local bool g_next_heap_failed = false;
+thread_local int32_t g_next_external_mode = -1;
+constexpr size_t kExternalReadBytes = 16 * 1024 * 1024;
 
 llamadart_webgpu::HeapModelBlocks & heap_model_blocks() {
   static auto * blocks = new llamadart_webgpu::HeapModelBlocks();
@@ -77,6 +86,8 @@ void release_js_model_mount(int32_t mount_id) {
 }
 
 class ChunkedJsModelFile : public wasmfs::DataFile {
+  const int32_t external_mode_ = g_next_external_mode;
+
   uintptr_t getFileIndex() const {
     return reinterpret_cast<uintptr_t>(this);
   }
@@ -102,7 +113,9 @@ class ChunkedJsModelFile : public wasmfs::DataFile {
     if (offset < 0) {
       return -EINVAL;
     }
-    constexpr size_t max_chunk = std::numeric_limits<int32_t>::max();
+    const size_t max_chunk = external_mode_ >= 0
+        ? kExternalReadBytes
+        : static_cast<size_t>(std::numeric_limits<int32_t>::max());
     const size_t readable = std::min(len, static_cast<size_t>(std::numeric_limits<ssize_t>::max()));
     const auto offset_headroom = static_cast<uint64_t>(std::numeric_limits<int64_t>::max() - offset);
     size_t total = 0;
@@ -112,10 +125,14 @@ class ChunkedJsModelFile : public wasmfs::DataFile {
         return -EOVERFLOW;
       }
       const auto step = static_cast<uint32_t>(std::min(readable - total, max_chunk));
-      const int32_t got = _llamadart_js_model_fs_read(
-          getFileIndex(), buf + total, step, offset + static_cast<int64_t>(total));
+      const int64_t read_offset = offset + static_cast<int64_t>(total);
+      const int32_t got = external_mode_ == 1
+          ? _llamadart_js_model_fs_read_async(getFileIndex(), buf + total, step, read_offset)
+          : _llamadart_js_model_fs_read(getFileIndex(), buf + total, step, read_offset);
       if (got < 0) {
-        return total == 0 ? got : static_cast<ssize_t>(total);
+        // A short count would let a WASMFS mmap zero-fill the rest of an
+        // external file whose size is known.
+        return external_mode_ >= 0 || total == 0 ? got : static_cast<ssize_t>(total);
       }
       total += static_cast<size_t>(got);
       if (static_cast<uint32_t>(got) < step) {
@@ -198,7 +215,7 @@ std::unordered_map<std::string, MountedJsModelEntry> & mounted_js_model_paths() 
 extern "C" {
 
 EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_js_model_fs_api_version() {
-  return 4;
+  return 5;
 }
 
 EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_js_model_fs_mount_id(const char * mount_path) {
@@ -403,6 +420,52 @@ EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_js_model_fs_open_direct(
     double prealloc_bytes,
     int32_t append) {
   return open_direct_file(file_path, prealloc_bytes, append, 0);
+}
+
+EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_js_model_fs_open_external(
+    const char * file_path,
+    double byte_length,
+    int32_t mode) {
+  constexpr double max_exact_js_size = 9007199254740991.0;
+  if (file_path == nullptr || !(byte_length > 0.0) ||
+      byte_length > max_exact_js_size || byte_length > static_cast<double>(SIZE_MAX) ||
+      std::trunc(byte_length) != byte_length || (mode != 0 && mode != 1)) {
+    return -EINVAL;
+  }
+
+  // Only a direct child of a currently mounted private filesystem can consume
+  // the pending external mode during open().
+  const std::string path(file_path);
+  const auto slash = path.rfind('/');
+  const auto name = path.substr(slash == std::string::npos ? 0 : slash + 1);
+  if (slash == std::string::npos || name.empty() || name == "." || name == ".." ||
+      llamadart_webgpu_js_model_fs_mount_id(path.substr(0, slash).c_str()) <= 0) {
+    return -EINVAL;
+  }
+
+  _llamadart_js_model_fs_set_next_prealloc_bytes(0);
+  g_last_opened_file_id = 0;
+  g_next_external_mode = mode;
+  const int fd = ::open(file_path, O_RDONLY | O_CREAT | O_EXCL, 0444);
+  const int open_errno = errno;
+  g_next_external_mode = -1;
+  const uintptr_t file_id = g_last_opened_file_id;
+  g_last_opened_file_id = 0;
+  if (fd < 0) {
+    return -(open_errno > 0 ? open_errno : EIO);
+  }
+  ::close(fd);
+  if (file_id == 0) {
+    ::unlink(file_path);
+    return -EBADF;
+  }
+  _llamadart_js_model_fs_mark_external(file_id, byte_length, mode);
+  const int32_t handle = _llamadart_js_model_fs_bind_direct(file_id);
+  if (handle <= 0) {
+    ::unlink(file_path);
+    return handle < 0 ? handle : -EBADF;
+  }
+  return handle;
 }
 
 EMSCRIPTEN_KEEPALIVE int32_t llamadart_webgpu_js_model_fs_supports_heap_resident() {

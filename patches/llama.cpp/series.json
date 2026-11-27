@@ -6,6 +6,13 @@
       "tracking": "https://github.com/leehack/llama-web-bridge/issues/344",
       "upstream": "https://github.com/ggml-org/llama.cpp/blob/171527522610996f5f0acf12334e185156ca8f44/ggml/src/ggml-webgpu/ggml-webgpu.cpp#L4181-L4183",
       "wasm_marker": "flushing batched WebGPU weight uploads"
+    },
+    {
+      "file": "0002-chunked-model-loader-read.patch",
+      "target": "llama",
+      "tracking": "https://github.com/leehack/llama-web-bridge/issues/346",
+      "upstream": "https://github.com/ggml-org/llama.cpp/blob/171527522610996f5f0acf12334e185156ca8f44/src/llama-model-loader.cpp#L1899-L1925",
+      "wasm_marker": "chunked WebAssembly tensor read"
     }
   ]
 }

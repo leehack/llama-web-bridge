@@ -47,3 +47,11 @@ aligned weight writes on that queue. It uses the backend's existing timed
 `GPUQueue.onSubmittedWorkDone()`. Bridge model loads enter Wasm through
 async `ccall`, and the bridge serializes operations on the core while the
 load yields.
+
+## Model file reads in WebAssembly
+
+`0002-chunked-model-loader-read.patch` caps the non-host tensor upload
+scratch allocation at 16 MiB. It keeps WebGPU upload offsets four-byte
+aligned and validates complete quantization blocks when tensor checks are
+enabled. Retire it after verifying the original Gemma 4 E2B and Voxtral 4B
+loads against an upstream implementation that bounds this scratch allocation.

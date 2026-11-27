@@ -40,6 +40,112 @@ addToLibrary({
     chunks.length = keep;
   },
 
+  $llamadartJsModelFsDiscardFile__deps: ['$llamadartJsModelFsDiscardChunks'],
+  $llamadartJsModelFsDiscardFile: (file) => {
+    const reader = file.reader;
+    file.reader = null;
+    file.size = 0;
+    llamadartJsModelFsDiscardChunks(file.chunks);
+    try {
+      reader?.close();
+    } catch (_) {
+      // Cleanup must finish even if the browser has invalidated an OPFS handle.
+    }
+  },
+
+  _llamadart_js_model_fs_mark_external__sig: 'vpdi',
+  _llamadart_js_model_fs_mark_external__deps: ['$llamadartJsModelFsFiles'],
+  _llamadart_js_model_fs_mark_external: (fileId, size, mode) => {
+    const file = llamadartJsModelFsFiles().get(fileId);
+    file.size = size;
+    file.externalMode = mode;
+  },
+
+  $llamadartJsModelFsBindExternal__deps: ['$llamadartJsModelFsFiles', '$llamadartJsModelFsHandles'],
+  $llamadartJsModelFsBindExternal: (handle, mountId, reader) => {
+    const fileId = llamadartJsModelFsHandles().get(handle);
+    const file = llamadartJsModelFsFiles().get(fileId);
+    if (!file || file.externalMode === undefined) {
+      return -{{{ cDefs.EBADF }}};
+    }
+    if (file.mountId !== mountId || file.reader || reader?.mode !== file.externalMode
+        || reader.size !== file.size || typeof reader.read !== 'function'
+        || typeof reader.close !== 'function') {
+      return -{{{ cDefs.EINVAL }}};
+    }
+    file.reader = reader;
+    return 0;
+  },
+
+  // Native readers report only -errno, so the first failure is kept on the
+  // reader for the caller to classify once the native load returns.
+  $llamadartJsModelFsReadExternal: (file, buffer, length, offset) => {
+    const reader = file.reader;
+    if (!reader) {
+      return -{{{ cDefs.EBADF }}};
+    }
+    const fail = (code, error) => {
+      reader.failure ??= { code, error };
+      return -code;
+    };
+    if (!Number.isSafeInteger(offset) || offset < 0 || length < 0 || length > 16777216) {
+      return fail({{{ cDefs.EINVAL }}}, new RangeError('Invalid model read range.'));
+    }
+    const cancelled = () => reader.signal?.aborted
+      ? fail({{{ cDefs.ECANCELED }}}, reader.signal.reason)
+      : 0;
+    if (cancelled()) {
+      return -{{{ cDefs.ECANCELED }}};
+    }
+    const count = Math.min(length, file.size - offset);
+    if (count <= 0) {
+      return 0;
+    }
+    let copied = false;
+    const finish = () => {
+      if (cancelled()) return -{{{ cDefs.ECANCELED }}};
+      if (file.reader !== reader) return -{{{ cDefs.EBADF }}};
+      return copied ? count : fail({{{ cDefs.EIO }}}, new Error('Model reader returned no bytes.'));
+    };
+    const rejected = (error) => cancelled() || fail({{{ cDefs.EIO }}}, error);
+    try {
+      const pending = reader.read(offset, count, (bytes) => {
+        if (!reader.signal?.aborted && file.reader === reader && bytes.byteLength === count) {
+          HEAPU8.set(bytes, Number(buffer));
+          copied = true;
+        }
+      });
+      return pending ? pending.then(finish, rejected) : finish();
+    } catch (error) {
+      return rejected(error);
+    }
+  },
+
+  _llamadart_js_model_fs_read_async__sig: 'ippij',
+  _llamadart_js_model_fs_read_async__i53abi: true,
+  _llamadart_js_model_fs_read_async__async: true,
+  _llamadart_js_model_fs_read_async__deps: [
+    '$Asyncify',
+    '$llamadartJsModelFsFiles',
+    '$llamadartJsModelFsReadExternal',
+  ],
+  _llamadart_js_model_fs_read_async: (fileId, buffer, length, offset) => {
+    return Asyncify.handleSleep((wake) => {
+      const file = llamadartJsModelFsFiles().get(fileId);
+      if (file?.externalMode !== 1) {
+        wake(-{{{ cDefs.EBADF }}});
+        return;
+      }
+      // A header-window hit can return before Asyncify unwinds the stack.
+      const result = llamadartJsModelFsReadExternal(file, buffer, length, offset);
+      if (typeof result === 'number') {
+        wake(result);
+      } else {
+        result.then(wake);
+      }
+    });
+  },
+
   $llamadartJsModelFsWriteBytes__deps: [
     '$llamadartJsModelFsState',
     '$llamadartJsModelFsDiscardChunks',
@@ -163,14 +269,13 @@ addToLibrary({
   _llamadart_js_model_fs_free_file__deps: [
     '$llamadartJsModelFsFiles',
     '$llamadartJsModelFsHandles',
-    '$llamadartJsModelFsDiscardChunks',
+    '$llamadartJsModelFsDiscardFile',
   ],
   _llamadart_js_model_fs_free_file: (fileId) => {
     const files = llamadartJsModelFsFiles();
     const file = files.get(fileId);
     if (file) {
-      llamadartJsModelFsDiscardChunks(file.chunks);
-      file.size = 0;
+      llamadartJsModelFsDiscardFile(file);
       files.delete(fileId);
     }
     const handles = llamadartJsModelFsHandles();
@@ -218,6 +323,9 @@ addToLibrary({
     if (!file) {
       return -{{{ cDefs.EBADF }}};
     }
+    if (file.externalMode !== undefined) {
+      return -{{{ cDefs.EROFS }}};
+    }
     if (file.oomError) {
       return -{{{ cDefs.ENOMEM }}};
     }
@@ -259,6 +367,9 @@ addToLibrary({
     if (!file) {
       return -{{{ cDefs.EBADF }}};
     }
+    if (file.externalMode !== undefined) {
+      return -{{{ cDefs.EROFS }}};
+    }
     if (file.oomError) {
       return -{{{ cDefs.ENOMEM }}};
     }
@@ -288,10 +399,19 @@ addToLibrary({
 
   _llamadart_js_model_fs_read__sig: 'ippij',
   _llamadart_js_model_fs_read__i53abi: true,
-  _llamadart_js_model_fs_read__deps: ['$llamadartJsModelFsFiles'],
+  _llamadart_js_model_fs_read__deps: [
+    '$llamadartJsModelFsFiles',
+    '$llamadartJsModelFsReadExternal',
+  ],
   _llamadart_js_model_fs_read: (fileId, buffer, length, offset) => {
     const file = llamadartJsModelFsFiles().get(fileId);
     if (!file) {
+      return -{{{ cDefs.EBADF }}};
+    }
+    if (file.externalMode === 0) {
+      return llamadartJsModelFsReadExternal(file, buffer, length, offset);
+    }
+    if (file.externalMode === 1) {
       return -{{{ cDefs.EBADF }}};
     }
     if (offset < 0) {
@@ -356,6 +476,9 @@ addToLibrary({
     if (!file) {
       return -{{{ cDefs.EBADF }}};
     }
+    if (file.externalMode !== undefined) {
+      return -{{{ cDefs.EROFS }}};
+    }
     if (size < 0) {
       return -{{{ cDefs.EINVAL }}};
     }
@@ -397,7 +520,7 @@ addToLibrary({
   _llamadart_js_model_fs_release_mount__deps: [
     '$llamadartJsModelFsFiles',
     '$llamadartJsModelFsHandles',
-    '$llamadartJsModelFsDiscardChunks',
+    '$llamadartJsModelFsDiscardFile',
   ],
   _llamadart_js_model_fs_release_mount: (mountId) => {
     const files = llamadartJsModelFsFiles();
@@ -407,8 +530,7 @@ addToLibrary({
       if ((file.mountId | 0) !== targetMountId) {
         continue;
       }
-      llamadartJsModelFsDiscardChunks(file.chunks);
-      file.size = 0;
+      llamadartJsModelFsDiscardFile(file);
       files.delete(fileId);
     }
     for (const [handle, fileId] of handles.entries()) {

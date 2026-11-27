@@ -1,0 +1,59 @@
+--- a/src/llama-model-loader.cpp
++++ b/src/llama-model-loader.cpp
+@@ -12,6 +12,7 @@
+ #include <cstdint>
+ #include <cstring>
+ #include <future>
++#include <numeric>
+ #include <regex>
+ #include <unordered_set>
+ 
+@@ -1897,6 +1898,40 @@
+                         buffer_idx %= n_buffers;
+                     }
+                 } else {
++#if defined(__EMSCRIPTEN__)
++                    // Wasm does not support O_DIRECT. Limit the scratch buffer to
++                    // 16 MiB since its linear memory cannot shrink after loading.
++                    constexpr size_t max_chunk_bytes = 16 * 1024 * 1024;
++                    const size_t unit = check_tensors ? std::lcm(size_t(4), ggml_type_size(cur->type)) : 4;
++                    GGML_ASSERT(unit <= max_chunk_bytes && file->read_alignment() == 1);
++                    const size_t chunk_bytes = max_chunk_bytes / unit * unit;
++                    const size_t buf_size = std::min(n_size, chunk_bytes);
++                    if (!read_buf || ggml_backend_buffer_get_size(read_buf.get()) < buf_size) {
++                        read_buf.reset();
++                        read_buf.reset(ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), buf_size));
++                        if (!read_buf) {
++                            throw std::runtime_error(format("failed to allocate a %zu-byte staging buffer", buf_size));
++                        }
++                    }
++                    if (n_size > chunk_bytes) {
++                        LLAMA_LOG_DEBUG("%s: chunked WebAssembly tensor read\n", __func__);
++                    }
++                    auto * data = static_cast<uint8_t *>(ggml_backend_buffer_get_base(read_buf.get()));
++                    file->seek(weight->offs, SEEK_SET);
++                    for (size_t pos = 0; pos < n_size;) {
++                        if (pos != 0 && progress_callback &&
++                            !progress_callback(float(size_done + pos) / size_data, progress_callback_user_data)) {
++                            return false;
++                        }
++                        const size_t count = std::min(n_size - pos, chunk_bytes);
++                        file->read_raw_unsafe(data, count);
++                        ggml_backend_tensor_set(cur, data, pos, count);
++                        if (check_tensors && !ggml_validate_row_data(cur->type, data, count)) {
++                            throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(cur)));
++                        }
++                        pos += count;
++                    }
++#else
+                     // with direct IO read the aligned range around the tensor and use the data inside it, so no bounce buffer is needed
+                     const size_t align          = file->read_alignment();
+                     const size_t aligned_offset = weight->offs & ~(align - 1);
+@@ -1923,6 +1958,7 @@
+                     if (check_tensors && !ggml_validate_row_data(cur->type, data, n_size)) {
+                         throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(cur)));
+                     }
++#endif
+                 }
+             }
+         }

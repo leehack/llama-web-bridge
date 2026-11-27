@@ -108,4 +108,7 @@ export interface LlamaCoreModule {
   _llamadart_webgpu_js_model_fs_open_direct_heap?: unknown;
   _llamadart_webgpu_js_model_fs_heap_resident_bytes?: unknown;
   llamadartJsModelFsWriteDirect?: (handle: number, source: Uint8Array, offset: number) => number;
+  // Present only in builds with JS model FS ABI version 5.
+  _llamadart_webgpu_js_model_fs_open_external?: unknown;
+  llamadartJsModelFsBindExternal?: (handle: number, mountId: number, reader: unknown) => number;
 }

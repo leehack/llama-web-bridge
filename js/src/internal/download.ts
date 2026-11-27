@@ -701,6 +701,8 @@ export async function deleteModelCacheParts(cache: Cache, cacheKey: string, lock
 export interface CachedModelParts {
   response: Response;
   decodedBytes: number;
+  partBytes: number;
+  readPart(index: number): Promise<ArrayBuffer>;
 }
 
 // The part-stored model for a key as one response, or null when there is none.
@@ -715,6 +717,32 @@ export async function openModelCacheParts(
   const manifest = await readModelCacheManifest(cache, digest);
   if (!manifest) return null;
   const { record, decodedBytes, partCount, partBytes } = manifest;
+  const readPart = async (index: number) => {
+    const expected = index === partCount - 1 ? decodedBytes - partBytes * index : partBytes;
+    let bytes: ArrayBuffer | null = null;
+    try {
+      const part = await cache.match(modelCachePartUrl(digest, record, index));
+      bytes = part ? await part.arrayBuffer() : null;
+    } catch (_) {
+      // Treat a missing and an unreadable part alike.
+    }
+    if (bytes?.byteLength === expected) return bytes;
+
+    let retryWithoutCache = true;
+    try {
+      await withModelCacheLock(lockScope, digest, async (lock) => {
+        if (!lock) return;
+        if ((await readModelCacheManifest(cache, digest))?.record === record) {
+          await cache.delete(modelCacheManifestUrl(digest));
+          await deleteModelCachePartEntries(cache, digest, (partRecord) => partRecord === record);
+        }
+        retryWithoutCache = false;
+      });
+    } catch (_) {
+      // An uncached retry can proceed even if the damaged entry could not be removed.
+    }
+    throw new ModelCacheEntryError('Cached model part ' + index + ' is missing or damaged.', retryWithoutCache);
+  };
   let index = 0;
   const body = new ReadableStream<Uint8Array>(
     {
@@ -723,37 +751,8 @@ export async function openModelCacheParts(
           controller.close();
           return;
         }
-        const expected = index === partCount - 1 ? decodedBytes - partBytes * index : partBytes;
-        let bytes: Uint8Array | null = null;
-        try {
-          const part = await cache.match(modelCachePartUrl(digest, record, index));
-          // A stream would keep each part alive on WebKit after it is read.
-          bytes = part ? new Uint8Array(await part.arrayBuffer()) : null;
-        } catch (_) {
-          bytes = null;
-        }
-        if (!bytes || bytes.byteLength !== expected) {
-          let retryWithoutCache = true;
-          try {
-            await withModelCacheLock(lockScope, digest, async (lock) => {
-              if (!lock) return;
-              if ((await readModelCacheManifest(cache, digest))?.record === record) {
-                await cache.delete(modelCacheManifestUrl(digest));
-                await deleteModelCachePartEntries(cache, digest, (partRecord) => partRecord === record);
-              }
-              retryWithoutCache = false;
-            });
-          } catch (_) {
-            // An uncached retry can proceed even if the damaged entry could not be removed.
-          }
-          controller.error(new ModelCacheEntryError(
-            'Cached model part ' + index + ' is missing or damaged.',
-            retryWithoutCache,
-          ));
-          return;
-        }
-        index += 1;
-        controller.enqueue(bytes);
+        // A stream would keep each part alive on WebKit after it is read.
+        controller.enqueue(new Uint8Array(await readPart(index++)));
       },
     },
     { highWaterMark: 0 },
@@ -763,7 +762,7 @@ export async function openModelCacheParts(
   // The parts hold decoded bytes.
   headers.delete('content-encoding');
   headers.set('content-length', String(decodedBytes));
-  return { response: new Response(body, { status: 200, headers }), decodedBytes };
+  return { response: new Response(body, { status: 200, headers }), decodedBytes, partBytes, readPart };
 }
 
 export async function readCachedModelPartsSize(cache: Cache, cacheKey: string): Promise<number | null> {

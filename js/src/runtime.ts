@@ -91,9 +91,14 @@ import {
   jsBackedStagingMode,
   missingJsModelStagingExports,
   shouldUseHeapResidentStaging,
+  supportsExternalModelReader,
   supportsHeapResidentStaging,
   supportsJsBackedStaging,
 } from './internal/model_staging.ts';
+import { ExternalReadRetry, externalReadFailure, openCachedExternalModel } from './internal/external_model_source.ts';
+import type { ExternalModelReader } from './internal/external_model_reader.ts';
+import { createOpfsModelDownload, evictOpfsModel, hasOpfsModel, OpfsWriteError } from './internal/opfs_model_store.ts';
+import type { OpfsModelDownload } from './internal/opfs_model_store.ts';
 import { nextTokenCandidateIds, scoredTokensFrom } from './internal/next_token_scores.ts';
 import {
   parseBooleanFlag,
@@ -289,6 +294,7 @@ export class LlamaWebGpuBridgeRuntime {
   declare _useMmap: boolean;
   declare _useMlock: boolean;
   declare _useMmapDisabled: boolean;
+  declare _externalModelLoad: boolean;
   declare _jsModelStagingApiVersion: number;
   declare _flashAttention: number;
   declare _cacheTypeK: number;
@@ -397,6 +403,7 @@ export class LlamaWebGpuBridgeRuntime {
     this._useMmap = false;
     this._useMlock = false;
     this._useMmapDisabled = false;
+    this._externalModelLoad = false;
     this._jsModelStagingApiVersion = 0;
     this._flashAttention = -1;
     this._cacheTypeK = 1;
@@ -1093,7 +1100,7 @@ export class LlamaWebGpuBridgeRuntime {
   _nativeLoadOptionValues() {
     return [
       this._nSeqMax,
-      this._useMmap ? 1 : 0,
+      this._useMmap && !this._externalModelLoad ? 1 : 0,
       this._useMlock ? 1 : 0,
       this._flashAttention,
       this._cacheTypeK,
@@ -1688,6 +1695,47 @@ export class LlamaWebGpuBridgeRuntime {
       heapResident,
       heapUnavailableReason,
     };
+  }
+
+  _supportsExternalReaders(core: LlamaCoreModule): boolean {
+    return supportsExternalModelReader(core, this._jsModelStagingApiVersion);
+  }
+
+  // Makes the reader the read-only content of a file in the staging mount. The
+  // file owns the reader from then on and closes it when the file is unlinked.
+  _bindExternalModelFile(
+    core: LlamaCoreModule,
+    filePath: string,
+    mountId: number,
+    reader: ExternalModelReader,
+    assertMountOwned: () => void,
+  ): boolean {
+    assertMountOwned();
+    const handle = Number(
+      core.ccall(
+        'llamadart_webgpu_js_model_fs_open_external',
+        'number',
+        ['string', 'number', 'number'],
+        [filePath, reader.size, reader.mode],
+      ),
+    );
+    if (!Number.isInteger(handle) || handle <= 0) {
+      reader.close();
+      this._pushRuntimeNote('model_reader_bind_failed');
+      return false;
+    }
+    let bound = false;
+    try {
+      bound = core.llamadartJsModelFsBindExternal!(handle, mountId, reader) === 0;
+    } finally {
+      core.ccall('llamadart_webgpu_js_model_fs_close_direct', null, ['number'], [handle]);
+    }
+    if (!bound) {
+      reader.close();
+      this._deleteFsFile(filePath);
+      this._pushRuntimeNote('model_reader_bind_failed');
+    }
+    return bound;
   }
 
   _assertJsStagingMountOwned(core: LlamaCoreModule, mountPath: string, mountId: number) {
@@ -2288,23 +2336,40 @@ export class LlamaWebGpuBridgeRuntime {
       return false;
     }
 
-    if (!globalThis.caches || typeof globalThis.caches.open !== 'function') {
+    const hasCacheStorage = !!globalThis.caches && typeof globalThis.caches.open === 'function';
+    const removedOpfs = new Set<string>();
+    for (const modelUrl of modelUrls) {
+      const cacheKey = normalizeAbsoluteUrl(modelUrl);
+      try {
+        if (await evictOpfsModel(cacheName, cacheKey)) removedOpfs.add(cacheKey);
+      } catch (_) {
+        // A browser without OPFS has no entry to remove.
+      }
+    }
+    if (!hasCacheStorage && removedOpfs.size === 0) {
       this._modelCacheState = 'unavailable';
       return false;
     }
 
     try {
-      const cache = await globalThis.caches.open(cacheName);
+      const cache = hasCacheStorage ? await globalThis.caches.open(cacheName) : null;
       let removedCount = 0;
       for (const modelUrl of modelUrls) {
         const cacheKey = normalizeAbsoluteUrl(modelUrl);
-        const removedParts = await deleteModelCacheParts(cache, cacheKey, cacheName);
-        if (removedParts === null) continue;
-        const removed = await cache.delete(cacheKey);
-        if (removed) {
-          await pruneCachedModelSizes(cache, cacheKey);
+        let removed = false;
+        let removedParts: boolean | null = false;
+        if (cache) {
+          removedParts = await deleteModelCacheParts(cache, cacheKey, cacheName);
+          if (removedParts === null) {
+            if (removedOpfs.has(cacheKey)) removedCount += 1;
+            continue;
+          }
+          removed = await cache.delete(cacheKey);
+          if (removed) {
+            await pruneCachedModelSizes(cache, cacheKey);
+          }
         }
-        if (removed || removedParts) {
+        if (removed || removedParts || removedOpfs.has(cacheKey)) {
           removedCount += 1;
         }
       }
@@ -2329,12 +2394,14 @@ export class LlamaWebGpuBridgeRuntime {
     try {
       const modelUrls = expandModelShardUrls(url);
       const cache = globalThis.caches;
-      if (modelUrls.length === 0 || typeof cache?.match !== 'function') return false;
+      if (modelUrls.length === 0) return false;
 
       const cacheName = this._resolveCacheName(options);
       for (const modelUrl of modelUrls) {
         const cacheKey = normalizeAbsoluteUrl(modelUrl);
         if (!isModelCacheUrl(cacheKey)) return false;
+        if (await hasOpfsModel(cacheName, cacheKey)) continue;
+        if (typeof cache?.match !== 'function') return false;
         if (this._isWebKit && await hasCommittedModelCacheManifest(cache, cacheKey, cacheName)) continue;
 
         const response = await cache.match(cacheKey, { cacheName });
@@ -2893,6 +2960,12 @@ export class LlamaWebGpuBridgeRuntime {
       }
       this._modelFilesUseJsStaging = useJsBackedStaging;
       let totalModelBytes = 0;
+      const cacheName = this._resolveCacheName(options);
+      const externalCapable = useJsBackedStaging && this._supportsExternalReaders(core);
+      const externalReaders: ExternalModelReader[] = [];
+      const cachedReaders = new Set<ExternalModelReader>();
+      let useCachedReaders = externalCapable;
+      let bypassCacheOnRetry = false;
       const maxStreamResumeRetries = Number.isFinite(options.streamResumeRetries)
         ? Math.max(0, Math.trunc(options.streamResumeRetries as number))
         : 8;
@@ -2901,6 +2974,7 @@ export class LlamaWebGpuBridgeRuntime {
         90000,
       );
 
+      for (let loadAttempt = 0; ; loadAttempt += 1) {
       try {
         for (let shardIndex = 0; shardIndex < modelUrls.length; shardIndex += 1) {
           const shardUrl = modelUrls[shardIndex];
@@ -2917,10 +2991,23 @@ export class LlamaWebGpuBridgeRuntime {
           let minimumShardBytes = 0;
           let heapFileBytes: number | null = null;
           let heapUnavailableReason: string | undefined;
-          let bypassShardCache = false;
+          let bypassShardCache = bypassCacheOnRetry;
+          let opfsDownload: OpfsModelDownload | null = null;
+          let externalStaged = false;
+          const shardCacheKey = normalizeAbsoluteUrl(shardUrl);
+          const cacheable = options.useCache !== false && isModelCacheUrl(shardCacheKey);
 
-          const restartShard = (reason: 'url' | 'range' | 'etag' | 'cache') => {
+          const restartShard = (reason: 'url' | 'range' | 'etag' | 'cache' | 'opfs') => {
             this._runtimeNotes.push('model_stream_restart:' + reason);
+            if (opfsDownload && reason !== 'opfs') {
+              try {
+                opfsDownload.reset();
+              } catch (_) {
+                void opfsDownload.dispose();
+                opfsDownload = null;
+                this._runtimeNotes.push('model_opfs_fallback:reset');
+              }
+            }
             if (resumeAttempt >= maxStreamResumeRetries) {
               throw new Error('Model shard changed during download and the retry limit was reached.');
             }
@@ -2935,242 +3022,311 @@ export class LlamaWebGpuBridgeRuntime {
             emitAggregateProgress();
           };
 
-          while (true) {
-            throwIfAborted(operationSignal, abortMessage);
-            const requestHeaders = resumeOffset > 0
-              ? { Range: `bytes=${resumeOffset}-` }
-              : null;
-
-            const response = await this._getCachedModelResponse(activeShardUrl, {
-              ...options,
-              requireReadableStream: true,
-              readDecodedCacheSize: heapResidentStaging,
-              useCache: requestHeaders || bypassShardCache ? false : options.useCache,
-              force: requestHeaders ? true : options.force,
-              requestHeaders,
-            });
-            if (!response.ok) {
-              throw new Error(
-                `Failed to fetch model shard: ${response.status} ${response.statusText}`,
-              );
-            }
-
-            const responseUrl =
-              typeof response.url === 'string' && response.url.length > 0
-                ? response.url
-                : activeShardUrl;
-            if (responseUrl !== activeShardUrl) {
-              activeShardUrl = responseUrl;
-              if (resumeOffset > 0) {
-                this._runtimeNotes.push('model_stream_resume_redirect');
+          let activeOpfsDownload: OpfsModelDownload | null = null;
+          try {
+            if (useCachedReaders && cacheable && options.force !== true) {
+              const cached = await openCachedExternalModel(cacheName, shardCacheKey, {
+                worker: this._isWorkerRuntime(),
+                wholeBody: !this._isWebKit,
+                signal: operationSignal,
+              });
+              if (cached) {
+                if (!ownedPaths.includes(modelPath)) ownedPaths.push(modelPath);
+                if (this._bindExternalModelFile(core, modelPath, stagingMountId, cached.reader, assertMountOwned!)) {
+                  externalReaders.push(cached.reader);
+                  cachedReaders.add(cached.reader);
+                  shardBytes = cached.reader.size;
+                  externalStaged = true;
+                  this._modelCacheState = 'hit';
+                  this._modelSource = 'cache';
+                  this._pushRuntimeNote('model_cache_hit');
+                  this._pushRuntimeNote('model_reader:' + cached.kind);
+                }
               }
             }
-
-            if (resumeOffset > 0 && response.status !== 206) {
-              this._runtimeNotes.push(`model_stream_resume_status:${response.status}`);
-              throw new Error(
-                `Range resume not honored for model shard: ${response.status} ${response.statusText}`,
-              );
-            }
-
-            let expectedShardBytes: number | null = null;
-            if (resumeOffset > 0 && resumeIdentity) {
-              const resume = classifyResumeResponse(
-                resumeIdentity, response, responseUrl, resumeOffset, minimumShardBytes,
-              );
-              if (resume.verdict === 'changed') {
-                await response.body?.cancel().catch(() => {});
-                restartShard(resume.reason);
-                continue;
+            if (!externalStaged && externalCapable && cacheable && !bypassShardCache && this._isWorkerRuntime()) {
+              try {
+                opfsDownload = await createOpfsModelDownload(cacheName, shardCacheKey, operationSignal);
+              } catch (error) {
+                if (operationSignal?.aborted) throw error;
+                opfsDownload = null;
               }
-              this._runtimeNotes.push('model_stream_resume_' + resume.verdict);
-              expectedShardBytes = resume.expectedBytes;
-              resumeIdentity.total = resume.total;
-              if (resume.validator) {
-                resumeIdentity.resumedStrongEtags.set(resume.validator.encoding, resume.validator.etag);
-              }
+              if (opfsDownload) this._pushRuntimeNote('model_opfs_download');
             }
-
-            if (!hasReadableResponseStream(response)) {
-              this._runtimeNotes.push('model_response_nostream');
-              const declaredBytes = inferResponseTotalBytes(response, 0);
-              const declaredText = declaredBytes > 0 ? `${declaredBytes} bytes` : 'unknown size';
-              throw new Error(
-                `Model response did not expose a readable stream (${declaredText}).`,
-              );
-            }
-            this._runtimeNotes.push('model_response_stream');
-
-            const decodedCacheSize = cachedModelSizes.get(response);
-            const responseTotal = decodedCacheSize ?? inferResponseTotalBytes(response, knownTotalBytes);
-            let fullGetSpanBytes: number | null = null;
-            if (resumeOffset === 0) {
-              resumeIdentity = captureResumeIdentity(response, responseUrl);
-              if (!resumeIdentity) {
-                await response.body?.cancel().catch(() => {});
-                throw createModelTransferLengthError('Model response reported conflicting Content-Range and X-Linked-Size totals.');
-              }
-              resumeIdentity.total ??= decodedCacheSize ?? null;
-              expectedShardBytes = resumeIdentity.total;
-              fullGetSpanBytes = resumeIdentity.initialSpanBytes;
-            }
-            const responseEndBytes = response.status === 206 ? fullGetSpanBytes ?? expectedShardBytes : null;
-            // A declared end from an earlier partial response is a lower bound on the shard size.
-            minimumShardBytes = Math.max(minimumShardBytes, expectedShardBytes ?? 0, fullGetSpanBytes ?? 0);
-            if (responseTotal > 0) {
-              knownTotalBytes = responseTotal;
-              shardTotals[shardIndex] = responseTotal;
-            }
-
-            try {
-              if (useJsBackedStaging && !ownedPaths.includes(modelPath)) {
-                ownedPaths.push(modelPath);
-              }
-              const directWriter = assertMountOwned
-                ? this._openDirectJsWriter(
-                    core,
-                    modelPath,
-                    resumeOffset === 0 && knownTotalBytes > 0 ? knownTotalBytes : 0,
-                    resumeOffset > 0,
-                    assertMountOwned,
-                    // The block cannot grow, so it needs the exact decoded size.
-                    heapResidentStaging && resumeOffset === 0 && expectedShardBytes !== null
-                      ? expectedShardBytes
-                      : 0,
-                  )
+            while (!externalStaged) {
+              throwIfAborted(operationSignal, abortMessage);
+              const requestHeaders = resumeOffset > 0
+                ? { Range: `bytes=${resumeOffset}-` }
                 : null;
-              if (resumeOffset === 0) {
-                heapFileBytes = directWriter?.heapResident ? expectedShardBytes : null;
-                heapUnavailableReason = heapResidentStaging && expectedShardBytes === null
-                  ? 'unknown_size'
-                  : directWriter?.heapUnavailableReason;
-              }
-              shardBytes = await writeResponseToFsFileWithProgress(
-                response,
-                core.FS,
-                modelPath,
-                progressCallback
-                  ? (progress) => {
-                      const loaded = Number(progress?.loaded) || 0;
-                      const total = Number(progress?.total) || 0;
-                      shardLoaded[shardIndex] = loaded;
-                      if (total > 0) {
-                        shardTotals[shardIndex] = total;
-                      }
-                      emitAggregateProgress();
-                    }
-                  : null,
-                {
-                  useBigIntPosition: this._coreVariant === 'wasm64',
-                  skipMemoryReservation: useJsBackedStaging,
-                  memory64ReservationLimitBytes: this._coreVariant === 'wasm64' && !useJsBackedStaging && resumeOffset === 0
-                    ? this._heapHeadroomBytes(core)
-                    : null,
-                  directWriter,
-                  // The cache tee and staging writer share each network buffer.
-                  releaseConsumedChunks: !teedModelResponses.has(response),
-                  startOffset: resumeOffset,
-                  heapFileBytes,
-                  preservePartialOnError: true,
-                  totalBytes: knownTotalBytes,
-                  chunkTimeoutMs: streamChunkTimeoutMs,
-                  signal: operationSignal,
-                  abortMessage,
-                },
-              );
-              const expectedBytes = fullGetSpanBytes !== null && shardBytes !== fullGetSpanBytes
-                ? fullGetSpanBytes
-                : expectedShardBytes;
-              if (expectedBytes !== null && shardBytes !== expectedBytes) {
-                throw createModelTransferLengthError(
-                  'Model response staged ' + shardBytes + ' bytes, expected ' + expectedBytes + '.',
+
+              const response = await this._getCachedModelResponse(activeShardUrl, {
+                ...options,
+                requireReadableStream: true,
+                readDecodedCacheSize: heapResidentStaging && !opfsDownload,
+                useCache: requestHeaders || bypassShardCache || opfsDownload ? false : options.useCache,
+                force: requestHeaders ? true : options.force,
+                requestHeaders,
+              });
+              if (!response.ok) {
+                throw new Error(
+                  `Failed to fetch model shard: ${response.status} ${response.statusText}`,
                 );
               }
-              if (shardBytes < minimumShardBytes) {
-                throw createModelTransferLengthError(
-                  'Model response staged ' + shardBytes + ' bytes, expected at least ' + minimumShardBytes + '.',
-                );
-              }
-              await this._settleModelCacheStore(response);
-              if (heapFileBytes !== null) {
-                this._pushRuntimeNote('model_staging_heap_resident');
-              } else if (heapUnavailableReason) {
-                this._pushRuntimeNote(`model_staging_heap_resident_unavailable:${heapUnavailableReason}`);
-              }
-              break;
-            } catch (error) {
-              if (assertMountOwned && !isCoreRetired(core)) {
-                assertMountOwned();
-              }
-              const text = String(error || '').toLowerCase();
-              const loadedBytes = Number(
-                (error as { llamadartLoadedBytes?: unknown } | null | undefined)?.llamadartLoadedBytes,
-              );
-              const rangeOverrun = responseEndBytes !== null && loadedBytes > responseEndBytes;
-              if (Number.isFinite(loadedBytes) && loadedBytes >= 0) {
-                const normalizedLoaded = Math.trunc(loadedBytes);
-                this._runtimeNotes.push(`model_fs_write_loaded:${normalizedLoaded}`);
-                if (!rangeOverrun && normalizedLoaded > resumeOffset) {
-                  resumeOffset = normalizedLoaded;
-                  shardLoaded[shardIndex] = normalizedLoaded;
-                  if (knownTotalBytes > 0 && shardTotals[shardIndex] < knownTotalBytes) {
-                    shardTotals[shardIndex] = knownTotalBytes;
-                  }
-                  emitAggregateProgress();
+
+              const responseUrl =
+                typeof response.url === 'string' && response.url.length > 0
+                  ? response.url
+                  : activeShardUrl;
+              if (responseUrl !== activeShardUrl) {
+                activeShardUrl = responseUrl;
+                if (resumeOffset > 0) {
+                  this._runtimeNotes.push('model_stream_resume_redirect');
                 }
               }
 
-              const stagingAllocError = useJsBackedStaging
-                ? this._consumeStagingAllocFailure(
-                    core,
-                    error,
-                    knownTotalBytes > 0 ? knownTotalBytes : resumeOffset,
-                  )
-                : null;
-
-              if (!stagingAllocError && error instanceof ModelCacheEntryError) {
-                this._runtimeNotes.push('model_cache_entry_invalid');
-                bypassShardCache = error.retryWithoutCache;
-                restartShard('cache');
-                continue;
+              if (resumeOffset > 0 && response.status !== 206) {
+                this._runtimeNotes.push(`model_stream_resume_status:${response.status}`);
+                throw new Error(
+                  `Range resume not honored for model shard: ${response.status} ${response.statusText}`,
+                );
               }
 
-              const retryableNetworkError = isRetryableStreamNetworkError(error);
-              if (!stagingAllocError && retryableNetworkError && rangeOverrun) {
-                restartShard('range');
-                continue;
+              let expectedShardBytes: number | null = null;
+              if (resumeOffset > 0 && resumeIdentity) {
+                const resume = classifyResumeResponse(
+                  resumeIdentity, response, responseUrl, resumeOffset, minimumShardBytes,
+                );
+                if (resume.verdict === 'changed') {
+                  await response.body?.cancel().catch(() => {});
+                  restartShard(resume.reason);
+                  continue;
+                }
+                this._runtimeNotes.push('model_stream_resume_' + resume.verdict);
+                expectedShardBytes = resume.expectedBytes;
+                resumeIdentity.total = resume.total;
+                if (resume.validator) {
+                  resumeIdentity.resumedStrongEtags.set(resume.validator.encoding, resume.validator.etag);
+                }
               }
 
-              const shouldRetryResume =
-                !stagingAllocError
-                && retryableNetworkError
-                && resumeOffset > 0
-                && resumeAttempt < maxStreamResumeRetries;
-              if (shouldRetryResume) {
-                resumeAttempt += 1;
-                this._runtimeNotes.push(`model_stream_resume_retry:${resumeAttempt}`);
-                this._runtimeNotes.push(`model_stream_resume_offset:${resumeOffset}`);
-                continue;
+              if (!hasReadableResponseStream(response)) {
+                this._runtimeNotes.push('model_response_nostream');
+                const declaredBytes = inferResponseTotalBytes(response, 0);
+                const declaredText = declaredBytes > 0 ? `${declaredBytes} bytes` : 'unknown size';
+                throw new Error(
+                  `Model response did not expose a readable stream (${declaredText}).`,
+                );
+              }
+              this._runtimeNotes.push('model_response_stream');
+
+              const decodedCacheSize = cachedModelSizes.get(response);
+              const responseTotal = decodedCacheSize ?? inferResponseTotalBytes(response, knownTotalBytes);
+              let fullGetSpanBytes: number | null = null;
+              if (resumeOffset === 0) {
+                resumeIdentity = captureResumeIdentity(response, responseUrl);
+                if (!resumeIdentity) {
+                  await response.body?.cancel().catch(() => {});
+                  throw createModelTransferLengthError('Model response reported conflicting Content-Range and X-Linked-Size totals.');
+                }
+                resumeIdentity.total ??= decodedCacheSize ?? null;
+                expectedShardBytes = resumeIdentity.total;
+                fullGetSpanBytes = resumeIdentity.initialSpanBytes;
+              }
+              const responseEndBytes = response.status === 206 ? fullGetSpanBytes ?? expectedShardBytes : null;
+              // A declared end from an earlier partial response is a lower bound on the shard size.
+              minimumShardBytes = Math.max(minimumShardBytes, expectedShardBytes ?? 0, fullGetSpanBytes ?? 0);
+              if (responseTotal > 0) {
+                knownTotalBytes = responseTotal;
+                shardTotals[shardIndex] = responseTotal;
               }
 
-              if (stagingAllocError) {
-                throw stagingAllocError;
-              }
+              try {
+                if (useJsBackedStaging && !ownedPaths.includes(modelPath)) {
+                  ownedPaths.push(modelPath);
+                }
+                const download = opfsDownload;
+                const directWriter = download
+                  ? {
+                      writeChunk: (chunk: Uint8Array, position: number) => download.writeChunk(chunk, position),
+                      assertMountOwned,
+                    }
+                  : assertMountOwned
+                  ? this._openDirectJsWriter(
+                      core,
+                      modelPath,
+                      resumeOffset === 0 && knownTotalBytes > 0 ? knownTotalBytes : 0,
+                      resumeOffset > 0,
+                      assertMountOwned,
+                      // The block cannot grow, so it needs the exact decoded size.
+                      heapResidentStaging && resumeOffset === 0 && expectedShardBytes !== null
+                        ? expectedShardBytes
+                        : 0,
+                    )
+                  : null;
+                if (resumeOffset === 0) {
+                  heapFileBytes = directWriter?.heapResident ? expectedShardBytes : null;
+                  heapUnavailableReason = heapResidentStaging && !download && expectedShardBytes === null
+                    ? 'unknown_size'
+                    : directWriter?.heapUnavailableReason;
+                }
+                shardBytes = await writeResponseToFsFileWithProgress(
+                  response,
+                  core.FS,
+                  modelPath,
+                  progressCallback
+                    ? (progress) => {
+                        const loaded = Number(progress?.loaded) || 0;
+                        const total = Number(progress?.total) || 0;
+                        shardLoaded[shardIndex] = loaded;
+                        if (total > 0) {
+                          shardTotals[shardIndex] = total;
+                        }
+                        emitAggregateProgress();
+                      }
+                    : null,
+                  {
+                    useBigIntPosition: this._coreVariant === 'wasm64',
+                    skipMemoryReservation: useJsBackedStaging,
+                    memory64ReservationLimitBytes: this._coreVariant === 'wasm64' && !useJsBackedStaging && resumeOffset === 0
+                      ? this._heapHeadroomBytes(core)
+                      : null,
+                    directWriter,
+                    // The cache tee and staging writer share each network buffer.
+                    releaseConsumedChunks: !teedModelResponses.has(response),
+                    startOffset: resumeOffset,
+                    heapFileBytes,
+                    preservePartialOnError: true,
+                    totalBytes: knownTotalBytes,
+                    chunkTimeoutMs: streamChunkTimeoutMs,
+                    signal: operationSignal,
+                    abortMessage,
+                  },
+                );
+                const expectedBytes = fullGetSpanBytes !== null && shardBytes !== fullGetSpanBytes
+                  ? fullGetSpanBytes
+                  : expectedShardBytes;
+                if (expectedBytes !== null && shardBytes !== expectedBytes) {
+                  throw createModelTransferLengthError(
+                    'Model response staged ' + shardBytes + ' bytes, expected ' + expectedBytes + '.',
+                  );
+                }
+                if (shardBytes < minimumShardBytes) {
+                  throw createModelTransferLengthError(
+                    'Model response staged ' + shardBytes + ' bytes, expected at least ' + minimumShardBytes + '.',
+                  );
+                }
+                await this._settleModelCacheStore(response);
+                if (heapFileBytes !== null) {
+                  this._pushRuntimeNote('model_staging_heap_resident');
+                } else if (heapUnavailableReason) {
+                  this._pushRuntimeNote(`model_staging_heap_resident_unavailable:${heapUnavailableReason}`);
+                }
+                break;
+              } catch (error) {
+                if (assertMountOwned && !isCoreRetired(core)) {
+                  assertMountOwned();
+                }
+                const text = String(error || '').toLowerCase();
+                const loadedBytes = Number(
+                  (error as { llamadartLoadedBytes?: unknown } | null | undefined)?.llamadartLoadedBytes,
+                );
+                const rangeOverrun = responseEndBytes !== null && loadedBytes > responseEndBytes;
+                if (Number.isFinite(loadedBytes) && loadedBytes >= 0) {
+                  const normalizedLoaded = Math.trunc(loadedBytes);
+                  this._runtimeNotes.push(`model_fs_write_loaded:${normalizedLoaded}`);
+                  if (!rangeOverrun && normalizedLoaded > resumeOffset) {
+                    resumeOffset = normalizedLoaded;
+                    shardLoaded[shardIndex] = normalizedLoaded;
+                    if (knownTotalBytes > 0 && shardTotals[shardIndex] < knownTotalBytes) {
+                      shardTotals[shardIndex] = knownTotalBytes;
+                    }
+                    emitAggregateProgress();
+                  }
+                }
 
-              if (text.includes('bigint')) {
-                this._runtimeNotes.push('model_fs_write_bigint_error');
-              } else if (text.includes('abort')) {
-                this._runtimeNotes.push('model_fs_write_abort');
-              } else if (text.includes('array buffer allocation failed')) {
-                this._runtimeNotes.push('model_fs_write_arraybuffer_oom');
-              } else if (retryableNetworkError) {
-                this._runtimeNotes.push('model_fs_write_network_error');
-                this._runtimeNotes.push('model_fs_write_failed');
-              } else {
-                this._runtimeNotes.push('model_fs_write_failed');
+                const stagingAllocError = useJsBackedStaging
+                  ? this._consumeStagingAllocFailure(
+                      core,
+                      error,
+                      knownTotalBytes > 0 ? knownTotalBytes : resumeOffset,
+                    )
+                  : null;
+
+                if (opfsDownload && error instanceof OpfsWriteError) {
+                  this._runtimeNotes.push('model_opfs_fallback:write');
+                  void opfsDownload.dispose();
+                  opfsDownload = null;
+                  restartShard('opfs');
+                  continue;
+                }
+
+                if (!stagingAllocError && error instanceof ModelCacheEntryError) {
+                  this._runtimeNotes.push('model_cache_entry_invalid');
+                  bypassShardCache = error.retryWithoutCache;
+                  restartShard('cache');
+                  continue;
+                }
+
+                const retryableNetworkError = isRetryableStreamNetworkError(error);
+                if (!stagingAllocError && retryableNetworkError && rangeOverrun) {
+                  restartShard('range');
+                  continue;
+                }
+
+                const shouldRetryResume =
+                  !stagingAllocError
+                  && retryableNetworkError
+                  && resumeOffset > 0
+                  && resumeAttempt < maxStreamResumeRetries;
+                if (shouldRetryResume) {
+                  resumeAttempt += 1;
+                  this._runtimeNotes.push(`model_stream_resume_retry:${resumeAttempt}`);
+                  this._runtimeNotes.push(`model_stream_resume_offset:${resumeOffset}`);
+                  continue;
+                }
+
+                if (stagingAllocError) {
+                  throw stagingAllocError;
+                }
+
+                if (text.includes('bigint')) {
+                  this._runtimeNotes.push('model_fs_write_bigint_error');
+                } else if (text.includes('abort')) {
+                  this._runtimeNotes.push('model_fs_write_abort');
+                } else if (text.includes('array buffer allocation failed')) {
+                  this._runtimeNotes.push('model_fs_write_arraybuffer_oom');
+                } else if (retryableNetworkError) {
+                  this._runtimeNotes.push('model_fs_write_network_error');
+                  this._runtimeNotes.push('model_fs_write_failed');
+                } else {
+                  this._runtimeNotes.push('model_fs_write_failed');
+                }
+                throw error;
               }
-              throw error;
             }
+            if (opfsDownload) {
+              const finished = opfsDownload;
+              const reader = await finished.finish(shardBytes);
+              activeOpfsDownload = finished;
+              if (!ownedPaths.includes(modelPath)) ownedPaths.push(modelPath);
+              if (!this._bindExternalModelFile(core, modelPath, stagingMountId, reader, assertMountOwned!)) {
+                throw new ModelStagingError(
+                  'MODEL_STAGING_MOUNT_FAILED',
+                  'The downloaded model could not be attached to the staging mount.',
+                );
+              }
+              externalReaders.push(reader);
+              this._pushRuntimeNote('model_reader:' + (reader.mode === 0 ? 'opfs_sync' : 'opfs_blob'));
+              if (finished.committed) {
+                this._modelCacheState = 'stored';
+                this._pushRuntimeNote('model_cache_stored');
+                this._pushRuntimeNote('model_cache_opfs');
+              } else {
+                this._modelCacheState = 'disabled';
+              }
+            }
+          } finally {
+            if (opfsDownload && activeOpfsDownload !== opfsDownload) await opfsDownload.dispose();
           }
 
           shardLoaded[shardIndex] = shardBytes;
@@ -3185,9 +3341,15 @@ export class LlamaWebGpuBridgeRuntime {
         this._modelPath = modelPaths[0] || null;
         this._modelBytes = totalModelBytes;
 
+        if (this._useMmap && externalReaders.length > 0) {
+          // A mapping would copy the whole file into the heap and defeat reading on demand.
+          this._pushRuntimeNote('model_mmap_disabled:external_reader');
+        }
+
         let rc = 0;
         let nativeLoadStarted = false;
         let nativeAbortCleanupDone = false;
+        this._externalModelLoad = externalReaders.length > 0;
         try {
           throwIfAborted(operationSignal, abortMessage);
           assertMountOwned?.();
@@ -3247,10 +3409,29 @@ export class LlamaWebGpuBridgeRuntime {
             this._runtimeNotes.push('model_load_ccall_failed');
           }
           throw error;
+        } finally {
+          this._externalModelLoad = false;
         }
 
-        if (rc !== 0) {
-          const errorMessage = this._coreErrorMessage('Failed to load GGUF model', rc);
+        const readFailure = externalReadFailure(externalReaders);
+        if (rc === 0 && readFailure) {
+          // A memory-mapped load can finish over bytes a failed read left zeroed.
+          await core.ccall('llamadart_webgpu_free_model', 'number', [], [], { async: true });
+        }
+        if (rc !== 0 || readFailure) {
+          const errorMessage = rc === 0
+            ? 'Failed to load GGUF model'
+            : this._coreErrorMessage('Failed to load GGUF model', rc);
+          if (readFailure) {
+            this._pushRuntimeNote('model_read_failed');
+            const cachedFailure = [...cachedReaders].some((reader) => reader.failure);
+            if (cachedFailure && loadAttempt === 0) {
+              this._pushRuntimeNote('model_cache_entry_invalid');
+              throw new ExternalReadRetry();
+            }
+            const reason = readFailure.error instanceof Error ? readFailure.error.message : String(readFailure.error);
+            throw new ModelStagingError('MODEL_READ_FAILED', `${errorMessage} (model read failed: ${reason})`);
+          }
           if (useJsBackedStaging) {
             const combined = `${errorMessage} ${this._lastCoreErrorHint} ${this._lastCoreErrorText}`;
             if (rc === -4 || isWasm32TensorLimitText(combined)) {
@@ -3263,7 +3444,28 @@ export class LlamaWebGpuBridgeRuntime {
         if (modelUrls.length > 1) {
           this._runtimeNotes.push(`model_split_loaded:${modelUrls.length}`);
         }
+        break;
       } catch (error) {
+        if (error instanceof ExternalReadRetry) {
+          // The damaged entry is removed once the readers holding it are closed.
+          this._releaseModelFiles(null, assertMountOwned);
+          externalReaders.length = 0;
+          cachedReaders.clear();
+          ownedPaths.length = 0;
+          modelPaths.length = 0;
+          shardLoaded.fill(0);
+          shardTotals.fill(0);
+          totalModelBytes = 0;
+          this._ownedModelPaths = ownedPaths;
+          this._ownedModelMount = { mountPath: stagingMountPath!, mountId: stagingMountId };
+          this._modelFilesUseJsStaging = true;
+          this._pushRuntimeNote('model_stream_restart:cache');
+          const evicted = await this.evictModelFromCache(modelUrls, options);
+          bypassCacheOnRetry = !evicted;
+          useCachedReaders = false;
+          emitAggregateProgress();
+          continue;
+        }
         this._modelBytes = 0;
         this._modelPath = null;
         this._modelPaths = [];
@@ -3287,6 +3489,7 @@ export class LlamaWebGpuBridgeRuntime {
           }
         }
         throw error;
+      }
       }
     }
 
@@ -3544,6 +3747,7 @@ export class LlamaWebGpuBridgeRuntime {
       let assertMountOwned: (() => void) | undefined;
       let projectorLoaded = false;
       let response: Response | null = null;
+      let externalReader: ExternalModelReader | null = null;
       try {
         if (useJsBackedStaging) {
           const mountPath = this._mountJsBackedStaging(core, 'mmproj_staging_js_backed');
@@ -3553,20 +3757,37 @@ export class LlamaWebGpuBridgeRuntime {
           mmprojPath = `${mountPath}/${fileName}`;
         }
 
-        if (useCache) {
-          response = await this._getCachedModelResponse(url, {
-            useCache: true,
-            cacheName: options.cacheName,
-            requireReadableStream: true,
-            readDecodedCacheSize: true,
-          }, false);
-        } else {
-          response = await this._fetchWithTimeout(url, { cache: 'no-store' }, fetchTimeoutMs);
-        }
-        if (!response.ok) {
-          throw new Error(
-            `Failed to fetch multimodal projector: ${response.status} ${response.statusText}`,
+        if (useCache && assertMountOwned && this._supportsExternalReaders(core) && isModelCacheUrl(normalizeAbsoluteUrl(url))) {
+          const cached = await openCachedExternalModel(
+            this._resolveCacheName(options),
+            normalizeAbsoluteUrl(url),
+            { worker: this._isWorkerRuntime(), wholeBody: !this._isWebKit, signal: null },
           );
+          if (cached) {
+            createdMmprojPath = mmprojPath;
+            if (this._bindExternalModelFile(core, mmprojPath, stagingMountId, cached.reader, assertMountOwned)) {
+              externalReader = cached.reader;
+              this._pushRuntimeNote('mmproj_reader:' + cached.kind);
+            }
+          }
+        }
+
+        if (!externalReader) {
+          if (useCache) {
+            response = await this._getCachedModelResponse(url, {
+              useCache: true,
+              cacheName: options.cacheName,
+              requireReadableStream: true,
+              readDecodedCacheSize: true,
+            }, false);
+          } else {
+            response = await this._fetchWithTimeout(url, { cache: 'no-store' }, fetchTimeoutMs);
+          }
+          if (!response.ok) {
+            throw new Error(
+              `Failed to fetch multimodal projector: ${response.status} ${response.statusText}`,
+            );
+          }
         }
 
         this._mmProjPath = mmprojPath;
@@ -3581,28 +3802,30 @@ export class LlamaWebGpuBridgeRuntime {
           this._ownedMmProjPath = null;
           this._ownedMmProjMount = null;
         }
-        const knownTotalBytes = useCache || assertMountOwned
-          ? (cachedModelSizes.get(response) ?? inferResponseTotalBytes(response, 0))
-          : 0;
-        let directWriter: DirectFileChunkWriter | null = null;
-        if (assertMountOwned) {
-          directWriter = this._openDirectJsWriter(core, this._mmProjPath, knownTotalBytes, false, assertMountOwned);
+        if (response) {
+          const knownTotalBytes = useCache || assertMountOwned
+            ? (cachedModelSizes.get(response) ?? inferResponseTotalBytes(response, 0))
+            : 0;
+          let directWriter: DirectFileChunkWriter | null = null;
+          if (assertMountOwned) {
+            directWriter = this._openDirectJsWriter(core, this._mmProjPath, knownTotalBytes, false, assertMountOwned);
+          }
+          await writeResponseToFsFileWithProgress(
+            response,
+            core.FS,
+            this._mmProjPath,
+            null,
+            {
+              useBigIntPosition: this._coreVariant === 'wasm64',
+              skipMemoryReservation: useJsBackedStaging,
+              directWriter,
+              ...(useJsBackedStaging || useCache ? { totalBytes: knownTotalBytes } : {}),
+              releaseConsumedChunks: useCache && this._isWebKit && !teedModelResponses.has(response),
+              chunkTimeoutMs,
+            },
+          );
+          if (useCache) await this._settleModelCacheStore(response, false);
         }
-        await writeResponseToFsFileWithProgress(
-          response,
-          core.FS,
-          this._mmProjPath,
-          null,
-          {
-            useBigIntPosition: this._coreVariant === 'wasm64',
-            skipMemoryReservation: useJsBackedStaging,
-            directWriter,
-            ...(useJsBackedStaging || useCache ? { totalBytes: knownTotalBytes } : {}),
-            releaseConsumedChunks: useCache && this._isWebKit && !teedModelResponses.has(response),
-            chunkTimeoutMs,
-          },
-        );
-        if (useCache) await this._settleModelCacheStore(response, false);
 
         assertMountOwned?.();
         const rc = Number(
@@ -3614,6 +3837,23 @@ export class LlamaWebGpuBridgeRuntime {
             { async: true },
           ),
         );
+        // mtmd does not check every read, so a failed read can leave a
+        // projector that loaded from damaged bytes.
+        if (externalReader?.failure) {
+          if (rc === 0) {
+            core.ccall('llamadart_webgpu_mmproj_free', 'number', [], []);
+          }
+          this._pushRuntimeNote('mmproj_read_failed');
+          const reason = externalReader.failure.error instanceof Error
+            ? externalReader.failure.error.message
+            : String(externalReader.failure.error);
+          if (attempt === 0) {
+            this._deleteFsFile(mmprojPath);
+            const evicted = await this.evictModelFromCache([url], { cacheName: options.cacheName });
+            throw new ModelCacheEntryError('Cached multimodal projector could not be read: ' + reason, !evicted);
+          }
+          throw new ModelStagingError('MODEL_READ_FAILED', 'Failed to read the multimodal projector: ' + reason);
+        }
         if (rc !== 0) {
           throw new Error(this._coreErrorMessage('Failed to load multimodal projector', rc));
         }

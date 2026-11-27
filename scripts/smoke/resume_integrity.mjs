@@ -203,6 +203,7 @@ const FULL = [[MODEL, null]];
 const RESUME = [...FULL, [MODEL, RANGE]];
 const RESTART = [...RESUME, ...FULL];
 const REDIRECT = [...RESUME, [OTHER, RANGE], ...FULL];
+const EMPTY_SHA256 = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855';
 const VALIDATED = 'model_stream_resume_validated';
 const UNVALIDATED = 'model_stream_resume_unvalidated';
 
@@ -439,11 +440,14 @@ function verifyCase(args, revisions, name, result, worker = false) {
     assert.equal(result.notes.includes('model_staging_js_backed'), args.jsBackedModelStaging);
     const expected = revisions.expected[scenario.expected];
     const staged = { sha256: expected.sha256, bytes: revisions.revA.length };
-    assert.deepEqual(result.staged, scenario.cacheReload ? [staged, staged] : [staged]);
+    const reloaded = args.jsBackedModelStaging ? { sha256: EMPTY_SHA256, bytes: 0 } : staged;
+    assert.deepEqual(result.staged, scenario.cacheReload ? [staged, reloaded] : [staged]);
     if (scenario.cacheReload) {
       assert.equal(result.initialCache, 'stored');
       assert.equal(result.cache, 'hit');
-      assert.equal(result.notes.includes('model_staging_heap_resident'), args.jsBackedModelStaging && !args.noMmap);
+      assert.equal(result.notes.includes('model_reader:blob_cache'), args.jsBackedModelStaging,
+        'a cached model is read on demand only when the core stages through JS');
+      assert.equal(result.notes.includes('model_staging_heap_resident'), false);
     }
     assert.equal(result.name, expected.name);
     assert.deepEqual(result.tokens, [29871, expected.token]);

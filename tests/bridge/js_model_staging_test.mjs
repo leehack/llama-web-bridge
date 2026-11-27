@@ -111,6 +111,7 @@ function createStagingHarness({
   let nextMountId = 1;
   const mountIds = new Map();
   const releasedChunkMountIds = [];
+  const externalBinds = [];
   let preallocNextBytes = 0;
   let oomBytes = 0;
   let lastErrorText = '';
@@ -147,6 +148,13 @@ function createStagingHarness({
           position,
         });
         return chunk.byteLength;
+      },
+    } : {}),
+    ...(apiVersion >= 5 ? {
+      _llamadart_webgpu_js_model_fs_open_external: () => 0,
+      llamadartJsModelFsBindExternal(handle, mountId, reader) {
+        externalBinds.push({ handle, mountId, reader });
+        return 0;
       },
     } : {}),
     ...(apiVersion >= 4 ? {
@@ -205,6 +213,11 @@ function createStagingHarness({
         const handle = nextDirectHandle++;
         openDirectHandles.add(handle);
         return handle;
+      }
+      if (name === 'llamadart_webgpu_js_model_fs_open_external') {
+        const [filePath, size] = args;
+        fs.files.set(filePath, Number(size));
+        return nextDirectHandle++;
       }
       if (name === 'llamadart_webgpu_js_model_fs_open_direct') {
         const [filePath, preallocBytes = 0, append = 0] = args;
@@ -285,6 +298,7 @@ function createStagingHarness({
     ccalls,
     directWrites,
     openDirectHandles,
+    externalBinds,
     mountIds,
     releasedChunkMountIds,
     closedDirectHandles,
@@ -2838,4 +2852,171 @@ test('staging errors keep their type whenever staging can be active', async () =
       await bridge.dispose();
     });
   }
+});
+
+function stubCachedModel(bytes) {
+  const original = Object.getOwnPropertyDescriptor(globalThis, 'caches');
+  const cache = {
+    deletes: [],
+    async match() { return new Response(new Blob([bytes])); },
+    async delete(key) { cache.deletes.push(String(key)); return true; },
+    async keys() { return []; },
+  };
+  Object.defineProperty(globalThis, 'caches', { value: { open: async () => cache }, configurable: true });
+  return () => {
+    if (original) Object.defineProperty(globalThis, 'caches', original);
+    else delete globalThis.caches;
+  };
+}
+
+const EXTERNAL_LOAD_OPTIONS = {
+  nCtx: 128, nGpuLayers: 0, useCache: true, cacheName: 'external-reader-test',
+  forceRemoteFetchBackend: false, safariGpuProbe: false,
+};
+
+test('a cached model is attached to the staging file as a reader instead of being copied', async (t) => {
+  t.after(stubCachedModel(new Uint8Array(64).fill(3)));
+  const { runtime, externalBinds, directWrites, ccalls, fs } = createStagingHarness({ apiVersion: 5 });
+  runtime._getCachedModelResponse = async () => assert.fail('a readable cache entry must not be downloaded');
+
+  await runtime.loadModelFromUrl('https://models.test/model.gguf', EXTERNAL_LOAD_OPTIONS);
+
+  assert.equal(externalBinds.length, 1);
+  assert.equal(externalBinds[0].reader.size, 64);
+  assert.equal(externalBinds[0].reader.mode, 1);
+  assert.deepEqual(directWrites, []);
+  const open = ccalls.find(([name]) => name === 'llamadart_webgpu_js_model_fs_open_external');
+  assert.deepEqual(open.slice(1), [`${[...fs.unmountedPaths, ...fs.dirs].find((dir) => dir.startsWith('/jsmodels-'))}/model.gguf`, 64, 1]);
+  assert.ok(runtime._runtimeNotes.includes('model_reader:blob_cache'));
+  assert.ok(runtime._runtimeNotes.includes('model_staging_js_backed'));
+});
+
+test('a cached model that cannot be read is replaced once and the core loads it again', async (t) => {
+  const restore = stubCachedModel(new Uint8Array(64).fill(3));
+  t.after(restore);
+  const loads = [];
+  let harness;
+  harness = createStagingHarness({
+    apiVersion: 5,
+    onLoadModel: () => {
+      loads.push(harness.externalBinds.length);
+      if (loads.length === 1) harness.externalBinds[0].reader.failure = { code: 5, error: new Error('Blob is damaged') };
+      return loads.length === 1 ? -2 : 0;
+    },
+  });
+  const requests = [];
+  harness.runtime._getCachedModelResponse = async (url, options) => {
+    requests.push(options.useCache);
+    return new Response(new Uint8Array([1, 2, 3, 4]), { status: 200, headers: { 'content-length': '4' } });
+  };
+
+  await harness.runtime.loadModelFromUrl('https://models.test/model.gguf', EXTERNAL_LOAD_OPTIONS);
+
+  assert.deepEqual(loads, [1, 1], 'the retry stages from the network instead of reading the cache again');
+  assert.equal(harness.externalBinds[0].reader.failure.code, 5);
+  assert.equal(requests.length, 1);
+  for (const note of ['model_read_failed', 'model_cache_entry_invalid', 'model_stream_restart:cache']) {
+    assert.ok(harness.runtime._runtimeNotes.includes(note), note);
+  }
+  assert.equal(harness.runtime._modelBytes, 4);
+});
+
+test('a load that finishes over a failed read is freed and restaged instead of kept', async (t) => {
+  t.after(stubCachedModel(new Uint8Array(64).fill(3)));
+  let loads = 0;
+  const harness = createStagingHarness({
+    apiVersion: 5,
+    onLoadModel: () => {
+      loads += 1;
+      if (loads === 1) harness.externalBinds[0].reader.failure = { code: 5, error: new Error('Blob is damaged') };
+      return 0;
+    },
+  });
+  harness.runtime._getCachedModelResponse = async () => new Response(new Uint8Array([1, 2, 3, 4]), {
+    status: 200, headers: { 'content-length': '4' },
+  });
+
+  await harness.runtime.loadModelFromUrl('https://models.test/model.gguf', EXTERNAL_LOAD_OPTIONS);
+
+  assert.equal(loads, 2);
+  const names = harness.ccalls.map(([name]) => name).filter((name) => /load_model|free_model/.test(name));
+  assert.deepEqual(names, ['llamadart_webgpu_load_model', 'llamadart_webgpu_free_model', 'llamadart_webgpu_load_model']);
+  for (const note of ['model_read_failed', 'model_cache_entry_invalid', 'model_stream_restart:cache']) {
+    assert.ok(harness.runtime._runtimeNotes.includes(note), note);
+  }
+  assert.equal(harness.runtime._modelBytes, 4);
+});
+
+test('a model read through an external reader is never mapped into the heap', async (t) => {
+  t.after(stubCachedModel(new Uint8Array(64).fill(3)));
+  const warm = createStagingHarness({ apiVersion: 5, onLoadModel: () => 0 });
+  await warm.runtime.loadModelFromUrl('https://models.test/model.gguf', { ...EXTERNAL_LOAD_OPTIONS, useMmap: true });
+  const mapped = (harness) => harness.ccalls.find(([name]) => name === 'llamadart_webgpu_load_model')[9];
+  assert.equal(mapped(warm), 0);
+  assert.ok(warm.runtime._runtimeNotes.includes('model_mmap_disabled:external_reader'));
+
+  const staged = createStagingHarness({ apiVersion: 5, onLoadModel: () => 0 });
+  staged.runtime._getCachedModelResponse = async () => new Response(new Uint8Array([1, 2, 3, 4]), {
+    status: 200, headers: { 'content-length': '4' },
+  });
+  await staged.runtime.loadModelFromUrl('https://models.test/model.gguf', {
+    ...EXTERNAL_LOAD_OPTIONS, useMmap: true, useCache: false,
+  });
+  assert.equal(mapped(staged), 1, 'a staged copy keeps the requested mapping');
+  assert.ok(!staged.runtime._runtimeNotes.includes('model_mmap_disabled:external_reader'));
+});
+
+test('a second failed load after the retry is reported instead of retried again', async (t) => {
+  t.after(stubCachedModel(new Uint8Array(64).fill(3)));
+  let loads = 0;
+  const harness = createStagingHarness({
+    apiVersion: 5,
+    onLoadModel: () => {
+      loads += 1;
+      if (loads === 1) harness.externalBinds[0].reader.failure = { code: 5, error: new Error('Blob is damaged') };
+      return -2;
+    },
+  });
+  harness.runtime._getCachedModelResponse = async () => new Response(new Uint8Array([1, 2, 3, 4]), {
+    status: 200, headers: { 'content-length': '4' },
+  });
+
+  await assert.rejects(
+    harness.runtime.loadModelFromUrl('https://models.test/model.gguf', EXTERNAL_LOAD_OPTIONS),
+    /Failed to load GGUF model/,
+  );
+  assert.equal(loads, 2);
+});
+
+test('a projector read failure frees the projector and retries once without the cache entry', async (t) => {
+  t.after(stubCachedModel(new Uint8Array(64).fill(5)));
+  const harness = createStagingHarness({ apiVersion: 5, onLoadModel: () => 0 });
+  const { runtime, core, ccalls } = harness;
+  runtime._modelBytes = 1;
+  let projectorLoads = 0;
+  const ccall = core.ccall;
+  core.ccall = (name, ...rest) => {
+    if (name === 'llamadart_webgpu_mmproj_load') {
+      projectorLoads += 1;
+      if (projectorLoads === 1) harness.externalBinds[0].reader.failure = { code: 5, error: new Error('Blob is damaged') };
+      ccalls.push([name]);
+      return Promise.resolve(0);
+    }
+    if (name === 'llamadart_webgpu_mmproj_free') {
+      ccalls.push([name]);
+      return 0;
+    }
+    return ccall.call(core, name, ...rest);
+  };
+  runtime._getCachedModelResponse = async () => new Response(new Uint8Array([1, 2, 3, 4]), {
+    status: 200, headers: { 'content-length': '4' },
+  });
+
+  await runtime.loadMultimodalProjector('https://models.test/mmproj.gguf', { useCache: true, cacheName: 'external-reader-test' });
+
+  assert.equal(projectorLoads, 2);
+  assert.equal(ccalls.filter(([name]) => name === 'llamadart_webgpu_mmproj_free').length, 1,
+    'the projector that loaded from damaged bytes is freed');
+  assert.ok(runtime._runtimeNotes.includes('mmproj_read_failed'));
+  assert.ok(runtime._runtimeNotes.includes('mmproj_cache_entry_invalid'));
 });
