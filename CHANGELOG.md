@@ -2,18 +2,14 @@
 
 ## Unreleased
 
-- Keep the WebGPU core usable for another load when llama.cpp rejects a model or cannot read its GGUF.
-
-- Read JS-backed models and projectors on demand from OPFS or Cache Storage instead of staging them in JS chunks, and bound the native tensor read buffer to 16 MiB so a large tensor no longer grows the Wasm heap permanently.
-
-- Replace a cached model that cannot be read during a load and retry once, or reject with `ModelStagingError` code `MODEL_READ_FAILED`. The core stays usable either way.
-
-- Add `loadModelFromSource()` to load one GGUF from a `Blob`, `File` or `FileSystemFileHandle` the page already holds. The core reads it on demand without copying it. A worker restart or CPU fallback reloads the same source. A handle is checked by size, modification time and a sampled content fingerprint on every reload and after the native load, and a worker keeps an exclusive lock on an OPFS file while a model loaded from it exists, refusing one that another context holds open (`MODEL_SOURCE_BUSY`). Only that lock guarantees the bytes. `preflightCore()` reports `externalModelReader` and the bridge `supportsCallerModelSource` for feature detection.
-
-- Preserve separate DFlash and DSpark draft strategies on llama.cpp v1.1.0 and report unsupported draft variants by name.
+## v0.1.96 - 2026-11-27
 
 - Update the runtime to llama.cpp v1.1.0 and retain bounded WebGPU weight uploads. Text-to-speech uses the model's normal speaking speed and respects the context's prompt batch limit.
+- Preserve separate DFlash and DSpark draft strategies on llama.cpp v1.1.0 and report unsupported draft variants by name.
 - Report omitted and negative GPU layer counts as full offload, run Safari's probe and one-layer retry for those requests, and reject GPU layer counts outside the signed 32-bit integer range.
+- Keep the WebGPU core usable for another load when llama.cpp rejects a model or cannot read its GGUF. A cached model that cannot be read is replaced and retried once, or rejected with `ModelStagingError` code `MODEL_READ_FAILED`.
+- Read JS-backed models and projectors on demand from OPFS or Cache Storage instead of staging them in JS chunks, and bound the native tensor read buffer to 16 MiB so a large tensor no longer grows the Wasm heap permanently.
+- Add `loadModelFromSource()` to load one GGUF from a `Blob`, `File` or `FileSystemFileHandle` the page already holds. The core reads it on demand without copying it. A worker restart or CPU fallback reloads the same source. A handle is checked by size, modification time and a sampled content fingerprint on every reload and after the native load, and a worker keeps an exclusive lock on an OPFS file while a model loaded from it exists, refusing one that another context holds open (`MODEL_SOURCE_BUSY`). Only that lock guarantees the bytes. `preflightCore()` reports `externalModelReader` and the bridge `supportsCallerModelSource` for feature detection.
 
 ## v0.1.95 - 2026-11-26
 
