@@ -27,6 +27,7 @@ export interface WorkerResponse {
   supportsIncrementalAudio?: boolean;
   supportsJsBackedModelStaging?: boolean;
   supportsCorePreflight?: boolean;
+  supportsCallerModelSource?: boolean;
   id?: number;
   value?: unknown;
   state?: BridgeStateSnapshot;

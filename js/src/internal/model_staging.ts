@@ -117,7 +117,12 @@ export function isModelStagingErrorCode(value: unknown): value is ModelStagingEr
     || value === 'MODEL_TENSOR_SIZE_LIMIT_EXCEEDED'
     || value === 'MODEL_STAGING_MOUNT_FAILED'
     || value === 'MODEL_STAGING_UNSUPPORTED'
-    || value === 'MODEL_READ_FAILED';
+    || value === 'MODEL_READ_FAILED'
+    || value === 'MODEL_SOURCE_INVALID'
+    || value === 'MODEL_SOURCE_UNSUPPORTED'
+    || value === 'MODEL_SOURCE_SPLIT_UNSUPPORTED'
+    || value === 'MODEL_SOURCE_CHANGED'
+    || value === 'MODEL_SOURCE_BUSY';
 }
 
 export function missingJsModelStagingExports(core: LlamaCoreModule | null | undefined): string[] {

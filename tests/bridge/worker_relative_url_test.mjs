@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
+import { CALLER_MODEL_SOURCE_URL } from '../../js/src/internal/caller_model_source.ts';
 import { normalizeAbsoluteUrl, resolveModelSource } from '../../js/src/internal/model_source.ts';
 import { createWorkerBridge } from './bridge_operation_queue_fixtures.mjs';
 
@@ -121,4 +122,77 @@ test('resolving a model source never drops, joins or rewrites non-URL shard entr
       ['https://example.test/app/a.gguf', '', null, 'https://cdn.example/b.gguf'],
     );
   });
+});
+
+test('a caller source reaches the worker by reference and a worker restart reloads the same one', async () => {
+  const { bridge, calls } = recordingWorkerBridge();
+  const blob = new Blob([new Uint8Array(16)]);
+  await bridge.loadModelFromSource(blob, { nCtx: 256 });
+
+  const [url, options] = argsOf(calls, 'loadModelFromUrl').at(-1);
+  assert.equal(url, CALLER_MODEL_SOURCE_URL);
+  assert.equal(options.callerModelSource.size, 16);
+  assert.equal(bridge._loadedModelOptions.callerModelSource.source, blob, 'the facade keeps the caller reference');
+
+  calls.length = 0;
+  await bridge._loadRememberedModelIntoWorker(bridge._sanitizeModelLoadOptions(bridge._loadedModelOptions));
+  const [replayUrl, replayOptions] = argsOf(calls, 'loadModelFromUrl').at(-1);
+  assert.equal(replayUrl, CALLER_MODEL_SOURCE_URL);
+  assert.equal(replayOptions.callerModelSource.size, 16);
+  assert.equal(replayOptions.nCtx, 256);
+});
+
+test('the facade rejects an invalid source before it reaches a worker and forgets the source with the model', async () => {
+  const { bridge, calls } = recordingWorkerBridge();
+  await assert.rejects(bridge.loadModelFromSource('https://x/model.gguf'), (error) => error.code === 'MODEL_SOURCE_INVALID');
+  await assert.rejects(bridge.loadModelFromSource(new Blob([])), (error) => error.code === 'MODEL_SOURCE_INVALID');
+  assert.equal(argsOf(calls, 'loadModelFromUrl').length, 0);
+
+  const controller = new AbortController();
+  controller.abort();
+  await assert.rejects(
+    bridge.loadModelFromSource(new Blob([new Uint8Array(4)]), { signal: controller.signal }),
+    (error) => error.name === 'AbortError',
+  );
+
+  await bridge.loadModelFromSource(new Blob([new Uint8Array(4)]));
+  bridge._forgetLoadedModel();
+  assert.equal(bridge._loadedModelOptions, null);
+});
+
+test('a worker script without caller-source support is refused before dispatch', async () => {
+  const { BridgeWorkerProxy } = await import('../../js/src/worker_proxy.ts');
+  const proxy = Object.create(BridgeWorkerProxy.prototype);
+  proxy._supportsCallerModelSource = false;
+  proxy._config = {};
+  proxy._worker = { postMessage() { assert.fail('the request must not be posted'); } };
+  proxy._supportsCorePreflight = true;
+  await assert.rejects(
+    proxy.call('loadModelFromUrl', [CALLER_MODEL_SOURCE_URL, { callerModelSource: { size: 1 } }]),
+    (error) => error.name === 'ModelStagingError' && error.code === 'MODEL_SOURCE_UNSUPPORTED',
+  );
+});
+
+test('a source the browser cannot clone to the worker is a typed error and leaves no pending request', async () => {
+  const { BridgeWorkerProxy } = await import('../../js/src/worker_proxy.ts');
+  const proxy = Object.create(BridgeWorkerProxy.prototype);
+  proxy._supportsCallerModelSource = true;
+  proxy._supportsCorePreflight = true;
+  proxy._config = { workerRequestTimeoutMs: 60000 };
+  proxy._pending = new Map();
+  proxy._nextId = 1;
+  proxy._worker = {
+    postMessage() { throw new DOMException('not cloneable', 'DataCloneError'); },
+  };
+  await assert.rejects(
+    proxy.call('loadModelFromUrl', [CALLER_MODEL_SOURCE_URL, { callerModelSource: { size: 1 } }]),
+    (error) => error.name === 'ModelStagingError' && error.code === 'MODEL_SOURCE_INVALID',
+  );
+  assert.equal(proxy._pending.size, 0);
+
+  proxy._worker.postMessage = () => { throw new DOMException('other', 'DataCloneError'); };
+  await assert.rejects(
+    proxy.call('loadModelFromUrl', ['https://x/model.gguf', {}]),
+    (error) => error.name === 'DataCloneError',
+  );
 });

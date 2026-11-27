@@ -322,6 +322,14 @@ before dispatching an explicit staging load, and validates the core ABI before
 staging. Bridges before v0.1.92 lack the flag. Bridges before v0.1.87 ignore
 the option.
 
+#### `LlamaWebGpuBridge.supportsCallerModelSource`
+
+`true` when the bridge has `loadModelFromSource()`. In worker mode, the bridge
+also checks that the worker declared the same flag before it dispatches a
+source load, and rejects with `ModelStagingError` (`MODEL_SOURCE_UNSUPPORTED`)
+when the scripts come from different releases. The core must support it too:
+check `externalModelReader` in the `preflightCore()` result.
+
 #### `LlamaWebGpuBridge.supportsCorePreflight`
 
 `true` when the bridge exposes `preflightCore()`. Bridges before v0.1.93 lack
@@ -361,6 +369,7 @@ retry that import, reload the page or use a different loader URL.
 | `fallbackReason` | `unsupported`, `timeout`, or `init_error` for a memory64 fallback. Otherwise `null`. |
 | `loaderUrl` | The selected loader URL or specifier. `null` for `coreModuleFactory`. |
 | `wasmUrl` | The Wasm URL from the explicit override, resolved assets, or the loader's `locateFile` call. `null` if unavailable. |
+| `externalModelReader` | `true` when the core reads a model on demand (JS model filesystem API version 5), which `loadModelFromSource()` needs. Absent from a bridge before this field, and from a worker script that predates it. |
 
 Core retirement invalidates the cached result. The next preflight initializes
 the replacement core without restoring the previous model. After `dispose()`,
@@ -488,6 +497,88 @@ fails, no model stays loaded; call `loadModelFromUrl()` again. The core refuses
 the release while a generation or speech synthesis is active, and the current
 model stays loaded. Load a projector, LoRA adapters and a draft model again
 after switching models.
+
+### `loadModelFromSource(source, options?)`
+
+```ts
+loadModelFromSource(
+  source: Blob | FileSystemFileHandle,
+  options?: LoadModelFromSourceOptions,
+): Promise<unknown>
+```
+
+Loads one GGUF file that the page already holds, without downloading or caching
+it. `source` is a `Blob`, a `File`, or a `FileSystemFileHandle` from the origin
+private file system or a file picker. The core reads it on demand in bounded
+16 MiB steps, so the model is never copied into JavaScript or the Wasm heap
+first. Other options are those of `loadModelFromUrl()`, except that the cache
+and download options (`useCache`, `cacheName`, `force`, and the fetch, resume
+and remote-fetch options) and `jsBackedModelStaging` have no effect and
+`useMmap: true` is ignored (`model_mmap_disabled:external_reader`): a mapping
+would copy the whole file into the heap. `signal` and `progressCallback`
+(one final event with the file size) work as for a URL load.
+
+Support needs `LlamaWebGpuBridge.supportsCallerModelSource` and a core that
+reports `externalModelReader` from `preflightCore()`. A core without it rejects
+with `MODEL_SOURCE_UNSUPPORTED` before the loaded model is released.
+
+**Lifetime.** Keep the source valid and unchanged while the model is loaded. The
+bridge keeps a reference to your source, not a copy, and reads it again for any
+reload it performs itself: a worker restart, the fallback to the main thread and
+CPU recovery after a generation failure. It never writes to your handle, never
+closes it, and never reads another file. Loading another model, `dispose()` and
+a core abort release the reference.
+
+- A `Blob` or `File` is an immutable snapshot. A reload reads the same bytes. If
+  the browser can no longer read the underlying file, the load rejects with
+  `MODEL_READ_FAILED`. A `File` that came from an OPFS handle's `getFile()` is not
+  a snapshot in every browser; pass the handle instead.
+- A `FileSystemFileHandle` is a live file. The bridge records its size,
+  `lastModified` and a content fingerprint when you call `loadModelFromSource()`.
+  The fingerprint hashes the first and last 64 KiB and 16 evenly spaced 64 KiB
+  stripes between them, so its cost does not grow with the file; a file of
+  1 MiB or less is hashed whole. The bridge compares all three at every open,
+  including a reload after a restart, and once more when the native load returns.
+  A difference rejects with `MODEL_SOURCE_CHANGED` and the model is freed.
+- **Only an exclusive lock guarantees the bytes.** In a worker the bridge opens
+  its own `FileSystemSyncAccessHandle` on an OPFS handle and keeps it open for as
+  long as a model loaded from it exists. Nothing, including you, can write the
+  file in that time: `createWritable()` and `createSyncAccessHandle()` reject with
+  `NoModificationAllowedError`, so a reload inside the same worker (CPU recovery)
+  reads the bytes it loaded. A restart replaces the worker, which ends the lock;
+  until the new worker reopens the file it can be written, and the reload is
+  checked only by the size, `lastModified` and fingerprint described below. The bridge closes the handle when the model unloads (another
+  load replaces it, `dispose()`, a core abort or the worker ending) and when a
+  load fails or is cancelled. Close your own handles and any writer before you
+  call `loadModelFromSource()`, and load another model or dispose the bridge
+  before you edit the file. If another context already holds a sync access handle
+  on an OPFS file, the load rejects with `MODEL_SOURCE_BUSY` whatever error name
+  the browser reports, and never reads a file that can change.
+- **Everything else is best effort.** On the main thread, or for a handle outside
+  OPFS such as a file picker handle (a worker's sync access handle is refused there
+  for a reason other than a lock), the bridge holds no lock and reads the live
+  file (`caller_opfs_blob`). Detection then rests on the size, `lastModified` and
+  the sampled fingerprint. Some browsers keep the size and `lastModified` across
+  an in-place write (Chromium's in-memory OPFS, in private windows and Playwright,
+  does), and an edit in bytes between the sampled stripes changes none of the
+  three, so such an edit is not detected and the model can load changed bytes.
+  Do not write a source while a model loaded from it can still be reloaded.
+  Your handle is untouched either way.
+
+**Errors.** All are `ModelStagingError` and keep their `code` across the worker.
+The core stays usable for another load after each, and a failed load leaves no
+model loaded.
+
+| Code | Meaning |
+| --- | --- |
+| `MODEL_SOURCE_INVALID` | `source` is not a Blob, File or file handle (or is a handle the worker cannot receive), is empty, is not a GGUF file, is truncated inside its metadata, or the handle cannot be read. |
+| `MODEL_SOURCE_UNSUPPORTED` | The core or the worker script cannot read a caller source. |
+| `MODEL_SOURCE_SPLIT_UNSUPPORTED` | The file is one shard of a split GGUF (`split.count` above 1). Merge the shards or load them by URL. Split caller sources are tracked in [#357](https://github.com/leehack/llama-web-bridge/issues/357). |
+| `MODEL_SOURCE_CHANGED` | A handle's file no longer has the size, modification time or sampled content it had when you handed it over, at an open or when the native load returned. The loaded model is freed. |
+| `MODEL_SOURCE_BUSY` | In a worker, the bridge could not open a sync access handle on an OPFS file, normally because another context holds one (the message names the browser's error). Close that handle and load again. A worker that replaces another worker can see this briefly in Firefox. |
+| `MODEL_READ_FAILED` | A read of the source failed during the native load. A caller source has no cache entry to replace, so there is no retry. |
+
+Projectors and draft models still load by URL.
 
 ### `prefetchModelToCache(url, options?)`
 
@@ -1487,7 +1578,7 @@ include:
 | `llamadart.webgpu.thread_pool_size` | Detected or configured pthread pool size. |
 | `llamadart.webgpu.n_gpu_layers` | Active GPU layer count. |
 | `llamadart.webgpu.core_variant` | `wasm32`, `wasm64`, or initialization state. |
-| `llamadart.webgpu.model_source` | Model load source, such as network/cache/remote fetch. |
+| `llamadart.webgpu.model_source` | Model load source, such as network/cache/remote fetch, or `caller` for `loadModelFromSource()`. |
 | `llamadart.webgpu.model_cache_state` | Cache Storage state for the loaded model. |
 | `llamadart.webgpu.runtime_notes` | Semicolon-separated bridge diagnostics. See [Runtime notes](#runtime-notes). |
 | `llamadart.webgpu.mmproj_loaded` | `1` when a projector is loaded. |
@@ -1513,7 +1604,9 @@ include:
 | `model_stream_restart:<reason>` | The shard download restarted at byte zero. `model_stream_restart:cache` identifies a retry after a cache entry error. |
 | `model_cache_parts` | The operation read or stored a WebKit part entry. |
 | `model_cache_entry_invalid`, `mmproj_cache_entry_invalid` | A missing or damaged cache part, or a cached model that could not be read during the native load, caused a model or projector retry. The entry is removed and the retry restages from the network once. |
-| `model_reader:<kind>` | JS-backed staging on a core with JS model FS ABI version 5 read the model on demand instead of copying it into JS chunks. `opfs_sync` reads a committed OPFS file synchronously in a worker, `opfs_blob` reads the same file as a Blob, `blob_cache` reads a Cache Storage response, and `cache_parts` reads WebKit's part entry. `mmproj_reader:<kind>` reports the same for a projector. |
+| `model_reader:<kind>` | JS-backed staging on a core with JS model FS ABI version 5 read the model on demand instead of copying it into JS chunks. `opfs_sync` reads a committed OPFS file synchronously in a worker, `opfs_blob` reads the same file as a Blob, `blob_cache` reads a Cache Storage response, and `cache_parts` reads WebKit's part entry. `mmproj_reader:<kind>` reports the same for a projector. A caller source reports `caller_blob`, `caller_file`, `caller_opfs_sync` (a locked read in a worker) or `caller_opfs_blob` (a live file read with no lock). |
+| `model_source:caller`, `model_fetch_backend_skipped_caller_source` | The model came from `loadModelFromSource()`. The fetch backend, the cache and the download are not used. |
+| `model_source_changed_during_load` | A handle's file changed while the native load ran. The model was freed and the load rejected with `MODEL_SOURCE_CHANGED`. |
 | `model_opfs_download`, `model_cache_opfs` | A worker streamed the model into an OPFS file instead of JS chunks. `model_cache_opfs` means the file is now a cache entry. |
 | `model_opfs_fallback:<reason>` | OPFS could not accept the download, and the load staged the model in JS chunks instead. |
 | `model_read_failed` | A read of the staged model failed during the native load. |
@@ -1688,6 +1781,7 @@ on WebKit. Use its `code` to distinguish these cases.
 | `MODEL_STAGING_MOUNT_FAILED` | The bridge could not allocate or verify its private staging mount, or lost ownership during the load. |
 | `MODEL_TENSOR_SIZE_LIMIT_EXCEEDED` | The single-file or split GGUF tensor payload exceeds the wasm32 4 GiB address bound. |
 | `MODEL_READ_FAILED` | A read of the staged model failed during the native load and a retry was not possible. The core stays usable for another load. |
+| `MODEL_SOURCE_INVALID`, `MODEL_SOURCE_UNSUPPORTED`, `MODEL_SOURCE_SPLIT_UNSUPPORTED`, `MODEL_SOURCE_CHANGED`, `MODEL_SOURCE_BUSY` | A caller source was refused. See [`loadModelFromSource()`](#loadmodelfromsourcesource-options). |
 
 See the [Chromium measurements](single_thread.md#chromium-webgpu-measurements)
 and [iOS Safari results](single_thread.md#ios-safari) for observed limits and
